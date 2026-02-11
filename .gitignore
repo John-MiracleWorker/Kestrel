@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Database (local data)
+*.db
+*.db-shm
+*.db-wal
+
+# Models (too large for git)
+models/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Environment
+.env
+.DS_Store

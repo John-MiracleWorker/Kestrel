@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Libre Bird — Your Private AI Assistant</title>
+    <meta name="description" content="Free, offline, privacy-first AI assistant powered by local LLMs. A Little Bird alternative that keeps all your data on your Mac." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./index.css" />
+</head>
+<body>
+    <div id="app">
+        <!-- Sidebar -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <span class="logo-icon">🕊️</span>
+                    <span class="logo-text">Libre Bird</span>
+                </div>
+                <span class="logo-badge">OFFLINE</span>
+            </div>
+
+            <nav class="nav">
+                <button class="nav-item active" data-view="chat" id="nav-chat">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                    </svg>
+                    <span>Chat</span>
+                </button>
+                <button class="nav-item" data-view="journal" id="nav-journal">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
+                        <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
+                    </svg>
+                    <span>Journal</span>
+                </button>
+                <button class="nav-item" data-view="tasks" id="nav-tasks">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="9 11 12 14 22 4"></polyline>
+                        <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path>
+                    </svg>
+                    <span>Tasks</span>
+                </button>
+                <button class="nav-item" data-view="settings" id="nav-settings">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="3"></circle>
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                    </svg>
+                    <span>Settings</span>
+                </button>
+            </nav>
+
+            <!-- Conversation List (visible in chat view) -->
+            <div class="conversations-list" id="conversations-list">
+                <div class="conversations-header">
+                    <h3>Conversations</h3>
+                    <button class="btn-icon" id="new-chat-btn" title="New Conversation">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="12" y1="5" x2="12" y2="19"></line>
+                            <line x1="5" y1="12" x2="19" y2="12"></line>
+                        </svg>
+                    </button>
+                </div>
+                <div class="conversations-items" id="conversations-items">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
+
+            <!-- Context Status -->
+            <div class="sidebar-footer">
+                <div class="context-status" id="context-status">
+                    <div class="status-dot offline"></div>
+                    <span>Context: checking...</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Chat View -->
+            <div class="view active" id="view-chat">
+                <div class="chat-container">
+                    <div class="chat-messages" id="chat-messages">
+                        <div class="welcome-message">
+                            <div class="welcome-icon">🕊️</div>
+                            <h1>Welcome to Libre Bird</h1>
+                            <p>Your free, offline, privacy-first AI assistant.<br/>All data stays on your Mac. Always.</p>
+                            <div class="welcome-tips">
+                                <div class="tip-card">
+                                    <span class="tip-icon">💬</span>
+                                    <span>Ask me anything — I see your screen context</span>
+                                </div>
+                                <div class="tip-card">
+                                    <span class="tip-icon">📓</span>
+                                    <span>I'll journal your day automatically</span>
+                                </div>
+                                <div class="tip-card">
+                                    <span class="tip-icon">✅</span>
+                                    <span>I extract tasks from your activity</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="chat-input-area">
+                        <div class="context-toggle" id="context-toggle">
+                            <button class="context-btn active" id="context-btn" title="Include screen context">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                                    <circle cx="12" cy="12" r="3"></circle>
+                                </svg>
+                                <span>Context On</span>
+                            </button>
+                        </div>
+                        <div class="input-wrapper">
+                            <textarea id="chat-input" placeholder="Message Libre Bird..." rows="1"></textarea>
+                            <button class="send-btn" id="send-btn" title="Send message">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <line x1="22" y1="2" x2="11" y2="13"></line>
+                                    <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Journal View -->
+            <div class="view" id="view-journal">
+                <div class="view-header">
+                    <h2>Daily Journal</h2>
+                    <button class="btn-primary" id="generate-journal-btn">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+                        </svg>
+                        Generate Today's Journal
+                    </button>
+                </div>
+                <div class="journal-content" id="journal-content">
+                    <div class="empty-state">
+                        <div class="empty-icon">📓</div>
+                        <h3>No journal entries yet</h3>
+                        <p>Keep Libre Bird running to collect activity data, then generate your daily summary.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tasks View -->
+            <div class="view" id="view-tasks">
+                <div class="view-header">
+                    <h2>Tasks</h2>
+                    <button class="btn-primary" id="add-task-btn">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="12" y1="5" x2="12" y2="19"></line>
+                            <line x1="5" y1="12" x2="19" y2="12"></line>
+                        </svg>
+                        Add Task
+                    </button>
+                </div>
+                <div class="tasks-filters">
+                    <button class="filter-btn active" data-filter="all">All</button>
+                    <button class="filter-btn" data-filter="todo">To Do</button>
+                    <button class="filter-btn" data-filter="in_progress">In Progress</button>
+                    <button class="filter-btn" data-filter="done">Done</button>
+                </div>
+                <div class="tasks-list" id="tasks-list">
+                    <div class="empty-state">
+                        <div class="empty-icon">✅</div>
+                        <h3>No tasks yet</h3>
+                        <p>Tasks are automatically extracted from your journal, or add them manually.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Settings View -->
+            <div class="view" id="view-settings">
+                <div class="view-header">
+                    <h2>Settings</h2>
+                </div>
+                <div class="settings-content">
+                    <!-- Model Settings -->
+                    <div class="settings-section">
+                        <h3>🧠 AI Model</h3>
+                        <div class="settings-card">
+                            <div class="setting-row">
+                                <div class="setting-info">
+                                    <label>Current Model</label>
+                                    <span class="setting-value" id="current-model">No model loaded</span>
+                                </div>
+                            </div>
+                            <div class="setting-row">
+                                <div class="setting-info">
+                                    <label>Available Models</label>
+                                    <span class="setting-hint">Place GGUF files in the <code>models/</code> folder</span>
+                                </div>
+                            </div>
+                            <div class="models-list" id="models-list">
+                                <!-- Populated by JS -->
+                            </div>
+                            <div class="setting-row">
+                                <div class="setting-info">
+                                    <label>Context Length</label>
+                                    <span class="setting-hint">Higher = more memory usage</span>
+                                </div>
+                                <select id="setting-n-ctx" class="setting-select">
+                                    <option value="4096">4096 tokens</option>
+                                    <option value="8192" selected>8192 tokens</option>
+                                    <option value="16384">16384 tokens</option>
+                                    <option value="32768">32768 tokens</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Inference Settings -->
+                    <div class="settings-section">
+                        <h3>⚡ Inference</h3>
+                        <div class="settings-card">
+                            <div class="setting-row">
+                                <div class="setting-info">
+                                    <label>Temperature</label>
+                                    <span class="setting-hint">Lower = more precise, Higher = more creative</span>
+                                </div>
+                                <input type="range" id="setting-temperature" min="0" max="1.5" step="0.1" value="0.7" class="setting-range" />
+                                <span class="range-value" id="temp-value">0.7</span>
+                            </div>
+                            <div class="setting-row">
+                                <div class="setting-info">
+                                    <label>Max Output Tokens</label>
+                                </div>
+                                <select id="setting-max-tokens" class="setting-select">
+                                    <option value="512">512</option>
+                                    <option value="1024">1024</option>
+                                    <option value="2048" selected>2048</option>
+                                    <option value="4096">4096</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Context Settings -->
+                    <div class="settings-section">
+                        <h3>👁 Screen Context</h3>
+                        <div class="settings-card">
+                            <div class="setting-row">
+                                <div class="setting-info">
+                                    <label>Context Collection</label>
+                                    <span class="setting-hint">Captures your active window info for smart assistance</span>
+                                </div>
+                                <label class="toggle">
+                                    <input type="checkbox" id="setting-context-enabled" checked />
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="setting-row">
+                                <div class="setting-info">
+                                    <label>Capture Interval</label>
+                                    <span class="setting-hint">How often to snapshot your screen context</span>
+                                </div>
+                                <select id="setting-context-interval" class="setting-select">
+                                    <option value="15">15 seconds</option>
+                                    <option value="30" selected>30 seconds</option>
+                                    <option value="60">60 seconds</option>
+                                    <option value="120">2 minutes</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Privacy -->
+                    <div class="settings-section">
+                        <h3>🔒 Privacy</h3>
+                        <div class="settings-card privacy-card">
+                            <div class="privacy-badge">
+                                <span class="privacy-icon">🛡️</span>
+                                <div>
+                                    <strong>100% Offline & Private</strong>
+                                    <p>All data is stored locally in <code>libre_bird.db</code>. No network requests. No telemetry. No cloud.</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Task Modal -->
+    <div class="modal-overlay" id="task-modal" style="display: none;">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>New Task</h3>
+                <button class="btn-icon modal-close" id="task-modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="task-title">Title</label>
+                    <input type="text" id="task-title" placeholder="What needs to be done?" />
+                </div>
+                <div class="form-group">
+                    <label for="task-desc">Description (optional)</label>
+                    <textarea id="task-desc" rows="3" placeholder="Add details..."></textarea>
+                </div>
+                <div class="form-group">
+                    <label for="task-priority">Priority</label>
+                    <select id="task-priority">
+                        <option value="low">Low</option>
+                        <option value="medium" selected>Medium</option>
+                        <option value="high">High</option>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" id="task-cancel">Cancel</button>
+                <button class="btn-primary" id="task-save">Create Task</button>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="./main.js"></script>
+</body>
+</html>
