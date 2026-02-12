@@ -13,6 +13,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -491,3 +492,19 @@ async def update_setting(setting: SettingUpdate):
             context_collector.pause()
 
     return {"ok": True}
+
+
+# ── Static File Serving (production mode) ────────────────────────────
+# Serve the built frontend when running as a native app (no Vite dev server)
+
+_frontend_dist = os.path.join(os.path.dirname(__file__), "frontend", "dist")
+if os.path.isdir(_frontend_dist):
+    # Serve index.html for the root route
+    @app.get("/")
+    async def serve_index():
+        from fastapi.responses import FileResponse
+        return FileResponse(os.path.join(_frontend_dist, "index.html"))
+
+    # Serve static assets
+    app.mount("/", StaticFiles(directory=_frontend_dist), name="static")
+    logger.info(f"Serving frontend from {_frontend_dist}")

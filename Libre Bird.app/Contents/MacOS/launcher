@@ -1,0 +1,14 @@
+#!/bin/bash
+# Libre Bird — macOS App Launcher
+# This script is the entry point for the .app bundle.
+
+# Resolve the project directory (3 levels up from MacOS/launcher)
+DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+
+cd "$DIR" || exit 1
+
+# Activate the Python virtual environment
+source .venv/bin/activate
+
+# Run the app
+exec python3 app.py
