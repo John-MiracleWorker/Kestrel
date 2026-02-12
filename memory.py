@@ -231,8 +231,8 @@ async def retrieve_context(db, message: str) -> str:
         except Exception:
             pass  # FTS query syntax error — skip
 
-    # 3. Fallback: recent context if nothing found
+    # 3. If nothing found, return empty — let the model say "I don't know"
     if not results:
-        results = await db.get_recent_context(limit=20)
+        return ""
 
     return compress_snapshots(results)

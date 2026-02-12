@@ -183,6 +183,9 @@ async def chat(req: ChatRequest):
         memory = await retrieve_context(db, req.message)
         if memory:
             logger.info(f"Retrieved {len(memory)} chars of historical memory")
+        else:
+            memory = "[No activity data found for this time period. Tell the user you don't have data for what they're asking about.]"
+            logger.info("No historical memory found — sending honest 'no data' signal")
 
     # Generate title for new conversations
     if len(history) == 0:

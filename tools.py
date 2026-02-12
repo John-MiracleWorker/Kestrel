@@ -125,6 +125,14 @@ TOOL_DEFINITIONS = [
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_screen",
+            "description": "Read all visible text from the user's screen using OCR. Use this when the user asks what's on their screen, wants you to read something they're looking at, or says 'look at this'. The screenshot is captured, OCR'd, and immediately discarded — nothing is stored.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
 ]
 
 
@@ -227,7 +235,7 @@ def tool_open_url(url: str) -> dict:
 
 
 def tool_search_files(query: str, folder: str = None) -> dict:
-    """Search for files using macOS Spotlight (mdfind)."""
+    """Search for files on this Mac using Spotlight. Returns file paths matching the query. Note: these are raw filesystem paths, not 'workspaces' or 'projects'."""
     try:
         cmd = ["mdfind"]
         if folder:
@@ -235,7 +243,12 @@ def tool_search_files(query: str, folder: str = None) -> dict:
         cmd.append(query)
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         files = [f for f in result.stdout.strip().split("\n") if f][:10]  # Limit to 10
-        return {"query": query, "files": files, "count": len(files)}
+        return {
+            "query": query,
+            "files": files,
+            "count": len(files),
+            "note": "These are raw file paths from Spotlight search. Interpret them as files on the user's Mac, not as projects or workspaces.",
+        }
     except Exception as e:
         return {"query": query, "error": str(e)}
 
@@ -312,6 +325,12 @@ def tool_get_system_info() -> dict:
 # Tool dispatcher
 # ---------------------------------------------------------------------------
 
+# Import screen OCR (lazy — only used when the tool is called)
+try:
+    from screen_ocr import read_screen as _read_screen
+except ImportError:
+    _read_screen = lambda: {"error": "screen_ocr module not available"}
+
 _TOOL_REGISTRY = {
     "get_datetime": lambda args: tool_get_datetime(),
     "web_search": lambda args: tool_web_search(args.get("query", "")),
@@ -322,6 +341,7 @@ _TOOL_REGISTRY = {
         args.get("query", ""), args.get("folder")
     ),
     "get_system_info": lambda args: tool_get_system_info(),
+    "read_screen": lambda args: _read_screen(),
 }
 
 

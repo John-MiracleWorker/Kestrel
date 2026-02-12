@@ -10,3 +10,4 @@ huggingface-hub==0.27.1
 duckduckgo-search==8.1.1
 ddgs==9.10.0
 pywebview==6.1
+pyobjc-framework-Vision==10.3.1
