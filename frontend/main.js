@@ -17,6 +17,7 @@ const state = {
     settings: {},
     voiceActive: false,
     voicePolling: null,
+    attachedFile: null,
 };
 
 // ── API Helpers ───────────────────────────────────────────────
@@ -153,6 +154,16 @@ function switchView(viewName) {
     if (viewName === 'settings') loadSettings();
 }
 
+// ── Slash Commands Definition ─────────────────────────────────
+const SLASH_COMMANDS = [
+    { cmd: '/summarize', desc: 'Summarize the conversation', icon: '📝' },
+    { cmd: '/explain', desc: 'Explain something simply', icon: '💡' },
+    { cmd: '/translate', desc: 'Translate to another language', icon: '🌐' },
+    { cmd: '/email', desc: 'Draft an email', icon: '✉️' },
+    { cmd: '/code', desc: 'Write or fix code', icon: '💻' },
+    { cmd: '/help', desc: 'Show available commands', icon: '❓' },
+];
+
 // ── Chat ──────────────────────────────────────────────────────
 function setupChat() {
     const input = document.getElementById('chat-input');
@@ -164,6 +175,8 @@ function setupChat() {
     input.addEventListener('input', () => {
         input.style.height = 'auto';
         input.style.height = Math.min(input.scrollHeight, 150) + 'px';
+        // Slash command hints
+        handleSlashHints(input.value);
     });
 
     // Send on Enter (Shift+Enter for newline)
@@ -182,19 +195,68 @@ function setupChat() {
         contextBtn.classList.toggle('active', state.includeContext);
         contextBtn.querySelector('span').textContent = state.includeContext ? 'Context On' : 'Context Off';
     });
+
+    // ── Conversation Search ────────────────────────────────
+    const searchInput = document.getElementById('conv-search-input');
+    if (searchInput) {
+        searchInput.addEventListener('input', () => {
+            renderConversations(searchInput.value.trim().toLowerCase());
+        });
+    }
+
+    // ── File Drop ──────────────────────────────────────────
+    setupFileDrop();
+
+    // ── Model Quick-Switch ────────────────────────────────
+    setupModelPill();
+
+    // ── File attachment remove ─────────────────────────────
+    const removeBtn = document.getElementById('file-attachment-remove');
+    if (removeBtn) {
+        removeBtn.addEventListener('click', () => {
+            state.attachedFile = null;
+            document.getElementById('file-attachment').style.display = 'none';
+        });
+    }
 }
 
 async function sendMessage() {
     const input = document.getElementById('chat-input');
-    const message = input.value.trim();
+    let message = input.value.trim();
     if (!message || state.isStreaming) return;
+
+    // Handle /help client-side
+    if (message === '/help') {
+        input.value = '';
+        const helpText = SLASH_COMMANDS.map(c => `${c.icon} **${c.cmd}** — ${c.desc}`).join('\n');
+        appendMessage('user', '/help');
+        appendMessage('assistant', `## Available Commands\n\n${helpText}\n\n---\nYou can also **drop files** into the chat to analyze them.`);
+        document.getElementById('slash-hints').style.display = 'none';
+        return;
+    }
+
+    // Attach file content to message if present
+    if (state.attachedFile) {
+        const fileCtx = `[Attached file: ${state.attachedFile.name}]\n\`\`\`${state.attachedFile.ext.replace('.', '')}\n${state.attachedFile.content}\n\`\`\`\n\n`;
+        message = fileCtx + (message || `Analyze this ${state.attachedFile.ext} file.`);
+        state.attachedFile = null;
+        document.getElementById('file-attachment').style.display = 'none';
+    }
+
+    // Hide slash hints
+    const hintsEl = document.getElementById('slash-hints');
+    if (hintsEl) hintsEl.style.display = 'none';
+
+    // Clear suggestions
+    const sugBar = document.getElementById('suggestions-bar');
+    if (sugBar) sugBar.innerHTML = '';
 
     // Clear welcome message
     const welcome = document.querySelector('.welcome-message');
     if (welcome) welcome.remove();
 
     // Add user message to UI
-    appendMessage('user', message);
+    appendMessage('user', input.value.trim() || message.substring(0, 100));
     input.value = '';
     input.style.height = 'auto';
 
@@ -341,6 +403,14 @@ async function sendMessage() {
 
     state.isStreaming = false;
     document.getElementById('send-btn').disabled = false;
+
+    // Generate smart follow-up suggestions
+    if (fullResponse) {
+        showSuggestions(fullResponse, text => {
+            document.getElementById('chat-input').value = text;
+            sendMessage();
+        });
+    }
 }
 
 function appendMessage(role, content) {
@@ -380,26 +450,156 @@ function scrollToBottom() {
 }
 
 function formatMarkdown(text) {
-    // Basic markdown rendering
-    let html = text
-        // Escape HTML
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        // Code blocks
-        .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
-        // Inline code
-        .replace(/`([^`]+)`/g, '<code>$1</code>')
-        // Bold
-        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-        // Italic
-        .replace(/\*(.+?)\*/g, '<em>$1</em>')
-        // Links
-        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
-        // Line breaks
-        .replace(/\n/g, '<br>');
+    if (!text) return '';
+
+    // Pass 1: Extract fenced code blocks and protect them
+    const codeBlocks = [];
+    let processed = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+        const idx = codeBlocks.length;
+        const escapedCode = code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const langLabel = lang ? `<span class="code-lang">${lang}</span>` : '';
+        const copyBtn = `<button class="code-copy" onclick="navigator.clipboard.writeText(this.parentElement.querySelector('code').textContent)">📋</button>`;
+        codeBlocks.push(`<div class="code-block">${langLabel}${copyBtn}<pre><code class="lang-${lang || 'text'}">${escapedCode}</code></pre></div>`);
+        return `\x00CODE${idx}\x00`;
+    });
+
+    // Escape HTML in remaining text
+    processed = processed.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    // Pass 2: Block-level elements (process line by line)
+    const lines = processed.split('\n');
+    let html = '';
+    let inList = false;
+    let listType = '';
+    let inBlockquote = false;
+    let inTable = false;
+    let tableRows = [];
+
+    function closeList() {
+        if (inList) { html += `</${listType}>`; inList = false; }
+    }
+    function closeBlockquote() {
+        if (inBlockquote) { html += '</blockquote>'; inBlockquote = false; }
+    }
+    function closeTable() {
+        if (inTable) {
+            // Build table
+            let t = '<table>';
+            tableRows.forEach((row, i) => {
+                const tag = i === 0 ? 'th' : 'td';
+                const cells = row.split('|').filter(c => c.trim() !== '');
+                t += '<tr>' + cells.map(c => `<${tag}>${c.trim()}</${tag}>`).join('') + '</tr>';
+            });
+            t += '</table>';
+            html += t;
+            inTable = false;
+            tableRows = [];
+        }
+    }
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+
+        // Code block placeholder
+        if (/\x00CODE\d+\x00/.test(line)) {
+            closeList(); closeBlockquote(); closeTable();
+            html += line;
+            continue;
+        }
+
+        // Table rows (detect |...|...|)
+        const tableMatch = line.match(/^\|(.+)\|$/);
+        if (tableMatch) {
+            closeList(); closeBlockquote();
+            // Skip separator rows (|---|---|)
+            if (/^\|[\s\-:|]+\|$/.test(line)) continue;
+            if (!inTable) inTable = true;
+            tableRows.push(line);
+            continue;
+        } else {
+            closeTable();
+        }
+
+        // Horizontal rule
+        if (/^(\-{3,}|\*{3,}|_{3,})$/.test(line.trim())) {
+            closeList(); closeBlockquote();
+            html += '<hr>';
+            continue;
+        }
+
+        // Headings
+        const headingMatch = line.match(/^(#{1,4})\s+(.+)$/);
+        if (headingMatch) {
+            closeList(); closeBlockquote();
+            const level = headingMatch[1].length;
+            html += `<h${level}>${inlineFormat(headingMatch[2])}</h${level}>`;
+            continue;
+        }
+
+        // Blockquote
+        if (line.startsWith('&gt; ') || line === '&gt;') {
+            closeList();
+            if (!inBlockquote) { html += '<blockquote>'; inBlockquote = true; }
+            html += inlineFormat(line.replace(/^&gt;\s?/, '')) + '<br>';
+            continue;
+        } else {
+            closeBlockquote();
+        }
+
+        // Unordered list
+        const ulMatch = line.match(/^(\s*)[*\-+]\s+(.+)$/);
+        if (ulMatch) {
+            closeBlockquote();
+            if (!inList || listType !== 'ul') {
+                closeList();
+                html += '<ul>'; inList = true; listType = 'ul';
+            }
+            html += `<li>${inlineFormat(ulMatch[2])}</li>`;
+            continue;
+        }
+
+        // Ordered list
+        const olMatch = line.match(/^(\s*)\d+\.\s+(.+)$/);
+        if (olMatch) {
+            closeBlockquote();
+            if (!inList || listType !== 'ol') {
+                closeList();
+                html += '<ol>'; inList = true; listType = 'ol';
+            }
+            html += `<li>${inlineFormat(olMatch[2])}</li>`;
+            continue;
+        }
+
+        // Regular line
+        closeList();
+        if (line.trim() === '') {
+            html += '<br>';
+        } else {
+            html += `<p>${inlineFormat(line)}</p>`;
+        }
+    }
+
+    closeList(); closeBlockquote(); closeTable();
+
+    // Pass 3: Restore code blocks
+    html = html.replace(/\x00CODE(\d+)\x00/g, (_, idx) => codeBlocks[parseInt(idx)]);
 
     return html;
+}
+
+function inlineFormat(text) {
+    return text
+        // Bold
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        // Strikethrough
+        .replace(/~~(.+?)~~/g, '<del>$1</del>')
+        // Italic
+        .replace(/\*(.+?)\*/g, '<em>$1</em>')
+        .replace(/_(.+?)_/g, '<em>$1</em>')
+        // Inline code
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        // Links
+        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
 }
 
 // ── Conversations ─────────────────────────────────────────────
@@ -410,14 +610,21 @@ async function loadConversations() {
     } catch (e) { }
 }
 
-function renderConversations() {
+function renderConversations(searchQuery = '') {
     const container = document.getElementById('conversations-items');
-    if (state.conversations.length === 0) {
-        container.innerHTML = '<div style="padding: 16px; font-size: 0.8rem; color: var(--text-tertiary); text-align: center;">No conversations yet</div>';
+    let convs = state.conversations;
+
+    // Filter by search query
+    if (searchQuery) {
+        convs = convs.filter(c => (c.title || '').toLowerCase().includes(searchQuery));
+    }
+
+    if (convs.length === 0) {
+        container.innerHTML = `<div style="padding: 16px; font-size: 0.8rem; color: var(--text-tertiary); text-align: center;">${searchQuery ? 'No matching conversations' : 'No conversations yet'}</div>`;
         return;
     }
 
-    container.innerHTML = state.conversations.map(c => `
+    container.innerHTML = convs.map(c => `
         <div class="conv-item ${c.id === state.currentConversation ? 'active' : ''}" data-id="${c.id}">
             <span class="conv-item-title">${escapeHtml(c.title)}</span>
             <button class="conv-item-delete" data-id="${c.id}" title="Delete">
@@ -888,6 +1095,216 @@ async function speakText(text) {
 async function stopSpeaking() {
     try {
         await api.post('/api/tts/stop');
+    } catch (e) { /* ignore */ }
+}
+
+// ── Slash Command Hints ───────────────────────────────────────
+function handleSlashHints(value) {
+    const hintsEl = document.getElementById('slash-hints');
+    if (!hintsEl) return;
+
+    if (value.startsWith('/') && value.length < 20) {
+        const query = value.toLowerCase();
+        const matches = SLASH_COMMANDS.filter(c => c.cmd.startsWith(query));
+        if (matches.length > 0 && value !== '/help') {
+            hintsEl.style.display = 'flex';
+            hintsEl.innerHTML = matches.map(c => `
+                <button class="slash-hint" data-cmd="${c.cmd}">
+                    <span class="slash-hint-icon">${c.icon}</span>
+                    <span class="slash-hint-cmd">${c.cmd}</span>
+                    <span class="slash-hint-desc">${c.desc}</span>
+                </button>
+            `).join('');
+
+            hintsEl.querySelectorAll('.slash-hint').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const input = document.getElementById('chat-input');
+                    input.value = btn.dataset.cmd + ' ';
+                    input.focus();
+                    hintsEl.style.display = 'none';
+                });
+            });
+            return;
+        }
+    }
+    hintsEl.style.display = 'none';
+}
+
+// ── File Drop ─────────────────────────────────────────────────
+function setupFileDrop() {
+    const chatContainer = document.querySelector('.chat-container');
+    const overlay = document.getElementById('file-drop-overlay');
+    if (!chatContainer || !overlay) return;
+
+    const TEXT_EXTENSIONS = ['.txt', '.md', '.csv', '.json', '.xml', '.yaml', '.yml',
+        '.toml', '.env', '.log', '.py', '.js', '.ts', '.jsx', '.tsx',
+        '.html', '.css', '.scss', '.sql', '.sh', '.bash', '.zsh',
+        '.swift', '.kt', '.java', '.c', '.cpp', '.h', '.rs', '.go',
+        '.rb', '.php', '.r', '.lua', '.conf', '.cfg', '.ini'];
+
+    let dragCounter = 0;
+
+    chatContainer.addEventListener('dragenter', (e) => {
+        e.preventDefault();
+        dragCounter++;
+        overlay.classList.add('visible');
+    });
+
+    chatContainer.addEventListener('dragleave', (e) => {
+        e.preventDefault();
+        dragCounter--;
+        if (dragCounter <= 0) {
+            dragCounter = 0;
+            overlay.classList.remove('visible');
+        }
+    });
+
+    chatContainer.addEventListener('dragover', (e) => {
+        e.preventDefault();
+    });
+
+    chatContainer.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        dragCounter = 0;
+        overlay.classList.remove('visible');
+
+        const files = e.dataTransfer.files;
+        if (files.length === 0) return;
+
+        const file = files[0]; // One file at a time
+        const ext = '.' + file.name.split('.').pop().toLowerCase();
+
+        if (!TEXT_EXTENSIONS.includes(ext)) {
+            appendMessage('assistant', `⚠️ **Unsupported file type** (${ext}). I can read text-based files like .txt, .py, .js, .json, .csv, .md, etc.`);
+            return;
+        }
+
+        try {
+            let content = await file.text();
+            const MAX_CHARS = 12000; // ~3000 tokens
+            if (content.length > MAX_CHARS) {
+                content = content.substring(0, MAX_CHARS) + '\n\n[... truncated — file too large ...]';
+            }
+            state.attachedFile = { name: file.name, content, ext };
+            // Show attachment pill
+            document.getElementById('file-attachment').style.display = 'flex';
+            document.getElementById('file-attachment-name').textContent = `📎 ${file.name}`;
+        } catch (err) {
+            appendMessage('assistant', `❌ Could not read file: ${err.message}`);
+        }
+    });
+}
+
+// ── Smart Suggestions ─────────────────────────────────────────
+function showSuggestions(aiResponse, onSelect) {
+    const bar = document.getElementById('suggestions-bar');
+    if (!bar) return;
+
+    // Generate contextual follow-ups based on the AI's response
+    const suggestions = generateSuggestions(aiResponse);
+    if (suggestions.length === 0) {
+        bar.innerHTML = '';
+        return;
+    }
+
+    bar.innerHTML = suggestions.map(s => `
+        <button class="suggestion-chip">${escapeHtml(s)}</button>
+    `).join('');
+
+    bar.querySelectorAll('.suggestion-chip').forEach((chip, i) => {
+        chip.addEventListener('click', () => {
+            bar.innerHTML = '';
+            onSelect(suggestions[i]);
+        });
+    });
+}
+
+function generateSuggestions(response) {
+    const suggestions = [];
+    const lower = response.toLowerCase();
+
+    // Context-aware suggestions
+    if (lower.includes('code') || lower.includes('function') || lower.includes('```')) {
+        suggestions.push('Explain this code step by step');
+        suggestions.push('Can you optimize this?');
+    }
+    if (lower.includes('error') || lower.includes('bug') || lower.includes('fix')) {
+        suggestions.push('What caused this error?');
+        suggestions.push('How can I prevent this?');
+    }
+    if (lower.includes('list') || lower.includes('steps') || lower.includes('1.')) {
+        suggestions.push('Tell me more about the first point');
+        suggestions.push('Can you elaborate?');
+    }
+    if (lower.includes('example')) {
+        suggestions.push('Show me another example');
+    }
+
+    // Always offer these if nothing else matched
+    if (suggestions.length === 0) {
+        suggestions.push('Tell me more');
+        suggestions.push('Can you give an example?');
+    }
+    suggestions.push('Summarize this');
+
+    return suggestions.slice(0, 3);
+}
+
+// ── Model Quick-Switch ────────────────────────────────────────
+function setupModelPill() {
+    const pill = document.getElementById('model-pill');
+    if (!pill) return;
+
+    pill.addEventListener('click', async () => {
+        try {
+            const data = await api.get('/api/models');
+            if (!data.models || data.models.length === 0) {
+                return;
+            }
+            // Cycle to the next model
+            const currentIdx = data.models.findIndex(m => m.path === data.loaded);
+            const nextIdx = (currentIdx + 1) % data.models.length;
+            const next = data.models[nextIdx];
+
+            if (next.path === data.loaded) return; // Only one model
+
+            pill.querySelector('.model-pill-name').textContent = 'Loading...';
+            pill.disabled = true;
+
+            const nCtx = parseInt(state.settings.n_ctx || '8192');
+            await (await api.post('/api/models/load', {
+                model_path: next.path,
+                n_ctx: nCtx,
+            })).json();
+
+            await refreshStatus();
+            updateModelPill();
+            pill.disabled = false;
+        } catch (e) {
+            console.error('Model switch failed:', e);
+            pill.disabled = false;
+            updateModelPill();
+        }
+    });
+
+    // Initial update
+    updateModelPill();
+}
+
+async function updateModelPill() {
+    try {
+        const data = await api.get('/api/models');
+        const nameEl = document.getElementById('model-pill-name');
+        const dotEl = document.querySelector('.model-pill-dot');
+        if (data.loaded) {
+            const name = data.loaded.split('/').pop().replace('.gguf', '');
+            // Shorten for the pill
+            nameEl.textContent = name.length > 20 ? name.substring(0, 18) + '…' : name;
+            dotEl.classList.add('active');
+        } else {
+            nameEl.textContent = 'No model';
+            dotEl.classList.remove('active');
+        }
     } catch (e) { /* ignore */ }
 }
 

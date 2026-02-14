@@ -74,6 +74,10 @@
                         </svg>
                     </button>
                 </div>
+                <div class="conv-search">
+                    <input type="text" id="conv-search-input" placeholder="🔍 Search conversations..."
+                        autocomplete="off" />
+                </div>
                 <div class="conversations-items" id="conversations-items">
                     <!-- Populated by JS -->
                 </div>
@@ -93,6 +97,13 @@
             <!-- Chat View -->
             <div class="view active" id="view-chat">
                 <div class="chat-container">
+                    <!-- File drop overlay -->
+                    <div class="file-drop-overlay" id="file-drop-overlay">
+                        <div class="file-drop-content">
+                            <span class="file-drop-icon">📄</span>
+                            <span>Drop file to attach</span>
+                        </div>
+                    </div>
                     <div class="chat-messages" id="chat-messages">
                         <div class="welcome-message">
                             <div class="welcome-icon">🕊️</div>
@@ -115,19 +126,36 @@
                             </div>
                         </div>
                     </div>
+                    <!-- Smart Suggestions -->
+                    <div class="suggestions-bar" id="suggestions-bar"></div>
                     <div class="chat-input-area">
-                        <div class="context-toggle" id="context-toggle">
-                            <button class="context-btn active" id="context-btn" title="Include screen context">
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
-                                    <circle cx="12" cy="12" r="3"></circle>
-                                </svg>
-                                <span>Context On</span>
+                        <div class="input-top-row">
+                            <div class="context-toggle" id="context-toggle">
+                                <button class="context-btn active" id="context-btn" title="Include screen context">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                        stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                                        <circle cx="12" cy="12" r="3"></circle>
+                                    </svg>
+                                    <span>Context On</span>
+                                </button>
+                            </div>
+                            <!-- Model quick-switch pill -->
+                            <button class="model-pill" id="model-pill" title="Switch model">
+                                <span class="model-pill-dot"></span>
+                                <span class="model-pill-name" id="model-pill-name">No model</span>
                             </button>
+                            <!-- File attachment -->
+                            <div class="file-attachment" id="file-attachment" style="display:none">
+                                <span class="file-attachment-name" id="file-attachment-name"></span>
+                                <button class="file-attachment-remove" id="file-attachment-remove">✕</button>
+                            </div>
                         </div>
+                        <!-- Slash command hints -->
+                        <div class="slash-hints" id="slash-hints" style="display:none"></div>
                         <div class="input-wrapper">
-                            <textarea id="chat-input" placeholder="Message Libre Bird..." rows="1"></textarea>
+                            <textarea id="chat-input" placeholder="Message Libre Bird... (type / for commands)"
+                                rows="1"></textarea>
                             <button class="mic-btn" id="mic-btn" title="Voice input (Hey Libre)">
                                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
