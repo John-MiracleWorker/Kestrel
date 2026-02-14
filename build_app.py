@@ -13,17 +13,26 @@ CONTENTS = os.path.join(APP_DIR, "Contents")
 MACOS = os.path.join(CONTENTS, "MacOS")
 RESOURCES = os.path.join(CONTENTS, "Resources")
 
-ICON_SRC = os.path.join(
-    os.path.expanduser("~"),
-    ".gemini/antigravity/brain/8ab06dc2-e5f9-4d60-a24b-0b7aad2a3066",
-    "libre_bird_icon_1770851859290.png",
-)
+ICON_SRC = os.path.join(PROJECT_DIR, "icon.png")
 
 
 def create_iconset():
     """Create .icns from source PNG using sips + iconutil."""
     iconset = os.path.join(PROJECT_DIR, "AppIcon.iconset")
-    os.makedirs(iconset, exist_ok=True)
+    if os.path.exists(iconset):
+        shutil.rmtree(iconset)
+    os.makedirs(iconset)
+
+    # Convert source to clean PNG and upscale to 1024
+    base = os.path.join(PROJECT_DIR, "_icon_base.png")
+    subprocess.run(
+        ["sips", "-s", "format", "png", ICON_SRC, "--out", base],
+        capture_output=True, timeout=10,
+    )
+    subprocess.run(
+        ["sips", "-z", "1024", "1024", base, "--out", base],
+        capture_output=True, timeout=10,
+    )
 
     sizes = [
         (16, "icon_16x16.png"),
@@ -41,7 +50,7 @@ def create_iconset():
     for size, name in sizes:
         out = os.path.join(iconset, name)
         subprocess.run(
-            ["sips", "-z", str(size), str(size), ICON_SRC, "--out", out],
+            ["sips", "-z", str(size), str(size), base, "--out", out],
             capture_output=True, timeout=10,
         )
 
@@ -51,12 +60,13 @@ def create_iconset():
         capture_output=True, timeout=10,
     )
     shutil.rmtree(iconset, ignore_errors=True)
+    if os.path.exists(base):
+        os.remove(base)
 
     if result.returncode == 0:
         print(f"✓ Icon created: {icns_path}")
     else:
         print(f"⚠ Icon creation failed: {result.stderr.decode()}")
-        # Copy PNG as fallback
         shutil.copy2(ICON_SRC, os.path.join(RESOURCES, "AppIcon.png"))
         print("  Using PNG fallback")
 
