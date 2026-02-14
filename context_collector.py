@@ -127,6 +127,39 @@ def get_screen_context() -> Optional[dict]:
 class ContextCollector:
     """Background service that periodically captures screen context."""
 
+    # Activity categories based on app bundle IDs and names
+    _ACTIVITY_MAP = {
+        "coding": {
+            "com.microsoft.VSCode", "com.apple.dt.Xcode",
+            "com.sublimetext", "com.jetbrains", "com.googlecode.iterm2",
+            "com.apple.Terminal", "dev.warp.Warp-Stable",
+        },
+        "browsing": {
+            "com.apple.Safari", "com.google.Chrome",
+            "org.mozilla.firefox", "com.brave.Browser",
+            "com.microsoft.edgemac",
+        },
+        "writing": {
+            "com.apple.iWork.Pages", "com.microsoft.Word",
+            "com.apple.TextEdit", "com.apple.Notes",
+            "md.obsidian", "com.notion.id",
+        },
+        "communication": {
+            "com.apple.MobileSMS", "com.apple.mail",
+            "com.tinyspeck.slackmacgap", "com.hnc.Discord",
+            "us.zoom.xos", "com.microsoft.teams2",
+        },
+        "media": {
+            "com.spotify.client", "com.apple.Music",
+            "com.apple.TV", "com.google.youtube",
+            "com.apple.podcasts",
+        },
+        "design": {
+            "com.figma.Desktop", "com.bohemiancoding.sketch3",
+            "com.adobe.Photoshop", "com.apple.Preview",
+        },
+    }
+
     def __init__(self, interval: int = 30, on_context: Callable = None):
         self.interval = interval  # seconds between captures
         self.on_context = on_context  # callback(context_dict)
@@ -134,6 +167,10 @@ class ContextCollector:
         self._paused = False
         self._thread: Optional[threading.Thread] = None
         self._last_context: Optional[dict] = None
+        # Activity tracking
+        self._activity_start: Optional[float] = None
+        self._current_activity: Optional[str] = None
+        self._activity_durations: dict[str, float] = {}  # category -> total seconds
 
     @property
     def is_running(self) -> bool:
@@ -146,6 +183,44 @@ class ContextCollector:
     @property
     def last_context(self) -> Optional[dict]:
         return self._last_context
+
+    @property
+    def activity_summary(self) -> dict:
+        """Return a summary of time spent per activity category."""
+        # Include time for the currently active activity
+        durations = dict(self._activity_durations)
+        if self._current_activity and self._activity_start:
+            elapsed = time.time() - self._activity_start
+            durations[self._current_activity] = (
+                durations.get(self._current_activity, 0) + elapsed
+            )
+        return {
+            category: round(seconds / 60, 1)  # minutes
+            for category, seconds in durations.items()
+            if seconds > 0
+        }
+
+    def _classify_activity(self, bundle_id: str, app_name: str) -> str:
+        """Classify the current app into an activity category."""
+        for category, bundles in self._ACTIVITY_MAP.items():
+            if bundle_id in bundles:
+                return category
+            # Fuzzy match by app name
+            for b in bundles:
+                if app_name.lower() in b.lower() or b.split(".")[-1].lower() in app_name.lower():
+                    return category
+        return "other"
+
+    def _track_activity(self, category: str):
+        """Track time spent on each activity category."""
+        now = time.time()
+        if self._current_activity and self._activity_start:
+            elapsed = now - self._activity_start
+            self._activity_durations[self._current_activity] = (
+                self._activity_durations.get(self._current_activity, 0) + elapsed
+            )
+        self._current_activity = category
+        self._activity_start = now
 
     def start(self):
         """Start the background context collection."""
@@ -185,6 +260,20 @@ class ContextCollector:
             if not self._paused:
                 ctx = get_screen_context()
                 if ctx:
+                    # Classify and track activity
+                    category = self._classify_activity(
+                        ctx.get("bundle_id", ""),
+                        ctx.get("app_name", ""),
+                    )
+                    ctx["activity"] = category
+                    self._track_activity(category)
+
+                    # Add time-on-activity to context
+                    if self._activity_start:
+                        ctx["activity_minutes"] = round(
+                            (time.time() - self._activity_start) / 60, 1
+                        )
+
                     # De-duplicate: skip if same as last capture
                     if (self._last_context and
                         ctx["app_name"] == self._last_context.get("app_name") and
@@ -200,3 +289,4 @@ class ContextCollector:
                                 logger.error(f"Context callback error: {e}")
 
             time.sleep(self.interval)
+

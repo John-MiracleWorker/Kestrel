@@ -15,6 +15,8 @@ const state = {
     isStreaming: false,
     modelLoaded: false,
     settings: {},
+    voiceActive: false,
+    voicePolling: null,
 };
 
 // ── API Helpers ───────────────────────────────────────────────
@@ -64,6 +66,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     setupChat();
     setupTasks();
     setupSettings();
+    setupVoice();
     await refreshStatus();
     await loadConversations();
     // Periodic status refresh
@@ -801,6 +804,81 @@ async function loadModels() {
     } catch (e) {
         console.error('Failed to load models:', e);
     }
+}
+
+// ── Voice Input & TTS ─────────────────────────────────────────
+function setupVoice() {
+    const micBtn = document.getElementById('mic-btn');
+    if (!micBtn) return;
+
+    micBtn.addEventListener('click', toggleVoice);
+}
+
+async function toggleVoice() {
+    const micBtn = document.getElementById('mic-btn');
+    if (state.voiceActive) {
+        // Stop listening
+        try { await api.post('/api/voice/stop'); } catch (e) { /* ignore */ }
+        state.voiceActive = false;
+        micBtn.classList.remove('active');
+        if (state.voicePolling) {
+            clearInterval(state.voicePolling);
+            state.voicePolling = null;
+        }
+    } else {
+        // Start listening
+        try {
+            await api.post('/api/voice/start');
+            state.voiceActive = true;
+            micBtn.classList.add('active');
+            // Poll for transcriptions
+            state.voicePolling = setInterval(pollVoice, 800);
+        } catch (e) {
+            console.error('Voice start failed:', e);
+        }
+    }
+}
+
+async function pollVoice() {
+    try {
+        const res = await api.get('/api/voice/status');
+        if (res.transcriptions && res.transcriptions.length > 0) {
+            const input = document.getElementById('chat-input');
+            // Append the latest transcription to the input
+            const latest = res.transcriptions[res.transcriptions.length - 1];
+            if (latest && latest.text) {
+                const text = latest.text.trim();
+                if (text) {
+                    input.value = (input.value ? input.value + ' ' : '') + text;
+                    input.dispatchEvent(new Event('input'));
+                }
+            }
+        }
+        // Update mic button visual state
+        const micBtn = document.getElementById('mic-btn');
+        if (res.listening) {
+            micBtn.classList.add('listening');
+        } else {
+            micBtn.classList.remove('listening');
+        }
+    } catch (e) {
+        // Server might be down, stop polling
+        console.warn('Voice poll error:', e);
+    }
+}
+
+async function speakText(text) {
+    try {
+        await api.post('/api/tts/speak', { text });
+    } catch (e) {
+        console.warn('TTS failed:', e);
+    }
+}
+
+async function stopSpeaking() {
+    try {
+        await api.post('/api/tts/stop');
+    } catch (e) { /* ignore */ }
 }
 
 // ── Utility ───────────────────────────────────────────────────

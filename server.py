@@ -21,6 +21,9 @@ from database import Database
 from llm_engine import engine as llm_engine
 from context_collector import ContextCollector, get_screen_context
 from memory import detect_recall_intent, retrieve_context
+from notifications import reminder_scheduler, send_notification
+from voice_input import voice_listener
+from tts import speak as tts_speak, stop_speaking as tts_stop, is_speaking as tts_is_speaking
 
 # ── Logging ──────────────────────────────────────────────────────────
 
@@ -45,6 +48,9 @@ app.add_middleware(
 
 db = Database()
 context_collector: Optional[ContextCollector] = None
+
+# Voice transcription queue for SSE streaming
+_voice_transcriptions: list[str] = []
 
 # ── Request/Response Models ──────────────────────────────────────────
 
@@ -109,6 +115,9 @@ async def startup():
     if auto_collect == "true":
         context_collector.start()
 
+    # Start reminder scheduler
+    reminder_scheduler.start()
+
     # Auto-load last used model
     model_path = await db.get_setting("model_path")
     if model_path and os.path.exists(model_path):
@@ -125,6 +134,7 @@ async def startup():
 async def shutdown():
     if context_collector:
         context_collector.stop()
+    reminder_scheduler.stop()
     llm_engine.unload_model()
     await db.close()
     logger.info("Libre Bird shut down")
@@ -495,6 +505,145 @@ async def update_setting(setting: SettingUpdate):
             context_collector.pause()
 
     return {"ok": True}
+
+
+# ── Reminders API ────────────────────────────────────────────────────
+
+
+@app.get("/api/reminders")
+async def list_reminders():
+    return reminder_scheduler.list_reminders()
+
+
+@app.delete("/api/reminders/{reminder_id}")
+async def cancel_reminder(reminder_id: str):
+    success = reminder_scheduler.cancel_reminder(reminder_id)
+    if not success:
+        raise HTTPException(404, "Reminder not found or already fired")
+    return {"ok": True, "id": reminder_id}
+
+
+# ── Daily Briefing API ───────────────────────────────────────────────
+
+
+@app.get("/api/briefing")
+async def daily_briefing():
+    """Assemble a morning briefing: weather, pending tasks, yesterday's journal."""
+    from tools import tool_get_weather
+
+    pieces = []
+
+    # Weather (best-effort)
+    try:
+        weather = tool_get_weather("auto")
+        if "error" not in weather:
+            pieces.append(
+                f"🌤 **Weather**: {weather.get('condition', '?')} "
+                f"{weather.get('temp_f', '?')}°F in {weather.get('location', 'your area')}"
+            )
+    except Exception:
+        pass
+
+    # Pending tasks
+    try:
+        tasks = await db.get_tasks(status="pending")
+        if tasks:
+            task_list = "\n".join(f"  • {t['title']}" for t in tasks[:10])
+            pieces.append(f"📋 **Pending tasks** ({len(tasks)}):\n{task_list}")
+        else:
+            pieces.append("✅ **Tasks**: All clear — nothing pending!")
+    except Exception:
+        pass
+
+    # Yesterday's journal
+    try:
+        from datetime import timedelta
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        entry = await db.get_journal_entry(yesterday)
+        if entry:
+            snippet = entry.get("content", "")[:300]
+            pieces.append(f"📓 **Yesterday's journal**: {snippet}")
+    except Exception:
+        pass
+
+    # Active reminders
+    reminders = reminder_scheduler.list_reminders()
+    if reminders:
+        rem_list = "\n".join(
+            f"  ⏰ {r['message']} (in {r['remaining_seconds'] // 60}m)"
+            for r in reminders
+        )
+        pieces.append(f"⏰ **Reminders**:\n{rem_list}")
+
+    return {
+        "briefing": "\n\n".join(pieces)
+        if pieces
+        else "Good morning! Nothing on the radar today."
+    }
+
+
+# ── Voice Input API ──────────────────────────────────────────────────
+
+
+@app.post("/api/voice/start")
+async def start_voice():
+    """Start listening for the 'Hey Libre' wake word."""
+
+    def on_transcription(text: str):
+        _voice_transcriptions.append(text)
+
+    voice_listener.on_transcription = on_transcription
+    success = voice_listener.start()
+    if not success:
+        raise HTTPException(500, "Voice input not available (missing pyaudio or whisper)")
+    return {"ok": True, "status": "listening"}
+
+
+@app.post("/api/voice/stop")
+async def stop_voice():
+    """Stop voice listening."""
+    voice_listener.stop()
+    return {"ok": True, "status": "stopped"}
+
+
+@app.get("/api/voice/status")
+async def voice_status():
+    """Get voice listener status and any pending transcriptions."""
+    transcriptions = list(_voice_transcriptions)
+    _voice_transcriptions.clear()
+    return {
+        "running": voice_listener.is_running,
+        "listening": voice_listener.is_listening,
+        "transcriptions": transcriptions,
+    }
+
+
+# ── Text-to-Speech API ───────────────────────────────────────────────
+
+
+class SpeakRequest(BaseModel):
+    text: str
+    voice: Optional[str] = None
+    rate: int = 190
+
+
+@app.post("/api/tts/speak")
+async def speak_text(req: SpeakRequest):
+    """Speak text aloud using macOS neural voices."""
+    tts_speak(req.text, voice=req.voice, rate=req.rate)
+    return {"ok": True, "status": "speaking"}
+
+
+@app.post("/api/tts/stop")
+async def stop_tts():
+    """Stop any current speech output."""
+    tts_stop()
+    return {"ok": True, "status": "stopped"}
+
+
+@app.get("/api/tts/status")
+async def tts_status():
+    return {"speaking": tts_is_speaking()}
 
 
 # ── Static File Serving (production mode) ────────────────────────────

@@ -69,6 +69,14 @@ def main():
         text_select=True,
     )
 
+    # Start global hotkey listener (⌘+Shift+Space)
+    try:
+        from hotkey import global_hotkey
+        global_hotkey.start()
+        print("⌨️  Global hotkey registered: ⌘+Shift+Space")
+    except Exception as e:
+        print(f"⚠️  Global hotkey unavailable: {e}")
+
     # Start the webview (this blocks until window is closed)
     webview.start(
         debug=False,

@@ -104,7 +104,7 @@ def create_launcher():
     """Create shell launcher script."""
     launcher = f"""#!/bin/bash
 # Libre Bird macOS launcher
-DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+DIR="{PROJECT_DIR}"
 
 # Activate venv and run the app
 cd "$DIR"

@@ -12,6 +12,8 @@ import subprocess
 import webbrowser
 from datetime import datetime, timezone
 
+from notifications import reminder_scheduler
+
 logger = logging.getLogger("libre_bird.tools")
 
 
@@ -133,6 +135,66 @@ TOOL_DEFINITIONS = [
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_reminder",
+            "description": "Set a timed reminder that will show as a macOS notification. Use this when the user says 'remind me', 'in X minutes', 'set a timer', etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The reminder message to display",
+                    },
+                    "minutes": {
+                        "type": "number",
+                        "description": "How many minutes from now to fire the reminder",
+                    },
+                },
+                "required": ["message", "minutes"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clipboard",
+            "description": "Read or write the system clipboard. Use 'read' to see what the user copied, or 'write' to copy text for them.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "'read' to get clipboard contents, 'write' to set clipboard contents",
+                        "enum": ["read", "write"],
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text to copy to clipboard (required when action is 'write')",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_app",
+            "description": "Open (launch) a macOS application by name. Use this when the user asks to open an app, e.g. 'open Spotify' or 'launch Calculator'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The name of the app to open, e.g. 'Safari', 'Calculator', 'Spotify'",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 
@@ -204,8 +266,9 @@ def tool_get_weather(location: str) -> dict:
     try:
         encoded = urllib.parse.quote(location)
         url = f"https://wttr.in/{encoded}?format=j1"
+        logger.info(f"Weather request: {url}")
         req = urllib.request.Request(url, headers={"User-Agent": "LibreBird/1.0"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
 
         current = data.get("current_condition", [{}])[0]
@@ -220,7 +283,8 @@ def tool_get_weather(location: str) -> dict:
             "wind_direction": current.get("winddir16Point", "?"),
         }
     except Exception as e:
-        return {"location": location, "error": f"Could not get weather: {str(e)}"}
+        logger.error(f"Weather tool failed: {type(e).__name__}: {e}")
+        return {"location": location, "error": f"Could not get weather: {type(e).__name__}: {str(e)}"}
 
 
 def tool_open_url(url: str) -> dict:
@@ -322,6 +386,69 @@ def tool_get_system_info() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# New tool implementations: reminders, clipboard, app launcher
+# ---------------------------------------------------------------------------
+
+def tool_set_reminder(message: str, minutes: float) -> dict:
+    """Schedule a reminder notification."""
+    try:
+        if minutes <= 0:
+            return {"error": "Minutes must be positive"}
+        result = reminder_scheduler.schedule_reminder(message, minutes)
+        return {
+            "status": "scheduled",
+            "id": result["id"],
+            "message": message,
+            "fire_at": result["fire_at"],
+            "minutes": minutes,
+        }
+    except Exception as e:
+        return {"error": f"Failed to set reminder: {str(e)}"}
+
+
+def tool_clipboard(action: str, text: str = None) -> dict:
+    """Read from or write to the macOS clipboard using pbpaste/pbcopy."""
+    try:
+        if action == "read":
+            result = subprocess.run(
+                ["pbpaste"], capture_output=True, text=True, timeout=3
+            )
+            content = result.stdout
+            if not content:
+                return {"action": "read", "content": "", "message": "Clipboard is empty"}
+            return {"action": "read", "content": content[:5000]}  # Limit size
+        elif action == "write":
+            if not text:
+                return {"error": "No text provided to write to clipboard"}
+            proc = subprocess.Popen(
+                ["pbcopy"], stdin=subprocess.PIPE, text=True
+            )
+            proc.communicate(input=text, timeout=3)
+            return {"action": "write", "status": "success", "length": len(text)}
+        else:
+            return {"error": f"Unknown action: {action}. Use 'read' or 'write'."}
+    except Exception as e:
+        return {"error": f"Clipboard operation failed: {str(e)}"}
+
+
+def tool_open_app(name: str) -> dict:
+    """Launch a macOS application by name."""
+    try:
+        result = subprocess.run(
+            ["open", "-a", name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return {"app": name, "status": "opened"}
+        else:
+            return {"app": name, "error": f"Could not open: {result.stderr.strip()}"}
+    except Exception as e:
+        return {"app": name, "error": f"Failed to open app: {str(e)}"}
+
+
+# ---------------------------------------------------------------------------
 # Tool dispatcher
 # ---------------------------------------------------------------------------
 
@@ -342,6 +469,13 @@ _TOOL_REGISTRY = {
     ),
     "get_system_info": lambda args: tool_get_system_info(),
     "read_screen": lambda args: _read_screen(),
+    "set_reminder": lambda args: tool_set_reminder(
+        args.get("message", "Reminder"), args.get("minutes", 1)
+    ),
+    "clipboard": lambda args: tool_clipboard(
+        args.get("action", "read"), args.get("text")
+    ),
+    "open_app": lambda args: tool_open_app(args.get("name", "")),
 }
 
 

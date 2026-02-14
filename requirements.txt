@@ -11,3 +11,6 @@ duckduckgo-search==8.1.1
 ddgs==9.10.0
 pywebview==6.1
 pyobjc-framework-Vision==10.3.1
+pynput==1.7.7
+rumps==0.4.0
+openai-whisper==20240930

@@ -1,15 +1,19 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Libre Bird — Your Private AI Assistant</title>
-    <meta name="description" content="Free, offline, privacy-first AI assistant powered by local LLMs. A Little Bird alternative that keeps all your data on your Mac." />
+    <meta name="description"
+        content="Free, offline, privacy-first AI assistant powered by local LLMs. A Little Bird alternative that keeps all your data on your Mac." />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap"
+        rel="stylesheet" />
     <link rel="stylesheet" href="./index.css" />
 </head>
+
 <body>
     <div id="app">
         <!-- Sidebar -->
@@ -24,29 +28,35 @@
 
             <nav class="nav">
                 <button class="nav-item active" data-view="chat" id="nav-chat">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
                         <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
                     </svg>
                     <span>Chat</span>
                 </button>
                 <button class="nav-item" data-view="journal" id="nav-journal">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
                         <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
                         <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
                     </svg>
                     <span>Journal</span>
                 </button>
                 <button class="nav-item" data-view="tasks" id="nav-tasks">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
                         <polyline points="9 11 12 14 22 4"></polyline>
                         <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path>
                     </svg>
                     <span>Tasks</span>
                 </button>
                 <button class="nav-item" data-view="settings" id="nav-settings">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
                         <circle cx="12" cy="12" r="3"></circle>
-                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                        <path
+                            d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z">
+                        </path>
                     </svg>
                     <span>Settings</span>
                 </button>
@@ -57,7 +67,8 @@
                 <div class="conversations-header">
                     <h3>Conversations</h3>
                     <button class="btn-icon" id="new-chat-btn" title="New Conversation">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <line x1="12" y1="5" x2="12" y2="19"></line>
                             <line x1="5" y1="12" x2="19" y2="12"></line>
                         </svg>
@@ -86,7 +97,8 @@
                         <div class="welcome-message">
                             <div class="welcome-icon">🕊️</div>
                             <h1>Welcome to Libre Bird</h1>
-                            <p>Your free, offline, privacy-first AI assistant.<br/>All data stays on your Mac. Always.</p>
+                            <p>Your free, offline, privacy-first AI assistant.<br />All data stays on your Mac. Always.
+                            </p>
                             <div class="welcome-tips">
                                 <div class="tip-card">
                                     <span class="tip-icon">💬</span>
@@ -106,7 +118,8 @@
                     <div class="chat-input-area">
                         <div class="context-toggle" id="context-toggle">
                             <button class="context-btn active" id="context-btn" title="Include screen context">
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                                     <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
                                     <circle cx="12" cy="12" r="3"></circle>
                                 </svg>
@@ -115,8 +128,19 @@
                         </div>
                         <div class="input-wrapper">
                             <textarea id="chat-input" placeholder="Message Libre Bird..." rows="1"></textarea>
+                            <button class="mic-btn" id="mic-btn" title="Voice input (Hey Libre)">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                                    <line x1="12" y1="19" x2="12" y2="23"></line>
+                                    <line x1="8" y1="23" x2="16" y2="23"></line>
+                                </svg>
+                                <span class="mic-pulse" id="mic-pulse"></span>
+                            </button>
                             <button class="send-btn" id="send-btn" title="Send message">
-                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                                     <line x1="22" y1="2" x2="11" y2="13"></line>
                                     <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
                                 </svg>
@@ -131,7 +155,8 @@
                 <div class="view-header">
                     <h2>Daily Journal</h2>
                     <button class="btn-primary" id="generate-journal-btn">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
                         </svg>
                         Generate Today's Journal
@@ -151,7 +176,8 @@
                 <div class="view-header">
                     <h2>Tasks</h2>
                     <button class="btn-primary" id="add-task-btn">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <line x1="12" y1="5" x2="12" y2="19"></line>
                             <line x1="5" y1="12" x2="19" y2="12"></line>
                         </svg>
@@ -192,7 +218,8 @@
                             <div class="setting-row">
                                 <div class="setting-info">
                                     <label>Available Models</label>
-                                    <span class="setting-hint">Place GGUF files in the <code>models/</code> folder</span>
+                                    <span class="setting-hint">Place GGUF files in the <code>models/</code>
+                                        folder</span>
                                 </div>
                             </div>
                             <div class="models-list" id="models-list">
@@ -222,7 +249,8 @@
                                     <label>Temperature</label>
                                     <span class="setting-hint">Lower = more precise, Higher = more creative</span>
                                 </div>
-                                <input type="range" id="setting-temperature" min="0" max="1.5" step="0.1" value="0.7" class="setting-range" />
+                                <input type="range" id="setting-temperature" min="0" max="1.5" step="0.1" value="0.7"
+                                    class="setting-range" />
                                 <span class="range-value" id="temp-value">0.7</span>
                             </div>
                             <div class="setting-row">
@@ -246,7 +274,8 @@
                             <div class="setting-row">
                                 <div class="setting-info">
                                     <label>Context Collection</label>
-                                    <span class="setting-hint">Captures your active window info for smart assistance</span>
+                                    <span class="setting-hint">Captures your active window info for smart
+                                        assistance</span>
                                 </div>
                                 <label class="toggle">
                                     <input type="checkbox" id="setting-context-enabled" checked />
@@ -276,7 +305,8 @@
                                 <span class="privacy-icon">🛡️</span>
                                 <div>
                                     <strong>100% Offline & Private</strong>
-                                    <p>All data is stored locally in <code>libre_bird.db</code>. No network requests. No telemetry. No cloud.</p>
+                                    <p>All data is stored locally in <code>libre_bird.db</code>. No network requests. No
+                                        telemetry. No cloud.</p>
                                 </div>
                             </div>
                         </div>
@@ -320,4 +350,5 @@
 
     <script type="module" src="./main.js"></script>
 </body>
+
 </html>
