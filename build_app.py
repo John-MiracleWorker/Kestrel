@@ -8,7 +8,7 @@ import sys
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_NAME = "Libre Bird"
-APP_DIR = os.path.join(PROJECT_DIR, f"{APP_NAME}.app")
+APP_DIR = os.path.join(os.path.expanduser("~"), "Desktop", f"{APP_NAME}.app")
 CONTENTS = os.path.join(APP_DIR, "Contents")
 MACOS = os.path.join(CONTENTS, "MacOS")
 RESOURCES = os.path.join(CONTENTS, "Resources")

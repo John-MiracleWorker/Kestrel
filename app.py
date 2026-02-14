@@ -80,7 +80,7 @@ def main():
     # Start the webview (this blocks until window is closed)
     webview.start(
         debug=False,
-        private_mode=False,
+        private_mode=True,
     )
 
     # Window closed — exit cleanly
