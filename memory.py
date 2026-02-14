@@ -209,30 +209,48 @@ def compress_snapshots(snapshots: list[dict], max_entries: int = 15) -> str:
 async def retrieve_context(db, message: str) -> str:
     """
     Search historical context snapshots relevant to the user's question.
+    Falls back to long-term memories if no recent snapshots match.
     Returns a compressed, token-efficient summary string.
     """
     results = []
 
-    # 1. Try time-range search
+    # 1. Try time-range search on recent snapshots
     start, end = extract_time_range(message)
     if start and end:
         results = await db.get_context_for_timerange(start, end, limit=50)
 
-    # 2. Try FTS keyword search
+    # 2. Try FTS keyword search on snapshots
     terms = extract_search_terms(message)
     if terms:
         try:
             fts_results = await db.search_context(terms, limit=30)
-            # Merge, avoiding duplicates by id
             seen_ids = {r["id"] for r in results}
             for r in fts_results:
                 if r["id"] not in seen_ids:
                     results.append(r)
         except Exception:
-            pass  # FTS query syntax error — skip
+            pass
 
-    # 3. If nothing found, return empty — let the model say "I don't know"
-    if not results:
-        return ""
+    # 3. If snapshots found, return compressed version
+    if results:
+        return compress_snapshots(results)
 
-    return compress_snapshots(results)
+    # 4. Fallback: search long-term memories
+    if terms:
+        try:
+            memories = await db.search_memories(terms, limit=10)
+            if memories:
+                lines = []
+                for mem in memories:
+                    d = mem.get("memory_date", "?")
+                    summary = mem.get("summary", "")
+                    # Compact format: date + first ~200 chars of summary
+                    preview = summary[:200].replace("\n", " | ")
+                    lines.append(f"[{d}] {preview}")
+                return "Long-term memories:\n" + "\n".join(lines)
+        except Exception:
+            pass
+
+    # 5. Nothing found — let the model say "I don't know"
+    return ""
+

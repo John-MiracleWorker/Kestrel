@@ -1,6 +1,8 @@
 """
 Libre Bird — SQLite storage layer with FTS5 full-text search.
 All data stays local. Zero cloud. Zero telemetry.
+Data retention: old context snapshots are condensed into searchable
+memory summaries, then pruned to keep the DB lean.
 """
 
 import aiosqlite
@@ -114,6 +116,29 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
             CREATE INDEX IF NOT EXISTS idx_journal_date ON journal_entries(entry_date);
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+
+            -- Long-term memories (condensed from old context snapshots)
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_date TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                app_names TEXT,  -- comma-separated list of apps used
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memories_date ON memories(memory_date);
+
+            -- FTS5 for searching memories
+            CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                summary, app_names,
+                content=memories,
+                content_rowid=id
+            );
+
+            CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+                INSERT INTO memories_fts(rowid, summary, app_names)
+                VALUES (new.id, new.summary, new.app_names);
+            END;
         """)
         await self._db.commit()
 
@@ -314,3 +339,161 @@ class Database:
     async def delete_task(self, task_id: int):
         await self._db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         await self._db.commit()
+
+    # ── Long-term Memories ───────────────────────────────────────────
+
+    async def save_memory(self, memory_date: str, summary: str,
+                          app_names: str = None):
+        """Save a condensed daily memory."""
+        await self._db.execute(
+            """INSERT OR REPLACE INTO memories (memory_date, summary, app_names)
+               VALUES (?, ?, ?)""",
+            (memory_date, summary, app_names),
+        )
+        await self._db.commit()
+
+    async def search_memories(self, query: str, limit: int = 10) -> list:
+        """Search long-term memories using FTS5."""
+        try:
+            cursor = await self._db.execute(
+                """SELECT m.* FROM memories m
+                   JOIN memories_fts ON m.id = memories_fts.rowid
+                   WHERE memories_fts MATCH ?
+                   ORDER BY rank LIMIT ?""",
+                (query, limit),
+            )
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+    async def get_memories_for_date(self, d: str) -> list:
+        """Get memories for a specific date."""
+        cursor = await self._db.execute(
+            "SELECT * FROM memories WHERE memory_date = ?", (d,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def cleanup(self, context_days: int = 7, task_days: int = 30) -> dict:
+        """
+        Auto-prune old data to keep the database lean.
+        1. Condense old context snapshots into daily memory summaries
+        2. Delete the raw snapshots (keeping referenced ones)
+        3. Purge old completed tasks
+        4. Rebuild FTS + VACUUM
+        """
+        import logging
+        logger = logging.getLogger("libre_bird.db")
+
+        # Allow overriding retention via settings
+        ctx_override = await self.get_setting("retention_context_days")
+        if ctx_override:
+            context_days = int(ctx_override)
+        task_override = await self.get_setting("retention_task_days")
+        if task_override:
+            task_days = int(task_override)
+
+        stats = {"context_deleted": 0, "tasks_deleted": 0, "memories_created": 0}
+
+        # ── Step 1: Condense old snapshots into daily memories ──────
+        # Find all distinct dates that have snapshots older than retention
+        cutoff = f"-{context_days} days"
+        cursor = await self._db.execute(
+            """SELECT DISTINCT date(timestamp) as snap_date
+               FROM context_snapshots
+               WHERE timestamp < datetime('now', 'localtime', ?)
+               ORDER BY snap_date""",
+            (cutoff,),
+        )
+        old_dates = [row[0] for row in await cursor.fetchall()]
+
+        for snap_date in old_dates:
+            # Check if we already have a memory for this date
+            existing = await self.get_memories_for_date(snap_date)
+            if existing:
+                continue  # Already condensed
+
+            # Get all snapshots for that day
+            snapshots = await self.get_context_for_date(snap_date)
+            if not snapshots:
+                continue
+
+            # Condense into a compact daily summary
+            apps_seen = {}  # app_name -> set of window titles
+            for snap in snapshots:
+                app = snap.get("app_name", "Unknown")
+                window = snap.get("window_title", "")
+                if app not in apps_seen:
+                    apps_seen[app] = set()
+                if window:
+                    apps_seen[app].add(window)
+
+            # Build summary lines
+            lines = []
+            for app, windows in sorted(apps_seen.items()):
+                if windows:
+                    # Keep up to 5 unique windows per app
+                    w_list = sorted(windows)[:5]
+                    extra = f" (+{len(windows) - 5} more)" if len(windows) > 5 else ""
+                    lines.append(f"{app}: {', '.join(w_list)}{extra}")
+                else:
+                    lines.append(app)
+
+            summary = "\n".join(lines[:30])  # Cap at 30 lines
+            app_names = ", ".join(sorted(apps_seen.keys()))
+
+            await self.save_memory(snap_date, summary, app_names)
+            stats["memories_created"] += 1
+
+        # ── Step 2: Purge old context snapshots ────────────────────
+        cursor = await self._db.execute(
+            """DELETE FROM context_snapshots
+               WHERE timestamp < datetime('now', 'localtime', ?)
+               AND id NOT IN (
+                   SELECT DISTINCT context_snapshot_id FROM messages
+                   WHERE context_snapshot_id IS NOT NULL
+               )""",
+            (cutoff,),
+        )
+        stats["context_deleted"] = cursor.rowcount
+        await self._db.commit()
+
+        # ── Step 3: Purge old completed/dismissed tasks ────────────
+        cursor = await self._db.execute(
+            """DELETE FROM tasks
+               WHERE status IN ('done', 'dismissed')
+               AND completed_at < datetime('now', 'localtime', ?)""",
+            (f"-{task_days} days",),
+        )
+        stats["tasks_deleted"] = cursor.rowcount
+        await self._db.commit()
+
+        # ── Step 4: Rebuild FTS indexes ────────────────────────────
+        for fts_table in ["context_fts", "memories_fts"]:
+            try:
+                await self._db.execute(
+                    f"INSERT INTO {fts_table}({fts_table}) VALUES('rebuild')"
+                )
+                await self._db.commit()
+            except Exception:
+                pass
+
+        # ── Step 5: Reclaim disk space ─────────────────────────────
+        try:
+            await self._db.execute("VACUUM")
+        except Exception:
+            pass
+
+        total = stats["context_deleted"] + stats["tasks_deleted"]
+        if total > 0 or stats["memories_created"] > 0:
+            logger.info(
+                f"🧹 Cleanup: condensed {stats['memories_created']} days into memories, "
+                f"removed {stats['context_deleted']} old snapshots, "
+                f"{stats['tasks_deleted']} old tasks"
+            )
+        else:
+            logger.info("🧹 Cleanup: nothing to prune")
+
+        return stats
+

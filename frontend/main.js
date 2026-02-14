@@ -812,27 +812,32 @@ function setupVoice() {
     if (!micBtn) return;
 
     micBtn.addEventListener('click', toggleVoice);
+
+    // Auto-start polling — voice listener runs in the background on the server
+    state.voiceActive = true;
+    micBtn.classList.add('active');
+    state.voicePolling = setInterval(pollVoice, 1200);
 }
 
 async function toggleVoice() {
     const micBtn = document.getElementById('mic-btn');
     if (state.voiceActive) {
-        // Stop listening
+        // Manually stop the always-on listener
         try { await api.post('/api/voice/stop'); } catch (e) { /* ignore */ }
         state.voiceActive = false;
         micBtn.classList.remove('active');
+        micBtn.classList.remove('listening');
         if (state.voicePolling) {
             clearInterval(state.voicePolling);
             state.voicePolling = null;
         }
     } else {
-        // Start listening
+        // Re-enable the listener
         try {
             await api.post('/api/voice/start');
             state.voiceActive = true;
             micBtn.classList.add('active');
-            // Poll for transcriptions
-            state.voicePolling = setInterval(pollVoice, 800);
+            state.voicePolling = setInterval(pollVoice, 1200);
         } catch (e) {
             console.error('Voice start failed:', e);
         }
@@ -842,27 +847,32 @@ async function toggleVoice() {
 async function pollVoice() {
     try {
         const res = await api.get('/api/voice/status');
+        // Handle transcriptions (strings from the server)
         if (res.transcriptions && res.transcriptions.length > 0) {
             const input = document.getElementById('chat-input');
-            // Append the latest transcription to the input
-            const latest = res.transcriptions[res.transcriptions.length - 1];
-            if (latest && latest.text) {
-                const text = latest.text.trim();
-                if (text) {
-                    input.value = (input.value ? input.value + ' ' : '') + text;
+            for (const text of res.transcriptions) {
+                const trimmed = (typeof text === 'string' ? text : text.text || '').trim();
+                if (trimmed) {
+                    input.value = (input.value ? input.value + ' ' : '') + trimmed;
                     input.dispatchEvent(new Event('input'));
                 }
             }
         }
         // Update mic button visual state
         const micBtn = document.getElementById('mic-btn');
-        if (res.listening) {
-            micBtn.classList.add('listening');
-        } else {
-            micBtn.classList.remove('listening');
+        if (micBtn) {
+            if (res.listening) {
+                micBtn.classList.add('listening');
+            } else {
+                micBtn.classList.remove('listening');
+            }
+            // Show running state
+            if (res.running) {
+                micBtn.classList.add('active');
+            }
         }
     } catch (e) {
-        // Server might be down, stop polling
+        // Server might be down, ignore
         console.warn('Voice poll error:', e);
     }
 }

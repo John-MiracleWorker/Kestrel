@@ -8,12 +8,27 @@ All audio is processed locally — nothing is sent to any server.
 import io
 import logging
 import struct
+import subprocess
 import threading
 import time
 import wave
 from typing import Callable, Optional
 
 logger = logging.getLogger("libre_bird.voice")
+
+
+def bring_to_front():
+    """Bring the Libre Bird window to the front using macOS AppleScript."""
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to set frontmost of '
+             'first process whose name contains "Python" to true'],
+            capture_output=True, timeout=3,
+        )
+        logger.info("Brought Libre Bird to front")
+    except Exception as e:
+        logger.warning(f"Could not bring window to front: {e}")
 
 # Try to import audio dependencies
 AUDIO_AVAILABLE = False
@@ -72,6 +87,7 @@ class VoiceListener:
         on_wake: Callable = None,
         on_transcription: Callable[[str], None] = None,
         on_status: Callable[[str], None] = None,
+        auto_focus: bool = True,
     ):
         self._model_path = model_path
         self._model = None
@@ -80,6 +96,11 @@ class VoiceListener:
         self._running = False
         self._listening = False
         self._thread: Optional[threading.Thread] = None
+        self._auto_focus = auto_focus
+
+        # Thread-safe transcription storage
+        self._transcriptions: list[str] = []
+        self._lock = threading.Lock()
 
         # Callbacks
         self.on_wake = on_wake  # Called when wake word is detected
@@ -94,6 +115,13 @@ class VoiceListener:
     def is_listening(self) -> bool:
         return self._listening
 
+    def get_transcriptions(self) -> list[str]:
+        """Get and clear all pending transcriptions (thread-safe)."""
+        with self._lock:
+            result = list(self._transcriptions)
+            self._transcriptions.clear()
+        return result
+
     def start(self):
         """Start the voice listener in a background thread."""
         if not AUDIO_AVAILABLE:
@@ -106,7 +134,7 @@ class VoiceListener:
         self._running = True
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        logger.info("Voice listener started (wake word: 'Hey Libre')")
+        logger.info("🎙️  Always-on voice listener started (wake word: 'Hey Libre')")
         return True
 
     def stop(self):
@@ -285,9 +313,13 @@ class VoiceListener:
                 text = self._transcribe(audio_chunk).lower()
 
                 if WAKE_WORD in text:
-                    logger.info("Wake word detected!")
+                    logger.info("🎤 Wake word detected!")
                     self._listening = True
                     self._emit_status("wake_word_detected")
+
+                    # Bring Libre Bird to front
+                    if self._auto_focus:
+                        bring_to_front()
 
                     if self.on_wake:
                         self.on_wake()
@@ -305,6 +337,10 @@ class VoiceListener:
 
                     if transcription:
                         logger.info(f"Voice transcription: {transcription}")
+                        # Store internally
+                        with self._lock:
+                            self._transcriptions.append(transcription)
+                        # Also fire callback if set
                         if self.on_transcription:
                             self.on_transcription(transcription)
 

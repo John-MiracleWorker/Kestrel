@@ -118,6 +118,18 @@ async def startup():
     # Start reminder scheduler
     reminder_scheduler.start()
 
+    # Start always-on voice listener
+    try:
+        voice_listener.start()
+    except Exception as e:
+        logger.warning(f"Voice listener auto-start failed: {e}")
+
+    # Run data retention cleanup (condense old snapshots → memories)
+    try:
+        await db.cleanup()
+    except Exception as e:
+        logger.warning(f"Data cleanup failed: {e}")
+
     # Auto-load last used model
     model_path = await db.get_setting("model_path")
     if model_path and os.path.exists(model_path):
@@ -135,6 +147,7 @@ async def shutdown():
     if context_collector:
         context_collector.stop()
     reminder_scheduler.stop()
+    voice_listener.stop()
     llm_engine.unload_model()
     await db.close()
     logger.info("Libre Bird shut down")
@@ -588,11 +601,6 @@ async def daily_briefing():
 @app.post("/api/voice/start")
 async def start_voice():
     """Start listening for the 'Hey Libre' wake word."""
-
-    def on_transcription(text: str):
-        _voice_transcriptions.append(text)
-
-    voice_listener.on_transcription = on_transcription
     success = voice_listener.start()
     if not success:
         raise HTTPException(500, "Voice input not available (missing pyaudio or whisper)")
@@ -609,8 +617,7 @@ async def stop_voice():
 @app.get("/api/voice/status")
 async def voice_status():
     """Get voice listener status and any pending transcriptions."""
-    transcriptions = list(_voice_transcriptions)
-    _voice_transcriptions.clear()
+    transcriptions = voice_listener.get_transcriptions()
     return {
         "running": voice_listener.is_running,
         "listening": voice_listener.is_listening,
