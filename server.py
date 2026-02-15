@@ -494,6 +494,7 @@ async def unload_model():
 
 @app.get("/api/settings")
 async def get_all_settings():
+    gemini_key = await db.get_setting("gemini_api_key", "")
     return {
         "model_path": await db.get_setting("model_path", ""),
         "n_ctx": await db.get_setting("n_ctx", "8192"),
@@ -501,6 +502,8 @@ async def get_all_settings():
         "context_enabled": await db.get_setting("context_enabled", "true"),
         "temperature": await db.get_setting("temperature", "0.7"),
         "max_tokens": await db.get_setting("max_tokens", "2048"),
+        "gemini_api_key": ("****" + gemini_key[-4:]) if len(gemini_key) > 4 else "",
+        "gemini_api_key_set": len(gemini_key) > 0,
     }
 
 
@@ -651,6 +654,14 @@ async def stop_tts():
 @app.get("/api/tts/status")
 async def tts_status():
     return {"speaking": tts_is_speaking()}
+
+
+# ── Generated Images Serving ────────────────────────────────────────
+# Serve images created by the image_generate tool
+_generated_dir = os.path.expanduser("~/Pictures/libre-bird")
+os.makedirs(_generated_dir, exist_ok=True)
+app.mount("/generated", StaticFiles(directory=_generated_dir), name="generated")
+logger.info(f"Serving generated images from {_generated_dir}")
 
 
 # ── Static File Serving (production mode) ────────────────────────────

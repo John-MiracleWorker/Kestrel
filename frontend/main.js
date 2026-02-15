@@ -216,6 +216,8 @@ function setupChat() {
         removeBtn.addEventListener('click', () => {
             state.attachedFile = null;
             document.getElementById('file-attachment').style.display = 'none';
+            const uploadBtn = document.getElementById('upload-btn');
+            if (uploadBtn) uploadBtn.classList.remove('has-file');
         });
     }
 }
@@ -347,17 +349,63 @@ async function sendMessage() {
                                 open_url: '🌐 Opening URL…',
                                 search_files: '📂 Searching files…',
                                 get_system_info: '💻 Getting system info…',
+                                image_generate: '🎨 Generating image (this may take a while)…',
+                                read_url: '📖 Reading webpage…',
+                                read_screen: '👁️ Reading your screen…',
+                                run_code: '⚙️ Running code…',
+                                shell_command: '💻 Running command…',
+                                speak: '🔊 Speaking…',
+                                knowledge_search: '🧠 Searching knowledge…',
+                                knowledge_add: '🧠 Saving to knowledge…',
+                                set_reminder: '⏰ Setting reminder…',
+                                clipboard: '📋 Using clipboard…',
+                                open_app: '📱 Opening app…',
                             };
                             if (!toolIndicator) {
                                 toolIndicator = document.createElement('div');
                                 toolIndicator.className = 'tool-indicator';
+                                toolIndicator._startTime = Date.now();
+
+                                // Spinner
+                                const spinner = document.createElement('div');
+                                spinner.className = 'tool-indicator-spinner';
+                                toolIndicator.appendChild(spinner);
+
+                                // Content wrapper
+                                const content = document.createElement('div');
+                                content.className = 'tool-indicator-content';
+
+                                const label = document.createElement('div');
+                                label.className = 'tool-indicator-label';
+                                content.appendChild(label);
+
+                                const elapsed = document.createElement('div');
+                                elapsed.className = 'tool-indicator-elapsed';
+                                elapsed.textContent = '0s elapsed';
+                                content.appendChild(elapsed);
+
+                                toolIndicator.appendChild(content);
                                 bubble.appendChild(toolIndicator);
+
+                                // Live elapsed timer
+                                toolIndicator._timer = setInterval(() => {
+                                    const secs = Math.floor((Date.now() - toolIndicator._startTime) / 1000);
+                                    if (secs < 60) {
+                                        elapsed.textContent = `${secs}s elapsed`;
+                                    } else {
+                                        const m = Math.floor(secs / 60);
+                                        const s = secs % 60;
+                                        elapsed.textContent = `${m}m ${s.toString().padStart(2, '0')}s elapsed`;
+                                    }
+                                }, 1000);
                             }
-                            toolIndicator.textContent = friendlyNames[toolName] || `🔧 Using ${toolName}…`;
+                            const labelEl = toolIndicator.querySelector('.tool-indicator-label');
+                            if (labelEl) labelEl.textContent = friendlyNames[toolName] || `🔧 Using ${toolName}…`;
                             scrollToBottom();
                         } else if (currentEvent === 'token') {
                             // Remove tool indicator when answer starts
                             if (toolIndicator) {
+                                if (toolIndicator._timer) clearInterval(toolIndicator._timer);
                                 toolIndicator.remove();
                                 toolIndicator = null;
                             }
@@ -462,6 +510,21 @@ function formatMarkdown(text) {
         codeBlocks.push(`<div class="code-block">${langLabel}${copyBtn}<pre><code class="lang-${lang || 'text'}">${escapedCode}</code></pre></div>`);
         return `\x00CODE${idx}\x00`;
     });
+    // Pass 1.5: Detect image paths and convert to inline images
+    // Matches: /Users/.../Pictures/libre-bird/filename.png or /generated/filename.png
+    processed = processed.replace(
+        /(?:\/Users\/[^\s]*\/Pictures\/libre-bird\/|\/generated\/)([a-zA-Z0-9_-]+\.png)/g,
+        (match, filename) => {
+            const idx = codeBlocks.length;
+            codeBlocks.push(
+                `<div class="generated-image-card">` +
+                `<img src="/generated/${filename}" alt="Generated image" class="generated-image" onclick="this.classList.toggle('expanded')" />` +
+                `<div class="generated-image-caption">🎨 Generated image</div>` +
+                `</div>`
+            );
+            return `\x00CODE${idx}\x00`;
+        }
+    );
 
     // Escape HTML in remaining text
     processed = processed.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -902,6 +965,16 @@ async function loadSettings() {
         document.getElementById('setting-context-enabled').checked = state.settings.context_enabled !== 'false';
         document.getElementById('setting-context-interval').value = state.settings.context_interval || '30';
 
+        // Gemini API key status
+        const geminiStatus = document.getElementById('gemini-key-status');
+        if (state.settings.gemini_api_key_set) {
+            geminiStatus.innerHTML = '✅ API key configured (' + state.settings.gemini_api_key + ')';
+            geminiStatus.style.color = 'var(--accent)';
+        } else {
+            geminiStatus.innerHTML = '⚠️ No API key set — image generation will not work';
+            geminiStatus.style.color = 'var(--warning, #f59e0b)';
+        }
+
         // Load models
         await loadModels();
 
@@ -938,6 +1011,34 @@ function setupSettingHandlers() {
     // Context length
     document.getElementById('setting-n-ctx').onchange = (e) => {
         saveSetting('n_ctx', e.target.value);
+    };
+
+    // Gemini API key save
+    document.getElementById('save-gemini-key').onclick = async () => {
+        const keyInput = document.getElementById('setting-gemini-key');
+        const key = keyInput.value.trim();
+        if (!key) return;
+        try {
+            await api.put('/api/settings', { key: 'gemini_api_key', value: key });
+            state.settings.gemini_api_key_set = true;
+            const status = document.getElementById('gemini-key-status');
+            status.innerHTML = '✅ API key saved successfully!';
+            status.style.color = 'var(--accent)';
+            keyInput.value = '';
+            keyInput.placeholder = 'Key saved — enter new key to update';
+        } catch (e) {
+            const status = document.getElementById('gemini-key-status');
+            status.innerHTML = '❌ Failed to save API key';
+            status.style.color = '#ef4444';
+        }
+    };
+
+    // Gemini API key show/hide toggle
+    document.getElementById('toggle-gemini-key').onclick = () => {
+        const keyInput = document.getElementById('setting-gemini-key');
+        const isPassword = keyInput.type === 'password';
+        keyInput.type = isPassword ? 'text' : 'password';
+        document.getElementById('toggle-gemini-key').textContent = isPassword ? '🙈' : '👁';
     };
 }
 
@@ -1142,6 +1243,47 @@ function setupFileDrop() {
         '.swift', '.kt', '.java', '.c', '.cpp', '.h', '.rs', '.go',
         '.rb', '.php', '.r', '.lua', '.conf', '.cfg', '.ini'];
 
+    // Shared file processing logic
+    async function handleFileAttach(file) {
+        const ext = '.' + file.name.split('.').pop().toLowerCase();
+
+        if (!TEXT_EXTENSIONS.includes(ext)) {
+            appendMessage('assistant', `⚠️ **Unsupported file type** (${ext}). I can read text-based files like .txt, .py, .js, .json, .csv, .md, etc.`);
+            return;
+        }
+
+        try {
+            let content = await file.text();
+            const MAX_CHARS = 12000; // ~3000 tokens
+            if (content.length > MAX_CHARS) {
+                content = content.substring(0, MAX_CHARS) + '\n\n[... truncated — file too large ...]';
+            }
+            state.attachedFile = { name: file.name, content, ext };
+            // Show attachment pill
+            document.getElementById('file-attachment').style.display = 'flex';
+            document.getElementById('file-attachment-name').textContent = `📎 ${file.name}`;
+            // Highlight upload button
+            const uploadBtn = document.getElementById('upload-btn');
+            if (uploadBtn) uploadBtn.classList.add('has-file');
+        } catch (err) {
+            appendMessage('assistant', `❌ Could not read file: ${err.message}`);
+        }
+    }
+
+    // ── Upload button click ──────────────────────────────────
+    const uploadBtn = document.getElementById('upload-btn');
+    const fileInput = document.getElementById('file-input');
+    if (uploadBtn && fileInput) {
+        uploadBtn.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', async () => {
+            if (fileInput.files.length > 0) {
+                await handleFileAttach(fileInput.files[0]);
+                fileInput.value = ''; // Reset so same file can be re-selected
+            }
+        });
+    }
+
+    // ── Drag and drop ────────────────────────────────────────
     let dragCounter = 0;
 
     chatContainer.addEventListener('dragenter', (e) => {
@@ -1170,28 +1312,7 @@ function setupFileDrop() {
 
         const files = e.dataTransfer.files;
         if (files.length === 0) return;
-
-        const file = files[0]; // One file at a time
-        const ext = '.' + file.name.split('.').pop().toLowerCase();
-
-        if (!TEXT_EXTENSIONS.includes(ext)) {
-            appendMessage('assistant', `⚠️ **Unsupported file type** (${ext}). I can read text-based files like .txt, .py, .js, .json, .csv, .md, etc.`);
-            return;
-        }
-
-        try {
-            let content = await file.text();
-            const MAX_CHARS = 12000; // ~3000 tokens
-            if (content.length > MAX_CHARS) {
-                content = content.substring(0, MAX_CHARS) + '\n\n[... truncated — file too large ...]';
-            }
-            state.attachedFile = { name: file.name, content, ext };
-            // Show attachment pill
-            document.getElementById('file-attachment').style.display = 'flex';
-            document.getElementById('file-attachment-name').textContent = `📎 ${file.name}`;
-        } catch (err) {
-            appendMessage('assistant', `❌ Could not read file: ${err.message}`);
-        }
+        await handleFileAttach(files[0]);
     });
 }
 

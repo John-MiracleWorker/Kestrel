@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Libre Bird — Native macOS App Launcher
+Libre Bird — macOS App Launcher
 
-Starts the FastAPI backend server and opens a native pywebview window.
+Starts the FastAPI backend server and opens the app in a native macOS window
+using pywebview (WebKit-backed).
 """
-import multiprocessing
 import os
 import signal
 import socket
+import subprocess
 import sys
 import time
 import threading
@@ -57,18 +58,6 @@ def main():
     # Give it a moment to finish initialization
     time.sleep(1)
 
-    # Open native window
-    import webview
-
-    window = webview.create_window(
-        title="Libre Bird",
-        url=URL,
-        width=1200,
-        height=800,
-        min_size=(800, 600),
-        text_select=True,
-    )
-
     # Start global hotkey listener (⌘+Shift+Space)
     try:
         from hotkey import global_hotkey
@@ -77,15 +66,44 @@ def main():
     except Exception as e:
         print(f"⚠️  Global hotkey unavailable: {e}")
 
-    # Start the webview (this blocks until window is closed)
-    webview.start(
-        debug=False,
-        private_mode=True,
-    )
+    # Open in a native macOS window via pywebview
+    try:
+        import webview
 
-    # Window closed — exit cleanly
-    print("👋 Libre Bird closed")
-    os._exit(0)
+        print("🪟 Opening native Libre Bird window...")
+        window = webview.create_window(
+            title="Libre Bird",
+            url=URL,
+            width=1280,
+            height=820,
+            min_size=(800, 500),
+            text_select=True,
+        )
+
+        # When the window is closed, exit the app
+        def on_closed():
+            print("\n👋 Libre Bird closed")
+            os._exit(0)
+
+        window.events.closed += on_closed
+
+        # webview.start() blocks until all windows are closed
+        webview.start()
+
+    except ImportError:
+        # Fallback: open in browser if pywebview is not installed
+        import webbrowser
+        print("⚠️  pywebview not installed — opening in browser instead")
+        print("   Install it with: pip install pywebview")
+        webbrowser.open(URL)
+
+        print("💡 Libre Bird is running. Press Ctrl+C to quit.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n👋 Libre Bird closed")
+            os._exit(0)
 
 
 if __name__ == "__main__":

@@ -143,6 +143,17 @@ def main():
     create_launcher()
     create_iconset()
 
+    # Set the macOS bundle bit so Finder shows it as an app, not a folder
+    result = subprocess.run(["/usr/bin/SetFile", "-a", "B", APP_DIR], capture_output=True)
+    if result.returncode != 0:
+        print(f"⚠ SetFile failed: {result.stderr.decode()}")
+    else:
+        print("✓ Bundle bit set")
+
+    # Force Finder to refresh icon
+    subprocess.run(["touch", APP_DIR], capture_output=True)
+    subprocess.run(["killall", "Finder"], capture_output=True)
+
     print(f"\n✅ {APP_NAME}.app built successfully at:\n   {APP_DIR}")
 
 

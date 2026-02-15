@@ -9,12 +9,35 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 import webbrowser
 from datetime import datetime, timezone
 
 from notifications import reminder_scheduler
 
 logger = logging.getLogger("libre_bird.tools")
+
+
+def _pip_install(package: str) -> bool:
+    """Auto-install a missing Python package into the active venv."""
+    try:
+        logger.info(f"Auto-installing missing package: {package} (this may take a few minutes)...")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", package],
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode == 0:
+            logger.info(f"Successfully installed {package}")
+            return True
+        else:
+            logger.error(f"Failed to install {package}: {result.stderr}")
+            return False
+    except subprocess.TimeoutExpired:
+        logger.error(f"pip install {package} timed out (5 min limit)")
+        return False
+    except Exception as e:
+        logger.error(f"pip install failed: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +218,130 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    # ── New tools ─────────────────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "read_url",
+            "description": "Fetch and extract the main text content from a webpage URL. Use this when the user shares a link and wants you to read it, summarize an article, or get information from a website.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The full URL to fetch, e.g. 'https://example.com/article'",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_code",
+            "description": "Execute a Python code snippet and return the output. Use this for calculations, data processing, generating text, or any task that benefits from running actual code. The code runs in an isolated subprocess.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Python code to execute. Use print() to produce output.",
+                    },
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "shell_command",
+            "description": "Run a shell command on the user's macOS system. Use for safe operations like listing files, checking processes, disk usage, network info, and installing Python packages (pip install). NEVER use for destructive operations (rm, mv, sudo, etc). You CAN and SHOULD use this to install missing Python packages when a tool reports a package is not installed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to run, e.g. 'ls -la ~/Documents' or 'df -h'",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "speak",
+            "description": "Read text aloud using macOS text-to-speech. Use when the user asks you to read something aloud, speak, or when a verbal response would be helpful.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The text to speak aloud",
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "image_generate",
+            "description": "Generate an image from a text description using Google Gemini (Nano Banana Pro). Use when the user asks to create, generate, or draw an image. Requires a Gemini API key in Settings. Takes 5-15 seconds.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Detailed description of the image to generate",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "knowledge_search",
+            "description": "Search the user's local knowledge base for relevant information. Use this when the user asks about something they previously saved, or when you need to recall stored documents, notes, or context.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language search query",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "knowledge_add",
+            "description": "Add a document or text to the user's local knowledge base for future reference. Use when the user asks to remember, save, or store information for later.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The text content to store",
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "A label for where this came from, e.g. 'user note', 'meeting notes', a filename",
+                    },
+                },
+                "required": ["text", "source"],
+            },
+        },
+    },
 ]
 
 
@@ -236,7 +383,9 @@ def tool_web_search(query: str) -> dict:
             ]
         }
     except ImportError:
-        return {"error": "Search package not installed. Run: pip install ddgs"}
+        if _pip_install("ddgs"):
+            return tool_web_search(query)  # retry after install
+        return {"error": "Search package not installed and auto-install failed."}
     except Exception as e:
         return {"error": f"Search failed: {str(e)}"}
 
@@ -449,6 +598,238 @@ def tool_open_app(name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# New tool implementations: URL reader, code exec, shell, TTS, image gen, RAG
+# ---------------------------------------------------------------------------
+
+def tool_read_url(url: str) -> dict:
+    """Fetch and extract clean text from a URL."""
+    try:
+        import trafilatura
+        downloaded = trafilatura.fetch_url(url)
+        if not downloaded:
+            return {"error": f"Could not fetch URL: {url}"}
+        text = trafilatura.extract(downloaded, include_links=False,
+                                   include_images=False, include_tables=True)
+        if not text:
+            return {"error": "Could not extract text content from page"}
+        # Truncate for context window
+        MAX_CHARS = 8000
+        truncated = len(text) > MAX_CHARS
+        if truncated:
+            text = text[:MAX_CHARS] + "\n\n[... truncated — page too long ...]"
+        return {"url": url, "content": text, "truncated": truncated}
+    except ImportError:
+        if _pip_install("trafilatura"):
+            return tool_read_url(url)  # retry after install
+        return {"error": "trafilatura not installed and auto-install failed."}
+    except Exception as e:
+        return {"url": url, "error": f"Failed to read URL: {str(e)}"}
+
+
+def tool_run_code(code: str) -> dict:
+    """Execute Python code in a sandboxed subprocess."""
+    import tempfile, sys
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py',
+                                         delete=False) as f:
+            f.write(code)
+            f.flush()
+            tmppath = f.name
+
+        result = subprocess.run(
+            [sys.executable, tmppath],
+            capture_output=True, text=True, timeout=10,
+            cwd=tempfile.gettempdir(),
+        )
+        os.unlink(tmppath)
+
+        output = result.stdout.strip()
+        errors = result.stderr.strip()
+        return {
+            "output": output or "(no output)",
+            "errors": errors if errors else None,
+            "exit_code": result.returncode,
+        }
+    except subprocess.TimeoutExpired:
+        try:
+            os.unlink(tmppath)
+        except Exception:
+            pass
+        return {"error": "Code execution timed out (10s limit)"}
+    except Exception as e:
+        return {"error": f"Code execution failed: {str(e)}"}
+
+
+# Commands that should NEVER be run via shell_command
+_DANGEROUS_COMMANDS = {
+    "rm", "rmdir", "mv", "dd", "mkfs", "fdisk", "sudo", "su",
+    "chmod", "chown", "kill", "killall", "reboot", "shutdown",
+    "format", "diskutil", "csrutil", "nvram",
+}
+
+
+def tool_shell_command(command: str) -> dict:
+    """Run a shell command (with safety checks)."""
+    # Check for dangerous commands
+    first_word = command.strip().split()[0] if command.strip() else ""
+    if first_word in _DANGEROUS_COMMANDS:
+        return {"error": f"Blocked: '{first_word}' is a destructive command and cannot be run."}
+
+    # Also block piped destructive commands
+    for dangerous in _DANGEROUS_COMMANDS:
+        if f"| {dangerous}" in command or f"|{dangerous}" in command:
+            return {"error": f"Blocked: piping to '{dangerous}' is not allowed."}
+
+    # Use a longer timeout for pip install commands
+    is_pip = "pip install" in command or "pip3 install" in command
+    timeout = 300 if is_pip else 30
+
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True,
+            timeout=timeout, cwd=os.path.expanduser("~"),
+        )
+        output = result.stdout.strip()
+        errors = result.stderr.strip()
+
+        # Truncate long output
+        MAX_CHARS = 6000
+        if len(output) > MAX_CHARS:
+            output = output[:MAX_CHARS] + "\n\n[... truncated ...]"
+
+        return {
+            "output": output or "(no output)",
+            "errors": errors if errors else None,
+            "exit_code": result.returncode,
+        }
+    except subprocess.TimeoutExpired:
+        return {"error": "Command timed out (15s limit)"}
+    except Exception as e:
+        return {"error": f"Command failed: {str(e)}"}
+
+
+def tool_speak(text: str) -> dict:
+    """Speak text aloud using macOS TTS."""
+    try:
+        from tts import speak
+        success = speak(text)
+        return {"status": "speaking" if success else "failed"}
+    except ImportError:
+        return {"error": "TTS module not available"}
+    except Exception as e:
+        return {"error": f"TTS failed: {str(e)}"}
+
+
+def tool_image_generate(prompt: str) -> dict:
+    """Generate an image using Google Gemini Nano Banana Pro."""
+    try:
+        import re, time, asyncio
+
+        # Get Gemini API key from settings
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    api_key = pool.submit(
+                        lambda: asyncio.run(_get_gemini_key())
+                    ).result(timeout=5)
+            else:
+                api_key = loop.run_until_complete(_get_gemini_key())
+        except Exception:
+            api_key = ""
+
+        if not api_key:
+            return {"error": "No Gemini API key configured. Please add your API key in Settings → API Keys."}
+
+        # Ensure google-genai is installed
+        try:
+            from google import genai
+        except ImportError:
+            if _pip_install("google-genai"):
+                from google import genai
+            else:
+                return {"error": "google-genai not installed and auto-install failed."}
+
+        # Output directory
+        output_dir = os.path.expanduser("~/Pictures/libre-bird")
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Generate a filename from the prompt
+        safe_name = re.sub(r'[^a-zA-Z0-9]+', '_', prompt[:50]).strip('_').lower()
+        timestamp = int(time.time())
+        filename = f"{safe_name}_{timestamp}.png"
+        filepath = os.path.join(output_dir, filename)
+
+        logger.info(f"Generating image with Gemini Nano Banana Pro: '{prompt}'")
+
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model="gemini-3-pro-image-preview",
+            contents=prompt,
+            config=genai.types.GenerateContentConfig(
+                response_modalities=["IMAGE", "TEXT"],
+            ),
+        )
+
+        # Extract image from response
+        image_saved = False
+        for part in response.candidates[0].content.parts:
+            if part.inline_data is not None:
+                image = part.as_image()
+                image.save(filepath)
+                image_saved = True
+                break
+
+        if not image_saved:
+            return {"error": "Gemini did not return an image. Try a different prompt."}
+
+        logger.info(f"Image saved: {filepath}")
+
+        return {
+            "status": "generated",
+            "path": filepath,
+            "filename": filename,
+            "url": f"/generated/{filename}",
+            "prompt": prompt,
+        }
+    except Exception as e:
+        logger.error(f"Image generation failed: {e}")
+        return {"error": f"Image generation failed: {str(e)}"}
+
+
+async def _get_gemini_key():
+    """Helper to read the Gemini API key from settings DB."""
+    from database import Database
+    _db = Database()
+    await _db.initialize()
+    key = await _db.get_setting("gemini_api_key", "")
+    return key
+
+
+def tool_knowledge_search(query: str) -> dict:
+    """Search the local knowledge base."""
+    try:
+        from knowledge import search
+        return search(query)
+    except ImportError:
+        return {"error": "Knowledge module not available"}
+    except Exception as e:
+        return {"error": f"Knowledge search failed: {str(e)}"}
+
+
+def tool_knowledge_add(text: str, source: str = "user_input") -> dict:
+    """Add a document to the local knowledge base."""
+    try:
+        from knowledge import add_document
+        return add_document(text, source)
+    except ImportError:
+        return {"error": "Knowledge module not available"}
+    except Exception as e:
+        return {"error": f"Knowledge add failed: {str(e)}"}
+
+
+# ---------------------------------------------------------------------------
 # Tool dispatcher
 # ---------------------------------------------------------------------------
 
@@ -476,6 +857,18 @@ _TOOL_REGISTRY = {
         args.get("action", "read"), args.get("text")
     ),
     "open_app": lambda args: tool_open_app(args.get("name", "")),
+    # ── New tools ─────────────────────────────────────────────────────
+    "read_url": lambda args: tool_read_url(args.get("url", "")),
+    "run_code": lambda args: tool_run_code(args.get("code", "")),
+    "shell_command": lambda args: tool_shell_command(args.get("command", "")),
+    "speak": lambda args: tool_speak(args.get("text", "")),
+    "image_generate": lambda args: tool_image_generate(
+        args.get("prompt", "")
+    ),
+    "knowledge_search": lambda args: tool_knowledge_search(args.get("query", "")),
+    "knowledge_add": lambda args: tool_knowledge_add(
+        args.get("text", ""), args.get("source", "user_input")
+    ),
 }
 
 
