@@ -1138,6 +1138,18 @@ body {
     letter-spacing: 0.02em;
 }
 
+.tool-indicator-step {
+    display: none;
+    font-size: 0.65rem;
+    font-weight: 600;
+    color: var(--accent-primary);
+    background: rgba(88, 166, 255, 0.12);
+    padding: 1px 7px;
+    border-radius: 8px;
+    margin-top: 2px;
+    width: fit-content;
+}
+
 @keyframes toolFadeIn {
     from {
         opacity: 0;

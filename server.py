@@ -247,8 +247,8 @@ async def chat(req: ChatRequest):
                 max_tokens=req.max_tokens,
             ):
                 if tag == "tool":
-                    # Tool being called — send indicator
-                    yield {"event": "tool", "data": json.dumps({"tool": content})}
+                    # Tool being called — send indicator with step info
+                    yield {"event": "tool", "data": content}
                     continue
 
                 # tag == "raw" — stream token with think detection

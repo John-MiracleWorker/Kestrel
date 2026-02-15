@@ -190,7 +190,7 @@ TOOL_DEFINITIONS = [
                     "action": {
                         "type": "string",
                         "description": "'read' to get clipboard contents, 'write' to set clipboard contents",
-                        "enum": ["read", "write"],
+                        "enum": ["read", "write", "history"],
                     },
                     "text": {
                         "type": "string",
@@ -391,6 +391,123 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["text", "source"],
+            },
+        },
+    },
+    # ── Phase 1 Agentic Tools ────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "file_operations",
+            "description": "Perform file system operations. Read, write, list, move, copy, or delete files and folders. Use when the user asks to create, edit, organize, or inspect files. Delete sends to Trash (safe).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read", "write", "append", "list", "move", "copy", "delete", "mkdir", "info"],
+                        "description": "The file operation to perform",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "The file or directory path",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "File content for 'write' or 'append' actions",
+                    },
+                    "destination": {
+                        "type": "string",
+                        "description": "Destination path for 'move' or 'copy' actions",
+                    },
+                },
+                "required": ["action", "path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "keyboard",
+            "description": "Type text or press keys in the active application. Use when the user asks to type something, fill in a form, press a keyboard shortcut, or automate text input.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["type_text", "press_key", "hotkey"],
+                        "description": "'type_text' to type a string, 'press_key' for special keys (return, tab, escape, etc.), 'hotkey' for shortcuts (e.g., cmd+s)",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text to type (for type_text) or key name (for press_key) or shortcut (for hotkey, e.g., 'cmd+s', 'cmd+shift+z')",
+                    },
+                },
+                "required": ["action", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_document",
+            "description": "Read and extract text from documents: PDFs, Word docs (.docx), plain text, Markdown, and CSV files. Use when the user asks to read, summarize, or analyze a document.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the document file",
+                    },
+                    "pages": {
+                        "type": "string",
+                        "description": "Optional page range for PDFs, e.g., '1-5' or '3'. Omit to read all pages.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_notifications",
+            "description": "Read recent macOS notifications or clear notifications for a specific app. Use when the user asks what notifications they have, or wants to check/dismiss alerts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "clear"],
+                        "description": "'list' to get recent notifications, 'clear' to dismiss notifications for an app",
+                    },
+                    "app_name": {
+                        "type": "string",
+                        "description": "App name to filter or clear notifications for (optional for list, required for clear)",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_screen",
+            "description": "Capture and analyze what's currently visible on the user's screen. Uses OCR to extract all visible text and describes the screen layout. Can also analyze a specific image file from disk. Use when the user asks 'what's on my screen?', 'what am I looking at?', 'read my screen', or wants you to analyze/describe an image.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to look for or focus on (e.g., 'error messages', 'the code', 'the email'). Optional — omit for general analysis.",
+                    },
+                    "image_path": {
+                        "type": "string",
+                        "description": "Optional path to an image file on disk to analyze instead of capturing the screen.",
+                    },
+                },
+                "required": [],
             },
         },
     },
@@ -608,7 +725,7 @@ def tool_set_reminder(message: str, minutes: float) -> dict:
 
 
 def tool_clipboard(action: str, text: str = None) -> dict:
-    """Read from or write to the macOS clipboard using pbpaste/pbcopy."""
+    """Read from or write to the macOS clipboard using pbpaste/pbcopy. Supports history."""
     try:
         if action == "read":
             result = subprocess.run(
@@ -617,7 +734,14 @@ def tool_clipboard(action: str, text: str = None) -> dict:
             content = result.stdout
             if not content:
                 return {"action": "read", "content": "", "message": "Clipboard is empty"}
-            return {"action": "read", "content": content[:5000]}  # Limit size
+            # Store in history
+            _clipboard_history.insert(0, {
+                "content": content[:2000],
+                "time": datetime.now().strftime("%H:%M:%S"),
+            })
+            if len(_clipboard_history) > 20:
+                _clipboard_history.pop()
+            return {"action": "read", "content": content[:5000]}
         elif action == "write":
             if not text:
                 return {"error": "No text provided to write to clipboard"}
@@ -626,8 +750,12 @@ def tool_clipboard(action: str, text: str = None) -> dict:
             )
             proc.communicate(input=text, timeout=3)
             return {"action": "write", "status": "success", "length": len(text)}
+        elif action == "history":
+            if not _clipboard_history:
+                return {"action": "history", "count": 0, "entries": [], "message": "No clipboard history yet"}
+            return {"action": "history", "count": len(_clipboard_history), "entries": _clipboard_history}
         else:
-            return {"error": f"Unknown action: {action}. Use 'read' or 'write'."}
+            return {"error": f"Unknown action: {action}. Use 'read', 'write', or 'history'."}
     except Exception as e:
         return {"error": f"Clipboard operation failed: {str(e)}"}
 
@@ -1281,6 +1409,399 @@ end tell'''
         return {"error": f"Music control failed: {str(e)}"}
 
 
+# ---------------------------------------------------------------------------
+# Phase 1 Agentic Tools
+# ---------------------------------------------------------------------------
+
+# Clipboard history (in-memory, shared with tool_clipboard)
+_clipboard_history: list[dict] = []
+
+
+def tool_file_operations(action: str, path: str, content: str = None, destination: str = None) -> dict:
+    """Perform file system operations with safety checks."""
+    try:
+        # Expand ~ and resolve path
+        path = os.path.expanduser(path)
+
+        # Safety: restrict to $HOME
+        home = os.path.expanduser("~")
+        if not os.path.abspath(path).startswith(home):
+            return {"error": f"Access denied: path must be within {home}"}
+
+        if action == "read":
+            if not os.path.isfile(path):
+                return {"error": f"File not found: {path}"}
+            size = os.path.getsize(path)
+            if size > 1_000_000:  # 1MB limit
+                return {"error": f"File too large ({size} bytes). Max 1MB for text reading."}
+            with open(path, "r", errors="replace") as f:
+                text = f.read()
+            return {"action": "read", "path": path, "size": len(text), "content": text[:50000]}
+
+        elif action == "write":
+            if not content:
+                return {"error": "No content provided for write"}
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(content)
+            return {"action": "write", "path": path, "size": len(content)}
+
+        elif action == "append":
+            if not content:
+                return {"error": "No content provided for append"}
+            with open(path, "a") as f:
+                f.write(content)
+            return {"action": "append", "path": path, "added": len(content)}
+
+        elif action == "list":
+            if not os.path.isdir(path):
+                return {"error": f"Not a directory: {path}"}
+            entries = []
+            for entry in sorted(os.listdir(path)):
+                full = os.path.join(path, entry)
+                try:
+                    stat = os.stat(full)
+                    entries.append({
+                        "name": entry,
+                        "type": "dir" if os.path.isdir(full) else "file",
+                        "size": stat.st_size,
+                        "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                    })
+                except OSError:
+                    entries.append({"name": entry, "type": "unknown"})
+            return {"action": "list", "path": path, "count": len(entries), "entries": entries[:100]}
+
+        elif action == "move":
+            if not destination:
+                return {"error": "No destination provided for move"}
+            destination = os.path.expanduser(destination)
+            shutil.move(path, destination)
+            return {"action": "move", "from": path, "to": destination}
+
+        elif action == "copy":
+            if not destination:
+                return {"error": "No destination provided for copy"}
+            destination = os.path.expanduser(destination)
+            if os.path.isdir(path):
+                shutil.copytree(path, destination)
+            else:
+                shutil.copy2(path, destination)
+            return {"action": "copy", "from": path, "to": destination}
+
+        elif action == "delete":
+            # Safe delete: move to Trash via AppleScript
+            if not os.path.exists(path):
+                return {"error": f"Path not found: {path}"}
+            escaped = path.replace('"', '\\"')
+            script = f'''
+            tell application "Finder"
+                delete POSIX file "{escaped}"
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
+            return {"action": "delete", "path": path, "method": "moved_to_trash"}
+
+        elif action == "mkdir":
+            os.makedirs(path, exist_ok=True)
+            return {"action": "mkdir", "path": path}
+
+        elif action == "info":
+            if not os.path.exists(path):
+                return {"error": f"Path not found: {path}"}
+            stat = os.stat(path)
+            return {
+                "action": "info",
+                "path": path,
+                "exists": True,
+                "type": "directory" if os.path.isdir(path) else "file",
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                "created": datetime.fromtimestamp(stat.st_birthtime).isoformat() if hasattr(stat, "st_birthtime") else None,
+                "extension": os.path.splitext(path)[1] if os.path.isfile(path) else None,
+            }
+
+        else:
+            return {"error": f"Unknown action: {action}"}
+
+    except Exception as e:
+        logger.error(f"File operation failed: {e}")
+        return {"error": f"File operation failed: {str(e)}"}
+
+
+def tool_keyboard(action: str, text: str) -> dict:
+    """Type text or press keys in the active application via AppleScript."""
+    try:
+        if action == "type_text":
+            # Escape for AppleScript string
+            safe = text.replace("\\", "\\\\").replace('"', '\\"')
+            script = f'''
+            tell application "System Events"
+                keystroke "{safe}"
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
+            return {"action": "type_text", "typed": len(text)}
+
+        elif action == "press_key":
+            # Map friendly names to key codes
+            key_map = {
+                "return": 36, "enter": 36, "tab": 48, "escape": 53, "esc": 53,
+                "space": 49, "delete": 51, "backspace": 51, "forward_delete": 117,
+                "up": 126, "down": 125, "left": 123, "right": 124,
+                "home": 115, "end": 119, "page_up": 116, "page_down": 121,
+                "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96,
+                "f6": 97, "f7": 98, "f8": 100, "f9": 101, "f10": 109,
+                "f11": 103, "f12": 111,
+            }
+            key_code = key_map.get(text.lower())
+            if key_code is None:
+                return {"error": f"Unknown key: {text}. Available: {', '.join(key_map.keys())}"}
+            script = f'''
+            tell application "System Events"
+                key code {key_code}
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
+            return {"action": "press_key", "key": text}
+
+        elif action == "hotkey":
+            # Parse shortcut like "cmd+s", "cmd+shift+z"
+            parts = [p.strip().lower() for p in text.split("+")]
+            key_char = parts[-1]
+            modifiers = parts[:-1]
+
+            modifier_map = {
+                "cmd": "command down", "command": "command down",
+                "ctrl": "control down", "control": "control down",
+                "alt": "option down", "option": "option down",
+                "shift": "shift down",
+            }
+
+            mod_list = []
+            for m in modifiers:
+                mapped = modifier_map.get(m)
+                if mapped:
+                    mod_list.append(mapped)
+
+            if not mod_list:
+                return {"error": f"No valid modifiers in '{text}'. Use cmd, ctrl, alt, shift."}
+
+            mods = ", ".join(mod_list)
+            script = f'''
+            tell application "System Events"
+                keystroke "{key_char}" using {{{mods}}}
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
+            return {"action": "hotkey", "shortcut": text}
+
+        else:
+            return {"error": f"Unknown action: {action}. Use type_text, press_key, or hotkey."}
+
+    except Exception as e:
+        logger.error(f"Keyboard action failed: {e}")
+        return {"error": f"Keyboard action failed: {str(e)}"}
+
+
+def tool_read_document(path: str, pages: str = None) -> dict:
+    """Read and extract text from documents (PDF, Word, text, Markdown, CSV)."""
+    try:
+        path = os.path.expanduser(path)
+        if not os.path.isfile(path):
+            return {"error": f"File not found: {path}"}
+
+        ext = os.path.splitext(path)[1].lower()
+        file_size = os.path.getsize(path)
+
+        # PDF
+        if ext == ".pdf":
+            try:
+                import PyPDF2
+            except ImportError:
+                if _pip_install("PyPDF2"):
+                    import PyPDF2
+                else:
+                    return {"error": "PyPDF2 not installed and auto-install failed"}
+
+            with open(path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                total_pages = len(reader.pages)
+
+                # Parse page range
+                start_page, end_page = 0, total_pages
+                if pages:
+                    if "-" in pages:
+                        parts = pages.split("-")
+                        start_page = max(0, int(parts[0]) - 1)
+                        end_page = min(total_pages, int(parts[1]))
+                    else:
+                        start_page = max(0, int(pages) - 1)
+                        end_page = start_page + 1
+
+                text_parts = []
+                for i in range(start_page, end_page):
+                    page_text = reader.pages[i].extract_text() or ""
+                    text_parts.append(f"--- Page {i + 1} ---\n{page_text}")
+
+                text = "\n\n".join(text_parts)
+
+            return {
+                "type": "pdf",
+                "path": path,
+                "total_pages": total_pages,
+                "pages_read": f"{start_page + 1}-{end_page}",
+                "content": text[:50000],
+            }
+
+        # Word documents
+        elif ext == ".docx":
+            try:
+                import docx
+            except ImportError:
+                if _pip_install("python-docx"):
+                    import docx
+                else:
+                    return {"error": "python-docx not installed and auto-install failed"}
+
+            doc = docx.Document(path)
+            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+            text = "\n\n".join(paragraphs)
+            return {
+                "type": "docx",
+                "path": path,
+                "paragraphs": len(paragraphs),
+                "content": text[:50000],
+            }
+
+        # Plain text, Markdown, CSV, JSON, etc.
+        elif ext in {".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml", ".log", ".ini", ".conf", ".cfg", ".html", ".htm", ".rtf"}:
+            if file_size > 2_000_000:
+                return {"error": f"File too large ({file_size} bytes). Max 2MB."}
+            with open(path, "r", errors="replace") as f:
+                text = f.read()
+            return {
+                "type": ext.lstrip("."),
+                "path": path,
+                "size": file_size,
+                "content": text[:50000],
+            }
+
+        else:
+            return {"error": f"Unsupported file type: {ext}. Supported: .pdf, .docx, .txt, .md, .csv, .json, .xml, .yaml, .log, .html"}
+
+    except Exception as e:
+        logger.error(f"Document read failed: {e}")
+        return {"error": f"Document read failed: {str(e)}"}
+
+
+def tool_read_notifications(action: str, app_name: str = None) -> dict:
+    """Read or clear macOS notifications."""
+    try:
+        if action == "list":
+            # Try AppleScript approach first
+            script = '''
+            tell application "System Events"
+                set notifList to {}
+                try
+                    tell process "NotificationCenter"
+                        set theWindows to every window
+                        repeat with w in theWindows
+                            try
+                                set notifTitle to value of static text 1 of w
+                                set notifBody to ""
+                                try
+                                    set notifBody to value of static text 2 of w
+                                end try
+                                set end of notifList to notifTitle & " | " & notifBody
+                            end try
+                        end repeat
+                    end tell
+                end try
+            end tell
+            if (count of notifList) is 0 then
+                return "NO_NOTIFICATIONS"
+            end if
+            set AppleScript's text item delimiters to "|||"
+            return notifList as text
+            '''
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=10
+            )
+
+            if result.returncode == 0 and result.stdout.strip() != "NO_NOTIFICATIONS":
+                notifications = []
+                for item in result.stdout.strip().split("|||"):
+                    parts = item.split(" | ", 1)
+                    notifications.append({
+                        "title": parts[0].strip() if parts else "",
+                        "body": parts[1].strip() if len(parts) > 1 else "",
+                    })
+
+                if app_name:
+                    notifications = [n for n in notifications
+                                     if app_name.lower() in n.get("title", "").lower()
+                                     or app_name.lower() in n.get("body", "").lower()]
+
+                return {"action": "list", "count": len(notifications), "notifications": notifications[:20]}
+
+            # Fallback: try reading notification DB
+            import sqlite3 as _sqlite3
+            import glob
+            db_pattern = os.path.expanduser("~/Library/Group Containers/group.com.apple.usernoted/db2/db")
+            db_files = glob.glob(db_pattern)
+            if db_files:
+                conn = _sqlite3.connect(db_files[0])
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT app_id, title, subtitle, body, delivered_date
+                    FROM record
+                    ORDER BY delivered_date DESC
+                    LIMIT 20
+                """)
+                rows = cursor.fetchall()
+                conn.close()
+
+                notifications = []
+                for row in rows:
+                    n = {"app": row[0] or "", "title": row[1] or "", "subtitle": row[2] or "", "body": row[3] or ""}
+                    if app_name and app_name.lower() not in n["app"].lower() and app_name.lower() not in n["title"].lower():
+                        continue
+                    notifications.append(n)
+
+                return {"action": "list", "count": len(notifications), "notifications": notifications, "source": "database"}
+
+            return {"action": "list", "count": 0, "notifications": [], "message": "No notifications found or access denied"}
+
+        elif action == "clear":
+            if not app_name:
+                return {"error": "app_name required for clear action"}
+            # Close notification banners via AppleScript
+            script = f'''
+            tell application "System Events"
+                try
+                    tell process "NotificationCenter"
+                        set theWindows to every window
+                        repeat with w in theWindows
+                            try
+                                click button 1 of w
+                            end try
+                        end repeat
+                    end tell
+                end try
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
+            return {"action": "clear", "app": app_name, "status": "attempted"}
+
+        else:
+            return {"error": f"Unknown action: {action}. Use 'list' or 'clear'."}
+
+    except Exception as e:
+        logger.error(f"Notification reading failed: {e}")
+        return {"error": f"Notification reading failed: {str(e)}"}
+
+
 def tool_knowledge_search(query: str) -> dict:
     """Search the local knowledge base."""
     try:
@@ -1290,6 +1811,120 @@ def tool_knowledge_search(query: str) -> dict:
         return {"error": "Knowledge module not available"}
     except Exception as e:
         return {"error": f"Knowledge search failed: {str(e)}"}
+
+
+def tool_analyze_screen(query: str = None, image_path: str = None) -> dict:
+    """Capture the screen (or load an image) and extract text via OCR.
+    
+    Returns rich screen data that the LLM can reason about:
+    - Extracted text from the screen/image
+    - Active app context if available
+    - Timestamp
+    """
+    import base64
+    
+    if image_path:
+        # Analyze a specific image file from disk
+        image_path = os.path.expanduser(image_path)
+        if not os.path.exists(image_path):
+            return {"error": f"Image file not found: {image_path}"}
+        
+        ext = os.path.splitext(image_path)[1].lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".gif", ".webp"):
+            return {"error": f"Unsupported image format: {ext}"}
+        
+        # Try OCR on the image file
+        try:
+            from screen_ocr import ocr_image, VISION_AVAILABLE
+            if not VISION_AVAILABLE:
+                return {
+                    "error": "macOS Vision framework not available. Install pyobjc-framework-Vision.",
+                }
+            
+            import Quartz
+            from Foundation import NSURL
+            
+            # Load image from file
+            file_url = NSURL.fileURLWithPath_(image_path)
+            cg_source = Quartz.CGImageSourceCreateWithURL(file_url, None)
+            if cg_source is None:
+                return {"error": f"Could not load image: {image_path}"}
+            
+            cg_image = Quartz.CGImageSourceCreateImageAtIndex(cg_source, 0, None)
+            if cg_image is None:
+                return {"error": f"Could not decode image: {image_path}"}
+            
+            text = ocr_image(cg_image)
+            del cg_image
+            
+            result = {
+                "source": "image_file",
+                "path": image_path,
+                "text": text if text else "(No text detected in image)",
+                "char_count": len(text) if text else 0,
+                "timestamp": datetime.now().isoformat(),
+            }
+            
+            if query:
+                result["focus_query"] = query
+                result["note"] = f"The user is specifically asking about: {query}. Focus your analysis on that."
+            
+            return result
+            
+        except Exception as e:
+            return {"error": f"Image analysis failed: {str(e)}"}
+    
+    else:
+        # Capture and analyze the current screen
+        try:
+            from screen_ocr import read_screen
+        except ImportError:
+            return {"error": "screen_ocr module not available"}
+        
+        screen_data = read_screen()
+        
+        if not screen_data.get("available"):
+            return {
+                "error": screen_data.get("error", "Screen capture not available"),
+                "hint": "Check System Settings > Privacy & Security > Screen Recording permissions.",
+            }
+        
+        text = screen_data.get("text", "")
+        
+        result = {
+            "source": "screen_capture",
+            "text": text if text else "(No text detected on screen)",
+            "char_count": len(text) if text else 0,
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+        # Add context about what app is active (if we can get it)
+        try:
+            active_app = subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to get name of first application process whose frontmost is true'],
+                capture_output=True, text=True, timeout=3
+            )
+            if active_app.returncode == 0:
+                result["active_app"] = active_app.stdout.strip()
+            
+            window_title = subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to get name of front window of (first application process whose frontmost is true)'],
+                capture_output=True, text=True, timeout=3
+            )
+            if window_title.returncode == 0:
+                result["window_title"] = window_title.stdout.strip()
+        except Exception:
+            pass  # Non-critical — proceed without app context
+        
+        if query:
+            result["focus_query"] = query
+            result["note"] = f"The user is specifically asking about: {query}. Focus your analysis on that."
+        else:
+            result["note"] = "This is the OCR-extracted text from the user's screen. Describe what you see and answer any questions about it."
+        
+        return result
 
 
 def tool_knowledge_add(text: str, source: str = "user_input") -> dict:
@@ -1348,6 +1983,23 @@ _TOOL_REGISTRY = {
     "knowledge_search": lambda args: tool_knowledge_search(args.get("query", "")),
     "knowledge_add": lambda args: tool_knowledge_add(
         args.get("text", ""), args.get("source", "user_input")
+    ),
+    # ── Phase 1 Agentic Tools ────────────────────────────────────────
+    "file_operations": lambda args: tool_file_operations(
+        args.get("action", ""), args.get("path", ""), args.get("content"), args.get("destination")
+    ),
+    "keyboard": lambda args: tool_keyboard(
+        args.get("action", ""), args.get("text", "")
+    ),
+    "read_document": lambda args: tool_read_document(
+        args.get("path", ""), args.get("pages")
+    ),
+    "read_notifications": lambda args: tool_read_notifications(
+        args.get("action", "list"), args.get("app_name")
+    ),
+    # ── Phase 3 Intelligence Tools ───────────────────────────────────
+    "analyze_screen": lambda args: tool_analyze_screen(
+        args.get("query"), args.get("image_path")
     ),
 }
 

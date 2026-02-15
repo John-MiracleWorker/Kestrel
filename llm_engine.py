@@ -1,6 +1,6 @@
 """
 Libre Bird — Local LLM Engine powered by llama-cpp-python.
-Supports GPT-OSS 20B and Qwen 3 14B GGUF models.
+Supports Gemma 3 12B IT, Qwen 3, and other GGUF models.
 Zero cloud. All inference runs on your Mac.
 """
 
@@ -56,13 +56,29 @@ Key behaviors:
 - Help with writing, coding, research, and organization
 - Keep responses focused and practical
 - If context isn't relevant to the question, don't force it
-- Keep your internal reasoning brief and focused. For simple questions, think in 1-2 sentences. Save extended reasoning for complex problems."""
+- Keep your internal reasoning brief and focused. For simple questions, think in 1-2 sentences. Save extended reasoning for complex problems.
+
+AGENTIC CAPABILITIES:
+- You can perform FILE OPERATIONS: read, write, create, move, copy, delete files and folders. Delete moves to Trash safely.
+- You can TYPE TEXT AND PRESS KEYS in any active application using keyboard automation. Use this to fill forms, trigger shortcuts (cmd+s to save), or automate repetitive typing.
+- You can READ DOCUMENTS: extract text from PDFs, Word docs (.docx), Markdown, CSV, and other text-based files.
+- You can READ NOTIFICATIONS from the macOS Notification Center and clear them per-app.
+- You have access to CLIPBOARD HISTORY: not just the current clipboard, but the last 20 things the user copied.
+- You can ANALYZE THE SCREEN: capture and read what's currently visible on the user's display via OCR. You can also analyze image files from disk. Use this when asked "what's on my screen?", "read this", or to help debug visible errors.
+
+MULTI-STEP PLANNING:
+- For complex requests that require multiple steps, break the work down and execute tools one at a time.
+- You have up to 10 tool rounds per request — use them wisely to accomplish complex tasks autonomously.
+- After each tool result, inspect it and decide the next step. Don't ask the user for permission to continue — just do it.
+- Chain tools creatively: search files → read document → summarize → write output → copy to clipboard.
+- If a step fails, try an alternative approach before giving up."""
 
 
 class LLMEngine:
     def __init__(self):
         self._model: Optional[Llama] = None
         self._model_path: Optional[str] = None
+        self._mmproj_path: Optional[str] = None
         self._loading = False
 
     @property
@@ -74,45 +90,73 @@ class LLMEngine:
         return self._model_path
 
     def get_available_models(self) -> list[dict]:
-        """Scan models directory for GGUF files."""
+        """Scan models directory for GGUF files.
+        Filters out mmproj vision encoder files (not standalone models).
+        """
         models = []
         if not os.path.exists(MODELS_DIR):
             os.makedirs(MODELS_DIR, exist_ok=True)
             return models
 
+        # Collect mmproj files separately for vision-capable detection
+        mmproj_files = set()
         for f in os.listdir(MODELS_DIR):
-            if f.endswith(".gguf"):
+            if f.endswith(".gguf") and "mmproj" in f.lower():
+                mmproj_files.add(f)
+
+        for f in os.listdir(MODELS_DIR):
+            if f.endswith(".gguf") and f not in mmproj_files:
                 path = os.path.realpath(os.path.join(MODELS_DIR, f))
                 size_gb = os.path.getsize(path) / (1024 ** 3)
                 models.append({
                     "name": f,
                     "path": path,
                     "size_gb": round(size_gb, 2),
+                    "vision": bool(mmproj_files),  # has a vision encoder available
                 })
         return sorted(models, key=lambda m: m["name"])
 
+    def _find_mmproj(self, model_path: str) -> Optional[str]:
+        """Auto-detect a matching mmproj vision encoder in the models directory."""
+        models_dir = os.path.dirname(model_path)
+        for f in os.listdir(models_dir):
+            if f.endswith(".gguf") and "mmproj" in f.lower():
+                return os.path.join(models_dir, f)
+        return None
+
     async def load_model(self, model_path: str, n_ctx: int = 8192,
                          n_gpu_layers: int = -1):
-        """Load a GGUF model. n_gpu_layers=-1 offloads all layers to Metal GPU."""
+        """Load a GGUF model. n_gpu_layers=-1 offloads all layers to Metal GPU.
+        Auto-detects mmproj vision encoder if present in the models directory.
+        """
         if self._loading:
             raise RuntimeError("Model is already loading")
 
         self._loading = True
         try:
+            # Check for vision encoder
+            mmproj = self._find_mmproj(model_path)
+            if mmproj:
+                logger.info(f"Vision encoder found: {mmproj}")
+
+            # Build kwargs for Llama constructor
+            llama_kwargs = dict(
+                model_path=model_path,
+                n_ctx=n_ctx,
+                n_gpu_layers=n_gpu_layers,
+                n_threads=os.cpu_count(),
+                verbose=False,
+                flash_attn=True,
+            )
+
             # Run in thread to avoid blocking the event loop
             loop = asyncio.get_event_loop()
             self._model = await loop.run_in_executor(
                 None,
-                lambda: Llama(
-                    model_path=model_path,
-                    n_ctx=n_ctx,
-                    n_gpu_layers=n_gpu_layers,
-                    n_threads=os.cpu_count(),
-                    verbose=False,
-                    flash_attn=True,
-                )
+                lambda: Llama(**llama_kwargs)
             )
             self._model_path = model_path
+            self._mmproj_path = mmproj
         finally:
             self._loading = False
 
@@ -122,13 +166,15 @@ class LLMEngine:
             del self._model
             self._model = None
             self._model_path = None
+            self._mmproj_path = None
 
     @staticmethod
     def _clean_response(text: str) -> str:
         """Clean model-specific formatting from the response.
         
         Handles:
-        - Qwen3 <think>...</think> reasoning blocks
+        - Thinking blocks: <think>...</think>
+        - Gemma 3 turn tokens: <start_of_turn>, <end_of_turn>
         - GPT-OSS <|channel|>analysis...<|channel|>final<|message|>RESPONSE
         - Stray control tokens
         """
@@ -137,14 +183,18 @@ class LLMEngine:
         
         import re
         
-        # 1. Strip Qwen3 thinking blocks: <think>...</think>
+        # 1. Strip thinking blocks: <think>...</think>
         cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
         
         # 2. Strip tool call/response blocks
         cleaned = re.sub(r'<tool_call>.*?</tool_call>', '', cleaned, flags=re.DOTALL)
         cleaned = re.sub(r'<tool_response>.*?</tool_response>', '', cleaned, flags=re.DOTALL)
         
-        # 3. GPT-OSS: extract final channel message
+        # 3. Strip Gemma 3 turn markers
+        cleaned = re.sub(r'<start_of_turn>(?:model|user)?', '', cleaned)
+        cleaned = re.sub(r'<end_of_turn>', '', cleaned)
+        
+        # 4. GPT-OSS: extract final channel message
         final_match = re.search(
             r'<\|channel\|>final<\|message\|>(.*?)(?:<\|end\|>|$)',
             cleaned, re.DOTALL
@@ -152,7 +202,7 @@ class LLMEngine:
         if final_match:
             cleaned = final_match.group(1)
         
-        # 4. Strip any remaining control tokens
+        # 5. Strip any remaining control tokens
         cleaned = re.sub(r'<\|(?:channel|message|start|end|im_start|im_end)\|>[a-z]*', '', cleaned)
         
         return cleaned.strip()
@@ -172,7 +222,10 @@ class LLMEngine:
                 ctx_parts.append(f"Window: {context['window_title']}")
             if context.get("focused_text"):
                 text = context["focused_text"][:2000]  # Limit context size
-                ctx_parts.append(f"Screen text: {text}")
+                ctx_parts.append(f"Focused text: {text}")
+            if context.get("screen_text"):
+                screen = context["screen_text"][:3000]  # OCR snapshot
+                ctx_parts.append(f"Screen OCR: {screen}")
             if ctx_parts:
                 sys_content += "\n\n--- Current Screen Context ---\n" + "\n".join(ctx_parts)
 
@@ -240,7 +293,7 @@ class LLMEngine:
 
         _SENTINEL = object()  # marks end of stream
 
-        MAX_TOOL_ROUNDS = 3
+        MAX_TOOL_ROUNDS = 10
         for round_num in range(MAX_TOOL_ROUNDS + 1):
             queue: asyncio.Queue = asyncio.Queue()
 
@@ -296,7 +349,7 @@ class LLMEngine:
                         fn_name = tc_data.get("name", "")
                         fn_args = tc_data.get("arguments", {})
                         logger.info(f"Tool call XML (round {round_num + 1}): {fn_name}({fn_args})")
-                        yield ("tool", fn_name)
+                        yield ("tool", json.dumps({"name": fn_name, "step": round_num + 1, "max_steps": MAX_TOOL_ROUNDS}))
                         result = execute_tool(fn_name, fn_args)
                         tool_results.append(f"<tool_response>\n{result}\n</tool_response>")
                     except json.JSONDecodeError:
@@ -319,7 +372,7 @@ class LLMEngine:
             return first_message[:50]
 
         prompt_messages = [
-            {"role": "system", "content": "Generate a very short title (3-6 words) for this conversation. Reply with ONLY the title, nothing else. /no_think"},
+            {"role": "system", "content": "Generate a very short title (3-6 words) for this conversation. Reply with ONLY the title, nothing else."},
             {"role": "user", "content": first_message},
         ]
 

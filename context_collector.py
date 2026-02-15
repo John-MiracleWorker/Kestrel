@@ -1,6 +1,7 @@
 """
 Libre Bird — macOS Screen Context Collector.
 Uses the Accessibility API to read active window info.
+Optionally captures screen text via OCR for richer context.
 Requires accessibility permissions in System Settings.
 """
 
@@ -160,13 +161,19 @@ class ContextCollector:
         },
     }
 
-    def __init__(self, interval: int = 30, on_context: Callable = None):
+    def __init__(self, interval: int = 30, on_context: Callable = None,
+                 ocr_enabled: bool = True, ocr_every_n: int = 2):
         self.interval = interval  # seconds between captures
         self.on_context = on_context  # callback(context_dict)
         self._running = False
         self._paused = False
         self._thread: Optional[threading.Thread] = None
         self._last_context: Optional[dict] = None
+        # OCR settings
+        self._ocr_enabled = ocr_enabled
+        self._ocr_every_n = ocr_every_n  # run OCR every N ticks (e.g. 2 = ~60s at 30s interval)
+        self._ocr_tick = 0
+        self._last_screen_text: str = ""  # latest OCR snapshot
         # Activity tracking
         self._activity_start: Optional[float] = None
         self._current_activity: Optional[str] = None
@@ -254,6 +261,17 @@ class ContextCollector:
         self._paused = False
         logger.info("Context collector resumed")
 
+    def _capture_screen_ocr(self) -> str:
+        """Run OCR on the current screen. Returns extracted text or empty string."""
+        try:
+            from screen_ocr import read_screen
+            result = read_screen()
+            if result.get("available") and result.get("text"):
+                return result["text"]
+        except Exception as e:
+            logger.debug(f"Background OCR failed: {e}")
+        return ""
+
     def _run_loop(self):
         """Main collection loop (runs in background thread)."""
         while self._running:
@@ -273,6 +291,19 @@ class ContextCollector:
                         ctx["activity_minutes"] = round(
                             (time.time() - self._activity_start) / 60, 1
                         )
+
+                    # Periodic OCR capture
+                    if self._ocr_enabled:
+                        self._ocr_tick += 1
+                        if self._ocr_tick >= self._ocr_every_n:
+                            self._ocr_tick = 0
+                            screen_text = self._capture_screen_ocr()
+                            if screen_text:
+                                self._last_screen_text = screen_text
+
+                    # Always attach latest screen text to context
+                    if self._last_screen_text:
+                        ctx["screen_text"] = self._last_screen_text
 
                     # De-duplicate: skip if same as last capture
                     if (self._last_context and

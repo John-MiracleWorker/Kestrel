@@ -339,8 +339,10 @@ async function sendMessage() {
                                 thinkingEl.querySelector('summary').textContent = '🧠 Thought process';
                             }
                         } else if (currentEvent === 'tool') {
-                            // Show tool indicator
-                            const toolName = parsed.tool || 'tool';
+                            // Show tool indicator — parse new format with step info
+                            const toolName = parsed.name || parsed.tool || 'tool';
+                            const stepNum = parsed.step || 0;
+                            const maxSteps = parsed.max_steps || 10;
                             const friendlyNames = {
                                 get_datetime: '🕐 Getting time…',
                                 web_search: '🔍 Searching the web…',
@@ -360,6 +362,15 @@ async function sendMessage() {
                                 set_reminder: '⏰ Setting reminder…',
                                 clipboard: '📋 Using clipboard…',
                                 open_app: '📱 Opening app…',
+                                system_control: '⚙️ System control…',
+                                music_control: '🎵 Controlling music…',
+                                file_operations: '📁 Working with files…',
+                                keyboard: '⌨️ Typing…',
+                                read_document: '📄 Reading document…',
+                                read_notifications: '🔔 Checking notifications…',
+                                analyze_screen: '👁️ Analyzing screen (VLM)…',
+                                manage_preferences: '🧠 Learning preferences…',
+                                workflow: '🔄 Running workflow…',
                             };
                             if (!toolIndicator) {
                                 toolIndicator = document.createElement('div');
@@ -378,6 +389,11 @@ async function sendMessage() {
                                 const label = document.createElement('div');
                                 label.className = 'tool-indicator-label';
                                 content.appendChild(label);
+
+                                // Step badge for multi-step chains
+                                const stepBadge = document.createElement('div');
+                                stepBadge.className = 'tool-indicator-step';
+                                content.appendChild(stepBadge);
 
                                 const elapsed = document.createElement('div');
                                 elapsed.className = 'tool-indicator-elapsed';
@@ -401,6 +417,11 @@ async function sendMessage() {
                             }
                             const labelEl = toolIndicator.querySelector('.tool-indicator-label');
                             if (labelEl) labelEl.textContent = friendlyNames[toolName] || `🔧 Using ${toolName}…`;
+                            const stepEl = toolIndicator.querySelector('.tool-indicator-step');
+                            if (stepEl && stepNum > 0) {
+                                stepEl.textContent = `Step ${stepNum}`;
+                                stepEl.style.display = 'inline-block';
+                            }
                             scrollToBottom();
                         } else if (currentEvent === 'token') {
                             // Remove tool indicator when answer starts
