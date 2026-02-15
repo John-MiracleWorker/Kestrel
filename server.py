@@ -23,6 +23,7 @@ from context_collector import ContextCollector, get_screen_context
 from memory import detect_recall_intent, retrieve_context
 from notifications import reminder_scheduler, send_notification
 from voice_input import voice_listener
+from proactive import ProactiveEngine
 from tts import speak as tts_speak, stop_speaking as tts_stop, is_speaking as tts_is_speaking
 
 # ── Logging ──────────────────────────────────────────────────────────
@@ -48,6 +49,7 @@ app.add_middleware(
 
 db = Database()
 context_collector: Optional[ContextCollector] = None
+proactive_engine: Optional[ProactiveEngine] = None
 
 # Voice transcription queue for SSE streaming
 _voice_transcriptions: list[str] = []
@@ -141,9 +143,18 @@ async def startup():
         except Exception as e:
             logger.error(f"Failed to auto-load model: {e}")
 
+    # Start proactive analysis engine
+    global proactive_engine
+    proactive_engine = ProactiveEngine(llm_engine, context_collector)
+    proactive_enabled = await db.get_setting("proactive_enabled", "true")
+    if proactive_enabled == "true":
+        proactive_engine.start(loop)
+
 
 @app.on_event("shutdown")
 async def shutdown():
+    if proactive_engine:
+        proactive_engine.stop()
     if context_collector:
         context_collector.stop()
     reminder_scheduler.stop()
@@ -487,6 +498,41 @@ async def load_model(req: ModelLoadRequest):
 async def unload_model():
     llm_engine.unload_model()
     return {"ok": True}
+
+
+# ── Proactive Analysis ───────────────────────────────────────────────
+
+
+@app.get("/api/proactive/suggestions")
+async def get_proactive_suggestions():
+    if not proactive_engine:
+        return {"suggestions": [], "enabled": False}
+    return {
+        "suggestions": proactive_engine.suggestions,
+        "enabled": proactive_engine.is_running,
+    }
+
+
+@app.post("/api/proactive/dismiss")
+async def dismiss_suggestion(index: int = -1):
+    if proactive_engine:
+        proactive_engine.dismiss_suggestion(index)
+    return {"ok": True}
+
+
+@app.post("/api/proactive/toggle")
+async def toggle_proactive():
+    if not proactive_engine:
+        raise HTTPException(400, "Proactive engine not initialized")
+    if proactive_engine.is_running:
+        proactive_engine.stop()
+        await db.save_setting("proactive_enabled", "false")
+        return {"enabled": False}
+    else:
+        loop = asyncio.get_event_loop()
+        proactive_engine.start(loop)
+        await db.save_setting("proactive_enabled", "true")
+        return {"enabled": True}
 
 
 # ── Settings ─────────────────────────────────────────────────────────

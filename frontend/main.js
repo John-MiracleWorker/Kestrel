@@ -975,6 +975,12 @@ async function loadSettings() {
             geminiStatus.style.color = 'var(--warning, #f59e0b)';
         }
 
+        // Proactive toggle state
+        try {
+            const proactiveState = await api.get('/api/proactive/suggestions');
+            document.getElementById('proactive-toggle').checked = proactiveState.enabled;
+        } catch (e) { }
+
         // Load models
         await loadModels();
 
@@ -1011,6 +1017,14 @@ function setupSettingHandlers() {
     // Context length
     document.getElementById('setting-n-ctx').onchange = (e) => {
         saveSetting('n_ctx', e.target.value);
+    };
+
+    // Proactive toggle
+    document.getElementById('proactive-toggle').onchange = async () => {
+        try {
+            const result = await api.post('/api/proactive/toggle');
+            document.getElementById('proactive-toggle').checked = result.enabled;
+        } catch (e) { }
     };
 
     // Gemini API key save

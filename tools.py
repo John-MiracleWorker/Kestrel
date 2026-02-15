@@ -307,6 +307,58 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "system_control",
+            "description": "Control macOS system settings and actions. Use when the user asks to change volume, brightness, toggle dark mode, lock the screen, take a screenshot, open an app, check battery, toggle wifi/bluetooth, enable Do Not Disturb, or similar system-level actions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["volume_set", "volume_up", "volume_down", "mute", "unmute", "brightness", "dark_mode", "light_mode", "dnd_on", "dnd_off", "lock_screen", "screenshot", "open_app", "sleep", "empty_trash", "battery", "wifi_on", "wifi_off", "bluetooth_on", "bluetooth_off"],
+                        "description": "The system action to perform",
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "Optional value for the action (e.g., volume level 0-100, app name for open_app)",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "music_control",
+            "description": "Control Apple Music and analyze listening habits. Use for playback (play/pause/skip), searching the library, creating playlists, and getting listening stats. You can recommend music based on what the user is working on by combining screen context with their listening history and library.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["play", "pause", "next", "previous", "now_playing", "search", "create_playlist", "add_to_playlist", "listening_stats", "recent_history"],
+                        "description": "The music action to perform",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Search query for 'search' action, or playlist name for 'create_playlist'/'add_to_playlist'",
+                    },
+                    "track_name": {
+                        "type": "string",
+                        "description": "Track name for 'add_to_playlist' action",
+                    },
+                    "genre": {
+                        "type": "string",
+                        "description": "Optional genre filter for 'listening_stats' or 'search'",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "knowledge_search",
             "description": "Search the user's local knowledge base for relevant information. Use this when the user asks about something they previously saved, or when you need to recall stored documents, notes, or context.",
             "parameters": {
@@ -723,19 +775,17 @@ def tool_speak(text: str) -> dict:
 def tool_image_generate(prompt: str) -> dict:
     """Generate an image using Google Gemini Nano Banana Pro."""
     try:
-        import re, time, asyncio
+        import re, time, sqlite3 as _sql3
 
-        # Get Gemini API key from settings
+        # Get Gemini API key from settings (sync read — tools run in sync context)
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    api_key = pool.submit(
-                        lambda: asyncio.run(_get_gemini_key())
-                    ).result(timeout=5)
-            else:
-                api_key = loop.run_until_complete(_get_gemini_key())
+            _db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libre_bird.db")
+            _conn = _sql3.connect(_db_path)
+            _row = _conn.execute(
+                "SELECT value FROM settings WHERE key = 'gemini_api_key'"
+            ).fetchone()
+            _conn.close()
+            api_key = _row[0] if _row else ""
         except Exception:
             api_key = ""
 
@@ -798,13 +848,437 @@ def tool_image_generate(prompt: str) -> dict:
         return {"error": f"Image generation failed: {str(e)}"}
 
 
-async def _get_gemini_key():
-    """Helper to read the Gemini API key from settings DB."""
-    from database import Database
-    _db = Database()
-    await _db.initialize()
-    key = await _db.get_setting("gemini_api_key", "")
-    return key
+def tool_system_control(action: str, value: str = None) -> dict:
+    """Control macOS system settings and actions via AppleScript/CLI."""
+    try:
+        def _osascript(script: str) -> str:
+            """Run an AppleScript and return stdout."""
+            r = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=10
+            )
+            return r.stdout.strip() if r.returncode == 0 else r.stderr.strip()
+
+        def _sh(cmd: str) -> str:
+            """Run a shell command and return stdout."""
+            r = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=10
+            )
+            return r.stdout.strip() if r.returncode == 0 else r.stderr.strip()
+
+        # ── Volume ────────────────────────────────────────────
+        if action == "volume_set":
+            level = int(value) if value else 50
+            level = max(0, min(100, level))
+            vol = round(level / 100 * 7)  # macOS volume is 0-7
+            _osascript(f"set volume output volume {level}")
+            return {"status": "ok", "action": "volume_set", "level": level}
+
+        elif action == "volume_up":
+            _osascript("set volume output volume ((output volume of (get volume settings)) + 10)")
+            cur = _osascript("output volume of (get volume settings)")
+            return {"status": "ok", "action": "volume_up", "level": cur}
+
+        elif action == "volume_down":
+            _osascript("set volume output volume ((output volume of (get volume settings)) - 10)")
+            cur = _osascript("output volume of (get volume settings)")
+            return {"status": "ok", "action": "volume_down", "level": cur}
+
+        elif action == "mute":
+            _osascript("set volume with output muted")
+            return {"status": "ok", "action": "muted"}
+
+        elif action == "unmute":
+            _osascript("set volume without output muted")
+            return {"status": "ok", "action": "unmuted"}
+
+        # ── Brightness ────────────────────────────────────────
+        elif action == "brightness":
+            level = float(value) if value else 50
+            level = max(0, min(100, level))
+            brightness = level / 100
+            # Try brightness command first, fall back to AppleScript
+            result = _sh(f"brightness {brightness} 2>/dev/null")
+            if "not found" in result.lower():
+                _osascript(f'tell application "System Preferences" to quit')
+                return {"status": "partial", "message": f"Install 'brightness' CLI via Homebrew: brew install brightness. Attempted to set to {level}%."}
+            return {"status": "ok", "action": "brightness", "level": level}
+
+        # ── Dark/Light Mode ───────────────────────────────────
+        elif action == "dark_mode":
+            _osascript('tell application "System Events" to tell appearance preferences to set dark mode to true')
+            return {"status": "ok", "action": "dark_mode", "mode": "dark"}
+
+        elif action == "light_mode":
+            _osascript('tell application "System Events" to tell appearance preferences to set dark mode to false')
+            return {"status": "ok", "action": "light_mode", "mode": "light"}
+
+        # ── Do Not Disturb ────────────────────────────────────
+        elif action == "dnd_on":
+            _sh("shortcuts run 'Do Not Disturb' 2>/dev/null || true")
+            # Fallback: use Focus via AppleScript
+            _osascript('''
+                tell application "System Events"
+                    tell process "ControlCenter"
+                        click menu bar item "Focus" of menu bar 1
+                    end tell
+                end tell
+            ''')
+            return {"status": "ok", "action": "dnd_on", "message": "Attempted to enable Do Not Disturb. You may need to confirm via Control Center."}
+
+        elif action == "dnd_off":
+            return {"status": "ok", "action": "dnd_off", "message": "To disable DnD, click the Focus icon in the menu bar or use Control Center."}
+
+        # ── Lock Screen ───────────────────────────────────────
+        elif action == "lock_screen":
+            _sh("pmset displaysleepnow")
+            return {"status": "ok", "action": "lock_screen"}
+
+        # ── Screenshot ────────────────────────────────────────
+        elif action == "screenshot":
+            import time as _t
+            ts = int(_t.time())
+            path = os.path.expanduser(f"~/Desktop/screenshot_{ts}.png")
+            _sh(f"screencapture -x {path}")
+            if os.path.exists(path):
+                return {"status": "ok", "action": "screenshot", "path": path}
+            return {"error": "Screenshot failed"}
+
+        # ── Open App ──────────────────────────────────────────
+        elif action == "open_app":
+            app_name = value or ""
+            if not app_name:
+                return {"error": "Please specify the app name"}
+            result = _sh(f'open -a "{app_name}" 2>&1')
+            if "unable to find" in result.lower() or "can't open" in result.lower():
+                return {"error": f"Could not find app: {app_name}"}
+            return {"status": "ok", "action": "open_app", "app": app_name}
+
+        # ── Sleep ─────────────────────────────────────────────
+        elif action == "sleep":
+            _osascript('tell application "System Events" to sleep')
+            return {"status": "ok", "action": "sleep"}
+
+        # ── Empty Trash ───────────────────────────────────────
+        elif action == "empty_trash":
+            _osascript('tell application "Finder" to empty the trash')
+            return {"status": "ok", "action": "empty_trash"}
+
+        # ── Battery ───────────────────────────────────────────
+        elif action == "battery":
+            info = _sh("pmset -g batt")
+            # Parse battery percentage and state
+            import re
+            match = re.search(r'(\d+)%;\s*(\w+)', info)
+            if match:
+                return {
+                    "status": "ok",
+                    "action": "battery",
+                    "percentage": int(match.group(1)),
+                    "state": match.group(2),  # charging, discharging, charged
+                    "raw": info,
+                }
+            return {"status": "ok", "action": "battery", "raw": info}
+
+        # ── WiFi ──────────────────────────────────────────────
+        elif action == "wifi_on":
+            _sh("networksetup -setairportpower en0 on")
+            return {"status": "ok", "action": "wifi_on"}
+
+        elif action == "wifi_off":
+            _sh("networksetup -setairportpower en0 off")
+            return {"status": "ok", "action": "wifi_off"}
+
+        # ── Bluetooth ─────────────────────────────────────────
+        elif action == "bluetooth_on":
+            result = _sh("blueutil --power 1 2>/dev/null")
+            if not result or "not found" in result.lower():
+                _osascript('tell application "System Preferences" to reveal pane id "com.apple.preferences.Bluetooth"')
+                return {"status": "partial", "message": "Opened Bluetooth preferences. Install 'blueutil' for CLI control: brew install blueutil"}
+            return {"status": "ok", "action": "bluetooth_on"}
+
+        elif action == "bluetooth_off":
+            result = _sh("blueutil --power 0 2>/dev/null")
+            if not result or "not found" in result.lower():
+                return {"status": "partial", "message": "Install 'blueutil' for CLI control: brew install blueutil"}
+            return {"status": "ok", "action": "bluetooth_off"}
+
+        else:
+            return {"error": f"Unknown action: {action}"}
+
+    except Exception as e:
+        logger.error(f"System control failed: {e}")
+        return {"error": f"System control failed: {str(e)}"}
+
+
+def tool_music_control(action: str, query: str = None, track_name: str = None, genre: str = None) -> dict:
+    """Control Apple Music and analyze listening habits via AppleScript."""
+    try:
+        def _music_script(script: str) -> str:
+            """Run an AppleScript targeting Music.app."""
+            full = f'tell application "Music"\n{script}\nend tell'
+            r = subprocess.run(
+                ["osascript", "-e", full],
+                capture_output=True, text=True, timeout=15
+            )
+            return r.stdout.strip() if r.returncode == 0 else r.stderr.strip()
+
+        def _raw_osascript(script: str) -> str:
+            r = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=30
+            )
+            return r.stdout.strip() if r.returncode == 0 else r.stderr.strip()
+
+        # ── Playback ──────────────────────────────────────────
+        if action == "play":
+            if query:
+                # Search and play
+                _music_script(f'play (first track of playlist "Library" whose name contains "{query}" or artist contains "{query}")')
+                return {"status": "ok", "action": "play", "query": query}
+            else:
+                _music_script("play")
+                return {"status": "ok", "action": "play"}
+
+        elif action == "pause":
+            _music_script("pause")
+            return {"status": "ok", "action": "paused"}
+
+        elif action == "next":
+            _music_script("next track")
+            import time; time.sleep(0.5)
+            info = _music_script("get {name, artist, album} of current track")
+            return {"status": "ok", "action": "next", "now_playing": info}
+
+        elif action == "previous":
+            _music_script("previous track")
+            import time; time.sleep(0.5)
+            info = _music_script("get {name, artist, album} of current track")
+            return {"status": "ok", "action": "previous", "now_playing": info}
+
+        # ── Now Playing ───────────────────────────────────────
+        elif action == "now_playing":
+            state = _music_script("get player state as string")
+            if "playing" not in state.lower() and "paused" not in state.lower():
+                return {"status": "ok", "state": "stopped", "message": "Nothing is playing"}
+            name = _music_script("get name of current track")
+            artist = _music_script("get artist of current track")
+            album = _music_script("get album of current track")
+            genre_info = _music_script("get genre of current track")
+            duration = _music_script("get duration of current track")
+            pos = _music_script("get player position")
+            return {
+                "status": "ok",
+                "state": state,
+                "track": name,
+                "artist": artist,
+                "album": album,
+                "genre": genre_info,
+                "duration_seconds": duration,
+                "position_seconds": pos,
+            }
+
+        # ── Search Library ────────────────────────────────────
+        elif action == "search":
+            if not query:
+                return {"error": "Please provide a search query"}
+            # Search by name, artist, or genre
+            script = f'''
+tell application "Music"
+    set results to {{}}
+    set searchResults to (search playlist "Library" for "{query}")
+    set maxResults to 15
+    if (count of searchResults) < maxResults then set maxResults to (count of searchResults)
+    repeat with i from 1 to maxResults
+        set t to item i of searchResults
+        set end of results to (name of t) & " — " & (artist of t) & " [" & (album of t) & "]"
+    end repeat
+    return results
+end tell'''
+            result = _raw_osascript(script)
+            if not result or "error" in result.lower():
+                return {"status": "ok", "results": [], "message": f"No results for '{query}'"}
+            tracks = [t.strip() for t in result.split(",") if t.strip()]
+            return {"status": "ok", "query": query, "results": tracks, "count": len(tracks)}
+
+        # ── Create Playlist ───────────────────────────────────
+        elif action == "create_playlist":
+            name = query or "Libre Bird Mix"
+            _music_script(f'make new playlist with properties {{name:"{name}"}}')
+            return {"status": "ok", "action": "create_playlist", "name": name}
+
+        # ── Add to Playlist ───────────────────────────────────
+        elif action == "add_to_playlist":
+            playlist_name = query or "Libre Bird Mix"
+            if not track_name:
+                return {"error": "Please specify track_name to add"}
+            script = f'''
+tell application "Music"
+    set t to (first track of playlist "Library" whose name contains "{track_name}")
+    duplicate t to playlist "{playlist_name}"
+end tell'''
+            result = _raw_osascript(script)
+            if "error" in result.lower():
+                return {"error": f"Could not add '{track_name}' to '{playlist_name}': {result}"}
+            return {"status": "ok", "action": "add_to_playlist", "track": track_name, "playlist": playlist_name}
+
+        # ── Listening Stats ───────────────────────────────────
+        elif action == "listening_stats":
+            # Get top artists by play count
+            top_artists_script = '''
+tell application "Music"
+    set allTracks to every track of playlist "Library"
+    set artistCounts to {}
+    set artistNames to {}
+    repeat with t in allTracks
+        set a to artist of t
+        set pc to played count of t
+        if pc > 0 then
+            set found to false
+            repeat with i from 1 to count of artistNames
+                if item i of artistNames is a then
+                    set item i of artistCounts to (item i of artistCounts) + pc
+                    set found to true
+                    exit repeat
+                end if
+            end repeat
+            if not found then
+                set end of artistNames to a
+                set end of artistCounts to pc
+            end if
+        end if
+    end repeat
+    -- Sort and return top 10
+    set output to {}
+    repeat 10 times
+        set maxVal to 0
+        set maxIdx to 0
+        repeat with i from 1 to count of artistCounts
+            if item i of artistCounts > maxVal then
+                set maxVal to item i of artistCounts
+                set maxIdx to i
+            end if
+        end repeat
+        if maxIdx > 0 then
+            set end of output to (item maxIdx of artistNames) & " (" & maxVal & " plays)"
+            set item maxIdx of artistCounts to 0
+        end if
+    end repeat
+    return output
+end tell'''
+            # Get top genres
+            top_genres_script = '''
+tell application "Music"
+    set allTracks to every track of playlist "Library"
+    set genreNames to {}
+    set genreCounts to {}
+    repeat with t in allTracks
+        set g to genre of t
+        set pc to played count of t
+        if pc > 0 and g is not "" then
+            set found to false
+            repeat with i from 1 to count of genreNames
+                if item i of genreNames is g then
+                    set item i of genreCounts to (item i of genreCounts) + pc
+                    set found to true
+                    exit repeat
+                end if
+            end repeat
+            if not found then
+                set end of genreNames to g
+                set end of genreCounts to pc
+            end if
+        end if
+    end repeat
+    set output to {}
+    repeat 8 times
+        set maxVal to 0
+        set maxIdx to 0
+        repeat with i from 1 to count of genreCounts
+            if item i of genreCounts > maxVal then
+                set maxVal to item i of genreCounts
+                set maxIdx to i
+            end if
+        end repeat
+        if maxIdx > 0 then
+            set end of output to (item maxIdx of genreNames) & " (" & maxVal & " plays)"
+            set item maxIdx of genreCounts to 0
+        end if
+    end repeat
+    return output
+end tell'''
+            # Get most played tracks
+            top_tracks_script = '''
+tell application "Music"
+    set allTracks to every track of playlist "Library"
+    set trackInfos to {}
+    set trackPlays to {}
+    repeat with t in allTracks
+        set pc to played count of t
+        if pc > 2 then
+            set end of trackInfos to (name of t) & " — " & (artist of t)
+            set end of trackPlays to pc
+        end if
+    end repeat
+    set output to {}
+    repeat 15 times
+        set maxVal to 0
+        set maxIdx to 0
+        repeat with i from 1 to count of trackPlays
+            if item i of trackPlays > maxVal then
+                set maxVal to item i of trackPlays
+                set maxIdx to i
+            end if
+        end repeat
+        if maxIdx > 0 then
+            set end of output to (item maxIdx of trackInfos) & " (" & maxVal & "x)"
+            set item maxIdx of trackPlays to 0
+        end if
+    end repeat
+    return output
+end tell'''
+            artists = _raw_osascript(top_artists_script)
+            genres = _raw_osascript(top_genres_script)
+            tracks = _raw_osascript(top_tracks_script)
+
+            return {
+                "status": "ok",
+                "action": "listening_stats",
+                "top_artists": [a.strip() for a in artists.split(",") if a.strip()] if artists else [],
+                "top_genres": [g.strip() for g in genres.split(",") if g.strip()] if genres else [],
+                "most_played_tracks": [t.strip() for t in tracks.split(",") if t.strip()] if tracks else [],
+                "tip": "Use this data to recommend music based on what the user is currently working on.",
+            }
+
+        # ── Recent History ────────────────────────────────────
+        elif action == "recent_history":
+            script = '''
+tell application "Music"
+    set recentTracks to (every track of playlist "Library" whose played date > (current date) - 7 * days)
+    set output to {}
+    set maxItems to 20
+    if (count of recentTracks) < maxItems then set maxItems to (count of recentTracks)
+    repeat with i from 1 to maxItems
+        set t to item i of recentTracks
+        set end of output to (name of t) & " — " & (artist of t) & " [" & (genre of t) & "]"
+    end repeat
+    return output
+end tell'''
+            result = _raw_osascript(script)
+            tracks = [t.strip() for t in result.split(",") if t.strip()] if result else []
+            return {
+                "status": "ok",
+                "action": "recent_history",
+                "recent_tracks": tracks,
+                "period": "last 7 days",
+            }
+
+        else:
+            return {"error": f"Unknown music action: {action}"}
+
+    except Exception as e:
+        logger.error(f"Music control failed: {e}")
+        return {"error": f"Music control failed: {str(e)}"}
 
 
 def tool_knowledge_search(query: str) -> dict:
@@ -864,6 +1338,12 @@ _TOOL_REGISTRY = {
     "speak": lambda args: tool_speak(args.get("text", "")),
     "image_generate": lambda args: tool_image_generate(
         args.get("prompt", "")
+    ),
+    "system_control": lambda args: tool_system_control(
+        args.get("action", ""), args.get("value")
+    ),
+    "music_control": lambda args: tool_music_control(
+        args.get("action", ""), args.get("query"), args.get("track_name"), args.get("genre")
     ),
     "knowledge_search": lambda args: tool_knowledge_search(args.get("query", "")),
     "knowledge_add": lambda args: tool_knowledge_add(
