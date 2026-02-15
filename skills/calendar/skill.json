@@ -1,0 +1,16 @@
+{
+    "name": "calendar",
+    "display_name": "Apple Calendar",
+    "description": "View, search, and create calendar events using macOS Calendar.",
+    "version": "1.0.0",
+    "author": "Libre Bird Community",
+    "icon": "📅",
+    "category": "community",
+    "dependencies": [],
+    "tools": [
+        "list_calendars",
+        "get_events",
+        "create_event",
+        "todays_agenda"
+    ]
+}

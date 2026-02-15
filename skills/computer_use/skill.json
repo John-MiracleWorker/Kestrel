@@ -1,0 +1,20 @@
+{
+    "name": "computer_use",
+    "display_name": "Computer Use",
+    "description": "Control mouse clicks, keyboard typing, hotkeys, and take screenshots — like a human using the computer.",
+    "version": "1.0.0",
+    "author": "Libre Bird Community",
+    "icon": "🖱️",
+    "category": "community",
+    "dependencies": [
+        "pyautogui"
+    ],
+    "tools": [
+        "mouse_click",
+        "type_text",
+        "hotkey",
+        "screenshot",
+        "mouse_move",
+        "get_mouse_position"
+    ]
+}

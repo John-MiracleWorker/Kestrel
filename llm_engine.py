@@ -1,6 +1,6 @@
 """
 Libre Bird — Local LLM Engine powered by llama-cpp-python.
-Supports Gemma 3 12B IT, Qwen 3, and other GGUF models.
+Supports Qwen 3, Gemma 3, and other GGUF models.
 Zero cloud. All inference runs on your Mac.
 """
 
@@ -35,6 +35,8 @@ CRITICAL HONESTY RULES:
 - If a tool returns raw file paths or system data, explain what they are honestly — don't present internal system files as user workspaces
 
 TOOL USE:
+- You have access to tools you can call using XML format. To call a tool, emit:
+  <tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>
 - You can chain multiple tools together to accomplish complex tasks
 - If a tool fails because a package is missing, use shell_command to install it and then retry
 - Combine tools creatively: web_search to find info, read_url to get details, run_code to process data, etc.
@@ -56,7 +58,7 @@ Key behaviors:
 - Help with writing, coding, research, and organization
 - Keep responses focused and practical
 - If context isn't relevant to the question, don't force it
-- Keep your internal reasoning brief and focused. For simple questions, think in 1-2 sentences. Save extended reasoning for complex problems.
+- When you need a tool, call it immediately — don't describe what you're going to do first.
 
 AGENTIC CAPABILITIES:
 - You can perform FILE OPERATIONS: read, write, create, move, copy, delete files and folders. Delete moves to Trash safely.
@@ -71,7 +73,9 @@ MULTI-STEP PLANNING:
 - You have up to 10 tool rounds per request — use them wisely to accomplish complex tasks autonomously.
 - After each tool result, inspect it and decide the next step. Don't ask the user for permission to continue — just do it.
 - Chain tools creatively: search files → read document → summarize → write output → copy to clipboard.
-- If a step fails, try an alternative approach before giving up."""
+- If a step fails, try an alternative approach before giving up.
+
+/no_think"""
 
 
 class LLMEngine:
@@ -183,8 +187,10 @@ class LLMEngine:
         
         import re
         
-        # 1. Strip thinking blocks: <think>...</think>
+        # 1. Strip thinking blocks: <think>...</think> (closed and unclosed)
         cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        # Also strip unclosed <think> (model hit max_tokens mid-thought)
+        cleaned = re.sub(r'<think>.*', '', cleaned, flags=re.DOTALL)
         
         # 2. Strip tool call/response blocks
         cleaned = re.sub(r'<tool_call>.*?</tool_call>', '', cleaned, flags=re.DOTALL)
@@ -214,6 +220,21 @@ class LLMEngine:
 
         # System prompt with optional context
         sys_content = SYSTEM_PROMPT
+
+        # Add compact tool list (avoids the bloated JSON schemas that overflow KV cache)
+        tool_lines = []
+        for td in TOOL_DEFINITIONS:
+            fn = td.get("function", {})
+            name = fn.get("name", "")
+            desc = fn.get("description", "")
+            params = fn.get("parameters", {}).get("properties", {})
+            param_names = list(params.keys())
+            if param_names:
+                tool_lines.append(f"- {name}({', '.join(param_names)}): {desc}")
+            else:
+                tool_lines.append(f"- {name}(): {desc}")
+        sys_content += "\n\nAVAILABLE TOOLS:\n" + "\n".join(tool_lines)
+
         if context:
             ctx_parts = []
             if context.get("app_name"):
@@ -306,7 +327,6 @@ class LLMEngine:
                         temperature=temperature,
                         max_tokens=max_tokens,
                         stream=True,
-                        tools=TOOL_DEFINITIONS if round_num < MAX_TOOL_ROUNDS else None,
                     )
                     for chunk in stream:
                         delta = chunk["choices"][0].get("delta", {})
@@ -350,7 +370,11 @@ class LLMEngine:
                         fn_args = tc_data.get("arguments", {})
                         logger.info(f"Tool call XML (round {round_num + 1}): {fn_name}({fn_args})")
                         yield ("tool", json.dumps({"name": fn_name, "step": round_num + 1, "max_steps": MAX_TOOL_ROUNDS}))
-                        result = execute_tool(fn_name, fn_args)
+                        # Run tool in executor so the event loop can flush
+                        # the tool-status SSE to the browser while we wait
+                        result = await loop.run_in_executor(
+                            None, execute_tool, fn_name, fn_args
+                        )
                         tool_results.append(f"<tool_response>\n{result}\n</tool_response>")
                     except json.JSONDecodeError:
                         logger.warning(f"Failed to parse tool call: {tc_json}")
@@ -372,7 +396,7 @@ class LLMEngine:
             return first_message[:50]
 
         prompt_messages = [
-            {"role": "system", "content": "Generate a very short title (3-6 words) for this conversation. Reply with ONLY the title, nothing else."},
+            {"role": "system", "content": "Generate a very short title (3-6 words) for this conversation. Reply with ONLY the title, nothing else.\n/no_think"},
             {"role": "user", "content": first_message},
         ]
 

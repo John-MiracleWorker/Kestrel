@@ -1,0 +1,12 @@
+{
+    "name": "browser_automation",
+    "display_name": "Browser Automation",
+    "description": "Full browser control with Playwright: navigate, click, type, screenshot, extract text from web pages.",
+    "version": "1.0.0",
+    "author": "Libre Bird Community",
+    "icon": "🌐",
+    "category": "community",
+    "dependencies": [
+        "playwright"
+    ]
+}

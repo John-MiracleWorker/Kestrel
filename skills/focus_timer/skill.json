@@ -1,0 +1,16 @@
+{
+    "name": "focus_timer",
+    "display_name": "Focus / Pomodoro Timer",
+    "description": "Pomodoro-style focus sessions with notifications, break reminders, and productivity tracking.",
+    "version": "1.0.0",
+    "author": "Libre Bird Community",
+    "icon": "🍅",
+    "category": "community",
+    "dependencies": [],
+    "tools": [
+        "start_focus",
+        "stop_focus",
+        "focus_status",
+        "focus_history"
+    ]
+}

@@ -1,0 +1,10 @@
+{
+    "name": "home_automation",
+    "display_name": "Home Automation",
+    "description": "Control HomeKit devices and run macOS Shortcuts from Libre Bird.",
+    "version": "1.0.0",
+    "author": "Libre Bird Community",
+    "icon": "🏠",
+    "category": "community",
+    "dependencies": []
+}

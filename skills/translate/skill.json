@@ -1,0 +1,14 @@
+{
+    "name": "translate",
+    "display_name": "Translation",
+    "description": "Translate text between languages using free translation APIs.",
+    "version": "1.0.0",
+    "author": "Libre Bird Community",
+    "icon": "🌐",
+    "category": "community",
+    "dependencies": [],
+    "tools": [
+        "translate_text",
+        "detect_language"
+    ]
+}

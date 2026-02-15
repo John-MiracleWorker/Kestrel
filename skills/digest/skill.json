@@ -1,0 +1,10 @@
+{
+    "name": "digest",
+    "display_name": "Daily Digest",
+    "description": "RSS feed reader and article digest. Subscribe to feeds, fetch latest articles, and get AI-powered summaries.",
+    "version": "1.0.0",
+    "author": "Libre Bird Community",
+    "icon": "📰",
+    "category": "community",
+    "dependencies": []
+}

@@ -1,0 +1,16 @@
+{
+    "name": "system_monitor",
+    "display_name": "System Monitor",
+    "description": "Monitor CPU, memory, disk, battery, network, and running processes.",
+    "version": "1.0.0",
+    "author": "Libre Bird Community",
+    "icon": "📊",
+    "category": "community",
+    "dependencies": [],
+    "tools": [
+        "system_stats",
+        "battery_status",
+        "top_processes",
+        "network_info"
+    ]
+}

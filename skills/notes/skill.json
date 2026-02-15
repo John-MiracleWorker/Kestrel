@@ -1,0 +1,10 @@
+{
+    "name": "notes",
+    "display_name": "Apple Notes",
+    "description": "Read, create, and search Apple Notes via AppleScript.",
+    "version": "1.0.0",
+    "author": "Libre Bird Community",
+    "icon": "📝",
+    "category": "community",
+    "dependencies": []
+}

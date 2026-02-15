@@ -1,0 +1,20 @@
+{
+    "name": "documents",
+    "display_name": "Document Intelligence",
+    "description": "Parse, extract text, and summarize PDFs, Word docs, and spreadsheets.",
+    "version": "1.0.0",
+    "author": "Libre Bird Community",
+    "icon": "📄",
+    "category": "community",
+    "dependencies": [
+        "pypdf",
+        "python-docx",
+        "openpyxl"
+    ],
+    "tools": [
+        "read_pdf",
+        "read_docx",
+        "read_xlsx",
+        "document_stats"
+    ]
+}

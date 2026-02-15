@@ -1,0 +1,10 @@
+{
+    "name": "screen",
+    "display_name": "Screen Analysis",
+    "description": "Read and analyze on-screen content using OCR. Capture screenshots and extract text.",
+    "version": "1.0.0",
+    "author": "Libre Bird",
+    "icon": "👁",
+    "category": "built-in",
+    "dependencies": []
+}

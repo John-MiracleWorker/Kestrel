@@ -1,0 +1,10 @@
+{
+    "name": "knowledge",
+    "display_name": "Knowledge Base",
+    "description": "Search and add documents to the local RAG knowledge base",
+    "version": "1.0.0",
+    "author": "Libre Bird",
+    "icon": "🧠",
+    "category": "built-in",
+    "dependencies": []
+}

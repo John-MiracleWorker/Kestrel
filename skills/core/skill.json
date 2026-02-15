@@ -1,0 +1,10 @@
+{
+    "name": "core",
+    "display_name": "Core Utilities",
+    "description": "Essential tools: date/time, calculator, weather, URL opener, file search, system info, app launcher",
+    "version": "1.0.0",
+    "author": "Libre Bird",
+    "icon": "⚙️",
+    "category": "built-in",
+    "dependencies": []
+}

@@ -1,0 +1,10 @@
+{
+    "name": "productivity",
+    "display_name": "Productivity",
+    "description": "Clipboard manager, reminders, file operations, keyboard automation, document reader, notifications",
+    "version": "1.0.0",
+    "author": "Libre Bird",
+    "icon": "📋",
+    "category": "built-in",
+    "dependencies": []
+}

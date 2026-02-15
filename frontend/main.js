@@ -1005,6 +1005,9 @@ async function loadSettings() {
         // Load models
         await loadModels();
 
+        // Load skills
+        await loadSkills();
+
         // Attach handlers
         setupSettingHandlers();
     } catch (e) { }
@@ -1084,6 +1087,65 @@ async function saveSetting(key, value) {
     } catch (e) {
         console.error('Failed to save setting:', e);
     }
+}
+
+// ── Skills ────────────────────────────────────────────────────
+async function loadSkills() {
+    const grid = document.getElementById('skills-grid');
+    if (!grid) return;
+    try {
+        const data = await api.get('/api/skills');
+        renderSkills(data.skills || []);
+    } catch (e) {
+        grid.innerHTML = '<div style="padding: 12px; color: var(--text-tertiary); font-size: 0.82rem;">Could not load skills.</div>';
+    }
+}
+
+function renderSkills(skills) {
+    const grid = document.getElementById('skills-grid');
+    if (!grid) return;
+    if (skills.length === 0) {
+        grid.innerHTML = '<div style="padding: 12px; color: var(--text-tertiary); font-size: 0.82rem;">No skills installed.</div>';
+        return;
+    }
+
+    grid.innerHTML = skills.map(s => {
+        const catClass = s.category === 'community' ? 'community' : 'builtin';
+        const catLabel = s.category === 'community' ? 'Community' : 'Built-in';
+        return `
+            <div class="skill-card ${s.enabled ? '' : 'disabled'}">
+                <div class="skill-card-header">
+                    <span class="skill-icon">${s.icon || '🧩'}</span>
+                    <span class="skill-badge ${catClass}">${catLabel}</span>
+                    <label class="toggle skill-toggle">
+                        <input type="checkbox" data-skill="${s.name}" ${s.enabled ? 'checked' : ''}>
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <div class="skill-card-body">
+                    <strong>${escapeHtml(s.display_name)}</strong>
+                    <span class="skill-desc">${escapeHtml(s.description)}</span>
+                    <span class="skill-tools">${s.tool_count || 0} tool${s.tool_count !== 1 ? 's' : ''}</span>
+                </div>
+            </div>
+        `;
+    }).join('');
+
+    // Toggle handlers
+    grid.querySelectorAll('input[data-skill]').forEach(input => {
+        input.addEventListener('change', async () => {
+            const name = input.dataset.skill;
+            const enabled = input.checked;
+            try {
+                await api.post(`/api/skills/${name}/toggle`, { enabled });
+                // Re-render to update visual state
+                await loadSkills();
+            } catch (e) {
+                input.checked = !enabled; // revert on error
+                console.error('Skill toggle failed:', e);
+            }
+        });
+    });
 }
 
 async function loadModels() {
@@ -1200,15 +1262,29 @@ async function pollVoice() {
                     input.dispatchEvent(new Event('input'));
                 }
             }
+            // Auto-send after voice transcription
+            const sendBtn = document.getElementById('send-btn');
+            if (sendBtn && document.getElementById('chat-input').value.trim()) {
+                sendBtn.click();
+            }
         }
-        // Update mic button visual state
+        // Update mic button visual state based on detailed status
         const micBtn = document.getElementById('mic-btn');
         if (micBtn) {
-            if (res.listening) {
+            // Remove all voice states first
+            micBtn.classList.remove('listening', 'wake-detected', 'recording', 'transcribing');
+
+            if (res.status === 'wake_word_detected') {
+                micBtn.classList.add('wake-detected');
+                showVoiceToast('🎤 Hey Libre! Listening...');
+            } else if (res.status === 'recording') {
+                micBtn.classList.add('recording');
+            } else if (res.status === 'transcribing') {
+                micBtn.classList.add('transcribing');
+            } else if (res.listening) {
                 micBtn.classList.add('listening');
-            } else {
-                micBtn.classList.remove('listening');
             }
+
             // Show running state
             if (res.running) {
                 micBtn.classList.add('active');
@@ -1218,6 +1294,23 @@ async function pollVoice() {
         // Server might be down, ignore
         console.warn('Voice poll error:', e);
     }
+}
+
+function showVoiceToast(message) {
+    // Remove any existing voice toast
+    const existing = document.querySelector('.voice-toast');
+    if (existing) existing.remove();
+
+    const toast = document.createElement('div');
+    toast.className = 'voice-toast';
+    toast.textContent = message;
+    document.body.appendChild(toast);
+    // Trigger animation
+    requestAnimationFrame(() => toast.classList.add('show'));
+    setTimeout(() => {
+        toast.classList.remove('show');
+        setTimeout(() => toast.remove(), 300);
+    }, 2500);
 }
 
 async function speakText(text) {

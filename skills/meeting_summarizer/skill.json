@@ -1,0 +1,14 @@
+{
+    "name": "meeting_summarizer",
+    "display_name": "Meeting Summarizer",
+    "description": "Summarize meeting transcripts, extract action items, and identify key decisions.",
+    "version": "1.0.0",
+    "author": "Libre Bird Community",
+    "icon": "📝",
+    "category": "community",
+    "dependencies": [],
+    "tools": [
+        "summarize_meeting",
+        "extract_action_items"
+    ]
+}

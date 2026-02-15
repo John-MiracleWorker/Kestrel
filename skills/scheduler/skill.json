@@ -1,0 +1,15 @@
+{
+    "name": "scheduler",
+    "display_name": "Task Scheduler",
+    "description": "Schedule prompts, commands, and reminders to run at specific times or intervals.",
+    "version": "1.0.0",
+    "author": "Libre Bird Community",
+    "icon": "⏰",
+    "category": "community",
+    "dependencies": [],
+    "tools": [
+        "schedule_task",
+        "list_scheduled",
+        "cancel_scheduled"
+    ]
+}

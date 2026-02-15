@@ -1,0 +1,15 @@
+{
+    "name": "api_caller",
+    "display_name": "API Caller",
+    "description": "Make HTTP requests to any REST API — GET, POST, PUT, DELETE with custom headers and JSON bodies.",
+    "version": "1.0.0",
+    "author": "Libre Bird Community",
+    "icon": "🔌",
+    "category": "community",
+    "dependencies": [],
+    "tools": [
+        "http_request",
+        "http_get",
+        "http_post"
+    ]
+}

@@ -95,6 +95,7 @@ class VoiceListener:
         self._pa = None
         self._running = False
         self._listening = False
+        self._status = "idle"  # Current status for API
         self._thread: Optional[threading.Thread] = None
         self._auto_focus = auto_focus
 
@@ -114,6 +115,10 @@ class VoiceListener:
     @property
     def is_listening(self) -> bool:
         return self._listening
+
+    @property
+    def status(self) -> str:
+        return self._status
 
     def get_transcriptions(self) -> list[str]:
         """Get and clear all pending transcriptions (thread-safe)."""
@@ -152,8 +157,9 @@ class VoiceListener:
             return True
 
         try:
-            if "mlx_whisper" in dir():
-                # mlx-whisper doesn't need explicit model loading
+            # Check if mlx-whisper was imported at module level
+            import sys
+            if "mlx_whisper" in sys.modules:
                 self._model = "mlx"
                 logger.info("Using mlx-whisper backend")
                 return True
@@ -272,7 +278,7 @@ class VoiceListener:
                     temp_path = f.name
 
                 result = mlx_whisper.transcribe(
-                    temp_path, path_or_hf_repo="mlx-community/whisper-small"
+                    temp_path, path_or_hf_repo="mlx-community/whisper-small-mlx"
                 )
                 os.unlink(temp_path)
                 return result.get("text", "").strip()
@@ -310,7 +316,25 @@ class VoiceListener:
                 if not self._running:
                     break
 
-                text = self._transcribe(audio_chunk).lower()
+                # Skip silent audio — Whisper hallucinates "thank you" on silence
+                chunk_rms = _rms(audio_chunk)
+                if chunk_rms < 300:
+                    continue
+
+                text = self._transcribe(audio_chunk).lower().strip()
+
+                # Filter known Whisper hallucinations on near-silence
+                HALLUCINATIONS = {
+                    "thank you", "thank you.", "thanks for watching",
+                    "thanks for watching.", "you", "bye", "bye.",
+                    "thanks.", "thank you for watching.",
+                    "please subscribe", "subscribe",
+                }
+                if text in HALLUCINATIONS:
+                    continue
+
+                if text:
+                    logger.info(f"Wake word check: heard '{text}'")
 
                 if WAKE_WORD in text:
                     logger.info("🎤 Wake word detected!")
@@ -355,6 +379,7 @@ class VoiceListener:
 
     def _emit_status(self, status: str):
         """Emit a status update."""
+        self._status = status
         logger.info(f"Voice status: {status}")
         if self.on_status:
             try:

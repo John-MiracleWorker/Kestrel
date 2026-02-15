@@ -1,0 +1,15 @@
+{
+    "name": "wikipedia",
+    "display_name": "Wikipedia + Wolfram Alpha",
+    "description": "Look up facts on Wikipedia and compute answers with Wolfram Alpha.",
+    "version": "1.0.0",
+    "author": "Libre Bird Community",
+    "icon": "📚",
+    "category": "community",
+    "dependencies": [],
+    "tools": [
+        "wikipedia_search",
+        "wikipedia_summary",
+        "wolfram_alpha"
+    ]
+}

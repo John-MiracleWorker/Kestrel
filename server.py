@@ -235,7 +235,8 @@ async def chat(req: ChatRequest):
         display_response = ""   # only the answer (saved to DB)
         thinking_text = ""      # thinking block content
         in_thinking = False
-        think_buffer = ""       # buffer to detect <think> and </think> tags
+        in_tool_call = False     # suppress <tool_call>...</tool_call> from display
+        think_buffer = ""       # buffer to detect <think>, </think>, <tool_call>, </tool_call>
 
         try:
             async for tag, content in llm_engine.chat_stream(
@@ -251,13 +252,23 @@ async def chat(req: ChatRequest):
                     yield {"event": "tool", "data": content}
                     continue
 
-                # tag == "raw" — stream token with think detection
+                # tag == "raw" — stream token with think/tool_call detection
                 full_response += content
                 think_buffer += content
 
-                # Process buffer for <think> and </think> tags
+                # Process buffer for <think>, </think>, <tool_call>, </tool_call> tags
                 while think_buffer:
-                    if in_thinking:
+                    if in_tool_call:
+                        # Suppress everything inside <tool_call>...</tool_call>
+                        end_idx = think_buffer.find("</tool_call>")
+                        if end_idx != -1:
+                            think_buffer = think_buffer[end_idx + len("</tool_call>"):]
+                            in_tool_call = False
+                        else:
+                            # Hasn't closed yet — consume and wait
+                            think_buffer = ""
+                            break
+                    elif in_thinking:
                         # Look for </think>
                         end_idx = think_buffer.find("</think>")
                         if end_idx != -1:
@@ -279,29 +290,26 @@ async def chat(req: ChatRequest):
                             else:
                                 break  # Wait for more data
                     else:
-                        # Look for <think>
-                        start_idx = think_buffer.find("<think>")
-                        if start_idx != -1:
-                            # Emit any content before <think> as regular tokens
-                            before = think_buffer[:start_idx]
-                            if before:
-                                display_response += before
-                                yield {"event": "token", "data": json.dumps({"token": before})}
-                            think_buffer = think_buffer[start_idx + len("<think>"):]
-                            in_thinking = True
-                        else:
-                            # Could be a partial <think> at the end
-                            # Check if the buffer ends with a prefix of "<think>"
+                        # Not inside any tag — check for <think> or <tool_call>
+                        think_idx = think_buffer.find("<think>")
+                        tool_idx = think_buffer.find("<tool_call>")
+
+                        # Find the earliest tag
+                        if think_idx == -1 and tool_idx == -1:
+                            # No tags found — check for partial tags at end of buffer
                             partial = False
-                            for i in range(1, min(len("<think>"), len(think_buffer) + 1)):
-                                if think_buffer.endswith("<think>"[:i]):
-                                    # Emit everything except the potential partial tag
-                                    safe = think_buffer[:len(think_buffer) - i]
-                                    if safe:
-                                        display_response += safe
-                                        yield {"event": "token", "data": json.dumps({"token": safe})}
-                                    think_buffer = think_buffer[len(think_buffer) - i:]
-                                    partial = True
+                            for tag_str in ("<think>", "<tool_call>"):
+                                for i in range(1, min(len(tag_str), len(think_buffer) + 1)):
+                                    if think_buffer.endswith(tag_str[:i]):
+                                        # Emit everything except the potential partial tag
+                                        safe = think_buffer[:len(think_buffer) - i]
+                                        if safe:
+                                            display_response += safe
+                                            yield {"event": "token", "data": json.dumps({"token": safe})}
+                                        think_buffer = think_buffer[len(think_buffer) - i:]
+                                        partial = True
+                                        break
+                                if partial:
                                     break
                             if not partial:
                                 # No partial tag — emit everything
@@ -310,9 +318,29 @@ async def chat(req: ChatRequest):
                                 think_buffer = ""
                             break  # Wait for more data if partial
 
+                        # Determine which tag comes first
+                        if think_idx != -1 and (tool_idx == -1 or think_idx < tool_idx):
+                            # <think> comes first
+                            before = think_buffer[:think_idx]
+                            if before:
+                                display_response += before
+                                yield {"event": "token", "data": json.dumps({"token": before})}
+                            think_buffer = think_buffer[think_idx + len("<think>"):]
+                            in_thinking = True
+                        else:
+                            # <tool_call> comes first
+                            before = think_buffer[:tool_idx]
+                            if before:
+                                display_response += before
+                                yield {"event": "token", "data": json.dumps({"token": before})}
+                            think_buffer = think_buffer[tool_idx + len("<tool_call>"):]
+                            in_tool_call = True
+
             # Flush remaining buffer
             if think_buffer:
-                if in_thinking:
+                if in_tool_call:
+                    pass  # Discard — tool_call content is never shown
+                elif in_thinking:
                     thinking_text += think_buffer
                     yield {"event": "thinking", "data": json.dumps({"token": think_buffer})}
                 else:
@@ -591,7 +619,7 @@ async def cancel_reminder(reminder_id: str):
 @app.get("/api/briefing")
 async def daily_briefing():
     """Assemble a morning briefing: weather, pending tasks, yesterday's journal."""
-    from tools import tool_get_weather
+    from skills.core import tool_get_weather
 
     pieces = []
 
@@ -670,6 +698,7 @@ async def voice_status():
     return {
         "running": voice_listener.is_running,
         "listening": voice_listener.is_listening,
+        "status": voice_listener.status,
         "transcriptions": transcriptions,
     }
 
@@ -700,6 +729,31 @@ async def stop_tts():
 @app.get("/api/tts/status")
 async def tts_status():
     return {"speaking": tts_is_speaking()}
+
+
+# ── Skills API ───────────────────────────────────────────────────────
+
+
+@app.get("/api/skills")
+async def list_skills():
+    """List all installed skills with their enabled/disabled status."""
+    from skill_loader import list_skills as _list_skills
+    return {"skills": _list_skills()}
+
+
+class SkillToggle(BaseModel):
+    enabled: Optional[bool] = None
+
+
+@app.post("/api/skills/{name}/toggle")
+async def toggle_skill(name: str, body: SkillToggle = None):
+    """Toggle a skill on/off. Pass {enabled: true/false} or omit to flip."""
+    from skill_loader import toggle_skill as _toggle_skill
+    enabled = body.enabled if body else None
+    result = _toggle_skill(name, enabled)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return result
 
 
 # ── Generated Images Serving ────────────────────────────────────────

@@ -1,0 +1,10 @@
+{
+    "name": "media",
+    "display_name": "Media & Music",
+    "description": "Apple Music control, text-to-speech, AI image generation",
+    "version": "1.0.0",
+    "author": "Libre Bird",
+    "icon": "🎵",
+    "category": "built-in",
+    "dependencies": []
+}

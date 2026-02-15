@@ -1,0 +1,16 @@
+{
+    "name": "email",
+    "display_name": "Apple Mail",
+    "description": "Read inbox, compose emails, and check unread count using macOS Mail.",
+    "version": "1.0.0",
+    "author": "Libre Bird Community",
+    "icon": "📧",
+    "category": "community",
+    "dependencies": [],
+    "tools": [
+        "check_inbox",
+        "read_email",
+        "compose_email",
+        "unread_count"
+    ]
+}

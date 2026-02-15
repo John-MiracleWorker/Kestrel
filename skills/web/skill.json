@@ -1,0 +1,10 @@
+{
+    "name": "web",
+    "display_name": "Web & Code",
+    "description": "Web search, URL reader, Python code execution, shell commands",
+    "version": "1.0.0",
+    "author": "Libre Bird",
+    "icon": "🌐",
+    "category": "built-in",
+    "dependencies": []
+}

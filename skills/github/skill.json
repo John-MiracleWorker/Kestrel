@@ -1,0 +1,12 @@
+{
+    "name": "github",
+    "display_name": "GitHub",
+    "description": "GitHub integration: view repos, issues, pull requests, and repo stats. Requires a GITHUB_TOKEN in .env.",
+    "version": "1.0.0",
+    "author": "Libre Bird Community",
+    "icon": "🐙",
+    "category": "community",
+    "dependencies": [
+        "GITHUB_TOKEN environment variable"
+    ]
+}
