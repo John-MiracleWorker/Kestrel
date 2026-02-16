@@ -28,6 +28,9 @@ from google.protobuf import json_format
 from providers.local import LocalProvider
 from providers.cloud import CloudProvider
 from memory.vector_store import VectorStore
+from memory.retrieval import RetrievalPipeline
+from memory.embeddings import EmbeddingPipeline
+from provider_config import ProviderConfig
 
 load_dotenv()
 logger = logging.getLogger("brain")
@@ -210,6 +213,8 @@ async def save_message(conversation_id: str, role: str, content: str) -> str:
 # ── LLM Provider Registry ────────────────────────────────────────────
 
 _providers: dict[str, LocalProvider | CloudProvider] = {}
+_retrieval: RetrievalPipeline | None = None
+_embedding_pipeline: EmbeddingPipeline | None = None
 
 
 def get_provider(name: str):
@@ -240,15 +245,21 @@ class BrainServicer:
         user_id = request.user_id
         workspace_id = request.workspace_id
         conversation_id = request.conversation_id
-        provider_name = request.provider or "local"
-        model = request.model
 
         logger.info(
-            f"StreamChat: user={user_id}, provider={provider_name}, "
-            f"model={model}, msgs={len(request.messages)}"
+            f"StreamChat: user={user_id}, workspace={workspace_id}, "
+            f"msgs={len(request.messages)}"
         )
 
         try:
+            # ── 1. Load workspace provider config ───────────────────
+            pool = await get_pool()
+            ws_config = await ProviderConfig(pool).get_config(workspace_id)
+
+            # Request can override workspace defaults
+            provider_name = request.provider or ws_config["provider"]
+            model = request.model or ws_config["model"]
+
             provider = get_provider(provider_name)
 
             # Convert proto messages to dict format
@@ -260,29 +271,71 @@ class BrainServicer:
                     "content": msg.content,
                 })
 
-            # Extract parameters
+            # Extract parameters (request overrides → workspace config → defaults)
             params = dict(request.parameters) if request.parameters else {}
-            temperature = float(params.get("temperature", "0.7"))
-            max_tokens = int(params.get("max_tokens", "2048"))
+            temperature = float(params.get("temperature", str(ws_config["temperature"])))
+            max_tokens = int(params.get("max_tokens", str(ws_config["max_tokens"])))
 
-            # Stream tokens
+            # ── 2. RAG context injection ────────────────────────────
+            if ws_config["rag_enabled"] and _retrieval:
+                user_msg = next(
+                    (m["content"] for m in reversed(messages) if m["role"] == "user"),
+                    "",
+                )
+                if user_msg:
+                    base_prompt = ws_config.get("system_prompt", "")
+                    augmented = await _retrieval.build_augmented_prompt(
+                        workspace_id=workspace_id,
+                        user_message=user_msg,
+                        system_prompt=base_prompt,
+                        top_k=ws_config["rag_top_k"],
+                        min_similarity=ws_config["rag_min_similarity"],
+                    )
+                    if augmented:
+                        # Inject or replace system message
+                        if messages and messages[0]["role"] == "system":
+                            messages[0]["content"] = augmented
+                        else:
+                            messages.insert(0, {"role": "system", "content": augmented})
+
+            elif ws_config.get("system_prompt"):
+                # No RAG but workspace has a system prompt
+                if messages and messages[0]["role"] == "system":
+                    messages[0]["content"] = ws_config["system_prompt"]
+                else:
+                    messages.insert(0, {"role": "system", "content": ws_config["system_prompt"]})
+
+            logger.info(f"Using provider={provider_name}, model={model}")
+
+            # ── 3. Stream tokens ────────────────────────────────────
             async for token in provider.stream(
                 messages=messages,
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
             ):
-                # Build ChatResponse proto
                 yield self._make_response(
                     chunk_type=0,  # CONTENT_DELTA
                     content_delta=token,
                 )
 
-            # Save the full response to DB
-            # (Provider accumulates internally)
+            # ── 4. Save response + auto-embed ──────────────────────
             full_response = provider.last_response
             if conversation_id and full_response:
                 await save_message(conversation_id, "assistant", full_response)
+
+                # Auto-embed the Q&A pair for future RAG
+                if ws_config["rag_enabled"] and _embedding_pipeline:
+                    user_msg = next(
+                        (m["content"] for m in reversed(messages) if m["role"] == "user"),
+                        "",
+                    )
+                    await _embedding_pipeline.embed_conversation_turn(
+                        workspace_id=workspace_id,
+                        conversation_id=conversation_id,
+                        user_message=user_msg,
+                        assistant_response=full_response,
+                    )
 
             # Send DONE
             yield self._make_response(
@@ -429,10 +482,16 @@ async def serve():
     await get_pool()
     logger.info("Database pool initialized")
 
-    # Initialize vector store
+    # Initialize vector store + RAG pipelines
     vector_store = VectorStore()
     await vector_store.initialize()
     logger.info("Vector store initialized")
+
+    global _retrieval, _embedding_pipeline
+    _retrieval = RetrievalPipeline(vector_store)
+    _embedding_pipeline = EmbeddingPipeline(vector_store)
+    await _embedding_pipeline.start()
+    logger.info("RAG pipelines initialized")
 
     await server.start()
     logger.info("Brain service ready")

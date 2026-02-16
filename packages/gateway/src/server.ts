@@ -13,6 +13,7 @@ import workspaceRoutes from './routes/workspaces';
 import apiKeyRoutes from './routes/api-keys';
 import oauthRoutes from './auth/strategies/oauth';
 import magicLinkRoutes from './auth/strategies/magic-link';
+import providerRoutes from './routes/providers';
 
 dotenv.config();
 
@@ -90,6 +91,7 @@ async function start() {
         await apiKeyRoutes(app, { redis });
         await oauthRoutes(app, deps);
         await magicLinkRoutes(app, deps);
+        await providerRoutes(app, deps);
 
         // 4. Set up metrics
         setupMetrics(app);

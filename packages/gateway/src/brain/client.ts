@@ -60,6 +60,26 @@ export class BrainClient {
     }
 
     /**
+     * Generic unary RPC call — used for forward-compatible Brain methods.
+     * Falls back to a no-op if the method doesn't exist yet.
+     */
+    async call(method: string, request: any): Promise<any> {
+        if (!this.connected) throw new Error('Brain service not connected');
+
+        return new Promise((resolve, reject) => {
+            if (typeof this.client[method] !== 'function') {
+                logger.warn(`Brain RPC method ${method} not available — returning empty`);
+                resolve({});
+                return;
+            }
+            this.client[method](request, (err: Error | null, response: any) => {
+                if (err) reject(err);
+                else resolve(response);
+            });
+        });
+    }
+
+    /**
      * Stream chat — returns an async iterable of ChatResponse chunks.
      */
     async *streamChat(request: {
