@@ -839,13 +839,16 @@ class CloudChatRequest(BaseModel):
     temperature: float = 0.7
     max_tokens: int = 2048
     mode: str = "general"
+    autonomous: bool = False
 
 
 @app.post("/api/chat/cloud")
 async def cloud_chat_endpoint(req: CloudChatRequest):
-    """Send a message to a cloud LLM provider (SSE streaming)."""
+    """Send a message to a cloud LLM provider (SSE streaming with tool support)."""
+    import re
     from cloud_providers import cloud_chat_stream, PROVIDERS
-    from agent_modes import get_prompt_addon
+    from agent_modes import get_prompt_addon, get_preferred_skills
+    from tools import TOOL_DEFINITIONS, execute_tool
 
     if req.provider not in PROVIDERS:
         raise HTTPException(400, f"Unknown provider: {req.provider}")
@@ -868,33 +871,117 @@ async def cloud_chat_endpoint(req: CloudChatRequest):
         except Exception:
             pass
 
-    # Build messages
+    # Build messages with tool definitions (mirrors llm_engine._build_messages)
     from llm_engine import SYSTEM_PROMPT
     sys_content = SYSTEM_PROMPT
     mode_addon = get_prompt_addon(req.mode)
     if mode_addon:
         sys_content += "\n" + mode_addon.strip()
 
+    # Add tool list so the cloud model knows what tools are available
+    preferred = set(get_preferred_skills(req.mode))
+
+    def _tool_line(td):
+        fn = td.get("function", {})
+        name = fn.get("name", "")
+        desc = fn.get("description", "")
+        params = fn.get("parameters", {}).get("properties", {})
+        param_names = list(params.keys())
+        if param_names:
+            return f"- {name}({', '.join(param_names)}): {desc}"
+        return f"- {name}(): {desc}"
+
+    if preferred:
+        pref_lines = [_tool_line(td) for td in TOOL_DEFINITIONS
+                      if td.get("_skill") in preferred]
+        other_lines = [_tool_line(td) for td in TOOL_DEFINITIONS
+                       if td.get("_skill") not in preferred]
+        sys_content += "\n\nPREFERRED TOOLS (use these first):\n" + "\n".join(pref_lines)
+        if other_lines:
+            sys_content += "\n\nOTHER AVAILABLE TOOLS:\n" + "\n".join(other_lines)
+    else:
+        tool_lines = [_tool_line(td) for td in TOOL_DEFINITIONS]
+        if tool_lines:
+            sys_content += "\n\nAVAILABLE TOOLS:\n" + "\n".join(tool_lines)
+
     messages = [{"role": "system", "content": sys_content}]
     for msg in history[-20:]:
         messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": req.message})
 
+    max_tool_rounds = 10 if req.autonomous else 1
+
     async def event_generator():
+        nonlocal messages
         full_response = ""
         try:
-            # Send conversation ID first so frontend can track it
             yield {"event": "meta", "data": json.dumps({"conversation_id": conv_id})}
 
-            async for token in cloud_chat_stream(
-                req.provider, model, messages,
-                req.temperature, req.max_tokens,
-            ):
-                full_response += token
-                yield {
-                    "event": "token",
-                    "data": json.dumps({"token": token}),
-                }
+            for round_num in range(max_tool_rounds + 1):
+                # Stream one round from the cloud model
+                accumulated = ""
+                async for token in cloud_chat_stream(
+                    req.provider, model, messages,
+                    req.temperature, req.max_tokens,
+                ):
+                    accumulated += token
+                    yield {
+                        "event": "token",
+                        "data": json.dumps({"token": token}),
+                    }
+
+                # Check for tool calls in the accumulated response
+                xml_tool_calls = re.findall(
+                    r'<tool_call>\s*(\{.*?\})\s*</tool_call>',
+                    accumulated, re.DOTALL
+                )
+
+                if xml_tool_calls and round_num < max_tool_rounds:
+                    # Tool call detected — execute and loop
+                    messages.append({"role": "assistant", "content": accumulated})
+                    tool_results = []
+
+                    for tc_json in xml_tool_calls:
+                        try:
+                            tc_data = json.loads(tc_json)
+                            fn_name = tc_data.get("name", "")
+                            fn_args = tc_data.get("arguments", {})
+                            logger.info(f"Cloud tool call (round {round_num + 1}): {fn_name}({fn_args})")
+
+                            yield {"event": "tool", "data": json.dumps({
+                                "name": fn_name,
+                                "step": round_num + 1,
+                                "max_steps": max_tool_rounds,
+                            })}
+                            yield {"event": "progress", "data": json.dumps({
+                                "round": round_num + 1,
+                                "total": max_tool_rounds,
+                                "tool": fn_name,
+                            })}
+
+                            # Execute tool in executor to not block event loop
+                            loop = asyncio.get_event_loop()
+                            result = await loop.run_in_executor(
+                                None, execute_tool, fn_name, fn_args
+                            )
+                            tool_results.append(
+                                f"<tool_response>\n{result}\n</tool_response>"
+                            )
+                        except json.JSONDecodeError:
+                            logger.warning(f"Failed to parse tool call: {tc_json}")
+                            continue
+
+                    if tool_results:
+                        messages.append({
+                            "role": "user",
+                            "content": "\n".join(tool_results),
+                        })
+                    # Continue the loop — will stream the next round
+                    continue
+
+                # No tool calls — this is the final response
+                full_response = accumulated
+                break
 
             # Save the full response
             await db.add_message(conv_id, "assistant", full_response)

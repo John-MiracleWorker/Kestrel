@@ -281,7 +281,7 @@ async function sendMessage() {
     try {
         let res;
         if (isCloud) {
-            // Cloud provider — non-streaming JSON
+            // Cloud provider — SSE streaming with tool support
             res = await fetch('/api/chat/cloud', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -293,6 +293,7 @@ async function sendMessage() {
                     temperature: parseFloat(state.settings.temperature || 0.7),
                     max_tokens: parseInt(state.settings.max_tokens || 2048),
                     mode: state.currentMode,
+                    autonomous: state.autonomous,
                 }),
             });
         } else {
