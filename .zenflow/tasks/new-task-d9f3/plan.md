@@ -796,6 +796,7 @@ Prepare for cloud deployment.
 - [ ] Tested on AWS/GCP/Azure
 
 ### [ ] Step: Documentation and launch preparation
+<!-- chat-id: 50513744-a263-43a2-b4ed-aa3403d9340f -->
 
 Finalize documentation and prepare for v1.0 launch.
 
