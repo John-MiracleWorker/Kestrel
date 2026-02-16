@@ -17,17 +17,17 @@ logger = logging.getLogger("brain.providers.cloud")
 PROVIDER_CONFIGS = {
     "openai": {
         "api_key_env": "OPENAI_API_KEY",
-        "default_model": os.getenv("OPENAI_DEFAULT_MODEL", "gpt-4-turbo-preview"),
+        "default_model": os.getenv("OPENAI_DEFAULT_MODEL", "gpt-5-nano"),
         "base_url": "https://api.openai.com/v1/chat/completions",
     },
     "anthropic": {
         "api_key_env": "ANTHROPIC_API_KEY",
-        "default_model": os.getenv("ANTHROPIC_DEFAULT_MODEL", "claude-3-opus-20240229"),
+        "default_model": os.getenv("ANTHROPIC_DEFAULT_MODEL", "claude-haiku-4-5"),
         "base_url": "https://api.anthropic.com/v1/messages",
     },
     "google": {
         "api_key_env": "GOOGLE_API_KEY",
-        "default_model": os.getenv("GOOGLE_DEFAULT_MODEL", "gemini-pro"),
+        "default_model": os.getenv("GOOGLE_DEFAULT_MODEL", "gemini-2.5-flash"),
         "base_url": "https://generativelanguage.googleapis.com/v1beta/models",
     },
 }
