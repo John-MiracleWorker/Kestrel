@@ -1,0 +1,15 @@
+{
+  "name": "@librebird/brain",
+  "version": "0.1.0",
+  "description": "Brain service - LLM engine and reasoning coordinator",
+  "scripts": {
+    "dev": "python server.py",
+    "test": "pytest tests/",
+    "lint": "ruff check .",
+    "format": "ruff format .",
+    "typecheck": "mypy ."
+  },
+  "engines": {
+    "python": ">=3.10"
+  }
+}

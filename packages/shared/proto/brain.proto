@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package librebird.brain;
+
+// Brain service handles LLM inference and reasoning
+service BrainService {
+  // Stream chat completions with tool calling support
+  rpc StreamChat(ChatRequest) returns (stream ChatResponse);
+  
+  // Health check endpoint
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// Chat request message
+message ChatRequest {
+  string user_id = 1;
+  string workspace_id = 2;
+  string conversation_id = 3;
+  repeated Message messages = 4;
+  string provider = 5; // "local", "openai", "anthropic", "google"
+  string model = 6;
+  map<string, string> parameters = 7; // temperature, max_tokens, etc.
+  repeated Tool available_tools = 8;
+}
+
+// Individual message in conversation
+message Message {
+  enum Role {
+    USER = 0;
+    ASSISTANT = 1;
+    SYSTEM = 2;
+    TOOL = 3;
+  }
+  
+  Role role = 1;
+  string content = 2;
+  string tool_call_id = 3; // for tool responses
+  repeated ToolCall tool_calls = 4; // for assistant messages with tool calls
+}
+
+// Tool definition
+message Tool {
+  string name = 1;
+  string description = 2;
+  string parameters_schema = 3; // JSON schema as string
+}
+
+// Tool call made by assistant
+message ToolCall {
+  string id = 1;
+  string name = 2;
+  string arguments = 3; // JSON string
+}
+
+// Chat response (streamed)
+message ChatResponse {
+  enum ChunkType {
+    CONTENT_DELTA = 0;
+    TOOL_CALL = 1;
+    DONE = 2;
+    ERROR = 3;
+  }
+  
+  ChunkType type = 1;
+  string content_delta = 2;
+  ToolCall tool_call = 3;
+  string error_message = 4;
+  
+  // Metadata
+  map<string, string> metadata = 5; // usage stats, model info, etc.
+}
+
+// Health check messages
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  string version = 2;
+  map<string, string> status = 3; // provider status, model status, etc.
+}

@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+package librebird.hands;
+
+// Hands service handles sandboxed tool execution
+service HandsService {
+  // Execute a skill in sandboxed environment
+  rpc ExecuteSkill(SkillExecutionRequest) returns (stream SkillExecutionResponse);
+  
+  // List available skills
+  rpc ListSkills(ListSkillsRequest) returns (ListSkillsResponse);
+  
+  // Health check endpoint
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// Skill execution request
+message SkillExecutionRequest {
+  string user_id = 1;
+  string workspace_id = 2;
+  string conversation_id = 3;
+  string skill_name = 4;
+  string function_name = 5;
+  string arguments = 6; // JSON string
+  
+  // Security and resource constraints
+  ResourceLimits limits = 7;
+  repeated string allowed_domains = 8; // for network access
+  repeated string allowed_paths = 9; // for file access
+}
+
+// Resource limits for sandbox
+message ResourceLimits {
+  int32 timeout_seconds = 1; // default: 30
+  int32 memory_mb = 2; // default: 512
+  float cpu_limit = 3; // default: 1.0
+  bool network_enabled = 4; // default: false
+  bool file_system_read = 5; // default: false
+  bool file_system_write = 6; // default: false
+}
+
+// Skill execution response (streamed)
+message SkillExecutionResponse {
+  enum Status {
+    RUNNING = 0;
+    SUCCESS = 1;
+    ERROR = 2;
+    TIMEOUT = 3;
+    PERMISSION_DENIED = 4;
+  }
+  
+  Status status = 1;
+  string output = 2; // stdout/result
+  string error = 3; // stderr/error message
+  
+  // Metadata
+  int32 execution_time_ms = 4;
+  int32 memory_used_mb = 5;
+  AuditLog audit_log = 6;
+}
+
+// Audit log for skill execution
+message AuditLog {
+  repeated string network_requests = 1;
+  repeated string file_accesses = 2;
+  repeated string system_calls = 3;
+  string sandbox_id = 4;
+}
+
+// List skills request
+message ListSkillsRequest {
+  string workspace_id = 1;
+}
+
+// List skills response
+message ListSkillsResponse {
+  repeated SkillMetadata skills = 1;
+}
+
+// Skill metadata
+message SkillMetadata {
+  string name = 1;
+  string description = 2;
+  string version = 3;
+  repeated FunctionMetadata functions = 4;
+  bool requires_network = 5;
+  bool requires_filesystem = 6;
+}
+
+// Function metadata
+message FunctionMetadata {
+  string name = 1;
+  string description = 2;
+  string parameters_schema = 3; // JSON schema
+}
+
+// Health check messages
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  string version = 2;
+  int32 active_sandboxes = 3;
+  int32 available_capacity = 4;
+}

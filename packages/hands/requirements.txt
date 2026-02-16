@@ -1,0 +1,11 @@
+grpcio>=1.60.0
+grpcio-tools>=1.60.0
+protobuf>=4.25.0
+docker>=7.0.0
+psycopg2-binary>=2.9.9
+pydantic>=2.5.0
+python-dotenv>=1.0.0
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+mypy>=1.8.0
+ruff>=0.1.0

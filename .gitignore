@@ -2,7 +2,11 @@
 __pycache__/
 *.pyc
 .venv/
+venv/
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Database (local data)
 *.db
@@ -11,11 +15,52 @@ __pycache__/
 
 # Models (too large for git)
 models/
+*.gguf
 
-# Node
+# Node/JavaScript
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.eslintcache
+
+# Legacy frontend
 frontend/node_modules/
 frontend/dist/
 
+# Monorepo packages
+packages/*/node_modules/
+packages/*/dist/
+packages/*/build/
+packages/shared/generated/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
 # Environment
 .env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Docker
+.docker/
+
+# Test coverage
+coverage/
+.coverage
+htmlcov/

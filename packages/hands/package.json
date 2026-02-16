@@ -1,0 +1,15 @@
+{
+  "name": "@librebird/hands",
+  "version": "0.1.0",
+  "description": "Hands service - Sandboxed tool execution engine",
+  "scripts": {
+    "dev": "python server.py",
+    "test": "pytest tests/",
+    "lint": "ruff check .",
+    "format": "ruff format .",
+    "typecheck": "mypy ."
+  },
+  "engines": {
+    "python": ">=3.10"
+  }
+}

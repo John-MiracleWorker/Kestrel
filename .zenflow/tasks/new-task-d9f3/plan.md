@@ -72,6 +72,7 @@ This project transforms Libre Bird into a full-blown OpenClaw-like platform thro
 **Goal**: Establish Gateway/Brain/Hands microservices architecture with Docker Compose local deployment
 
 ### [ ] Step: Project scaffolding and monorepo setup
+<!-- chat-id: 58ce7e22-3b4b-490e-9bea-dc56881d3f13 -->
 
 Set up the monorepo structure with proper tooling and initial configurations.
 
@@ -90,6 +91,7 @@ Set up the monorepo structure with proper tooling and initial configurations.
 - [ ] Protobuf definitions compile successfully
 
 ### [ ] Step: Gateway service foundation (Node.js/TypeScript)
+<!-- chat-id: 668e0b17-c708-414a-b414-e2e68b214552 -->
 
 Implement the core Gateway service with WebSocket support and basic routing.
 
@@ -123,6 +125,7 @@ Implement the core Gateway service with WebSocket support and basic routing.
 - [ ] Lint and typecheck clean (`npm run lint`, `npm run typecheck`)
 
 ### [ ] Step: Brain service with gRPC wrapper
+<!-- chat-id: 33c378c0-66d5-4597-a87f-e931e3257d06 -->
 
 Refactor existing `llm_engine.py` to work as a gRPC service.
 
@@ -154,6 +157,7 @@ Refactor existing `llm_engine.py` to work as a gRPC service.
 - [ ] Lint clean (`ruff check .`)
 
 ### [ ] Step: Hands service with Docker sandboxing
+<!-- chat-id: 6598cd78-fa46-4252-9b92-b67893f5de23 -->
 
 Create the Hands service for sandboxed tool execution.
 
@@ -190,6 +194,7 @@ Create the Hands service for sandboxed tool execution.
 - [ ] Lint clean (`ruff check .`)
 
 ### [ ] Step: PostgreSQL schema and migration tooling
+<!-- chat-id: 6767c39b-3bfb-48e4-a15a-c4ce3331965a -->
 
 Design multi-user database schema and create SQLite migration tools.
 
@@ -221,6 +226,7 @@ Design multi-user database schema and create SQLite migration tools.
 - [ ] Rollback functionality verified
 
 ### [ ] Step: Docker Compose local development environment
+<!-- chat-id: a81324b5-65df-4313-88e8-20b84261f24a -->
 
 Create Docker Compose setup for running all services locally.
 
@@ -251,6 +257,7 @@ Create Docker Compose setup for running all services locally.
 - [ ] Services restart gracefully
 
 ### [ ] Step: Backward compatibility with desktop app
+<!-- chat-id: 779c4304-36e8-4470-9752-1a183c44724c -->
 
 Ensure existing macOS desktop app can use new backend.
 
@@ -282,6 +289,7 @@ Ensure existing macOS desktop app can use new backend.
 **Goal**: Add multi-user support, authentication, workspaces, and web interface
 
 ### [ ] Step: User authentication and authorization system
+<!-- chat-id: c0ca772a-6a66-4f9c-bb9a-5256c5125b34 -->
 
 Implement JWT-based auth with multiple strategies.
 
@@ -314,6 +322,7 @@ Implement JWT-based auth with multiple strategies.
 - [ ] All unit tests passing
 
 ### [ ] Step: Workspace management and team collaboration
+<!-- chat-id: b3f20b09-4bd2-454d-80c4-f1731cb9a676 -->
 
 Implement workspace system for team collaboration.
 
@@ -342,6 +351,7 @@ Implement workspace system for team collaboration.
 - [ ] All tests passing
 
 ### [ ] Step: Multi-provider LLM support (OpenAI, Anthropic, Google)
+<!-- chat-id: 92c851ac-0787-4e50-ae68-48ac95b886e1 -->
 
 Extend Brain to support cloud LLM providers.
 
@@ -374,6 +384,7 @@ Extend Brain to support cloud LLM providers.
 - [ ] Integration tests passing for each provider
 
 ### [ ] Step: Vector memory (RAG) with pgvector
+<!-- chat-id: 955f8907-c9b6-467b-8fad-76edbe792ba2 -->
 
 Implement semantic memory and retrieval.
 
@@ -403,6 +414,7 @@ Implement semantic memory and retrieval.
 - [ ] All tests passing
 
 ### [ ] Step: Web application (React + WebSocket)
+<!-- chat-id: 6538114b-57ac-4ab7-bc06-c3e63b58df50 -->
 
 Build modern web interface with real-time chat.
 
@@ -443,6 +455,7 @@ Build modern web interface with real-time chat.
 **Goal**: Enable multi-channel support (WhatsApp, Telegram, Discord)
 
 ### [ ] Step: Channel adapter framework
+<!-- chat-id: ce455c3f-13b9-4177-8a2d-f2692940cc26 -->
 
 Create base infrastructure for channel integrations.
 
@@ -468,6 +481,7 @@ Create base infrastructure for channel integrations.
 - [ ] Framework tests passing
 
 ### [ ] Step: WhatsApp adapter (Twilio)
+<!-- chat-id: ec792562-5345-49e8-a87b-63138a8a8cb2 -->
 
 Integrate WhatsApp Business API via Twilio.
 
@@ -494,6 +508,7 @@ Integrate WhatsApp Business API via Twilio.
 - [ ] Integration tests passing
 
 ### [ ] Step: Telegram bot adapter
+<!-- chat-id: 149fc192-fb0a-4d28-92fa-8e5d6a3cc52b -->
 
 Create Telegram bot integration.
 
@@ -520,6 +535,7 @@ Create Telegram bot integration.
 - [ ] Integration tests passing
 
 ### [ ] Step: Discord bot adapter
+<!-- chat-id: cb767cb9-ce0f-4fe0-b08e-ae63c83a04de -->
 
 Implement Discord integration.
 
@@ -544,6 +560,7 @@ Implement Discord integration.
 - [ ] Integration tests passing
 
 ### [ ] Step: Cross-channel message synchronization
+<!-- chat-id: 68fa2664-ee54-4326-948e-bbb1501bff15 -->
 
 Ensure messages sync across all connected channels.
 
@@ -575,6 +592,7 @@ Ensure messages sync across all connected channels.
 **Goal**: Launch mobile apps and plugin marketplace
 
 ### [ ] Step: Mobile backend APIs and push notifications
+<!-- chat-id: 96916f8a-08f9-445d-bb59-54eaad789b02 -->
 
 Prepare backend for mobile app support.
 
@@ -661,6 +679,7 @@ Build native Android application.
 - [ ] Play Store beta deployed
 
 ### [ ] Step: Enhanced skill SDK and CLI tooling
+<!-- chat-id: 7e5551b0-83b0-4b7e-9bfe-8a59c544bfc4 -->
 
 Create developer tools for skill creation.
 
@@ -690,6 +709,7 @@ Create developer tools for skill creation.
 - [ ] Documentation clear and complete
 
 ### [ ] Step: Marketplace backend and security scanner
+<!-- chat-id: acebece0-369e-4e34-9f18-1ac93979d7f4 -->
 
 Build skill marketplace infrastructure.
 
@@ -718,6 +738,7 @@ Build skill marketplace infrastructure.
 - [ ] API tests passing
 
 ### [ ] Step: Marketplace web UI
+<!-- chat-id: 426948c3-afbc-49d0-a956-39182abb5426 -->
 
 Create user-facing marketplace interface.
 
@@ -745,6 +766,7 @@ Create user-facing marketplace interface.
 - [ ] UI tests passing
 
 ### [ ] Step: Kubernetes deployment and Helm charts
+<!-- chat-id: ffe0963f-9558-460d-880d-d5134adb41e7 -->
 
 Prepare for cloud deployment.
 
