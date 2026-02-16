@@ -83,7 +83,7 @@ def create_info_plist():
     <key>CFBundleDisplayName</key>
     <string>{APP_NAME}</string>
     <key>CFBundleIdentifier</key>
-    <string>com.librebird.app</string>
+    <string>com.kestrel.app</string>
     <key>CFBundleVersion</key>
     <string>1.0.0</string>
     <key>CFBundleShortVersionString</key>

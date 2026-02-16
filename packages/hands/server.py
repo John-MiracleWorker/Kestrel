@@ -59,7 +59,7 @@ def load_skills(skills_dir: str = None):
 # ── gRPC Servicer ────────────────────────────────────────────────────
 
 class HandsServicer:
-    """Implements librebird.hands.HandsService."""
+    """Implements kestrel.hands.HandsService."""
 
     def __init__(self, executor: DockerExecutor, permissions: PermissionChecker,
                  audit: AuditLogger):

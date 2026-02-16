@@ -1,15 +1,10 @@
 import Fastify, { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
-import { WebSocketServer, WebSocket } from 'ws';
-import { createServer, Server as HttpServer } from 'http';
-import { createClient as createRedisClient, RedisClientType } from 'ioredis';
+import { WebSocketServer } from 'ws';
 import Redis from 'ioredis';
 import jwt from 'jsonwebtoken';
-import * as grpc from '@grpc/grpc-js';
-import * as protoLoader from '@grpc/proto-loader';
-import path from 'path';
 import dotenv from 'dotenv';
 import { logger } from './utils/logger';
-import { setupMetrics, httpRequestDuration, wsConnectionsGauge, grpcRequestDuration } from './utils/metrics';
+import { setupMetrics } from './utils/metrics';
 import { requireAuth, JWTPayload } from './auth/middleware';
 import { SessionManager } from './session/manager';
 import { BrainClient } from './brain/client';
@@ -77,7 +72,7 @@ app.post('/api/auth/register', async (req: FastifyRequest, reply: FastifyReply) 
             email: user.email,
             workspaces: [],
         };
-        const token = jwt.sign(payload, config.jwtSecret, { expiresIn: config.jwtExpiration });
+        const token = jwt.sign(payload, config.jwtSecret, { expiresIn: config.jwtExpiration } as jwt.SignOptions);
 
         return { token, user: { id: user.id, email: user.email, displayName: user.displayName } };
     } catch (err: any) {
@@ -101,7 +96,7 @@ app.post('/api/auth/login', async (req: FastifyRequest, reply: FastifyReply) => 
             email: user.email,
             workspaces: user.workspaces || [],
         };
-        const token = jwt.sign(payload, config.jwtSecret, { expiresIn: config.jwtExpiration });
+        const token = jwt.sign(payload, config.jwtSecret, { expiresIn: config.jwtExpiration } as jwt.SignOptions);
 
         return { token, user: { id: user.id, email: user.email, displayName: user.displayName } };
     } catch (err: any) {

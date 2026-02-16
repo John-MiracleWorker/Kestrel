@@ -161,7 +161,7 @@ def tool_get_weather(location: str) -> dict:
     try:
         encoded = urllib.parse.quote(location)
         url = f"https://wttr.in/{encoded}?format=j1"
-        req = urllib.request.Request(url, headers={"User-Agent": "LibreBird/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "Kestrel/1.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
         current = data.get("current_condition", [{}])[0]

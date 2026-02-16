@@ -1,5 +1,5 @@
 {
-  "name": "librebird",
+  "name": "kestrel",
   "version": "0.1.0",
   "private": true,
   "description": "Personal AI agent platform with Gateway/Brain/Hands architecture",
@@ -13,7 +13,7 @@
     "lint": "npm run lint --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "clean": "rm -rf packages/*/node_modules packages/*/dist node_modules",
-    "proto:compile": "npm run proto:compile --workspace=@librebird/shared"
+    "proto:compile": "npm run proto:compile --workspace=@kestrel/shared"
   },
   "engines": {
     "node": ">=18.0.0",
@@ -21,7 +21,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourusername/librebird"
+    "url": "https://github.com/yourusername/kestrel"
   },
   "keywords": [
     "ai",

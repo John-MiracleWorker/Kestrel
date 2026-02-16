@@ -88,7 +88,7 @@ def tool_web_search(query: str) -> dict:
         import urllib.parse
 
         url = f"https://api.duckduckgo.com/?q={urllib.parse.quote(query)}&format=json&no_html=1&skip_disambig=1"
-        req = urllib.request.Request(url, headers={"User-Agent": "LibreBird/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "Kestrel/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
 
@@ -124,7 +124,7 @@ def tool_read_url(url: str, max_length: int = 10000) -> dict:
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
         req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) LibreBird/1.0"
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Kestrel/1.0"
         })
         with urllib.request.urlopen(req, timeout=15) as resp:
             content_type = resp.headers.get("Content-Type", "")

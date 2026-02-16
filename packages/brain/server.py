@@ -38,11 +38,11 @@ GRPC_PORT = int(os.getenv("BRAIN_GRPC_PORT", "50051"))
 GRPC_HOST = os.getenv("BRAIN_GRPC_HOST", "0.0.0.0")
 DB_URL = os.getenv(
     "DATABASE_URL",
-    f"postgresql://{os.getenv('POSTGRES_USER', 'librebird')}:"
+    f"postgresql://{os.getenv('POSTGRES_USER', 'kestrel')}:"
     f"{os.getenv('POSTGRES_PASSWORD', 'changeme')}@"
     f"{os.getenv('POSTGRES_HOST', 'localhost')}:"
     f"{os.getenv('POSTGRES_PORT', '5432')}/"
-    f"{os.getenv('POSTGRES_DB', 'librebird')}"
+    f"{os.getenv('POSTGRES_DB', 'kestrel')}"
 )
 
 # ── Database Layer ────────────────────────────────────────────────────
@@ -233,7 +233,7 @@ BRAIN_PROTO = os.path.join(PROTO_PATH, "brain.proto")
 
 
 class BrainServicer:
-    """Implements librebird.brain.BrainService gRPC interface."""
+    """Implements kestrel.brain.BrainService gRPC interface."""
 
     async def StreamChat(self, request, context):
         """Stream LLM responses back to the caller."""

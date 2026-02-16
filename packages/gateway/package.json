@@ -1,5 +1,5 @@
 {
-  "name": "@librebird/gateway",
+  "name": "@kestrel/gateway",
   "version": "0.1.0",
   "description": "Gateway service - WebSocket server and API router",
   "main": "dist/server.js",

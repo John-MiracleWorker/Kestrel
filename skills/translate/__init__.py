@@ -63,7 +63,7 @@ def _translate_mymemory(text: str, source: str, target: str) -> dict:
     params = urllib.parse.urlencode({"q": text, "langpair": langpair})
     url = f"{_MYMEMORY_API}?{params}"
 
-    req = urllib.request.Request(url, headers={"User-Agent": "LibreBird/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Kestrel/1.0"})
     with urllib.request.urlopen(req, timeout=10) as resp:
         result = json.loads(resp.read().decode())
 
@@ -125,7 +125,7 @@ def tool_detect_language(args: dict) -> dict:
     try:
         params = urllib.parse.urlencode({"q": sample, "langpair": "autodetect|en"})
         url = f"{_MYMEMORY_API}?{params}"
-        req = urllib.request.Request(url, headers={"User-Agent": "LibreBird/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "Kestrel/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             result = json.loads(resp.read().decode())
 

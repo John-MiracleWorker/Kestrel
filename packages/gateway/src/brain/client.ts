@@ -24,7 +24,7 @@ export class BrainClient {
             oneofs: true,
         });
         const proto = grpc.loadPackageDefinition(packageDef) as any;
-        const BrainService = proto.librebird.brain.BrainService;
+        const BrainService = proto.kestrel.brain.BrainService;
 
         this.client = new BrainService(
             this.address,
@@ -32,7 +32,7 @@ export class BrainClient {
         );
 
         // Wait for connection (with 5s deadline)
-        return new Promise((resolve, reject) => {
+        return new Promise((resolve, _reject) => {
             const deadline = new Date(Date.now() + 5000);
             this.client.waitForReady(deadline, (err: Error | null) => {
                 if (err) {

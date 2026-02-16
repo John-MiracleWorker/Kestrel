@@ -12,7 +12,7 @@ from typing import Optional
 
 logger = logging.getLogger("hands.executor")
 
-SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "librebird/sandbox:latest")
+SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "kestrel/sandbox:latest")
 MAX_CONCURRENT = int(os.getenv("SANDBOX_MAX_CONCURRENT", "10"))
 
 

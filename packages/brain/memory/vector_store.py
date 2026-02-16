@@ -17,11 +17,11 @@ VECTOR_SEARCH_LIMIT = int(os.getenv("VECTOR_SEARCH_LIMIT", "10"))
 
 DB_URL = os.getenv(
     "DATABASE_URL",
-    f"postgresql://{os.getenv('POSTGRES_USER', 'librebird')}:"
+    f"postgresql://{os.getenv('POSTGRES_USER', 'kestrel')}:"
     f"{os.getenv('POSTGRES_PASSWORD', 'changeme')}@"
     f"{os.getenv('POSTGRES_HOST', 'localhost')}:"
     f"{os.getenv('POSTGRES_PORT', '5432')}/"
-    f"{os.getenv('POSTGRES_DB', 'librebird')}"
+    f"{os.getenv('POSTGRES_DB', 'kestrel')}"
 )
 
 

@@ -40,7 +40,7 @@ export const messageCounter = new client.Counter({
  */
 export function setupMetrics(app: FastifyInstance): void {
     // Metrics endpoint
-    app.get('/metrics', async (req, reply) => {
+    app.get('/metrics', async (_req, reply) => {
         reply.header('Content-Type', register.contentType);
         return register.metrics();
     });

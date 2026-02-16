@@ -1,17 +1,37 @@
 syntax = "proto3";
 
-package librebird.brain;
+package kestrel.brain;
 
-// Brain service handles LLM inference and reasoning
+// Brain service handles LLM inference, user management, and data CRUD
 service BrainService {
   // Stream chat completions with tool calling support
   rpc StreamChat(ChatRequest) returns (stream ChatResponse);
-  
+
   // Health check endpoint
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // ── User Management ──────────────────────────────────────────
+  rpc CreateUser(CreateUserRequest) returns (UserResponse);
+  rpc AuthenticateUser(AuthenticateUserRequest) returns (AuthenticateUserResponse);
+
+  // ── Workspace CRUD ───────────────────────────────────────────
+  rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
+  rpc CreateWorkspace(CreateWorkspaceRequest) returns (WorkspaceResponse);
+
+  // ── Conversation CRUD ────────────────────────────────────────
+  rpc ListConversations(ListConversationsRequest) returns (ListConversationsResponse);
+  rpc CreateConversation(CreateConversationRequest) returns (ConversationResponse);
+  rpc GetMessages(GetMessagesRequest) returns (GetMessagesResponse);
+
+  // ── Mobile / Sync ────────────────────────────────────────────
+  rpc RegisterPushToken(RegisterPushTokenRequest) returns (RegisterPushTokenResponse);
+  rpc GetUpdates(GetUpdatesRequest) returns (GetUpdatesResponse);
 }
 
-// Chat request message
+// ═══════════════════════════════════════════════════════════════
+// Chat messages
+// ═══════════════════════════════════════════════════════════════
+
 message ChatRequest {
   string user_id = 1;
   string workspace_id = 2;
@@ -23,7 +43,6 @@ message ChatRequest {
   repeated Tool available_tools = 8;
 }
 
-// Individual message in conversation
 message Message {
   enum Role {
     USER = 0;
@@ -31,28 +50,25 @@ message Message {
     SYSTEM = 2;
     TOOL = 3;
   }
-  
+
   Role role = 1;
   string content = 2;
-  string tool_call_id = 3; // for tool responses
-  repeated ToolCall tool_calls = 4; // for assistant messages with tool calls
+  string tool_call_id = 3;
+  repeated ToolCall tool_calls = 4;
 }
 
-// Tool definition
 message Tool {
   string name = 1;
   string description = 2;
   string parameters_schema = 3; // JSON schema as string
 }
 
-// Tool call made by assistant
 message ToolCall {
   string id = 1;
   string name = 2;
   string arguments = 3; // JSON string
 }
 
-// Chat response (streamed)
 message ChatResponse {
   enum ChunkType {
     CONTENT_DELTA = 0;
@@ -60,21 +76,145 @@ message ChatResponse {
     DONE = 2;
     ERROR = 3;
   }
-  
+
   ChunkType type = 1;
   string content_delta = 2;
   ToolCall tool_call = 3;
   string error_message = 4;
-  
-  // Metadata
-  map<string, string> metadata = 5; // usage stats, model info, etc.
+  map<string, string> metadata = 5;
 }
 
-// Health check messages
+// ═══════════════════════════════════════════════════════════════
+// Health check
+// ═══════════════════════════════════════════════════════════════
+
 message HealthCheckRequest {}
 
 message HealthCheckResponse {
   bool healthy = 1;
   string version = 2;
-  map<string, string> status = 3; // provider status, model status, etc.
+  map<string, string> status = 3;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// User Management
+// ═══════════════════════════════════════════════════════════════
+
+message CreateUserRequest {
+  string email = 1;
+  string password = 2;
+  string display_name = 3;
+}
+
+message UserResponse {
+  string id = 1;
+  string email = 2;
+  string display_name = 3;
+}
+
+message AuthenticateUserRequest {
+  string email = 1;
+  string password = 2;
+}
+
+message WorkspaceMembership {
+  string id = 1;
+  string role = 2;
+}
+
+message AuthenticateUserResponse {
+  string id = 1;
+  string email = 2;
+  string display_name = 3;
+  repeated WorkspaceMembership workspaces = 4;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Workspace CRUD
+// ═══════════════════════════════════════════════════════════════
+
+message ListWorkspacesRequest {
+  string user_id = 1;
+}
+
+message WorkspaceResponse {
+  string id = 1;
+  string name = 2;
+  string role = 3;
+  string created_at = 4;
+}
+
+message ListWorkspacesResponse {
+  repeated WorkspaceResponse workspaces = 1;
+}
+
+message CreateWorkspaceRequest {
+  string user_id = 1;
+  string name = 2;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Conversation CRUD
+// ═══════════════════════════════════════════════════════════════
+
+message ListConversationsRequest {
+  string user_id = 1;
+  string workspace_id = 2;
+}
+
+message ConversationResponse {
+  string id = 1;
+  string title = 2;
+  string created_at = 3;
+  string updated_at = 4;
+}
+
+message ListConversationsResponse {
+  repeated ConversationResponse conversations = 1;
+}
+
+message CreateConversationRequest {
+  string user_id = 1;
+  string workspace_id = 2;
+}
+
+message GetMessagesRequest {
+  string user_id = 1;
+  string workspace_id = 2;
+  string conversation_id = 3;
+}
+
+message MessageResponse {
+  string id = 1;
+  string role = 2;
+  string content = 3;
+  string created_at = 4;
+}
+
+message GetMessagesResponse {
+  repeated MessageResponse messages = 1;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Mobile / Sync
+// ═══════════════════════════════════════════════════════════════
+
+message RegisterPushTokenRequest {
+  string user_id = 1;
+  string device_token = 2;
+  string platform = 3; // "ios", "android", "web"
+}
+
+message RegisterPushTokenResponse {
+  bool success = 1;
+}
+
+message GetUpdatesRequest {
+  string user_id = 1;
+  string since = 2; // ISO timestamp
+}
+
+message GetUpdatesResponse {
+  repeated MessageResponse messages = 1;
+  repeated ConversationResponse conversations = 2;
 }

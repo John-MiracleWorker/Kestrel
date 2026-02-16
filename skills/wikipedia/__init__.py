@@ -25,7 +25,7 @@ def _wiki_get(params: dict) -> dict:
     """Hit the MediaWiki API and return parsed JSON."""
     params["format"] = "json"
     url = f"{_WIKI_API}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"User-Agent": "LibreBird/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Kestrel/1.0"})
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode())
 
@@ -114,7 +114,7 @@ def tool_wolfram_alpha(args: dict) -> dict:
     try:
         params = urllib.parse.urlencode({"appid": app_id, "i": query})
         url = f"{_WOLFRAM_API}?{params}"
-        req = urllib.request.Request(url, headers={"User-Agent": "LibreBird/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "Kestrel/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             answer = resp.read().decode()
         return {"query": query, "answer": answer}

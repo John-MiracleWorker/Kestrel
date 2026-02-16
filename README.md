@@ -1,216 +1,165 @@
-# 🕊️ Libre Bird
+# Kestrel
 
-**Free, offline, privacy-first AI assistant for macOS** — a local alternative to [Little Bird](https://littlebird.ai).
+**Privacy-first, self-hostable AI agent platform.**
 
-All AI processing runs on your Mac using quantized open-source models. **Zero cloud. Zero cost. Zero data leaves your device.**
+Kestrel is a distributed microservices platform that provides a personal AI assistant with tool execution, multi-channel support, and long-term memory — all running on your own infrastructure.
 
 ---
 
-## ✨ Features
+## Architecture
 
-| Feature | Description |
-|---|---|
-| 💬 **AI Chat** | Context-aware conversations powered by local LLMs |
-| 🧩 **101 Tools / 26 Skills** | Modular skill system — toggle skills on/off from Settings |
-| 👁 **Screen Context** | Reads your active window to provide relevant assistance |
-| 📓 **Daily Journal** | Auto-generates activity summaries from your screen context |
-| ✅ **Task Manager** | AI-extracted tasks + manual task tracking |
-| 🎙️ **Voice Input** | Hands-free with "Hey Libre" wake word (Whisper Small) |
-| 🔊 **Text-to-Speech** | Responses read aloud via macOS neural voices |
-| 🔔 **Notifications & Reminders** | Native macOS notifications with timed reminders |
-| 🌅 **Daily Briefing** | Morning summary: tasks, yesterday's recap, and context |
-| ⌨️ **Global Hotkey** | ⌘+Shift+Space to summon Libre Bird from anywhere |
-| 🔒 **100% Private** | All data stored locally in SQLite. No network requests. |
-| 🎨 **Aurora Theme** | Stunning aurora borealis glassmorphism design |
+```
+┌─────────────┐     WebSocket / REST
+│   Clients   │◄──────────────────────►┌──────────────┐
+│  (Web, iOS, │                        │   Gateway    │
+│   Android)  │                        │  (Node.js)   │
+└─────────────┘                        └──────┬───────┘
+                                              │ gRPC
+                              ┌───────────────┼───────────────┐
+                              ▼                               ▼
+                       ┌──────────────┐              ┌──────────────┐
+                       │    Brain     │              │    Hands     │
+                       │  (Python)    │              │  (Python)    │
+                       └──────┬───────┘              └──────┬───────┘
+                              │                             │
+                    ┌─────────┼─────────┐           ┌───────┴───────┐
+                    ▼         ▼         ▼           ▼               ▼
+              ┌──────┐  ┌──────────┐ ┌─────┐  ┌──────────┐   ┌──────────┐
+              │Postgr│  │ LLM      │ │Redis│  │ Docker   │   │  Skills  │
+              │  SQL  │  │Providers │ │     │  │ Sandbox  │   │          │
+              └──────┘  └──────────┘ └─────┘  └──────────┘   └──────────┘
+```
 
-## 🧠 Supported Models
+### Services
 
-| Model | Type | RAM (Q4) | Best For |
-|---|---|---|---|
-| **GPT-OSS 20B** | MoE (3.6B active) | ~12GB | Speed + quality (recommended) |
-| **Qwen 3 14B** | Dense | ~10GB | Thinking mode, reasoning |
+| Service | Language | Port | Role |
+|---------|----------|------|------|
+| **Gateway** | Node.js / TypeScript | 3000 | Authentication, WebSocket sessions, request routing |
+| **Brain** | Python | 50051 (gRPC) | LLM orchestration, conversation management, vector memory |
+| **Hands** | Python | 50052 (gRPC) | Sandboxed tool/skill execution via Docker containers |
 
-Any GGUF model works — just drop it in the `models/` directory.
+### Infrastructure
 
-## 🧩 Skills System
+| Component | Purpose |
+|-----------|---------|
+| **PostgreSQL** (pgvector) | Persistent storage with vector search for semantic memory |
+| **Redis** | Session management, caching, pub/sub |
+| **Docker** | Sandboxed execution environment for skills |
 
-Libre Bird uses a **modular skills architecture** — 26 skill packs containing 101 tools, all auto-discovered and toggleable from Settings.
+---
 
-### Built-in Skills
+## Quick Start
 
-| Skill | Icon | Tools | Description |
-|---|---|---|---|
-| Core Utilities | ⚙️ | 7 | Weather, calculator, datetime, file search, app launcher, system info |
-| Screen Analysis | 👁 | 2 | Read & analyze the active screen |
-| Productivity | 📋 | 6 | Clipboard, reminders, keyboard control, file operations, document reading |
-| Media & Music | 🎵 | 3 | Apple Music control, text-to-speech, image generation |
-| Web & Code | 🌐 | 4 | Web search, URL reader, code execution, shell commands |
-| Knowledge Base | 🧠 | 2 | Local RAG — save and search personal knowledge |
+### Prerequisites
 
-### Community Skills
+- Node.js ≥ 18
+- Python ≥ 3.10
+- Docker & Docker Compose
+- PostgreSQL 16+ with pgvector extension
 
-| Skill | Icon | Tools | Description |
-|---|---|---|---|
-| Wikipedia + Wolfram | 📚 | 3 | Encyclopedia lookup + computational answers |
-| Task Scheduler | ⏰ | 3 | Cron-style scheduled tasks with JSON persistence |
-| Document Intelligence | 📄 | 4 | Parse PDFs, Word docs, and Excel spreadsheets |
-| Translation | 🌐 | 2 | Multi-language translation (MyMemory / DeepL) |
-| Computer Use | 🖱️ | 6 | Mouse clicks, keyboard typing, hotkeys, screenshots (pyautogui) |
-| Focus Timer | 🍅 | 4 | Pomodoro sessions with notifications and productivity stats |
-| API Caller | 🔌 | 3 | Generic REST API client (GET/POST/PUT/DELETE) |
-| Text Transform | 🔄 | 6 | MD→HTML, JSON prettify, CSV→JSON, case conversion, Base64 |
-| Meeting Summarizer | 📝 | 2 | Parse transcripts (VTT/SRT/TXT), extract action items |
-| Server SSH/FTP | 🖥️ | 5 | Remote server commands and file transfer via SSH/SFTP |
-| Serial / USB | 🔧 | 4 | Communicate with Arduino and USB serial devices |
-| Browser Automation | 🌐 | 5 | Navigate, click, type on web pages (Playwright) |
-| Daily Digest | 📰 | 4 | RSS/Atom feed reader |
-| GitHub | 🐙 | 4 | Repos, issues, PRs, and stats |
-| Home Automation | 🏠 | 3 | macOS Shortcuts and HomeKit devices |
-| Apple Calendar | 📅 | 4 | List, create, and manage calendar events |
-| Apple Contacts | 👥 | 3 | Search, view, and create contacts |
-| Apple Mail | 📧 | 4 | Check inbox, read, compose, unread count |
-| Apple Notes | 📝 | 4 | List, read, create, and search notes |
-| System Monitor | 📊 | 4 | CPU, memory, disk, battery, top processes, network |
+### Setup
 
-### Optional API Keys
-
-Add these to your `.env` file for enhanced features (everything works without them):
-
-| Key | Skill | Notes |
-|---|---|---|
-| `WOLFRAM_APP_ID` | Wikipedia | Free at [developer.wolframalpha.com](https://developer.wolframalpha.com/) |
-| `DEEPL_API_KEY` | Translation | Free tier at [deepl.com/pro-api](https://www.deepl.com/pro-api) |
-| `GITHUB_TOKEN` | GitHub | For private repos and higher rate limits |
-
-## 🚀 Quick Start
-
-> For a detailed walkthrough, see **[SETUP.md](SETUP.md)**.
-
-### 1. Setup (one time)
 ```bash
-chmod +x setup.sh start.sh
-./setup.sh
+# Clone the repository
+git clone https://github.com/John-MiracleWorker/Kestrel.git
+cd Kestrel
+
+# Copy environment config
+cp .env.example .env
+# Edit .env with your settings (API keys, DB passwords, etc.)
+
+# Install Node.js dependencies
+npm install
+
+# Install Python dependencies
+cd packages/brain && pip install -r requirements.txt && cd ../..
+cd packages/hands && pip install -r requirements.txt && cd ../..
+
+# Start all services
+docker compose up -d
 ```
 
-### 2. Start
+### Development
+
 ```bash
-./start.sh
+# Run Gateway in dev mode
+cd packages/gateway && npm run dev
+
+# Run Brain service
+cd packages/brain && python server.py
+
+# Run Hands service
+cd packages/hands && python server.py
+
+# Run tests
+npm test                    # Gateway tests
+cd packages/brain && pytest # Brain tests
+cd packages/hands && pytest # Hands tests
 ```
 
-### 3. Grant Permissions
-For full functionality, grant your terminal these macOS permissions:
-- **Accessibility** (System Settings → Privacy → Accessibility) — for screen context
-- **Microphone** (System Settings → Privacy → Microphone) — for voice input
-- **Notifications** — for reminders (auto-prompted)
+---
 
-## 🎙️ Voice Input
-
-Libre Bird listens for the wake word **"Hey Libre"** using OpenAI's Whisper Small model locally. When activated:
-
-1. Click the **🎤 mic button** in the chat input area, or
-2. Say **"Hey Libre"** if the voice listener is running
-
-Transcribed speech is inserted into the chat input. Voice processing is 100% local — no audio ever leaves your Mac.
-
-## ⌨️ Global Hotkey
-
-Press **⌘+Shift+Space** from any app to instantly bring Libre Bird to the front.
-
-## 📁 Project Structure
+## Project Structure
 
 ```
-libre-bird/
-├── server.py              # FastAPI backend
-├── llm_engine.py          # LLM inference (llama-cpp-python / Metal)
-├── skill_loader.py        # Auto-discovers and manages all skills
-├── tools.py               # Compatibility shim → skill_loader
-├── context_collector.py   # macOS screen context + activity tracking
-├── proactive.py           # Proactive suggestion engine
-├── notifications.py       # macOS native notifications
-├── voice_input.py         # Whisper STT + "Hey Libre" wake word
-├── tts.py                 # macOS neural text-to-speech
-├── hotkey.py              # Global ⌘+Shift+Space hotkey
-├── database.py            # SQLite storage with FTS5
-├── memory.py              # Semantic memory / recall
-├── app.py                 # pywebview native macOS window launcher
-├── skills/                # ← Modular skill packs (26 skills, 101 tools)
-│   ├── core/              # Weather, calculator, datetime, etc.
-│   ├── screen/            # Screen reading & analysis
-│   ├── productivity/      # Clipboard, keyboard, file ops
-│   ├── media/             # Music control, TTS, image gen
-│   ├── web/               # Web search, code execution, shell
-│   ├── knowledge/         # Local RAG knowledge base
-│   ├── wikipedia/         # Wikipedia + Wolfram Alpha
-│   ├── scheduler/         # Cron-style task scheduler
-│   ├── documents/         # PDF, DOCX, XLSX parser
-│   ├── translate/         # Multi-language translation
-│   ├── computer_use/      # Mouse & keyboard automation
-│   ├── focus_timer/       # Pomodoro timer + stats
-│   ├── api_caller/        # Generic REST API client
-│   ├── text_transform/    # Format conversion & text tools
-│   ├── meeting_summarizer/# Transcript analysis
-│   ├── ssh_ftp/           # Remote server SSH/SFTP
-│   ├── serial_usb/        # Arduino & USB serial
-│   ├── browser_automation/# Playwright browser control
-│   ├── calendar/          # Apple Calendar
-│   ├── contacts/          # Apple Contacts
-│   ├── email/             # Apple Mail
-│   ├── notes/             # Apple Notes
-│   ├── digest/            # RSS feed reader
-│   ├── github/            # GitHub integration
-│   ├── home_automation/   # HomeKit + Shortcuts
-│   └── system_monitor/    # CPU, memory, disk, battery
-├── models/                # Place GGUF model files here
-└── frontend/
-    ├── index.html         # App shell
-    ├── index.css          # Aurora borealis glassmorphism design
-    ├── main.js            # Application logic
-    └── vite.config.js     # Dev server proxy
+kestrel/
+├── packages/
+│   ├── gateway/          # Node.js API gateway
+│   │   ├── src/
+│   │   │   ├── server.ts       # Fastify server, auth, routes
+│   │   │   ├── brain/          # gRPC client to Brain service
+│   │   │   ├── channels/       # WebSocket & channel adapters
+│   │   │   └── utils/          # Logger, metrics, session mgmt
+│   │   └── tests/              # Jest unit tests
+│   ├── brain/            # Python AI service
+│   │   ├── server.py           # gRPC server (11 RPCs)
+│   │   ├── providers/          # LLM provider adapters (local, cloud)
+│   │   ├── memory/             # Vector store for semantic memory
+│   │   ├── migrations/         # PostgreSQL schema + RLS policies
+│   │   └── tests/              # Pytest unit tests
+│   ├── hands/            # Python tool execution service
+│   │   ├── server.py           # gRPC server (3 RPCs)
+│   │   ├── executor.py         # Docker sandbox executor
+│   │   ├── security/           # Allowlist & audit logging
+│   │   └── tests/              # Pytest unit tests
+│   └── shared/           # Shared definitions
+│       └── proto/              # Protobuf service contracts
+│           ├── brain.proto
+│           └── hands.proto
+├── skills/               # Built-in skills (web, github, translate, etc.)
+├── docker-compose.yml    # Full stack orchestration
+├── .env.example          # Environment variable template
+└── README.md
 ```
 
-## 🔧 API
+---
 
-The backend exposes a full REST API at `http://127.0.0.1:8741`:
+## Security
 
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/chat` | POST | Send a message (SSE streaming response) |
-| `/api/conversations` | GET | List conversations |
-| `/api/journal/generate` | POST | Generate today's journal |
-| `/api/tasks` | GET | List tasks |
-| `/api/models` | GET | List available GGUF models |
-| `/api/models/load` | POST | Load a model |
-| `/api/context/recent` | GET | View recent screen context |
-| `/api/reminders` | GET | List active reminders |
-| `/api/briefing` | GET | Get the daily briefing |
-| `/api/voice/start` | POST | Start voice listener |
-| `/api/voice/stop` | POST | Stop voice listener |
-| `/api/voice/status` | GET | Voice status + transcriptions |
-| `/api/tts/speak` | POST | Speak text aloud |
-| `/api/tts/stop` | POST | Stop speech |
-| `/api/settings` | GET | View settings |
-| `/api/skills` | GET | List all skills and their status |
-| `/api/skills/{name}/toggle` | POST | Enable/disable a skill |
+- **JWT authentication** with configurable expiry
+- **Row-Level Security (RLS)** on PostgreSQL for workspace data isolation
+- **Sandboxed execution** — all skills run in Docker containers with resource limits
+- **Module allowlisting** — only approved Python modules available in sandboxes
+- **Audit logging** — all tool executions are logged with full context
 
-Full interactive docs at **http://127.0.0.1:8741/docs**
+---
 
-## 🔒 Privacy
+## Skills
 
-- **No network requests** — all processing is local
-- **No telemetry** — zero tracking or analytics
-- **No cloud** — data never leaves your Mac
-- **SQLite database** — stored in `libre_bird.db`, easy to inspect or delete
-- **Open source** — you can audit every line of code
+Built-in skills include:
 
-## ⚙️ Requirements
+| Skill | Description |
+|-------|-------------|
+| `web` | Web search (DuckDuckGo) and page fetching |
+| `github` | GitHub API integration (repos, issues, PRs) |
+| `translate` | Language translation via MyMemory API |
+| `wikipedia` | Wikipedia & Wolfram Alpha lookups |
+| `digest` | RSS/Atom feed aggregation |
+| `api_caller` | Generic REST API client |
+| `core` | Weather, file management, math utilities |
 
-- macOS with Apple Silicon (M1/M2/M3/M4)
-- 16GB RAM (for GPT-OSS 20B Q4)
-- Python 3.9+
-- Node.js 18+
-- ~10GB disk space for the model
-- ~300MB additional for Whisper Small model (auto-downloaded on first use)
+---
 
-## 📝 License
+## License
 
-MIT — Free for any use.
+Private — all rights reserved.

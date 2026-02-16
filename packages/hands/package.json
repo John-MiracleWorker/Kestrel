@@ -1,5 +1,5 @@
 {
-  "name": "@librebird/hands",
+  "name": "@kestrel/hands",
   "version": "0.1.0",
   "description": "Hands service - Sandboxed tool execution engine",
   "scripts": {

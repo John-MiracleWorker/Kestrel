@@ -1,5 +1,3 @@
-import { WebSocket } from 'ws';
-
 /**
  * Supported channel types.
  */

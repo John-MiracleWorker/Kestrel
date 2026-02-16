@@ -18,8 +18,8 @@ Comprehensive guide to get Libre Bird running on your Mac.
 ## Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/John-MiracleWorker/LibreBird.git
-cd LibreBird
+git clone https://github.com/John-MiracleWorker/Kestrel.git
+cd Kestrel
 ```
 
 ## Step 2: Run the Setup Script

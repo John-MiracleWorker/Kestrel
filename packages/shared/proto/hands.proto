@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package librebird.hands;
+package kestrel.hands;
 
 // Hands service handles sandboxed tool execution
 service HandsService {

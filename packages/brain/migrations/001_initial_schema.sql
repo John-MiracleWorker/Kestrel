@@ -172,11 +172,43 @@ ALTER TABLE journal_entries ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE settings ENABLE ROW LEVEL SECURITY;
 
--- Note: RLS policies require a current_user_id or workspace_id
--- set via SET LOCAL. Applied in app-level connection setup.
--- Example policy (applied per-service):
--- CREATE POLICY workspace_isolation ON conversations
---     USING (workspace_id IN (
---         SELECT workspace_id FROM workspace_members
---         WHERE user_id = current_setting('app.current_user_id')::uuid
---     ));
+-- Application must SET LOCAL app.current_user_id before each request.
+-- Example: SET LOCAL app.current_user_id = '<uuid>';
+
+-- Helper function: returns workspace IDs the current user belongs to
+CREATE OR REPLACE FUNCTION user_workspace_ids() RETURNS SETOF UUID AS $$
+  SELECT workspace_id FROM workspace_members
+  WHERE user_id = current_setting('app.current_user_id', true)::uuid;
+$$ LANGUAGE sql SECURITY DEFINER STABLE;
+
+-- Conversations: users can only see conversations in their workspaces
+CREATE POLICY workspace_isolation ON conversations
+    USING (workspace_id IN (SELECT user_workspace_ids()));
+
+-- Messages: accessible if the parent conversation is accessible
+CREATE POLICY workspace_isolation ON messages
+    USING (conversation_id IN (
+        SELECT id FROM conversations
+        WHERE workspace_id IN (SELECT user_workspace_ids())
+    ));
+
+-- Context snapshots: workspace-scoped
+CREATE POLICY workspace_isolation ON context_snapshots
+    USING (workspace_id IN (SELECT user_workspace_ids()));
+
+-- Memories: workspace-scoped
+CREATE POLICY workspace_isolation ON memories
+    USING (workspace_id IN (SELECT user_workspace_ids()));
+
+-- Journal entries: workspace-scoped
+CREATE POLICY workspace_isolation ON journal_entries
+    USING (workspace_id IN (SELECT user_workspace_ids()));
+
+-- Tasks: workspace-scoped
+CREATE POLICY workspace_isolation ON tasks
+    USING (workspace_id IN (SELECT user_workspace_ids()));
+
+-- Settings: workspace-scoped
+CREATE POLICY workspace_isolation ON settings
+    USING (workspace_id IN (SELECT user_workspace_ids()));
+

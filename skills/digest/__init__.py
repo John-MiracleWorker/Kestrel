@@ -101,7 +101,7 @@ TOOL_DEFINITIONS = [
 def _parse_feed(url: str, limit: int = 5) -> dict:
     """Fetch and parse an RSS/Atom feed."""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "LibreBird/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "Kestrel/1.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             xml_data = resp.read()
 

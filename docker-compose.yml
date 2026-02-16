@@ -11,8 +11,8 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-librebird}
-      POSTGRES_USER: ${POSTGRES_USER:-librebird}
+      POSTGRES_DB: ${POSTGRES_DB:-kestrel}
+      POSTGRES_USER: ${POSTGRES_USER:-kestrel}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
@@ -20,7 +20,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./packages/brain/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-librebird}" ]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kestrel}" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -76,8 +76,8 @@ services:
       BRAIN_GRPC_PORT: 50051
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-librebird}
-      POSTGRES_USER: ${POSTGRES_USER:-librebird}
+      POSTGRES_DB: ${POSTGRES_DB:-kestrel}
+      POSTGRES_USER: ${POSTGRES_USER:-kestrel}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
       POSTGRES_POOL_MIN: ${POSTGRES_POOL_MIN:-2}
       POSTGRES_POOL_MAX: ${POSTGRES_POOL_MAX:-10}
@@ -107,7 +107,7 @@ services:
     environment:
       HANDS_GRPC_HOST: 0.0.0.0
       HANDS_GRPC_PORT: 50052
-      SANDBOX_IMAGE: librebird/sandbox:latest
+      SANDBOX_IMAGE: kestrel/sandbox:latest
       SANDBOX_MAX_CONCURRENT: ${SANDBOX_MAX_CONCURRENT:-10}
       SANDBOX_DEFAULT_TIMEOUT: ${SANDBOX_DEFAULT_TIMEOUT:-30}
       SKILLS_DIR: /skills

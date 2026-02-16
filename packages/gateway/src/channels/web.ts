@@ -1,7 +1,8 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { randomUUID } from 'crypto';
+import jwt from 'jsonwebtoken';
 import { BaseChannelAdapter, IncomingMessage, OutgoingMessage, ChannelType } from './base';
-import { verifyToken, JWTPayload } from '../auth/middleware';
+import { JWTPayload } from '../auth/middleware';
 import { SessionManager } from '../session/manager';
 import { BrainClient } from '../brain/client';
 import { logger } from '../utils/logger';
@@ -48,7 +49,12 @@ export class WebChannelAdapter extends BaseChannelAdapter {
                 return;
             }
 
-            const payload = verifyToken(token);
+            let payload: JWTPayload | null = null;
+            try {
+                payload = jwt.verify(token, this.jwtSecret) as JWTPayload;
+            } catch {
+                payload = null;
+            }
             if (!payload) {
                 socket.send(JSON.stringify({ type: 'error', error: 'Invalid token' }));
                 socket.close(4001, 'Invalid token');

@@ -1,5 +1,5 @@
 {
-  "name": "@librebird/shared",
+  "name": "@kestrel/shared",
   "version": "0.1.0",
   "description": "Shared protobuf definitions and common utilities",
   "main": "dist/index.js",

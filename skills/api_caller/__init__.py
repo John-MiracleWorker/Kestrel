@@ -24,7 +24,7 @@ def _do_request(url: str, method: str = "GET", headers: dict = None,
 
     headers = headers or {}
     if "User-Agent" not in headers:
-        headers["User-Agent"] = "LibreBird/1.0"
+        headers["User-Agent"] = "Kestrel/1.0"
 
     data = None
     if body is not None:
