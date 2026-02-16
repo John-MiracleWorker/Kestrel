@@ -41,7 +41,12 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://127.0.0.1:5173",   # Vite dev server
+        "http://localhost:5173",
+        "http://127.0.0.1:8741",   # Self (production)
+        "http://localhost:8741",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -523,6 +528,26 @@ async def list_models():
 
 @app.post("/api/models/load")
 async def load_model(req: ModelLoadRequest):
+    # Validate the model path to prevent path traversal.
+    # Resolve to an absolute path and ensure it lives inside the models directory
+    # or is an absolute path the user explicitly configured.
+    _models_dir = os.path.join(os.path.dirname(__file__), "models")
+    resolved = os.path.realpath(req.model_path)
+    allowed_dirs = [os.path.realpath(_models_dir)]
+    # Also allow the symlink target if models/ is a symlink
+    if os.path.islink(_models_dir):
+        allowed_dirs.append(os.path.realpath(os.readlink(_models_dir)))
+
+    if not any(resolved.startswith(d + os.sep) or resolved == d for d in allowed_dirs):
+        raise HTTPException(
+            400,
+            "Model path must be inside the models/ directory. "
+            "Place your GGUF files there or create a symlink.",
+        )
+
+    if not resolved.endswith(".gguf"):
+        raise HTTPException(400, "Only .gguf model files are supported")
+
     try:
         await llm_engine.load_model(req.model_path, n_ctx=req.n_ctx)
         await db.set_setting("model_path", req.model_path)
@@ -591,8 +616,20 @@ async def get_all_settings():
     }
 
 
+# Keys that can be modified via the settings API.
+# Prevents callers from overwriting internal keys (model_path, retention, etc.)
+_ALLOWED_SETTING_KEYS = {
+    "n_ctx", "temperature", "max_tokens",
+    "context_interval", "context_enabled",
+    "gemini_api_key",
+}
+
+
 @app.put("/api/settings")
 async def update_setting(setting: SettingUpdate):
+    if setting.key not in _ALLOWED_SETTING_KEYS:
+        raise HTTPException(400, f"Setting '{setting.key}' cannot be modified via this endpoint")
+
     await db.set_setting(setting.key, setting.value)
 
     # Apply live changes

@@ -592,15 +592,21 @@ function formatMarkdown(text) {
         return `\x00CODE${idx}\x00`;
     });
     // Pass 1.5: Detect image paths and convert to inline images
-    // Matches: /Users/.../Pictures/libre-bird/filename.png or /generated/filename.png
+    // Only matches strict filenames (alphanumeric, hyphens, underscores, 1-128 chars, .png)
+    // to prevent XSS via crafted LLM responses.
     processed = processed.replace(
-        /(?:\/Users\/[^\s]*\/Pictures\/libre-bird\/|\/generated\/)([a-zA-Z0-9_-]+\.png)/g,
+        /(?:\/Users\/[^\s]*\/Pictures\/libre-bird\/|\/generated\/)([a-zA-Z0-9_-]{1,128}\.png)/g,
         (match, filename) => {
+            // Double-check: filename must be purely alphanumeric + hyphens/underscores
+            if (!/^[a-zA-Z0-9_-]{1,128}\.png$/.test(filename)) return match;
             const idx = codeBlocks.length;
+            // Build the image element safely using DOM APIs to avoid innerHTML injection
+            const safeFilename = filename.replace(/[^a-zA-Z0-9_.-]/g, '');
+            const safeSrc = `/generated/${safeFilename}`;
             codeBlocks.push(
                 `<div class="generated-image-card">` +
-                `<img src="/generated/${filename}" alt="Generated image" class="generated-image" onclick="this.classList.toggle('expanded')" />` +
-                `<div class="generated-image-caption">🎨 Generated image</div>` +
+                `<img src="${safeSrc}" alt="Generated image" class="generated-image" />` +
+                `<div class="generated-image-caption">Generated image</div>` +
                 `</div>`
             );
             return `\x00CODE${idx}\x00`;
