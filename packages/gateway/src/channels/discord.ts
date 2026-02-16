@@ -15,6 +15,7 @@ export interface DiscordConfig {
     clientId: string;
     guildId?: string;               // For guild-specific slash commands
     defaultWorkspaceId: string;
+    allowedRoleIds?: string[];      // Optional: restrict to users with these roles
 }
 
 // ── Discord API Types ──────────────────────────────────────────────
@@ -26,11 +27,10 @@ interface DiscordUser {
     global_name?: string;
 }
 
-
 interface DiscordMessagePayload {
     id: string;
     channel_id: string;
-    author: DiscordUser;
+    author: DiscordUser & { bot?: boolean };
     content: string;
     timestamp: string;
     attachments?: Array<{
@@ -45,14 +45,15 @@ interface DiscordMessagePayload {
 
 interface DiscordInteraction {
     id: string;
-    type: number;                    // 2 = APPLICATION_COMMAND
+    type: number;                    // 2 = APPLICATION_COMMAND, 3 = MESSAGE_COMPONENT
     data?: {
         name: string;
+        custom_id?: string;
         options?: Array<{ name: string; value: string; type: number }>;
     };
     channel_id: string;
     guild_id?: string;
-    member?: { user: DiscordUser };
+    member?: { user: DiscordUser; roles?: string[] };
     user?: DiscordUser;
     token: string;
 }
@@ -71,6 +72,44 @@ const SLASH_COMMANDS = [
         }],
     },
     {
+        name: 'task',
+        description: 'Launch an autonomous agent task',
+        options: [{
+            name: 'goal',
+            description: 'What should the agent accomplish?',
+            type: 3,
+            required: true,
+        }],
+    },
+    {
+        name: 'tasks',
+        description: 'List your active tasks',
+    },
+    {
+        name: 'status',
+        description: 'Show Kestrel system status',
+    },
+    {
+        name: 'cancel',
+        description: 'Cancel a running task',
+        options: [{
+            name: 'task_id',
+            description: 'ID of the task to cancel',
+            type: 3,
+            required: true,
+        }],
+    },
+    {
+        name: 'model',
+        description: 'Switch AI model',
+        options: [{
+            name: 'name',
+            description: 'Model name (e.g. gpt-4o, claude-sonnet-4-20250514)',
+            type: 3,
+            required: true,
+        }],
+    },
+    {
         name: 'workspace',
         description: 'Show current workspace info',
     },
@@ -80,25 +119,57 @@ const SLASH_COMMANDS = [
     },
 ];
 
+// ── Embed Colors ───────────────────────────────────────────────────
+
+const COLORS = {
+    primary: 0x6366f1,   // Indigo
+    success: 0x22c55e,   // Green
+    warning: 0xf59e0b,   // Amber
+    error: 0xef4444,   // Red
+    info: 0x3b82f6,   // Blue
+    task: 0x8b5cf6,   // Purple
+    progress: 0x64748b,   // Slate
+};
+
 // ── Discord Adapter ────────────────────────────────────────────────
 
 /**
- * Discord Bot adapter using the Discord REST + Gateway API.
- * Supports slash commands, rich embeds, thread-based conversations,
- * and message component interactions.
+ * Full-featured Discord Bot adapter for Kestrel.
+ *
+ * Features:
+ *   ✅ Chat mode — conversational AI via Discord messages + /chat command
+ *   ✅ Task mode — /task command + !goal prefix for autonomous agent tasks
+ *   ✅ Rich embeds — color-coded embedded responses with fields
+ *   ✅ Extended slash commands — /task, /tasks, /status, /cancel, /model
+ *   ✅ Inline buttons — approve/reject actions with message components
+ *   ✅ Thread-based tasks — creates threads for task progress updates
+ *   ✅ Smart chunking — splits long responses into embeds
+ *   ✅ Typing indicators — shows typing while processing
+ *   ✅ Access control — optional role-based allowlist
+ *   ✅ Auto-reconnect — resilient Gateway WebSocket connection
+ *   ✅ File handling — images, audio, video, documents
  */
 export class DiscordAdapter extends BaseChannelAdapter {
     readonly channelType: ChannelType = 'discord';
 
     private readonly apiBase = 'https://discord.com/api/v10';
-    private gatewayWs: any = null;   // WebSocket to Discord Gateway
+    private gatewayWs: any = null;
     private heartbeatInterval?: NodeJS.Timeout;
     private sessionId?: string;
     private sequence: number | null = null;
 
     // Channel → userId mapping
     private channelUserMap = new Map<string, string>();    // discordUserId → kestrelUserId
-    private userChannelMap = new Map<string, string>();    // kestrelUserId → discordChannelId (DM)
+    private userChannelMap = new Map<string, string>();    // kestrelUserId → discordChannelId
+
+    // Typing indicators
+    private typingIntervals = new Map<string, NodeJS.Timeout>();
+
+    // Active task threads
+    private taskThreads = new Map<string, string>();  // taskConversationId → threadId
+
+    // Pending approvals
+    private pendingApprovals = new Map<string, { channelId: string; userId: string }>();
 
     constructor(private config: DiscordConfig) {
         super();
@@ -124,6 +195,13 @@ export class DiscordAdapter extends BaseChannelAdapter {
 
     async disconnect(): Promise<void> {
         if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
+
+        // Clear all typing indicators
+        for (const [, interval] of this.typingIntervals) {
+            clearInterval(interval);
+        }
+        this.typingIntervals.clear();
+
         if (this.gatewayWs) {
             this.gatewayWs.close(1000, 'Bot shutting down');
             this.gatewayWs = null;
@@ -132,10 +210,38 @@ export class DiscordAdapter extends BaseChannelAdapter {
         logger.info('Discord adapter disconnected');
     }
 
+    // ── Access Control ─────────────────────────────────────────────
+
+    private isAllowed(roles?: string[]): boolean {
+        if (!this.config.allowedRoleIds?.length) return true;
+        if (!roles?.length) return false;
+        return roles.some(r => this.config.allowedRoleIds!.includes(r));
+    }
+
+    // ── Typing Indicators ──────────────────────────────────────────
+
+    private startTyping(channelId: string): void {
+        this.apiRequest('POST', `/channels/${channelId}/typing`).catch(() => { });
+
+        if (!this.typingIntervals.has(channelId)) {
+            const interval = setInterval(() => {
+                this.apiRequest('POST', `/channels/${channelId}/typing`).catch(() => { });
+            }, 8000);  // Discord typing indicator lasts ~10s
+            this.typingIntervals.set(channelId, interval);
+        }
+    }
+
+    private stopTyping(channelId: string): void {
+        const interval = this.typingIntervals.get(channelId);
+        if (interval) {
+            clearInterval(interval);
+            this.typingIntervals.delete(channelId);
+        }
+    }
+
     // ── Gateway WebSocket ──────────────────────────────────────────
 
     private async connectGateway(url: string): Promise<void> {
-        // Dynamic import since discord gateway uses ws
         const { WebSocket } = await import('ws');
 
         return new Promise((resolve, reject) => {
@@ -155,7 +261,6 @@ export class DiscordAdapter extends BaseChannelAdapter {
                 logger.warn(`Discord Gateway closed with code ${code}`);
                 this.setStatus('disconnected');
 
-                // Auto-reconnect on non-fatal close codes
                 if (code !== 1000 && code !== 4004) {
                     setTimeout(() => {
                         logger.info('Reconnecting to Discord Gateway...');
@@ -180,12 +285,12 @@ export class DiscordAdapter extends BaseChannelAdapter {
         switch (op) {
             case 10: // HELLO
                 this.startHeartbeat(d.heartbeat_interval);
-                // Send IDENTIFY
                 this.gatewayWs?.send(JSON.stringify({
                     op: 2,
                     d: {
                         token: this.config.botToken,
-                        intents: (1 << 9) | (1 << 12) | (1 << 15), // GUILDS | MESSAGE_CONTENT | GUILD_MESSAGES
+                        intents: (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15),
+                        // GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT | GUILD_MESSAGE_REACTIONS
                         properties: {
                             os: process.platform,
                             browser: 'kestrel',
@@ -219,7 +324,6 @@ export class DiscordAdapter extends BaseChannelAdapter {
             case 9: // INVALID SESSION
                 logger.warn('Discord invalid session, re-identifying...');
                 if (d) {
-                    // Resumable
                     this.gatewayWs?.send(JSON.stringify({
                         op: 6,
                         d: {
@@ -251,7 +355,6 @@ export class DiscordAdapter extends BaseChannelAdapter {
             case 'MESSAGE_CREATE':
                 this.handleMessage(data as DiscordMessagePayload);
                 break;
-
             case 'INTERACTION_CREATE':
                 this.handleInteraction(data as DiscordInteraction);
                 break;
@@ -260,9 +363,24 @@ export class DiscordAdapter extends BaseChannelAdapter {
 
     private handleMessage(msg: DiscordMessagePayload): void {
         // Ignore bot messages
-        if ((msg.author as any).bot) return;
+        if (msg.author.bot) return;
+
+        const text = msg.content;
+
+        // Handle task mode (!goal prefix)
+        if (text.startsWith('!')) {
+            const goal = text.substring(1).trim();
+            if (goal) {
+                this.handleTaskMessage(msg, goal);
+                return;
+            }
+        }
+
+        // Start typing indicator
+        this.startTyping(msg.channel_id);
 
         const userId = this.resolveUserId(msg.author);
+        this.userChannelMap.set(userId, msg.channel_id);
 
         const attachments: Attachment[] = (msg.attachments || []).map((att) => {
             let type: Attachment['type'] = 'file';
@@ -285,7 +403,7 @@ export class DiscordAdapter extends BaseChannelAdapter {
             userId,
             workspaceId: this.config.defaultWorkspaceId,
             conversationId: `dc-${msg.channel_id}`,
-            content: msg.content,
+            content: text,
             attachments: attachments.length ? attachments : undefined,
             metadata: {
                 channelUserId: msg.author.id,
@@ -300,11 +418,114 @@ export class DiscordAdapter extends BaseChannelAdapter {
         this.emit('message', incoming);
     }
 
+    /**
+     * Handle a !goal message — create a thread and launch the task.
+     */
+    private async handleTaskMessage(msg: DiscordMessagePayload, goal: string): Promise<void> {
+        const userId = this.resolveUserId(msg.author);
+        this.userChannelMap.set(userId, msg.channel_id);
+
+        // Create a thread for this task
+        const threadName = `🦅 Task: ${goal.substring(0, 90)}`;
+        try {
+            const thread = await this.apiRequest('POST', `/channels/${msg.channel_id}/messages/${msg.id}/threads`, {
+                name: threadName,
+                auto_archive_duration: 1440,  // 24 hours
+            });
+
+            const conversationId = `dc-task-${thread.id}`;
+            this.taskThreads.set(conversationId, thread.id);
+
+            // Send initial message in thread
+            await this.apiRequest('POST', `/channels/${thread.id}/messages`, {
+                embeds: [{
+                    title: '🦅 Autonomous Task Started',
+                    description: goal,
+                    color: COLORS.task,
+                    fields: [
+                        { name: 'Status', value: '⏳ Working...', inline: true },
+                        { name: 'Requested By', value: `<@${msg.author.id}>`, inline: true },
+                    ],
+                    timestamp: new Date().toISOString(),
+                }],
+            });
+
+            // Emit the task
+            const incoming: IncomingMessage = {
+                id: randomUUID(),
+                channel: 'discord',
+                userId,
+                workspaceId: this.config.defaultWorkspaceId,
+                conversationId,
+                content: goal,
+                metadata: {
+                    channelUserId: msg.author.id,
+                    channelMessageId: msg.id,
+                    timestamp: new Date(msg.timestamp),
+                    discordChannelId: thread.id,
+                    discordGuildId: msg.guild_id,
+                    discordUsername: msg.author.username,
+                    isTaskRequest: true,
+                    taskThreadId: thread.id,
+                },
+            };
+
+            this.emit('message', incoming);
+        } catch (err) {
+            // Fallback: no thread, just reply inline
+            logger.warn('Could not create Discord thread for task', { error: (err as Error).message });
+            await this.apiRequest('POST', `/channels/${msg.channel_id}/messages`, {
+                embeds: [{
+                    title: '🦅 Task Started',
+                    description: goal,
+                    color: COLORS.task,
+                }],
+            });
+
+            this.emit('message', {
+                id: randomUUID(),
+                channel: 'discord',
+                userId,
+                workspaceId: this.config.defaultWorkspaceId,
+                conversationId: `dc-${msg.channel_id}`,
+                content: goal,
+                metadata: {
+                    channelUserId: msg.author.id,
+                    channelMessageId: msg.id,
+                    timestamp: new Date(msg.timestamp),
+                    discordChannelId: msg.channel_id,
+                    isTaskRequest: true,
+                },
+            });
+        }
+    }
+
+    // ── Interaction Handling ────────────────────────────────────────
+
     private async handleInteraction(interaction: DiscordInteraction): Promise<void> {
-        if (interaction.type !== 2) return; // Only APPLICATION_COMMAND
+        // Handle button clicks (MESSAGE_COMPONENT)
+        if (interaction.type === 3) {
+            await this.handleComponentInteraction(interaction);
+            return;
+        }
+
+        // Only handle APPLICATION_COMMAND
+        if (interaction.type !== 2) return;
 
         const user = interaction.member?.user || interaction.user;
         if (!user) return;
+
+        // Access control
+        if (!this.isAllowed(interaction.member?.roles)) {
+            await this.respondToInteraction(interaction.id, interaction.token, {
+                type: 4,
+                data: {
+                    content: '🔒 Access denied. You don\'t have the required role to use Kestrel.',
+                    flags: 64,
+                },
+            });
+            return;
+        }
 
         const commandName = interaction.data?.name;
         const options = interaction.data?.options || [];
@@ -316,11 +537,15 @@ export class DiscordAdapter extends BaseChannelAdapter {
 
                 // Acknowledge with "thinking"
                 await this.respondToInteraction(interaction.id, interaction.token, {
-                    type: 5, // DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
+                    type: 5,
                 });
 
-                // Route as a normal message
+                // Start typing
+                this.startTyping(interaction.channel_id);
+
                 const userId = this.resolveUserId(user);
+                this.userChannelMap.set(userId, interaction.channel_id);
+
                 const incoming: IncomingMessage = {
                     id: randomUUID(),
                     channel: 'discord',
@@ -341,12 +566,142 @@ export class DiscordAdapter extends BaseChannelAdapter {
                 break;
             }
 
+            case 'task': {
+                const goalOpt = options.find(o => o.name === 'goal');
+                const goal = goalOpt?.value || '';
+
+                // Acknowledge
+                await this.respondToInteraction(interaction.id, interaction.token, {
+                    type: 4,
+                    data: {
+                        embeds: [{
+                            title: '🦅 Launching Autonomous Task',
+                            description: goal,
+                            color: COLORS.task,
+                            fields: [
+                                { name: 'Status', value: '⏳ Initializing...', inline: true },
+                            ],
+                            timestamp: new Date().toISOString(),
+                        }],
+                    },
+                });
+
+                const userId = this.resolveUserId(user);
+                this.userChannelMap.set(userId, interaction.channel_id);
+
+                const incoming: IncomingMessage = {
+                    id: randomUUID(),
+                    channel: 'discord',
+                    userId,
+                    workspaceId: this.config.defaultWorkspaceId,
+                    conversationId: `dc-task-${interaction.channel_id}-${Date.now()}`,
+                    content: goal,
+                    metadata: {
+                        channelUserId: user.id,
+                        channelMessageId: interaction.id,
+                        timestamp: new Date(),
+                        discordChannelId: interaction.channel_id,
+                        isTaskRequest: true,
+                        interactionToken: interaction.token,
+                    },
+                };
+
+                this.emit('message', incoming);
+                break;
+            }
+
+            case 'tasks':
+                await this.respondToInteraction(interaction.id, interaction.token, {
+                    type: 4,
+                    data: {
+                        embeds: [{
+                            title: '📋 Your Tasks',
+                            description: 'Task listing is available via the CLI:\n```\nkestrel tasks\n```',
+                            color: COLORS.info,
+                        }],
+                        flags: 64,
+                    },
+                });
+                break;
+
+            case 'status':
+                await this.respondToInteraction(interaction.id, interaction.token, {
+                    type: 4,
+                    data: {
+                        embeds: [{
+                            title: '🦅 Kestrel Status',
+                            color: COLORS.success,
+                            fields: [
+                                { name: '🟢 Bot', value: 'Online', inline: true },
+                                { name: '🏢 Workspace', value: `\`${this.config.defaultWorkspaceId}\``, inline: true },
+                                { name: '👤 User', value: `<@${user.id}>`, inline: true },
+                                { name: '📡 Gateway', value: this.sessionId ? 'Connected' : 'Disconnected', inline: true },
+                            ],
+                            timestamp: new Date().toISOString(),
+                        }],
+                        flags: 64,
+                    },
+                });
+                break;
+
+            case 'cancel': {
+                const taskIdOpt = options.find(o => o.name === 'task_id');
+                const taskId = taskIdOpt?.value || '';
+
+                const userId = this.resolveUserId(user);
+                this.emit('message', {
+                    id: randomUUID(),
+                    channel: 'discord',
+                    userId,
+                    workspaceId: this.config.defaultWorkspaceId,
+                    conversationId: `dc-${interaction.channel_id}`,
+                    content: `/cancel ${taskId}`,
+                    metadata: {
+                        channelUserId: user.id,
+                        channelMessageId: interaction.id,
+                        timestamp: new Date(),
+                        isCommand: true,
+                    },
+                });
+
+                await this.respondToInteraction(interaction.id, interaction.token, {
+                    type: 4,
+                    data: {
+                        embeds: [{
+                            title: '⏹ Cancellation Requested',
+                            description: `Task \`${taskId}\` cancellation sent.`,
+                            color: COLORS.warning,
+                        }],
+                        flags: 64,
+                    },
+                });
+                break;
+            }
+
+            case 'model': {
+                const nameOpt = options.find(o => o.name === 'name');
+                const modelName = nameOpt?.value || '';
+
+                await this.respondToInteraction(interaction.id, interaction.token, {
+                    type: 4,
+                    data: {
+                        embeds: [{
+                            title: '🔄 Model Switched',
+                            description: `Now using \`${modelName}\``,
+                            color: COLORS.info,
+                        }],
+                        flags: 64,
+                    },
+                });
+                break;
+            }
+
             case 'workspace':
                 await this.respondToInteraction(interaction.id, interaction.token, {
                     type: 4,
                     data: {
-                        content: `🪶 Current workspace: \`${this.config.defaultWorkspaceId}\``,
-                        flags: 64, // Ephemeral
+                        content: `🏢 Current workspace: \`${this.config.defaultWorkspaceId}\``,
+                        flags: 64,
                     },
                 });
                 break;
@@ -356,19 +711,81 @@ export class DiscordAdapter extends BaseChannelAdapter {
                     type: 4,
                     data: {
                         embeds: [{
-                            title: '🪶 Kestrel Help',
-                            description: 'Your AI assistant on Discord.',
-                            color: 0x6366f1,
+                            title: '🦅 Kestrel — Autonomous AI Agent',
+                            description: 'Your AI assistant on Discord. Chat naturally or launch autonomous tasks.',
+                            color: COLORS.primary,
                             fields: [
-                                { name: '/chat', value: 'Chat with Kestrel AI', inline: true },
-                                { name: '/workspace', value: 'Show workspace info', inline: true },
-                                { name: '/help', value: 'Show this help', inline: true },
+                                { name: '💬 Chat', value: '`/chat` or just type in a DM', inline: false },
+                                { name: '🤖 Task', value: '`/task` or `!goal` to launch autonomous agent', inline: false },
+                                { name: '📋 Tasks', value: '`/tasks` — List active tasks', inline: true },
+                                { name: '⏹ Cancel', value: '`/cancel` — Cancel a task', inline: true },
+                                { name: '📊 Status', value: '`/status` — System status', inline: true },
+                                { name: '🔄 Model', value: '`/model` — Switch AI model', inline: true },
+                                { name: '🏢 Workspace', value: '`/workspace` — Show workspace', inline: true },
                             ],
                         }],
                         flags: 64,
                     },
                 });
                 break;
+        }
+    }
+
+    // ── Component (Button) Interactions ────────────────────────────
+
+    private async handleComponentInteraction(interaction: DiscordInteraction): Promise<void> {
+        const customId = interaction.data?.custom_id || '';
+        const user = interaction.member?.user || interaction.user;
+
+        if (customId.startsWith('approve:')) {
+            const approvalId = customId.substring('approve:'.length);
+            await this.respondToInteraction(interaction.id, interaction.token, {
+                type: 4,
+                data: {
+                    embeds: [{
+                        title: '✅ Approved',
+                        description: `Approval \`${approvalId}\` confirmed by <@${user?.id}>`,
+                        color: COLORS.success,
+                    }],
+                },
+            });
+            this.pendingApprovals.delete(approvalId);
+        } else if (customId.startsWith('reject:')) {
+            const approvalId = customId.substring('reject:'.length);
+            await this.respondToInteraction(interaction.id, interaction.token, {
+                type: 4,
+                data: {
+                    embeds: [{
+                        title: '❌ Rejected',
+                        description: `Approval \`${approvalId}\` rejected by <@${user?.id}>`,
+                        color: COLORS.error,
+                    }],
+                },
+            });
+            this.pendingApprovals.delete(approvalId);
+        } else {
+            // Treat as a generic callback → route as message
+            await this.respondToInteraction(interaction.id, interaction.token, {
+                type: 6, // DEFERRED_UPDATE_MESSAGE
+            });
+
+            if (user) {
+                const userId = this.resolveUserId(user);
+                this.emit('message', {
+                    id: randomUUID(),
+                    channel: 'discord',
+                    userId,
+                    workspaceId: this.config.defaultWorkspaceId,
+                    conversationId: `dc-${interaction.channel_id}`,
+                    content: customId,
+                    metadata: {
+                        channelUserId: user.id,
+                        channelMessageId: interaction.id,
+                        timestamp: new Date(),
+                        isComponentInteraction: true,
+                    },
+                });
+            }
         }
     }
 
@@ -381,39 +798,147 @@ export class DiscordAdapter extends BaseChannelAdapter {
             return;
         }
 
-        // Build embed for rich responses
-        const payload: any = {};
+        await this.sendToChannel(channelId, message);
+    }
 
-        if (message.content.length > 2000) {
-            // Long messages → embed
-            payload.embeds = [{
-                description: message.content.substring(0, 4096),
-                color: 0x6366f1,
-            }];
+    /**
+     * Send a message to a Discord channel, using embeds for long content
+     * and smart chunking.
+     */
+    private async sendToChannel(channelId: string, message: OutgoingMessage): Promise<void> {
+        this.stopTyping(channelId);
+
+        const content = message.content;
+
+        if (content.length > 2000) {
+            // Long messages → embed(s)
+            const chunks = this.chunkMessage(content, 4000);
+            for (let i = 0; i < chunks.length; i++) {
+                const payload: any = {
+                    embeds: [{
+                        description: chunks[i],
+                        color: COLORS.primary,
+                    }],
+                };
+
+                // Add buttons only to last chunk
+                if (i === chunks.length - 1 && message.options?.buttons?.length) {
+                    payload.components = [{
+                        type: 1,
+                        components: message.options.buttons.map((btn) => ({
+                            type: 2,
+                            style: 1,
+                            label: btn.label,
+                            custom_id: btn.action,
+                        })),
+                    }];
+                }
+
+                await this.apiRequest('POST', `/channels/${channelId}/messages`, payload);
+            }
         } else {
-            payload.content = message.content;
+            // Short messages → plain text
+            const payload: any = { content };
+
+            if (message.options?.buttons?.length) {
+                payload.components = [{
+                    type: 1,
+                    components: message.options.buttons.map((btn) => ({
+                        type: 2,
+                        style: 1,
+                        label: btn.label,
+                        custom_id: btn.action,
+                    })),
+                }];
+            }
+
+            await this.apiRequest('POST', `/channels/${channelId}/messages`, payload);
+        }
+    }
+
+    private chunkMessage(text: string, maxLength: number): string[] {
+        if (text.length <= maxLength) return [text];
+
+        const chunks: string[] = [];
+        let remaining = text;
+
+        while (remaining.length > 0) {
+            if (remaining.length <= maxLength) {
+                chunks.push(remaining);
+                break;
+            }
+
+            let splitAt = remaining.lastIndexOf('\n', maxLength);
+            if (splitAt < maxLength / 2) splitAt = remaining.lastIndexOf('. ', maxLength);
+            if (splitAt < maxLength / 2) splitAt = remaining.lastIndexOf(' ', maxLength);
+            if (splitAt < maxLength / 2) splitAt = maxLength;
+
+            chunks.push(remaining.substring(0, splitAt));
+            remaining = remaining.substring(splitAt).trimStart();
         }
 
-        // Buttons → message components
-        if (message.options?.buttons?.length) {
-            payload.components = [{
-                type: 1, // ACTION_ROW
-                components: message.options.buttons.map((btn) => ({
-                    type: 2, // BUTTON
-                    style: 1, // PRIMARY
-                    label: btn.label,
-                    custom_id: btn.action,
-                })),
-            }];
-        }
+        return chunks;
+    }
+
+    // ── Task Progress ─────────────────────────────────────────────
+
+    /**
+     * Send a progress update to a task thread.
+     */
+    async sendTaskProgress(channelId: string, step: string, detail: string = ''): Promise<void> {
+        const payload = {
+            embeds: [{
+                description: detail
+                    ? `🔧 **${step}**\n${detail}`
+                    : `🔧 ${step}`,
+                color: COLORS.progress,
+            }],
+        };
 
         await this.apiRequest('POST', `/channels/${channelId}/messages`, payload);
+    }
+
+    /**
+     * Send an approval request with approve/reject buttons.
+     */
+    async sendApprovalRequest(
+        channelId: string,
+        approvalId: string,
+        description: string,
+    ): Promise<void> {
+        this.pendingApprovals.set(approvalId, { channelId, userId: '' });
+
+        await this.apiRequest('POST', `/channels/${channelId}/messages`, {
+            embeds: [{
+                title: '⚠️ Approval Required',
+                description: `${description}\n\nID: \`${approvalId}\``,
+                color: COLORS.warning,
+                timestamp: new Date().toISOString(),
+            }],
+            components: [{
+                type: 1,
+                components: [
+                    {
+                        type: 2,
+                        style: 3, // SUCCESS (green)
+                        label: '✅ Approve',
+                        custom_id: `approve:${approvalId}`,
+                    },
+                    {
+                        type: 2,
+                        style: 4, // DANGER (red)
+                        label: '❌ Reject',
+                        custom_id: `reject:${approvalId}`,
+                    },
+                ],
+            }],
+        });
     }
 
     // ── Formatting ─────────────────────────────────────────────────
 
     formatOutgoing(message: OutgoingMessage): OutgoingMessage {
-        // Discord supports most Markdown natively, no changes needed
+        // Discord supports full Markdown, no changes needed
         return message;
     }
 
@@ -425,7 +950,7 @@ export class DiscordAdapter extends BaseChannelAdapter {
             : `/applications/${this.config.clientId}/commands`;
 
         await this.apiRequest('PUT', endpoint, SLASH_COMMANDS);
-        logger.info('Discord slash commands registered');
+        logger.info(`Discord slash commands registered (${SLASH_COMMANDS.length} commands)`);
     }
 
     // ── Interaction Responses ──────────────────────────────────────

@@ -1,7 +1,7 @@
 /**
  * Supported channel types.
  */
-export type ChannelType = 'web' | 'whatsapp' | 'telegram' | 'discord' | 'mobile';
+export type ChannelType = 'web' | 'whatsapp' | 'telegram' | 'discord' | 'mobile' | 'moltbook';
 
 /**
  * Adapter connection state.

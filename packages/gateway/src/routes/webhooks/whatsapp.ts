@@ -69,6 +69,10 @@ export default async function whatsappWebhookRoutes(
             status: body.MessageStatus,
             to: body.To,
         });
+
+        // Forward to adapter for delivery tracking
+        whatsappAdapter.processStatusCallback(body);
+
         return reply.code(200).send({ ok: true });
     });
 }

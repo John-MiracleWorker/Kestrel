@@ -17,7 +17,7 @@ logger = logging.getLogger("brain.providers.cloud")
 PROVIDER_CONFIGS = {
     "openai": {
         "api_key_env": "OPENAI_API_KEY",
-        "default_model": os.getenv("OPENAI_DEFAULT_MODEL", "gpt-5-nano"),
+        "default_model": os.getenv("OPENAI_DEFAULT_MODEL", "gpt-5-mini"),
         "base_url": "https://api.openai.com/v1/chat/completions",
     },
     "anthropic": {
@@ -27,8 +27,55 @@ PROVIDER_CONFIGS = {
     },
     "google": {
         "api_key_env": "GOOGLE_API_KEY",
-        "default_model": os.getenv("GOOGLE_DEFAULT_MODEL", "gemini-2.5-flash"),
+        "default_model": os.getenv("GOOGLE_DEFAULT_MODEL", "gemini-3-flash"),
         "base_url": "https://generativelanguage.googleapis.com/v1beta/models",
+    },
+}
+
+# ── Model Catalog (current as of Feb 2026) ────────────────────────────
+# Use this for model discovery via CLI (`kestrel models`) or API.
+MODEL_CATALOG = {
+    "openai": {
+        "flagship": [
+            {"id": "gpt-5.2",          "ctx": "128k", "desc": "Most capable — enterprise knowledge work, complex reasoning"},
+            {"id": "gpt-5.1",          "ctx": "128k", "desc": "Core dev model — conversation stability, long-context reasoning"},
+            {"id": "gpt-5",            "ctx": "128k", "desc": "Developer-focused — coding + agentic tasks"},
+        ],
+        "efficient": [
+            {"id": "gpt-5-mini",       "ctx": "128k", "desc": "Fast + cheap — well-defined tasks (default)"},
+            {"id": "gpt-5-nano",       "ctx": "128k", "desc": "Ultra-fast — rapid tasks, edge deployment"},
+        ],
+        "coding": [
+            {"id": "gpt-5.3-codex",       "ctx": "128k", "desc": "Most capable agentic coding model"},
+            {"id": "gpt-5.3-codex-spark", "ctx": "128k", "desc": "Low-latency coding — real-time editing, prototyping"},
+        ],
+        "legacy": [
+            {"id": "gpt-4.1",         "ctx": "128k", "desc": "Previous gen — still available via API"},
+            {"id": "gpt-4.1-mini",    "ctx": "128k", "desc": "Previous gen compact"},
+        ],
+    },
+    "anthropic": {
+        "flagship": [
+            {"id": "claude-opus-4-6",   "ctx": "200k", "desc": "Most intelligent — complex tasks, sustained agentic work"},
+            {"id": "claude-sonnet-4-5", "ctx": "200k", "desc": "Best all-around — coding, agents, cost-efficient (recommended)"},
+        ],
+        "efficient": [
+            {"id": "claude-haiku-4-5",  "ctx": "200k", "desc": "Fastest + cheapest — quick responses (default)"},
+        ],
+    },
+    "google": {
+        "flagship": [
+            {"id": "gemini-3-pro",          "ctx": "1M",   "desc": "Multimodal flagship — deep reasoning, rich visuals"},
+            {"id": "gemini-3-deep-think",   "ctx": "1M",   "desc": "Specialized reasoning — science, research, engineering"},
+        ],
+        "efficient": [
+            {"id": "gemini-3-flash",        "ctx": "1M",   "desc": "Speed-optimized — price-performance leader (default)"},
+            {"id": "gemini-2.5-flash",      "ctx": "1M",   "desc": "Stable workhorse — high-volume, audio output"},
+            {"id": "gemini-2.5-flash-lite", "ctx": "1M",   "desc": "Ultra-cheap — high-throughput services"},
+        ],
+        "stable": [
+            {"id": "gemini-2.5-pro",        "ctx": "1M",   "desc": "Previous gen flagship — enterprise stable"},
+        ],
     },
 }
 

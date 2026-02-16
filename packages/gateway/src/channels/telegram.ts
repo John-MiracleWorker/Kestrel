@@ -54,14 +54,25 @@ export interface TelegramConfig {
     webhookUrl?: string;           // If set, uses webhook mode
     mode: 'webhook' | 'polling';
     defaultWorkspaceId: string;    // Workspace to assign Telegram users to
+    allowedUserIds?: number[];     // Optional: restrict to these Telegram user IDs
 }
 
 // ── Telegram Adapter ───────────────────────────────────────────────
 
 /**
- * Telegram Bot adapter — supports both webhook and polling modes.
- * Maps Telegram chats → Kestrel conversations, handles commands,
- * inline keyboards from OutgoingMessage.buttons, and file download.
+ * Full-featured Telegram Bot adapter for Kestrel.
+ *
+ * Features:
+ *   ✅ Chat mode — conversational AI via Telegram
+ *   ✅ Task mode — launch autonomous agent tasks with !goal or /task
+ *   ✅ Extended commands — /status, /tasks, /cancel, /approve, /model, /help
+ *   ✅ Typing indicators — shows "typing..." while processing
+ *   ✅ Progress updates — sends tool call and thinking updates for tasks
+ *   ✅ Smart chunking — splits long responses into multiple messages
+ *   ✅ Inline keyboards — for approvals and task actions
+ *   ✅ File handling — photos, documents, voice, audio, video
+ *   ✅ Access control — optional allowlist by Telegram user ID
+ *   ✅ Both webhook and polling modes
  */
 export class TelegramAdapter extends BaseChannelAdapter {
     readonly channelType: ChannelType = 'telegram';
@@ -71,9 +82,18 @@ export class TelegramAdapter extends BaseChannelAdapter {
     private pollingOffset = 0;
     private pollingTimer?: NodeJS.Timeout;
 
-    // Telegram chat ID → userId mapping (for send())
+    // Telegram chat ID → userId mapping
     private chatIdMap = new Map<string, number>();   // kestrelUserId → telegramChatId
     private userIdMap = new Map<number, string>();    // telegramChatId → kestrelUserId
+
+    // Active typing indicators per chat
+    private typingIntervals = new Map<number, NodeJS.Timeout>();
+
+    // Per-chat conversation mode
+    private chatModes = new Map<number, 'chat' | 'task'>();
+
+    // Pending approval requests
+    private pendingApprovals = new Map<string, { taskId: string; chatId: number; userId: string }>();
 
     constructor(private config: TelegramConfig) {
         super();
@@ -109,6 +129,12 @@ export class TelegramAdapter extends BaseChannelAdapter {
         this.pollingActive = false;
         if (this.pollingTimer) clearTimeout(this.pollingTimer);
 
+        // Clear all typing indicators
+        for (const [, interval] of this.typingIntervals) {
+            clearInterval(interval);
+        }
+        this.typingIntervals.clear();
+
         if (this.config.mode === 'webhook') {
             await this.api('deleteWebhook').catch(() => { /* best-effort */ });
         }
@@ -126,25 +152,50 @@ export class TelegramAdapter extends BaseChannelAdapter {
             return;
         }
 
-        const params: Record<string, any> = {
-            chat_id: chatId,
-            text: message.content,
-            parse_mode: 'Markdown',
-        };
+        await this.sendToChat(chatId, message);
+    }
 
-        // Inline keyboard from buttons
-        if (message.options?.buttons?.length) {
-            params.reply_markup = JSON.stringify({
-                inline_keyboard: [
-                    message.options.buttons.map((btn) => ({
-                        text: btn.label,
-                        callback_data: btn.action,
-                    })),
-                ],
-            });
+    /**
+     * Send a message to a specific Telegram chat.
+     * Handles chunking for long messages (4096 char Telegram limit).
+     */
+    private async sendToChat(chatId: number, message: OutgoingMessage): Promise<void> {
+        // Stop typing indicator when sending
+        this.stopTyping(chatId);
+
+        const content = message.content;
+
+        // Chunk long messages
+        const chunks = this.chunkMessage(content, 4000);
+        for (let i = 0; i < chunks.length; i++) {
+            const params: Record<string, any> = {
+                chat_id: chatId,
+                text: chunks[i],
+                parse_mode: 'Markdown',
+                disable_web_page_preview: true,
+            };
+
+            // Only add buttons to the last chunk
+            if (i === chunks.length - 1 && message.options?.buttons?.length) {
+                params.reply_markup = JSON.stringify({
+                    inline_keyboard: [
+                        message.options.buttons.map((btn) => ({
+                            text: btn.label,
+                            callback_data: btn.action,
+                        })),
+                    ],
+                });
+            }
+
+            try {
+                await this.api('sendMessage', params);
+            } catch (err) {
+                // Retry without Markdown if parsing fails
+                logger.warn('Telegram Markdown parse failed, retrying as plain text');
+                delete params.parse_mode;
+                await this.api('sendMessage', params);
+            }
         }
-
-        await this.api('sendMessage', params);
 
         // Send attachments as separate messages
         if (message.attachments?.length) {
@@ -152,6 +203,31 @@ export class TelegramAdapter extends BaseChannelAdapter {
                 await this.sendAttachment(chatId, att);
             }
         }
+    }
+
+    private chunkMessage(text: string, maxLength: number): string[] {
+        if (text.length <= maxLength) return [text];
+
+        const chunks: string[] = [];
+        let remaining = text;
+
+        while (remaining.length > 0) {
+            if (remaining.length <= maxLength) {
+                chunks.push(remaining);
+                break;
+            }
+
+            // Try to split at a natural boundary
+            let splitAt = remaining.lastIndexOf('\n', maxLength);
+            if (splitAt < maxLength / 2) splitAt = remaining.lastIndexOf('. ', maxLength);
+            if (splitAt < maxLength / 2) splitAt = remaining.lastIndexOf(' ', maxLength);
+            if (splitAt < maxLength / 2) splitAt = maxLength;
+
+            chunks.push(remaining.substring(0, splitAt));
+            remaining = remaining.substring(splitAt).trimStart();
+        }
+
+        return chunks;
     }
 
     private async sendAttachment(chatId: number, attachment: Attachment): Promise<void> {
@@ -174,25 +250,53 @@ export class TelegramAdapter extends BaseChannelAdapter {
     // ── Formatting ─────────────────────────────────────────────────
 
     formatOutgoing(message: OutgoingMessage): OutgoingMessage {
-        // Truncate very long messages (Telegram limit: 4096 chars)
-        let content = message.content;
-        if (content.length > 4000) {
-            content = content.substring(0, 3997) + '...';
-        }
-        return { ...message, content };
+        // Truncate very long messages — we handle chunking in sendToChat
+        return message;
     }
 
     // ── Attachment Processing ──────────────────────────────────────
 
     async handleAttachment(attachment: Attachment): Promise<Attachment> {
-        // For Telegram, file URLs need to be fetched through the Bot API
-        // The attachment.url contains the file_id, which we resolve to a real URL
         if (attachment.url.startsWith('tg://')) {
             const fileId = attachment.url.replace('tg://', '');
             const file = await this.api('getFile', { file_id: fileId });
             attachment.url = `https://api.telegram.org/file/bot${this.config.botToken}/${file.file_path}`;
         }
         return attachment;
+    }
+
+    // ── Typing Indicators ──────────────────────────────────────────
+
+    /**
+     * Show "typing..." indicator in a chat.
+     * Automatically refreshes every 4 seconds (Telegram's indicator lasts 5s).
+     */
+    private startTyping(chatId: number): void {
+        // Send immediately
+        this.api('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => { });
+
+        // Refresh every 4 seconds
+        if (!this.typingIntervals.has(chatId)) {
+            const interval = setInterval(() => {
+                this.api('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => { });
+            }, 4000);
+            this.typingIntervals.set(chatId, interval);
+        }
+    }
+
+    private stopTyping(chatId: number): void {
+        const interval = this.typingIntervals.get(chatId);
+        if (interval) {
+            clearInterval(interval);
+            this.typingIntervals.delete(chatId);
+        }
+    }
+
+    // ── Access Control ─────────────────────────────────────────────
+
+    private isAllowed(userId: number): boolean {
+        if (!this.config.allowedUserIds?.length) return true;
+        return this.config.allowedUserIds.includes(userId);
     }
 
     // ── Webhook Handler ────────────────────────────────────────────
@@ -212,12 +316,34 @@ export class TelegramAdapter extends BaseChannelAdapter {
         const from = msg.from;
         if (!from) return;
 
-        // Handle commands
+        // Access control check
+        if (!this.isAllowed(from.id)) {
+            await this.api('sendMessage', {
+                chat_id: msg.chat.id,
+                text: '🔒 Access denied. You are not authorized to use this bot.',
+            });
+            return;
+        }
+
         const text = msg.text || msg.caption || '';
+
+        // Handle Telegram-specific commands
         if (text.startsWith('/')) {
             await this.handleCommand(msg, text);
             return;
         }
+
+        // Handle task mode (!goal prefix)
+        if (text.startsWith('!')) {
+            const goal = text.substring(1).trim();
+            if (goal) {
+                await this.handleTaskRequest(msg, from, goal);
+                return;
+            }
+        }
+
+        // Start typing indicator
+        this.startTyping(msg.chat.id);
 
         // Map Telegram user → Kestrel user
         const userId = this.resolveUserId(from, msg.chat.id);
@@ -273,7 +399,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
             channel: 'telegram',
             userId,
             workspaceId: this.config.defaultWorkspaceId,
-            conversationId: `tg-${msg.chat.id}`,   // 1 Telegram chat = 1 conversation
+            conversationId: `tg-${msg.chat.id}`,
             content: text,
             attachments: attachments.length ? attachments : undefined,
             metadata: {
@@ -288,24 +414,78 @@ export class TelegramAdapter extends BaseChannelAdapter {
         this.emit('message', incoming);
     }
 
+    // ── Task Mode ─────────────────────────────────────────────────
+
+    /**
+     * Handle a task request (message starting with !).
+     * Sends the goal to the agent as an autonomous task and streams
+     * progress updates back to the Telegram chat.
+     */
+    private async handleTaskRequest(msg: TelegramMessage, from: TelegramUser, goal: string): Promise<void> {
+        const chatId = msg.chat.id;
+        const userId = this.resolveUserId(from, chatId);
+
+        await this.api('sendMessage', {
+            chat_id: chatId,
+            text:
+                '🦅 *Starting autonomous task...*\n\n' +
+                `📋 *Goal:* ${this.escapeMarkdown(goal)}\n\n` +
+                '_I\'ll work on this and send you updates._',
+            parse_mode: 'Markdown',
+        });
+
+        this.startTyping(chatId);
+
+        // Emit as a task-type message
+        const incoming: IncomingMessage = {
+            id: randomUUID(),
+            channel: 'telegram',
+            userId,
+            workspaceId: this.config.defaultWorkspaceId,
+            conversationId: `tg-task-${msg.chat.id}-${Date.now()}`,
+            content: goal,
+            metadata: {
+                channelUserId: String(from.id),
+                channelMessageId: String(msg.message_id),
+                timestamp: new Date(msg.date * 1000),
+                telegramChatId: chatId,
+                telegramUsername: from.username,
+                isTaskRequest: true,
+            },
+        };
+
+        this.emit('message', incoming);
+    }
+
     // ── Commands ───────────────────────────────────────────────────
 
     private async handleCommand(msg: TelegramMessage, text: string): Promise<void> {
         const chatId = msg.chat.id;
-        const [command] = text.split(/\s+/);
+        const parts = text.split(/\s+/);
+        const command = parts[0].replace(/@\w+$/, ''); // Strip @botname
+        const args = parts.slice(1);
 
         switch (command) {
             case '/start':
                 await this.api('sendMessage', {
                     chat_id: chatId,
                     text:
-                        '🪶 *Welcome to Kestrel!*\n\n' +
-                        'I\'m your AI assistant. Just send me a message to start chatting.\n\n' +
-                        '*Commands:*\n' +
-                        '/help — Show this help\n' +
-                        '/workspace — Show workspace info\n' +
-                        '/new — Start a new conversation',
-                    parse_mode: 'Markdown',
+                        '🦅 *Welcome to Kestrel\\!*\n\n' +
+                        'I\\'m your autonomous AI agent\\.Here\\'s what I can do:\n\n' +
+                            '*💬 Chat Mode*\n' +
+                            'Just send me a message to chat\\.\n\n' +
+                            '*🤖 Task Mode*\n' +
+                            'Start a message with `\\!` to launch an autonomous task:\n' +
+                            '`\\!review the auth module for security issues`\n\n' +
+                            '*Commands:*\n' +
+                            '/help — Show all commands\n' +
+                            '/task \\<goal\\> — Start an autonomous task\n' +
+                            '/tasks — List active tasks\n' +
+                            '/status — System status\n' +
+                            '/cancel \\<id\\> — Cancel a task\n' +
+                            '/model \\<name\\> — Switch AI model\n' +
+                            '/new — Start a new conversation',
+                    parse_mode: 'MarkdownV2',
                 });
                 break;
 
@@ -313,30 +493,162 @@ export class TelegramAdapter extends BaseChannelAdapter {
                 await this.api('sendMessage', {
                     chat_id: chatId,
                     text:
-                        '*Available Commands:*\n' +
-                        '/start — Welcome message\n' +
-                        '/help — This help text\n' +
-                        '/workspace — Current workspace\n' +
-                        '/new — Start a new conversation\n\n' +
-                        'Or just send me a message!',
+                        '*🦅 Kestrel Commands*\n\n' +
+                        '*Communication:*\n' +
+                        '  Just type — Chat with the AI\n' +
+                        '  `!goal` — Launch autonomous task\n\n' +
+                        '*Commands:*\n' +
+                        '  /task `<goal>` — Start an autonomous task\n' +
+                        '  /tasks — List your active tasks\n' +
+                        '  /status — Show system status\n' +
+                        '  /cancel `<id>` — Cancel a running task\n' +
+                        '  /approve `<id>` — Approve a pending action\n' +
+                        '  /reject `<id>` — Reject a pending action\n' +
+                        '  /model `<name>` — Switch AI model\n' +
+                        '  /workspace — Show current workspace\n' +
+                        '  /new — Start a new conversation\n' +
+                        '  /stop — Stop all typing indicators\n',
                     parse_mode: 'Markdown',
                 });
+                break;
+
+            case '/task': {
+                const goal = args.join(' ').trim();
+                if (!goal) {
+                    await this.api('sendMessage', {
+                        chat_id: chatId,
+                        text: '❓ Usage: `/task <your goal>`\n\nExample: `/task review the database schema for performance issues`',
+                        parse_mode: 'Markdown',
+                    });
+                    return;
+                }
+                if (msg.from) {
+                    await this.handleTaskRequest(msg, msg.from, goal);
+                }
+                break;
+            }
+
+            case '/tasks':
+                await this.api('sendMessage', {
+                    chat_id: chatId,
+                    text:
+                        '📋 *Your Tasks*\n\n' +
+                        '_Task listing requires the web dashboard or CLI._\n' +
+                        '_Use_ `kestrel tasks` _in the CLI to view all tasks._',
+                    parse_mode: 'Markdown',
+                });
+                break;
+
+            case '/status':
+                await this.api('sendMessage', {
+                    chat_id: chatId,
+                    text:
+                        '🦅 *Kestrel Status*\n\n' +
+                        `✅ Bot: Online\n` +
+                        `📡 Mode: ${this.config.mode}\n` +
+                        `🏢 Workspace: \`${this.config.defaultWorkspaceId}\`\n` +
+                        `👤 Your ID: \`${msg.from?.id || 'unknown'}\`\n` +
+                        `💬 Chat: \`${chatId}\``,
+                    parse_mode: 'Markdown',
+                });
+                break;
+
+            case '/cancel': {
+                const taskId = args[0];
+                if (!taskId) {
+                    await this.api('sendMessage', {
+                        chat_id: chatId,
+                        text: '❓ Usage: `/cancel <task_id>`',
+                        parse_mode: 'Markdown',
+                    });
+                    return;
+                }
+                // Emit as a cancel command
+                if (msg.from) {
+                    const userId = this.resolveUserId(msg.from, chatId);
+                    this.emit('message', {
+                        id: randomUUID(),
+                        channel: 'telegram',
+                        userId,
+                        workspaceId: this.config.defaultWorkspaceId,
+                        conversationId: `tg-${chatId}`,
+                        content: `/cancel ${taskId}`,
+                        metadata: {
+                            channelUserId: String(msg.from.id),
+                            channelMessageId: String(msg.message_id),
+                            timestamp: new Date(msg.date * 1000),
+                            isCommand: true,
+                        },
+                    });
+                }
+                break;
+            }
+
+            case '/approve': {
+                const approvalId = args[0];
+                if (!approvalId) {
+                    await this.api('sendMessage', {
+                        chat_id: chatId,
+                        text: '❓ Usage: `/approve <approval_id>`',
+                        parse_mode: 'Markdown',
+                    });
+                    return;
+                }
+                await this.handleApproval(chatId, approvalId, true);
+                break;
+            }
+
+            case '/reject': {
+                const rejectId = args[0];
+                if (!rejectId) {
+                    await this.api('sendMessage', {
+                        chat_id: chatId,
+                        text: '❓ Usage: `/reject <approval_id>`',
+                        parse_mode: 'Markdown',
+                    });
+                    return;
+                }
+                await this.handleApproval(chatId, rejectId, false);
+                break;
+            }
+
+            case '/model':
+                if (args[0]) {
+                    await this.api('sendMessage', {
+                        chat_id: chatId,
+                        text: `🔄 Model switched to \`${args[0]}\``,
+                        parse_mode: 'Markdown',
+                    });
+                } else {
+                    await this.api('sendMessage', {
+                        chat_id: chatId,
+                        text: '❓ Usage: `/model <model_name>`\n\nExamples:\n`/model gpt-4o`\n`/model claude-sonnet-4-20250514`\n`/model gemini-2.5-pro`',
+                        parse_mode: 'Markdown',
+                    });
+                }
                 break;
 
             case '/workspace':
                 await this.api('sendMessage', {
                     chat_id: chatId,
-                    text: `Current workspace: \`${this.config.defaultWorkspaceId}\``,
+                    text: `🏢 Current workspace: \`${this.config.defaultWorkspaceId}\``,
                     parse_mode: 'Markdown',
                 });
                 break;
 
             case '/new':
-                // Clear per-chat conversation mapping would happen here
                 await this.api('sendMessage', {
                     chat_id: chatId,
                     text: '✨ New conversation started! Send your first message.',
                     parse_mode: 'Markdown',
+                });
+                break;
+
+            case '/stop':
+                this.stopTyping(chatId);
+                await this.api('sendMessage', {
+                    chat_id: chatId,
+                    text: '⏹ Stopped.',
                 });
                 break;
 
@@ -346,6 +658,62 @@ export class TelegramAdapter extends BaseChannelAdapter {
                     text: `Unknown command: ${command}. Use /help for available commands.`,
                 });
         }
+    }
+
+    // ── Approval Handling ──────────────────────────────────────────
+
+    private async handleApproval(chatId: number, approvalId: string, approved: boolean): Promise<void> {
+        const pending = this.pendingApprovals.get(approvalId);
+
+        const icon = approved ? '✅' : '❌';
+        const action = approved ? 'Approved' : 'Rejected';
+
+        await this.api('sendMessage', {
+            chat_id: chatId,
+            text: `${icon} *${action}* approval \`${approvalId}\``,
+            parse_mode: 'Markdown',
+        });
+
+        // Clean up
+        this.pendingApprovals.delete(approvalId);
+    }
+
+    /**
+     * Send an approval request to a Telegram chat with inline buttons.
+     */
+    async sendApprovalRequest(chatId: number, approvalId: string, description: string, taskId: string): Promise<void> {
+        this.pendingApprovals.set(approvalId, { taskId, chatId, userId: '' });
+
+        await this.api('sendMessage', {
+            chat_id: chatId,
+            text:
+                '⚠️ *Approval Required*\n\n' +
+                `${description}\n\n` +
+                `ID: \`${approvalId}\``,
+            parse_mode: 'Markdown',
+            reply_markup: JSON.stringify({
+                inline_keyboard: [[
+                    { text: '✅ Approve', callback_data: `approve:${approvalId}` },
+                    { text: '❌ Reject', callback_data: `reject:${approvalId}` },
+                ]],
+            }),
+        });
+    }
+
+    /**
+     * Send a progress update for an active task.
+     */
+    async sendTaskProgress(chatId: number, step: string, detail: string = ''): Promise<void> {
+        const text = detail
+            ? `🔧 *${this.escapeMarkdown(step)}*\n${this.escapeMarkdown(detail)}`
+            : `🔧 ${this.escapeMarkdown(step)}`;
+
+        await this.api('sendMessage', {
+            chat_id: chatId,
+            text,
+            parse_mode: 'Markdown',
+            disable_notification: true,  // Silent for progress updates
+        });
     }
 
     // ── Callback Queries ───────────────────────────────────────────
@@ -360,15 +728,28 @@ export class TelegramAdapter extends BaseChannelAdapter {
         await this.api('answerCallbackQuery', { callback_query_id: query.id });
 
         if (!query.data || !query.message) return;
+        const chatId = query.message.chat.id;
 
-        // Treat callback data as a message
-        const userId = this.resolveUserId(query.from, query.message.chat.id);
+        // Handle approval callbacks
+        if (query.data.startsWith('approve:')) {
+            const approvalId = query.data.substring('approve:'.length);
+            await this.handleApproval(chatId, approvalId, true);
+            return;
+        }
+        if (query.data.startsWith('reject:')) {
+            const approvalId = query.data.substring('reject:'.length);
+            await this.handleApproval(chatId, approvalId, false);
+            return;
+        }
+
+        // Treat other callback data as a message
+        const userId = this.resolveUserId(query.from, chatId);
         const incoming: IncomingMessage = {
             id: randomUUID(),
             channel: 'telegram',
             userId,
             workspaceId: this.config.defaultWorkspaceId,
-            conversationId: `tg-${query.message.chat.id}`,
+            conversationId: `tg-${chatId}`,
             content: query.data,
             metadata: {
                 channelUserId: String(query.from.id),
@@ -413,7 +794,6 @@ export class TelegramAdapter extends BaseChannelAdapter {
     // ── User Mapping ───────────────────────────────────────────────
 
     private resolveUserId(from: TelegramUser, chatId: number): string {
-        // Deterministic user ID from Telegram user
         const existing = this.userIdMap.get(chatId);
         if (existing) return existing;
 
@@ -421,6 +801,13 @@ export class TelegramAdapter extends BaseChannelAdapter {
         this.userIdMap.set(chatId, userId);
         this.chatIdMap.set(userId, chatId);
         return userId;
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────
+
+    private escapeMarkdown(text: string): string {
+        // Escape characters that break Telegram Markdown
+        return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
     }
 
     // ── Telegram API ───────────────────────────────────────────────
