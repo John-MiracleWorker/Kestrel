@@ -21,6 +21,10 @@ const state = {
     currentMode: 'general',
     autonomous: true,
     modes: [],
+    // Provider selection: 'local' or 'gemini'/'openai'/'claude'
+    selectedProvider: 'local',
+    selectedCloudModel: null,
+    cloudProviders: [],
 };
 
 // ── API Helpers ───────────────────────────────────────────────
@@ -211,7 +215,7 @@ function setupChat() {
     setupFileDrop();
 
     // ── Model Quick-Switch ────────────────────────────────
-    setupModelPill();
+    setupProviderSelector();
 
     // ── File attachment remove ─────────────────────────────
     const removeBtn = document.getElementById('file-attachment-remove');
@@ -272,16 +276,37 @@ async function sendMessage() {
     state.isStreaming = true;
     document.getElementById('send-btn').disabled = true;
 
+    const isCloud = state.selectedProvider !== 'local';
+
     try {
-        const res = await api.post('/api/chat', {
-            message,
-            conversation_id: state.currentConversation,
-            include_context: state.includeContext,
-            temperature: parseFloat(state.settings.temperature || 0.7),
-            max_tokens: parseInt(state.settings.max_tokens || 2048),
-            mode: state.currentMode,
-            autonomous: state.autonomous,
-        });
+        let res;
+        if (isCloud) {
+            // Cloud provider — non-streaming JSON
+            res = await fetch('/api/chat/cloud', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    message,
+                    provider: state.selectedProvider,
+                    model: state.selectedCloudModel,
+                    conversation_id: state.currentConversation,
+                    temperature: parseFloat(state.settings.temperature || 0.7),
+                    max_tokens: parseInt(state.settings.max_tokens || 2048),
+                    mode: state.currentMode,
+                }),
+            });
+        } else {
+            // Local model — SSE streaming
+            res = await api.post('/api/chat', {
+                message,
+                conversation_id: state.currentConversation,
+                include_context: state.includeContext,
+                temperature: parseFloat(state.settings.temperature || 0.7),
+                max_tokens: parseInt(state.settings.max_tokens || 2048),
+                mode: state.currentMode,
+                autonomous: state.autonomous,
+            });
+        }
 
         // Remove typing indicator
         typingEl.remove();
@@ -290,202 +315,222 @@ async function sendMessage() {
         const assistantEl = appendMessage('assistant', '');
         const bubble = assistantEl.querySelector('.message-bubble');
 
-        // Thinking block (collapsible)
-        let thinkingEl = null;
-        let thinkingContent = null;
-        let thinkingText = '';
-        let toolIndicator = null;
-
-        // Read SSE stream
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
         let fullResponse = '';
-        let buffer = '';
-        let currentEvent = 'message';
 
-        while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
+        if (isCloud) {
+            // Handle cloud JSON response
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({ detail: res.statusText }));
+                throw new Error(err.detail || `Cloud error (${res.status})`);
+            }
+            const data = await res.json();
+            const answerEl = document.createElement('div');
+            answerEl.className = 'answer-content';
+            answerEl.innerHTML = formatMarkdown(data.response || '(Empty response)');
+            bubble.appendChild(answerEl);
+            if (data.conversation_id) {
+                state.currentConversation = data.conversation_id;
+                await loadConversations();
+            }
+            fullResponse = data.response;
+        } else {
+            // Thinking block (collapsible)
+            let thinkingEl = null;
+            let thinkingContent = null;
+            let thinkingText = '';
+            let toolIndicator = null;
 
-            buffer += decoder.decode(value, { stream: true });
+            // Read SSE stream
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            fullResponse = '';
+            let buffer = '';
+            let currentEvent = 'message';
 
-            // Parse SSE events (event: + data: lines)
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
 
-            for (const line of lines) {
-                if (line.startsWith('event:')) {
-                    currentEvent = line.slice(6).trim();
-                } else if (line.startsWith('data:')) {
-                    const data = line.slice(5).trim();
-                    if (!data) continue;
-                    try {
-                        const parsed = JSON.parse(data);
+                buffer += decoder.decode(value, { stream: true });
 
-                        if (currentEvent === 'thinking') {
-                            // Create thinking block if needed
-                            if (!thinkingEl) {
-                                thinkingEl = document.createElement('details');
-                                thinkingEl.className = 'thinking-block';
-                                thinkingEl.open = true;
-                                thinkingEl.innerHTML = `<summary>🧠 Thinking…</summary><div class="thinking-content"></div>`;
-                                bubble.appendChild(thinkingEl);
-                                thinkingContent = thinkingEl.querySelector('.thinking-content');
-                            }
-                            if (parsed.token) {
-                                thinkingText += parsed.token;
-                                thinkingContent.innerHTML = formatMarkdown(thinkingText);
+                // Parse SSE events (event: + data: lines)
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+
+                for (const line of lines) {
+                    if (line.startsWith('event:')) {
+                        currentEvent = line.slice(6).trim();
+                    } else if (line.startsWith('data:')) {
+                        const data = line.slice(5).trim();
+                        if (!data) continue;
+                        try {
+                            const parsed = JSON.parse(data);
+
+                            if (currentEvent === 'thinking') {
+                                // Create thinking block if needed
+                                if (!thinkingEl) {
+                                    thinkingEl = document.createElement('details');
+                                    thinkingEl.className = 'thinking-block';
+                                    thinkingEl.open = true;
+                                    thinkingEl.innerHTML = `<summary>🧠 Thinking…</summary><div class="thinking-content"></div>`;
+                                    bubble.appendChild(thinkingEl);
+                                    thinkingContent = thinkingEl.querySelector('.thinking-content');
+                                }
+                                if (parsed.token) {
+                                    thinkingText += parsed.token;
+                                    thinkingContent.innerHTML = formatMarkdown(thinkingText);
+                                    scrollToBottom();
+                                }
+                            } else if (currentEvent === 'thinking_done') {
+                                // Collapse thinking and update label
+                                if (thinkingEl) {
+                                    thinkingEl.open = false;
+                                    thinkingEl.querySelector('summary').textContent = '🧠 Thought process';
+                                }
+                            } else if (currentEvent === 'tool') {
+                                // Show tool indicator — parse new format with step info
+                                const toolName = parsed.name || parsed.tool || 'tool';
+                                const stepNum = parsed.step || 0;
+                                const maxSteps = parsed.max_steps || 10;
+                                const friendlyNames = {
+                                    get_datetime: '🕐 Getting time…',
+                                    web_search: '🔍 Searching the web…',
+                                    calculator: '🧮 Calculating…',
+                                    get_weather: '🌤️ Checking weather…',
+                                    open_url: '🌐 Opening URL…',
+                                    search_files: '📂 Searching files…',
+                                    get_system_info: '💻 Getting system info…',
+                                    image_generate: '🎨 Generating image (this may take a while)…',
+                                    read_url: '📖 Reading webpage…',
+                                    read_screen: '👁️ Reading your screen…',
+                                    run_code: '⚙️ Running code…',
+                                    shell_command: '💻 Running command…',
+                                    speak: '🔊 Speaking…',
+                                    knowledge_search: '🧠 Searching knowledge…',
+                                    knowledge_add: '🧠 Saving to knowledge…',
+                                    set_reminder: '⏰ Setting reminder…',
+                                    clipboard: '📋 Using clipboard…',
+                                    open_app: '📱 Opening app…',
+                                    system_control: '⚙️ System control…',
+                                    music_control: '🎵 Controlling music…',
+                                    file_operations: '📁 Working with files…',
+                                    keyboard: '⌨️ Typing…',
+                                    read_document: '📄 Reading document…',
+                                    read_notifications: '🔔 Checking notifications…',
+                                    analyze_screen: '👁️ Analyzing screen (VLM)…',
+                                    manage_preferences: '🧠 Learning preferences…',
+                                    workflow: '🔄 Running workflow…',
+                                };
+                                if (!toolIndicator) {
+                                    toolIndicator = document.createElement('div');
+                                    toolIndicator.className = 'tool-indicator';
+                                    toolIndicator._startTime = Date.now();
+
+                                    // Spinner
+                                    const spinner = document.createElement('div');
+                                    spinner.className = 'tool-indicator-spinner';
+                                    toolIndicator.appendChild(spinner);
+
+                                    // Content wrapper
+                                    const content = document.createElement('div');
+                                    content.className = 'tool-indicator-content';
+
+                                    const label = document.createElement('div');
+                                    label.className = 'tool-indicator-label';
+                                    content.appendChild(label);
+
+                                    // Step badge for multi-step chains
+                                    const stepBadge = document.createElement('div');
+                                    stepBadge.className = 'tool-indicator-step';
+                                    content.appendChild(stepBadge);
+
+                                    const elapsed = document.createElement('div');
+                                    elapsed.className = 'tool-indicator-elapsed';
+                                    elapsed.textContent = '0s elapsed';
+                                    content.appendChild(elapsed);
+
+                                    toolIndicator.appendChild(content);
+                                    bubble.appendChild(toolIndicator);
+
+                                    // Live elapsed timer
+                                    toolIndicator._timer = setInterval(() => {
+                                        const secs = Math.floor((Date.now() - toolIndicator._startTime) / 1000);
+                                        if (secs < 60) {
+                                            elapsed.textContent = `${secs}s elapsed`;
+                                        } else {
+                                            const m = Math.floor(secs / 60);
+                                            const s = secs % 60;
+                                            elapsed.textContent = `${m}m ${s.toString().padStart(2, '0')}s elapsed`;
+                                        }
+                                    }, 1000);
+                                }
+                                const labelEl = toolIndicator.querySelector('.tool-indicator-label');
+                                if (labelEl) labelEl.textContent = friendlyNames[toolName] || `🔧 Using ${toolName}…`;
+                                const stepEl = toolIndicator.querySelector('.tool-indicator-step');
+                                if (stepEl && stepNum > 0) {
+                                    stepEl.textContent = `Step ${stepNum}`;
+                                    stepEl.style.display = 'inline-block';
+                                }
                                 scrollToBottom();
-                            }
-                        } else if (currentEvent === 'thinking_done') {
-                            // Collapse thinking and update label
-                            if (thinkingEl) {
-                                thinkingEl.open = false;
-                                thinkingEl.querySelector('summary').textContent = '🧠 Thought process';
-                            }
-                        } else if (currentEvent === 'tool') {
-                            // Show tool indicator — parse new format with step info
-                            const toolName = parsed.name || parsed.tool || 'tool';
-                            const stepNum = parsed.step || 0;
-                            const maxSteps = parsed.max_steps || 10;
-                            const friendlyNames = {
-                                get_datetime: '🕐 Getting time…',
-                                web_search: '🔍 Searching the web…',
-                                calculator: '🧮 Calculating…',
-                                get_weather: '🌤️ Checking weather…',
-                                open_url: '🌐 Opening URL…',
-                                search_files: '📂 Searching files…',
-                                get_system_info: '💻 Getting system info…',
-                                image_generate: '🎨 Generating image (this may take a while)…',
-                                read_url: '📖 Reading webpage…',
-                                read_screen: '👁️ Reading your screen…',
-                                run_code: '⚙️ Running code…',
-                                shell_command: '💻 Running command…',
-                                speak: '🔊 Speaking…',
-                                knowledge_search: '🧠 Searching knowledge…',
-                                knowledge_add: '🧠 Saving to knowledge…',
-                                set_reminder: '⏰ Setting reminder…',
-                                clipboard: '📋 Using clipboard…',
-                                open_app: '📱 Opening app…',
-                                system_control: '⚙️ System control…',
-                                music_control: '🎵 Controlling music…',
-                                file_operations: '📁 Working with files…',
-                                keyboard: '⌨️ Typing…',
-                                read_document: '📄 Reading document…',
-                                read_notifications: '🔔 Checking notifications…',
-                                analyze_screen: '👁️ Analyzing screen (VLM)…',
-                                manage_preferences: '🧠 Learning preferences…',
-                                workflow: '🔄 Running workflow…',
-                            };
-                            if (!toolIndicator) {
-                                toolIndicator = document.createElement('div');
-                                toolIndicator.className = 'tool-indicator';
-                                toolIndicator._startTime = Date.now();
-
-                                // Spinner
-                                const spinner = document.createElement('div');
-                                spinner.className = 'tool-indicator-spinner';
-                                toolIndicator.appendChild(spinner);
-
-                                // Content wrapper
-                                const content = document.createElement('div');
-                                content.className = 'tool-indicator-content';
-
-                                const label = document.createElement('div');
-                                label.className = 'tool-indicator-label';
-                                content.appendChild(label);
-
-                                // Step badge for multi-step chains
-                                const stepBadge = document.createElement('div');
-                                stepBadge.className = 'tool-indicator-step';
-                                content.appendChild(stepBadge);
-
-                                const elapsed = document.createElement('div');
-                                elapsed.className = 'tool-indicator-elapsed';
-                                elapsed.textContent = '0s elapsed';
-                                content.appendChild(elapsed);
-
-                                toolIndicator.appendChild(content);
-                                bubble.appendChild(toolIndicator);
-
-                                // Live elapsed timer
-                                toolIndicator._timer = setInterval(() => {
-                                    const secs = Math.floor((Date.now() - toolIndicator._startTime) / 1000);
-                                    if (secs < 60) {
-                                        elapsed.textContent = `${secs}s elapsed`;
-                                    } else {
-                                        const m = Math.floor(secs / 60);
-                                        const s = secs % 60;
-                                        elapsed.textContent = `${m}m ${s.toString().padStart(2, '0')}s elapsed`;
-                                    }
-                                }, 1000);
-                            }
-                            const labelEl = toolIndicator.querySelector('.tool-indicator-label');
-                            if (labelEl) labelEl.textContent = friendlyNames[toolName] || `🔧 Using ${toolName}…`;
-                            const stepEl = toolIndicator.querySelector('.tool-indicator-step');
-                            if (stepEl && stepNum > 0) {
-                                stepEl.textContent = `Step ${stepNum}`;
-                                stepEl.style.display = 'inline-block';
-                            }
-                            scrollToBottom();
-                        } else if (currentEvent === 'progress') {
-                            // Show step progress indicator
-                            const round = parsed.round || 0;
-                            const total = parsed.total || 10;
-                            const toolName = parsed.tool || '';
-                            let progressEl = bubble.querySelector('.tool-progress');
-                            if (!progressEl) {
-                                progressEl = document.createElement('div');
-                                progressEl.className = 'tool-progress';
-                                bubble.appendChild(progressEl);
-                            }
-                            progressEl.innerHTML = `
+                            } else if (currentEvent === 'progress') {
+                                // Show step progress indicator
+                                const round = parsed.round || 0;
+                                const total = parsed.total || 10;
+                                const toolName = parsed.tool || '';
+                                let progressEl = bubble.querySelector('.tool-progress');
+                                if (!progressEl) {
+                                    progressEl = document.createElement('div');
+                                    progressEl.className = 'tool-progress';
+                                    bubble.appendChild(progressEl);
+                                }
+                                progressEl.innerHTML = `
                                 <span class="tool-progress-step">Step ${round}/${total}</span>
                                 <span class="tool-progress-name">${toolName}</span>
                             `;
-                            scrollToBottom();
-                        } else if (currentEvent === 'token') {
-                            // Remove tool indicator when answer starts
-                            if (toolIndicator) {
-                                if (toolIndicator._timer) clearInterval(toolIndicator._timer);
-                                toolIndicator.remove();
-                                toolIndicator = null;
-                            }
-                            if (parsed.token) {
-                                fullResponse += parsed.token;
-                                // Render after thinking block
-                                let answerEl = bubble.querySelector('.answer-content');
-                                if (!answerEl) {
-                                    answerEl = document.createElement('div');
-                                    answerEl.className = 'answer-content';
-                                    bubble.appendChild(answerEl);
-                                }
-                                answerEl.innerHTML = formatMarkdown(fullResponse);
                                 scrollToBottom();
+                            } else if (currentEvent === 'token') {
+                                // Remove tool indicator when answer starts
+                                if (toolIndicator) {
+                                    if (toolIndicator._timer) clearInterval(toolIndicator._timer);
+                                    toolIndicator.remove();
+                                    toolIndicator = null;
+                                }
+                                if (parsed.token) {
+                                    fullResponse += parsed.token;
+                                    // Render after thinking block
+                                    let answerEl = bubble.querySelector('.answer-content');
+                                    if (!answerEl) {
+                                        answerEl = document.createElement('div');
+                                        answerEl.className = 'answer-content';
+                                        bubble.appendChild(answerEl);
+                                    }
+                                    answerEl.innerHTML = formatMarkdown(fullResponse);
+                                    scrollToBottom();
+                                }
+                            } else if (currentEvent === 'done' || parsed.conversation_id) {
+                                if (parsed.conversation_id) {
+                                    state.currentConversation = parsed.conversation_id;
+                                    await loadConversations();
+                                }
                             }
-                        } else if (currentEvent === 'done' || parsed.conversation_id) {
-                            if (parsed.conversation_id) {
-                                state.currentConversation = parsed.conversation_id;
-                                await loadConversations();
-                            }
-                        }
-                    } catch (e) { }
-                    currentEvent = 'message'; // Reset after processing data
+                        } catch (e) { }
+                        currentEvent = 'message'; // Reset after processing data
+                    }
                 }
             }
-        }
 
-        if (!fullResponse) {
-            let answerEl = bubble.querySelector('.answer-content');
-            if (!answerEl) {
-                answerEl = document.createElement('div');
-                answerEl.className = 'answer-content';
-                bubble.appendChild(answerEl);
+            if (!fullResponse) {
+                let answerEl = bubble.querySelector('.answer-content');
+                if (!answerEl) {
+                    answerEl = document.createElement('div');
+                    answerEl.className = 'answer-content';
+                    bubble.appendChild(answerEl);
+                }
+                if (!thinkingText) {
+                    answerEl.textContent = '(Empty response)';
+                }
             }
-            if (!thinkingText) {
-                answerEl.textContent = '(Empty response)';
-            }
-        }
+        } // end else (local)
     } catch (e) {
         typingEl?.remove();
         appendMessage('assistant', `❌ Error: ${e.message}`);
@@ -1755,62 +1800,145 @@ function generateSuggestions(response) {
     return suggestions.slice(0, 3);
 }
 
-// ── Model Quick-Switch ────────────────────────────────────────
-function setupModelPill() {
-    const pill = document.getElementById('model-pill');
-    if (!pill) return;
+// ── Provider Selector ─────────────────────────────────────────
+function setupProviderSelector() {
+    const selector = document.getElementById('provider-selector');
+    const pill = document.getElementById('provider-pill');
+    const dropdown = document.getElementById('provider-dropdown');
+    if (!selector || !pill || !dropdown) return;
 
-    pill.addEventListener('click', async () => {
-        try {
-            const data = await api.get('/api/models');
-            if (!data.models || data.models.length === 0) {
-                return;
-            }
-            // Cycle to the next model
-            const currentIdx = data.models.findIndex(m => m.path === data.loaded);
-            const nextIdx = (currentIdx + 1) % data.models.length;
-            const next = data.models[nextIdx];
+    // Toggle dropdown on pill click
+    pill.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const isOpen = selector.classList.contains('open');
+        if (isOpen) {
+            selector.classList.remove('open');
+            return;
+        }
+        await populateProviderDropdown();
+        selector.classList.add('open');
+    });
 
-            if (next.path === data.loaded) return; // Only one model
-
-            pill.querySelector('.model-pill-name').textContent = 'Loading...';
-            pill.disabled = true;
-
-            const nCtx = parseInt(state.settings.n_ctx || '8192');
-            await (await api.post('/api/models/load', {
-                model_path: next.path,
-                n_ctx: nCtx,
-            })).json();
-
-            await refreshStatus();
-            updateModelPill();
-            pill.disabled = false;
-        } catch (e) {
-            console.error('Model switch failed:', e);
-            pill.disabled = false;
-            updateModelPill();
+    // Close dropdown when clicking outside
+    document.addEventListener('click', (e) => {
+        if (!selector.contains(e.target)) {
+            selector.classList.remove('open');
         }
     });
 
-    // Initial update
-    updateModelPill();
+    // Initial pill update
+    updateProviderPill();
 }
 
-async function updateModelPill() {
+async function populateProviderDropdown() {
+    const dropdown = document.getElementById('provider-dropdown');
+    if (!dropdown) return;
+
+    let html = '';
+
+    // Section: Local model
+    html += '<div class="provider-dropdown-label">Local</div>';
     try {
         const data = await api.get('/api/models');
-        const nameEl = document.getElementById('model-pill-name');
-        const dotEl = document.querySelector('.model-pill-dot');
         if (data.loaded) {
             const name = data.loaded.split('/').pop().replace('.gguf', '');
-            // Shorten for the pill
-            nameEl.textContent = name.length > 20 ? name.substring(0, 18) + '…' : name;
-            dotEl.classList.add('active');
+            const shortName = name.length > 28 ? name.substring(0, 26) + '…' : name;
+            const selected = state.selectedProvider === 'local' ? 'selected' : '';
+            html += `
+                <div class="provider-option ${selected}" data-provider="local">
+                    <span class="provider-option-icon">🖥️</span>
+                    <div class="provider-option-info">
+                        <span class="provider-option-name">${shortName}</span>
+                        <span class="provider-option-model">Local · Ollama / GGUF</span>
+                    </div>
+                    <span class="provider-option-badge local">Local</span>
+                </div>`;
         } else {
-            nameEl.textContent = 'No model';
-            dotEl.classList.remove('active');
+            html += `
+                <div class="provider-option" style="opacity:0.4;cursor:default;">
+                    <span class="provider-option-icon">🖥️</span>
+                    <div class="provider-option-info">
+                        <span class="provider-option-name">No model loaded</span>
+                        <span class="provider-option-model">Load one in Settings → AI Model</span>
+                    </div>
+                </div>`;
         }
-    } catch (e) { /* ignore */ }
+    } catch (e) {
+        html += '<div class="provider-option" style="opacity:0.4;">🖥️ Could not fetch models</div>';
+    }
+
+    // Section: Cloud providers
+    try {
+        const provData = await api.get('/api/providers');
+        const providers = (provData.providers || []).filter(p => p.configured);
+        state.cloudProviders = provData.providers || [];
+
+        if (providers.length > 0) {
+            html += '<div class="provider-dropdown-divider"></div>';
+            html += '<div class="provider-dropdown-label">Cloud</div>';
+
+            for (const p of providers) {
+                // Each model gets its own row
+                for (const model of p.models) {
+                    const isSelected = state.selectedProvider === p.name && state.selectedCloudModel === model;
+                    html += `
+                        <div class="provider-option ${isSelected ? 'selected' : ''}" data-provider="${p.name}" data-model="${model}">
+                            <span class="provider-option-icon">${p.icon}</span>
+                            <div class="provider-option-info">
+                                <span class="provider-option-name">${model}</span>
+                                <span class="provider-option-model">${p.display_name}</span>
+                            </div>
+                            <span class="provider-option-badge cloud">Cloud</span>
+                        </div>`;
+                }
+            }
+        }
+    } catch (e) {
+        console.error('Failed to fetch providers:', e);
+    }
+
+    dropdown.innerHTML = html;
+
+    // Attach click handlers
+    dropdown.querySelectorAll('.provider-option[data-provider]').forEach(option => {
+        option.addEventListener('click', () => {
+            const provider = option.dataset.provider;
+            const model = option.dataset.model || null;
+            state.selectedProvider = provider;
+            state.selectedCloudModel = model;
+            updateProviderPill();
+            document.getElementById('provider-selector').classList.remove('open');
+        });
+    });
+}
+
+async function updateProviderPill() {
+    const nameEl = document.getElementById('provider-pill-name');
+    const dotEl = document.getElementById('provider-pill-dot');
+    if (!nameEl || !dotEl) return;
+
+    dotEl.className = 'provider-pill-dot';
+
+    if (state.selectedProvider === 'local') {
+        try {
+            const data = await api.get('/api/models');
+            if (data.loaded) {
+                const name = data.loaded.split('/').pop().replace('.gguf', '');
+                nameEl.textContent = name.length > 18 ? name.substring(0, 16) + '…' : name;
+                dotEl.classList.add('active');
+            } else {
+                nameEl.textContent = 'No model';
+            }
+        } catch (e) {
+            nameEl.textContent = 'No model';
+        }
+    } else {
+        // Cloud provider selected
+        const model = state.selectedCloudModel || state.selectedProvider;
+        const shortModel = model.length > 18 ? model.substring(0, 16) + '…' : model;
+        nameEl.textContent = shortModel;
+        dotEl.classList.add('cloud');
+    }
 }
 
 // ── Utility ───────────────────────────────────────────────────

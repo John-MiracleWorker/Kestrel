@@ -145,11 +145,21 @@
                                     <span>Context On</span>
                                 </button>
                             </div>
-                            <!-- Model quick-switch pill -->
-                            <button class="model-pill" id="model-pill" title="Switch model">
-                                <span class="model-pill-dot"></span>
-                                <span class="model-pill-name" id="model-pill-name">No model</span>
-                            </button>
+                            <!-- Provider / model selector -->
+                            <div class="provider-selector" id="provider-selector">
+                                <button class="provider-pill" id="provider-pill" title="Switch provider / model">
+                                    <span class="provider-pill-dot" id="provider-pill-dot"></span>
+                                    <span class="provider-pill-name" id="provider-pill-name">No model</span>
+                                    <svg class="provider-pill-arrow" width="10" height="10" viewBox="0 0 24 24"
+                                        fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"
+                                        stroke-linejoin="round">
+                                        <polyline points="6 9 12 15 18 9"></polyline>
+                                    </svg>
+                                </button>
+                                <div class="provider-dropdown" id="provider-dropdown">
+                                    <!-- Populated by JS -->
+                                </div>
+                            </div>
                             <!-- Mode selector pill -->
                             <div class="mode-selector" id="mode-selector">
                                 <button class="mode-pill" id="mode-pill" title="Switch agent mode">
