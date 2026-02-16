@@ -7,13 +7,19 @@ import { setupMetrics } from './utils/metrics';
 import { requireAuth } from './auth/middleware';
 import { SessionManager } from './session/manager';
 import { BrainClient } from './brain/client';
+import { ChannelRegistry } from './channels/registry';
 import { WebChannelAdapter } from './channels/web';
+import { TelegramAdapter } from './channels/telegram';
+import { WhatsAppAdapter } from './channels/whatsapp';
+import { DiscordAdapter } from './channels/discord';
 import authRoutes from './routes/auth';
 import workspaceRoutes from './routes/workspaces';
 import apiKeyRoutes from './routes/api-keys';
 import oauthRoutes from './auth/strategies/oauth';
 import magicLinkRoutes from './auth/strategies/magic-link';
 import providerRoutes from './routes/providers';
+import telegramWebhookRoutes from './routes/webhooks/telegram';
+import whatsappWebhookRoutes from './routes/webhooks/whatsapp';
 
 dotenv.config();
 
@@ -43,7 +49,7 @@ app.register(import('@fastify/cors'), {
 let redis: Redis;
 let sessionManager: SessionManager;
 let brainClient: BrainClient;
-let webChannel: WebChannelAdapter;
+let channelRegistry: ChannelRegistry;
 
 // ── Health Check ─────────────────────────────────────────────────────
 app.get('/health', async () => ({
@@ -100,18 +106,60 @@ async function start() {
         await app.listen({ port: config.port, host: config.host });
         logger.info(`Gateway listening on ${config.host}:${config.port}`);
 
-        // 6. Start WebSocket server (shares same HTTP server)
+        // 6. Set up channel registry + WebSocket adapter
         const server = app.server;
         const wss = new WebSocketServer({ server, path: config.wsPath });
 
-        webChannel = new WebChannelAdapter(wss, sessionManager, brainClient, config.jwtSecret);
-        await webChannel.connect();
+        channelRegistry = new ChannelRegistry(brainClient);
+
+        const webAdapter = new WebChannelAdapter(wss, sessionManager, brainClient, config.jwtSecret);
+        await channelRegistry.register(webAdapter);
         logger.info(`WebSocket server on ${config.wsPath}`);
+
+        // Future adapters — conditionally enabled via env vars
+
+        // Telegram
+        if (process.env.TELEGRAM_BOT_TOKEN) {
+            const tgAdapter = new TelegramAdapter({
+                botToken: process.env.TELEGRAM_BOT_TOKEN,
+                mode: (process.env.TELEGRAM_MODE as 'webhook' | 'polling') || 'polling',
+                webhookUrl: process.env.TELEGRAM_WEBHOOK_URL,
+                defaultWorkspaceId: process.env.DEFAULT_WORKSPACE_ID || 'default',
+            });
+            await channelRegistry.register(tgAdapter);
+            await telegramWebhookRoutes(app, { telegramAdapter: tgAdapter });
+            logger.info('Telegram adapter enabled');
+        }
+
+        // WhatsApp (Twilio)
+        if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+            const waAdapter = new WhatsAppAdapter({
+                accountSid: process.env.TWILIO_ACCOUNT_SID,
+                authToken: process.env.TWILIO_AUTH_TOKEN,
+                fromNumber: process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886',
+                defaultWorkspaceId: process.env.DEFAULT_WORKSPACE_ID || 'default',
+            });
+            await channelRegistry.register(waAdapter);
+            await whatsappWebhookRoutes(app, { whatsappAdapter: waAdapter });
+            logger.info('WhatsApp adapter enabled');
+        }
+
+        // Discord
+        if (process.env.DISCORD_BOT_TOKEN && process.env.DISCORD_CLIENT_ID) {
+            const dcAdapter = new DiscordAdapter({
+                botToken: process.env.DISCORD_BOT_TOKEN,
+                clientId: process.env.DISCORD_CLIENT_ID,
+                guildId: process.env.DISCORD_GUILD_ID,
+                defaultWorkspaceId: process.env.DEFAULT_WORKSPACE_ID || 'default',
+            });
+            await channelRegistry.register(dcAdapter);
+            logger.info('Discord adapter enabled');
+        }
 
         // Graceful shutdown
         const shutdown = async () => {
             logger.info('Shutting down Gateway...');
-            await webChannel.disconnect();
+            await channelRegistry.shutdown();
             await redis.quit();
             brainClient.close();
             await app.close();
