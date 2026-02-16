@@ -843,8 +843,8 @@ class CloudChatRequest(BaseModel):
 
 @app.post("/api/chat/cloud")
 async def cloud_chat_endpoint(req: CloudChatRequest):
-    """Send a message to a cloud LLM provider (non-streaming)."""
-    from cloud_providers import cloud_chat, PROVIDERS
+    """Send a message to a cloud LLM provider (SSE streaming)."""
+    from cloud_providers import cloud_chat_stream, PROVIDERS
     from agent_modes import get_prompt_addon
 
     if req.provider not in PROVIDERS:
@@ -880,18 +880,41 @@ async def cloud_chat_endpoint(req: CloudChatRequest):
         messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": req.message})
 
-    try:
-        response = await cloud_chat(req.provider, model, messages,
-                                     req.temperature, req.max_tokens)
-        await db.add_message(conv_id, "assistant", response)
-        return {
-            "conversation_id": conv_id,
-            "response": response,
-            "provider": req.provider,
-            "model": model,
-        }
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    async def event_generator():
+        full_response = ""
+        try:
+            # Send conversation ID first so frontend can track it
+            yield {"event": "meta", "data": json.dumps({"conversation_id": conv_id})}
+
+            async for token in cloud_chat_stream(
+                req.provider, model, messages,
+                req.temperature, req.max_tokens,
+            ):
+                full_response += token
+                yield {
+                    "event": "token",
+                    "data": json.dumps({"token": token}),
+                }
+
+            # Save the full response
+            await db.add_message(conv_id, "assistant", full_response)
+
+            yield {
+                "event": "done",
+                "data": json.dumps({
+                    "conversation_id": conv_id,
+                    "provider": req.provider,
+                    "model": model,
+                }),
+            }
+        except Exception as e:
+            logger.error(f"Cloud stream error: {e}")
+            yield {
+                "event": "error",
+                "data": json.dumps({"error": str(e)}),
+            }
+
+    return EventSourceResponse(event_generator())
 
 
 # ── Skill Install API ───────────────────────────────────────────────

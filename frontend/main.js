@@ -317,23 +317,7 @@ async function sendMessage() {
 
         let fullResponse = '';
 
-        if (isCloud) {
-            // Handle cloud JSON response
-            if (!res.ok) {
-                const err = await res.json().catch(() => ({ detail: res.statusText }));
-                throw new Error(err.detail || `Cloud error (${res.status})`);
-            }
-            const data = await res.json();
-            const answerEl = document.createElement('div');
-            answerEl.className = 'answer-content';
-            answerEl.innerHTML = formatMarkdown(data.response || '(Empty response)');
-            bubble.appendChild(answerEl);
-            if (data.conversation_id) {
-                state.currentConversation = data.conversation_id;
-                await loadConversations();
-            }
-            fullResponse = data.response;
-        } else {
+        {
             // Thinking block (collapsible)
             let thinkingEl = null;
             let thinkingContent = null;
@@ -366,7 +350,14 @@ async function sendMessage() {
                         try {
                             const parsed = JSON.parse(data);
 
-                            if (currentEvent === 'thinking') {
+                            if (currentEvent === 'meta') {
+                                // Cloud sends meta with conversation_id
+                                if (parsed.conversation_id) {
+                                    state.currentConversation = parsed.conversation_id;
+                                }
+                            } else if (currentEvent === 'error') {
+                                throw new Error(parsed.error || 'Stream error');
+                            } else if (currentEvent === 'thinking') {
                                 // Create thinking block if needed
                                 if (!thinkingEl) {
                                     thinkingEl = document.createElement('details');
@@ -513,7 +504,9 @@ async function sendMessage() {
                                     await loadConversations();
                                 }
                             }
-                        } catch (e) { }
+                        } catch (e) {
+                            if (e.message && (e.message === 'Stream error' || e.message.startsWith('No API key') || e.message.startsWith('API error'))) throw e;
+                        }
                         currentEvent = 'message'; // Reset after processing data
                     }
                 }
@@ -530,7 +523,7 @@ async function sendMessage() {
                     answerEl.textContent = '(Empty response)';
                 }
             }
-        } // end else (local)
+        }
     } catch (e) {
         typingEl?.remove();
         appendMessage('assistant', `❌ Error: ${e.message}`);

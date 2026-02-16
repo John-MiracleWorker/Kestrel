@@ -197,32 +197,39 @@ def _http_json(url: str, data: dict, headers: dict, timeout: int = 60) -> dict:
 async def cloud_chat(provider: str, model: str, messages: list,
                      temperature: float = 0.7, max_tokens: int = 2048) -> str:
     """Send a chat completion request to a cloud provider. Returns full text."""
-    import asyncio
-
-    api_key = get_api_key(provider)
-    if not api_key:
-        raise RuntimeError(f"No API key configured for {provider}. Add it in Settings → Cloud Providers.")
-
-    loop = asyncio.get_event_loop()
-
-    if provider == "gemini":
-        result = await loop.run_in_executor(None, lambda: _gemini_chat(api_key, model, messages, temperature, max_tokens))
-    elif provider == "openai":
-        result = await loop.run_in_executor(None, lambda: _openai_chat(api_key, model, messages, temperature, max_tokens))
-    elif provider == "claude":
-        result = await loop.run_in_executor(None, lambda: _claude_chat(api_key, model, messages, temperature, max_tokens))
-    else:
-        raise RuntimeError(f"Unknown provider: {provider}")
-
-    return result
+    full = []
+    async for token in cloud_chat_stream(provider, model, messages, temperature, max_tokens):
+        full.append(token)
+    return "".join(full)
 
 
-def _gemini_chat(api_key: str, model: str, messages: list,
-                 temperature: float, max_tokens: int) -> str:
-    """Gemini API chat completion."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+# ---------------------------------------------------------------------------
+# Streaming helpers
+# ---------------------------------------------------------------------------
 
-    # Convert messages to Gemini format
+def _http_stream(url: str, data: dict, headers: dict, timeout: int = 120):
+    """Make an HTTP POST and yield raw bytes line-by-line (for SSE / streaming)."""
+    body = json.dumps(data).encode("utf-8")
+    req = Request(url, data=body, headers=headers, method="POST")
+    try:
+        resp = urlopen(req, timeout=timeout)
+        for line in resp:
+            yield line
+        resp.close()
+    except HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        logger.error(f"Cloud API stream error {e.code}: {error_body}")
+        raise RuntimeError(f"API error ({e.code}): {error_body[:200]}")
+    except URLError as e:
+        raise RuntimeError(f"Connection failed: {e.reason}")
+
+
+def _gemini_stream(api_key: str, model: str, messages: list,
+                   temperature: float, max_tokens: int):
+    """Gemini streaming — yields text tokens."""
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{model}:streamGenerateContent?alt=sse&key={api_key}")
+
     contents = []
     system_instruction = None
     for msg in messages:
@@ -247,17 +254,28 @@ def _gemini_chat(api_key: str, model: str, messages: list,
         data["systemInstruction"] = {"parts": [{"text": system_instruction}]}
 
     headers = {"Content-Type": "application/json"}
-    resp = _http_json(url, data, headers)
 
-    try:
-        return resp["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError):
-        raise RuntimeError(f"Unexpected Gemini response: {json.dumps(resp)[:300]}")
+    for line in _http_stream(url, data, headers):
+        text = line.decode("utf-8", errors="replace").strip()
+        if not text or not text.startswith("data: "):
+            continue
+        payload = text[6:]
+        if payload == "[DONE]":
+            break
+        try:
+            chunk = json.loads(payload)
+            parts = chunk.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            for part in parts:
+                t = part.get("text", "")
+                if t:
+                    yield t
+        except (json.JSONDecodeError, KeyError, IndexError):
+            continue
 
 
-def _openai_chat(api_key: str, model: str, messages: list,
-                 temperature: float, max_tokens: int) -> str:
-    """OpenAI API chat completion."""
+def _openai_stream(api_key: str, model: str, messages: list,
+                   temperature: float, max_tokens: int):
+    """OpenAI streaming — yields text tokens."""
     url = "https://api.openai.com/v1/chat/completions"
 
     data = {
@@ -265,6 +283,7 @@ def _openai_chat(api_key: str, model: str, messages: list,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "stream": True,
     }
 
     headers = {
@@ -272,20 +291,28 @@ def _openai_chat(api_key: str, model: str, messages: list,
         "Authorization": f"Bearer {api_key}",
     }
 
-    resp = _http_json(url, data, headers)
+    for line in _http_stream(url, data, headers):
+        text = line.decode("utf-8", errors="replace").strip()
+        if not text or not text.startswith("data: "):
+            continue
+        payload = text[6:]
+        if payload == "[DONE]":
+            break
+        try:
+            chunk = json.loads(payload)
+            delta = chunk["choices"][0].get("delta", {})
+            content = delta.get("content", "")
+            if content:
+                yield content
+        except (json.JSONDecodeError, KeyError, IndexError):
+            continue
 
-    try:
-        return resp["choices"][0]["message"]["content"]
-    except (KeyError, IndexError):
-        raise RuntimeError(f"Unexpected OpenAI response: {json.dumps(resp)[:300]}")
 
-
-def _claude_chat(api_key: str, model: str, messages: list,
-                 temperature: float, max_tokens: int) -> str:
-    """Claude/Anthropic API chat completion."""
+def _claude_stream(api_key: str, model: str, messages: list,
+                   temperature: float, max_tokens: int):
+    """Claude streaming — yields text tokens."""
     url = "https://api.anthropic.com/v1/messages"
 
-    # Extract system message
     system_text = ""
     chat_messages = []
     for msg in messages:
@@ -302,6 +329,7 @@ def _claude_chat(api_key: str, model: str, messages: list,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "messages": chat_messages,
+        "stream": True,
     }
     if system_text:
         data["system"] = system_text
@@ -312,9 +340,71 @@ def _claude_chat(api_key: str, model: str, messages: list,
         "anthropic-version": "2023-06-01",
     }
 
-    resp = _http_json(url, data, headers)
+    for line in _http_stream(url, data, headers):
+        text = line.decode("utf-8", errors="replace").strip()
+        if not text or not text.startswith("data: "):
+            continue
+        payload = text[6:]
+        if payload == "[DONE]":
+            break
+        try:
+            chunk = json.loads(payload)
+            if chunk.get("type") == "content_block_delta":
+                delta = chunk.get("delta", {})
+                t = delta.get("text", "")
+                if t:
+                    yield t
+        except (json.JSONDecodeError, KeyError):
+            continue
 
-    try:
-        return resp["content"][0]["text"]
-    except (KeyError, IndexError):
-        raise RuntimeError(f"Unexpected Claude response: {json.dumps(resp)[:300]}")
+
+async def cloud_chat_stream(provider: str, model: str, messages: list,
+                            temperature: float = 0.7, max_tokens: int = 2048):
+    """Async generator that yields text tokens from a cloud provider."""
+    import asyncio
+    import queue
+    import threading
+
+    api_key = get_api_key(provider)
+    if not api_key:
+        raise RuntimeError(
+            f"No API key configured for {provider}. "
+            "Add it in Settings → Cloud Providers."
+        )
+
+    providers_map = {
+        "gemini": _gemini_stream,
+        "openai": _openai_stream,
+        "claude": _claude_stream,
+    }
+
+    stream_fn = providers_map.get(provider)
+    if not stream_fn:
+        raise RuntimeError(f"Unknown provider: {provider}")
+
+    # Run the synchronous streaming generator in a thread and relay tokens
+    # via an asyncio-safe queue so we don't block the event loop.
+    q: queue.Queue = queue.Queue()
+    _SENTINEL = object()
+
+    def _run():
+        try:
+            for token in stream_fn(api_key, model, messages, temperature, max_tokens):
+                q.put(token)
+        except Exception as exc:
+            q.put(exc)
+        finally:
+            q.put(_SENTINEL)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    loop = asyncio.get_event_loop()
+    while True:
+        item = await loop.run_in_executor(None, q.get)
+        if item is _SENTINEL:
+            break
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
