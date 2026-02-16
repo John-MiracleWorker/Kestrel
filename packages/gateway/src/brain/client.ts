@@ -201,4 +201,40 @@ export class BrainClient {
             );
         });
     }
+
+    async updateWorkspace(workspaceId: string, data: { name?: string; description?: string; settings?: any }): Promise<any> {
+        return new Promise((resolve, reject) => {
+            this.client.UpdateWorkspace(
+                { workspace_id: workspaceId, ...data },
+                (err: any, response: any) => {
+                    if (err) reject(new Error(err.details || err.message));
+                    else resolve(response);
+                }
+            );
+        });
+    }
+
+    async deleteWorkspace(workspaceId: string): Promise<void> {
+        return new Promise((resolve, reject) => {
+            this.client.DeleteWorkspace(
+                { workspace_id: workspaceId },
+                (err: any) => {
+                    if (err) reject(new Error(err.details || err.message));
+                    else resolve();
+                }
+            );
+        });
+    }
+
+    async addWorkspaceMember(workspaceId: string, userId: string, role: string): Promise<any> {
+        return new Promise((resolve, reject) => {
+            this.client.AddWorkspaceMember(
+                { workspace_id: workspaceId, user_id: userId, role },
+                (err: any, response: any) => {
+                    if (err) reject(new Error(err.details || err.message));
+                    else resolve(response);
+                }
+            );
+        });
+    }
 }
