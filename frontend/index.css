@@ -2597,3 +2597,393 @@ body {
 .file-attachment-remove:hover {
     color: var(--error);
 }
+
+/* ── Mode Selector ─────────────────────────────────────────── */
+
+.mode-selector {
+    position: relative;
+}
+
+.mode-pill {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 10px;
+    border-radius: 20px;
+    border: 1px solid var(--border);
+    background: var(--bg-glass);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 0.78rem;
+    transition: all var(--duration) var(--ease);
+    white-space: nowrap;
+}
+
+.mode-pill:hover {
+    border-color: var(--accent);
+    color: var(--text-primary);
+    background: rgba(56, 224, 187, 0.08);
+}
+
+.mode-pill-icon {
+    font-size: 0.85rem;
+}
+
+.mode-dropdown {
+    display: none;
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    margin-bottom: 6px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 6px;
+    min-width: 200px;
+    z-index: 100;
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    box-shadow: var(--shadow-lg);
+    animation: dropUp 0.2s var(--ease);
+}
+
+.mode-dropdown.open {
+    display: block;
+}
+
+@keyframes dropUp {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.mode-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background 0.15s;
+    border: none;
+    background: none;
+    width: 100%;
+    text-align: left;
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+}
+
+.mode-option:hover {
+    background: rgba(56, 224, 187, 0.08);
+    color: var(--text-primary);
+}
+
+.mode-option.active {
+    background: rgba(56, 224, 187, 0.12);
+    color: var(--accent);
+    border-left: 2px solid var(--accent);
+}
+
+.mode-option-icon {
+    font-size: 1rem;
+    width: 24px;
+    text-align: center;
+}
+
+.mode-option-info {
+    flex: 1;
+}
+
+.mode-option-name {
+    display: block;
+    font-weight: 500;
+}
+
+.mode-option-desc {
+    display: block;
+    font-size: 0.7rem;
+    color: var(--text-tertiary);
+    margin-top: 1px;
+}
+
+/* ── Auto Toggle Pill ──────────────────────────────────────── */
+
+.auto-pill {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 10px;
+    border-radius: 20px;
+    border: 1px solid var(--border);
+    background: var(--bg-glass);
+    color: var(--text-tertiary);
+    cursor: pointer;
+    font-size: 0.78rem;
+    transition: all var(--duration) var(--ease);
+    white-space: nowrap;
+}
+
+.auto-pill.active {
+    border-color: rgba(34, 211, 238, 0.4);
+    color: var(--info);
+    background: rgba(34, 211, 238, 0.08);
+}
+
+.auto-pill:hover {
+    border-color: var(--info);
+    color: var(--info);
+}
+
+/* ── Progress Indicator ────────────────────────────────────── */
+
+.tool-progress {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: rgba(56, 224, 187, 0.06);
+    border-radius: var(--radius-sm);
+    font-size: 0.75rem;
+    color: var(--text-tertiary);
+    margin: 4px 0;
+    border-left: 2px solid var(--accent);
+    animation: fadeIn 0.3s var(--ease);
+}
+
+.tool-progress-step {
+    color: var(--accent);
+    font-weight: 600;
+    font-family: var(--font-mono);
+}
+
+.tool-progress-name {
+    color: var(--text-secondary);
+}
+
+/* ── Cloud Providers ───────────────────────────────────────── */
+
+.cloud-privacy-warning {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px;
+    background: rgba(251, 191, 36, 0.06);
+    border: 1px solid rgba(251, 191, 36, 0.2);
+    border-radius: var(--radius-sm);
+    margin-bottom: 16px;
+}
+
+.cloud-privacy-warning .warning-icon {
+    font-size: 1.2rem;
+    flex-shrink: 0;
+    margin-top: 2px;
+}
+
+.cloud-privacy-warning p {
+    font-size: 0.78rem;
+    color: var(--text-tertiary);
+    margin-top: 3px;
+    line-height: 1.4;
+}
+
+.cloud-provider-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    margin-bottom: 10px;
+    transition: border-color 0.2s;
+}
+
+.cloud-provider-card.configured {
+    border-color: rgba(52, 211, 153, 0.3);
+}
+
+.cloud-provider-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.cloud-provider-icon {
+    font-size: 1.1rem;
+}
+
+.cloud-provider-name {
+    font-weight: 500;
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    flex: 1;
+}
+
+.cloud-provider-status {
+    font-size: 0.72rem;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-weight: 500;
+}
+
+.cloud-provider-status.configured {
+    background: rgba(52, 211, 153, 0.12);
+    color: var(--success);
+}
+
+.cloud-provider-status.not-configured {
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-tertiary);
+}
+
+.cloud-provider-key-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+
+.cloud-provider-key-row input {
+    flex: 1;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    padding: 6px 10px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    outline: none;
+    transition: border-color 0.2s;
+}
+
+.cloud-provider-key-row input:focus {
+    border-color: var(--accent);
+}
+
+.cloud-provider-key-row button {
+    padding: 6px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(56, 224, 187, 0.3);
+    background: rgba(56, 224, 187, 0.1);
+    color: var(--accent);
+    cursor: pointer;
+    font-size: 0.8rem;
+    font-weight: 500;
+    transition: all 0.2s;
+    white-space: nowrap;
+}
+
+.cloud-provider-key-row button:hover {
+    background: rgba(56, 224, 187, 0.2);
+}
+
+.cloud-provider-key-row button.remove-key {
+    border-color: rgba(255, 92, 119, 0.3);
+    background: rgba(255, 92, 119, 0.08);
+    color: var(--error);
+}
+
+.cloud-provider-key-row button.remove-key:hover {
+    background: rgba(255, 92, 119, 0.15);
+}
+
+.cloud-provider-models {
+    font-size: 0.72rem;
+    color: var(--text-tertiary);
+    padding-top: 4px;
+}
+
+/* ── Skill Install Bar ─────────────────────────────────────── */
+
+.skill-install-bar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.btn-accent {
+    padding: 6px 14px;
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(56, 224, 187, 0.3);
+    background: rgba(56, 224, 187, 0.12);
+    color: var(--accent);
+    cursor: pointer;
+    font-size: 0.82rem;
+    font-weight: 500;
+    transition: all 0.2s;
+    white-space: nowrap;
+}
+
+.btn-accent:hover {
+    background: rgba(56, 224, 187, 0.22);
+}
+
+.btn-accent:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* ── Skill Card Uninstall ──────────────────────────────────── */
+
+.skill-card .skill-uninstall {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    font-size: 0.7rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid rgba(255, 92, 119, 0.2);
+    background: rgba(255, 92, 119, 0.06);
+    color: var(--error);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.2s;
+}
+
+.skill-card:hover .skill-uninstall {
+    opacity: 1;
+}
+
+.skill-card .skill-uninstall:hover {
+    background: rgba(255, 92, 119, 0.15);
+}
+
+/* ── Continue Button (Manual Mode) ─────────────────────────── */
+
+.continue-prompt {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    background: rgba(34, 211, 238, 0.06);
+    border: 1px solid rgba(34, 211, 238, 0.2);
+    border-radius: var(--radius-sm);
+    margin: 8px 0;
+}
+
+.continue-prompt span {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    flex: 1;
+}
+
+.continue-btn {
+    padding: 5px 14px;
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(34, 211, 238, 0.4);
+    background: rgba(34, 211, 238, 0.1);
+    color: var(--info);
+    cursor: pointer;
+    font-size: 0.8rem;
+    font-weight: 500;
+    transition: all 0.2s;
+}
+
+.continue-btn:hover {
+    background: rgba(34, 211, 238, 0.2);
+}

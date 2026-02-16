@@ -11,6 +11,7 @@ import asyncio
 from typing import AsyncIterator, Optional
 from llama_cpp import Llama
 from tools import TOOL_DEFINITIONS, execute_tool
+from agent_modes import get_prompt_addon, get_preferred_skills
 
 logger = logging.getLogger("libre_bird.engine")
 
@@ -214,26 +215,44 @@ class LLMEngine:
         return cleaned.strip()
 
     def _build_messages(self, user_message: str, history: list[dict] = None,
-                        context: dict = None, memory: str = None) -> list[dict]:
+                        context: dict = None, memory: str = None,
+                        mode: str = "general") -> list[dict]:
         """Build the message list with system prompt, context, memory, and history."""
         messages = []
 
         # System prompt with optional context
         sys_content = SYSTEM_PROMPT
 
-        # Add compact tool list (avoids the bloated JSON schemas that overflow KV cache)
-        tool_lines = []
-        for td in TOOL_DEFINITIONS:
+        # Inject agent mode addon
+        mode_addon = get_prompt_addon(mode)
+        if mode_addon:
+            sys_content += "\n" + mode_addon.strip()
+
+        # Add compact tool list with preferred tools first
+        preferred = set(get_preferred_skills(mode))
+
+        def _tool_line(td):
             fn = td.get("function", {})
             name = fn.get("name", "")
             desc = fn.get("description", "")
             params = fn.get("parameters", {}).get("properties", {})
             param_names = list(params.keys())
             if param_names:
-                tool_lines.append(f"- {name}({', '.join(param_names)}): {desc}")
-            else:
-                tool_lines.append(f"- {name}(): {desc}")
-        sys_content += "\n\nAVAILABLE TOOLS:\n" + "\n".join(tool_lines)
+                return f"- {name}({', '.join(param_names)}): {desc}"
+            return f"- {name}(): {desc}"
+
+        if preferred:
+            # Split into preferred and other
+            pref_lines = [_tool_line(td) for td in TOOL_DEFINITIONS
+                          if td.get("_skill") in preferred]
+            other_lines = [_tool_line(td) for td in TOOL_DEFINITIONS
+                           if td.get("_skill") not in preferred]
+            sys_content += "\n\nPREFERRED TOOLS (use these first):\n" + "\n".join(pref_lines)
+            if other_lines:
+                sys_content += "\n\nOTHER AVAILABLE TOOLS:\n" + "\n".join(other_lines)
+        else:
+            tool_lines = [_tool_line(td) for td in TOOL_DEFINITIONS]
+            sys_content += "\n\nAVAILABLE TOOLS:\n" + "\n".join(tool_lines)
 
         if context:
             ctx_parts = []
@@ -296,10 +315,12 @@ class LLMEngine:
     async def chat_stream(self, user_message: str, history: list[dict] = None,
                           context: dict = None, memory: str = None,
                           temperature: float = 0.7,
-                          max_tokens: int = 2048) -> AsyncIterator[tuple[str, str]]:
+                          max_tokens: int = 2048,
+                          mode: str = "general",
+                          max_tool_rounds: int = 10) -> AsyncIterator[tuple[str, str]]:
         """Generate a streaming response with tool-calling support.
 
-        Yields tagged tuples: ("tool", name), ("raw", text).
+        Yields tagged tuples: ("tool", name), ("raw", text), ("progress", json).
         Always streams. Uses asyncio.Queue to bridge between the synchronous
         llama-cpp stream iterator and the async event loop.
         """
@@ -309,12 +330,12 @@ class LLMEngine:
         if not self._model:
             raise RuntimeError("No model loaded. Please load a model first.")
 
-        messages = self._build_messages(user_message, history, context, memory)
+        messages = self._build_messages(user_message, history, context, memory, mode=mode)
         loop = asyncio.get_event_loop()
 
         _SENTINEL = object()  # marks end of stream
 
-        MAX_TOOL_ROUNDS = 10
+        MAX_TOOL_ROUNDS = max_tool_rounds
         for round_num in range(MAX_TOOL_ROUNDS + 1):
             queue: asyncio.Queue = asyncio.Queue()
 
@@ -370,6 +391,7 @@ class LLMEngine:
                         fn_args = tc_data.get("arguments", {})
                         logger.info(f"Tool call XML (round {round_num + 1}): {fn_name}({fn_args})")
                         yield ("tool", json.dumps({"name": fn_name, "step": round_num + 1, "max_steps": MAX_TOOL_ROUNDS}))
+                        yield ("progress", json.dumps({"round": round_num + 1, "total": MAX_TOOL_ROUNDS, "tool": fn_name}))
                         # Run tool in executor so the event loop can flush
                         # the tool-status SSE to the browser while we wait
                         result = await loop.run_in_executor(

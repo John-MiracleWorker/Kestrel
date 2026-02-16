@@ -192,6 +192,7 @@ def load_all_skills():
             _skills[skill.name] = skill
             # Register tools
             for td in skill.tool_defs:
+                td["_skill"] = skill.name  # tag for mode-based ordering
                 TOOL_DEFINITIONS.append(td)
             for tool_name, handler in skill.tool_handlers.items():
                 _tool_registry[tool_name] = handler
@@ -263,6 +264,140 @@ def get_skill(name: str) -> Optional[dict]:
     """Get metadata for a single skill."""
     skill = _skills.get(name)
     return skill.to_dict() if skill else None
+
+
+# ---------------------------------------------------------------------------
+# Skill install / uninstall
+# ---------------------------------------------------------------------------
+
+# Built-in skills that cannot be uninstalled
+_BUILTIN_SKILLS = {
+    "core", "screen", "productivity", "media", "web", "knowledge"
+}
+
+
+def install_skill(source: str) -> dict:
+    """Install a skill from a GitHub URL or user/repo shorthand.
+
+    Clones the repo, validates it has skill.json + __init__.py,
+    copies it to skills/, and hot-reloads.
+    """
+    import subprocess
+    import tempfile
+    import shutil
+    import re as _re
+
+    # Normalize source to a git URL
+    source = source.strip().rstrip("/")
+    if source.startswith("http://") or source.startswith("https://"):
+        git_url = source if source.endswith(".git") else source + ".git"
+    elif _re.match(r'^[\w.-]+/[\w.-]+$', source):
+        git_url = f"https://github.com/{source}.git"
+    else:
+        return {"error": f"Invalid source: {source}. Use a GitHub URL or user/repo format."}
+
+    try:
+        # Clone to temp directory
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            clone_dir = os.path.join(tmp_dir, "repo")
+            result = subprocess.run(
+                ["git", "clone", "--depth", "1", git_url, clone_dir],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
+                return {"error": f"Git clone failed: {result.stderr.strip()}"}
+
+            # Find skill.json — could be at root or in a subdirectory
+            skill_json_path = None
+            for root, dirs, files in os.walk(clone_dir):
+                if "skill.json" in files and "__init__.py" in files:
+                    skill_json_path = root
+                    break
+
+            if not skill_json_path:
+                return {"error": "No valid skill found. Repo must contain skill.json + __init__.py"}
+
+            # Read and validate manifest
+            with open(os.path.join(skill_json_path, "skill.json"), "r") as f:
+                manifest = json.load(f)
+
+            skill_name = manifest.get("name")
+            if not skill_name:
+                return {"error": "skill.json missing 'name' field"}
+
+            # Check if already exists
+            dest = os.path.join(SKILLS_DIR, skill_name)
+            if os.path.exists(dest):
+                # Overwrite for updates
+                shutil.rmtree(dest)
+
+            # Copy skill directory
+            shutil.copytree(skill_json_path, dest)
+
+            # Load the new skill
+            skill = Skill(dest, manifest)
+            skill.enabled = True
+            if _load_skill(skill):
+                _skills[skill.name] = skill
+                for td in skill.tool_defs:
+                    td["_skill"] = skill.name
+                    TOOL_DEFINITIONS.append(td)
+                for tool_name, handler in skill.tool_handlers.items():
+                    _tool_registry[tool_name] = handler
+
+                logger.info(f"Installed skill '{skill_name}' from {source}")
+                return {
+                    "ok": True,
+                    "skill": skill.to_dict(),
+                    "message": f"Installed '{skill.display_name}' with {len(skill.tool_defs)} tools",
+                }
+            else:
+                return {"error": f"Skill loaded but failed to initialize: {skill.error}"}
+
+    except subprocess.TimeoutExpired:
+        return {"error": "Git clone timed out after 30 seconds"}
+    except Exception as e:
+        return {"error": f"Install failed: {str(e)}"}
+
+
+def uninstall_skill(name: str) -> dict:
+    """Uninstall a community skill. Moves directory to trash."""
+    if name in _BUILTIN_SKILLS:
+        return {"error": f"Cannot uninstall built-in skill '{name}'"}
+
+    skill = _skills.get(name)
+    if not skill:
+        return {"error": f"Skill '{name}' not found"}
+
+    skill_path = skill.path
+
+    # Remove from registries
+    for td in skill.tool_defs:
+        fn_name = td.get("function", {}).get("name", "")
+        _tool_registry.pop(fn_name, None)
+
+    TOOL_DEFINITIONS[:] = [
+        td for td in TOOL_DEFINITIONS
+        if td.get("_skill") != name
+    ]
+
+    _skills.pop(name, None)
+
+    # Move to trash (macOS)
+    try:
+        import subprocess
+        subprocess.run(
+            ["osascript", "-e",
+             f'tell application "Finder" to delete POSIX file "{skill_path}"'],
+            capture_output=True, timeout=5
+        )
+    except Exception:
+        # Fallback: just delete
+        import shutil
+        shutil.rmtree(skill_path, ignore_errors=True)
+
+    logger.info(f"Uninstalled skill '{name}'")
+    return {"ok": True, "message": f"Skill '{name}' uninstalled"}
 
 
 # ---------------------------------------------------------------------------

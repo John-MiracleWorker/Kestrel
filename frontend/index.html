@@ -150,6 +150,21 @@
                                 <span class="model-pill-dot"></span>
                                 <span class="model-pill-name" id="model-pill-name">No model</span>
                             </button>
+                            <!-- Mode selector pill -->
+                            <div class="mode-selector" id="mode-selector">
+                                <button class="mode-pill" id="mode-pill" title="Switch agent mode">
+                                    <span class="mode-pill-icon" id="mode-pill-icon">🕊️</span>
+                                    <span class="mode-pill-name" id="mode-pill-name">General</span>
+                                </button>
+                                <div class="mode-dropdown" id="mode-dropdown">
+                                    <!-- Populated by JS -->
+                                </div>
+                            </div>
+                            <!-- Auto/manual toggle pill -->
+                            <button class="auto-pill" id="auto-pill" title="Autonomous tool-chaining">
+                                <span class="auto-pill-icon">⚡</span>
+                                <span class="auto-pill-label" id="auto-pill-label">Auto</span>
+                            </button>
                             <!-- File attachment -->
                             <div class="file-attachment" id="file-attachment" style="display:none">
                                 <span class="file-attachment-name" id="file-attachment-name"></span>
@@ -372,6 +387,24 @@
                         </div>
                     </div>
 
+                    <!-- Cloud Providers -->
+                    <div class="settings-section">
+                        <h3>☁️ Cloud LLM Providers</h3>
+                        <div class="settings-card">
+                            <div class="cloud-privacy-warning">
+                                <span class="warning-icon">⚠️</span>
+                                <div>
+                                    <strong>Privacy Notice</strong>
+                                    <p>Cloud providers send your messages to external servers. This bypasses Libre
+                                        Bird's offline-first design. Only use if you understand the tradeoff.</p>
+                                </div>
+                            </div>
+                            <div class="cloud-providers-list" id="cloud-providers-list">
+                                <!-- Populated by JS -->
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Proactive Assistant -->
                     <div class="settings-section">
                         <h3>🧠 Proactive Assistant</h3>
@@ -396,6 +429,17 @@
                             style="margin: -4px 0 12px 0; font-size: 0.8rem; color: var(--text-tertiary);">
                             Enable or disable skill packs to control what tools are available to the AI.
                         </p>
+                        <!-- Install skill from git -->
+                        <div class="skill-install-bar" id="skill-install-bar">
+                            <input type="text" id="skill-install-url" class="setting-input"
+                                placeholder="Install from GitHub: user/repo or URL..."
+                                style="flex: 1; font-family: monospace; font-size: 0.85rem;" />
+                            <button id="skill-install-btn" class="btn-accent" title="Install skill">
+                                📦 Install
+                            </button>
+                        </div>
+                        <div id="skill-install-status"
+                            style="font-size: 0.75rem; margin: 4px 0 8px 0; color: var(--text-tertiary);"></div>
                         <div class="skills-grid" id="skills-grid">
                             <div
                                 style="padding: 20px; text-align: center; color: var(--text-tertiary); font-size: 0.85rem;">
@@ -412,8 +456,10 @@
                                 <span class="privacy-icon">🛡️</span>
                                 <div>
                                     <strong>Local-First & Private</strong>
-                                    <p>All data is stored locally in <code>libre_bird.db</code>. The LLM runs offline on
-                                        your Mac. Image generation uses Google Gemini API (optional).</p>
+                                    <p>All data is stored locally in <code>libre_bird.db</code>. The local LLM runs
+                                        offline on your Mac. Cloud providers (Gemini, Claude, OpenAI) are
+                                        <strong>optional</strong> and will send data externally when enabled.
+                                    </p>
                                 </div>
                             </div>
                         </div>

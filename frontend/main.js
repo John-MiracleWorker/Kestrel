@@ -18,6 +18,9 @@ const state = {
     voiceActive: false,
     voicePolling: null,
     attachedFile: null,
+    currentMode: 'general',
+    autonomous: true,
+    modes: [],
 };
 
 // ── API Helpers ───────────────────────────────────────────────
@@ -276,6 +279,8 @@ async function sendMessage() {
             include_context: state.includeContext,
             temperature: parseFloat(state.settings.temperature || 0.7),
             max_tokens: parseInt(state.settings.max_tokens || 2048),
+            mode: state.currentMode,
+            autonomous: state.autonomous,
         });
 
         // Remove typing indicator
@@ -422,6 +427,22 @@ async function sendMessage() {
                                 stepEl.textContent = `Step ${stepNum}`;
                                 stepEl.style.display = 'inline-block';
                             }
+                            scrollToBottom();
+                        } else if (currentEvent === 'progress') {
+                            // Show step progress indicator
+                            const round = parsed.round || 0;
+                            const total = parsed.total || 10;
+                            const toolName = parsed.tool || '';
+                            let progressEl = bubble.querySelector('.tool-progress');
+                            if (!progressEl) {
+                                progressEl = document.createElement('div');
+                                progressEl.className = 'tool-progress';
+                                bubble.appendChild(progressEl);
+                            }
+                            progressEl.innerHTML = `
+                                <span class="tool-progress-step">Step ${round}/${total}</span>
+                                <span class="tool-progress-name">${toolName}</span>
+                            `;
                             scrollToBottom();
                         } else if (currentEvent === 'token') {
                             // Remove tool indicator when answer starts
@@ -1008,6 +1029,18 @@ async function loadSettings() {
         // Load skills
         await loadSkills();
 
+        // Load modes
+        await initModes();
+
+        // Load cloud providers
+        await loadCloudProviders();
+
+        // Init auto toggle
+        initAutoToggle();
+
+        // Init skill install
+        initSkillInstall();
+
         // Attach handlers
         setupSettingHandlers();
     } catch (e) { }
@@ -1109,11 +1142,17 @@ function renderSkills(skills) {
         return;
     }
 
+    const builtinSet = new Set(['core', 'screen', 'productivity', 'media', 'web', 'knowledge']);
+
     grid.innerHTML = skills.map(s => {
         const catClass = s.category === 'community' ? 'community' : 'builtin';
         const catLabel = s.category === 'community' ? 'Community' : 'Built-in';
+        const uninstallBtn = !builtinSet.has(s.name)
+            ? `<button class="skill-uninstall" data-skill-uninstall="${s.name}" title="Uninstall">✕</button>`
+            : '';
         return `
-            <div class="skill-card ${s.enabled ? '' : 'disabled'}">
+            <div class="skill-card ${s.enabled ? '' : 'disabled'}" style="position:relative">
+                ${uninstallBtn}
                 <div class="skill-card-header">
                     <span class="skill-icon">${s.icon || '🧩'}</span>
                     <span class="skill-badge ${catClass}">${catLabel}</span>
@@ -1138,13 +1177,230 @@ function renderSkills(skills) {
             const enabled = input.checked;
             try {
                 await api.post(`/api/skills/${name}/toggle`, { enabled });
-                // Re-render to update visual state
                 await loadSkills();
             } catch (e) {
-                input.checked = !enabled; // revert on error
+                input.checked = !enabled;
                 console.error('Skill toggle failed:', e);
             }
         });
+    });
+
+    // Uninstall handlers
+    grid.querySelectorAll('[data-skill-uninstall]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const name = btn.dataset.skillUninstall;
+            if (!confirm(`Uninstall skill "${name}"? This will move it to Trash.`)) return;
+            try {
+                await api.del(`/api/skills/${name}`);
+                await loadSkills();
+            } catch (e) {
+                console.error('Uninstall failed:', e);
+            }
+        });
+    });
+}
+
+// ── Agent Modes ──────────────────────────────────────────────
+async function initModes() {
+    try {
+        const data = await api.get('/api/modes');
+        state.modes = data.modes || [];
+
+        // Get saved mode
+        try {
+            const current = await api.get('/api/modes/current');
+            state.currentMode = current.name || 'general';
+        } catch (e) {
+            state.currentMode = 'general';
+        }
+
+        updateModePill();
+        renderModeDropdown();
+        setupModeHandlers();
+    } catch (e) {
+        console.error('Failed to load modes:', e);
+    }
+}
+
+function updateModePill() {
+    const mode = state.modes.find(m => m.name === state.currentMode) || state.modes[0];
+    if (!mode) return;
+    const iconEl = document.getElementById('mode-pill-icon');
+    const nameEl = document.getElementById('mode-pill-name');
+    if (iconEl) iconEl.textContent = mode.icon;
+    if (nameEl) nameEl.textContent = mode.display_name;
+}
+
+function renderModeDropdown() {
+    const dropdown = document.getElementById('mode-dropdown');
+    if (!dropdown) return;
+    dropdown.innerHTML = state.modes.map(m => `
+        <button class="mode-option ${m.name === state.currentMode ? 'active' : ''}" data-mode="${m.name}">
+            <span class="mode-option-icon">${m.icon}</span>
+            <div class="mode-option-info">
+                <span class="mode-option-name">${m.display_name}</span>
+                <span class="mode-option-desc">${m.description}</span>
+            </div>
+        </button>
+    `).join('');
+}
+
+function setupModeHandlers() {
+    const pill = document.getElementById('mode-pill');
+    const dropdown = document.getElementById('mode-dropdown');
+    if (!pill || !dropdown) return;
+
+    pill.addEventListener('click', (e) => {
+        e.stopPropagation();
+        dropdown.classList.toggle('open');
+    });
+
+    document.addEventListener('click', () => {
+        dropdown.classList.remove('open');
+    });
+
+    dropdown.addEventListener('click', async (e) => {
+        const btn = e.target.closest('[data-mode]');
+        if (!btn) return;
+        const modeName = btn.dataset.mode;
+        state.currentMode = modeName;
+
+        try {
+            await api.post('/api/modes/current', { mode: modeName });
+        } catch (e) {
+            console.error('Failed to save mode:', e);
+        }
+
+        updateModePill();
+        renderModeDropdown();
+        dropdown.classList.remove('open');
+    });
+}
+
+// ── Auto Toggle ──────────────────────────────────────────────
+function initAutoToggle() {
+    const pill = document.getElementById('auto-pill');
+    const label = document.getElementById('auto-pill-label');
+    if (!pill) return;
+
+    // Set initial state
+    pill.classList.toggle('active', state.autonomous);
+    label.textContent = state.autonomous ? 'Auto' : 'Manual';
+
+    pill.addEventListener('click', () => {
+        state.autonomous = !state.autonomous;
+        pill.classList.toggle('active', state.autonomous);
+        label.textContent = state.autonomous ? 'Auto' : 'Manual';
+    });
+}
+
+// ── Cloud Providers ──────────────────────────────────────────
+async function loadCloudProviders() {
+    const container = document.getElementById('cloud-providers-list');
+    if (!container) return;
+
+    try {
+        const data = await api.get('/api/providers');
+        renderCloudProviders(data.providers || [], container);
+    } catch (e) {
+        container.innerHTML = '<div style="padding: 12px; color: var(--text-tertiary);">Could not load providers.</div>';
+    }
+}
+
+function renderCloudProviders(providers, container) {
+    container.innerHTML = providers.map(p => `
+        <div class="cloud-provider-card ${p.configured ? 'configured' : ''}" data-provider="${p.name}">
+            <div class="cloud-provider-header">
+                <span class="cloud-provider-icon">${p.icon}</span>
+                <span class="cloud-provider-name">${p.display_name}</span>
+                <span class="cloud-provider-status ${p.configured ? 'configured' : 'not-configured'}">
+                    ${p.configured ? `✓ Key set (${p.key_preview})` : 'Not configured'}
+                </span>
+            </div>
+            <div class="cloud-provider-key-row">
+                <input type="password" placeholder="Enter API key..." data-provider-key="${p.name}"
+                    value="${p.configured ? '••••••••' : ''}" />
+                <button data-save-key="${p.name}">Save</button>
+                ${p.configured ? `<button class="remove-key" data-remove-key="${p.name}">Remove</button>` : ''}
+            </div>
+            <div class="cloud-provider-models">Models: ${p.models.join(', ')}</div>
+        </div>
+    `).join('');
+
+    // Save key handlers
+    container.querySelectorAll('[data-save-key]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const name = btn.dataset.saveKey;
+            const input = container.querySelector(`[data-provider-key="${name}"]`);
+            const key = input.value.trim();
+            if (!key || key === '••••••••') return;
+
+            btn.textContent = '...';
+            try {
+                await api.post(`/api/providers/${name}/key`, { api_key: key });
+                btn.textContent = '✓';
+                setTimeout(() => loadCloudProviders(), 800);
+            } catch (e) {
+                btn.textContent = 'Error';
+                console.error('Save key failed:', e);
+            }
+        });
+    });
+
+    // Remove key handlers
+    container.querySelectorAll('[data-remove-key]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const name = btn.dataset.removeKey;
+            if (!confirm(`Remove API key for this provider?`)) return;
+
+            try {
+                await api.del(`/api/providers/${name}/key`);
+                loadCloudProviders();
+            } catch (e) {
+                console.error('Remove key failed:', e);
+            }
+        });
+    });
+}
+
+// ── Skill Install ────────────────────────────────────────────
+function initSkillInstall() {
+    const btn = document.getElementById('skill-install-btn');
+    const input = document.getElementById('skill-install-url');
+    const status = document.getElementById('skill-install-status');
+    if (!btn || !input) return;
+
+    btn.addEventListener('click', async () => {
+        const source = input.value.trim();
+        if (!source) return;
+
+        btn.disabled = true;
+        btn.textContent = '⏳ Installing...';
+        if (status) status.textContent = 'Cloning repository...';
+
+        try {
+            const result = await api.post('/api/skills/install', { source });
+            if (status) {
+                status.textContent = result.message || 'Installed!';
+                status.style.color = 'var(--success)';
+            }
+            input.value = '';
+            await loadSkills();
+        } catch (e) {
+            if (status) {
+                status.textContent = `Error: ${e.message}`;
+                status.style.color = 'var(--error)';
+            }
+        } finally {
+            btn.disabled = false;
+            btn.textContent = '📦 Install';
+            setTimeout(() => {
+                if (status) {
+                    status.textContent = '';
+                    status.style.color = '';
+                }
+            }, 5000);
+        }
     });
 }
 

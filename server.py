@@ -63,6 +63,10 @@ class ChatRequest(BaseModel):
     include_context: bool = True
     temperature: float = 0.7
     max_tokens: int = 2048
+    mode: str = "general"
+    autonomous: bool = True
+    cloud_provider: Optional[str] = None
+    cloud_model: Optional[str] = None
 
 
 class TaskCreate(BaseModel):
@@ -246,10 +250,16 @@ async def chat(req: ChatRequest):
                 memory=memory,
                 temperature=req.temperature,
                 max_tokens=req.max_tokens,
+                mode=req.mode,
+                max_tool_rounds=10 if req.autonomous else 1,
             ):
                 if tag == "tool":
                     # Tool being called — send indicator with step info
                     yield {"event": "tool", "data": content}
+                    continue
+
+                if tag == "progress":
+                    yield {"event": "progress", "data": content}
                     continue
 
                 # tag == "raw" — stream token with think/tool_call detection
@@ -753,6 +763,161 @@ async def toggle_skill(name: str, body: SkillToggle = None):
     result = _toggle_skill(name, enabled)
     if "error" in result:
         raise HTTPException(404, result["error"])
+    return result
+
+# ── Agent Modes API ─────────────────────────────────────────────────
+
+
+@app.get("/api/modes")
+async def get_modes():
+    """List all available agent modes."""
+    from agent_modes import list_modes
+    return {"modes": list_modes()}
+
+
+@app.get("/api/modes/current")
+async def get_current_mode():
+    """Get the currently active mode (stored in settings)."""
+    mode = await db.get_setting("agent_mode") or "general"
+    from agent_modes import get_mode
+    return get_mode(mode)
+
+
+class ModeSetRequest(BaseModel):
+    mode: str
+
+
+@app.post("/api/modes/current")
+async def set_current_mode(body: ModeSetRequest):
+    """Set the active agent mode."""
+    from agent_modes import get_mode, MODES
+    if body.mode not in MODES:
+        raise HTTPException(400, f"Unknown mode: {body.mode}")
+    await db.set_setting("agent_mode", body.mode)
+    return get_mode(body.mode)
+
+
+# ── Cloud Providers API ─────────────────────────────────────────────
+
+
+@app.get("/api/providers")
+async def get_providers():
+    """List cloud LLM providers and their configured status."""
+    from cloud_providers import list_providers
+    return {"providers": list_providers()}
+
+
+class ProviderKeyRequest(BaseModel):
+    api_key: str
+
+
+@app.post("/api/providers/{provider}/key")
+async def set_provider_key(provider: str, body: ProviderKeyRequest):
+    """Set (or remove) an API key for a cloud provider."""
+    from cloud_providers import set_api_key, PROVIDERS
+    if provider not in PROVIDERS:
+        raise HTTPException(404, f"Unknown provider: {provider}")
+    set_api_key(provider, body.api_key)
+    return {"ok": True, "provider": provider, "configured": bool(body.api_key)}
+
+
+@app.delete("/api/providers/{provider}/key")
+async def remove_provider_key(provider: str):
+    """Remove an API key for a cloud provider."""
+    from cloud_providers import remove_api_key, PROVIDERS
+    if provider not in PROVIDERS:
+        raise HTTPException(404, f"Unknown provider: {provider}")
+    remove_api_key(provider)
+    return {"ok": True, "provider": provider, "configured": False}
+
+
+class CloudChatRequest(BaseModel):
+    message: str
+    provider: str
+    model: Optional[str] = None
+    conversation_id: Optional[int] = None
+    temperature: float = 0.7
+    max_tokens: int = 2048
+    mode: str = "general"
+
+
+@app.post("/api/chat/cloud")
+async def cloud_chat_endpoint(req: CloudChatRequest):
+    """Send a message to a cloud LLM provider (non-streaming)."""
+    from cloud_providers import cloud_chat, PROVIDERS
+    from agent_modes import get_prompt_addon
+
+    if req.provider not in PROVIDERS:
+        raise HTTPException(400, f"Unknown provider: {req.provider}")
+
+    model = req.model or PROVIDERS[req.provider]["default_model"]
+
+    # Get or create conversation
+    conv_id = req.conversation_id
+    if not conv_id:
+        conv_id = await db.create_conversation()
+
+    history = await db.get_messages(conv_id)
+    await db.add_message(conv_id, "user", req.message)
+
+    # Generate title for new conversations
+    if len(history) == 0 and llm_engine.is_loaded:
+        try:
+            title = await llm_engine.generate_title(req.message)
+            await db.update_conversation_title(conv_id, title)
+        except Exception:
+            pass
+
+    # Build messages
+    from llm_engine import SYSTEM_PROMPT
+    sys_content = SYSTEM_PROMPT
+    mode_addon = get_prompt_addon(req.mode)
+    if mode_addon:
+        sys_content += "\n" + mode_addon.strip()
+
+    messages = [{"role": "system", "content": sys_content}]
+    for msg in history[-20:]:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": req.message})
+
+    try:
+        response = await cloud_chat(req.provider, model, messages,
+                                     req.temperature, req.max_tokens)
+        await db.add_message(conv_id, "assistant", response)
+        return {
+            "conversation_id": conv_id,
+            "response": response,
+            "provider": req.provider,
+            "model": model,
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── Skill Install API ───────────────────────────────────────────────
+
+
+class SkillInstallRequest(BaseModel):
+    source: str  # GitHub URL or user/repo shorthand
+
+
+@app.post("/api/skills/install")
+async def install_skill_endpoint(body: SkillInstallRequest):
+    """Install a community skill from a GitHub URL."""
+    from skill_loader import install_skill
+    result = install_skill(body.source)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@app.delete("/api/skills/{name}")
+async def uninstall_skill_endpoint(name: str):
+    """Uninstall a community skill (moves to trash)."""
+    from skill_loader import uninstall_skill
+    result = uninstall_skill(name)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
     return result
 
 
