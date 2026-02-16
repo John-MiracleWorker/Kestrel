@@ -118,19 +118,19 @@ Libre Bird will become:
 
 ### 2. Multi-Channel Support
 
-#### 2.1 Channel Adapters
+#### 2.1 Channel Adapters (Simplified for v1)
 Implement bidirectional adapters in Gateway for:
 
 | Channel | Library/API | Priority | Features |
 |---------|-------------|----------|----------|
 | **Web** | WebSocket | P0 | Real-time chat, file upload, rich UI |
-| **Mobile App** | Native clients + API | P0 | Push notifications, voice, camera |
-| **WhatsApp** | Twilio API or WhatsApp Business API | P1 | Text, media, voice messages |
-| **Telegram** | python-telegram-bot | P1 | Inline buttons, file sharing |
-| **Discord** | discord.js | P1 | Slash commands, embeds |
-| **Slack** | @slack/bolt | P2 | App mentions, modals, workflows |
-| **SMS** | Twilio | P2 | Fallback for low-bandwidth |
-| **Email** | SMTP/IMAP | P2 | Async requests via email |
+| **Telegram** | python-telegram-bot | P0 | **Easiest integration**, inline buttons, file sharing |
+| **Android App** | Native client + API | P1 | Push notifications, voice, camera |
+| **Discord** | discord.js | P2 | Slash commands, embeds (Phase 2) |
+| **Slack** | @slack/bolt | P2 | App mentions, modals (Phase 2) |
+
+**Phase 1 Focus**: Web + Telegram
+**Phase 2**: Add Discord, Slack, WhatsApp based on community demand
 
 **Unified Message Format**:
 ```typescript
@@ -156,93 +156,95 @@ interface Message {
 
 ### 3. Multi-User System
 
-#### 3.1 Authentication & Authorization
+#### 3.1 Authentication & Authorization (Simplified for v1)
 **Requirements**:
-- Multiple auth strategies:
-  - Email/password (bcrypt hashing)
-  - OAuth2 (Google, GitHub, Microsoft)
-  - Magic links (passwordless)
-  - API keys for programmatic access
+- **Primary user**: Owner account (email/password, bcrypt hashing)
+- **Guest users**: Optional read-only access with API keys
 - JWT tokens for stateless authentication
-- Role-based access control (RBAC):
+- Simple role system:
   - `owner`: Full admin access
-  - `admin`: User management, billing
-  - `member`: Regular user
-  - `guest`: Read-only, limited features
-- Multi-tenancy: Workspaces/organizations
-- Per-user skill permissions and quotas
+  - `guest`: Read-only, can send messages but limited tool access
 
-**Database Schema** (PostgreSQL):
+**Database Schema** (SQLite):
 ```sql
 CREATE TABLE users (
-  id UUID PRIMARY KEY,
-  email VARCHAR(255) UNIQUE NOT NULL,
-  password_hash VARCHAR(255),
-  display_name VARCHAR(255),
-  avatar_url TEXT,
-  created_at TIMESTAMP DEFAULT NOW()
+  id TEXT PRIMARY KEY,  -- UUID
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT,
+  display_name TEXT,
+  role TEXT NOT NULL DEFAULT 'owner',  -- 'owner' or 'guest'
+  created_at TEXT DEFAULT (datetime('now'))
 );
 
-CREATE TABLE workspaces (
-  id UUID PRIMARY KEY,
-  name VARCHAR(255) NOT NULL,
-  owner_id UUID REFERENCES users(id),
-  plan VARCHAR(50) DEFAULT 'free',  -- free, pro, enterprise
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE TABLE workspace_members (
-  workspace_id UUID REFERENCES workspaces(id),
-  user_id UUID REFERENCES users(id),
-  role VARCHAR(50) NOT NULL,  -- owner, admin, member, guest
-  PRIMARY KEY (workspace_id, user_id)
+CREATE TABLE api_keys (
+  id TEXT PRIMARY KEY,
+  user_id TEXT REFERENCES users(id),
+  key_hash TEXT UNIQUE NOT NULL,
+  name TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
 );
 ```
 
-#### 3.2 User Isolation
-- **Conversations**: Scoped to workspace + user
-- **Context/Memory**: Per-user, never shared unless explicitly granted
-- **Skills**: Per-user enable/disable + workspace-level policies
-- **Files**: User-owned storage with workspace-level sharing
-- **API quotas**: Rate limiting per user + workspace
+**Note**: Multi-tenancy (workspaces) is deferred to Phase 2. v1 = single-instance, single-owner model.
+
+#### 3.2 User Isolation (Simplified)
+- **Conversations**: Per-user isolation
+- **Context/Memory**: Per-user, guest users have no access to owner's context
+- **Skills**: Owner configures globally, guests inherit permissions
+- **Files**: Per-user directories with filesystem isolation
+- **API quotas**: Optional rate limiting per user
 
 ---
 
 ### 4. Data Storage & Memory
 
-#### 4.1 Database Migration (SQLite → PostgreSQL)
-**Why**: Multi-user support, horizontal scaling, better concurrency
+#### 4.1 Database Architecture (SQLite Primary)
+**Why SQLite**: Zero-config, single-file, perfect for self-hosted single-user
 
-**Migration Plan**:
-- Keep SQLite option for single-user self-hosted setups
-- Add PostgreSQL adapter with same interface
-- Migrate schema:
-  - Add `user_id` and `workspace_id` to all tables
-  - Add `memories` vector embeddings table (pgvector)
-  - Add `skills_config` for per-user settings
-  - Add audit logs for security
+**Design**:
+- SQLite as default and primary database
+- Database adapter interface to support PostgreSQL later
+- Schema updates:
+  - Add `user_id` to conversations, messages, tasks, context tables
+  - Keep existing tables, add new ones for users and API keys
+  - Audit logs optional (lightweight version for file operations)
 
-#### 4.2 Vector Memory (RAG)
+**PostgreSQL Support** (Phase 2):
+- For users who need horizontal scaling
+- Same schema via adapter pattern
+- Migration tool: `libre-bird migrate sqlite-to-postgres`
+
+#### 4.2 Vector Memory (RAG) with ChromaDB
 **Requirements**:
 - Embed conversations, context, and documents using sentence-transformers
-- Store in pgvector (PostgreSQL) or dedicated vector DB (ChromaDB, Qdrant, Pinecone)
+- Store in **ChromaDB** (self-hosted, Python-native)
 - Semantic search for "recall" queries
 - Time-weighted retrieval (recent context + relevant historical)
-- Privacy: User vectors isolated, never shared
+- Privacy: User vectors isolated, stored locally
 
-**Schema**:
-```sql
-CREATE TABLE memory_embeddings (
-  id UUID PRIMARY KEY,
-  user_id UUID REFERENCES users(id),
-  content TEXT NOT NULL,
-  embedding VECTOR(384),  -- or 768 depending on model
-  metadata JSONB,
-  created_at TIMESTAMP DEFAULT NOW()
-);
+**Architecture**:
+```python
+# ChromaDB collection structure
+collection = chroma_client.create_collection(
+    name="memories",
+    metadata={"user_id": "owner"},  # Per-user collections
+)
 
-CREATE INDEX ON memory_embeddings USING ivfflat (embedding vector_cosine_ops);
+collection.add(
+    documents=["User was working on FastAPI project..."],
+    metadatas=[{
+        "timestamp": "2024-01-15T10:30:00",
+        "source": "context",
+        "user_id": "owner"
+    }],
+    ids=["memory_uuid_123"]
+)
 ```
+
+**Benefits**:
+- No separate database server needed
+- Persistent storage in `./chroma_db/` directory
+- Easy backup (just copy the directory)
 
 #### 4.3 File Storage
 - **Local**: Keep filesystem for self-hosted
@@ -254,23 +256,7 @@ CREATE INDEX ON memory_embeddings USING ivfflat (embedding vector_cosine_ops);
 
 ### 5. Mobile Applications
 
-#### 5.1 iOS App (Swift/SwiftUI)
-**Features**:
-- Native chat UI with dark mode
-- Push notifications (APNs)
-- Voice input (iOS Speech Framework)
-- Camera integration for image analysis
-- Siri shortcuts
-- Face ID/Touch ID for auth
-- Offline mode with sync queue
-
-**Technical Stack**:
-- SwiftUI + Combine
-- URLSession for networking (WebSocket + REST)
-- CoreData for local persistence
-- Firebase Cloud Messaging (optional) for notifications
-
-#### 5.2 Android App (Kotlin/Jetpack Compose)
+#### 5.1 Android App (Kotlin/Jetpack Compose) - Phase 1 Priority
 **Features**:
 - Material Design 3 UI
 - Push notifications (FCM)
@@ -285,6 +271,16 @@ CREATE INDEX ON memory_embeddings USING ivfflat (embedding vector_cosine_ops);
 - Retrofit + OkHttp for networking
 - Room for local database
 - WorkManager for background sync
+- Firebase Cloud Messaging for push notifications (self-hosted alternative: UnifiedPush)
+
+#### 5.2 iOS App (Swift/SwiftUI) - Phase 2
+**Deferred to Phase 2** based on Android-first priority. Will follow same architecture as Android app.
+
+**Planned Features**:
+- Native SwiftUI interface
+- Push notifications (APNs)
+- Voice input, Face ID/Touch ID
+- Siri shortcuts
 
 #### 5.3 Shared API Client
 - Unified TypeScript/Kotlin/Swift SDK
@@ -351,12 +347,12 @@ $ libre-bird publish-skill ./my-custom-skill
 - User reviews and ratings
 - Automated security scanning (static analysis, sandbox tests)
 - Versioning and changelogs
-- Paid plugins (revenue share model)
+- **All plugins free and open source**
 
 **Backend**:
-- Skill registry API (PostgreSQL + S3 for package storage)
+- Skill registry API (SQLite locally, optional GitHub-based registry)
 - GitHub Actions for CI/CD (auto-test on publish)
-- Moderation queue for new skills
+- Community-driven moderation via GitHub PRs
 
 ---
 
@@ -410,38 +406,25 @@ services:
       - pgdata:/var/lib/postgresql/data
 ```
 
-#### 7.2 Kubernetes (Cloud/Enterprise)
-**Target**: Horizontal scaling for large deployments
+#### 7.2 Kubernetes (Optional)
+**Target**: Advanced users who want horizontal scaling
 
 **Components**:
 - Gateway: Stateless, horizontal autoscaling (HPA)
 - Brain: Worker pool with queue-based autoscaling
 - Hands: On-demand containers (Kubernetes Jobs)
 - Redis: Sentinel cluster for HA
-- PostgreSQL: Managed service (RDS, Cloud SQL) or Patroni cluster
+- SQLite replaced with PostgreSQL for multi-instance deployments
 
 **Helm Chart**:
 ```bash
 $ helm install librebird ./charts/librebird \
   --set brain.replicas=3 \
   --set gateway.autoscaling.enabled=true \
-  --set postgres.host=my-postgres.rds.amazonaws.com
+  --set database.type=postgresql
 ```
 
-#### 7.3 Managed Cloud (SaaS)
-**Optional**: Hosted version at `cloud.librebird.ai`
-
-**Features**:
-- Zero-setup onboarding
-- Auto-scaling based on usage
-- Managed backups and updates
-- Enhanced security (SOC2, GDPR compliance)
-- Premium features: Advanced analytics, team collaboration
-
-**Pricing Tiers**:
-- **Free**: 100 messages/month, local models only, 1 workspace
-- **Pro** ($15/mo): 10k messages/month, cloud models, 5 workspaces, priority support
-- **Enterprise**: Custom pricing, dedicated instances, SLA, SSO
+**Note**: Kubernetes support is optional and targets advanced self-hosting scenarios. Docker Compose is the primary deployment method.
 
 ---
 
@@ -464,9 +447,9 @@ $ helm install librebird ./charts/librebird \
 - User-facing activity dashboard
 
 #### 8.4 Compliance
-- **GDPR**: Data export, right to be forgotten, consent management
-- **SOC 2**: For enterprise cloud offering
-- **Privacy Policy**: Clear disclosure of what data is stored/processed
+- **GDPR**: Data export, right to be forgotten (self-hosted = user owns data)
+- **Privacy Policy**: Clear disclosure of what data is stored locally
+- **No telemetry**: Zero analytics, zero phone-home (true local-first)
 
 ---
 
@@ -538,11 +521,13 @@ $ lb conversations export <id> --format json
   - "GitHub PR has new comments"
 - Do Not Disturb mode (respect system focus modes)
 
-#### 10.2 Collaboration
-- **Shared conversations**: Multiple users in one chat
-- **Handoff**: Transfer conversation to another user/agent
-- **Mentions**: `@john can you review this?`
-- **Workspaces**: Team-wide skills, shared knowledge base
+#### 10.2 Collaboration (Phase 2)
+**Deferred to Phase 2** based on single-user focus for v1.
+
+Planned features:
+- Shared conversations between owner and guests
+- Conversation handoff
+- Team workspaces
 
 #### 10.3 Advanced Memory
 - **Semantic search**: "What was that restaurant John recommended last month?"
@@ -584,86 +569,88 @@ $ lb conversations export <id> --format json
 ## Migration Strategy (Existing Users)
 
 ### Backward Compatibility
-1. **Desktop app**: Keep as first-class citizen, rebrand as "Libre Bird Desktop"
-2. **Data migration**: Auto-migrate SQLite → PostgreSQL on first run (with backup)
+1. **Desktop app**: Keep as first-class citizen, continue as "Libre Bird Desktop"
+2. **Data migration**: SQLite remains default, seamless upgrade path
 3. **Skills**: Ensure all 26 existing skills work unchanged
 4. **API**: Keep `/api/*` endpoints, add `/api/v2/*` for new features
 
 ### Rollout Plan
-1. **Phase 1** (Month 1-3): Architecture refactor (Gateway/Brain/Hands)
-2. **Phase 2** (Month 4-6): Multi-user, PostgreSQL, web dashboard
-3. **Phase 3** (Month 7-9): Channel integrations (WhatsApp, Telegram, Discord)
-4. **Phase 4** (Month 10-12): Mobile apps, marketplace, cloud offering
+1. **Phase 1** (Month 1-3): Architecture refactor (Gateway/Brain/Hands separation)
+2. **Phase 2** (Month 4-6): Telegram bot integration, web dashboard improvements
+3. **Phase 3** (Month 7-9): Android app, enhanced marketplace
+4. **Phase 4** (Month 10-12): Additional channels (Discord, Slack), advanced features
 
 ---
 
 ## Success Metrics
 
 ### Adoption
-- **Users**: 10k users in first 6 months
-- **Workspaces**: 1k team workspaces created
-- **Channels**: 50% of users connect non-web channels
+- **Installations**: 10k Docker deployments in first 6 months
+- **GitHub Stars**: 5k+ stars within first year
+- **Channels**: 40% of users connect Telegram or other messaging apps
 
 ### Engagement
-- **DAU/MAU**: >40% ratio
-- **Messages per user**: >50/month average
-- **Retention**: >70% month-1 retention
+- **Active instances**: >5k weekly active deployments
+- **Messages per instance**: >100/week average
+- **Retention**: >60% month-over-month active instances
 
 ### Developer Ecosystem
-- **Community skills**: 100+ published in first year
-- **Contributors**: 50+ GitHub contributors
-- **SDK downloads**: 10k+ downloads across all languages
-
-### Revenue (Cloud SaaS)
-- **Conversions**: 10% free → pro conversion
-- **MRR**: $50k+ within first year of cloud launch
+- **Community skills**: 50+ published in first year
+- **Contributors**: 30+ GitHub contributors
+- **Marketplace activity**: 10k+ skill installs across all users
 
 ---
 
-## Open Questions for User Clarification
+## Confirmed Requirements & Technical Decisions
+
+Based on stakeholder input, the following decisions have been confirmed:
 
 ### Scope & Prioritization
-1. **Mobile apps**: Are iOS and Android both equally important, or should we focus on one platform first?
-2. **Channels**: Which messaging platforms are highest priority? (WhatsApp, Telegram, Discord, Slack, SMS)
-3. **Cloud offering**: Do you want to build a managed SaaS, or focus purely on self-hosted?
-4. **Enterprise features**: Are team collaboration features (workspaces, RBAC) critical for v1?
+1. ✅ **Mobile apps**: Android first (iOS deferred to Phase 2)
+2. ✅ **Channels**: Telegram priority (easiest integration with python-telegram-bot)
+3. ✅ **Cloud offering**: Self-hosted only, no managed SaaS
+4. ✅ **Team features**: Not critical for v1 (basic single-user auth only)
 
-### Technical Decisions
-5. **Programming language**:
-   - Keep Python for Brain + Hands?
-   - Use Node.js/TypeScript for Gateway, or Go for better performance?
-6. **Database**: PostgreSQL mandatory, or support SQLite for single-user setups?
-7. **Vector DB**: Managed (Pinecone) vs self-hosted (ChromaDB/Qdrant) vs PostgreSQL pgvector?
-8. **Message queue**: Redis Pub/Sub, RabbitMQ, or cloud-native (AWS SQS, Google Pub/Sub)?
+### Technical Stack Decisions
+5. ✅ **Gateway**: **Node.js/TypeScript**
+   - Better WebSocket ecosystem, easier community contributions
+   - Performance sufficient for self-hosted use cases
+   
+6. ✅ **Database**: **SQLite as primary, PostgreSQL optional**
+   - SQLite simpler for self-hosted, zero-config
+   - Add PostgreSQL support later for power users
+   - Architecture designed to support both via adapter pattern
+   
+7. ✅ **Vector DB**: **ChromaDB**
+   - Self-hosted, no external service needed
+   - Excellent Python integration
+   - Lightweight for single-user deployments
+   
+8. ✅ **Message Queue**: **Redis**
+   - Single dependency for queue + cache + session storage
+   - Battle-tested, simple setup
+   - Sufficient for self-hosted scale
 
 ### Infrastructure
-9. **Deployment**: Docker Compose as minimum viable, or Kubernetes from day one?
-10. **Hosting**: AWS, GCP, Azure, or cloud-agnostic (via Terraform)?
-11. **LLM providers**: Which cloud LLM APIs to support first? (OpenAI, Anthropic, Google, Azure, Cohere, etc.)
+9. ✅ **Deployment**: Docker Compose (Kubernetes optional for advanced users)
+10. ✅ **Hosting**: Cloud-agnostic, self-hosted on user hardware
+11. ✅ **LLM Providers**: Local (llama.cpp) + OpenAI + Anthropic for v1
 
 ### Business Model
-12. **Open source**: Keep fully open source, or open-core with premium features?
-13. **Marketplace**: Free only, or support paid plugins with revenue sharing?
-14. **Pricing**: For cloud SaaS, confirm pricing tiers and limits?
+12. ✅ **License**: Fully open source (MIT)
+13. ✅ **Marketplace**: Free only, community-driven
+14. ✅ **Pricing**: N/A (no SaaS offering)
 
----
+### Simplified Architecture for v1
 
-## Assumptions
+Given self-hosted + single-user focus, we can simplify:
 
-Since this PRD is created without full clarification, these assumptions are made:
-
-1. **Target audience**: Developers, power users, small teams (similar to OpenClaw)
-2. **Platform priority**: Web + Desktop first, mobile later
-3. **Deployment**: Self-hosted Docker Compose as primary, Kubernetes optional
-4. **Database**: PostgreSQL for multi-user, SQLite fallback for single-user
-5. **Gateway language**: Node.js/TypeScript (aligns with OpenClaw, good for real-time)
-6. **Brain language**: Keep Python (existing codebase, ML ecosystem)
-7. **Channels**: Start with web, WhatsApp, Telegram (most requested)
-8. **Business model**: Open source (MIT/Apache 2.0) with optional managed cloud offering
-9. **LLM support**: Local (llama.cpp) + OpenAI + Anthropic for v1
-10. **Mobile apps**: Phase 2 priority (after core platform is stable)
-
-**These assumptions should be validated with stakeholders before proceeding to technical specification.**
+- **No multi-tenancy**: Single workspace per instance
+- **Basic auth**: Email/password + API keys (skip OAuth, magic links)
+- **No RBAC**: Owner + guest roles only
+- **Simplified database**: SQLite with migration path to PostgreSQL
+- **Lightweight deployment**: docker-compose.yml as primary target
+- **Single channel priority**: Telegram bot (easiest API)
 
 ---
 
@@ -672,12 +659,12 @@ Since this PRD is created without full clarification, these assumptions are made
 | Feature | OpenClaw | Libre Bird (Current) | Libre Bird (Target) |
 |---------|----------|----------------------|---------------------|
 | **Architecture** | Gateway + Brain + Hands | Monolithic FastAPI | Gateway + Brain + Hands |
-| **Multi-user** | ✅ Yes | ❌ No | ✅ Yes |
-| **Channels** | WhatsApp, Telegram, Discord, Web | Desktop GUI only | All channels |
-| **Mobile apps** | ✅ iOS + Android | ❌ No | ✅ iOS + Android |
-| **Self-hosted** | ✅ Docker | ✅ macOS binary | ✅ Docker + K8s |
-| **Cloud hosting** | ✅ Managed service | ❌ No | ✅ Optional SaaS |
-| **Plugin system** | ✅ Marketplace | ✅ Skill loader | ✅ Enhanced marketplace |
+| **Multi-user** | ✅ Yes (cloud-first) | ❌ No | ✅ Yes (self-hosted) |
+| **Channels** | WhatsApp, Telegram, Discord, Web | Desktop GUI only | Telegram, Web, Android |
+| **Mobile apps** | ✅ iOS + Android | ❌ No | ✅ Android (iOS Phase 2) |
+| **Self-hosted** | ✅ Docker | ✅ macOS binary | ✅ Docker (primary) |
+| **Cloud hosting** | ✅ Managed service | ❌ No | ❌ No (self-hosted only) |
+| **Plugin system** | ✅ Marketplace | ✅ Skill loader | ✅ Free marketplace |
 | **Privacy** | ⚠️ Cloud-first | ✅ Local-only | ✅ Local-first, cloud optional |
 | **LLM support** | OpenAI, Anthropic, local | Local only | Local + all major providers |
 | **Voice** | ✅ STT/TTS | ✅ Whisper + macOS TTS | ✅ Enhanced multi-platform |
