@@ -1,0 +1,149 @@
+"""
+Tool Registry — manages tool definitions and dispatches execution.
+
+Tools are registered at startup and described to the LLM via OpenAI-style
+function schemas. The registry handles execution dispatch, timeout enforcement,
+and result formatting.
+"""
+
+import logging
+import time
+from typing import Callable, Dict, Optional
+
+from agent.types import (
+    RiskLevel,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+)
+
+logger = logging.getLogger("brain.agent.tools")
+
+
+class ToolRegistry:
+    """
+    Central registry for all agent tools.
+
+    Tools are registered with definitions (schema + metadata) and handler
+    functions. The registry mediates between the agent loop and concrete
+    tool implementations.
+    """
+
+    def __init__(self):
+        self._definitions: Dict[str, ToolDefinition] = {}
+        self._handlers: Dict[str, Callable] = {}
+
+    def register(
+        self,
+        definition: ToolDefinition,
+        handler: Callable,
+    ) -> None:
+        """Register a tool with its definition and async handler."""
+        self._definitions[definition.name] = definition
+        self._handlers[definition.name] = handler
+        logger.info(f"Tool registered: {definition.name} [{definition.risk_level.value}]")
+
+    def list_tools(self) -> list[ToolDefinition]:
+        """Return all registered tool definitions."""
+        return list(self._definitions.values())
+
+    def get_tool(self, name: str) -> Optional[ToolDefinition]:
+        """Get a tool definition by name."""
+        return self._definitions.get(name)
+
+    def get_risk_level(self, name: str) -> RiskLevel:
+        """Get the risk level for a tool."""
+        tool = self._definitions.get(name)
+        return tool.risk_level if tool else RiskLevel.HIGH  # Unknown = HIGH
+
+    async def execute(self, tool_call: ToolCall) -> ToolResult:
+        """
+        Execute a tool call and return the result.
+        Handles timeout enforcement and error wrapping.
+        """
+        handler = self._handlers.get(tool_call.name)
+        if not handler:
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                success=False,
+                error=f"Unknown tool: {tool_call.name}",
+            )
+
+        definition = self._definitions[tool_call.name]
+        start = time.monotonic()
+
+        try:
+            import asyncio
+            result = await asyncio.wait_for(
+                handler(**tool_call.arguments),
+                timeout=definition.timeout_seconds,
+            )
+
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+
+            # Normalize result to string
+            if isinstance(result, dict):
+                import json
+                output = json.dumps(result, indent=2, default=str)
+            elif isinstance(result, (list, tuple)):
+                import json
+                output = json.dumps(result, indent=2, default=str)
+            else:
+                output = str(result)
+
+            # Truncate very long outputs
+            if len(output) > 10_000:
+                output = output[:9_900] + f"\n\n... (truncated, {len(output)} total chars)"
+
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                success=True,
+                output=output,
+                execution_time_ms=elapsed_ms,
+            )
+
+        except asyncio.TimeoutError:
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            logger.warning(f"Tool {tool_call.name} timed out after {definition.timeout_seconds}s")
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                success=False,
+                error=f"Tool timed out after {definition.timeout_seconds} seconds",
+                execution_time_ms=elapsed_ms,
+            )
+
+        except Exception as e:
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            logger.error(f"Tool {tool_call.name} error: {e}", exc_info=True)
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                success=False,
+                error=str(e),
+                execution_time_ms=elapsed_ms,
+            )
+
+
+def build_tool_registry() -> ToolRegistry:
+    """
+    Build the default tool registry with all built-in tools.
+    Called during server startup.
+    """
+    registry = ToolRegistry()
+
+    # Import and register all built-in tools
+    from agent.tools.code import register_code_tools
+    from agent.tools.web import register_web_tools
+    from agent.tools.files import register_file_tools
+    from agent.tools.data import register_data_tools
+    from agent.tools.memory import register_memory_tools
+    from agent.tools.human import register_human_tools
+
+    register_code_tools(registry)
+    register_web_tools(registry)
+    register_file_tools(registry)
+    register_data_tools(registry)
+    register_memory_tools(registry)
+    register_human_tools(registry)
+
+    logger.info(f"Tool registry built: {len(registry._definitions)} tools")
+    return registry

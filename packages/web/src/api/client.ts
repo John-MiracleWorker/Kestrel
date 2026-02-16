@@ -199,3 +199,69 @@ export interface ApiKey {
     createdAt: string;
     expiresAt: string;
 }
+
+// ── Agent Tasks ─────────────────────────────────────────────────────
+
+export interface TaskEvent {
+    type: string;
+    taskId: string;
+    stepId: string;
+    content: string;
+    toolName: string;
+    toolArgs: string;
+    toolResult: string;
+    approvalId: string;
+    progress: Record<string, string>;
+}
+
+export interface TaskSummary {
+    id: string;
+    goal: string;
+    status: string;
+    iterations: number;
+    toolCalls: number;
+    result: string;
+    error: string;
+    createdAt: string;
+    completedAt: string;
+}
+
+export interface StartTaskOptions {
+    goal: string;
+    conversationId?: string;
+    guardrails?: {
+        maxIterations?: number;
+        maxToolCalls?: number;
+        maxTokens?: number;
+        maxWallTimeSeconds?: number;
+        autoApproveRisk?: string;
+    };
+}
+
+export const tasks = {
+    list: (workspaceId: string, status?: string) =>
+        request<{ tasks: TaskSummary[] }>(
+            `/workspaces/${workspaceId}/tasks${status ? `?status=${status}` : ''}`,
+        ),
+
+    /**
+     * Start a task via SSE — returns an EventSource that emits TaskEvent objects.
+     */
+    start: (workspaceId: string, options: StartTaskOptions): EventSource => {
+        // We POST and receive SSE, so we use fetch + ReadableStream
+        const url = `${BASE_URL}/workspaces/${workspaceId}/tasks`;
+        const eventSource = new EventSource(url); // Fallback — actual impl in hook
+        return eventSource;
+    },
+
+    approve: (taskId: string, approvalId: string, approved: boolean) =>
+        request<{ success: boolean; error?: string }>(`/tasks/${taskId}/approve`, {
+            method: 'POST',
+            body: { approvalId, approved },
+        }),
+
+    cancel: (taskId: string) =>
+        request<{ success: boolean }>(`/tasks/${taskId}/cancel`, {
+            method: 'POST',
+        }),
+};

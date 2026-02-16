@@ -1,0 +1,105 @@
+/* ── Plan View ──────────────────────────────────────────────────── */
+
+.plan-view {
+    border-bottom: 1px solid var(--agent-border, #334155);
+    padding: 12px 18px;
+    background: rgba(59, 130, 246, 0.04);
+}
+
+.plan-view--error {
+    color: var(--agent-muted, #64748b);
+    font-size: 13px;
+    font-style: italic;
+}
+
+.plan-view__header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--agent-text, #e2e8f0);
+    margin-bottom: 12px;
+}
+
+.plan-view__steps {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.plan-step {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    transition: background 0.2s;
+}
+
+.plan-step:hover {
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.plan-step__indicator {
+    flex-shrink: 0;
+    width: 22px;
+    text-align: center;
+    font-size: 14px;
+    line-height: 1.4;
+    color: var(--agent-muted, #64748b);
+}
+
+.plan-step--complete .plan-step__indicator {
+    color: var(--agent-success, #10b981);
+}
+
+.plan-step--active .plan-step__indicator {
+    color: var(--agent-active, #3b82f6);
+    animation: spin 1.5s linear infinite;
+}
+
+@keyframes spin {
+    0% {
+        transform: rotate(0deg);
+    }
+
+    100% {
+        transform: rotate(360deg);
+    }
+}
+
+.plan-step__content {
+    flex: 1;
+    min-width: 0;
+}
+
+.plan-step__name {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--agent-text, #e2e8f0);
+    line-height: 1.4;
+}
+
+.plan-step--complete .plan-step__name {
+    text-decoration: line-through;
+    opacity: 0.6;
+}
+
+.plan-step--pending .plan-step__name {
+    opacity: 0.5;
+}
+
+.plan-step__desc {
+    font-size: 12px;
+    color: var(--agent-muted, #64748b);
+    line-height: 1.4;
+    margin-top: 2px;
+}
+
+.plan-step__deps {
+    font-size: 11px;
+    color: var(--agent-muted, #64748b);
+    opacity: 0.7;
+    margin-top: 4px;
+}

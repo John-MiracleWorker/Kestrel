@@ -257,4 +257,112 @@ export class BrainClient {
             );
         });
     }
+
+    // ── Autonomous Agent ────────────────────────────────────────
+
+    /**
+     * Start an agent task — returns an async iterable of TaskEvent objects.
+     */
+    startTask(request: {
+        userId: string;
+        workspaceId: string;
+        goal: string;
+        conversationId?: string;
+        guardrails?: {
+            maxIterations?: number;
+            maxToolCalls?: number;
+            maxTokens?: number;
+            maxWallTimeSeconds?: number;
+            autoApproveRisk?: string;
+            blockedPatterns?: string[];
+            requireApprovalTools?: string[];
+        };
+    }): AsyncIterable<any> {
+        const stream = this.client.StartTask({
+            user_id: request.userId,
+            workspace_id: request.workspaceId,
+            goal: request.goal,
+            conversation_id: request.conversationId || '',
+            guardrails: request.guardrails
+                ? {
+                    max_iterations: request.guardrails.maxIterations || 0,
+                    max_tool_calls: request.guardrails.maxToolCalls || 0,
+                    max_tokens: request.guardrails.maxTokens || 0,
+                    max_wall_time_seconds: request.guardrails.maxWallTimeSeconds || 0,
+                    auto_approve_risk: request.guardrails.autoApproveRisk || '',
+                    blocked_patterns: request.guardrails.blockedPatterns || [],
+                    require_approval_tools: request.guardrails.requireApprovalTools || [],
+                }
+                : undefined,
+        });
+
+        return {
+            [Symbol.asyncIterator]() {
+                return {
+                    next(): Promise<IteratorResult<any>> {
+                        return new Promise((resolve) => {
+                            stream.once('data', (data: any) => {
+                                resolve({ value: data, done: false });
+                            });
+                            stream.once('end', () => {
+                                resolve({ value: undefined, done: true });
+                            });
+                            stream.once('error', (err: any) => {
+                                resolve({ value: undefined, done: true });
+                            });
+                        });
+                    },
+                };
+            },
+        };
+    }
+
+    /**
+     * Approve or deny a pending agent action.
+     */
+    async approveAction(approvalId: string, userId: string, approved: boolean): Promise<any> {
+        return new Promise((resolve, reject) => {
+            this.client.ApproveAction(
+                { approval_id: approvalId, user_id: userId, approved },
+                (err: any, response: any) => {
+                    if (err) reject(new Error(err.details || err.message));
+                    else resolve(response);
+                }
+            );
+        });
+    }
+
+    /**
+     * Cancel a running agent task.
+     */
+    async cancelTask(taskId: string, userId: string): Promise<any> {
+        return new Promise((resolve, reject) => {
+            this.client.CancelTask(
+                { task_id: taskId, user_id: userId },
+                (err: any, response: any) => {
+                    if (err) reject(new Error(err.details || err.message));
+                    else resolve(response);
+                }
+            );
+        });
+    }
+
+    /**
+     * List agent tasks for a user.
+     */
+    async listTasks(
+        userId: string,
+        workspaceId?: string,
+        status?: string,
+    ): Promise<any> {
+        return new Promise((resolve, reject) => {
+            this.client.ListTasks(
+                { user_id: userId, workspace_id: workspaceId || '', status: status || '' },
+                (err: any, response: any) => {
+                    if (err) reject(new Error(err.details || err.message));
+                    else resolve(response);
+                }
+            );
+        });
+    }
 }

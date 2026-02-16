@@ -1,0 +1,324 @@
+/* ── Agent CSS Variables ─────────────────────────────────────────── */
+
+:root {
+    --agent-neutral: #94a3b8;
+    --agent-active: #3b82f6;
+    --agent-success: #10b981;
+    --agent-warning: #f59e0b;
+    --agent-error: #ef4444;
+    --agent-bg: #0f172a;
+    --agent-surface: #1e293b;
+    --agent-border: #334155;
+    --agent-text: #e2e8f0;
+    --agent-muted: #64748b;
+    --agent-radius: 12px;
+}
+
+/* ── TaskPanel ──────────────────────────────────────────────────── */
+
+.task-panel {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background: var(--agent-bg);
+    border: 1px solid var(--agent-border);
+    border-radius: var(--agent-radius);
+    overflow: hidden;
+    font-family: 'Inter', -apple-system, sans-serif;
+    color: var(--agent-text);
+}
+
+/* Header */
+.task-panel__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 18px;
+    background: var(--agent-surface);
+    border-bottom: 1px solid var(--agent-border);
+}
+
+.task-panel__title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+    font-size: 15px;
+}
+
+.task-panel__icon {
+    font-size: 20px;
+}
+
+.task-panel__status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 500;
+}
+
+.task-panel__dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+}
+
+.task-panel__dot.running {
+    animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.3;
+    }
+}
+
+/* Progress */
+.task-panel__progress {
+    padding: 10px 18px;
+    border-bottom: 1px solid var(--agent-border);
+}
+
+.task-panel__progress-label {
+    font-size: 12px;
+    color: var(--agent-muted);
+    margin-bottom: 6px;
+}
+
+.task-panel__progress-bar {
+    height: 4px;
+    background: var(--agent-border);
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.task-panel__progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--agent-active), #818cf8);
+    border-radius: 2px;
+    transition: width 0.4s ease;
+}
+
+/* Thinking */
+.task-panel__thinking {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 10px 18px;
+    background: rgba(59, 130, 246, 0.08);
+    border-bottom: 1px solid var(--agent-border);
+    font-size: 13px;
+    color: #93c5fd;
+    font-style: italic;
+    animation: fade-in 0.3s ease;
+}
+
+.task-panel__thinking-text {
+    line-height: 1.5;
+}
+
+@keyframes fade-in {
+    from {
+        opacity: 0;
+        transform: translateY(-4px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* Plan Toggle */
+.task-panel__plan-toggle {
+    display: block;
+    width: 100%;
+    padding: 8px 18px;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--agent-border);
+    color: var(--agent-active);
+    font-size: 13px;
+    cursor: pointer;
+    text-align: left;
+    transition: background 0.2s;
+}
+
+.task-panel__plan-toggle:hover {
+    background: rgba(59, 130, 246, 0.08);
+}
+
+/* Event Stream */
+.task-panel__events {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 0;
+    scroll-behavior: smooth;
+}
+
+.event-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 6px 18px;
+    font-size: 13px;
+    line-height: 1.5;
+    transition: background 0.2s;
+    animation: slide-in 0.2s ease;
+}
+
+@keyframes slide-in {
+    from {
+        opacity: 0;
+        transform: translateX(-8px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateX(0);
+    }
+}
+
+.event-row:hover {
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.event-row__icon {
+    flex-shrink: 0;
+    width: 20px;
+    text-align: center;
+}
+
+.event-row__label {
+    font-weight: 500;
+    color: var(--agent-text);
+    white-space: nowrap;
+}
+
+.event-row__detail {
+    color: var(--agent-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+}
+
+.event-row--tool_called .event-row__label,
+.event-row--tool_result .event-row__label {
+    color: #818cf8;
+}
+
+.event-row--task_complete .event-row__label {
+    color: var(--agent-success);
+}
+
+.event-row--task_failed .event-row__label {
+    color: var(--agent-error);
+}
+
+/* Error */
+.task-panel__error {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 18px;
+    background: rgba(239, 68, 68, 0.1);
+    border-top: 1px solid rgba(239, 68, 68, 0.3);
+    color: #fca5a5;
+    font-size: 13px;
+}
+
+/* Controls */
+.task-panel__controls {
+    padding: 12px 18px;
+    border-top: 1px solid var(--agent-border);
+    background: var(--agent-surface);
+}
+
+.task-panel__input-row {
+    display: flex;
+    gap: 8px;
+}
+
+.task-panel__input {
+    flex: 1;
+    padding: 10px 14px;
+    background: var(--agent-bg);
+    border: 1px solid var(--agent-border);
+    border-radius: 8px;
+    color: var(--agent-text);
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.2s;
+}
+
+.task-panel__input:focus {
+    border-color: var(--agent-active);
+}
+
+.task-panel__input::placeholder {
+    color: var(--agent-muted);
+}
+
+.task-panel__start-btn {
+    padding: 10px 20px;
+    background: linear-gradient(135deg, var(--agent-active), #818cf8);
+    border: none;
+    border-radius: 8px;
+    color: white;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+    transition: opacity 0.2s, transform 0.1s;
+    white-space: nowrap;
+}
+
+.task-panel__start-btn:hover:not(:disabled) {
+    opacity: 0.9;
+    transform: translateY(-1px);
+}
+
+.task-panel__start-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.task-panel__cancel-btn {
+    width: 100%;
+    padding: 10px 20px;
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    border-radius: 8px;
+    color: #fca5a5;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.task-panel__cancel-btn:hover {
+    background: rgba(239, 68, 68, 0.25);
+}
+
+/* Scrollbar */
+.task-panel__events::-webkit-scrollbar {
+    width: 6px;
+}
+
+.task-panel__events::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.task-panel__events::-webkit-scrollbar-thumb {
+    background: var(--agent-border);
+    border-radius: 3px;
+}

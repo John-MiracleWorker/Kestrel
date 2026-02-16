@@ -20,6 +20,7 @@ import magicLinkRoutes from './auth/strategies/magic-link';
 import providerRoutes from './routes/providers';
 import telegramWebhookRoutes from './routes/webhooks/telegram';
 import whatsappWebhookRoutes from './routes/webhooks/whatsapp';
+import taskRoutes from './routes/tasks';
 
 dotenv.config();
 
@@ -98,6 +99,7 @@ async function start() {
         await oauthRoutes(app, deps);
         await magicLinkRoutes(app, deps);
         await providerRoutes(app, deps);
+        await taskRoutes(app, { brainClient });
 
         // 4. Set up metrics
         setupMetrics(app);

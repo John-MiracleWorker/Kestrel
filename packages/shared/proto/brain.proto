@@ -26,6 +26,13 @@ service BrainService {
   // ── Mobile / Sync ────────────────────────────────────────────
   rpc RegisterPushToken(RegisterPushTokenRequest) returns (RegisterPushTokenResponse);
   rpc GetUpdates(GetUpdatesRequest) returns (GetUpdatesResponse);
+
+  // ── Autonomous Agent ────────────────────────────────────────
+  rpc StartTask(StartTaskRequest) returns (stream TaskEvent);
+  rpc StreamTaskEvents(StreamTaskEventsRequest) returns (stream TaskEvent);
+  rpc ApproveAction(ApproveActionRequest) returns (ApproveActionResponse);
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -217,4 +224,98 @@ message GetUpdatesRequest {
 message GetUpdatesResponse {
   repeated MessageResponse messages = 1;
   repeated ConversationResponse conversations = 2;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Autonomous Agent
+// ═══════════════════════════════════════════════════════════════
+
+message StartTaskRequest {
+  string user_id = 1;
+  string workspace_id = 2;
+  string goal = 3;                    // Natural language goal
+  string conversation_id = 4;        // Optional: link to conversation
+  GuardrailConfig guardrails = 5;    // Optional: custom limits
+}
+
+message GuardrailConfig {
+  int32 max_iterations = 1;          // Default: 25
+  int32 max_tool_calls = 2;          // Default: 50
+  int32 max_tokens = 3;              // Default: 100000
+  int32 max_wall_time_seconds = 4;   // Default: 600
+  string auto_approve_risk = 5;      // "low", "medium", "high", "critical"
+  repeated string blocked_patterns = 6;
+  repeated string require_approval_tools = 7;
+}
+
+message TaskEvent {
+  enum EventType {
+    PLAN_CREATED = 0;
+    STEP_STARTED = 1;
+    TOOL_CALLED = 2;
+    TOOL_RESULT = 3;
+    STEP_COMPLETE = 4;
+    APPROVAL_NEEDED = 5;
+    THINKING = 6;
+    TASK_COMPLETE = 7;
+    TASK_FAILED = 8;
+    TASK_PAUSED = 9;
+  }
+
+  EventType type = 1;
+  string task_id = 2;
+  string step_id = 3;
+  string content = 4;               // Thinking text, result, error
+  string tool_name = 5;
+  string tool_args = 6;             // JSON string
+  string tool_result = 7;
+  string approval_id = 8;
+  map<string, string> progress = 9; // current_step, total_steps, etc.
+}
+
+message StreamTaskEventsRequest {
+  string task_id = 1;
+  string user_id = 2;
+}
+
+message ApproveActionRequest {
+  string approval_id = 1;
+  string user_id = 2;
+  bool approved = 3;                // true = approve, false = deny
+}
+
+message ApproveActionResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message CancelTaskRequest {
+  string task_id = 1;
+  string user_id = 2;
+}
+
+message CancelTaskResponse {
+  bool success = 1;
+}
+
+message ListTasksRequest {
+  string user_id = 1;
+  string workspace_id = 2;
+  string status = 3;                // Optional filter: "executing", "complete", etc.
+}
+
+message TaskSummary {
+  string id = 1;
+  string goal = 2;
+  string status = 3;
+  int32 iterations = 4;
+  int32 tool_calls = 5;
+  string result = 6;
+  string error = 7;
+  string created_at = 8;
+  string completed_at = 9;
+}
+
+message ListTasksResponse {
+  repeated TaskSummary tasks = 1;
 }

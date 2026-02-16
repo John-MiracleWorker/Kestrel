@@ -216,6 +216,12 @@ _providers: dict[str, LocalProvider | CloudProvider] = {}
 _retrieval: RetrievalPipeline | None = None
 _embedding_pipeline: EmbeddingPipeline | None = None
 
+# ── Agent Runtime ────────────────────────────────────────────────────
+
+_agent_loop = None
+_agent_persistence = None
+_running_tasks: dict[str, object] = {}
+
 
 def get_provider(name: str):
     if name not in _providers:
@@ -422,6 +428,159 @@ class BrainServicer:
         # Phase 2: implement sync
         return {"messages": [], "conversations": []}
 
+    # ── Autonomous Agent RPCs ────────────────────────────────────
+
+    async def StartTask(self, request, context):
+        """Start an autonomous agent task and stream events."""
+        import json
+        from agent.types import (
+            AgentTask,
+            GuardrailConfig as GCfg,
+            RiskLevel,
+            TaskStatus,
+        )
+
+        user_id = request.user_id
+        workspace_id = request.workspace_id
+        goal = request.goal
+
+        # Build guardrail config from request (or defaults)
+        config = GCfg()
+        if request.guardrails:
+            g = request.guardrails
+            if g.max_iterations > 0:
+                config.max_iterations = g.max_iterations
+            if g.max_tool_calls > 0:
+                config.max_tool_calls = g.max_tool_calls
+            if g.max_tokens > 0:
+                config.max_tokens = g.max_tokens
+            if g.max_wall_time_seconds > 0:
+                config.max_wall_time_seconds = g.max_wall_time_seconds
+            if g.auto_approve_risk:
+                config.auto_approve_risk = RiskLevel(g.auto_approve_risk)
+            if g.blocked_patterns:
+                config.blocked_patterns = list(g.blocked_patterns)
+            if g.require_approval_tools:
+                config.require_approval_tools = list(g.require_approval_tools)
+
+        # Create the task
+        task = AgentTask(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            goal=goal,
+            conversation_id=request.conversation_id or None,
+            config=config,
+        )
+
+        # Save to DB
+        await _agent_persistence.save_task(task)
+        logger.info(f"Agent task started: {task.id} — {goal}")
+
+        # Store the running task handle
+        _running_tasks[task.id] = task
+
+        # Run the agent loop and stream events
+        try:
+            async for event in _agent_loop.run(task):
+                yield {
+                    "type": event.type.value if hasattr(event.type, 'value') else event.type,
+                    "task_id": event.task_id,
+                    "step_id": event.step_id or "",
+                    "content": event.content,
+                    "tool_name": event.tool_name or "",
+                    "tool_args": event.tool_args or "",
+                    "tool_result": event.tool_result or "",
+                    "approval_id": event.approval_id or "",
+                    "progress": {k: str(v) for k, v in (event.progress or {}).items()},
+                }
+        finally:
+            _running_tasks.pop(task.id, None)
+
+    async def StreamTaskEvents(self, request, context):
+        """Reconnect to an already-running task's event stream."""
+        task_id = request.task_id
+
+        if task_id not in _running_tasks:
+            context.abort(grpc.StatusCode.NOT_FOUND, f"Task {task_id} is not running")
+            return
+
+        # TODO: Implement event replay/fan-out via Redis pubsub
+        context.abort(
+            grpc.StatusCode.UNIMPLEMENTED,
+            "Event stream reconnection coming in next iteration",
+        )
+
+    async def ApproveAction(self, request, context):
+        """Approve or deny a pending agent action."""
+        from agent.types import ApprovalStatus
+
+        try:
+            await _agent_persistence.resolve_approval(
+                approval_id=request.approval_id,
+                status=ApprovalStatus.APPROVED if request.approved else ApprovalStatus.DENIED,
+                decided_by=request.user_id,
+            )
+            return {"success": True, "error": ""}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def CancelTask(self, request, context):
+        """Cancel a running agent task."""
+        task_id = request.task_id
+
+        if task_id in _running_tasks:
+            task = _running_tasks[task_id]
+            task.status = "cancelled"
+            await _agent_persistence.update_task(task)
+            _running_tasks.pop(task_id, None)
+            return {"success": True}
+
+        # Try updating DB directly
+        pool = await get_pool()
+        await pool.execute(
+            "UPDATE agent_tasks SET status = 'cancelled' WHERE id = $1",
+            task_id,
+        )
+        return {"success": True}
+
+    async def ListTasks(self, request, context):
+        """List agent tasks for a user/workspace."""
+        pool = await get_pool()
+        query = """
+            SELECT id, goal, status, iterations, tool_calls_count,
+                   result, error, created_at, completed_at
+            FROM agent_tasks
+            WHERE user_id = $1
+        """
+        params = [request.user_id]
+
+        if request.workspace_id:
+            query += " AND workspace_id = $2"
+            params.append(request.workspace_id)
+
+        if request.status:
+            query += f" AND status = ${len(params) + 1}"
+            params.append(request.status)
+
+        query += " ORDER BY created_at DESC LIMIT 50"
+
+        rows = await pool.fetch(query, *params)
+        tasks = []
+        for row in rows:
+            tasks.append({
+                "id": str(row["id"]),
+                "goal": row["goal"],
+                "status": row["status"],
+                "iterations": row["iterations"],
+                "tool_calls": row["tool_calls_count"],
+                "result": row["result"] or "",
+                "error": row["error"] or "",
+                "created_at": row["created_at"].isoformat() if row["created_at"] else "",
+                "completed_at": row["completed_at"].isoformat() if row["completed_at"] else "",
+            })
+
+        return {"tasks": tasks}
+
 
 # ── Server Bootstrap ─────────────────────────────────────────────────
 
@@ -492,6 +651,24 @@ async def serve():
     _embedding_pipeline = EmbeddingPipeline(vector_store)
     await _embedding_pipeline.start()
     logger.info("RAG pipelines initialized")
+
+    # Initialize agent runtime
+    from agent.tools import build_tool_registry
+    from agent.guardrails import Guardrails
+    from agent.loop import AgentLoop
+    from agent.persistence import PostgresTaskPersistence
+
+    global _agent_loop, _agent_persistence
+    tool_registry = build_tool_registry()
+    guardrails = Guardrails()
+    _agent_persistence = PostgresTaskPersistence(pool=await get_pool())
+    _agent_loop = AgentLoop(
+        provider=get_provider("local"),
+        tool_registry=tool_registry,
+        guardrails=guardrails,
+        persistence=_agent_persistence,
+    )
+    logger.info(f"Agent runtime initialized ({len(tool_registry._definitions)} tools)")
 
     await server.start()
     logger.info("Brain service ready")
