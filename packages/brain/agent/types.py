@@ -287,6 +287,10 @@ class AgentTask:
     pending_approval: Optional[ApprovalRequest] = None
     messages: list[dict[str, Any]] = field(default_factory=list)  # Conversation history
 
+    # Multi-agent delegation
+    parent_task_id: Optional[str] = None
+    child_task_ids: list[str] = field(default_factory=list)
+
 
 # ── Task Events (streamed to clients) ────────────────────────────────
 
@@ -303,6 +307,10 @@ class TaskEventType(str, Enum):
     TASK_COMPLETE = "task_complete"
     TASK_FAILED = "task_failed"
     TASK_PAUSED = "task_paused"
+    METRICS_UPDATE = "metrics_update"
+    DELEGATION_STARTED = "delegation_started"
+    DELEGATION_COMPLETE = "delegation_complete"
+    CHECKPOINT_SAVED = "checkpoint_saved"
 
 
 @dataclass
@@ -317,6 +325,7 @@ class TaskEvent:
     tool_result: Optional[str] = None
     approval_id: Optional[str] = None
     progress: Optional[dict] = None  # {current_step, total_steps, iterations, ...}
+    metrics: Optional[dict] = None   # {tokens, cost_usd, elapsed_ms, ...}
 
     def to_dict(self) -> dict:
         return {
@@ -329,4 +338,5 @@ class TaskEvent:
             "tool_result": self.tool_result,
             "approval_id": self.approval_id,
             "progress": self.progress,
+            "metrics": self.metrics,
         }

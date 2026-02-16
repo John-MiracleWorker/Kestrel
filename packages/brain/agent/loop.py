@@ -34,6 +34,7 @@ from agent.types import (
     ToolResult,
 )
 from agent.planner import TaskPlanner
+from agent.learner import TaskLearner
 
 logger = logging.getLogger("brain.agent.loop")
 
@@ -79,6 +80,8 @@ class AgentLoop:
         guardrails: "Guardrails",
         persistence: "TaskPersistence",
         model: str = "",
+        learner: Optional[TaskLearner] = None,
+        checkpoint_manager=None,
     ):
         self._provider = provider
         self._tools = tool_registry
@@ -86,6 +89,8 @@ class AgentLoop:
         self._persistence = persistence
         self._model = model
         self._planner = TaskPlanner(provider, model)
+        self._learner = learner
+        self._checkpoints = checkpoint_manager
 
         # Callback for approval resolution (set by the gRPC handler)
         self._approval_callback: Optional[Callable] = None
@@ -100,15 +105,30 @@ class AgentLoop:
         start_time = time.monotonic()
 
         try:
+            # ── Phase 0: Enrich with Past Lessons ────────────────
+            lesson_context = ""
+            if self._learner:
+                try:
+                    lesson_context = await self._learner.enrich_context(
+                        workspace_id=task.workspace_id,
+                        goal=task.goal,
+                    )
+                except Exception as e:
+                    logger.warning(f"Lesson enrichment failed: {e}")
+
             # ── Phase 1: Planning ────────────────────────────────
             if task.status == TaskStatus.PLANNING:
                 task.status = TaskStatus.PLANNING
                 await self._persistence.update_task(task)
 
+                context = self._build_context(task)
+                if lesson_context:
+                    context += f"\n\n{lesson_context}"
+
                 plan = await self._planner.create_plan(
                     goal=task.goal,
                     available_tools=self._tools.list_tools(),
-                    context=self._build_context(task),
+                    context=context,
                 )
                 task.plan = plan
                 await self._persistence.update_task(task)
@@ -266,6 +286,13 @@ class AgentLoop:
                 content=task.result,
                 progress=self._progress(task),
             )
+
+            # ── Phase 4: Learn from this task ────────────────────
+            if self._learner:
+                try:
+                    await self._learner.extract_lessons(task)
+                except Exception as e:
+                    logger.warning(f"Post-task learning failed: {e}")
 
         except asyncio.CancelledError:
             task.status = TaskStatus.CANCELLED
