@@ -371,6 +371,13 @@ def uninstall_skill(name: str) -> dict:
 
     skill_path = skill.path
 
+    # Validate the skill path is actually inside SKILLS_DIR to prevent
+    # directory traversal via a crafted skill name/path.
+    real_skill = os.path.realpath(skill_path)
+    real_skills_dir = os.path.realpath(SKILLS_DIR)
+    if not real_skill.startswith(real_skills_dir + os.sep):
+        return {"error": "Skill path is outside the skills directory"}
+
     # Remove from registries
     for td in skill.tool_defs:
         fn_name = td.get("function", {}).get("name", "")
@@ -383,18 +390,28 @@ def uninstall_skill(name: str) -> dict:
 
     _skills.pop(name, None)
 
-    # Move to trash (macOS)
+    # Move to trash (macOS) — use the Cocoa API via Python to avoid
+    # AppleScript command injection (the old code interpolated skill_path
+    # directly into an AppleScript string).
+    moved_to_trash = False
     try:
-        import subprocess
-        subprocess.run(
-            ["osascript", "-e",
-             f'tell application "Finder" to delete POSIX file "{skill_path}"'],
-            capture_output=True, timeout=5
-        )
+        from AppKit import NSWorkspace
+        from Foundation import NSURL
+        url = NSURL.fileURLWithPath_(real_skill)
+        success, _, error = NSWorkspace.sharedWorkspace() \
+            .recycleURLs_completionHandler_([url], None) \
+            if hasattr(NSWorkspace.sharedWorkspace(), 'recycleURLs_completionHandler_') \
+            else (False, None, None)
+        if not success:
+            raise RuntimeError("Cocoa trash API not available")
+        moved_to_trash = True
     except Exception:
-        # Fallback: just delete
+        pass
+
+    if not moved_to_trash:
+        # Fallback: delete directly
         import shutil
-        shutil.rmtree(skill_path, ignore_errors=True)
+        shutil.rmtree(real_skill, ignore_errors=True)
 
     logger.info(f"Uninstalled skill '{name}'")
     return {"ok": True, "message": f"Skill '{name}' uninstalled"}

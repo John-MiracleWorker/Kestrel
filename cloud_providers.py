@@ -92,7 +92,13 @@ def _load_env():
 
 
 def _save_env(env: dict):
-    """Write env dict back to .env, preserving comments."""
+    """Write env dict back to .env, preserving comments.
+
+    Uses atomic write (write to temp file, then rename) to prevent
+    corruption if the process crashes mid-write.
+    """
+    import tempfile
+
     lines = []
     existing_keys = set()
 
@@ -116,8 +122,23 @@ def _save_env(env: dict):
         if key not in existing_keys:
             lines.append(f"{key}={value}\n")
 
-    with open(_ENV_PATH, "w") as f:
-        f.writelines(lines)
+    # Atomic write: write to temp file in the same directory, then rename.
+    # os.replace() is atomic on POSIX and overwrites the destination.
+    env_dir = os.path.dirname(_ENV_PATH) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=env_dir, prefix=".env_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.writelines(lines)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, _ENV_PATH)
+    except BaseException:
+        # Clean up temp file on any failure — original .env is untouched
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def get_api_key(provider: str) -> Optional[str]:
