@@ -471,20 +471,20 @@ export class TelegramAdapter extends BaseChannelAdapter {
                     chat_id: chatId,
                     text:
                         '🦅 *Welcome to Kestrel\\!*\n\n' +
-                        'I\\'m your autonomous AI agent\\.Here\\'s what I can do:\n\n' +
-                            '*💬 Chat Mode*\n' +
-                            'Just send me a message to chat\\.\n\n' +
-                            '*🤖 Task Mode*\n' +
-                            'Start a message with `\\!` to launch an autonomous task:\n' +
-                            '`\\!review the auth module for security issues`\n\n' +
-                            '*Commands:*\n' +
-                            '/help — Show all commands\n' +
-                            '/task \\<goal\\> — Start an autonomous task\n' +
-                            '/tasks — List active tasks\n' +
-                            '/status — System status\n' +
-                            '/cancel \\<id\\> — Cancel a task\n' +
-                            '/model \\<name\\> — Switch AI model\n' +
-                            '/new — Start a new conversation',
+                        'I\'m your autonomous AI agent\\. Here\'s what I can do:\n\n' +
+                        '*💬 Chat Mode*\n' +
+                        'Just send me a message to chat\\.\n\n' +
+                        '*🤖 Task Mode*\n' +
+                        'Start a message with `\\!` to launch an autonomous task:\n' +
+                        '`\\!review the auth module for security issues`\n\n' +
+                        '*Commands:*\n' +
+                        '/help — Show all commands\n' +
+                        '/task \\<goal\\> — Start an autonomous task\n' +
+                        '/tasks — List active tasks\n' +
+                        '/status — System status\n' +
+                        '/cancel \\<id\\> — Cancel a task\n' +
+                        '/model \\<name\\> — Switch AI model\n' +
+                        '/new — Start a new conversation',
                     parse_mode: 'MarkdownV2',
                 });
                 break;

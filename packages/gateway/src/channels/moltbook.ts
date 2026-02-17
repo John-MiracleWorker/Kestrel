@@ -131,7 +131,7 @@ export class MoltbookAdapter extends BaseChannelAdapter {
         // Verify API key and get agent profile
         try {
             this.agentProfile = await this.api('GET', '/agents/me');
-            logger.info(`Moltbook agent connected: @${this.agentProfile.username} (karma: ${this.agentProfile.karma})`);
+            logger.info(`Moltbook agent connected: @${this.agentProfile!.username} (karma: ${this.agentProfile!.karma})`);
         } catch (err) {
             // Agent may not be registered yet — try to register
             logger.info('Moltbook agent not found, attempting registration...');

@@ -365,4 +365,59 @@ export class BrainClient {
             );
         });
     }
+
+    // ── Automation (Stubbed for Build) ──────────────────────────
+
+    async createCronJob(data: any): Promise<any> {
+        return this.call('CreateCronJob', data);
+    }
+
+    async listCronJobs(workspaceId: string): Promise<any> {
+        return this.call('ListCronJobs', { workspace_id: workspaceId });
+    }
+
+    async deleteCronJob(jobId: string): Promise<any> {
+        return this.call('DeleteCronJob', { job_id: jobId });
+    }
+
+    async createWebhook(data: any): Promise<any> {
+        return this.call('CreateWebhook', data);
+    }
+
+    async listWebhooks(workspaceId: string): Promise<any> {
+        return this.call('ListWebhooks', { workspace_id: workspaceId });
+    }
+
+    async deleteWebhook(webhookId: string): Promise<any> {
+        return this.call('DeleteWebhook', { webhook_id: webhookId });
+    }
+
+    async triggerWebhook(data: any): Promise<any> {
+        return this.call('TriggerWebhook', data);
+    }
+
+    async listWorkflows(category?: string): Promise<any> {
+        return this.call('ListWorkflows', { category });
+    }
+
+    async getWorkflow(workflowId: string): Promise<any> {
+        return this.call('GetWorkflow', { workflow_id: workflowId });
+    }
+
+    async *launchWorkflow(data: any): AsyncIterable<any> {
+        // Workflows are streamed, so we need a stream method
+        if (!this.connected) throw new Error('Brain service not connected');
+
+        // If method doesn't exist, we can't really stream. 
+        // We'll throw or return empty stream.
+        if (typeof this.client?.LaunchWorkflow !== 'function') {
+            logger.warn('Brain RPC method LaunchWorkflow not available');
+            return;
+        }
+
+        const stream = this.client.LaunchWorkflow(data);
+        for await (const chunk of stream) {
+            yield chunk;
+        }
+    }
 }

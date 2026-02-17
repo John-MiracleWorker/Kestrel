@@ -27,6 +27,11 @@ service BrainService {
   rpc RegisterPushToken(RegisterPushTokenRequest) returns (RegisterPushTokenResponse);
   rpc GetUpdates(GetUpdatesRequest) returns (GetUpdatesResponse);
 
+  // ── Provider Configuration ───────────────────────────────────
+  rpc ListProviderConfigs(ListProviderConfigsRequest) returns (ListProviderConfigsResponse);
+  rpc SetProviderConfig(SetProviderConfigRequest) returns (SetProviderConfigResponse);
+  rpc DeleteProviderConfig(DeleteProviderConfigRequest) returns (DeleteProviderConfigResponse);
+
   // ── Autonomous Agent ────────────────────────────────────────
   rpc StartTask(StartTaskRequest) returns (stream TaskEvent);
   rpc StreamTaskEvents(StreamTaskEventsRequest) returns (stream TaskEvent);
@@ -224,6 +229,61 @@ message GetUpdatesRequest {
 message GetUpdatesResponse {
   repeated MessageResponse messages = 1;
   repeated ConversationResponse conversations = 2;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Provider Configuration
+// ═══════════════════════════════════════════════════════════════
+
+message ProviderConfig {
+  string workspace_id = 1;
+  string provider = 2;
+  string model = 3;
+  float temperature = 4;
+  int32 max_tokens = 5;
+  string system_prompt = 6;
+  bool rag_enabled = 7;
+  int32 rag_top_k = 8;
+  float rag_min_similarity = 9;
+  bool is_default = 10;
+  string api_key_encrypted = 11;
+  string created_at = 12;
+  string updated_at = 13;
+}
+
+message ListProviderConfigsRequest {
+  string workspace_id = 1;
+}
+
+message ListProviderConfigsResponse {
+  repeated ProviderConfig configs = 1;
+}
+
+message SetProviderConfigRequest {
+  string workspace_id = 1;
+  string provider = 2;
+  string model = 3;
+  float temperature = 4;
+  int32 max_tokens = 5;
+  string system_prompt = 6;
+  bool rag_enabled = 7;
+  int32 rag_top_k = 8;
+  float rag_min_similarity = 9;
+  bool is_default = 10;
+  string api_key_encrypted = 11; // Optional: only if updating key
+}
+
+message SetProviderConfigResponse {
+  ProviderConfig config = 1;
+}
+
+message DeleteProviderConfigRequest {
+  string workspace_id = 1;
+  string provider = 2;
+}
+
+message DeleteProviderConfigResponse {
+  bool success = 1;
 }
 
 // ═══════════════════════════════════════════════════════════════

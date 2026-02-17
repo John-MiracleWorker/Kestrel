@@ -96,6 +96,7 @@ export default function App() {
                     onClose={() => setShowSettings(false)}
                     userEmail={user?.email}
                     userDisplayName={user?.displayName}
+                    workspaceId={currentWorkspace?.id || ''}
                 />
             )}
         </div>

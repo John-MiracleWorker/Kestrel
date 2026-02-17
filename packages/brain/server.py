@@ -242,6 +242,85 @@ from grpc_tools.protoc import main as protoc_main
 PROTO_PATH = os.path.join(os.path.dirname(__file__), "../shared/proto")
 BRAIN_PROTO = os.path.join(PROTO_PATH, "brain.proto")
 
+# Dynamic proto loading
+from grpc_tools import protoc
+import importlib
+import sys
+import tempfile
+
+# Generate Python stubs in a temp dir
+out_dir = os.path.join(os.path.dirname(__file__), "_generated")
+os.makedirs(out_dir, exist_ok=True)
+
+protoc.main([
+    "grpc_tools.protoc",
+    f"-I{PROTO_PATH}",
+    f"--python_out={out_dir}",
+    f"--grpc_python_out={out_dir}",
+    "brain.proto",
+])
+
+# Import generated modules
+sys.path.insert(0, out_dir)
+import brain_pb2
+import brain_pb2_grpc
+
+
+import brain_pb2_grpc
+
+# ── Provider Config ────────────────────────────────────────────────
+async def list_provider_configs(workspace_id):
+    query = """
+        SELECT * FROM workspace_provider_config
+        WHERE workspace_id = $1
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch(query, workspace_id)
+
+async def set_provider_config(workspace_id, provider, config):
+    # upsert
+    query = """
+        INSERT INTO workspace_provider_config (
+            workspace_id, provider, model, api_key_encrypted, 
+            temperature, max_tokens, system_prompt, rag_enabled, 
+            rag_top_k, rag_min_similarity, is_default, settings
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+        )
+        ON CONFLICT (workspace_id, provider) DO UPDATE SET
+            model = EXCLUDED.model,
+            api_key_encrypted = COALESCE(EXCLUDED.api_key_encrypted, workspace_provider_config.api_key_encrypted),
+            temperature = EXCLUDED.temperature,
+            max_tokens = EXCLUDED.max_tokens,
+            system_prompt = EXCLUDED.system_prompt,
+            rag_enabled = EXCLUDED.rag_enabled,
+            rag_top_k = EXCLUDED.rag_top_k,
+            rag_min_similarity = EXCLUDED.rag_min_similarity,
+            is_default = EXCLUDED.is_default,
+            settings = EXCLUDED.settings,
+            updated_at = NOW()
+        RETURNING *
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(query, 
+            workspace_id, provider, config.get('model'), config.get('api_key_encrypted'),
+            config.get('temperature', 0.7), config.get('max_tokens', 2048),
+            config.get('system_prompt'), config.get('rag_enabled', True),
+            config.get('rag_top_k', 5), config.get('rag_min_similarity', 0.3),
+            config.get('is_default', False), json.dumps(config.get('settings', {}))
+        )
+
+async def delete_provider_config(workspace_id, provider):
+    query = "DELETE FROM workspace_provider_config WHERE workspace_id = $1 AND provider = $2"
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(query, workspace_id, provider)
+
+
+
+
 
 class BrainServicer:
     """Implements kestrel.brain.BrainService gRPC interface."""
@@ -386,47 +465,95 @@ class BrainServicer:
 
     async def CreateUser(self, request, context):
         try:
-            return await create_user(request.email, request.password, request.display_name)
+            data = await create_user(request.email, request.password, request.display_name)
+            return brain_pb2.UserResponse(
+                id=data["id"],
+                email=data["email"],
+                display_name=data["displayName"]
+            )
         except Exception as e:
             context.set_code(grpc.StatusCode.ALREADY_EXISTS)
             context.set_details(str(e))
-            return {}
+            return brain_pb2.UserResponse()
 
     async def AuthenticateUser(self, request, context):
         try:
-            return await authenticate_user(request.email, request.password)
+            data = await authenticate_user(request.email, request.password)
+            workspaces = [
+                brain_pb2.WorkspaceMembership(id=w["id"], role=w["role"])
+                for w in data["workspaces"]
+            ]
+            return brain_pb2.AuthenticateUserResponse(
+                id=data["id"],
+                email=data["email"],
+                display_name=data["displayName"],
+                workspaces=workspaces
+            )
         except ValueError as e:
             context.set_code(grpc.StatusCode.UNAUTHENTICATED)
             context.set_details(str(e))
-            return {}
+            return brain_pb2.AuthenticateUserResponse()
 
     async def ListWorkspaces(self, request, context):
-        workspaces = await list_workspaces(request.user_id)
-        return {"workspaces": workspaces}
+        raw_workspaces = await list_workspaces(request.user_id)
+        workspaces = [
+            brain_pb2.WorkspaceResponse(
+                id=w["id"],
+                name=w["name"],
+                role=w["role"],
+                created_at=w["createdAt"]
+            ) for w in raw_workspaces
+        ]
+        return brain_pb2.ListWorkspacesResponse(workspaces=workspaces)
 
     async def CreateWorkspace(self, request, context):
-        return await create_workspace(request.user_id, request.name)
+        data = await create_workspace(request.user_id, request.name)
+        return brain_pb2.WorkspaceResponse(
+            id=data["id"],
+            name=data["name"],
+            role=data["role"]
+        )
 
     async def ListConversations(self, request, context):
-        convos = await list_conversations(request.user_id, request.workspace_id)
-        return {"conversations": convos}
+        raw_convos = await list_conversations(request.user_id, request.workspace_id)
+        conversations = [
+            brain_pb2.ConversationResponse(
+                id=c["id"],
+                title=c["title"],
+                created_at=c["createdAt"],
+                updated_at=c["updatedAt"]
+            ) for c in raw_convos
+        ]
+        return brain_pb2.ListConversationsResponse(conversations=conversations)
 
     async def CreateConversation(self, request, context):
-        return await create_conversation(request.user_id, request.workspace_id)
+        data = await create_conversation(request.user_id, request.workspace_id)
+        return brain_pb2.ConversationResponse(
+            id=data["id"],
+            title=data["title"]
+        )
 
     async def GetMessages(self, request, context):
-        msgs = await get_messages(
+        raw_msgs = await get_messages(
             request.user_id, request.workspace_id, request.conversation_id
         )
-        return {"messages": msgs}
+        messages = [
+            brain_pb2.MessageResponse(
+                id=m["id"],
+                role=m["role"],
+                content=m["content"],
+                created_at=m["createdAt"]
+            ) for m in raw_msgs
+        ]
+        return brain_pb2.GetMessagesResponse(messages=messages)
 
     async def RegisterPushToken(self, request, context):
         # Phase 2: implement push token storage
-        return {"success": True}
+        return brain_pb2.RegisterPushTokenResponse(success=True)
 
     async def GetUpdates(self, request, context):
         # Phase 2: implement sync
-        return {"messages": [], "conversations": []}
+        return brain_pb2.GetUpdatesResponse(messages=[], conversations=[])
 
     # ── Autonomous Agent RPCs ────────────────────────────────────
 
@@ -567,19 +694,81 @@ class BrainServicer:
         rows = await pool.fetch(query, *params)
         tasks = []
         for row in rows:
-            tasks.append({
-                "id": str(row["id"]),
-                "goal": row["goal"],
-                "status": row["status"],
-                "iterations": row["iterations"],
-                "tool_calls": row["tool_calls_count"],
-                "result": row["result"] or "",
-                "error": row["error"] or "",
-                "created_at": row["created_at"].isoformat() if row["created_at"] else "",
-                "completed_at": row["completed_at"].isoformat() if row["completed_at"] else "",
-            })
+            tasks.append(brain_pb2.TaskSummary(
+                id=str(row["id"]),
+                goal=row["goal"],
+                status=row["status"],
+                iterations=row["iterations"],
+                tool_calls=row["tool_calls_count"],
+                result=row["result"] or "",
+                error=row["error"] or "",
+                created_at=row["created_at"].isoformat() if row["created_at"] else "",
+                completed_at=row["completed_at"].isoformat() if row["completed_at"] else "",
+            ))
 
-        return {"tasks": tasks}
+        return brain_pb2.ListTasksResponse(tasks=tasks)
+
+    # ── Provider Configuration ───────────────────────────────────
+
+
+
+    async def ListProviderConfigs(self, request, context):
+        rows = await list_provider_configs(request.workspace_id)
+        configs = []
+        for row in rows:
+            configs.append(brain_pb2.ProviderConfig(
+                workspace_id=str(row['workspace_id']),
+                provider=row['provider'],
+                model=row['model'] or "",
+                temperature=row['temperature'],
+                max_tokens=row['max_tokens'],
+                system_prompt=row['system_prompt'] or "",
+                rag_enabled=row['rag_enabled'],
+                rag_top_k=row['rag_top_k'],
+                rag_min_similarity=row['rag_min_similarity'],
+                is_default=row['is_default'],
+                # Don't return encrypted key
+                created_at=row['created_at'].isoformat(),
+                updated_at=row['updated_at'].isoformat()
+            ))
+        return brain_pb2.ListProviderConfigsResponse(configs=configs)
+
+    async def SetProviderConfig(self, request, context):
+        config_dict = {
+            'model': request.model,
+            'temperature': request.temperature,
+            'max_tokens': request.max_tokens,
+            'system_prompt': request.system_prompt,
+            'rag_enabled': request.rag_enabled,
+            'rag_top_k': request.rag_top_k,
+            'rag_min_similarity': request.rag_min_similarity,
+            'is_default': request.is_default,
+        }
+        if request.api_key_encrypted:
+            config_dict['api_key_encrypted'] = request.api_key_encrypted
+            
+        row = await set_provider_config(request.workspace_id, request.provider, config_dict)
+        
+        return brain_pb2.SetProviderConfigResponse(
+            config=brain_pb2.ProviderConfig(
+                workspace_id=str(row['workspace_id']),
+                provider=row['provider'],
+                model=row['model'] or "",
+                temperature=row['temperature'],
+                max_tokens=row['max_tokens'],
+                system_prompt=row['system_prompt'] or "",
+                rag_enabled=row['rag_enabled'],
+                rag_top_k=row['rag_top_k'],
+                rag_min_similarity=row['rag_min_similarity'],
+                is_default=row['is_default'],
+                created_at=row['created_at'].isoformat(),
+                updated_at=row['updated_at'].isoformat()
+            )
+        )
+
+    async def DeleteProviderConfig(self, request, context):
+        await delete_provider_config(request.workspace_id, request.provider)
+        return brain_pb2.DeleteProviderConfigResponse(success=True)
 
 
 # ── Server Bootstrap ─────────────────────────────────────────────────
@@ -599,29 +788,6 @@ async def serve():
     from grpc_reflection.v1alpha import reflection as grpc_reflection
 
     servicer = BrainServicer()
-
-    # Dynamic proto loading for servicer registration
-    from grpc_tools import protoc
-    import importlib
-    import sys
-    import tempfile
-
-    # Generate Python stubs in a temp dir
-    out_dir = os.path.join(os.path.dirname(__file__), "_generated")
-    os.makedirs(out_dir, exist_ok=True)
-
-    protoc.main([
-        "grpc_tools.protoc",
-        f"-I{PROTO_PATH}",
-        f"--python_out={out_dir}",
-        f"--grpc_python_out={out_dir}",
-        "brain.proto",
-    ])
-
-    # Import generated modules
-    sys.path.insert(0, out_dir)
-    import brain_pb2
-    import brain_pb2_grpc
 
     brain_pb2_grpc.add_BrainServiceServicer_to_server(servicer, server)
 

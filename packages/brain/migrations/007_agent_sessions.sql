@@ -4,10 +4,10 @@
 -- ── Agent Sessions ──────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS agent_sessions (
-    id          TEXT PRIMARY KEY,
-    task_id     TEXT REFERENCES agent_tasks(id) ON DELETE SET NULL,
-    workspace_id TEXT NOT NULL,
-    user_id     TEXT NOT NULL,
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id     UUID REFERENCES agent_tasks(id) ON DELETE SET NULL,
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     agent_type  TEXT NOT NULL DEFAULT 'main',  -- main, specialist, cron
     status      TEXT NOT NULL DEFAULT 'active', -- active, idle, paused, completed
     model       TEXT DEFAULT '',
@@ -25,12 +25,12 @@ CREATE INDEX IF NOT EXISTS idx_sessions_task
 -- ── Session Messages (inter-agent communication) ────────────────────
 
 CREATE TABLE IF NOT EXISTS agent_session_messages (
-    id               TEXT PRIMARY KEY,
-    from_session_id  TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
-    to_session_id    TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    from_session_id  UUID NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+    to_session_id    UUID NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
     content          TEXT NOT NULL,
     message_type     TEXT NOT NULL DEFAULT 'text',  -- text, request, response, announce
-    reply_to         TEXT REFERENCES agent_session_messages(id),
+    reply_to         UUID REFERENCES agent_session_messages(id),
     metadata         JSONB DEFAULT '{}',
     created_at       TIMESTAMPTZ DEFAULT now()
 );
@@ -46,10 +46,10 @@ ALTER TABLE agent_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_session_messages ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY sessions_workspace_isolation ON agent_sessions
-    USING (workspace_id = current_setting('app.workspace_id', true));
+    USING (workspace_id = current_setting('app.workspace_id', true)::uuid);
 
 CREATE POLICY session_messages_access ON agent_session_messages
     USING (
-        from_session_id IN (SELECT id FROM agent_sessions WHERE workspace_id = current_setting('app.workspace_id', true))
-        OR to_session_id IN (SELECT id FROM agent_sessions WHERE workspace_id = current_setting('app.workspace_id', true))
+        from_session_id IN (SELECT id FROM agent_sessions WHERE workspace_id = current_setting('app.workspace_id', true)::uuid)
+        OR to_session_id IN (SELECT id FROM agent_sessions WHERE workspace_id = current_setting('app.workspace_id', true)::uuid)
     );

@@ -4,9 +4,9 @@
 -- ── Cron Jobs ───────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS automation_cron_jobs (
-    id               TEXT PRIMARY KEY,
-    workspace_id     TEXT NOT NULL,
-    user_id          TEXT NOT NULL,
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id     UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name             TEXT NOT NULL,
     description      TEXT DEFAULT '',
     cron_expression  TEXT NOT NULL,    -- Standard 5-field cron
@@ -25,9 +25,9 @@ CREATE INDEX IF NOT EXISTS idx_cron_workspace
 -- ── Webhooks ────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS automation_webhooks (
-    id               TEXT PRIMARY KEY,
-    workspace_id     TEXT NOT NULL,
-    user_id          TEXT NOT NULL,
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id     UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name             TEXT NOT NULL,
     description      TEXT DEFAULT '',
     goal_template    TEXT NOT NULL,    -- Template with {payload}/{headers} placeholders
@@ -45,9 +45,9 @@ CREATE INDEX IF NOT EXISTS idx_webhooks_workspace
 -- ── Webhook Execution Log ───────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS automation_webhook_log (
-    id           TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-    webhook_id   TEXT NOT NULL REFERENCES automation_webhooks(id) ON DELETE CASCADE,
-    task_id      TEXT REFERENCES agent_tasks(id) ON DELETE SET NULL,
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    webhook_id   UUID NOT NULL REFERENCES automation_webhooks(id) ON DELETE CASCADE,
+    task_id      UUID REFERENCES agent_tasks(id) ON DELETE SET NULL,
     source_ip    TEXT DEFAULT '',
     payload_size INTEGER DEFAULT 0,
     status       TEXT NOT NULL,  -- success, failed, rejected
@@ -65,15 +65,15 @@ ALTER TABLE automation_webhooks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE automation_webhook_log ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY cron_workspace_isolation ON automation_cron_jobs
-    USING (workspace_id = current_setting('app.workspace_id', true));
+    USING (workspace_id = current_setting('app.workspace_id', true)::uuid);
 
 CREATE POLICY webhooks_workspace_isolation ON automation_webhooks
-    USING (workspace_id = current_setting('app.workspace_id', true));
+    USING (workspace_id = current_setting('app.workspace_id', true)::uuid);
 
 CREATE POLICY webhook_log_access ON automation_webhook_log
     USING (webhook_id IN (
         SELECT id FROM automation_webhooks
-        WHERE workspace_id = current_setting('app.workspace_id', true)
+        WHERE workspace_id = current_setting('app.workspace_id', true)::uuid
     ));
 
 -- ── Auto-update timestamps ──────────────────────────────────────────

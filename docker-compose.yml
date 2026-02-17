@@ -118,6 +118,16 @@ services:
     depends_on:
       - brain
 
+  # ── Frontend Web UI (React/Vite) ────────────────────────────
+  frontend:
+    build:
+      context: ./packages/web
+      dockerfile: Dockerfile
+    ports:
+      - "5174:80"
+    depends_on:
+      - gateway
+
 volumes:
   postgres_data:
   redis_data:

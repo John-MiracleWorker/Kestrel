@@ -4,8 +4,8 @@
 -- ── Memory Graph Nodes ──────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS memory_graph_nodes (
-    id                     TEXT PRIMARY KEY,
-    workspace_id           TEXT NOT NULL,
+    id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id           UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     entity_type            TEXT NOT NULL,     -- person, project, file, concept, decision, etc.
     name                   TEXT NOT NULL,
     description            TEXT DEFAULT '',
@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS memory_graph_nodes (
     mention_count          INTEGER DEFAULT 1,
     first_seen             TIMESTAMPTZ DEFAULT now(),
     last_seen              TIMESTAMPTZ DEFAULT now(),
-    source_conversation_id TEXT
+    source_conversation_id UUID REFERENCES conversations(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_workspace
@@ -27,13 +27,13 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_weight
 -- ── Memory Graph Edges ──────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS memory_graph_edges (
-    id              TEXT PRIMARY KEY,
-    source_id       TEXT NOT NULL REFERENCES memory_graph_nodes(id) ON DELETE CASCADE,
-    target_id       TEXT NOT NULL REFERENCES memory_graph_nodes(id) ON DELETE CASCADE,
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_id       UUID NOT NULL REFERENCES memory_graph_nodes(id) ON DELETE CASCADE,
+    target_id       UUID NOT NULL REFERENCES memory_graph_nodes(id) ON DELETE CASCADE,
     relation_type   TEXT NOT NULL,    -- mentioned_in, depends_on, related_to, etc.
     strength        REAL DEFAULT 1.0,
     context         TEXT DEFAULT '',
-    conversation_id TEXT,
+    conversation_id UUID REFERENCES conversations(id),
     created_at      TIMESTAMPTZ DEFAULT now()
 );
 
@@ -45,7 +45,7 @@ CREATE INDEX IF NOT EXISTS idx_graph_edges_target
 -- ── User Personas ───────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS user_personas (
-    user_id     TEXT PRIMARY KEY,
+    user_id     UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     preferences JSONB DEFAULT '{}',
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
@@ -53,8 +53,8 @@ CREATE TABLE IF NOT EXISTS user_personas (
 -- ── Evidence Chain ──────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS evidence_chain (
-    id             TEXT PRIMARY KEY,
-    task_id        TEXT NOT NULL,
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id        UUID NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
     step_number    INTEGER NOT NULL,
     decision_type  TEXT NOT NULL,
     description    TEXT NOT NULL,
@@ -77,19 +77,19 @@ ALTER TABLE user_personas ENABLE ROW LEVEL SECURITY;
 ALTER TABLE evidence_chain ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY graph_nodes_workspace_isolation ON memory_graph_nodes
-    USING (workspace_id = current_setting('app.workspace_id', true));
+    USING (workspace_id = current_setting('app.workspace_id', true)::uuid);
 
 CREATE POLICY graph_edges_access ON memory_graph_edges
     USING (source_id IN (
         SELECT id FROM memory_graph_nodes
-        WHERE workspace_id = current_setting('app.workspace_id', true)
+        WHERE workspace_id = current_setting('app.workspace_id', true)::uuid
     ));
 
 CREATE POLICY personas_user_access ON user_personas
-    USING (user_id = current_setting('app.user_id', true));
+    USING (user_id = current_setting('app.user_id', true)::uuid);
 
 CREATE POLICY evidence_chain_access ON evidence_chain
     USING (task_id IN (
         SELECT id FROM agent_tasks
-        WHERE workspace_id = current_setting('app.workspace_id', true)
+        WHERE workspace_id = current_setting('app.workspace_id', true)::uuid
     ));

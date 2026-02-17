@@ -1,13 +1,16 @@
 import { useState } from 'react';
+import { ConfigureProviderModal } from './ConfigureProviderModal';
 
 interface SettingsPanelProps {
     onClose: () => void;
     userEmail?: string;
     userDisplayName?: string;
+    workspaceId: string;
 }
 
-export function SettingsPanel({ onClose, userEmail, userDisplayName }: SettingsPanelProps) {
+export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId }: SettingsPanelProps) {
     const [activeTab, setActiveTab] = useState<'profile' | 'providers' | 'api-keys'>('profile');
+    const [configuringProvider, setConfiguringProvider] = useState<{ key: string; name: string } | null>(null);
 
     const tabs = [
         { id: 'profile' as const, label: 'Profile', icon: '👤' },
@@ -104,27 +107,35 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName }: SettingsP
                                 Configure which LLM provider to use for this workspace.
                             </p>
 
-                            {['Local (llama.cpp)', 'OpenAI', 'Anthropic', 'Google'].map((name) => (
-                                <div key={name} className="card" style={{
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    justifyContent: 'space-between',
-                                    padding: 'var(--space-4)',
-                                }}>
-                                    <div>
-                                        <p style={{ fontWeight: 500 }}>{name}</p>
-                                        <p style={{
-                                            fontSize: '0.8125rem',
-                                            color: 'var(--color-text-tertiary)',
-                                        }}>
-                                            {name === 'Local (llama.cpp)'
-                                                ? 'On-device inference — no API key needed'
-                                                : 'Cloud provider — requires API key'}
-                                        </p>
+                            {['Local (llama.cpp)', 'OpenAI', 'Anthropic', 'Google'].map((name) => {
+                                const key = name.toLowerCase().split(' ')[0];
+                                return (
+                                    <div key={name} className="card" style={{
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'space-between',
+                                        padding: 'var(--space-4)',
+                                    }}>
+                                        <div>
+                                            <p style={{ fontWeight: 500 }}>{name}</p>
+                                            <p style={{
+                                                fontSize: '0.8125rem',
+                                                color: 'var(--color-text-tertiary)',
+                                            }}>
+                                                {name === 'Local (llama.cpp)'
+                                                    ? 'On-device inference — no API key needed'
+                                                    : 'Cloud provider — requires API key'}
+                                            </p>
+                                        </div>
+                                        <button
+                                            className="btn btn-secondary"
+                                            onClick={() => setConfiguringProvider({ key, name })}
+                                        >
+                                            Configure
+                                        </button>
                                     </div>
-                                    <button className="btn btn-secondary">Configure</button>
-                                </div>
-                            ))}
+                                );
+                            })}
                         </div>
                     )}
 
@@ -158,6 +169,15 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName }: SettingsP
                     )}
                 </div>
             </div>
+
+            {configuringProvider && (
+                <ConfigureProviderModal
+                    workspaceId={workspaceId}
+                    providerKey={configuringProvider.key}
+                    providerName={configuringProvider.name}
+                    onClose={() => setConfiguringProvider(null)}
+                />
+            )}
         </div>
     );
 }
