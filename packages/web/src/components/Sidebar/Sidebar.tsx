@@ -28,9 +28,19 @@ export function Sidebar({
     // Load workspaces
     useEffect(() => {
         workspaces.list()
-            .then((res) => setWorkspaceList(res.workspaces || []))
+            .then((res) => {
+                const list = res.workspaces || [];
+                setWorkspaceList(list);
+
+                // Auto-select if none selected OR if current selection is invalid
+                const currentIsValid = currentWorkspace && list.find(w => w.id === currentWorkspace.id);
+
+                if ((!currentWorkspace || !currentIsValid) && list.length > 0) {
+                    onSelectWorkspace(list[0]);
+                }
+            })
             .catch(console.error);
-    }, []);
+    }, [currentWorkspace]);
 
     // Load conversations when workspace changes
     useEffect(() => {

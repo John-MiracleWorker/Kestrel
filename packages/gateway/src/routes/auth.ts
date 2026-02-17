@@ -33,10 +33,20 @@ export default async function authRoutes(app: FastifyInstance, deps: AuthDeps) {
         try {
             const user = await brainClient.createUser(email, password, displayName);
 
+            // Create a default workspace for the new user
+            let workspaces: Array<{ id: string; role: 'owner' | 'admin' | 'member' | 'guest' }> = [];
+            try {
+                const ws = await brainClient.createWorkspace(user.id, displayName ? `${displayName}'s Workspace` : 'My Workspace');
+                workspaces = [{ id: ws.id, role: 'owner' }];
+                logger.info('Default workspace created for new user', { userId: user.id, workspaceId: ws.id });
+            } catch (wsErr: any) {
+                logger.warn('Failed to create default workspace', { error: wsErr.message });
+            }
+
             const tokens = generateTokenPair({
                 sub: user.id,
                 email: user.email,
-                workspaces: [],
+                workspaces,
             });
 
             // Store refresh token in Redis

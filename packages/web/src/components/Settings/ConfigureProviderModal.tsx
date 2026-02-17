@@ -62,7 +62,7 @@ export function ConfigureProviderModal({ workspaceId, providerKey, providerName,
         <div style={{
             position: 'fixed',
             inset: 0,
-            zIndex: 200,
+            zIndex: 10000,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',

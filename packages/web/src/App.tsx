@@ -29,6 +29,18 @@ export default function App() {
             .catch(console.error);
     }, [currentWorkspace, currentConversation]);
 
+    // Auto-create conversation if none exists
+    useEffect(() => {
+        if (currentWorkspace && !currentConversation) {
+            conversations.create(currentWorkspace.id)
+                .then(conv => {
+                    setCurrentConversation(conv);
+                    setInitialMessages([]);
+                })
+                .catch(err => console.error('Failed to auto-create conversation:', err));
+        }
+    }, [currentWorkspace, currentConversation]);
+
     const handleNewConversation = useCallback(async () => {
         if (!currentWorkspace) return;
         try {

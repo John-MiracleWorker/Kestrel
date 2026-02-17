@@ -1,5 +1,5 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { requireAuth, requireRole } from '../auth/middleware';
+import { requireAuth, requireWorkspace, requireRole } from '../auth/middleware';
 import { BrainClient } from '../brain/client';
 import Redis from 'ioredis';
 
@@ -21,7 +21,7 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
     // List all provider configs for a workspace
     app.get(
         '/api/workspaces/:workspaceId/providers',
-        { preHandler: [requireAuth] },
+        { preHandler: [requireAuth, requireWorkspace] },
         async (req: FastifyRequest, reply: FastifyReply) => {
             const user = (req as any).user;
             const { workspaceId } = req.params as any;
@@ -45,7 +45,7 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
     // Create or update a provider config (admin+ only)
     app.put(
         '/api/workspaces/:workspaceId/providers/:provider',
-        { preHandler: [requireAuth, requireRole('admin')] },
+        { preHandler: [requireAuth, requireWorkspace, requireRole('admin')] },
         async (req: FastifyRequest, reply: FastifyReply) => {
             const { workspaceId, provider } = req.params as any;
             const body = req.body as any;
@@ -87,7 +87,7 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
     // Remove a provider config (admin+ only)
     app.delete(
         '/api/workspaces/:workspaceId/providers/:provider',
-        { preHandler: [requireAuth, requireRole('admin')] },
+        { preHandler: [requireAuth, requireWorkspace, requireRole('admin')] },
         async (req: FastifyRequest, _reply: FastifyReply) => {
             const { workspaceId, provider } = req.params as any;
 
