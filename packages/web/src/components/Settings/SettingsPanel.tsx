@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { createPortal } from 'react-dom';
 import { ConfigureProviderModal } from './ConfigureProviderModal';
 
 interface SettingsPanelProps {
@@ -18,11 +19,11 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
         { id: 'api-keys' as const, label: 'API Keys', icon: '🔑' },
     ];
 
-    return (
+    return createPortal(
         <div style={{
             position: 'fixed',
             inset: 0,
-            zIndex: 100,
+            zIndex: 9999, // Ensure it is on top of everything
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
@@ -178,6 +179,7 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                     onClose={() => setConfiguringProvider(null)}
                 />
             )}
-        </div>
+        </div>,
+        document.body
     );
 }

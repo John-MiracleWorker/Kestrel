@@ -1,8 +1,0 @@
-#!/bin/bash
-# Libre Bird macOS launcher
-DIR="/Users/tiuni/little bird alt"
-
-# Activate venv and run the app
-cd "$DIR"
-source .venv/bin/activate
-exec python3 app.py
