@@ -27,7 +27,7 @@ PROVIDER_CONFIGS = {
     },
     "google": {
         "api_key_env": "GOOGLE_API_KEY",
-        "default_model": os.getenv("GOOGLE_DEFAULT_MODEL", "gemini-3-flash"),
+        "default_model": os.getenv("GOOGLE_DEFAULT_MODEL", "gemini-3-flash-preview"),
         "base_url": "https://generativelanguage.googleapis.com/v1beta/models",
     },
 }
@@ -236,7 +236,10 @@ class CloudProvider:
 
         async with httpx.AsyncClient(timeout=120) as client:
             async with client.stream("POST", url, json=payload) as resp:
-                resp.raise_for_status()
+                if resp.status_code != 200:
+                   error_body = await resp.aread()
+                   logger.error(f"Google API Error: {error_body.decode('utf-8')}")
+                   resp.raise_for_status()
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
                         continue

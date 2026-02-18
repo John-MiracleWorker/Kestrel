@@ -50,8 +50,10 @@ DB_URL = os.getenv(
 
 # ── Database Layer ────────────────────────────────────────────────────
 import asyncpg
+import redis.asyncio as redis
 
 _pool: asyncpg.Pool | None = None
+_redis_pool: redis.Redis | None = None
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -63,6 +65,14 @@ async def get_pool() -> asyncpg.Pool:
             max_size=int(os.getenv("POSTGRES_POOL_MAX", "10")),
         )
     return _pool
+
+async def get_redis() -> redis.Redis:
+    global _redis_pool
+    if _redis_pool is None:
+        _redis_pool = redis.from_url(
+            f"redis://{os.getenv('REDIS_HOST', 'localhost')}:{os.getenv('REDIS_PORT', '6379')}"
+        )
+    return _redis_pool
 
 
 # ── User Management ──────────────────────────────────────────────────
@@ -341,6 +351,26 @@ class BrainServicer:
             # ── 1. Load workspace provider config ───────────────────
             pool = await get_pool()
             ws_config = await ProviderConfig(pool).get_config(workspace_id)
+            
+            # Resolve API Key from Redis if it's a reference
+            api_key = ws_config.get("api_key", "")
+            if api_key and api_key.startswith("provider_key:"):
+                try:
+                    r = await get_redis()
+                    real_key = await r.get(api_key)
+                    if real_key:
+                        api_key = real_key.decode("utf-8")
+                        logger.info(f"Resolved API key for {workspace_id} from Redis")
+                    else:
+                        logger.warning(f"API key reference {api_key} not found in Redis")
+                        api_key = ""
+                except Exception as e:
+                    logger.error(f"Redis error resolving API key: {e}")
+                    api_key = ""
+            
+            # DEBUG: Check if API key is present
+            api_key_status = "PRESENT" if api_key else "MISSING"
+            logger.info(f"Loaded config for {workspace_id}: provider={ws_config.get('provider')}, api_key={api_key_status}")
 
             # Request can override workspace defaults
             provider_name = request.provider or ws_config["provider"]
@@ -399,7 +429,7 @@ class BrainServicer:
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                api_key=ws_config.get("api_key", ""),
+                api_key=api_key,
             ):
                 yield self._make_response(
                     chunk_type=0,  # CONTENT_DELTA
@@ -442,6 +472,7 @@ class BrainServicer:
                        tool_call: dict = None):
         """Build a ChatResponse object."""
         # Use the generated protobuf class
+        logger.debug(f"Making response chunk {chunk_type}")
         resp = brain_pb2.ChatResponse(
             type=chunk_type,
             content_delta=content_delta,
@@ -452,6 +483,9 @@ class BrainServicer:
             resp.tool_call.id = tool_call.get("id", "")
             resp.tool_call.name = tool_call.get("name", "")
             resp.tool_call.arguments = tool_call.get("arguments", "")
+        
+        # DEBUG: Verify type
+        # logger.info(f"Response type: {type(resp)}")
         return resp
 
     async def HealthCheck(self, request, context):
