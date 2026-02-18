@@ -105,28 +105,35 @@ class CloudProvider:
         model: str = "",
         temperature: float = 0.7,
         max_tokens: int = 2048,
+        api_key: str = "",
     ) -> AsyncIterator[str]:
         """Stream tokens from the cloud provider."""
         model = model or self._config["default_model"]
         self._last_response = ""
 
+        # Use provided key or fallback to env var
+        request_key = api_key or self._api_key
+        if not request_key:
+             yield f"[Error: No API key found for {self.provider}]"
+             return
+
         if self.provider == "openai":
-            async for token in self._stream_openai(messages, model, temperature, max_tokens):
+            async for token in self._stream_openai(messages, model, temperature, max_tokens, request_key):
                 self._last_response += token
                 yield token
         elif self.provider == "anthropic":
-            async for token in self._stream_anthropic(messages, model, temperature, max_tokens):
+            async for token in self._stream_anthropic(messages, model, temperature, max_tokens, request_key):
                 self._last_response += token
                 yield token
         elif self.provider == "google":
-            async for token in self._stream_google(messages, model, temperature, max_tokens):
+            async for token in self._stream_google(messages, model, temperature, max_tokens, request_key):
                 self._last_response += token
                 yield token
 
-    async def _stream_openai(self, messages, model, temperature, max_tokens) -> AsyncIterator[str]:
+    async def _stream_openai(self, messages, model, temperature, max_tokens, api_key: str) -> AsyncIterator[str]:
         """OpenAI-compatible streaming."""
         headers = {
-            "Authorization": f"Bearer {self._api_key}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
         payload = {
@@ -157,7 +164,7 @@ class CloudProvider:
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
 
-    async def _stream_anthropic(self, messages, model, temperature, max_tokens) -> AsyncIterator[str]:
+    async def _stream_anthropic(self, messages, model, temperature, max_tokens, api_key: str) -> AsyncIterator[str]:
         """Anthropic Claude streaming."""
         # Extract system message
         system = ""
@@ -169,7 +176,7 @@ class CloudProvider:
                 chat_msgs.append(msg)
 
         headers = {
-            "x-api-key": self._api_key,
+            "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
             "Content-Type": "application/json",
         }
@@ -201,7 +208,7 @@ class CloudProvider:
                     except (json.JSONDecodeError, KeyError):
                         continue
 
-    async def _stream_google(self, messages, model, temperature, max_tokens) -> AsyncIterator[str]:
+    async def _stream_google(self, messages, model, temperature, max_tokens, api_key: str) -> AsyncIterator[str]:
         """Google Gemini streaming."""
         # Convert messages to Gemini format
         contents = []
@@ -216,7 +223,7 @@ class CloudProvider:
                     "parts": [{"text": msg["content"]}],
                 })
 
-        url = f"{self._config['base_url']}/{model}:streamGenerateContent?key={self._api_key}&alt=sse"
+        url = f"{self._config['base_url']}/{model}:streamGenerateContent?key={api_key}&alt=sse"
         payload = {
             "contents": contents,
             "generationConfig": {

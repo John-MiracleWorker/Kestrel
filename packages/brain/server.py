@@ -399,6 +399,7 @@ class BrainServicer:
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                api_key=ws_config.get("api_key", ""),
             ):
                 yield self._make_response(
                     chunk_type=0,  # CONTENT_DELTA
@@ -438,16 +439,19 @@ class BrainServicer:
 
     def _make_response(self, chunk_type: int, content_delta: str = "",
                        error_message: str = "", metadata: dict = None,
-                       tool_call: dict = None) -> dict:
-        """Build a ChatResponse-compatible dict."""
-        resp = {
-            "type": chunk_type,
-            "content_delta": content_delta,
-            "error_message": error_message,
-            "metadata": metadata or {},
-        }
+                       tool_call: dict = None):
+        """Build a ChatResponse object."""
+        # Use the generated protobuf class
+        resp = brain_pb2.ChatResponse(
+            type=chunk_type,
+            content_delta=content_delta,
+            error_message=error_message,
+            metadata=metadata or {},
+        )
         if tool_call:
-            resp["tool_call"] = tool_call
+            resp.tool_call.id = tool_call.get("id", "")
+            resp.tool_call.name = tool_call.get("name", "")
+            resp.tool_call.arguments = tool_call.get("arguments", "")
         return resp
 
     async def HealthCheck(self, request, context):
@@ -535,18 +539,25 @@ class BrainServicer:
         )
 
     async def GetMessages(self, request, context):
-        raw_msgs = await get_messages(
-            request.user_id, request.workspace_id, request.conversation_id
-        )
-        messages = [
-            brain_pb2.MessageResponse(
-                id=m["id"],
-                role=m["role"],
-                content=m["content"],
-                created_at=m["createdAt"]
-            ) for m in raw_msgs
-        ]
-        return brain_pb2.GetMessagesResponse(messages=messages)
+        try:
+            raw_msgs = await get_messages(
+                request.user_id, request.workspace_id, request.conversation_id
+            )
+            messages = [
+                brain_pb2.MessageResponse(
+                    id=m["id"],
+                    role=m["role"],
+                    content=m["content"],
+                    created_at=m["createdAt"]
+                ) for m in raw_msgs
+            ]
+            return brain_pb2.GetMessagesResponse(messages=messages)
+        except Exception as e:
+            # Handle invalid UUIDs or DB errors gracefully
+            logger.error(f"GetMessages error: {e}")
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(e))
+            return brain_pb2.GetMessagesResponse()
 
     async def RegisterPushToken(self, request, context):
         # Phase 2: implement push token storage

@@ -19,7 +19,8 @@ export function ConfigureProviderModal({ workspaceId, providerKey, providerName,
         setIsLoading(true);
         providers.list(workspaceId)
             .then((data: any) => {
-                const config = data.config?.[providerKey];
+                const configs = data.configs || [];
+                const config = configs.find((c: any) => c.provider === providerKey);
                 if (config) {
                     setApiKey(config.apiKey || '');
                     setModel(config.model || '');

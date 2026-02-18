@@ -60,6 +60,7 @@ class LocalProvider:
         model: str = "",
         temperature: float = 0.7,
         max_tokens: int = 2048,
+        api_key: str = "",
     ) -> AsyncIterator[str]:
         """Stream tokens from the local model."""
         self._ensure_loaded()

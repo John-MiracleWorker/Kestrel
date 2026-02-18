@@ -52,7 +52,12 @@ export class WebChannelAdapter extends BaseChannelAdapter {
             let payload: JWTPayload | null = null;
             try {
                 payload = jwt.verify(token, this.jwtSecret) as JWTPayload;
-            } catch {
+            } catch (err: any) {
+                logger.warn('WS Token verification failed', {
+                    error: err.message,
+                    tokenPreview: token.substring(0, 10) + '...',
+                    secretLength: this.jwtSecret.length
+                });
                 payload = null;
             }
             if (!payload) {
