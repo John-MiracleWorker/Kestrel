@@ -16,6 +16,7 @@ export function ConfigureProviderModal({ workspaceId, providerKey, providerName,
 
     // Load existing config
     useEffect(() => {
+        if (!workspaceId) return;
         setIsLoading(true);
         providers.list(workspaceId)
             .then((data: any) => {

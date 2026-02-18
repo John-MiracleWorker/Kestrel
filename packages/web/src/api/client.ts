@@ -72,15 +72,20 @@ async function request<T = unknown>(url: string, options: RequestOptions = {}): 
     });
 
     // Auto-refresh on 401
-    if (res.status === 401 && refreshToken) {
-        const refreshed = await tryRefresh();
-        if (refreshed) {
-            headers.Authorization = `Bearer ${accessToken}`;
-            res = await fetch(`${BASE_URL}${url}`, {
-                method: options.method || 'GET',
-                headers,
-                body: options.body ? JSON.stringify(options.body) : undefined,
-            });
+    if (res.status === 401) {
+        if (refreshToken) {
+            const refreshed = await tryRefresh();
+            if (refreshed) {
+                headers.Authorization = `Bearer ${accessToken}`;
+                res = await fetch(`${BASE_URL}${url}`, {
+                    method: options.method || 'GET',
+                    headers,
+                    body: options.body ? JSON.stringify(options.body) : undefined,
+                });
+            } else {
+                onAuthExpired?.();
+                throw new Error('Session expired');
+            }
         } else {
             onAuthExpired?.();
             throw new Error('Session expired');
