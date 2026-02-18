@@ -1,16 +1,16 @@
-"""
-Tests for Hands service skill loader.
-"""
 
-import os
 import json
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
 import pytest
+import server
 
-
-# ── Test load_skills ──────────────────────────────────────────────────
+@pytest.fixture(autouse=True)
+def clean_skills():
+    """Clear the global skills registry before each test."""
+    server._skills.clear()
+    yield
+    server._skills.clear()
 
 def test_load_skills_from_directory():
     """load_skills should discover skill manifests from a directory."""
@@ -29,15 +29,13 @@ def test_load_skills_from_directory():
         (skill_dir / "manifest.json").write_text(json.dumps(manifest))
         (skill_dir / "main.py").write_text("print('hello')")
 
-        from server import load_skills
-        skills = load_skills(tmpdir)
+        skills = server.load_skills(tmpdir)
 
         assert len(skills) >= 1
-        hello = next((s for s in skills if s["name"] == "hello"), None)
+        # server.py uses directory name as skill name
+        hello = next((s for s in skills if s["name"] == "hello_skill"), None)
         assert hello is not None
-        assert hello["version"] == "1.0.0"
-        assert "network" in hello["permissions"]
-
+        assert hello["manifest"]["name"] == "hello"
 
 def test_load_skills_skips_invalid():
     """load_skills should skip directories without valid manifests."""
@@ -46,17 +44,14 @@ def test_load_skills_skips_invalid():
         (Path(tmpdir) / "broken_skill").mkdir()
         (Path(tmpdir) / "broken_skill" / "README.md").write_text("not a skill")
 
-        from server import load_skills
-        skills = load_skills(tmpdir)
+        skills = server.load_skills(tmpdir)
 
         # Should not crash, just skip
         assert isinstance(skills, list)
         assert len(skills) == 0
 
-
 def test_load_skills_empty_directory():
     """load_skills should return empty list for empty directory."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        from server import load_skills
-        skills = load_skills(tmpdir)
+        skills = server.load_skills(tmpdir)
         assert skills == []

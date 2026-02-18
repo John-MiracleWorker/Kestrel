@@ -75,12 +75,13 @@ async def create_user(email: str, password: str, display_name: str = "") -> dict
     salt = secrets.token_hex(16)
     pw_hash = hashlib.sha256((password + salt).encode()).hexdigest()
 
+    final_display_name = display_name or email.split("@")[0]
     await pool.execute(
         """INSERT INTO users (id, email, password_hash, salt, display_name, created_at)
            VALUES ($1, $2, $3, $4, $5, NOW())""",
-        user_id, email, pw_hash, salt, display_name or email.split("@")[0],
+        user_id, email, pw_hash, salt, final_display_name,
     )
-    return {"id": user_id, "email": email, "displayName": display_name}
+    return {"id": user_id, "email": email, "displayName": final_display_name}
 
 
 async def authenticate_user(email: str, password: str) -> dict:

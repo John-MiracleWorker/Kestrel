@@ -37,7 +37,7 @@ def load_skills(skills_dir: str = None):
     skills_dir = skills_dir or os.getenv("SKILLS_DIR", "./skills")
     if not os.path.isdir(skills_dir):
         logger.warning(f"Skills directory not found: {skills_dir}")
-        return
+        return []
 
     for name in os.listdir(skills_dir):
         skill_path = os.path.join(skills_dir, name)
@@ -54,6 +54,8 @@ def load_skills(skills_dir: str = None):
                 logger.info(f"Loaded skill: {name}")
             except Exception as e:
                 logger.error(f"Failed to load skill {name}: {e}")
+
+    return list(_skills.values())
 
 
 # ── gRPC Servicer ────────────────────────────────────────────────────

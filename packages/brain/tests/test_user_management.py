@@ -50,7 +50,8 @@ async def test_create_user_uses_email_prefix_as_default_name():
         # The default display name should be the email prefix
         call_args = mock_pool.execute.call_args[0]
         # 5th positional arg to execute is display_name
-        assert call_args[4] == "bob"
+        assert call_args[5] == "bob"
+        assert result["displayName"] == "bob"
 
 
 # ── Test authenticate_user ────────────────────────────────────────────
