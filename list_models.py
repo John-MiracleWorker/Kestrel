@@ -2,7 +2,7 @@
 import requests
 import os
 
-API_KEY = "AIzaSyCMlBJfIk7yoGvEuwGfOD-RUwRhIIS5qVc"
+API_KEY = os.getenv("GOOGLE_API_KEY", "YOUR_API_KEY")
 ENDPOINTS = [
     f"https://generativelanguage.googleapis.com/v1/models?key={API_KEY}",
     f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"

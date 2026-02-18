@@ -49,9 +49,7 @@ async def test_chat():
         ]
         
         # Custom parameters to inject the key directly for testing
-        parameters = {
-            "api_key": "AIzaSyCMlBJfIk7yoGvEuwGfOD-RUwRhIIS5qVc"
-        }
+        parameters = {}
 
         print(f"Sending request for workspace={workspace_id}...")
         request = brain_pb2.ChatRequest(
