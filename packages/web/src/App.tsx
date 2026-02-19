@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAuth } from './hooks/useAuth';
 import { LoginPage } from './components/Auth/LoginPage';
 import { Sidebar } from './components/Sidebar/Sidebar';
@@ -13,6 +13,7 @@ export default function App() {
     const [currentConversation, setCurrentConversation] = useState<Conversation | null>(null);
     const [initialMessages, setInitialMessages] = useState<Message[]>([]);
     const [showSettings, setShowSettings] = useState(false);
+    const autoCreateAttempted = useRef<string | null>(null);
 
     const { messages, streamingMessage, sendMessage, isConnected } = useChat(
         currentWorkspace?.id || null,
@@ -29,9 +30,10 @@ export default function App() {
             .catch(console.error);
     }, [currentWorkspace, currentConversation]);
 
-    // Auto-create conversation if none exists
+    // Auto-create conversation if none exists (only attempt once per workspace)
     useEffect(() => {
-        if (currentWorkspace && !currentConversation) {
+        if (currentWorkspace && !currentConversation && autoCreateAttempted.current !== currentWorkspace.id) {
+            autoCreateAttempted.current = currentWorkspace.id;
             conversations.create(currentWorkspace.id)
                 .then(conv => {
                     setCurrentConversation(conv);

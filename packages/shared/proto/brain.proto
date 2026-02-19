@@ -210,6 +210,33 @@ message GetMessagesResponse {
   repeated MessageResponse messages = 1;
 }
 
+message UpdateConversationRequest {
+  string user_id = 1;
+  string workspace_id = 2;
+  string conversation_id = 3;
+  string title = 4;
+}
+
+message DeleteConversationRequest {
+  string user_id = 1;
+  string workspace_id = 2;
+  string conversation_id = 3;
+}
+
+message DeleteConversationResponse {
+  bool success = 1;
+}
+
+message GenerateTitleRequest {
+  string user_id = 1;
+  string workspace_id = 2;
+  string conversation_id = 3;
+}
+
+message GenerateTitleResponse {
+  string title = 1;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Mobile / Sync
 // ═══════════════════════════════════════════════════════════════

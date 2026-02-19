@@ -2,9 +2,9 @@ import { useState, useRef, useEffect, type FormEvent } from 'react';
 import type { Message } from '../../api/client';
 
 const PROVIDER_MODELS: Record<string, string[]> = {
-    google: ['gemini-2.0-flash', 'gemini-1.5-pro'],
-    openai: ['gpt-4o', 'gpt-4o-mini', 'o1', 'o3-mini'],
-    anthropic: ['claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022'],
+    openai: ['gpt-5-mini', 'gpt-5', 'gpt-5.1', 'gpt-5.2', 'gpt-5-nano'],
+    anthropic: ['claude-haiku-4-5', 'claude-sonnet-4-5', 'claude-opus-4-6'],
+    google: ['gemini-3-flash', 'gemini-3-pro', 'gemini-2.5-flash', 'gemini-2.5-pro'],
     local: ['auto'],
 };
 

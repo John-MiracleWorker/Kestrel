@@ -100,9 +100,9 @@ export function ConfigureProviderModal({ workspaceId, providerKey, providerName,
 
     const getDefaultModel = (key: string) => {
         switch (key) {
-            case 'openai': return 'gpt-4o';
-            case 'anthropic': return 'claude-3-5-sonnet-20240620';
-            case 'google': return 'gemini-1.5-flash';
+            case 'openai': return 'gpt-5-mini';
+            case 'anthropic': return 'claude-haiku-4-5';
+            case 'google': return 'gemini-3-flash';
             case 'local': return 'llama-3-8b-instruct';
             default: return '';
         }
