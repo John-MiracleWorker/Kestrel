@@ -17,14 +17,13 @@ let onAuthExpired: (() => void) | null = null;
 export function setTokens(access: string, refresh: string) {
     accessToken = access;
     refreshToken = refresh;
-    localStorage.setItem('kestrel_access', access);
+    localStorage.removeItem('kestrel_access'); // Ensure it's not stored
     localStorage.setItem('kestrel_refresh', refresh);
 }
 
 export function loadTokens(): boolean {
-    accessToken = localStorage.getItem('kestrel_access');
     refreshToken = localStorage.getItem('kestrel_refresh');
-    return !!accessToken;
+    return !!refreshToken;
 }
 
 export function clearTokens() {
@@ -180,8 +179,12 @@ export const apiKeys = {
 // ── WebSocket ───────────────────────────────────────────────────────
 export function createChatSocket(): WebSocket {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws?token=${accessToken}`;
-    return new WebSocket(wsUrl);
+    const wsUrl = `${protocol}//${window.location.host}/ws`;
+    const ws = new WebSocket(wsUrl);
+    ws.addEventListener('open', () => {
+        ws.send(JSON.stringify({ type: 'auth', token: accessToken }));
+    });
+    return ws;
 }
 
 // ── Types ───────────────────────────────────────────────────────────

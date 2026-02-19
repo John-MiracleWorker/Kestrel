@@ -80,11 +80,11 @@ async def get_redis() -> redis.Redis:
 
 async def create_user(email: str, password: str, display_name: str = "") -> dict:
     """Create a new user with hashed password."""
-    import hashlib, secrets
+    import bcrypt
     pool = await get_pool()
     user_id = str(uuid.uuid4())
-    salt = secrets.token_hex(16)
-    pw_hash = hashlib.sha256((password + salt).encode()).hexdigest()
+    salt = ""  # Bcrypt handles salting internally
+    pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
     final_display_name = display_name or email.split("@")[0]
     await pool.execute(
@@ -97,7 +97,7 @@ async def create_user(email: str, password: str, display_name: str = "") -> dict
 
 async def authenticate_user(email: str, password: str) -> dict:
     """Verify credentials and return user info."""
-    import hashlib
+    import bcrypt
     pool = await get_pool()
     row = await pool.fetchrow(
         "SELECT id, email, password_hash, salt, display_name FROM users WHERE email = $1",
@@ -106,8 +106,15 @@ async def authenticate_user(email: str, password: str) -> dict:
     if not row:
         raise ValueError("User not found")
 
-    pw_hash = hashlib.sha256((password + row["salt"]).encode()).hexdigest()
-    if pw_hash != row["password_hash"]:
+    if row["password_hash"].startswith("$2"):
+        valid = bcrypt.checkpw(password.encode(), row["password_hash"].encode())
+    else:
+        # Fallback to legacy SHA-256 for transition
+        import hashlib
+        old_hash = hashlib.sha256((password + row["salt"]).encode()).hexdigest()
+        valid = (old_hash == row["password_hash"])
+
+    if not valid:
         raise ValueError("Invalid password")
 
     # Fetch workspace memberships
@@ -421,7 +428,8 @@ class BrainServicer:
                                 if real_key:
                                     api_key = real_key.decode("utf-8")
                             elif encrypted:
-                                api_key = encrypted # Assuming config stores plain if not prefixed (or handled elsewhere)
+                                from .encryption import decrypt
+                                api_key = decrypt(encrypted)
                             break
                 except Exception as e:
                     logger.warning(f"Failed to resolve workspace key for ListModels: {e}")
@@ -1024,7 +1032,7 @@ class BrainServicer:
                 rag_top_k=row['rag_top_k'],
                 rag_min_similarity=row['rag_min_similarity'],
                 is_default=row['is_default'],
-                api_key_encrypted=row['api_key_encrypted'] or "",
+                api_key_encrypted="***" if row['api_key_encrypted'] else "",
                 created_at=row['created_at'].isoformat(),
                 updated_at=row['updated_at'].isoformat()
             ))
@@ -1042,7 +1050,8 @@ class BrainServicer:
             'is_default': request.is_default,
         }
         if request.api_key_encrypted:
-            config_dict['api_key_encrypted'] = request.api_key_encrypted
+            from .encryption import encrypt
+            config_dict['api_key_encrypted'] = encrypt(request.api_key_encrypted)
             
         row = await set_provider_config(request.workspace_id, request.provider, config_dict)
         

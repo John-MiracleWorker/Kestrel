@@ -1,4 +1,6 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import { z } from 'zod';
+import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { requireAuth, requireWorkspace, requireRole } from '../auth/middleware';
 import { BrainClient } from '../brain/client';
 import { logger } from '../utils/logger';
@@ -17,15 +19,24 @@ interface ProviderDeps {
  */
 export default async function providerRoutes(app: FastifyInstance, deps: ProviderDeps) {
     const { brainClient, redis } = deps;
+    const typedApp = app.withTypeProvider<ZodTypeProvider>();
+
+    const workspaceParamsSchema = z.object({
+        workspaceId: z.string()
+    });
+    type WorkspaceParams = z.infer<typeof workspaceParamsSchema>;
 
     // ── GET /api/workspaces/:workspaceId/providers ────────────────────
     // List all provider configs for a workspace
-    app.get(
+    typedApp.get(
         '/api/workspaces/:workspaceId/providers',
-        { preHandler: [requireAuth, requireWorkspace] },
-        async (req: FastifyRequest, reply: FastifyReply) => {
-            const user = (req as any).user;
-            const { workspaceId } = req.params as any;
+        {
+            preHandler: [requireAuth, requireWorkspace],
+            schema: { params: workspaceParamsSchema }
+        },
+        async (req, reply) => {
+            const user = req.user!;
+            const { workspaceId } = req.params as WorkspaceParams;
 
             // Verify workspace membership
             const isMember = user.workspaces?.some((w: any) => w.id === workspaceId);
@@ -42,14 +53,36 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
         }
     );
 
+    const providerParamsSchema = z.object({
+        workspaceId: z.string(),
+        provider: z.string()
+    });
+    type ProviderParams = z.infer<typeof providerParamsSchema>;
+
+    const putProviderBodySchema = z.object({
+        model: z.string().optional(),
+        temperature: z.number().min(0).max(2).optional(),
+        maxTokens: z.number().int().min(1).max(32768).optional(),
+        systemPrompt: z.string().optional(),
+        ragEnabled: z.boolean().optional(),
+        ragTopK: z.number().int().min(1).max(20).optional(),
+        ragMinSimilarity: z.number().min(0).max(1).optional(),
+        isDefault: z.boolean().optional(),
+        apiKey: z.string().optional(),
+    });
+    type PutProviderBody = z.infer<typeof putProviderBodySchema>;
+
     // ── PUT /api/workspaces/:workspaceId/providers/:provider ─────────
     // Create or update a provider config (admin+ only)
-    app.put(
+    typedApp.put(
         '/api/workspaces/:workspaceId/providers/:provider',
-        { preHandler: [requireAuth, requireWorkspace, requireRole('admin')] },
-        async (req: FastifyRequest, reply: FastifyReply) => {
-            const { workspaceId, provider } = req.params as any;
-            const body = req.body as any;
+        {
+            preHandler: [requireAuth, requireWorkspace, requireRole('admin')],
+            schema: { params: providerParamsSchema, body: putProviderBodySchema }
+        },
+        async (req, reply) => {
+            const { workspaceId, provider } = req.params as ProviderParams;
+            const body = req.body as PutProviderBody;
 
             const validProviders = ['local', 'openai', 'anthropic', 'google'];
             if (!validProviders.includes(provider)) {
@@ -72,11 +105,9 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
                 is_default: body.isDefault ?? false,
             };
 
-            // API key handling — store encrypted in Redis, reference in DB
+            // API key handling — Send to Brain service for secure encryption and storage
             if (body.apiKey) {
-                const keyRef = `provider_key:${workspaceId}:${provider}`;
-                await redis.set(keyRef, body.apiKey, 'EX', 365 * 24 * 60 * 60); // 1 year
-                config.api_key_encrypted = keyRef;
+                config.api_key_encrypted = body.apiKey;
             }
 
             const result = await brainClient.call('SetProviderConfig', config);
@@ -86,14 +117,16 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
 
     // ── DELETE /api/workspaces/:workspaceId/providers/:provider ──────
     // Remove a provider config (admin+ only)
-    app.delete(
+    typedApp.delete(
         '/api/workspaces/:workspaceId/providers/:provider',
-        { preHandler: [requireAuth, requireWorkspace, requireRole('admin')] },
-        async (req: FastifyRequest, _reply: FastifyReply) => {
-            const { workspaceId, provider } = req.params as any;
+        {
+            preHandler: [requireAuth, requireWorkspace, requireRole('admin')],
+            schema: { params: providerParamsSchema }
+        },
+        async (req, _reply) => {
+            const { workspaceId, provider } = req.params as ProviderParams;
 
-            // Clean up Redis key
-            await redis.del(`provider_key:${workspaceId}:${provider}`);
+            // (Redis cleanup removed, legacy keys will expire naturally)
 
             await brainClient.call('DeleteProviderConfig', {
                 workspace_id: workspaceId,
@@ -140,13 +173,23 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
             ],
         };
     });
+
+
+    const providerQuerySchema = z.object({
+        apiKey: z.string().optional()
+    });
+    type ProviderQuery = z.infer<typeof providerQuerySchema>;
+
     // ── GET /api/workspaces/:workspaceId/providers/:provider/models ──
-    app.get(
+    typedApp.get(
         '/api/workspaces/:workspaceId/providers/:provider/models',
-        { preHandler: [requireAuth, requireWorkspace] },
-        async (req: FastifyRequest, reply: FastifyReply) => {
-            const { workspaceId, provider } = req.params as any;
-            const { apiKey } = req.query as any;
+        {
+            preHandler: [requireAuth, requireWorkspace],
+            schema: { params: providerParamsSchema, querystring: providerQuerySchema }
+        },
+        async (req, reply) => {
+            const { workspaceId, provider } = req.params as ProviderParams;
+            const { apiKey } = req.query as ProviderQuery;
 
             logger.info(`Fetching models for ${provider} in ${workspaceId}`);
             try {

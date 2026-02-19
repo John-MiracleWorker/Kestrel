@@ -14,7 +14,8 @@ import pytest
 # ── Helpers ───────────────────────────────────────────────────────────
 
 def _hash_pw(password: str, salt: str) -> str:
-    return hashlib.sha256((password + salt).encode()).hexdigest()
+    import bcrypt
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
 
 # ── Test create_user ──────────────────────────────────────────────────

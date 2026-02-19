@@ -1,4 +1,6 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import { z } from 'zod';
+import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { generateTokenPair, verifyToken, requireAuth } from '../auth/middleware';
 import { BrainClient } from '../brain/client';
 import { logger } from '../utils/logger';
@@ -17,18 +19,26 @@ interface AuthDeps {
  */
 export default async function authRoutes(app: FastifyInstance, deps: AuthDeps) {
     const { brainClient, redis } = deps;
+    const typedApp = app.withTypeProvider<ZodTypeProvider>();
+
+    const registerSchema = z.object({
+        email: z.string().email(),
+        password: z.string().min(8, 'Password must be at least 8 characters'),
+        displayName: z.string().optional(),
+    });
+    type RegisterBody = z.infer<typeof registerSchema>;
 
     // ── POST /api/auth/register ──────────────────────────────────────
-    app.post('/api/auth/register', async (req: FastifyRequest, reply: FastifyReply) => {
-        const { email, password, displayName } = req.body as any;
-
-        if (!email || !password) {
-            return reply.status(400).send({ error: 'Email and password required' });
+    typedApp.post('/api/auth/register', {
+        schema: { body: registerSchema },
+        config: {
+            rateLimit: {
+                max: 5,
+                timeWindow: '1 minute'
+            }
         }
-
-        if (password.length < 8) {
-            return reply.status(400).send({ error: 'Password must be at least 8 characters' });
-        }
+    }, async (req, reply) => {
+        const { email, password, displayName } = req.body as RegisterBody;
 
         try {
             const user = await brainClient.createUser(email, password, displayName);
@@ -76,13 +86,23 @@ export default async function authRoutes(app: FastifyInstance, deps: AuthDeps) {
         }
     });
 
-    // ── POST /api/auth/login ─────────────────────────────────────────
-    app.post('/api/auth/login', async (req: FastifyRequest, reply: FastifyReply) => {
-        const { email, password } = req.body as any;
+    const loginSchema = z.object({
+        email: z.string().email(),
+        password: z.string(),
+    });
+    type LoginBody = z.infer<typeof loginSchema>;
 
-        if (!email || !password) {
-            return reply.status(400).send({ error: 'Email and password required' });
+    // ── POST /api/auth/login ─────────────────────────────────────────
+    typedApp.post('/api/auth/login', {
+        schema: { body: loginSchema },
+        config: {
+            rateLimit: {
+                max: 10,
+                timeWindow: '1 minute'
+            }
         }
+    }, async (req, reply) => {
+        const { email, password } = req.body as LoginBody;
 
         try {
             const user = await brainClient.authenticateUser(email, password);
@@ -121,13 +141,22 @@ export default async function authRoutes(app: FastifyInstance, deps: AuthDeps) {
         }
     });
 
-    // ── POST /api/auth/refresh ───────────────────────────────────────
-    app.post('/api/auth/refresh', async (req: FastifyRequest, reply: FastifyReply) => {
-        const { refreshToken } = req.body as any;
+    const refreshSchema = z.object({
+        refreshToken: z.string()
+    });
+    type RefreshBody = z.infer<typeof refreshSchema>;
 
-        if (!refreshToken) {
-            return reply.status(400).send({ error: 'Refresh token required' });
+    // ── POST /api/auth/refresh ───────────────────────────────────────
+    typedApp.post('/api/auth/refresh', {
+        schema: { body: refreshSchema },
+        config: {
+            rateLimit: {
+                max: 20,
+                timeWindow: '1 minute'
+            }
         }
+    }, async (req, reply) => {
+        const { refreshToken } = req.body as RefreshBody;
 
         const payload = verifyToken(refreshToken);
         if (!payload || payload.type !== 'refresh') {
@@ -175,10 +204,18 @@ export default async function authRoutes(app: FastifyInstance, deps: AuthDeps) {
         };
     });
 
+    const logoutSchema = z.object({
+        refreshToken: z.string().optional(),
+    });
+    type LogoutBody = z.infer<typeof logoutSchema>;
+
     // ── POST /api/auth/logout ────────────────────────────────────────
-    app.post('/api/auth/logout', { preHandler: [requireAuth] }, async (req: FastifyRequest) => {
+    typedApp.post('/api/auth/logout', {
+        preHandler: [requireAuth],
+        schema: { body: logoutSchema }
+    }, async (req, reply) => {
         const user = (req as any).user;
-        const { refreshToken } = req.body as any;
+        const { refreshToken } = req.body as LogoutBody;
 
         if (refreshToken) {
             // Revoke specific refresh token

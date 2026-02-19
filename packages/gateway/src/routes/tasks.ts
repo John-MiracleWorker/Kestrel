@@ -1,4 +1,6 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import { z } from 'zod';
+import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { requireAuth, requireWorkspace } from '../auth/middleware';
 import { BrainClient } from '../brain/client';
 import { logger } from '../utils/logger';
@@ -18,19 +20,30 @@ interface TaskDeps {
  */
 export default async function taskRoutes(app: FastifyInstance, deps: TaskDeps) {
     const { brainClient } = deps;
+    const typedApp = app.withTypeProvider<ZodTypeProvider>();
+
+    const workspaceParamsSchema = z.object({
+        workspaceId: z.string()
+    });
+    type WorkspaceParams = z.infer<typeof workspaceParamsSchema>;
+
+    const startTaskBodySchema = z.object({
+        goal: z.string().min(3, 'Goal must be at least 3 characters'),
+        conversationId: z.string().optional(),
+        guardrails: z.record(z.string(), z.any()).optional()
+    });
+    type StartTaskBody = z.infer<typeof startTaskBodySchema>;
 
     // ── POST /api/workspaces/:workspaceId/tasks ─────────────────
     // Start a new autonomous agent task and stream events via SSE.
-    app.post('/api/workspaces/:workspaceId/tasks', {
+    typedApp.post('/api/workspaces/:workspaceId/tasks', {
         preHandler: [requireAuth, requireWorkspace],
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const user = (req as any).user;
-        const { workspaceId } = req.params as any;
-        const { goal, conversationId, guardrails } = req.body as any;
+        schema: { params: workspaceParamsSchema, body: startTaskBodySchema }
+    }, async (req, reply) => {
+        const user = req.user!;
+        const { workspaceId } = req.params as WorkspaceParams;
+        const { goal, conversationId, guardrails } = req.body as StartTaskBody;
 
-        if (!goal || goal.trim().length < 3) {
-            return reply.status(400).send({ error: 'Goal must be at least 3 characters' });
-        }
 
         // Set up SSE headers
         reply.raw.writeHead(200, {
@@ -74,34 +87,45 @@ export default async function taskRoutes(app: FastifyInstance, deps: TaskDeps) {
         }
     });
 
+    const listTasksQuerySchema = z.object({
+        status: z.string().optional()
+    });
+    type ListTasksQuery = z.infer<typeof listTasksQuerySchema>;
+
     // ── GET /api/workspaces/:workspaceId/tasks ──────────────────
     // List agent tasks for the current user in a workspace.
-    app.get('/api/workspaces/:workspaceId/tasks', {
+    typedApp.get('/api/workspaces/:workspaceId/tasks', {
         preHandler: [requireAuth, requireWorkspace],
-    }, async (req: FastifyRequest) => {
-        const user = (req as any).user;
-        const { workspaceId } = req.params as any;
-        const { status } = req.query as any;
+        schema: { params: workspaceParamsSchema, querystring: listTasksQuerySchema }
+    }, async (req) => {
+        const user = req.user!;
+        const { workspaceId } = req.params as WorkspaceParams;
+        const { status } = req.query as ListTasksQuery;
 
         const result = await brainClient.listTasks(user.id, workspaceId, status);
         return { tasks: result.tasks || [] };
     });
 
+    const taskParamsSchema = z.object({
+        taskId: z.string()
+    });
+    type TaskParams = z.infer<typeof taskParamsSchema>;
+
+    const approveActionBodySchema = z.object({
+        approvalId: z.string(),
+        approved: z.boolean()
+    });
+    type ApproveActionBody = z.infer<typeof approveActionBodySchema>;
+
     // ── POST /api/tasks/:taskId/approve ─────────────────────────
     // Approve or deny a pending agent action.
-    app.post('/api/tasks/:taskId/approve', {
+    typedApp.post('/api/tasks/:taskId/approve', {
         preHandler: [requireAuth],
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const user = (req as any).user;
-        const { taskId } = req.params as any;
-        const { approvalId, approved } = req.body as any;
-
-        if (!approvalId) {
-            return reply.status(400).send({ error: 'approvalId required' });
-        }
-        if (typeof approved !== 'boolean') {
-            return reply.status(400).send({ error: 'approved must be a boolean' });
-        }
+        schema: { params: taskParamsSchema, body: approveActionBodySchema }
+    }, async (req, reply) => {
+        const user = req.user!;
+        const { taskId } = req.params as TaskParams;
+        const { approvalId, approved } = req.body as ApproveActionBody;
 
         try {
             const result = await brainClient.approveAction(approvalId, user.id, approved);
@@ -114,11 +138,12 @@ export default async function taskRoutes(app: FastifyInstance, deps: TaskDeps) {
 
     // ── POST /api/tasks/:taskId/cancel ──────────────────────────
     // Cancel a running agent task.
-    app.post('/api/tasks/:taskId/cancel', {
+    typedApp.post('/api/tasks/:taskId/cancel', {
         preHandler: [requireAuth],
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const user = (req as any).user;
-        const { taskId } = req.params as any;
+        schema: { params: taskParamsSchema }
+    }, async (req, reply) => {
+        const user = req.user!;
+        const { taskId } = req.params as TaskParams;
 
         try {
             const result = await brainClient.cancelTask(taskId, user.id);

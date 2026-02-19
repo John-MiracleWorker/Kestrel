@@ -12,6 +12,7 @@ import { WebChannelAdapter } from './channels/web';
 import { TelegramAdapter } from './channels/telegram';
 import { WhatsAppAdapter } from './channels/whatsapp';
 import { DiscordAdapter } from './channels/discord';
+import { serializerCompiler, validatorCompiler } from 'fastify-type-provider-zod';
 import authRoutes from './routes/auth';
 import workspaceRoutes from './routes/workspaces';
 import apiKeyRoutes from './routes/api-keys';
@@ -35,15 +36,37 @@ const config = {
     corsOrigin: process.env.CORS_ORIGIN || 'http://localhost:5173',
 };
 
-// ── Fastify App ──────────────────────────────────────────────────────
 const app: FastifyInstance = Fastify({
     logger: false, // We use Winston
+});
+
+// Setup Zod Validation Compilers
+app.setValidatorCompiler(validatorCompiler);
+app.setSerializerCompiler(serializerCompiler);
+
+// Security Headers
+app.register(import('@fastify/helmet'), {
+    contentSecurityPolicy: process.env.NODE_ENV === 'production' ? undefined : false,
 });
 
 // CORS
 app.register(import('@fastify/cors'), {
     origin: config.corsOrigin,
     credentials: true,
+});
+
+// Global Error Handler
+app.setErrorHandler((error, request, reply) => {
+    if (error instanceof SyntaxError && error.statusCode === 400 && 'body' in error) {
+        logger.warn('JSON Parse Error', { error: error.message, path: request.url });
+        return reply.status(400).send({ error: 'Invalid JSON payload format' });
+    }
+
+    // Default fallback
+    if (error.statusCode && error.statusCode >= 500) {
+        logger.error('Server Error', { error: error.message, stack: error.stack, path: request.url });
+    }
+    return reply.status(error.statusCode || 500).send({ error: error.message || 'Internal Server Error' });
 });
 
 // ── Services (initialized in start()) ────────────────────────────────
@@ -79,6 +102,10 @@ app.get('/api/mobile/sync', { preHandler: [requireAuth] }, async (req) => {
 // ── Startup ──────────────────────────────────────────────────────────
 async function start() {
     try {
+        if (process.env.NODE_ENV === 'production' && (!process.env.JWT_SECRET || process.env.JWT_SECRET === 'dev-secret-change-me')) {
+            throw new Error('FATAL ERROR: JWT_SECRET is not securely set in production environment!');
+        }
+
         let telegramAdapter: TelegramAdapter | undefined;
         let whatsappAdapter: WhatsAppAdapter | undefined;
 
@@ -86,6 +113,12 @@ async function start() {
         redis = new Redis(config.redisUrl);
         redis.on('error', (err) => logger.error('Redis error', { error: err.message }));
         redis.on('connect', () => logger.info('Redis connected'));
+
+        // Register Rate Limiting
+        await app.register(import('@fastify/rate-limit'), {
+            global: false,
+            redis: redis,
+        });
 
         sessionManager = new SessionManager(redis);
 
@@ -118,8 +151,15 @@ async function start() {
         await authRoutes(app, deps);
         await workspaceRoutes(app, deps);
         await apiKeyRoutes(app, { redis });
-        await oauthRoutes(app, deps);
-        await magicLinkRoutes(app, deps);
+
+        if (process.env.ENABLE_OAUTH === 'true') {
+            await oauthRoutes(app, deps);
+        }
+
+        if (process.env.ENABLE_MAGIC_LINK === 'true') {
+            await magicLinkRoutes(app, deps);
+        }
+
         await providerRoutes(app, deps);
         await taskRoutes(app, { brainClient });
 

@@ -1,4 +1,6 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import { z } from 'zod';
+import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { requireAuth, generateSecureToken } from '../auth/middleware';
 import { logger } from '../utils/logger';
 import Redis from 'ioredis';
@@ -8,19 +10,25 @@ import Redis from 'ioredis';
  */
 export default async function apiKeyRoutes(app: FastifyInstance, deps: { redis: Redis }) {
     const { redis } = deps;
+    const typedApp = app.withTypeProvider<ZodTypeProvider>();
 
     // Prefix for API key storage in Redis
     const KEY_PREFIX = 'apikey:';
     const USER_KEYS_PREFIX = 'user_apikeys:';
 
-    // ── POST /api/api-keys ───────────────────────────────────────────
-    app.post('/api/api-keys', { preHandler: [requireAuth] }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const user = (req as any).user;
-        const { name, expiresInDays } = req.body as any;
+    const createKeySchema = z.object({
+        name: z.string().min(1, 'API key name required'),
+        expiresInDays: z.number().int().positive().optional(),
+    });
+    type CreateKeyBody = z.infer<typeof createKeySchema>;
 
-        if (!name || name.trim().length < 1) {
-            return reply.status(400).send({ error: 'API key name required' });
-        }
+    // ── POST /api/api-keys ───────────────────────────────────────────
+    typedApp.post('/api/api-keys', {
+        preHandler: [requireAuth],
+        schema: { body: createKeySchema }
+    }, async (req, reply) => {
+        const user = req.user!;
+        const { name, expiresInDays } = req.body as CreateKeyBody;
 
         const keyId = generateSecureToken(8);    // short ID for display
         const secret = generateSecureToken(48);   // the actual secret
@@ -55,8 +63,8 @@ export default async function apiKeyRoutes(app: FastifyInstance, deps: { redis: 
     });
 
     // ── GET /api/api-keys ────────────────────────────────────────────
-    app.get('/api/api-keys', { preHandler: [requireAuth] }, async (req: FastifyRequest) => {
-        const user = (req as any).user;
+    typedApp.get('/api/api-keys', { preHandler: [requireAuth] }, async (req) => {
+        const user = req.user!;
         const keyIds = await redis.smembers(`${USER_KEYS_PREFIX}${user.id}`);
 
         const keys = [];
@@ -79,10 +87,18 @@ export default async function apiKeyRoutes(app: FastifyInstance, deps: { redis: 
         return { keys };
     });
 
+    const deleteKeyParamsSchema = z.object({
+        id: z.string()
+    });
+    type DeleteKeyParams = z.infer<typeof deleteKeyParamsSchema>;
+
     // ── DELETE /api/api-keys/:id ─────────────────────────────────────
-    app.delete('/api/api-keys/:id', { preHandler: [requireAuth] }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const user = (req as any).user;
-        const { id } = req.params as any;
+    typedApp.delete('/api/api-keys/:id', {
+        preHandler: [requireAuth],
+        schema: { params: deleteKeyParamsSchema }
+    }, async (req, reply) => {
+        const user = req.user!;
+        const { id } = req.params as DeleteKeyParams;
 
         const raw = await redis.get(`${KEY_PREFIX}${id}`);
         if (!raw) {

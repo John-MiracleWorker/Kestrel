@@ -1,4 +1,6 @@
 import { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { logger } from '../../utils/logger';
 
 interface WebhookDeps {
@@ -17,17 +19,21 @@ export default async function telegramWebhookRoutes(
     deps: WebhookDeps,
 ): Promise<void> {
     const { telegramAdapter } = deps;
+    const typedApp = app.withTypeProvider<ZodTypeProvider>();
 
-    app.post('/webhooks/telegram', async (req, reply) => {
+    const telegramUpdateSchema = z.object({
+        update_id: z.number(),
+    }).passthrough();
+    type TelegramUpdate = z.infer<typeof telegramUpdateSchema>;
+
+    typedApp.post('/webhooks/telegram', {
+        schema: { body: telegramUpdateSchema }
+    }, async (req, reply) => {
         try {
-            const update = req.body as any;
-
-            // Basic validation — Telegram always sends update_id
-            if (!update || typeof update.update_id !== 'number') {
-                return reply.code(400).send({ error: 'Invalid update' });
-            }
+            const update = req.body as TelegramUpdate;
 
             // Process asynchronously — respond 200 immediately
+
             // so Telegram doesn't retry
             setImmediate(() => {
                 telegramAdapter.processUpdate(update).catch((err) => {

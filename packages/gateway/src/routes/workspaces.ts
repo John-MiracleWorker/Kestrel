@@ -1,4 +1,6 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import { z } from 'zod';
+import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { requireAuth, requireWorkspace, requireRole, generateSecureToken } from '../auth/middleware';
 import { BrainClient } from '../brain/client';
 import { logger } from '../utils/logger';
@@ -14,21 +16,26 @@ interface WorkspaceDeps {
  */
 export default async function workspaceRoutes(app: FastifyInstance, deps: WorkspaceDeps) {
     const { brainClient, redis } = deps;
+    const typedApp = app.withTypeProvider<ZodTypeProvider>();
 
     // ── GET /api/workspaces ──────────────────────────────────────────
-    app.get('/api/workspaces', { preHandler: [requireAuth] }, async (req: FastifyRequest) => {
-        const user = (req as any).user;
+    typedApp.get('/api/workspaces', { preHandler: [requireAuth] }, async (req) => {
+        const user = req.user!;
         return { workspaces: await brainClient.listWorkspaces(user.id) };
     });
 
-    // ── POST /api/workspaces ─────────────────────────────────────────
-    app.post('/api/workspaces', { preHandler: [requireAuth] }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const user = (req as any).user;
-        const { name } = req.body as any;
+    const createWorkspaceSchema = z.object({
+        name: z.string().min(2, 'Workspace name must be at least 2 characters'),
+    });
+    type CreateWorkspaceBody = z.infer<typeof createWorkspaceSchema>;
 
-        if (!name || name.trim().length < 2) {
-            return reply.status(400).send({ error: 'Workspace name must be at least 2 characters' });
-        }
+    // ── POST /api/workspaces ─────────────────────────────────────────
+    typedApp.post('/api/workspaces', {
+        preHandler: [requireAuth],
+        schema: { body: createWorkspaceSchema }
+    }, async (req, reply) => {
+        const user = req.user!;
+        const { name } = req.body as CreateWorkspaceBody;
 
         try {
             const workspace = await brainClient.createWorkspace(user.id, name.trim());
@@ -39,21 +46,35 @@ export default async function workspaceRoutes(app: FastifyInstance, deps: Worksp
         }
     });
 
+    const workspaceParamsSchema = z.object({
+        workspaceId: z.string(),
+    });
+    type WorkspaceParams = z.infer<typeof workspaceParamsSchema>;
+
     // ── GET /api/workspaces/:workspaceId ─────────────────────────────
-    app.get('/api/workspaces/:workspaceId', {
+    typedApp.get('/api/workspaces/:workspaceId', {
         preHandler: [requireAuth, requireWorkspace],
-    }, async (req: FastifyRequest) => {
-        const { workspaceId } = req.params as any;
-        const workspace = (req as any).workspace;
+        schema: { params: workspaceParamsSchema }
+    }, async (req) => {
+        const { workspaceId } = req.params as WorkspaceParams;
+        const workspace = req.workspace!;
         return { workspace: { id: workspaceId, role: workspace.role } };
     });
 
+    const updateWorkspaceSchema = z.object({
+        name: z.string().optional(),
+        description: z.string().optional(),
+        settings: z.any().optional(),
+    });
+    type UpdateWorkspaceBody = z.infer<typeof updateWorkspaceSchema>;
+
     // ── PUT /api/workspaces/:workspaceId ─────────────────────────────
-    app.put('/api/workspaces/:workspaceId', {
+    typedApp.put('/api/workspaces/:workspaceId', {
         preHandler: [requireAuth, requireWorkspace, requireRole('admin')],
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const { workspaceId } = req.params as any;
-        const { name, description, settings } = req.body as any;
+        schema: { params: workspaceParamsSchema, body: updateWorkspaceSchema }
+    }, async (req, reply) => {
+        const { workspaceId } = req.params as WorkspaceParams;
+        const { name, description, settings } = req.body as UpdateWorkspaceBody;
 
         try {
             const updated = await brainClient.updateWorkspace(workspaceId, { name, description, settings });
@@ -65,10 +86,11 @@ export default async function workspaceRoutes(app: FastifyInstance, deps: Worksp
     });
 
     // ── DELETE /api/workspaces/:workspaceId ──────────────────────────
-    app.delete('/api/workspaces/:workspaceId', {
+    typedApp.delete('/api/workspaces/:workspaceId', {
         preHandler: [requireAuth, requireWorkspace, requireRole('owner')],
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const { workspaceId } = req.params as any;
+        schema: { params: workspaceParamsSchema }
+    }, async (req, reply) => {
+        const { workspaceId } = req.params as WorkspaceParams;
 
         try {
             await brainClient.deleteWorkspace(workspaceId);
@@ -81,37 +103,47 @@ export default async function workspaceRoutes(app: FastifyInstance, deps: Worksp
 
     // ── Conversation Routes ──────────────────────────────────────────
 
-    app.get('/api/workspaces/:workspaceId/conversations', {
+    typedApp.get('/api/workspaces/:workspaceId/conversations', {
         preHandler: [requireAuth, requireWorkspace],
-    }, async (req: FastifyRequest) => {
-        const user = (req as any).user;
-        const { workspaceId } = req.params as any;
+        schema: { params: workspaceParamsSchema }
+    }, async (req) => {
+        const user = req.user!;
+        const { workspaceId } = req.params as WorkspaceParams;
         return { conversations: await brainClient.listConversations(user.id, workspaceId) };
     });
 
-    app.post('/api/workspaces/:workspaceId/conversations', {
+    typedApp.post('/api/workspaces/:workspaceId/conversations', {
         preHandler: [requireAuth, requireWorkspace],
-    }, async (req: FastifyRequest) => {
-        const user = (req as any).user;
-        const { workspaceId } = req.params as any;
+        schema: { params: workspaceParamsSchema }
+    }, async (req) => {
+        const user = req.user!;
+        const { workspaceId } = req.params as WorkspaceParams;
         const conversation = await brainClient.createConversation(user.id, workspaceId);
         return { conversation };
     });
 
-    app.get('/api/workspaces/:workspaceId/conversations/:conversationId/messages', {
+    const conversationParamsSchema = z.object({
+        workspaceId: z.string(),
+        conversationId: z.string(),
+    });
+    type ConversationParams = z.infer<typeof conversationParamsSchema>;
+
+    typedApp.get('/api/workspaces/:workspaceId/conversations/:conversationId/messages', {
         preHandler: [requireAuth, requireWorkspace],
-    }, async (req: FastifyRequest) => {
-        const user = (req as any).user;
-        const { workspaceId, conversationId } = req.params as any;
+        schema: { params: conversationParamsSchema }
+    }, async (req) => {
+        const user = req.user!;
+        const { workspaceId, conversationId } = req.params as ConversationParams;
         return { messages: await brainClient.getMessages(user.id, workspaceId, conversationId) };
     });
 
     // ── Delete Conversation ──────────────────────────────────────────
-    app.delete('/api/workspaces/:workspaceId/conversations/:conversationId', {
+    typedApp.delete('/api/workspaces/:workspaceId/conversations/:conversationId', {
         preHandler: [requireAuth, requireWorkspace],
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const user = (req as any).user;
-        const { workspaceId, conversationId } = req.params as any;
+        schema: { params: conversationParamsSchema }
+    }, async (req, reply) => {
+        const user = req.user!;
+        const { workspaceId, conversationId } = req.params as ConversationParams;
         try {
             const success = await brainClient.deleteConversation(user.id, workspaceId, conversationId);
             return { success };
@@ -120,13 +152,19 @@ export default async function workspaceRoutes(app: FastifyInstance, deps: Worksp
         }
     });
 
+    const updateConversationSchema = z.object({
+        title: z.string().min(1, 'Title cannot be empty')
+    });
+    type UpdateConversationBody = z.infer<typeof updateConversationSchema>;
+
     // ── Update Conversation (Rename) ─────────────────────────────────
-    app.patch('/api/workspaces/:workspaceId/conversations/:conversationId', {
+    typedApp.patch('/api/workspaces/:workspaceId/conversations/:conversationId', {
         preHandler: [requireAuth, requireWorkspace],
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const user = (req as any).user;
-        const { workspaceId, conversationId } = req.params as any;
-        const { title } = req.body as any;
+        schema: { params: conversationParamsSchema, body: updateConversationSchema }
+    }, async (req, reply) => {
+        const user = req.user!;
+        const { workspaceId, conversationId } = req.params as ConversationParams;
+        const { title } = req.body as UpdateConversationBody;
         try {
             const conversation = await brainClient.updateConversation(user.id, workspaceId, conversationId, title);
             return { conversation };
@@ -136,11 +174,12 @@ export default async function workspaceRoutes(app: FastifyInstance, deps: Worksp
     });
 
     // ── Generate Title ───────────────────────────────────────────────
-    app.post('/api/workspaces/:workspaceId/conversations/:conversationId/generate-title', {
+    typedApp.post('/api/workspaces/:workspaceId/conversations/:conversationId/generate-title', {
         preHandler: [requireAuth, requireWorkspace],
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const user = (req as any).user;
-        const { workspaceId, conversationId } = req.params as any;
+        schema: { params: conversationParamsSchema }
+    }, async (req, reply) => {
+        const user = req.user!;
+        const { workspaceId, conversationId } = req.params as ConversationParams;
         try {
             const title = await brainClient.generateTitle(user.id, workspaceId, conversationId);
             return { title };
@@ -151,14 +190,22 @@ export default async function workspaceRoutes(app: FastifyInstance, deps: Worksp
 
 
 
+
     // ── Invitation Routes ────────────────────────────────────────────
 
+    const inviteSchema = z.object({
+        email: z.string().email(),
+        role: z.enum(['owner', 'admin', 'member', 'guest']).optional(),
+    });
+    type InviteBody = z.infer<typeof inviteSchema>;
+
     // Send an invite
-    app.post('/api/workspaces/:workspaceId/invite', {
+    typedApp.post('/api/workspaces/:workspaceId/invite', {
         preHandler: [requireAuth, requireWorkspace, requireRole('admin')],
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const { workspaceId } = req.params as any;
-        const { email, role } = req.body as any;
+        schema: { params: workspaceParamsSchema, body: inviteSchema }
+    }, async (req, reply) => {
+        const { workspaceId } = req.params as WorkspaceParams;
+        const { email, role } = req.body as InviteBody;
 
         if (!email) {
             return reply.status(400).send({ error: 'Email required' });
@@ -186,12 +233,18 @@ export default async function workspaceRoutes(app: FastifyInstance, deps: Worksp
         };
     });
 
+    const acceptInviteParamsSchema = z.object({
+        token: z.string()
+    });
+    type AcceptInviteParams = z.infer<typeof acceptInviteParamsSchema>;
+
     // Accept an invite
-    app.post('/api/invitations/:token/accept', {
+    typedApp.post('/api/invitations/:token/accept', {
         preHandler: [requireAuth],
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const { token } = req.params as any;
-        const user = (req as any).user;
+        schema: { params: acceptInviteParamsSchema }
+    }, async (req, reply) => {
+        const { token } = req.params as AcceptInviteParams;
+        const user = req.user!;
 
         const raw = await redis.get(`invite:${token}`);
         if (!raw) {
