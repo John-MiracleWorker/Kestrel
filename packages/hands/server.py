@@ -59,7 +59,13 @@ def load_skills(skills_dir: str = None):
 
     for name in os.listdir(skills_dir):
         skill_path = os.path.join(skills_dir, name)
-        manifest_path = os.path.join(skill_path, "manifest.json")
+        skill_manifest_path = os.path.join(skill_path, "skill.json")
+        legacy_manifest_path = os.path.join(skill_path, "manifest.json")
+        manifest_path = (
+            skill_manifest_path
+            if os.path.isfile(skill_manifest_path)
+            else legacy_manifest_path
+        )
         if os.path.isfile(manifest_path):
             try:
                 with open(manifest_path) as f:
@@ -193,24 +199,38 @@ class HandsServicer:
                 continue
 
             manifest = skill["manifest"]
+            function_specs = manifest.get("functions")
+            if function_specs is None and "tools" in manifest:
+                function_specs = [{"name": tool} for tool in manifest.get("tools", [])]
+
             functions = []
-            for fn in manifest.get("functions", []):
-                functions.append(hands_pb2.FunctionMetadata(
-                    name=fn["name"],
-                    description=fn.get("description", ""),
-                    parameters_schema=json.dumps(fn.get("parameters", {})),
-                ))
+            for fn in function_specs or []:
+                functions.append({
+                    "name": fn["name"],
+                    "description": fn.get("description", ""),
+                    "parameters_schema": json.dumps(fn.get("parameters", {})),
+                })
 
-            skills.append(hands_pb2.SkillMetadata(
-                name=name,
-                description=manifest.get("description", ""),
-                version=manifest.get("version", "0.1.0"),
-                functions=functions,
-                requires_network=manifest.get("requires_network", False),
-                requires_filesystem=manifest.get("requires_filesystem", False),
-            ))
+            capabilities = manifest.get("capabilities", {})
+            requires_network = manifest.get(
+                "requires_network",
+                capabilities.get("network", False),
+            )
+            requires_filesystem = manifest.get(
+                "requires_filesystem",
+                capabilities.get("filesystem", False),
+            )
 
-        return hands_pb2.ListSkillsResponse(skills=skills)
+            skills.append({
+                "name": name,
+                "description": manifest.get("description", ""),
+                "version": manifest.get("version", "0.1.0"),
+                "functions": functions,
+                "requires_network": requires_network,
+                "requires_filesystem": requires_filesystem,
+            })
+
+        return {"skills": skills}
 
     async def HealthCheck(self, request, context):
         """Return health status."""
