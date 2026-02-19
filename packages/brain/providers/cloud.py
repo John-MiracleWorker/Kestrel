@@ -293,6 +293,7 @@ class CloudProvider:
 
     def _list_anthropic_models(self) -> list[dict]:
         # Return hardcoded list as Anthropic doesn't have a simple list endpoint purely for models
+        # Updated for 2026 availability
         return [
             {"id": "claude-opus-4-6", "name": "Claude Opus 4.6", "context_window": "200k"},
             {"id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5", "context_window": "200k"},
@@ -300,26 +301,47 @@ class CloudProvider:
         ]
 
     async def _list_google_models(self, api_key: str) -> list[dict]:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-        async with httpx.AsyncClient(timeout=30) as client:
-            try:
-                resp = await client.get(url)
-                resp.raise_for_status()
-                data = resp.json()
-                models = []
-                for m in data.get("models", []):
-                    # Filter for generateContent supported models
-                    if "generateContent" in m.get("supportedGenerationMethods", []):
-                        name = m["name"].replace("models/", "")
-                        models.append({
-                            "id": name,
-                            "name": m.get("displayName", name),
-                            "context_window": str(m.get("inputTokenLimit", "Unknown"))
-                        })
-                return sorted(models, key=lambda x: x["id"], reverse=True)
-            except Exception as e:
-                logger.error(f"Failed to list Google models: {e}")
-                return []
+        if not api_key:
+            return []
+        
+        # Hardcoded list of 2026 Gemini models to ensure availability
+        # The API might be versioned or restricted, so we prioritize these
+        common_models = [
+            {"id": "gemini-3-pro", "name": "Gemini 3 Pro", "context_window": "1M"},
+            {"id": "gemini-3-flash", "name": "Gemini 3 Flash", "context_window": "1M"},
+            {"id": "gemini-3-deep-think", "name": "Gemini 3 Deep Think", "context_window": "1M"},
+            {"id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro", "context_window": "1M"},
+            {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash", "context_window": "1M"},
+            {"id": "gemini-2.0-pro-exp", "name": "Gemini 2.0 Pro Exp", "context_window": "1M"},
+            {"id": "gemini-2.0-flash", "name": "Gemini 2.0 Flash", "context_window": "1M"},
+        ]
+
+        try:
+            # We still try to fetch from API to get any new/custom ones, but we'll merge
+            url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, timeout=10.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    api_models = []
+                    for m in data.get("models", []):
+                        # Filter for generation models
+                        if "generateContent" in m.get("supportedGenerationMethods", []):
+                            name_id = m["name"].split("/")[-1]
+                            # Avoid duplicates from hardcoded list
+                            if not any(cm["id"] == name_id for cm in common_models):
+                                api_models.append({
+                                    "id": name_id,
+                                    "name": m.get("displayName", name_id),
+                                    "context_window": str(m.get("inputTokenLimit", "Unknown"))
+                                })
+                    return common_models + api_models
+                else:
+                    logging.warning(f"Failed to fetch Google models: {resp.status_code} - {resp.text}")
+                    return common_models
+        except Exception as e:
+            logging.error(f"Error fetching Google models: {e}")
+            return common_models
 
     async def generate(
         self,

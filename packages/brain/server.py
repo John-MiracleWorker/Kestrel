@@ -609,7 +609,9 @@ class BrainServicer:
             resp.tool_call.arguments = tool_call.get("arguments", "")
         
         # DEBUG: Verify type
-        # logger.info(f"Response type: {type(resp)}")
+        logger.info(f"Response type: {type(resp)}")
+        if isinstance(resp, dict):
+            logger.error("CRITICAL: ChatResponse is a dict! This will crash gRPC.")
         return resp
 
     async def HealthCheck(self, request, context):

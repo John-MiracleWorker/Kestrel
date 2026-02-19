@@ -80,6 +80,21 @@ class BrainServiceStub(object):
                 request_serializer=brain__pb2.GetMessagesRequest.SerializeToString,
                 response_deserializer=brain__pb2.GetMessagesResponse.FromString,
                 _registered_method=True)
+        self.UpdateConversation = channel.unary_unary(
+                '/kestrel.brain.BrainService/UpdateConversation',
+                request_serializer=brain__pb2.UpdateConversationRequest.SerializeToString,
+                response_deserializer=brain__pb2.ConversationResponse.FromString,
+                _registered_method=True)
+        self.DeleteConversation = channel.unary_unary(
+                '/kestrel.brain.BrainService/DeleteConversation',
+                request_serializer=brain__pb2.DeleteConversationRequest.SerializeToString,
+                response_deserializer=brain__pb2.DeleteConversationResponse.FromString,
+                _registered_method=True)
+        self.GenerateTitle = channel.unary_unary(
+                '/kestrel.brain.BrainService/GenerateTitle',
+                request_serializer=brain__pb2.GenerateTitleRequest.SerializeToString,
+                response_deserializer=brain__pb2.GenerateTitleResponse.FromString,
+                _registered_method=True)
         self.RegisterPushToken = channel.unary_unary(
                 '/kestrel.brain.BrainService/RegisterPushToken',
                 request_serializer=brain__pb2.RegisterPushTokenRequest.SerializeToString,
@@ -104,6 +119,11 @@ class BrainServiceStub(object):
                 '/kestrel.brain.BrainService/DeleteProviderConfig',
                 request_serializer=brain__pb2.DeleteProviderConfigRequest.SerializeToString,
                 response_deserializer=brain__pb2.DeleteProviderConfigResponse.FromString,
+                _registered_method=True)
+        self.ListModels = channel.unary_unary(
+                '/kestrel.brain.BrainService/ListModels',
+                request_serializer=brain__pb2.ListModelsRequest.SerializeToString,
+                response_deserializer=brain__pb2.ListModelsResponse.FromString,
                 _registered_method=True)
         self.StartTask = channel.unary_stream(
                 '/kestrel.brain.BrainService/StartTask',
@@ -195,6 +215,24 @@ class BrainServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def UpdateConversation(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteConversation(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GenerateTitle(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def RegisterPushToken(self, request, context):
         """── Mobile / Sync ────────────────────────────────────────────
         """
@@ -222,6 +260,12 @@ class BrainServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def DeleteProviderConfig(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListModels(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -306,6 +350,21 @@ def add_BrainServiceServicer_to_server(servicer, server):
                     request_deserializer=brain__pb2.GetMessagesRequest.FromString,
                     response_serializer=brain__pb2.GetMessagesResponse.SerializeToString,
             ),
+            'UpdateConversation': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateConversation,
+                    request_deserializer=brain__pb2.UpdateConversationRequest.FromString,
+                    response_serializer=brain__pb2.ConversationResponse.SerializeToString,
+            ),
+            'DeleteConversation': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteConversation,
+                    request_deserializer=brain__pb2.DeleteConversationRequest.FromString,
+                    response_serializer=brain__pb2.DeleteConversationResponse.SerializeToString,
+            ),
+            'GenerateTitle': grpc.unary_unary_rpc_method_handler(
+                    servicer.GenerateTitle,
+                    request_deserializer=brain__pb2.GenerateTitleRequest.FromString,
+                    response_serializer=brain__pb2.GenerateTitleResponse.SerializeToString,
+            ),
             'RegisterPushToken': grpc.unary_unary_rpc_method_handler(
                     servicer.RegisterPushToken,
                     request_deserializer=brain__pb2.RegisterPushTokenRequest.FromString,
@@ -330,6 +389,11 @@ def add_BrainServiceServicer_to_server(servicer, server):
                     servicer.DeleteProviderConfig,
                     request_deserializer=brain__pb2.DeleteProviderConfigRequest.FromString,
                     response_serializer=brain__pb2.DeleteProviderConfigResponse.SerializeToString,
+            ),
+            'ListModels': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListModels,
+                    request_deserializer=brain__pb2.ListModelsRequest.FromString,
+                    response_serializer=brain__pb2.ListModelsResponse.SerializeToString,
             ),
             'StartTask': grpc.unary_stream_rpc_method_handler(
                     servicer.StartTask,
@@ -612,6 +676,87 @@ class BrainService(object):
             _registered_method=True)
 
     @staticmethod
+    def UpdateConversation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/UpdateConversation',
+            brain__pb2.UpdateConversationRequest.SerializeToString,
+            brain__pb2.ConversationResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteConversation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/DeleteConversation',
+            brain__pb2.DeleteConversationRequest.SerializeToString,
+            brain__pb2.DeleteConversationResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GenerateTitle(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/GenerateTitle',
+            brain__pb2.GenerateTitleRequest.SerializeToString,
+            brain__pb2.GenerateTitleResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def RegisterPushToken(request,
             target,
             options=(),
@@ -736,6 +881,33 @@ class BrainService(object):
             '/kestrel.brain.BrainService/DeleteProviderConfig',
             brain__pb2.DeleteProviderConfigRequest.SerializeToString,
             brain__pb2.DeleteProviderConfigResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListModels(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/ListModels',
+            brain__pb2.ListModelsRequest.SerializeToString,
+            brain__pb2.ListModelsResponse.FromString,
             options,
             channel_credentials,
             insecure,

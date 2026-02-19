@@ -118,73 +118,66 @@ export function Sidebar({
 
     return (
         <>
-            <aside className="card" style={{
+            <aside style={{
                 display: 'flex',
                 flexDirection: 'column',
-                width: '260px',
-                backgroundColor: 'var(--color-bg-secondary)',
-                borderRight: '1px solid var(--color-border)',
+                width: '280px',
+                backgroundColor: 'var(--bg-panel)',
+                borderRight: '1px solid var(--border-color)',
                 height: '100%',
+                fontFamily: 'var(--font-mono)',
             }}>
-                {/* Workspace header */}
+                {/* Workspace header as "Directory Path" */}
                 <div style={{
-                    padding: 'var(--space-4)',
-                    borderBottom: '1px solid var(--color-border)',
+                    padding: '16px',
+                    borderBottom: '1px solid var(--border-color)',
+                    background: 'var(--bg-highlight)',
                 }}>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '4px' }}>CURRENT_WORKSPACE</div>
                     <button
-                        className="btn btn-ghost"
+                        className="terminal-border"
                         style={{
                             width: '100%',
+                            display: 'flex',
+                            alignItems: 'center',
                             justifyContent: 'space-between',
-                            padding: 'var(--space-2) var(--space-3)',
+                            padding: '8px',
+                            background: 'var(--bg-surface)',
+                            color: 'var(--accent-cyan)',
+                            cursor: 'pointer',
+                            borderRadius: 'var(--radius-sm)',
                         }}
                         onClick={() => setShowWorkspaceSwitcher(!showWorkspaceSwitcher)}
                     >
-                        <span style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: 'var(--space-2)',
-                            fontWeight: 600,
-                        }}>
-                            <span style={{
-                                width: 28,
-                                height: 28,
-                                background: 'linear-gradient(135deg, var(--color-brand), #a855f7)',
-                                borderRadius: 'var(--radius-sm)',
-                                display: 'flex',
-                                alignItems: 'center',
-                                justifyContent: 'center',
-                                fontSize: '0.75rem',
-                            }}>
-                                {currentWorkspace?.name?.[0]?.toUpperCase() || 'K'}
-                            </span>
-                            {currentWorkspace?.name || 'Select Workspace'}
+                        <span style={{ fontWeight: 600 }}>
+                            ~/{currentWorkspace?.name || 'Start'}
                         </span>
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style={{ opacity: 0.5 }}>
-                            <path d="M7 10l5 5 5-5z" />
-                        </svg>
+                        <span style={{ fontSize: '0.8em' }}>▼</span>
                     </button>
 
                     {/* Workspace dropdown */}
                     {showWorkspaceSwitcher && (
-                        <div className="card animate-fade-in" style={{
+                        <div style={{
                             position: 'absolute',
-                            left: 'var(--space-2)',
-                            right: 'var(--space-2)',
+                            left: '16px',
+                            width: '248px',
                             zIndex: 50,
-                            marginTop: 'var(--space-2)',
-                            padding: 'var(--space-2)',
+                            marginTop: '4px',
+                            background: 'var(--bg-panel)',
+                            border: '1px solid var(--accent-cyan)',
+                            boxShadow: '0 4px 20px rgba(0,0,0,0.5)',
                         }}>
                             {workspaceList.map((ws) => (
                                 <button
                                     key={ws.id}
-                                    className="btn btn-ghost"
                                     style={{
                                         width: '100%',
-                                        justifyContent: 'flex-start',
-                                        padding: 'var(--space-2) var(--space-3)',
-                                        background: ws.id === currentWorkspace?.id
-                                            ? 'var(--color-bg-hover)' : undefined,
+                                        textAlign: 'left',
+                                        padding: '8px 12px',
+                                        background: ws.id === currentWorkspace?.id ? 'var(--bg-highlight)' : 'transparent',
+                                        color: ws.id === currentWorkspace?.id ? 'var(--accent-cyan)' : 'var(--text-primary)',
+                                        borderBottom: '1px solid var(--border-color)',
+                                        cursor: 'pointer',
                                     }}
                                     onClick={() => {
                                         onSelectWorkspace(ws);
@@ -192,204 +185,152 @@ export function Sidebar({
                                     }}
                                 >
                                     {ws.name}
-                                    <span className="badge" style={{ marginLeft: 'auto' }}>
-                                        {ws.role}
-                                    </span>
                                 </button>
                             ))}
                         </div>
                     )}
                 </div>
 
-                {/* New conversation button */}
-                <div style={{ padding: 'var(--space-3) var(--space-4)' }}>
+                {/* New conversation "Command" */}
+                <div style={{ padding: '16px 16px 8px' }}>
                     <button
-                        className="btn btn-primary"
-                        style={{ width: '100%' }}
+                        style={{
+                            width: '100%',
+                            padding: '10px',
+                            background: 'transparent',
+                            border: '1px dashed var(--text-secondary)',
+                            color: 'var(--text-primary)',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            gap: '8px',
+                            transition: 'all 0.2s',
+                            cursor: 'pointer',
+                        }}
+                        onMouseEnter={(e) => {
+                            e.currentTarget.style.borderColor = 'var(--accent-green)';
+                            e.currentTarget.style.color = 'var(--accent-green)';
+                        }}
+                        onMouseLeave={(e) => {
+                            e.currentTarget.style.borderColor = 'var(--text-secondary)';
+                            e.currentTarget.style.color = 'var(--text-primary)';
+                        }}
                         onClick={onNewConversation}
                     >
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <path d="M12 5v14M5 12h14" />
-                        </svg>
-                        New Chat
+                        <span>[+]</span> NEW_SESSION_ID
                     </button>
                 </div>
 
                 {/* Search */}
-                <div style={{ padding: '0 var(--space-4) var(--space-3)' }}>
-                    <input
-                        className="input"
-                        type="text"
-                        placeholder="Search conversations..."
-                        value={searchQuery}
-                        onChange={(e) => setSearchQuery(e.target.value)}
-                        style={{ fontSize: '0.8125rem' }}
-                    />
+                <div style={{ padding: '0 16px 16px' }}>
+                    <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        borderBottom: '1px solid var(--border-color)',
+                        paddingBottom: '4px'
+                    }}>
+                        <span style={{ color: 'var(--accent-purple)', marginRight: '8px' }}>find</span>
+                        <input
+                            type="text"
+                            placeholder='-name "*query*"'
+                            value={searchQuery}
+                            onChange={(e) => setSearchQuery(e.target.value)}
+                            style={{
+                                background: 'transparent',
+                                border: 'none',
+                                color: 'var(--text-primary)',
+                                outline: 'none',
+                                width: '100%',
+                                fontFamily: 'var(--font-mono)',
+                                fontSize: '0.875rem'
+                            }}
+                        />
+                    </div>
                 </div>
 
-                {/* Conversation list */}
+                {/* Conversation list as "Process List" */}
                 <div style={{
                     flex: 1,
                     overflowY: 'auto',
-                    padding: '0 var(--space-2)',
+                    padding: '0 8px',
                 }}>
+                    <div style={{ padding: '0 8px 8px', fontSize: '0.7rem', color: 'var(--text-dim)', textTransform: 'uppercase' }}>
+                        Active Processes
+                    </div>
                     {filteredConversations.map((conv) => (
                         <div
                             key={conv.id}
-                            className="group"
                             style={{
-                                position: 'relative',
+                                display: 'flex',
+                                alignItems: 'center',
+                                padding: '6px 8px',
                                 marginBottom: '2px',
+                                cursor: 'pointer',
+                                background: conv.id === currentConversation?.id ? 'rgba(0, 243, 255, 0.1)' : 'transparent',
+                                borderLeft: conv.id === currentConversation?.id ? '2px solid var(--accent-cyan)' : '2px solid transparent',
+                                color: conv.id === currentConversation?.id ? 'var(--accent-cyan)' : 'var(--text-secondary)',
+                                fontSize: '0.85rem',
                             }}
+                            onClick={() => onSelectConversation(conv)}
+                            className="group"
                         >
-                            {editingConversationId === conv.id ? (
-                                <div style={{ padding: 'var(--space-2) var(--space-3)' }}>
-                                    <input
-                                        autoFocus
-                                        className="input"
-                                        value={editTitle}
-                                        onChange={(e) => setEditTitle(e.target.value)}
-                                        onBlur={saveTitle}
-                                        onKeyDown={handleKeyDown}
-                                        style={{
-                                            width: '100%',
-                                            fontSize: '0.875rem',
-                                            padding: '4px 8px',
-                                            height: 'auto',
-                                        }}
-                                    />
-                                </div>
-                            ) : (
-                                <div
-                                    role="button"
-                                    tabIndex={0}
-                                    className="btn btn-ghost animate-slide-in"
-                                    style={{
-                                        width: '100%',
-                                        justifyContent: 'flex-start',
-                                        padding: 'var(--space-2) var(--space-3)',
-                                        paddingRight: 'var(--space-8)', // Make room for actions
-                                        borderRadius: 'var(--radius-sm)',
-                                        background: conv.id === currentConversation?.id
-                                            ? 'var(--color-bg-hover)' : undefined,
-                                        borderLeft: conv.id === currentConversation?.id
-                                            ? '2px solid var(--color-brand)' : '2px solid transparent',
-                                        cursor: 'pointer',
-                                        position: 'relative',
-                                        textAlign: 'left'
-                                    }}
-                                    onClick={() => onSelectConversation(conv)}
-                                    onKeyDown={(e) => {
-                                        if (e.key === 'Enter' || e.key === ' ') {
-                                            onSelectConversation(conv);
-                                        }
-                                    }}
-                                >
-                                    <span style={{
-                                        display: 'block',
-                                        overflow: 'hidden',
-                                        textOverflow: 'ellipsis',
-                                        whiteSpace: 'nowrap',
-                                        fontSize: '0.875rem',
-                                        width: '100%'
-                                    }}>
-                                        {conv.title || 'New conversation'}
-                                    </span>
+                            <span style={{ marginRight: '8px', opacity: 0.7 }}>
+                                {conv.id === currentConversation?.id ? '>' : '#'}
+                            </span>
 
-                                    {/* Actions (visible on hover) */}
-                                    <div
-                                        className="opacity-0 group-hover:opacity-100 transition-opacity"
-                                        style={{
-                                            position: 'absolute',
-                                            right: 'var(--space-2)',
-                                            top: '50%',
-                                            transform: 'translateY(-50%)',
-                                            display: 'flex',
-                                            gap: '4px',
-                                            zIndex: 10,
-                                            background: conv.id === currentConversation?.id
-                                                ? 'var(--color-bg-hover)'
-                                                : 'var(--color-bg-secondary)',
-                                        }}
-                                        onClick={(e) => e.stopPropagation()}
-                                    >
-                                        <button
-                                            type="button"
-                                            style={{
-                                                padding: 4,
-                                                cursor: 'pointer',
-                                                opacity: 0.6,
-                                                background: 'transparent',
-                                                border: 'none',
-                                                display: 'flex',
-                                                alignItems: 'center'
-                                            }}
-                                            onClick={(e) => startEditing(e, conv)}
-                                            title="Rename"
-                                        >
-                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
-                                                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
-                                            </svg>
-                                        </button>
-                                        <button
-                                            type="button"
-                                            style={{
-                                                padding: 4,
-                                                cursor: 'pointer',
-                                                opacity: 0.6,
-                                                color: 'var(--color-danger)',
-                                                background: 'transparent',
-                                                border: 'none',
-                                                display: 'flex',
-                                                alignItems: 'center'
-                                            }}
-                                            onClick={(e) => handleDeleteConversation(e, conv.id)}
-                                            title="Delete"
-                                        >
-                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                                <polyline points="3 6 5 6 21 6" />
-                                                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                                            </svg>
-                                        </button>
-                                    </div>
-                                </div>
+                            {editingConversationId === conv.id ? (
+                                <input
+                                    autoFocus
+                                    value={editTitle}
+                                    onChange={(e) => setEditTitle(e.target.value)}
+                                    onBlur={saveTitle}
+                                    onKeyDown={handleKeyDown}
+                                    onClick={(e) => e.stopPropagation()}
+                                    style={{
+                                        background: 'var(--bg-terminal)',
+                                        border: 'none',
+                                        color: 'var(--accent-cyan)',
+                                        outline: 'none',
+                                        fontFamily: 'var(--font-mono)',
+                                        width: '100%'
+                                    }}
+                                />
+                            ) : (
+                                <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                    {conv.title || 'untitled_process'}
+                                </span>
                             )}
+
+                            {/* Hover Actions */}
+                            <div
+                                style={{
+                                    display: 'none',
+                                    gap: '6px'
+                                }}
+                                className="group-hover:flex"
+                            >
+                                <button onClick={(e) => startEditing(e, conv)} style={{ color: 'var(--text-secondary)' }}>rn</button>
+                                <button onClick={(e) => handleDeleteConversation(e, conv.id)} style={{ color: 'var(--accent-error)' }}>rm</button>
+                            </div>
                         </div>
                     ))}
-
-                    {filteredConversations.length === 0 && (
-                        <p style={{
-                            textAlign: 'center',
-                            color: 'var(--color-text-tertiary)',
-                            fontSize: '0.8125rem',
-                            padding: 'var(--space-6)',
-                        }}>
-                            {searchQuery ? 'No matches found' : 'No conversations yet'}
-                        </p>
-                    )}
                 </div>
 
-                {/* Bottom actions */}
+                {/* Footer status bar style */}
                 <div style={{
-                    padding: 'var(--space-3) var(--space-4)',
-                    borderTop: '1px solid var(--color-border)',
+                    padding: '12px',
+                    borderTop: '1px solid var(--border-color)',
+                    background: 'var(--bg-highlight)',
+                    fontSize: '0.75rem',
                     display: 'flex',
-                    gap: 'var(--space-2)',
+                    justifyContent: 'space-between',
+                    color: 'var(--text-dim)'
                 }}>
-                    <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onOpenSettings}>
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <circle cx="12" cy="12" r="3" />
-                            <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06A1.65 1.65 0 0019.32 9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z" />
-                        </svg>
-                        Settings
+                    <button onClick={onOpenSettings} style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                        <span style={{ color: 'var(--accent-green)' }}>●</span> SYSTEM_CONFIG
                     </button>
-                    <button className="btn btn-ghost" onClick={onLogout}>
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4" />
-                            <polyline points="16,17 21,12 16,7" />
-                            <line x1="21" y1="12" x2="9" y2="12" />
-                        </svg>
+                    <button onClick={onLogout} style={{ cursor: 'pointer' }}>
+                        LOGOUT
                     </button>
                 </div>
             </aside>
@@ -437,6 +378,7 @@ export function Sidebar({
                     </div>
                 </div>
             )}
+
         </>
     );
 }

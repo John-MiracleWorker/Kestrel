@@ -4,6 +4,7 @@ import { LoginPage } from './components/Auth/LoginPage';
 import { Sidebar } from './components/Sidebar/Sidebar';
 import { ChatView } from './components/Chat/ChatView';
 import { SettingsPanel } from './components/Settings/SettingsPanel';
+import { LiveCanvas } from './components/Layout/LiveCanvas';
 import { useChat } from './hooks/useChat';
 import { conversations, type Workspace, type Conversation, type Message } from './api/client';
 
@@ -14,6 +15,7 @@ export default function App() {
     const [initialMessages, setInitialMessages] = useState<Message[]>([]);
     const [showSettings, setShowSettings] = useState(false);
     const autoCreateAttempted = useRef<string | null>(null);
+    const [showCanvas, setShowCanvas] = useState(true); // Default to open for the look
 
     const { messages, streamingMessage, sendMessage, isConnected } = useChat(
         currentWorkspace?.id || null,
@@ -26,7 +28,7 @@ export default function App() {
         if (!currentWorkspace || !currentConversation) return;
         conversations
             .messages(currentWorkspace.id, currentConversation.id)
-            .then((res) => setInitialMessages(res.messages || []))
+            .then((res: { messages: Message[] }) => setInitialMessages(res.messages || []))
             .catch(console.error);
     }, [currentWorkspace, currentConversation]);
 
@@ -35,11 +37,11 @@ export default function App() {
         if (currentWorkspace && !currentConversation && autoCreateAttempted.current !== currentWorkspace.id) {
             autoCreateAttempted.current = currentWorkspace.id;
             conversations.create(currentWorkspace.id)
-                .then(conv => {
+                .then((conv: Conversation) => {
                     setCurrentConversation(conv);
                     setInitialMessages([]);
                 })
-                .catch(err => console.error('Failed to auto-create conversation:', err));
+                .catch((err: Error) => console.error('Failed to auto-create conversation:', err));
         }
     }, [currentWorkspace, currentConversation]);
 
@@ -62,22 +64,11 @@ export default function App() {
                 alignItems: 'center',
                 justifyContent: 'center',
                 height: '100vh',
-                background: 'var(--color-bg)',
+                background: 'var(--bg-terminal)',
+                color: 'var(--accent-cyan)',
+                fontFamily: 'var(--font-mono)'
             }}>
-                <div style={{
-                    width: 48,
-                    height: 48,
-                    background: 'linear-gradient(135deg, var(--color-brand), #a855f7)',
-                    borderRadius: 'var(--radius-md)',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    fontSize: '1.5rem',
-                    boxShadow: 'var(--shadow-glow)',
-                    animation: 'pulse 2s infinite',
-                }}>
-                    🪶
-                </div>
+                <div className="animate-flicker">INITIALIZING_SYSTEM...</div>
             </div>
         );
     }
@@ -88,7 +79,7 @@ export default function App() {
     }
 
     return (
-        <div className="app-layout">
+        <div style={{ display: 'flex', height: '100vh', width: '100vw', overflow: 'hidden' }}>
             <Sidebar
                 currentWorkspace={currentWorkspace}
                 currentConversation={currentConversation}
@@ -98,13 +89,26 @@ export default function App() {
                 onOpenSettings={() => setShowSettings(true)}
                 onLogout={logout}
             />
-            <ChatView
-                messages={messages}
-                streamingMessage={streamingMessage}
-                onSendMessage={sendMessage}
-                isConnected={isConnected}
-                conversationTitle={currentConversation?.title}
+
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative' }}>
+                <ChatView
+                    workspaceId={currentWorkspace?.id || null}
+                    messages={messages}
+                    streamingMessage={streamingMessage}
+                    onSendMessage={sendMessage}
+                    isConnected={isConnected}
+                    conversationTitle={currentConversation?.title}
+                    onToggleCanvas={() => setShowCanvas(!showCanvas)}
+                />
+            </div>
+
+            <LiveCanvas
+                isVisible={showCanvas}
+                activeTask={streamingMessage ? "PROCESSING_USER_QUERY" : "SYSTEM_READY"}
+                isStreaming={!!streamingMessage}
+                content={streamingMessage?.content}
             />
+
             {showSettings && (
                 <SettingsPanel
                     onClose={() => setShowSettings(false)}

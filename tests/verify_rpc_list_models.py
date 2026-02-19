@@ -5,6 +5,7 @@ import sys
 
 # Add packages/brain to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../packages/brain')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../packages/brain/_generated')))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../packages/shared/proto')))
 
 import brain_pb2
@@ -41,7 +42,7 @@ async def main():
         print("Skipping Google test (no GOOGLE_API_KEY env)")
 
     print("\n--- Testing ListModels (Anthropic - static) ---")
-    request = brain_pb2.ListModelsRequest(provider="anthropic")
+    request = brain_pb2.ListModelsRequest(provider="anthropic", api_key="sk-ant-dummy")
     try:
         response = await stub.ListModels(request)
         print(f"Models: {len(response.models)}")

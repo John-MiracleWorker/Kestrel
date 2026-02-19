@@ -1,6 +1,7 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { requireAuth, requireWorkspace, requireRole } from '../auth/middleware';
 import { BrainClient } from '../brain/client';
+import { logger } from '../utils/logger';
 import Redis from 'ioredis';
 
 interface ProviderDeps {
@@ -139,4 +140,23 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
             ],
         };
     });
+    // ── GET /api/workspaces/:workspaceId/providers/:provider/models ──
+    app.get(
+        '/api/workspaces/:workspaceId/providers/:provider/models',
+        { preHandler: [requireAuth, requireWorkspace] },
+        async (req: FastifyRequest, reply: FastifyReply) => {
+            const { workspaceId, provider } = req.params as any;
+            const { apiKey } = req.query as any;
+
+            logger.info(`Fetching models for ${provider} in ${workspaceId}`);
+            try {
+                const models = await brainClient.listModels(provider, apiKey, workspaceId);
+                logger.info(`Found ${models.length} models`);
+                return { models };
+            } catch (err: any) {
+                logger.error('Fetch models failed', { error: err.message });
+                return { models: [] };
+            }
+        }
+    );
 }
