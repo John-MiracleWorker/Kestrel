@@ -332,20 +332,68 @@ export class BrainClient {
                 : undefined,
         });
 
+        const queue: any[] = [];
+        const waiters: Array<{
+            resolve: (value: IteratorResult<any>) => void;
+            reject: (reason?: any) => void;
+        }> = [];
+        let ended = false;
+        let streamError: any = null;
+
+        const settleWaiters = () => {
+            while (waiters.length > 0) {
+                const waiter = waiters.shift();
+                if (!waiter) continue;
+
+                if (queue.length > 0) {
+                    waiter.resolve({ value: queue.shift(), done: false });
+                    continue;
+                }
+
+                if (streamError) {
+                    waiter.reject(streamError);
+                    continue;
+                }
+
+                if (ended) {
+                    waiter.resolve({ value: undefined, done: true });
+                }
+            }
+        };
+
+        stream.on('data', (data: any) => {
+            queue.push(data);
+            settleWaiters();
+        });
+
+        stream.on('end', () => {
+            ended = true;
+            settleWaiters();
+        });
+
+        stream.on('error', (err: any) => {
+            streamError = err;
+            settleWaiters();
+        });
+
         return {
             [Symbol.asyncIterator]() {
                 return {
                     next(): Promise<IteratorResult<any>> {
-                        return new Promise((resolve) => {
-                            stream.once('data', (data: any) => {
-                                resolve({ value: data, done: false });
-                            });
-                            stream.once('end', () => {
-                                resolve({ value: undefined, done: true });
-                            });
-                            stream.once('error', (err: any) => {
-                                resolve({ value: undefined, done: true });
-                            });
+                        if (queue.length > 0) {
+                            return Promise.resolve({ value: queue.shift(), done: false });
+                        }
+
+                        if (streamError) {
+                            return Promise.reject(streamError);
+                        }
+
+                        if (ended) {
+                            return Promise.resolve({ value: undefined, done: true });
+                        }
+
+                        return new Promise((resolve, reject) => {
+                            waiters.push({ resolve, reject });
                         });
                     },
                 };
