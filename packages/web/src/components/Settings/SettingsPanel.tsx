@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { ConfigureProviderModal } from './ConfigureProviderModal';
+import { providers } from '../../api/client';
 
 interface SettingsPanelProps {
     onClose: () => void;
@@ -13,6 +14,15 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
     const [activeTab, setActiveTab] = useState<'profile' | 'providers' | 'api-keys'>('profile');
     const [configuringProvider, setConfiguringProvider] = useState<{ key: string; name: string } | null>(null);
     const [saveStatus, setSaveStatus] = useState<string | null>(null);
+    const [providerConfigs, setProviderConfigs] = useState<any[]>([]);
+
+    // Fetch provider configs whenever the providers tab is shown (or after a modal closes)
+    useEffect(() => {
+        if (activeTab !== 'providers' || !workspaceId) return;
+        providers.list(workspaceId)
+            .then((data: any) => setProviderConfigs(data?.configs || []))
+            .catch(() => setProviderConfigs([]));
+    }, [activeTab, workspaceId, configuringProvider]); // re-fetch after modal closes
 
     const tabs = [
         { id: 'profile' as const, label: 'Profile', icon: '👤' },
@@ -128,27 +138,47 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                             {activeTab === 'providers' && (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
                                     <p style={{ color: 'var(--color-text-secondary)', fontSize: '0.875rem' }}>
-                                        Configure which LLM provider to use for this workspace.
+                                        Configure which LLM provider to use for this workspace. The <strong>Default</strong> provider is used when no provider is selected in chat.
                                     </p>
 
                                     {['Local (llama.cpp)', 'OpenAI', 'Anthropic', 'Google'].map((name) => {
                                         const key = name.toLowerCase().split(' ')[0];
+                                        const cfg = providerConfigs.find((c: any) => c.provider === key);
+                                        const isConfigured = !!cfg;
+                                        const isDefault = cfg?.is_default || cfg?.isDefault;
+                                        const configuredModel = cfg?.model;
+
                                         return (
                                             <div key={name} className="card" style={{
                                                 display: 'flex',
                                                 alignItems: 'center',
                                                 justifyContent: 'space-between',
                                                 padding: 'var(--space-4)',
+                                                borderColor: isDefault ? 'var(--color-brand)' : undefined,
                                             }}>
                                                 <div>
-                                                    <p style={{ fontWeight: 500 }}>{name}</p>
+                                                    <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
+                                                        <p style={{ fontWeight: 500 }}>{name}</p>
+                                                        {isDefault && (
+                                                            <span className="badge badge-success" style={{ fontSize: '0.7rem' }}>
+                                                                Default
+                                                            </span>
+                                                        )}
+                                                        {isConfigured && !isDefault && (
+                                                            <span className="badge" style={{ fontSize: '0.7rem', opacity: 0.7 }}>
+                                                                Configured
+                                                            </span>
+                                                        )}
+                                                    </div>
                                                     <p style={{
                                                         fontSize: '0.8125rem',
                                                         color: 'var(--color-text-tertiary)',
                                                     }}>
-                                                        {name === 'Local (llama.cpp)'
-                                                            ? 'On-device inference — no API key needed'
-                                                            : 'Cloud provider — requires API key'}
+                                                        {configuredModel
+                                                            ? `Model: ${configuredModel}`
+                                                            : name === 'Local (llama.cpp)'
+                                                                ? 'On-device inference — no API key needed'
+                                                                : 'Cloud provider — requires API key'}
                                                     </p>
                                                 </div>
                                                 <button

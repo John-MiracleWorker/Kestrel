@@ -10,6 +10,7 @@ interface ConfigureProviderModalProps {
 
 export function ConfigureProviderModal({ workspaceId, providerKey, providerName, onClose }: ConfigureProviderModalProps) {
     const [isLoading, setIsLoading] = useState(false);
+    const [isDefault, setIsDefault] = useState(false);
     const [apiKey, setApiKey] = useState('');
     const [model, setModel] = useState('');
     const [error, setError] = useState<string | null>(null);
@@ -18,17 +19,25 @@ export function ConfigureProviderModal({ workspaceId, providerKey, providerName,
     useEffect(() => {
         if (!workspaceId) return;
         setIsLoading(true);
+        setError(null);
         providers.list(workspaceId)
             .then((data: any) => {
                 const configs = data.configs || [];
                 const config = configs.find((c: any) => c.provider === providerKey);
                 if (config) {
-                    setApiKey(config.apiKey || '');
+                    // Check for either camelCase (from gRPC-web sometimes) or snake_case
+                    const remoteKey = config.apiKey || config.apiKeyEncrypted || config.api_key_encrypted;
+                    if (remoteKey && remoteKey.startsWith('provider_key:')) {
+                        setApiKey('••••••••••••'); // Placeholder — key is saved
+                    } else {
+                        setApiKey(remoteKey || '');
+                    }
                     setModel(config.model || '');
+                    setIsDefault(config.isDefault || config.is_default || false);
                 }
             })
-            .catch(() => {
-                // Ignore error if no config exists yet
+            .catch((err: any) => {
+                setError('Could not load saved configuration: ' + (err?.message || 'service unavailable'));
             })
             .finally(() => setIsLoading(false));
     }, [workspaceId, providerKey]);
@@ -37,11 +46,18 @@ export function ConfigureProviderModal({ workspaceId, providerKey, providerName,
         setIsLoading(true);
         setError(null);
         try {
-            await providers.set(workspaceId, providerKey, {
-                apiKey,
+            const payload: any = {
                 model: model || getDefaultModel(providerKey),
-                enabled: true
-            });
+                enabled: true,
+                is_default: isDefault
+            };
+
+            // Only send API Key if it's not the placeholder
+            if (apiKey && apiKey !== '••••••••••••') {
+                payload.apiKey = apiKey;
+            }
+
+            await providers.set(workspaceId, providerKey, payload);
             onClose();
         } catch (err: any) {
             setError(err.message || 'Failed to save configuration');
@@ -54,7 +70,7 @@ export function ConfigureProviderModal({ workspaceId, providerKey, providerName,
         switch (key) {
             case 'openai': return 'gpt-4-turbo';
             case 'anthropic': return 'claude-3-opus-20240229';
-            case 'google': return 'gemini-1.5-pro-latest';
+            case 'google': return 'gemini-1.5-flash';
             case 'local': return 'llama-3-8b-instruct';
             default: return '';
         }
@@ -82,9 +98,20 @@ export function ConfigureProviderModal({ workspaceId, providerKey, providerName,
                 }}
                 onClick={(e) => e.stopPropagation()}
             >
-                <h3 style={{ fontSize: '1.25rem', fontWeight: 600, marginBottom: 'var(--space-4)' }}>
-                    Configure {providerName}
-                </h3>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 'var(--space-4)' }}>
+                    <h3 style={{ fontSize: '1.25rem', fontWeight: 600 }}>
+                        Configure {providerName}
+                    </h3>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+                        <input
+                            type="checkbox"
+                            id="isDefault"
+                            checked={isDefault}
+                            onChange={(e) => setIsDefault(e.target.checked)}
+                        />
+                        <label htmlFor="isDefault" style={{ fontSize: '0.875rem', cursor: 'pointer' }}>Set as Default</label>
+                    </div>
+                </div>
 
                 {error && (
                     <div style={{

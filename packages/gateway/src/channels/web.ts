@@ -179,7 +179,7 @@ export class WebChannelAdapter extends BaseChannelAdapter {
                         workspaceId: incoming.workspaceId,
                         conversationId: incoming.conversationId || '',
                         messages: [{ role: 0, content: msg.content }], // USER = 0
-                        provider: msg.provider || 'local',
+                        provider: msg.provider || '',
                         model: msg.model || '',
                         parameters: msg.parameters || {},
                     });

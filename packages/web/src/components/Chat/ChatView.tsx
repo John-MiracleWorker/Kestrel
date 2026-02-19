@@ -1,6 +1,13 @@
 import { useState, useRef, useEffect, type FormEvent } from 'react';
 import type { Message } from '../../api/client';
 
+const PROVIDER_MODELS: Record<string, string[]> = {
+    google: ['gemini-2.0-flash', 'gemini-1.5-pro'],
+    openai: ['gpt-4o', 'gpt-4o-mini', 'o1', 'o3-mini'],
+    anthropic: ['claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022'],
+    local: ['auto'],
+};
+
 interface ChatViewProps {
     messages: Message[];
     streamingMessage: {
@@ -9,7 +16,7 @@ interface ChatViewProps {
         content: string;
         isStreaming: boolean;
     } | null;
-    onSendMessage: (content: string) => void;
+    onSendMessage: (content: string, provider?: string, model?: string) => void;
     isConnected: boolean;
     conversationTitle?: string;
 }
@@ -22,6 +29,8 @@ export function ChatView({
     conversationTitle,
 }: ChatViewProps) {
     const [input, setInput] = useState('');
+    const [selectedProvider, setSelectedProvider] = useState('');
+    const [selectedModel, setSelectedModel] = useState('');
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -42,8 +51,14 @@ export function ChatView({
         e.preventDefault();
         const trimmed = input.trim();
         if (!trimmed) return;
-        onSendMessage(trimmed);
+        onSendMessage(trimmed, selectedProvider || undefined, selectedModel || undefined);
         setInput('');
+    }
+
+    function handleProviderChange(provider: string) {
+        setSelectedProvider(provider);
+        // Reset model when provider changes; default to first model for that provider
+        setSelectedModel(provider ? (PROVIDER_MODELS[provider]?.[0] ?? '') : '');
     }
 
     function handleKeyDown(e: React.KeyboardEvent) {
@@ -68,7 +83,47 @@ export function ChatView({
                 <h2 style={{ fontSize: '0.9375rem', fontWeight: 600 }}>
                     {conversationTitle || 'New Conversation'}
                 </h2>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
+                    {/* Provider selector */}
+                    <select
+                        value={selectedProvider}
+                        onChange={(e) => handleProviderChange(e.target.value)}
+                        style={{
+                            background: 'var(--color-bg-surface)',
+                            border: '1px solid var(--color-border)',
+                            borderRadius: 'var(--radius-sm)',
+                            color: 'var(--color-text)',
+                            fontSize: '0.8125rem',
+                            padding: '2px var(--space-2)',
+                            cursor: 'pointer',
+                        }}
+                    >
+                        <option value="">Workspace Default</option>
+                        <option value="google">Google</option>
+                        <option value="openai">OpenAI</option>
+                        <option value="anthropic">Anthropic</option>
+                        <option value="local">Local</option>
+                    </select>
+                    {/* Model selector — only shown when a provider is picked */}
+                    {selectedProvider && PROVIDER_MODELS[selectedProvider] && (
+                        <select
+                            value={selectedModel}
+                            onChange={(e) => setSelectedModel(e.target.value)}
+                            style={{
+                                background: 'var(--color-bg-surface)',
+                                border: '1px solid var(--color-border)',
+                                borderRadius: 'var(--radius-sm)',
+                                color: 'var(--color-text)',
+                                fontSize: '0.8125rem',
+                                padding: '2px var(--space-2)',
+                                cursor: 'pointer',
+                            }}
+                        >
+                            {PROVIDER_MODELS[selectedProvider].map((m) => (
+                                <option key={m} value={m}>{m}</option>
+                            ))}
+                        </select>
+                    )}
                     <span className={`badge ${isConnected ? 'badge-success' : 'badge-warning'}`}>
                         {isConnected ? '● Connected' : '○ Disconnected'}
                     </span>

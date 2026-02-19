@@ -7,7 +7,7 @@ and always require human approval.
 
 import logging
 import os
-from typing import Optional
+from typing import Optional, Union
 
 from agent.types import RiskLevel, ToolDefinition
 
@@ -149,7 +149,7 @@ async def database_mutate(
         return {"query": query, "error": str(e)}
 
 
-def _serialize_value(value) -> str | int | float | bool | None:
+def _serialize_value(value) -> Union[str, int, float, bool, None]:
     """Serialize a database value to a JSON-safe type."""
     if value is None:
         return None

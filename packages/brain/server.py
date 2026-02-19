@@ -18,6 +18,7 @@ from datetime import datetime
 
 import grpc
 from grpc import aio as grpc_aio
+from typing import Optional, Union
 from dotenv import load_dotenv
 
 # Generated protobuf stubs (will be generated from proto files)
@@ -52,8 +53,8 @@ DB_URL = os.getenv(
 import asyncpg
 import redis.asyncio as redis
 
-_pool: asyncpg.Pool | None = None
-_redis_pool: redis.Redis | None = None
+_pool: Optional[asyncpg.Pool] = None
+_redis_pool: Optional[redis.Redis] = None
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -223,9 +224,9 @@ async def save_message(conversation_id: str, role: str, content: str) -> str:
 
 # ── LLM Provider Registry ────────────────────────────────────────────
 
-_providers: dict[str, LocalProvider | CloudProvider] = {}
-_retrieval: RetrievalPipeline | None = None
-_embedding_pipeline: EmbeddingPipeline | None = None
+_providers: dict[str, Union[LocalProvider, CloudProvider]] = {}
+_retrieval: Optional[RetrievalPipeline] = None
+_embedding_pipeline: Optional[EmbeddingPipeline] = None
 
 # ── Agent Runtime ────────────────────────────────────────────────────
 
@@ -315,13 +316,20 @@ async def set_provider_config(workspace_id, provider, config):
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        return await conn.fetchrow(query, 
-            workspace_id, provider, config.get('model'), config.get('api_key_encrypted'),
-            config.get('temperature', 0.7), config.get('max_tokens', 2048),
-            config.get('system_prompt'), config.get('rag_enabled', True),
-            config.get('rag_top_k', 5), config.get('rag_min_similarity', 0.3),
-            config.get('is_default', False), json.dumps(config.get('settings', {}))
-        )
+        async with conn.transaction():
+            if config.get('is_default', False):
+                await conn.execute(
+                    "UPDATE workspace_provider_config SET is_default = FALSE WHERE workspace_id = $1",
+                    workspace_id
+                )
+            
+            return await conn.fetchrow(query, 
+                workspace_id, provider, config.get('model'), config.get('api_key_encrypted'),
+                config.get('temperature', 0.7), config.get('max_tokens', 2048),
+                config.get('system_prompt'), config.get('rag_enabled', True),
+                config.get('rag_top_k', 5), config.get('rag_min_similarity', 0.3),
+                config.get('is_default', False), json.dumps(config.get('settings', {}))
+            )
 
 async def delete_provider_config(workspace_id, provider):
     query = "DELETE FROM workspace_provider_config WHERE workspace_id = $1 AND provider = $2"
@@ -773,7 +781,7 @@ class BrainServicer:
                 rag_top_k=row['rag_top_k'],
                 rag_min_similarity=row['rag_min_similarity'],
                 is_default=row['is_default'],
-                # Don't return encrypted key
+                api_key_encrypted=row['api_key_encrypted'] or "",
                 created_at=row['created_at'].isoformat(),
                 updated_at=row['updated_at'].isoformat()
             ))

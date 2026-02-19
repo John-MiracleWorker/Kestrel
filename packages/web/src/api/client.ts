@@ -136,7 +136,8 @@ export const conversations = {
     list: (workspaceId: string) =>
         request<{ conversations: Conversation[] }>(`/workspaces/${workspaceId}/conversations`),
     create: (workspaceId: string) =>
-        request<Conversation>(`/workspaces/${workspaceId}/conversations`, { method: 'POST', body: {} }),
+        request<{ conversation: Conversation }>(`/workspaces/${workspaceId}/conversations`, { method: 'POST', body: {} })
+            .then(res => res.conversation),
     messages: (workspaceId: string, conversationId: string) =>
         request<{ messages: Message[] }>(`/workspaces/${workspaceId}/conversations/${conversationId}/messages`),
 };

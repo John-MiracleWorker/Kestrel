@@ -79,7 +79,7 @@ def register_human_tools(registry) -> None:
 
 async def ask_human(
     question: str,
-    options: list[str] | None = None,
+    options: Optional[list[str]] = None,
 ) -> dict:
     """
     Ask the user a question.
@@ -99,7 +99,7 @@ async def ask_human(
 
 async def task_complete(
     summary: str,
-    artifacts: list[str] | None = None,
+    artifacts: Optional[list[str]] = None,
 ) -> dict:
     """
     Mark the current step as complete.

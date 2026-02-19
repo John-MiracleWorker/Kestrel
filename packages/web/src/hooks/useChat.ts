@@ -11,7 +11,7 @@ interface StreamingMessage {
 interface UseChatReturn {
     messages: Message[];
     streamingMessage: StreamingMessage | null;
-    sendMessage: (content: string) => void;
+    sendMessage: (content: string, provider?: string, model?: string) => void;
     isConnected: boolean;
 }
 
@@ -34,19 +34,13 @@ export function useChat(
 
         ws.onopen = () => {
             setIsConnected(true);
-            // Join conversation
-            ws.send(JSON.stringify({
-                type: 'join',
-                workspaceId,
-                conversationId,
-            }));
         };
 
         ws.onmessage = (event) => {
             const data = JSON.parse(event.data);
 
             switch (data.type) {
-                case 'content_delta':
+                case 'token':
                     contentRef.current += data.content;
                     setStreamingMessage({
                         id: data.messageId || 'streaming',
@@ -71,7 +65,7 @@ export function useChat(
                     break;
 
                 case 'error':
-                    console.error('Chat error:', data.message);
+                    console.error('Chat error:', JSON.stringify(data));
                     setStreamingMessage(null);
                     contentRef.current = '';
                     break;
@@ -92,7 +86,7 @@ export function useChat(
         setMessages(initialMessages);
     }, [initialMessages]);
 
-    const sendMessage = useCallback((content: string) => {
+    const sendMessage = useCallback((content: string, provider?: string, model?: string) => {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
         const userMessage: Message = {
@@ -110,6 +104,8 @@ export function useChat(
             workspaceId,
             conversationId,
             content,
+            ...(provider ? { provider } : {}),
+            ...(model ? { model } : {}),
         }));
     }, [workspaceId, conversationId]);
 
