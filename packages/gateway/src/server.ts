@@ -79,6 +79,9 @@ app.get('/api/mobile/sync', { preHandler: [requireAuth] }, async (req) => {
 // ── Startup ──────────────────────────────────────────────────────────
 async function start() {
     try {
+        let telegramAdapter: TelegramAdapter | undefined;
+        let whatsappAdapter: WhatsAppAdapter | undefined;
+
         // 1. Connect to Redis
         redis = new Redis(config.redisUrl);
         redis.on('error', (err) => logger.error('Redis error', { error: err.message }));
@@ -91,7 +94,26 @@ async function start() {
         await brainClient.connect();
         logger.info(`Brain gRPC connected at ${config.brainGrpcUrl}`);
 
-        // 3. Register route plugins
+        // 3. Instantiate adapters required by route handlers
+        if (process.env.TELEGRAM_BOT_TOKEN) {
+            telegramAdapter = new TelegramAdapter({
+                botToken: process.env.TELEGRAM_BOT_TOKEN,
+                mode: (process.env.TELEGRAM_MODE as 'webhook' | 'polling') || 'polling',
+                webhookUrl: process.env.TELEGRAM_WEBHOOK_URL,
+                defaultWorkspaceId: process.env.DEFAULT_WORKSPACE_ID || 'default',
+            });
+        }
+
+        if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+            whatsappAdapter = new WhatsAppAdapter({
+                accountSid: process.env.TWILIO_ACCOUNT_SID,
+                authToken: process.env.TWILIO_AUTH_TOKEN,
+                fromNumber: process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886',
+                defaultWorkspaceId: process.env.DEFAULT_WORKSPACE_ID || 'default',
+            });
+        }
+
+        // 4. Register route plugins
         const deps = { brainClient, redis };
         await authRoutes(app, deps);
         await workspaceRoutes(app, deps);
@@ -101,14 +123,22 @@ async function start() {
         await providerRoutes(app, deps);
         await taskRoutes(app, { brainClient });
 
-        // 4. Set up metrics
+        if (telegramAdapter) {
+            await telegramWebhookRoutes(app, { telegramAdapter });
+        }
+
+        if (whatsappAdapter) {
+            await whatsappWebhookRoutes(app, { whatsappAdapter });
+        }
+
+        // 5. Set up metrics
         setupMetrics(app);
 
-        // 5. Start Fastify HTTP server
+        // 6. Start Fastify HTTP server
         await app.listen({ port: config.port, host: config.host });
         logger.info(`Gateway listening on ${config.host}:${config.port}`);
 
-        // 6. Set up channel registry + WebSocket adapter
+        // 7. Set up channel registry + WebSocket adapter
         const server = app.server;
         const wss = new WebSocketServer({ server, path: config.wsPath });
 
@@ -121,28 +151,14 @@ async function start() {
         // Future adapters — conditionally enabled via env vars
 
         // Telegram
-        if (process.env.TELEGRAM_BOT_TOKEN) {
-            const tgAdapter = new TelegramAdapter({
-                botToken: process.env.TELEGRAM_BOT_TOKEN,
-                mode: (process.env.TELEGRAM_MODE as 'webhook' | 'polling') || 'polling',
-                webhookUrl: process.env.TELEGRAM_WEBHOOK_URL,
-                defaultWorkspaceId: process.env.DEFAULT_WORKSPACE_ID || 'default',
-            });
-            await channelRegistry.register(tgAdapter);
-            await telegramWebhookRoutes(app, { telegramAdapter: tgAdapter });
+        if (telegramAdapter) {
+            await channelRegistry.register(telegramAdapter);
             logger.info('Telegram adapter enabled');
         }
 
         // WhatsApp (Twilio)
-        if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-            const waAdapter = new WhatsAppAdapter({
-                accountSid: process.env.TWILIO_ACCOUNT_SID,
-                authToken: process.env.TWILIO_AUTH_TOKEN,
-                fromNumber: process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886',
-                defaultWorkspaceId: process.env.DEFAULT_WORKSPACE_ID || 'default',
-            });
-            await channelRegistry.register(waAdapter);
-            await whatsappWebhookRoutes(app, { whatsappAdapter: waAdapter });
+        if (whatsappAdapter) {
+            await channelRegistry.register(whatsappAdapter);
             logger.info('WhatsApp adapter enabled');
         }
 
