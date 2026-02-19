@@ -32,14 +32,13 @@ export class BrainClient {
         );
 
         // Wait for connection (with 5s deadline)
-        return new Promise((resolve, _reject) => {
+        return new Promise((resolve, reject) => {
             const deadline = new Date(Date.now() + 5000);
             this.client.waitForReady(deadline, (err: Error | null) => {
                 if (err) {
                     logger.error('Brain gRPC connection failed', { error: err.message, address: this.address });
-                    // Don't reject — allow Gateway to start without Brain
                     this.connected = false;
-                    resolve();
+                    reject(new Error(`Failed to connect to Brain gRPC at ${this.address}: ${err.message}`));
                 } else {
                     this.connected = true;
                     resolve();

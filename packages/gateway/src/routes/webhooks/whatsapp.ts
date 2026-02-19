@@ -1,4 +1,6 @@
 import { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { logger } from '../../utils/logger';
 
 interface WebhookDeps {
@@ -17,10 +19,15 @@ export default async function whatsappWebhookRoutes(
     deps: WebhookDeps,
 ): Promise<void> {
     const { whatsappAdapter } = deps;
+    const typedApp = app.withTypeProvider<ZodTypeProvider>();
 
-    app.post('/webhooks/whatsapp', async (req, reply) => {
+    const twilioBodySchema = z.record(z.string(), z.string());
+
+    typedApp.post('/webhooks/whatsapp', {
+        schema: { body: twilioBodySchema }
+    }, async (req, reply) => {
         try {
-            const body = req.body as Record<string, string>;
+            const body = req.body as any;
 
             // Validate Twilio signature
             const signature = req.headers['x-twilio-signature'] as string;
@@ -62,7 +69,9 @@ export default async function whatsappWebhookRoutes(
     });
 
     // Status callback endpoint for delivery receipts
-    app.post('/webhooks/whatsapp/status', async (req, reply) => {
+    typedApp.post('/webhooks/whatsapp/status', {
+        schema: { body: twilioBodySchema }
+    }, async (req, reply) => {
         const body = req.body as Record<string, string>;
         logger.info('WhatsApp status callback', {
             messageSid: body.MessageSid,

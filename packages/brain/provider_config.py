@@ -8,6 +8,7 @@ a fallback chain: workspace config → env var → defaults.
 import os
 import logging
 from typing import Optional
+from .encryption import decrypt, encrypt
 
 import asyncpg
 
@@ -39,7 +40,7 @@ class ProviderConfig:
             return {
                 "provider": row["provider"],
                 "model": row["model"] or "",
-                "api_key": row["api_key_encrypted"] or "",  # TODO: decrypt
+                "api_key": decrypt(row["api_key_encrypted"]) if row["api_key_encrypted"] else "",
                 "temperature": float(row["temperature"]),
                 "max_tokens": int(row["max_tokens"]),
                 "system_prompt": row["system_prompt"] or "",
@@ -96,7 +97,7 @@ class ProviderConfig:
                    rag_min_similarity = EXCLUDED.rag_min_similarity,
                    is_default = EXCLUDED.is_default,
                    updated_at = NOW()""",
-            workspace_id, provider, model, api_key,  # TODO: encrypt
+            workspace_id, provider, model, encrypt(api_key),
             temperature, max_tokens, system_prompt,
             rag_enabled, rag_top_k, rag_min_similarity, is_default,
         )

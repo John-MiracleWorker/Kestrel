@@ -1,4 +1,6 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import { z } from 'zod';
+import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { requireAuth, requireWorkspace } from '../auth/middleware';
 import { BrainClient } from '../brain/client';
 import { logger } from '../utils/logger';
@@ -28,24 +30,34 @@ interface AutomationDeps {
  */
 export default async function automationRoutes(app: FastifyInstance, deps: AutomationDeps) {
     const { brainClient } = deps;
+    const typedApp = app.withTypeProvider<ZodTypeProvider>();
+
+    const workspaceParamsSchema = z.object({
+        workspaceId: z.string()
+    });
+    type WorkspaceParams = z.infer<typeof workspaceParamsSchema>;
 
     // ══════════════════════════════════════════════════════════════════
     // CRON JOBS
     // ══════════════════════════════════════════════════════════════════
 
-    // Create a cron job
-    app.post('/api/workspaces/:workspaceId/automation/cron', {
-        preHandler: [requireAuth, requireWorkspace],
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const user = (req as any).user;
-        const { workspaceId } = req.params as any;
-        const { name, description, cronExpression, goal, maxRuns } = req.body as any;
+    const createCronJobSchema = z.object({
+        name: z.string().min(1, 'name is required'),
+        description: z.string().optional(),
+        cronExpression: z.string().min(1, 'cronExpression is required'),
+        goal: z.string().min(1, 'goal is required'),
+        maxRuns: z.number().int().optional()
+    });
+    type CreateCronJobBody = z.infer<typeof createCronJobSchema>;
 
-        if (!name || !cronExpression || !goal) {
-            return reply.status(400).send({
-                error: 'name, cronExpression, and goal are required',
-            });
-        }
+    // Create a cron job
+    typedApp.post('/api/workspaces/:workspaceId/automation/cron', {
+        preHandler: [requireAuth, requireWorkspace],
+        schema: { params: workspaceParamsSchema, body: createCronJobSchema }
+    }, async (req, reply) => {
+        const user = req.user!;
+        const { workspaceId } = req.params as WorkspaceParams;
+        const { name, description, cronExpression, goal, maxRuns } = req.body as CreateCronJobBody;
 
         try {
             const result = await brainClient.createCronJob({
@@ -65,10 +77,11 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
     });
 
     // List cron jobs
-    app.get('/api/workspaces/:workspaceId/automation/cron', {
+    typedApp.get('/api/workspaces/:workspaceId/automation/cron', {
         preHandler: [requireAuth, requireWorkspace],
-    }, async (req: FastifyRequest) => {
-        const { workspaceId } = req.params as any;
+        schema: { params: workspaceParamsSchema }
+    }, async (req) => {
+        const { workspaceId } = req.params as WorkspaceParams;
 
         try {
             const result = await brainClient.listCronJobs(workspaceId);
@@ -79,11 +92,18 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
         }
     });
 
+    const cronJobParamsSchema = z.object({
+        jobId: z.string(),
+        workspaceId: z.string()
+    });
+    type CronJobParams = z.infer<typeof cronJobParamsSchema>;
+
     // Delete a cron job
-    app.delete('/api/workspaces/:workspaceId/automation/cron/:jobId', {
+    typedApp.delete('/api/workspaces/:workspaceId/automation/cron/:jobId', {
         preHandler: [requireAuth, requireWorkspace],
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const { jobId } = req.params as any;
+        schema: { params: cronJobParamsSchema }
+    }, async (req, reply) => {
+        const { jobId } = req.params as CronJobParams;
 
         try {
             await brainClient.deleteCronJob(jobId);
@@ -98,19 +118,22 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
     // WEBHOOKS
     // ══════════════════════════════════════════════════════════════════
 
-    // Create a webhook endpoint
-    app.post('/api/workspaces/:workspaceId/automation/webhooks', {
-        preHandler: [requireAuth, requireWorkspace],
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const user = (req as any).user;
-        const { workspaceId } = req.params as any;
-        const { name, description, goalTemplate, secret } = req.body as any;
+    const createWebhookSchema = z.object({
+        name: z.string().min(1, 'name is required'),
+        description: z.string().optional(),
+        goalTemplate: z.string().min(1, 'goalTemplate is required'),
+        secret: z.string().optional()
+    });
+    type CreateWebhookBody = z.infer<typeof createWebhookSchema>;
 
-        if (!name || !goalTemplate) {
-            return reply.status(400).send({
-                error: 'name and goalTemplate are required',
-            });
-        }
+    // Create a webhook endpoint
+    typedApp.post('/api/workspaces/:workspaceId/automation/webhooks', {
+        preHandler: [requireAuth, requireWorkspace],
+        schema: { params: workspaceParamsSchema, body: createWebhookSchema }
+    }, async (req, reply) => {
+        const user = req.user!;
+        const { workspaceId } = req.params as WorkspaceParams;
+        const { name, description, goalTemplate, secret } = req.body as CreateWebhookBody;
 
         try {
             const result = await brainClient.createWebhook({
@@ -129,10 +152,11 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
     });
 
     // List webhooks
-    app.get('/api/workspaces/:workspaceId/automation/webhooks', {
+    typedApp.get('/api/workspaces/:workspaceId/automation/webhooks', {
         preHandler: [requireAuth, requireWorkspace],
-    }, async (req: FastifyRequest) => {
-        const { workspaceId } = req.params as any;
+        schema: { params: workspaceParamsSchema }
+    }, async (req) => {
+        const { workspaceId } = req.params as WorkspaceParams;
 
         try {
             const result = await brainClient.listWebhooks(workspaceId);
@@ -143,11 +167,18 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
         }
     });
 
+    const webhookParamsSchema = z.object({
+        webhookId: z.string(),
+        workspaceId: z.string()
+    });
+    type WebhookParams = z.infer<typeof webhookParamsSchema>;
+
     // Delete a webhook
-    app.delete('/api/workspaces/:workspaceId/automation/webhooks/:webhookId', {
+    typedApp.delete('/api/workspaces/:workspaceId/automation/webhooks/:webhookId', {
         preHandler: [requireAuth, requireWorkspace],
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const { webhookId } = req.params as any;
+        schema: { params: webhookParamsSchema }
+    }, async (req, reply) => {
+        const { webhookId } = req.params as WebhookParams;
 
         try {
             await brainClient.deleteWebhook(webhookId);
@@ -158,11 +189,16 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
         }
     });
 
+    const triggerWebhookParamsSchema = z.object({
+        webhookId: z.string()
+    });
+    type TriggerWebhookParams = z.infer<typeof triggerWebhookParamsSchema>;
+
     // ── PUBLIC: Trigger a webhook (no auth required) ────────────────
-    app.post('/api/webhooks/:webhookId/trigger', {
-        // No auth — this is the public endpoint external services call
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const { webhookId } = req.params as any;
+    typedApp.post('/api/webhooks/:webhookId/trigger', {
+        schema: { params: triggerWebhookParamsSchema }
+    }, async (req, reply) => {
+        const { webhookId } = req.params as TriggerWebhookParams;
         const payload = JSON.stringify(req.body || {});
         const headers = req.headers as Record<string, string>;
         const sourceIp = req.ip || '';
@@ -194,11 +230,17 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
     // WORKFLOWS
     // ══════════════════════════════════════════════════════════════════
 
+    const listWorkflowsQuerySchema = z.object({
+        category: z.string().optional()
+    });
+    type ListWorkflowsQuery = z.infer<typeof listWorkflowsQuerySchema>;
+
     // List available workflow templates
-    app.get('/api/workflows', {
+    typedApp.get('/api/workflows', {
         preHandler: [requireAuth],
-    }, async (req: FastifyRequest) => {
-        const { category } = req.query as any;
+        schema: { querystring: listWorkflowsQuerySchema }
+    }, async (req) => {
+        const { category } = req.query as ListWorkflowsQuery;
 
         try {
             const result = await brainClient.listWorkflows(category);
@@ -209,11 +251,17 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
         }
     });
 
+    const workflowParamsSchema = z.object({
+        workflowId: z.string()
+    });
+    type WorkflowParams = z.infer<typeof workflowParamsSchema>;
+
     // Get a specific workflow template
-    app.get('/api/workflows/:workflowId', {
+    typedApp.get('/api/workflows/:workflowId', {
         preHandler: [requireAuth],
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const { workflowId } = req.params as any;
+        schema: { params: workflowParamsSchema }
+    }, async (req, reply) => {
+        const { workflowId } = req.params as WorkflowParams;
 
         try {
             const result = await brainClient.getWorkflow(workflowId);
@@ -226,13 +274,26 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
         }
     });
 
+    const launchWorkflowParamsSchema = z.object({
+        workspaceId: z.string(),
+        workflowId: z.string()
+    });
+    type LaunchWorkflowParams = z.infer<typeof launchWorkflowParamsSchema>;
+
+    const launchWorkflowBodySchema = z.object({
+        variables: z.record(z.string(), z.any()).optional(),
+        conversationId: z.string().optional()
+    });
+    type LaunchWorkflowBody = z.infer<typeof launchWorkflowBodySchema>;
+
     // Launch a workflow
-    app.post('/api/workspaces/:workspaceId/workflows/:workflowId/launch', {
+    typedApp.post('/api/workspaces/:workspaceId/workflows/:workflowId/launch', {
         preHandler: [requireAuth, requireWorkspace],
-    }, async (req: FastifyRequest, reply: FastifyReply) => {
-        const user = (req as any).user;
-        const { workspaceId, workflowId } = req.params as any;
-        const { variables, conversationId } = req.body as any;
+        schema: { params: launchWorkflowParamsSchema, body: launchWorkflowBodySchema }
+    }, async (req, reply) => {
+        const user = req.user!;
+        const { workspaceId, workflowId } = req.params as LaunchWorkflowParams;
+        const { variables, conversationId } = req.body as LaunchWorkflowBody;
 
         try {
             // First, start a task via the workflow
@@ -277,7 +338,7 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
             }
             reply.raw.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
         } finally {
-            if (reply.raw.headersSent) {
+            if (!reply.raw.writableEnded) {
                 reply.raw.end();
             }
         }

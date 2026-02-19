@@ -99,10 +99,10 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
         return reply.status(401).send({ error: 'Cannot use refresh token for API access' });
     }
 
-    (req as any).user = {
+    req.user = {
         id: payload.sub,
         email: payload.email,
-        workspaces: payload.workspaces,
+        workspaces: payload.workspaces as any,
     };
 }
 
@@ -116,17 +116,17 @@ export async function requireWorkspace(req: FastifyRequest, reply: FastifyReply)
         return reply.status(400).send({ error: 'Workspace ID required' });
     }
 
-    const user = (req as any).user;
-    if (!user) {
+    const ObjectUser = req.user;
+    if (!ObjectUser) {
         return reply.status(401).send({ error: 'Not authenticated' });
     }
 
-    const membership = user.workspaces?.find((w: any) => w.id === workspaceId);
+    const membership = ObjectUser.workspaces?.find((w: any) => w.id === workspaceId);
     if (!membership) {
         return reply.status(403).send({ error: 'Not a member of this workspace' });
     }
 
-    (req as any).workspace = { id: workspaceId, role: membership.role };
+    req.workspace = { id: workspaceId, role: membership.role as Role };
 }
 
 /**
@@ -136,12 +136,12 @@ export async function requireWorkspace(req: FastifyRequest, reply: FastifyReply)
  */
 export function requireRole(minRole: Role) {
     return async function (req: FastifyRequest, reply: FastifyReply) {
-        const workspace = (req as any).workspace;
-        if (!workspace) {
+        const ObjectWorkspace = req.workspace;
+        if (!ObjectWorkspace) {
             return reply.status(403).send({ error: 'Workspace context required' });
         }
 
-        const userLevel = ROLE_HIERARCHY[workspace.role as Role] || 0;
+        const userLevel = ROLE_HIERARCHY[ObjectWorkspace.role as Role] || 0;
         const requiredLevel = ROLE_HIERARCHY[minRole] || 0;
 
         if (userLevel < requiredLevel) {

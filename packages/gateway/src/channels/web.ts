@@ -39,60 +39,77 @@ export class WebChannelAdapter extends BaseChannelAdapter {
         this.wss.on('connection', async (ws: WebSocket, req) => {
             const socket = ws as AuthenticatedSocket;
 
-            // Authenticate via token in query string or first message
-            const url = new URL(req.url || '/', `http://${req.headers.host}`);
-            const token = url.searchParams.get('token');
+            let authenticated = false;
 
-            if (!token) {
-                socket.send(JSON.stringify({ type: 'error', error: 'Token required' }));
-                socket.close(4001, 'Authentication required');
-                return;
-            }
-
-            let payload: JWTPayload | null = null;
-            try {
-                payload = jwt.verify(token, this.jwtSecret) as JWTPayload;
-            } catch (err: any) {
-                logger.warn('WS Token verification failed', {
-                    error: err.message,
-                    tokenPreview: token.substring(0, 10) + '...',
-                    secretLength: this.jwtSecret.length
-                });
-                payload = null;
-            }
-            if (!payload) {
-                socket.send(JSON.stringify({ type: 'error', error: 'Invalid token' }));
-                socket.close(4001, 'Invalid token');
-                return;
-            }
-
-            // Set up authenticated socket
-            socket.userId = payload.sub;
-            socket.email = payload.email;
-            socket.sessionId = randomUUID();
-            socket.isAlive = true;
-
-            // Register connection
-            this.connections.set(socket.userId, socket);
-            wsConnectionsGauge.inc();
-
-            await this.sessions.create(socket.sessionId, {
-                userId: socket.userId,
-                email: socket.email,
-                channel: 'web',
-                connectedAt: new Date().toISOString(),
-            });
-
-            logger.info('WebSocket connected', { userId: socket.userId, sessionId: socket.sessionId });
-            socket.send(JSON.stringify({ type: 'connected', sessionId: socket.sessionId }));
+            const authTimeout = setTimeout(() => {
+                if (!authenticated) {
+                    socket.send(JSON.stringify({ type: 'error', error: 'Authentication timeout' }));
+                    socket.close(4008, 'Authentication timeout');
+                }
+            }, 5000);
 
             // Handle messages
             socket.on('message', async (data) => {
                 try {
                     const msg = JSON.parse(data.toString());
+
+                    if (!authenticated) {
+                        if (msg.type === 'auth') {
+                            const token = msg.token;
+                            if (!token) {
+                                socket.send(JSON.stringify({ type: 'error', error: 'Token required' }));
+                                socket.close(4001, 'Authentication required');
+                                return;
+                            }
+
+                            let payload: JWTPayload | null = null;
+                            try {
+                                payload = jwt.verify(token, this.jwtSecret) as JWTPayload;
+                            } catch (err: any) {
+                                logger.warn('WS Token verification failed', {
+                                    error: err.message,
+                                    tokenPreview: token.substring(0, 10) + '...',
+                                });
+                            }
+
+                            if (!payload) {
+                                socket.send(JSON.stringify({ type: 'error', error: 'Invalid token' }));
+                                socket.close(4001, 'Invalid token');
+                                return;
+                            }
+
+                            clearTimeout(authTimeout);
+                            authenticated = true;
+
+                            // Set up authenticated socket
+                            socket.userId = payload.sub;
+                            socket.email = payload.email;
+                            socket.sessionId = randomUUID();
+                            socket.isAlive = true;
+
+                            // Register connection
+                            this.connections.set(socket.userId, socket);
+                            wsConnectionsGauge.inc();
+
+                            await this.sessions.create(socket.sessionId, {
+                                userId: socket.userId,
+                                email: socket.email,
+                                channel: 'web',
+                                connectedAt: new Date().toISOString(),
+                            });
+
+                            logger.info('WebSocket authenticated', { userId: socket.userId, sessionId: socket.sessionId });
+                            socket.send(JSON.stringify({ type: 'connected', sessionId: socket.sessionId }));
+                        } else {
+                            socket.send(JSON.stringify({ type: 'error', error: 'Authentication required' }));
+                        }
+                        return;
+                    }
+
+                    if (msg.type === 'auth') return; // Ignore subsequent auth
                     await this.handleMessage(socket, msg);
                 } catch (err) {
-                    logger.error('WebSocket message error', { error: (err as Error).message, userId: socket.userId });
+                    logger.error('WebSocket message error', { error: (err as Error).message, userId: socket.userId || 'unauthenticated' });
                     socket.send(JSON.stringify({ type: 'error', error: 'Invalid message format' }));
                 }
             });

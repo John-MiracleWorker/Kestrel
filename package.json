@@ -13,7 +13,17 @@
     "lint": "npm run lint --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "clean": "rm -rf packages/*/node_modules packages/*/dist node_modules",
-    "proto:compile": "npm run proto:compile --workspace=@kestrel/shared"
+    "proto:compile": "npm run proto:compile --workspace=@kestrel/shared",
+    "prepare": "husky install"
+  },
+  "lint-staged": {
+    "**/*.{ts,tsx,js,jsx}": [
+      "eslint --fix",
+      "prettier --write"
+    ],
+    "**/*.{json,css,md}": [
+      "prettier --write"
+    ]
   },
   "engines": {
     "node": ">=18.0.0",
@@ -31,5 +41,10 @@
     "automation"
   ],
   "author": "",
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "husky": "^9.1.7",
+    "lint-staged": "^16.2.7",
+    "prettier": "^3.8.1"
+  }
 }
