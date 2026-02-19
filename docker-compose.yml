@@ -1,5 +1,5 @@
 # ============================================================
-# Libre Bird Platform — Docker Compose
+# Kestrel Platform — Docker Compose
 # Gateway (Node.js) + Brain (Python) + Hands (Python)
 # + PostgreSQL + Redis
 # ============================================================
@@ -124,7 +124,7 @@ services:
       context: ./packages/web
       dockerfile: Dockerfile
     ports:
-      - "5174:80"
+      - "5173:80"
     depends_on:
       - gateway
 

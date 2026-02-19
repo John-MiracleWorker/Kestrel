@@ -771,14 +771,14 @@ class BrainServicer:
             
             # Allow "smart" title generation:
             response_chunks = []
-            async for chunk in provider.stream_chat(
+            async for token in provider.stream(
                 messages=[{"role": "user", "content": prompt}],
-                model="default",
-                parameters={"temperature": 0.3, "max_tokens": 20}
+                model="",
+                temperature=0.3,
+                max_tokens=20,
             ):
-                 if chunk.get("type") == "content_delta":
-                     response_chunks.append(chunk["content_delta"])
-            
+                response_chunks.append(token)
+
             generated_title = "".join(response_chunks).strip().strip('"')
             
             # Update the title in DB

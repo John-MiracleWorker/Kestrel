@@ -294,11 +294,9 @@ class CloudProvider:
     def _list_anthropic_models(self) -> list[dict]:
         # Return hardcoded list as Anthropic doesn't have a simple list endpoint purely for models
         return [
-            {"id": "claude-3-opus-20240229", "name": "Claude 3 Opus", "context_window": "200k"},
-            {"id": "claude-3-sonnet-20240229", "name": "Claude 3 Sonnet", "context_window": "200k"},
-            {"id": "claude-3-haiku-20240307", "name": "Claude 3 Haiku", "context_window": "200k"},
-            {"id": "claude-3-5-sonnet-20240620", "name": "Claude 3.5 Sonnet", "context_window": "200k"},
-            {"id": "claude-3-5-haiku-20241022", "name": "Claude 3.5 Haiku", "context_window": "200k"},
+            {"id": "claude-opus-4-6", "name": "Claude Opus 4.6", "context_window": "200k"},
+            {"id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5", "context_window": "200k"},
+            {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5", "context_window": "200k"},
         ]
 
     async def _list_google_models(self, api_key: str) -> list[dict]:
