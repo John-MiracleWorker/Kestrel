@@ -618,11 +618,11 @@ class BrainServicer:
         for name, provider in _providers.items():
             status[name] = "ready" if provider.is_ready() else "not_ready"
 
-        return {
-            "healthy": True,
-            "version": "0.1.0",
-            "status": status,
-        }
+        return brain_pb2.HealthCheckResponse(
+            healthy=True,
+            version="0.1.0",
+            status=status,
+        )
 
     # ── Extended RPCs (user/workspace/conversation management) ────────
 
@@ -880,20 +880,41 @@ class BrainServicer:
         # Store the running task handle
         _running_tasks[task.id] = task
 
+        event_type_map = {
+            "plan_created": brain_pb2.TaskEvent.EventType.PLAN_CREATED,
+            "step_started": brain_pb2.TaskEvent.EventType.STEP_STARTED,
+            "tool_called": brain_pb2.TaskEvent.EventType.TOOL_CALLED,
+            "tool_result": brain_pb2.TaskEvent.EventType.TOOL_RESULT,
+            "step_complete": brain_pb2.TaskEvent.EventType.STEP_COMPLETE,
+            "approval_needed": brain_pb2.TaskEvent.EventType.APPROVAL_NEEDED,
+            "thinking": brain_pb2.TaskEvent.EventType.THINKING,
+            "task_complete": brain_pb2.TaskEvent.EventType.TASK_COMPLETE,
+            "task_failed": brain_pb2.TaskEvent.EventType.TASK_FAILED,
+            "task_paused": brain_pb2.TaskEvent.EventType.TASK_PAUSED,
+        }
+
         # Run the agent loop and stream events
         try:
             async for event in _agent_loop.run(task):
-                yield {
-                    "type": event.type.value if hasattr(event.type, 'value') else event.type,
-                    "task_id": event.task_id,
-                    "step_id": event.step_id or "",
-                    "content": event.content,
-                    "tool_name": event.tool_name or "",
-                    "tool_args": event.tool_args or "",
-                    "tool_result": event.tool_result or "",
-                    "approval_id": event.approval_id or "",
-                    "progress": {k: str(v) for k, v in (event.progress or {}).items()},
-                }
+                event_type_value = event.type.value if hasattr(event.type, "value") else str(event.type)
+                yield brain_pb2.TaskEvent(
+                    type=event_type_map.get(event_type_value, brain_pb2.TaskEvent.EventType.THINKING),
+                    task_id=event.task_id,
+                    step_id=event.step_id or "",
+                    content=event.content,
+                    tool_name=event.tool_name or "",
+                    tool_args=event.tool_args or "",
+                    tool_result=event.tool_result or "",
+                    approval_id=event.approval_id or "",
+                    progress={k: str(v) for k, v in (event.progress or {}).items()},
+                )
+        except Exception as e:
+            logger.error(f"StartTask error for task {task.id}: {e}", exc_info=True)
+            yield brain_pb2.TaskEvent(
+                type=brain_pb2.TaskEvent.EventType.TASK_FAILED,
+                task_id=task.id,
+                content=str(e),
+            )
         finally:
             _running_tasks.pop(task.id, None)
 
@@ -921,9 +942,9 @@ class BrainServicer:
                 status=ApprovalStatus.APPROVED if request.approved else ApprovalStatus.DENIED,
                 decided_by=request.user_id,
             )
-            return {"success": True, "error": ""}
+            return brain_pb2.ApproveActionResponse(success=True, error="")
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            return brain_pb2.ApproveActionResponse(success=False, error=str(e))
 
     async def CancelTask(self, request, context):
         """Cancel a running agent task."""
@@ -934,7 +955,7 @@ class BrainServicer:
             task.status = "cancelled"
             await _agent_persistence.update_task(task)
             _running_tasks.pop(task_id, None)
-            return {"success": True}
+            return brain_pb2.CancelTaskResponse(success=True)
 
         # Try updating DB directly
         pool = await get_pool()
@@ -942,7 +963,7 @@ class BrainServicer:
             "UPDATE agent_tasks SET status = 'cancelled' WHERE id = $1",
             task_id,
         )
-        return {"success": True}
+        return brain_pb2.CancelTaskResponse(success=True)
 
     async def ListTasks(self, request, context):
         """List agent tasks for a user/workspace."""
