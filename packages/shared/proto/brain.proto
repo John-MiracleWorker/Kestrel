@@ -22,7 +22,9 @@ service BrainService {
   rpc ListConversations(ListConversationsRequest) returns (ListConversationsResponse);
   rpc CreateConversation(CreateConversationRequest) returns (ConversationResponse);
   rpc GetMessages(GetMessagesRequest) returns (GetMessagesResponse);
-
+  rpc UpdateConversation(UpdateConversationRequest) returns (ConversationResponse);
+  rpc DeleteConversation(DeleteConversationRequest) returns (DeleteConversationResponse);
+  rpc GenerateTitle(GenerateTitleRequest) returns (GenerateTitleResponse);
   // ── Mobile / Sync ────────────────────────────────────────────
   rpc RegisterPushToken(RegisterPushTokenRequest) returns (RegisterPushTokenResponse);
   rpc GetUpdates(GetUpdatesRequest) returns (GetUpdatesResponse);

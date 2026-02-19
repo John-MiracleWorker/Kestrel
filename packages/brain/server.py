@@ -207,6 +207,36 @@ async def get_messages(user_id: str, workspace_id: str, conversation_id: str) ->
     ]
 
 
+async def delete_conversation(user_id: str, workspace_id: str, conversation_id: str) -> bool:
+    pool = await get_pool()
+    # Verify ownership/membership before deleting? 
+    # For now, we trust the workspace_id check implicitly via the query
+    result = await pool.execute(
+        "DELETE FROM conversations WHERE id = $1 AND workspace_id = $2",
+        conversation_id, workspace_id
+    )
+    return result != "DELETE 0"
+
+
+async def update_conversation_title(user_id: str, workspace_id: str, conversation_id: str, title: str) -> dict:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """UPDATE conversations SET title = $1, updated_at = NOW()
+           WHERE id = $2 AND workspace_id = $3
+           RETURNING id, title, created_at, updated_at""",
+        title, conversation_id, workspace_id
+    )
+    if not row:
+        raise ValueError("Conversation not found")
+    
+    return {
+        "id": str(row["id"]),
+        "title": row["title"],
+        "createdAt": row["created_at"].isoformat(),
+        "updatedAt": row["updated_at"].isoformat()
+    }
+
+
 async def save_message(conversation_id: str, role: str, content: str) -> str:
     pool = await get_pool()
     msg_id = str(uuid.uuid4())
@@ -600,6 +630,91 @@ class BrainServicer:
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
             context.set_details(str(e))
             return brain_pb2.GetMessagesResponse()
+
+    async def DeleteConversation(self, request, context):
+        try:
+            success = await delete_conversation(
+                request.user_id, request.workspace_id, request.conversation_id
+            )
+            return brain_pb2.DeleteConversationResponse(success=success)
+        except Exception as e:
+            logger.error(f"DeleteConversation error: {e}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            return brain_pb2.DeleteConversationResponse(success=False)
+
+    async def UpdateConversation(self, request, context):
+        try:
+            data = await update_conversation_title(
+                request.user_id, request.workspace_id, request.conversation_id, request.title
+            )
+            return brain_pb2.ConversationResponse(
+                id=data["id"],
+                title=data["title"],
+                created_at=data["createdAt"],
+                updated_at=data["updatedAt"]
+            )
+        except ValueError:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            return brain_pb2.ConversationResponse()
+        except Exception as e:
+            logger.error(f"UpdateConversation error: {e}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            return brain_pb2.ConversationResponse()
+
+    async def GenerateTitle(self, request, context):
+        """Generate a title for the conversation using the LLM."""
+        try:
+            # 1. Fetch messages
+            messages = await get_messages(
+                request.user_id, request.workspace_id, request.conversation_id
+            )
+            if not messages:
+                return brain_pb2.GenerateTitleResponse(title="New Conversation")
+
+            # 2. Construct prompt
+            conversation_text = ""
+            for m in messages[:6]: # Use first few messages
+                conversation_text += f"{m['role']}: {m['content']}\n"
+            
+            prompt = (
+                "Summarize the following conversation into a short, concise title (max 6 words). "
+                "Do not use quotes. Just the title.\n\n"
+                f"{conversation_text}"
+            )
+
+            # 3. Call LLM (using default/local provider for now)
+            # Ideally we use the workspace's configured provider, but for simplicity:
+            provider = get_provider("local") 
+            # Note: We might need to check if 'local' is valid or use workspace config
+            # But getting workspace config requires DB lookup. 
+            # For now, let's try to use the configured provider logic if possible, 
+            # or fall back to a "system" provider.
+            
+            # Simple approach: Use local if available, otherwise just return first user message truncated
+            
+            # Allow "smart" title generation:
+            response_chunks = []
+            async for chunk in provider.stream_chat(
+                messages=[{"role": "user", "content": prompt}],
+                model="default",
+                parameters={"temperature": 0.3, "max_tokens": 20}
+            ):
+                 if chunk.get("type") == "content_delta":
+                     response_chunks.append(chunk["content_delta"])
+            
+            generated_title = "".join(response_chunks).strip().strip('"')
+            
+            # Update the title in DB
+            await update_conversation_title(
+                request.user_id, request.workspace_id, request.conversation_id, generated_title
+            )
+
+            return brain_pb2.GenerateTitleResponse(title=generated_title)
+
+        except Exception as e:
+            logger.error(f"GenerateTitle error: {e}")
+            # Fallback
+            return brain_pb2.GenerateTitleResponse(title="New Conversation")
 
     async def RegisterPushToken(self, request, context):
         # Phase 2: implement push token storage

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { createChatSocket, type Message } from '../api/client';
+import { createChatSocket, conversations, type Message } from '../api/client';
 
 interface StreamingMessage {
     id: string;
@@ -80,6 +80,20 @@ export function useChat(
             wsRef.current = null;
         };
     }, [workspaceId, conversationId]);
+
+    // Automatic title generation trigger
+    useEffect(() => {
+        if (workspaceId && conversationId && messages.length === 2 && messages[1].role === 'assistant') {
+            conversations.generateTitle(workspaceId, conversationId)
+                .then(newTitle => {
+                    const event = new CustomEvent('conversation-title-changed', {
+                        detail: { conversationId, newTitle }
+                    });
+                    window.dispatchEvent(event);
+                })
+                .catch(err => console.error('Failed to auto-generate title:', err));
+        }
+    }, [messages.length, workspaceId, conversationId]);
 
     // Update messages when initialMessages change
     useEffect(() => {

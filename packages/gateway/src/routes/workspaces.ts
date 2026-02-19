@@ -106,6 +106,49 @@ export default async function workspaceRoutes(app: FastifyInstance, deps: Worksp
         return { messages: await brainClient.getMessages(user.id, workspaceId, conversationId) };
     });
 
+    // ── Delete Conversation ──────────────────────────────────────────
+    app.delete('/api/workspaces/:workspaceId/conversations/:conversationId', {
+        preHandler: [requireAuth, requireWorkspace],
+    }, async (req: FastifyRequest, reply: FastifyReply) => {
+        const user = (req as any).user;
+        const { workspaceId, conversationId } = req.params as any;
+        try {
+            const success = await brainClient.deleteConversation(user.id, workspaceId, conversationId);
+            return { success };
+        } catch (err: any) {
+            return reply.status(500).send({ error: err.message });
+        }
+    });
+
+    // ── Update Conversation (Rename) ─────────────────────────────────
+    app.patch('/api/workspaces/:workspaceId/conversations/:conversationId', {
+        preHandler: [requireAuth, requireWorkspace],
+    }, async (req: FastifyRequest, reply: FastifyReply) => {
+        const user = (req as any).user;
+        const { workspaceId, conversationId } = req.params as any;
+        const { title } = req.body as any;
+        try {
+            const conversation = await brainClient.updateConversation(user.id, workspaceId, conversationId, title);
+            return { conversation };
+        } catch (err: any) {
+            return reply.status(500).send({ error: err.message });
+        }
+    });
+
+    // ── Generate Title ───────────────────────────────────────────────
+    app.post('/api/workspaces/:workspaceId/conversations/:conversationId/generate-title', {
+        preHandler: [requireAuth, requireWorkspace],
+    }, async (req: FastifyRequest, reply: FastifyReply) => {
+        const user = (req as any).user;
+        const { workspaceId, conversationId } = req.params as any;
+        try {
+            const title = await brainClient.generateTitle(user.id, workspaceId, conversationId);
+            return { title };
+        } catch (err: any) {
+            return reply.status(500).send({ error: err.message });
+        }
+    });
+
     // ── Invitation Routes ────────────────────────────────────────────
 
     // Send an invite

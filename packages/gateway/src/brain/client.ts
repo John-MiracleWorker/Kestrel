@@ -150,6 +150,42 @@ export class BrainClient {
         });
     }
 
+    async deleteConversation(userId: string, workspaceId: string, conversationId: string): Promise<boolean> {
+        return new Promise((resolve, reject) => {
+            this.client.DeleteConversation(
+                { user_id: userId, workspace_id: workspaceId, conversation_id: conversationId },
+                (err: any, response: any) => {
+                    if (err) reject(new Error(err.details || err.message));
+                    else resolve(response.success);
+                }
+            );
+        });
+    }
+
+    async updateConversation(userId: string, workspaceId: string, conversationId: string, title: string): Promise<any> {
+        return new Promise((resolve, reject) => {
+            this.client.UpdateConversation(
+                { user_id: userId, workspace_id: workspaceId, conversation_id: conversationId, title },
+                (err: any, response: any) => {
+                    if (err) reject(new Error(err.details || err.message));
+                    else resolve(response);
+                }
+            );
+        });
+    }
+
+    async generateTitle(userId: string, workspaceId: string, conversationId: string): Promise<string> {
+        return new Promise((resolve, reject) => {
+            this.client.GenerateTitle(
+                { user_id: userId, workspace_id: workspaceId, conversation_id: conversationId },
+                (err: any, response: any) => {
+                    if (err) reject(new Error(err.details || err.message));
+                    else resolve(response.title);
+                }
+            );
+        });
+    }
+
     async createWorkspace(userId: string, name: string): Promise<any> {
         return new Promise((resolve, reject) => {
             this.client.CreateWorkspace(
@@ -404,7 +440,7 @@ export class BrainClient {
         return this.call('GetWorkflow', { workflow_id: workflowId });
     }
 
-    async *launchWorkflow(data: any): AsyncIterable<any> {
+    async * launchWorkflow(data: any): AsyncIterable<any> {
         // Workflows are streamed, so we need a stream method
         if (!this.connected) throw new Error('Brain service not connected');
 
