@@ -15,6 +15,8 @@ interface UseChatReturn {
     isConnected: boolean;
 }
 
+const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 15000]; // exponential backoff
+
 export function useChat(
     workspaceId: string | null,
     conversationId: string | null,
@@ -25,18 +27,24 @@ export function useChat(
     const [isConnected, setIsConnected] = useState(false);
     const wsRef = useRef<WebSocket | null>(null);
     const contentRef = useRef('');
+    const reconnectAttemptRef = useRef(0);
+    const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const isMountedRef = useRef(true);
 
-    useEffect(() => {
-        if (!workspaceId || !conversationId) return;
+    const connectSocket = useCallback(() => {
+        if (!workspaceId || !conversationId || !isMountedRef.current) return;
 
         const ws = createChatSocket();
         wsRef.current = ws;
 
         ws.onopen = () => {
+            if (!isMountedRef.current) return;
             setIsConnected(true);
+            reconnectAttemptRef.current = 0;
         };
 
         ws.onmessage = (event) => {
+            if (!isMountedRef.current) return;
             const data = JSON.parse(event.data);
 
             switch (data.type) {
@@ -72,18 +80,50 @@ export function useChat(
             }
         };
 
-        ws.onclose = () => setIsConnected(false);
-        ws.onerror = () => setIsConnected(false);
-
-        return () => {
-            ws.close();
-            wsRef.current = null;
+        const handleDisconnect = () => {
+            if (!isMountedRef.current) return;
+            setIsConnected(false);
+            // Schedule reconnect with backoff
+            const attempt = reconnectAttemptRef.current;
+            const delay = RECONNECT_DELAYS[Math.min(attempt, RECONNECT_DELAYS.length - 1)];
+            reconnectAttemptRef.current = attempt + 1;
+            reconnectTimerRef.current = setTimeout(connectSocket, delay);
         };
+
+        ws.onclose = handleDisconnect;
+        ws.onerror = () => setIsConnected(false);
     }, [workspaceId, conversationId]);
 
-    // Automatic title generation trigger
     useEffect(() => {
-        if (workspaceId && conversationId && messages.length === 2 && messages[1].role === 'assistant') {
+        if (!workspaceId || !conversationId) return;
+
+        isMountedRef.current = true;
+        reconnectAttemptRef.current = 0;
+        connectSocket();
+
+        return () => {
+            isMountedRef.current = false;
+            if (reconnectTimerRef.current) {
+                clearTimeout(reconnectTimerRef.current);
+                reconnectTimerRef.current = null;
+            }
+            wsRef.current?.close();
+            wsRef.current = null;
+        };
+    }, [workspaceId, conversationId, connectSocket]);
+
+    // Automatic title generation trigger — fires after first assistant reply
+    const titleGeneratedRef = useRef(false);
+    useEffect(() => {
+        if (
+            workspaceId &&
+            conversationId &&
+            !titleGeneratedRef.current &&
+            messages.length >= 2 &&
+            messages.some(m => m.role === 'user') &&
+            messages.some(m => m.role === 'assistant')
+        ) {
+            titleGeneratedRef.current = true;
             conversations.generateTitle(workspaceId, conversationId)
                 .then(newTitle => {
                     const event = new CustomEvent('conversation-title-changed', {
@@ -93,7 +133,12 @@ export function useChat(
                 })
                 .catch(err => console.error('Failed to auto-generate title:', err));
         }
-    }, [messages.length, workspaceId, conversationId]);
+    }, [messages, workspaceId, conversationId]);
+
+    // Reset title gen flag when conversation changes
+    useEffect(() => {
+        titleGeneratedRef.current = false;
+    }, [conversationId]);
 
     // Update messages when initialMessages change
     useEffect(() => {
@@ -101,7 +146,10 @@ export function useChat(
     }, [initialMessages]);
 
     const sendMessage = useCallback((content: string, provider?: string, model?: string) => {
-        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+            console.warn('WebSocket not ready, message dropped');
+            return;
+        }
 
         const userMessage: Message = {
             id: crypto.randomUUID(),

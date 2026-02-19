@@ -56,6 +56,15 @@ class ToolRegistry:
         tool = self._definitions.get(name)
         return tool.risk_level if tool else RiskLevel.HIGH  # Unknown = HIGH
 
+    def filter(self, allowed_names: list[str]) -> "ToolRegistry":
+        """Return a new registry containing only the named tools."""
+        filtered = ToolRegistry()
+        for name in allowed_names:
+            if name in self._definitions:
+                filtered._definitions[name] = self._definitions[name]
+                filtered._handlers[name] = self._handlers[name]
+        return filtered
+
     async def execute(self, tool_call: ToolCall) -> ToolResult:
         """
         Execute a tool call and return the result.
