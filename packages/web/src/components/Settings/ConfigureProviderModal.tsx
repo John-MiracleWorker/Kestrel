@@ -42,6 +42,38 @@ export function ConfigureProviderModal({ workspaceId, providerKey, providerName,
             .finally(() => setIsLoading(false));
     }, [workspaceId, providerKey]);
 
+    const [availableModels, setAvailableModels] = useState<any[]>([]);
+    const [loadingModels, setLoadingModels] = useState(false);
+
+    // Fetch models when provider or apiKey changes
+    useEffect(() => {
+        if (!workspaceId) return;
+
+        // Debounce to avoid spamming while typing key
+        const timer = setTimeout(() => {
+            fetchModels();
+        }, 500);
+
+        return () => clearTimeout(timer);
+    }, [workspaceId, providerKey, apiKey]);
+
+    const fetchModels = () => {
+        // If we have a masked key, we don't send it (backend uses stored key)
+        // If we have an entered key, we send it
+        const keyToSend = apiKey === '••••••••••••' ? undefined : apiKey;
+
+        setLoadingModels(true);
+        providers.listModels(workspaceId, providerKey, keyToSend)
+            .then(models => {
+                setAvailableModels(models || []);
+            })
+            .catch(err => {
+                console.warn('Failed to fetch models', err);
+                setAvailableModels([]);
+            })
+            .finally(() => setLoadingModels(false));
+    };
+
     const handleSave = async () => {
         setIsLoading(true);
         setError(null);
@@ -68,8 +100,8 @@ export function ConfigureProviderModal({ workspaceId, providerKey, providerName,
 
     const getDefaultModel = (key: string) => {
         switch (key) {
-            case 'openai': return 'gpt-4-turbo';
-            case 'anthropic': return 'claude-3-opus-20240229';
+            case 'openai': return 'gpt-4o';
+            case 'anthropic': return 'claude-3-5-sonnet-20240620';
             case 'google': return 'gemini-1.5-flash';
             case 'local': return 'llama-3-8b-instruct';
             default: return '';
@@ -141,15 +173,25 @@ export function ConfigureProviderModal({ workspaceId, providerKey, providerName,
                     )}
 
                     <div className="form-group">
-                        <label>Model</label>
+                        <label style={{ display: 'flex', justifyContent: 'space-between' }}>
+                            Model
+                            {loadingModels && <span style={{ fontSize: '0.75rem', opacity: 0.7 }}>Fetching models...</span>}
+                        </label>
                         <input
                             className="input"
                             value={model}
                             onChange={(e) => setModel(e.target.value)}
                             placeholder={getDefaultModel(providerKey)}
+                            list={`models-${providerKey}`}
+                            autoComplete="off"
                         />
+                        <datalist id={`models-${providerKey}`}>
+                            {availableModels.map(m => (
+                                <option key={m.id} value={m.id}>{m.name}</option>
+                            ))}
+                        </datalist>
                         <p style={{ fontSize: '0.75rem', color: 'var(--color-text-tertiary)', marginTop: 'var(--space-1)' }}>
-                            Leave blank to use default: {getDefaultModel(providerKey)}
+                            Selected: {model || 'Default'}
                         </p>
                     </div>
 

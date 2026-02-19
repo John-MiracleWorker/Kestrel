@@ -33,6 +33,7 @@ service BrainService {
   rpc ListProviderConfigs(ListProviderConfigsRequest) returns (ListProviderConfigsResponse);
   rpc SetProviderConfig(SetProviderConfigRequest) returns (SetProviderConfigResponse);
   rpc DeleteProviderConfig(DeleteProviderConfigRequest) returns (DeleteProviderConfigResponse);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
 
   // ── Autonomous Agent ────────────────────────────────────────
   rpc StartTask(StartTaskRequest) returns (stream TaskEvent);
@@ -286,6 +287,22 @@ message DeleteProviderConfigRequest {
 
 message DeleteProviderConfigResponse {
   bool success = 1;
+}
+
+message ListModelsRequest {
+  string provider = 1;
+  string api_key = 2; // Optional: use if not configured in workspace
+  string workspace_id = 3;
+}
+
+message Model {
+  string id = 1;
+  string name = 2; // Display name or description
+  string context_window = 3;
+}
+
+message ListModelsResponse {
+  repeated Model models = 1;
 }
 
 // ═══════════════════════════════════════════════════════════════

@@ -254,6 +254,75 @@ class CloudProvider:
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
 
+    async def list_models(self, api_key: str = "") -> list[dict]:
+        """List available models from the provider."""
+        request_key = api_key or self._api_key
+        if not request_key:
+            return []
+
+        if self.provider == "openai":
+            return await self._list_openai_models(request_key)
+        elif self.provider == "anthropic":
+            return self._list_anthropic_models() # Anthropic has no public list endpoint yet
+        elif self.provider == "google":
+            return await self._list_google_models(request_key)
+        return []
+
+    async def _list_openai_models(self, api_key: str) -> list[dict]:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            try:
+                resp = await client.get("https://api.openai.com/v1/models", headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                models = []
+                for m in data.get("data", []):
+                    # Filter for chat models to avoid clutter
+                    if "gpt" in m["id"] or "o1" in m["id"]:
+                        models.append({
+                            "id": m["id"],
+                            "name": m["id"],
+                            "context_window": "128k" # Placeholder, strict context not in list endpoint
+                        })
+                return sorted(models, key=lambda x: x["id"], reverse=True)
+            except Exception as e:
+                logger.error(f"Failed to list OpenAI models: {e}")
+                return []
+
+    def _list_anthropic_models(self) -> list[dict]:
+        # Return hardcoded list as Anthropic doesn't have a simple list endpoint purely for models
+        return [
+            {"id": "claude-3-opus-20240229", "name": "Claude 3 Opus", "context_window": "200k"},
+            {"id": "claude-3-sonnet-20240229", "name": "Claude 3 Sonnet", "context_window": "200k"},
+            {"id": "claude-3-haiku-20240307", "name": "Claude 3 Haiku", "context_window": "200k"},
+            {"id": "claude-3-5-sonnet-20240620", "name": "Claude 3.5 Sonnet", "context_window": "200k"},
+            {"id": "claude-3-5-haiku-20241022", "name": "Claude 3.5 Haiku", "context_window": "200k"},
+        ]
+
+    async def _list_google_models(self, api_key: str) -> list[dict]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        async with httpx.AsyncClient(timeout=30) as client:
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+                models = []
+                for m in data.get("models", []):
+                    # Filter for generateContent supported models
+                    if "generateContent" in m.get("supportedGenerationMethods", []):
+                        name = m["name"].replace("models/", "")
+                        models.append({
+                            "id": name,
+                            "name": m.get("displayName", name),
+                            "context_window": str(m.get("inputTokenLimit", "Unknown"))
+                        })
+                return sorted(models, key=lambda x: x["id"], reverse=True)
+            except Exception as e:
+                logger.error(f"Failed to list Google models: {e}")
+                return []
+
     async def generate(
         self,
         messages: list[dict],

@@ -149,6 +149,22 @@ export default async function workspaceRoutes(app: FastifyInstance, deps: Worksp
         }
     });
 
+    // ── Provider Models ──────────────────────────────────────────────
+    app.get('/api/workspaces/:workspaceId/providers/:provider/models', {
+        preHandler: [requireAuth, requireWorkspace],
+    }, async (req: FastifyRequest, reply: FastifyReply) => {
+        const { workspaceId, provider } = req.params as any;
+        const { apiKey } = req.query as any;
+
+        try {
+            const models = await brainClient.listModels(provider, apiKey, workspaceId);
+            return { models };
+        } catch (err: any) {
+            logger.error('Fetch models failed', { error: err.message });
+            return { models: [] };
+        }
+    });
+
     // ── Invitation Routes ────────────────────────────────────────────
 
     // Send an invite

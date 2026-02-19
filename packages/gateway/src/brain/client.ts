@@ -402,6 +402,28 @@ export class BrainClient {
         });
     }
 
+    async listModels(provider: string, apiKey?: string, workspaceId?: string): Promise<any[]> {
+        return new Promise((resolve, reject) => {
+            // If not connected or method missing (during dev/migration), return empty
+            if (!this.connected || typeof this.client?.ListModels !== 'function') {
+                resolve([]);
+                return;
+            }
+
+            this.client.ListModels(
+                { provider, api_key: apiKey, workspace_id: workspaceId },
+                (err: any, response: any) => {
+                    if (err) {
+                        logger.error('ListModels failed', { error: err.message, provider });
+                        resolve([]); // Fail gracefully for dropdowns
+                    } else {
+                        resolve(response.models || []);
+                    }
+                }
+            );
+        });
+    }
+
     // ── Automation (Stubbed for Build) ──────────────────────────
 
     async createCronJob(data: any): Promise<any> {

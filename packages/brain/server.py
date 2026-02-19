@@ -368,11 +368,88 @@ async def delete_provider_config(workspace_id, provider):
         await conn.execute(query, workspace_id, provider)
 
 
-
-
-
 class BrainServicer:
     """Implements kestrel.brain.BrainService gRPC interface."""
+
+    async def ListModels(self, request, context):
+        """List available models for a provider."""
+        try:
+            # 1. Get provider instance
+            if request.provider == "local":
+                # TODO: query local models
+                models = [
+                    {"id": "llama-3-8b-instruct", "name": "Llama 3 8B (Local)", "context_window": "8k"},
+                    {"id": "mistral-7b-instruct", "name": "Mistral 7B (Local)", "context_window": "32k"},
+                ]
+                pb_models = [
+                    brain_pb2.Model(id=m["id"], name=m["name"], context_window=m["context_window"])
+                    for m in models
+                ]
+                return brain_pb2.ListModelsResponse(models=pb_models)
+            
+            provider = get_provider(request.provider)
+            if not isinstance(provider, CloudProvider):
+                    logger.error(f"Provider {request.provider} is not a CloudProvider")
+                    return brain_pb2.ListModelsResponse(models=[])
+
+            # 2. Resolve API Key
+            api_key = request.api_key
+            if not api_key and request.workspace_id:
+                # Try to load from workspace config
+                try:
+                    pool = await get_pool()
+                    ws_config = await ProviderConfig(pool).get_config(request.workspace_id)
+                    # Check if this config is for the requested provider?
+                    # ProviderConfig.get_config returns *resolved* config (merged with default)
+                    # But we specifically want the key for the requested provider if it matches
+                    # Actually get_config returns configuration for the *active* provider?
+                    # No, let's look at provider_config.py...
+                    # It seems get_config fetches "effective" config.
+                    
+                    # Better approach: Fetch specifically for this provider
+                    # We can use list_provider_configs helper or check Redis
+                    # Let's check list_provider_configs in server.py
+                    configs = await list_provider_configs(request.workspace_id)
+                    # configs is a list of records
+                    for c in configs:
+                        if c["provider"] == request.provider:
+                            # Found config for this provider
+                            encrypted = c.get("api_key_encrypted")
+                            if encrypted and encrypted.startswith("provider_key:"):
+                                r = await get_redis()
+                                real_key = await r.get(encrypted)
+                                if real_key:
+                                    api_key = real_key.decode("utf-8")
+                            elif encrypted:
+                                api_key = encrypted # Assuming config stores plain if not prefixed (or handled elsewhere)
+                            break
+                except Exception as e:
+                    logger.warning(f"Failed to resolve workspace key for ListModels: {e}")
+
+            # 3. Fetch models
+            model_list = await provider.list_models(api_key=api_key)
+            
+            models = []
+            for m in model_list:
+                models.append({
+                    "id": m["id"],
+                    "name": m["name"],
+                    "context_window": m.get("context_window", "")
+                })
+
+            # 4. Convert to proto
+            pb_models = [
+                brain_pb2.Model(
+                    id=m["id"],
+                    name=m["name"],
+                    context_window=m["context_window"]
+                ) for m in models
+            ]
+            return brain_pb2.ListModelsResponse(models=pb_models)
+
+        except Exception as e:
+            logger.error(f"ListModels error: {e}", exc_info=True)
+            return brain_pb2.ListModelsResponse(models=[])
 
     async def StreamChat(self, request, context):
         """Stream LLM responses back to the caller."""
