@@ -395,30 +395,48 @@ export function Sidebar({
             </aside>
 
             {/* Delete Confirmation Modal */}
-            {
-                deleteConfirmationId && (
-                    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setDeleteConfirmationId(null)}>
-                        <div className="card animate-fade-in p-6 max-w-sm w-full mx-4" onClick={e => e.stopPropagation()}>
-                            <h3 className="text-lg font-bold mb-2">Delete Conversation</h3>
-                            <p className="text-gray-400 mb-6">Are you sure you want to delete this conversation? This action cannot be undone.</p>
-                            <div className="flex justify-end gap-3">
-                                <button
-                                    className="btn btn-ghost"
-                                    onClick={() => setDeleteConfirmationId(null)}
-                                >
-                                    Cancel
-                                </button>
-                                <button
-                                    className="btn btn-primary bg-red-600 hover:bg-red-700 border-none"
-                                    onClick={confirmDelete}
-                                >
-                                    Delete
-                                </button>
-                            </div>
+            {deleteConfirmationId && (
+                <div
+                    style={{
+                        position: 'fixed',
+                        inset: 0,
+                        zIndex: 50,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        background: 'rgba(0, 0, 0, 0.6)',
+                        backdropFilter: 'blur(4px)',
+                    }}
+                    onClick={() => setDeleteConfirmationId(null)}
+                >
+                    <div
+                        className="card animate-fade-in"
+                        style={{ maxWidth: 400, width: '100%', margin: '0 var(--space-4)', padding: 'var(--space-6)' }}
+                        onClick={e => e.stopPropagation()}
+                    >
+                        <h3 style={{ fontSize: '1.0625rem', fontWeight: 700, marginBottom: 'var(--space-2)' }}>
+                            Delete Conversation
+                        </h3>
+                        <p style={{ color: 'var(--color-text-secondary)', marginBottom: 'var(--space-6)', fontSize: '0.875rem' }}>
+                            Are you sure you want to delete this conversation? This action cannot be undone.
+                        </p>
+                        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-3)' }}>
+                            <button
+                                className="btn btn-ghost"
+                                onClick={() => setDeleteConfirmationId(null)}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                className="btn btn-danger"
+                                onClick={confirmDelete}
+                            >
+                                Delete
+                            </button>
                         </div>
                     </div>
-                )
-            }
+                </div>
+            )}
         </>
     );
 }

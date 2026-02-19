@@ -173,7 +173,7 @@ export const providers = {
 export const apiKeys = {
     list: () => request<{ keys: ApiKey[] }>('/api-keys'),
     create: (name: string, expiresInDays?: number) =>
-        request<{ id: string; secret: string }>('/api-keys', { method: 'POST', body: { name, expiresInDays } }),
+        request<{ id: string; name: string; key: string; expiresAt: string }>('/api-keys', { method: 'POST', body: { name, expiresInDays } }),
     revoke: (id: string) => request(`/api-keys/${id}`, { method: 'DELETE' }),
 };
 
@@ -217,7 +217,6 @@ export interface ProviderInfo {
 export interface ApiKey {
     id: string;
     name: string;
-    prefix: string;
     createdAt: string;
     expiresAt: string;
 }

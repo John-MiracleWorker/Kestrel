@@ -538,7 +538,16 @@ class BrainServicer:
 
             logger.info(f"Using provider={provider_name}, model={model}")
 
-            # ── 3. Stream tokens ────────────────────────────────────
+            # ── 3. Save user message before streaming ───────────────
+            if conversation_id:
+                user_content = next(
+                    (m["content"] for m in reversed(messages) if m["role"] == "user"),
+                    "",
+                )
+                if user_content:
+                    await save_message(conversation_id, "user", user_content)
+
+            # ── 4. Stream tokens ────────────────────────────────────
             async for token in provider.stream(
                 messages=messages,
                 model=model,
@@ -551,7 +560,7 @@ class BrainServicer:
                     content_delta=token,
                 )
 
-            # ── 4. Save response + auto-embed ──────────────────────
+            # ── 5. Save response + auto-embed ──────────────────────
             full_response = provider.last_response
             if conversation_id and full_response:
                 await save_message(conversation_id, "assistant", full_response)
@@ -759,27 +768,46 @@ class BrainServicer:
                 f"{conversation_text}"
             )
 
-            # 3. Call LLM (using default/local provider for now)
-            # Ideally we use the workspace's configured provider, but for simplicity:
-            provider = get_provider("local") 
-            # Note: We might need to check if 'local' is valid or use workspace config
-            # But getting workspace config requires DB lookup. 
-            # For now, let's try to use the configured provider logic if possible, 
-            # or fall back to a "system" provider.
-            
-            # Simple approach: Use local if available, otherwise just return first user message truncated
-            
+            # 3. Resolve provider — use workspace config, fall back to first user message
+            try:
+                pool = await get_pool()
+                ws_config = await ProviderConfig(pool).get_config(request.workspace_id)
+                provider_name = ws_config.get("provider", "local")
+                api_key = ws_config.get("api_key", "")
+                # Resolve Redis key reference
+                if api_key and api_key.startswith("provider_key:"):
+                    r = await get_redis()
+                    real_key = await r.get(api_key)
+                    api_key = real_key.decode("utf-8") if real_key else ""
+                provider = get_provider(provider_name)
+            except Exception:
+                provider_name = "local"
+                api_key = ""
+                provider = get_provider("local")
+
             # Allow "smart" title generation:
             response_chunks = []
-            async for token in provider.stream(
-                messages=[{"role": "user", "content": prompt}],
-                model="",
-                temperature=0.3,
-                max_tokens=20,
-            ):
-                response_chunks.append(token)
+            try:
+                async for token in provider.stream(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="",
+                    temperature=0.3,
+                    max_tokens=20,
+                    api_key=api_key,
+                ):
+                    response_chunks.append(token)
+            except Exception as stream_err:
+                logger.warning(f"Title generation stream failed: {stream_err}")
 
-            generated_title = "".join(response_chunks).strip().strip('"')
+            # If LLM failed or returned nothing, derive title from first user message
+            if not response_chunks:
+                first_user = next((m["content"] for m in messages if m["role"] == "user"), "")
+                generated_title = first_user[:50].strip() if first_user else "New Conversation"
+            else:
+                generated_title = "".join(response_chunks).strip().strip('"')
+
+            # Clamp to 80 chars
+            generated_title = generated_title[:80] if generated_title else "New Conversation"
             
             # Update the title in DB
             await update_conversation_title(

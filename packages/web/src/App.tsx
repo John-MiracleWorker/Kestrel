@@ -47,7 +47,6 @@ export default function App() {
         if (!currentWorkspace) return;
         try {
             const conv = await conversations.create(currentWorkspace.id);
-            console.log('DEBUG: Created conversation result:', conv);
             setCurrentConversation(conv);
             setInitialMessages([]);
         } catch (err) {

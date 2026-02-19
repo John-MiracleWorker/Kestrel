@@ -100,3 +100,47 @@ class LocalProvider:
         async for token in self.stream(messages, model, temperature, max_tokens):
             result.append(token)
         return "".join(result)
+
+    async def generate_with_tools(
+        self,
+        messages: list[dict],
+        model: str = "",
+        tools: list[dict] = None,
+        temperature: float = 0.2,
+        max_tokens: int = 4096,
+        api_key: str = "",
+    ) -> dict:
+        """
+        Local model tool calling via llama-cpp-python function calling support.
+        """
+        self._ensure_loaded()
+        if not self._model:
+            return {"content": "[Error: Local model not loaded]", "tool_calls": []}
+
+        loop = asyncio.get_event_loop()
+
+        def _generate():
+            kwargs: dict = {
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "stream": False,
+            }
+            if tools:
+                try:
+                    kwargs["tools"] = [{"type": "function", "function": t} for t in tools]
+                    kwargs["tool_choice"] = "auto"
+                except Exception:
+                    pass
+            return self._model.create_chat_completion(**kwargs)
+
+        try:
+            response = await loop.run_in_executor(None, _generate)
+            choice = response.get("choices", [{}])[0].get("message", {})
+            return {
+                "content": choice.get("content") or "",
+                "tool_calls": choice.get("tool_calls") or [],
+            }
+        except Exception as e:
+            logger.error(f"Local generate_with_tools failed: {e}")
+            return {"content": f"[Error: {e}]", "tool_calls": []}

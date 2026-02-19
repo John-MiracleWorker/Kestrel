@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { ConfigureProviderModal } from './ConfigureProviderModal';
-import { providers } from '../../api/client';
+import { providers, apiKeys, type ApiKey } from '../../api/client';
 
 interface SettingsPanelProps {
     onClose: () => void;
@@ -15,6 +15,11 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
     const [configuringProvider, setConfiguringProvider] = useState<{ key: string; name: string } | null>(null);
     const [saveStatus, setSaveStatus] = useState<string | null>(null);
     const [providerConfigs, setProviderConfigs] = useState<any[]>([]);
+    const [keysList, setKeysList] = useState<ApiKey[]>([]);
+    const [keysLoading, setKeysLoading] = useState(false);
+    const [newKeyName, setNewKeyName] = useState('');
+    const [createdKey, setCreatedKey] = useState<{ key: string; name: string } | null>(null);
+    const [keyError, setKeyError] = useState<string | null>(null);
 
     // Assuming currentWorkspace is derived from workspaceId or passed as a prop.
     // For this change, we'll use workspaceId directly where currentWorkspace.id was implied.
@@ -25,6 +30,43 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
             .then((data: any) => setProviderConfigs(data?.configs || []))
             .catch(() => setProviderConfigs([]));
     }, [activeTab, workspaceId, configuringProvider]); // re-fetch after modal closes
+
+    // Load API Keys when that tab is active
+    useEffect(() => {
+        if (activeTab !== 'api-keys') return;
+        setKeysLoading(true);
+        apiKeys.list()
+            .then((data: any) => setKeysList(data?.keys || []))
+            .catch(() => setKeysList([]))
+            .finally(() => setKeysLoading(false));
+    }, [activeTab]);
+
+    const handleCreateKey = async () => {
+        if (!newKeyName.trim()) {
+            setKeyError('Key name is required');
+            return;
+        }
+        setKeyError(null);
+        try {
+            const result = await apiKeys.create(newKeyName.trim());
+            setCreatedKey({ key: result.key, name: result.name });
+            setNewKeyName('');
+            // Refresh list
+            const data: any = await apiKeys.list();
+            setKeysList(data?.keys || []);
+        } catch (err: any) {
+            setKeyError(err.message || 'Failed to create API key');
+        }
+    };
+
+    const handleRevokeKey = async (id: string) => {
+        try {
+            await apiKeys.revoke(id);
+            setKeysList(prev => prev.filter(k => k.id !== id));
+        } catch (err: any) {
+            setKeyError(err.message || 'Failed to revoke key');
+        }
+    };
 
     const tabs = [
         { id: 'profile' as const, label: 'Profile', icon: '👤' },
@@ -198,30 +240,114 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
 
                             {activeTab === 'api-keys' && (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
-                                    <div style={{
-                                        display: 'flex',
-                                        justifyContent: 'space-between',
-                                        alignItems: 'center',
-                                    }}>
-                                        <p style={{ color: 'var(--color-text-secondary)', fontSize: '0.875rem' }}>
-                                            API keys for programmatic access to Kestrel.
-                                        </p>
-                                        <button className="btn btn-primary" onClick={() => alert('API key management coming soon')}>
+                                    <p style={{ color: 'var(--color-text-secondary)', fontSize: '0.875rem' }}>
+                                        API keys let you access Kestrel programmatically. Keys are shown only once at creation.
+                                    </p>
+
+                                    {/* One-time key reveal */}
+                                    {createdKey && (
+                                        <div style={{
+                                            padding: 'var(--space-4)',
+                                            background: 'rgba(34, 197, 94, 0.08)',
+                                            border: '1px solid rgba(34, 197, 94, 0.3)',
+                                            borderRadius: 'var(--radius-md)',
+                                        }}>
+                                            <p style={{ fontSize: '0.8125rem', fontWeight: 600, color: 'var(--color-success)', marginBottom: 'var(--space-2)' }}>
+                                                Key created: {createdKey.name}
+                                            </p>
+                                            <p style={{ fontSize: '0.75rem', color: 'var(--color-text-secondary)', marginBottom: 'var(--space-2)' }}>
+                                                Copy this now — it won't be shown again.
+                                            </p>
+                                            <div style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }}>
+                                                <code style={{
+                                                    flex: 1,
+                                                    padding: 'var(--space-2) var(--space-3)',
+                                                    background: 'var(--color-bg-surface)',
+                                                    borderRadius: 'var(--radius-sm)',
+                                                    fontSize: '0.75rem',
+                                                    wordBreak: 'break-all',
+                                                    fontFamily: 'monospace',
+                                                }}>
+                                                    {createdKey.key}
+                                                </code>
+                                                <button
+                                                    className="btn btn-secondary"
+                                                    style={{ flexShrink: 0, fontSize: '0.75rem' }}
+                                                    onClick={() => navigator.clipboard.writeText(createdKey.key)}
+                                                >
+                                                    Copy
+                                                </button>
+                                            </div>
+                                            <button
+                                                className="btn btn-ghost"
+                                                style={{ fontSize: '0.75rem', marginTop: 'var(--space-2)' }}
+                                                onClick={() => setCreatedKey(null)}
+                                            >
+                                                Dismiss
+                                            </button>
+                                        </div>
+                                    )}
+
+                                    {/* Create new key */}
+                                    <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
+                                        <input
+                                            className="input"
+                                            type="text"
+                                            placeholder="Key name (e.g. My Script)"
+                                            value={newKeyName}
+                                            onChange={e => setNewKeyName(e.target.value)}
+                                            onKeyDown={e => e.key === 'Enter' && handleCreateKey()}
+                                            style={{ flex: 1 }}
+                                        />
+                                        <button className="btn btn-primary" onClick={handleCreateKey}>
                                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                                 <path d="M12 5v14M5 12h14" />
                                             </svg>
-                                            Create Key
+                                            Create
                                         </button>
                                     </div>
+                                    {keyError && <p style={{ color: 'var(--color-error)', fontSize: '0.8125rem' }}>{keyError}</p>}
 
-                                    <div className="card" style={{
-                                        textAlign: 'center',
-                                        padding: 'var(--space-8)',
-                                        color: 'var(--color-text-tertiary)',
-                                        fontSize: '0.875rem',
-                                    }}>
-                                        No API keys created yet.
-                                    </div>
+                                    {/* Keys list */}
+                                    {keysLoading ? (
+                                        <div style={{ textAlign: 'center', color: 'var(--color-text-tertiary)', padding: 'var(--space-4)' }}>
+                                            Loading keys...
+                                        </div>
+                                    ) : keysList.length === 0 ? (
+                                        <div className="card" style={{
+                                            textAlign: 'center',
+                                            padding: 'var(--space-8)',
+                                            color: 'var(--color-text-tertiary)',
+                                            fontSize: '0.875rem',
+                                        }}>
+                                            No API keys yet. Create one above.
+                                        </div>
+                                    ) : (
+                                        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
+                                            {keysList.map(k => (
+                                                <div key={k.id} className="card" style={{
+                                                    display: 'flex',
+                                                    alignItems: 'center',
+                                                    justifyContent: 'space-between',
+                                                    padding: 'var(--space-3) var(--space-4)',
+                                                }}>
+                                                    <div>
+                                                        <div style={{ fontWeight: 500, fontSize: '0.875rem' }}>{k.name}</div>
+                                                        <div style={{ fontSize: '0.75rem', color: 'var(--color-text-tertiary)', marginTop: 2 }}>
+                                                            Expires {new Date(k.expiresAt).toLocaleDateString()}
+                                                        </div>
+                                                    </div>
+                                                    <button
+                                                        className="btn btn-ghost"
+                                                        style={{ color: 'var(--color-error)', fontSize: '0.8125rem' }}
+                                                        onClick={() => handleRevokeKey(k.id)}
+                                                    >
+                                                        Revoke
+                                                    </button>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
                                 </div>
                             )}
                         </div>

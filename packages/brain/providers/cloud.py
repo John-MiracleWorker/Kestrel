@@ -332,3 +332,168 @@ class CloudProvider:
         async for token in self.stream(messages, model, temperature, max_tokens):
             result.append(token)
         return "".join(result)
+
+    async def generate_with_tools(
+        self,
+        messages: list[dict],
+        model: str = "",
+        tools: list[dict] = None,
+        temperature: float = 0.2,
+        max_tokens: int = 4096,
+        api_key: str = "",
+    ) -> dict:
+        """
+        Call the LLM with function/tool calling support.
+        Returns a dict with 'content' (str) and/or 'tool_calls' (list).
+        """
+        model = model or self._config["default_model"]
+        request_key = api_key or self._api_key
+        if not request_key:
+            return {"content": f"[Error: No API key for {self.provider}]", "tool_calls": []}
+
+        if self.provider == "openai":
+            return await self._generate_with_tools_openai(messages, model, tools or [], temperature, max_tokens, request_key)
+        elif self.provider == "anthropic":
+            return await self._generate_with_tools_anthropic(messages, model, tools or [], temperature, max_tokens, request_key)
+        elif self.provider == "google":
+            return await self._generate_with_tools_google(messages, model, tools or [], temperature, max_tokens, request_key)
+        return {"content": "", "tool_calls": []}
+
+    async def _generate_with_tools_openai(self, messages, model, tools, temperature, max_tokens, api_key):
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            payload["tools"] = [{"type": "function", "function": t} for t in tools]
+            payload["tool_choice"] = "auto"
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(self._config["base_url"], json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            choice = data.get("choices", [{}])[0].get("message", {})
+            return {
+                "content": choice.get("content") or "",
+                "tool_calls": choice.get("tool_calls") or [],
+            }
+
+    async def _generate_with_tools_anthropic(self, messages, model, tools, temperature, max_tokens, api_key):
+        system = ""
+        chat_msgs = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system = msg["content"]
+            else:
+                chat_msgs.append(msg)
+
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+        # Convert OpenAI tool schema to Anthropic format
+        anthropic_tools = [
+            {
+                "name": t.get("name", ""),
+                "description": t.get("description", ""),
+                "input_schema": t.get("parameters", {"type": "object", "properties": {}}),
+            }
+            for t in tools
+        ]
+
+        payload: dict = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": chat_msgs,
+        }
+        if system:
+            payload["system"] = system
+        if anthropic_tools:
+            payload["tools"] = anthropic_tools
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(self._config["base_url"], json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+
+        # Convert Anthropic response to OpenAI-style format
+        tool_calls = []
+        content_text = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                content_text += block.get("text", "")
+            elif block.get("type") == "tool_use":
+                tool_calls.append({
+                    "id": block.get("id", "call_1"),
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name", ""),
+                        "arguments": json.dumps(block.get("input", {})),
+                    },
+                })
+
+        return {"content": content_text, "tool_calls": tool_calls}
+
+    async def _generate_with_tools_google(self, messages, model, tools, temperature, max_tokens, api_key):
+        contents = []
+        system_instruction = ""
+        for msg in messages:
+            if msg["role"] == "system":
+                system_instruction = msg["content"]
+            elif msg.get("tool_calls"):
+                parts = [
+                    {"functionCall": {"name": tc["function"]["name"], "args": json.loads(tc["function"]["arguments"])}}
+                    for tc in msg["tool_calls"]
+                ]
+                contents.append({"role": "model", "parts": parts})
+            elif msg["role"] == "tool":
+                contents.append({"role": "user", "parts": [{"functionResponse": {
+                    "name": "tool_result",
+                    "response": {"result": msg.get("content", "")},
+                }}]})
+            else:
+                role = "user" if msg["role"] == "user" else "model"
+                contents.append({"role": role, "parts": [{"text": msg.get("content") or ""}]})
+
+        url = f"{self._config['base_url']}/{model}:generateContent?key={api_key}"
+        payload: dict = {
+            "contents": contents,
+            "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+        }
+        if system_instruction:
+            payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+        if tools:
+            payload["tools"] = [{"functionDeclarations": [
+                {"name": t.get("name"), "description": t.get("description", ""),
+                 "parameters": t.get("parameters", {})}
+                for t in tools
+            ]}]
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        content_text = ""
+        tool_calls = []
+        for part in parts:
+            if "text" in part:
+                content_text += part["text"]
+            elif "functionCall" in part:
+                fc = part["functionCall"]
+                tool_calls.append({
+                    "id": f"call_{fc.get('name', '')}",
+                    "type": "function",
+                    "function": {
+                        "name": fc.get("name", ""),
+                        "arguments": json.dumps(fc.get("args", {})),
+                    },
+                })
+
+        return {"content": content_text, "tool_calls": tool_calls}
