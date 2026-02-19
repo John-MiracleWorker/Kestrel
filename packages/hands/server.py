@@ -15,6 +15,8 @@ from concurrent import futures
 import grpc
 from grpc import aio as grpc_aio
 from dotenv import load_dotenv
+from grpc_tools import protoc
+import sys
 
 from executor import DockerExecutor
 from security.allowlist import PermissionChecker
@@ -26,6 +28,22 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 
 GRPC_PORT = int(os.getenv("HANDS_GRPC_PORT", "50052"))
 GRPC_HOST = os.getenv("HANDS_GRPC_HOST", "0.0.0.0")
+
+PROTO_PATH = os.path.join(os.path.dirname(__file__), "../shared/proto")
+GENERATED_DIR = os.path.join(os.path.dirname(__file__), "_generated")
+os.makedirs(GENERATED_DIR, exist_ok=True)
+
+protoc.main([
+    "grpc_tools.protoc",
+    f"-I{PROTO_PATH}",
+    f"--python_out={GENERATED_DIR}",
+    f"--grpc_python_out={GENERATED_DIR}",
+    "hands.proto",
+])
+
+sys.path.insert(0, GENERATED_DIR)
+import hands_pb2
+import hands_pb2_grpc
 
 # ── Skill Registry ───────────────────────────────────────────────────
 
@@ -88,19 +106,19 @@ class HandsServicer:
 
         # Check permissions
         if not self.permissions.check(workspace_id, skill_name, function_name):
-            yield {
-                "status": 4,  # PERMISSION_DENIED
-                "error": f"Skill '{skill_name}' not allowed in workspace",
-            }
+            yield hands_pb2.SkillExecutionResponse(
+                status=hands_pb2.SkillExecutionResponse.Status.PERMISSION_DENIED,
+                error=f"Skill '{skill_name}' not allowed in workspace",
+            )
             return
 
         # Find skill
         skill = _skills.get(skill_name)
         if not skill:
-            yield {
-                "status": 2,  # ERROR
-                "error": f"Unknown skill: {skill_name}",
-            }
+            yield hands_pb2.SkillExecutionResponse(
+                status=hands_pb2.SkillExecutionResponse.Status.ERROR,
+                error=f"Unknown skill: {skill_name}",
+            )
             return
 
         # Build resource limits from request or defaults
@@ -119,10 +137,10 @@ class HandsServicer:
                              function_name, arguments)
 
         # Yield RUNNING status
-        yield {
-            "status": 0,  # RUNNING
-            "output": f"Executing {skill_name}.{function_name}...",
-        }
+        yield hands_pb2.SkillExecutionResponse(
+            status=hands_pb2.SkillExecutionResponse.Status.RUNNING,
+            output=f"Executing {skill_name}.{function_name}...",
+        )
 
         try:
             # Execute in Docker sandbox
@@ -143,27 +161,33 @@ class HandsServicer:
                 audit_log=result.get("audit_log", {}),
             )
 
-            yield {
-                "status": 1,  # SUCCESS
-                "output": result.get("output", ""),
-                "execution_time_ms": result.get("execution_time_ms", 0),
-                "memory_used_mb": result.get("memory_used_mb", 0),
-                "audit_log": result.get("audit_log", {}),
-            }
+            audit_data = result.get("audit_log", {}) or {}
+            yield hands_pb2.SkillExecutionResponse(
+                status=hands_pb2.SkillExecutionResponse.Status.SUCCESS,
+                output=result.get("output", ""),
+                execution_time_ms=result.get("execution_time_ms", 0),
+                memory_used_mb=result.get("memory_used_mb", 0),
+                audit_log=hands_pb2.AuditLog(
+                    network_requests=audit_data.get("network_requests", []),
+                    file_accesses=audit_data.get("file_accesses", []),
+                    system_calls=audit_data.get("system_calls", []),
+                    sandbox_id=audit_data.get("sandbox_id", ""),
+                ),
+            )
 
         except asyncio.TimeoutError:
             self.audit.log_complete(exec_id, status="timeout")
-            yield {
-                "status": 3,  # TIMEOUT
-                "error": f"Skill execution timed out after {limits['timeout']}s",
-            }
+            yield hands_pb2.SkillExecutionResponse(
+                status=hands_pb2.SkillExecutionResponse.Status.TIMEOUT,
+                error=f"Skill execution timed out after {limits['timeout']}s",
+            )
 
         except Exception as e:
             self.audit.log_complete(exec_id, status="error", error=str(e))
-            yield {
-                "status": 2,  # ERROR
-                "error": str(e),
-            }
+            yield hands_pb2.SkillExecutionResponse(
+                status=hands_pb2.SkillExecutionResponse.Status.ERROR,
+                error=str(e),
+            )
 
     async def ListSkills(self, request, context):
         """List available skills for a workspace."""
@@ -212,12 +236,12 @@ class HandsServicer:
         """Return health status."""
         active = self.executor.active_sandboxes
         capacity = self.executor.max_concurrent - active
-        return {
-            "healthy": True,
-            "version": "0.1.0",
-            "active_sandboxes": active,
-            "available_capacity": capacity,
-        }
+        return hands_pb2.HealthCheckResponse(
+            healthy=True,
+            version="0.1.0",
+            active_sandboxes=active,
+            available_capacity=capacity,
+        )
 
 
 # ── Server Bootstrap ─────────────────────────────────────────────────
@@ -240,26 +264,6 @@ async def serve():
     )
 
     servicer = HandsServicer(executor, permissions, audit)
-
-    # Generate and load proto stubs
-    from grpc_tools import protoc
-    import sys
-
-    proto_path = os.path.join(os.path.dirname(__file__), "../shared/proto")
-    out_dir = os.path.join(os.path.dirname(__file__), "_generated")
-    os.makedirs(out_dir, exist_ok=True)
-
-    protoc.main([
-        "grpc_tools.protoc",
-        f"-I{proto_path}",
-        f"--python_out={out_dir}",
-        f"--grpc_python_out={out_dir}",
-        "hands.proto",
-    ])
-
-    sys.path.insert(0, out_dir)
-    import hands_pb2
-    import hands_pb2_grpc
 
     hands_pb2_grpc.add_HandsServiceServicer_to_server(servicer, server)
 
