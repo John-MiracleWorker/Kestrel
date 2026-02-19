@@ -16,9 +16,11 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
     const [saveStatus, setSaveStatus] = useState<string | null>(null);
     const [providerConfigs, setProviderConfigs] = useState<any[]>([]);
 
-    // Fetch provider configs whenever the providers tab is shown (or after a modal closes)
+    // Assuming currentWorkspace is derived from workspaceId or passed as a prop.
+    // For this change, we'll use workspaceId directly where currentWorkspace.id was implied.
+    const currentWorkspace = { id: workspaceId };
+
     useEffect(() => {
-        if (activeTab !== 'providers' || !workspaceId) return;
         providers.list(workspaceId)
             .then((data: any) => setProviderConfigs(data?.configs || []))
             .catch(() => setProviderConfigs([]));
@@ -138,15 +140,13 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                             {activeTab === 'providers' && (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
                                     <p style={{ color: 'var(--color-text-secondary)', fontSize: '0.875rem' }}>
-                                        Configure which LLM provider to use for this workspace. The <strong>Default</strong> provider is used when no provider is selected in chat.
+                                        Configure which LLM provider to use for this workspace.
                                     </p>
 
                                     {['Local (llama.cpp)', 'OpenAI', 'Anthropic', 'Google'].map((name) => {
                                         const key = name.toLowerCase().split(' ')[0];
-                                        const cfg = providerConfigs.find((c: any) => c.provider === key);
-                                        const isConfigured = !!cfg;
-                                        const isDefault = cfg?.is_default || cfg?.isDefault;
-                                        const configuredModel = cfg?.model;
+                                        const config = providerConfigs.find((c: any) => c.provider === key);
+                                        const isDefault = config?.isDefault || config?.is_default;
 
                                         return (
                                             <div key={name} className="card" style={{
@@ -154,19 +154,21 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                                                 alignItems: 'center',
                                                 justifyContent: 'space-between',
                                                 padding: 'var(--space-4)',
-                                                borderColor: isDefault ? 'var(--color-brand)' : undefined,
+                                                border: isDefault ? '1px solid var(--color-primary)' : undefined
                                             }}>
                                                 <div>
-                                                    <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
+                                                    <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
                                                         <p style={{ fontWeight: 500 }}>{name}</p>
                                                         {isDefault && (
-                                                            <span className="badge badge-success" style={{ fontSize: '0.7rem' }}>
+                                                            <span style={{
+                                                                fontSize: '0.75rem',
+                                                                padding: '2px 6px',
+                                                                borderRadius: '4px',
+                                                                background: 'var(--color-primary)',
+                                                                color: 'white',
+                                                                fontWeight: 600
+                                                            }}>
                                                                 Default
-                                                            </span>
-                                                        )}
-                                                        {isConfigured && !isDefault && (
-                                                            <span className="badge" style={{ fontSize: '0.7rem', opacity: 0.7 }}>
-                                                                Configured
                                                             </span>
                                                         )}
                                                     </div>
@@ -174,11 +176,9 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                                                         fontSize: '0.8125rem',
                                                         color: 'var(--color-text-tertiary)',
                                                     }}>
-                                                        {configuredModel
-                                                            ? `Model: ${configuredModel}`
-                                                            : name === 'Local (llama.cpp)'
-                                                                ? 'On-device inference — no API key needed'
-                                                                : 'Cloud provider — requires API key'}
+                                                        {name === 'Local (llama.cpp)'
+                                                            ? 'On-device inference — no API key needed'
+                                                            : 'Cloud provider — requires API key'}
                                                     </p>
                                                 </div>
                                                 <button

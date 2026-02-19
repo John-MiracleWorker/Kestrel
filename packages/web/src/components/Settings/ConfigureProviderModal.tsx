@@ -49,7 +49,7 @@ export function ConfigureProviderModal({ workspaceId, providerKey, providerName,
             const payload: any = {
                 model: model || getDefaultModel(providerKey),
                 enabled: true,
-                is_default: isDefault
+                isDefault
             };
 
             // Only send API Key if it's not the placeholder
