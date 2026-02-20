@@ -88,11 +88,19 @@ export function useChat(
                     contentRef.current = '';
                     break;
 
-                case 'error':
+                case 'error': {
                     console.error('Chat error:', JSON.stringify(data));
+                    const errorMessage: Message = {
+                        id: data.messageId || generateId(),
+                        role: 'assistant',
+                        content: `[Error: ${data.error || 'Unknown error'}]`,
+                        createdAt: new Date().toISOString(),
+                    };
+                    setMessages(prev => [...prev, errorMessage]);
                     setStreamingMessage(null);
                     contentRef.current = '';
                     break;
+                }
             }
         };
 

@@ -433,7 +433,7 @@ class BrainServicer:
                                 if real_key:
                                     api_key = real_key.decode("utf-8")
                             elif encrypted:
-                                from .encryption import decrypt
+                                from encryption import decrypt
                                 api_key = decrypt(encrypted)
                             break
                 except Exception as e:
@@ -1125,7 +1125,7 @@ class BrainServicer:
             'is_default': request.is_default,
         }
         if request.api_key_encrypted:
-            from .encryption import encrypt
+            from encryption import encrypt
             config_dict['api_key_encrypted'] = encrypt(request.api_key_encrypted)
             
         row = await set_provider_config(request.workspace_id, request.provider, config_dict)

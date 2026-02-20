@@ -10,6 +10,7 @@ import logging
 from typing import Optional
 from encryption import encrypt, decrypt
 
+import json
 import asyncpg
 
 logger = logging.getLogger("brain.provider_config")
@@ -47,7 +48,7 @@ class ProviderConfig:
                 "rag_enabled": bool(row["rag_enabled"]),
                 "rag_top_k": int(row["rag_top_k"]),
                 "rag_min_similarity": float(row["rag_min_similarity"]),
-                "settings": dict(row["settings"]) if row["settings"] else {},
+                "settings": json.loads(row["settings"]) if isinstance(row.get("settings"), str) else (row.get("settings") or {}),
             }
 
         # Fallback to env-var defaults
