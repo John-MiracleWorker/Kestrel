@@ -1,11 +1,24 @@
 """
 Media & Music Skill
 Apple Music control, text-to-speech, AI image generation.
+
+Music and TTS features require macOS — will raise a clear error on Linux/Docker.
 """
 
 import json
 import os
+import platform
+import shutil
 import subprocess
+
+
+def _check_macos():
+    """Raise a clear error if not running on macOS."""
+    if platform.system() != "Darwin" or not shutil.which("osascript"):
+        raise RuntimeError(
+            "This skill requires macOS with osascript. "
+            "It cannot run in a Linux/Docker environment."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +88,7 @@ TOOL_DEFINITIONS = [
 # ---------------------------------------------------------------------------
 
 def tool_music_control(action: str, query: str = None, volume: int = None) -> dict:
+    _check_macos()
     try:
         if action == "toggle":
             script = 'tell application "Music" to playpause'
@@ -212,6 +226,7 @@ def tool_speak(text: str, voice: str = None) -> dict:
                 return {"status": "speaking", "text": text[:100], "engine": "mlx_tts"}
         except ImportError:
             pass
+        _check_macos()
         cmd = ["say"]
         if voice:
             cmd.extend(["-v", voice])

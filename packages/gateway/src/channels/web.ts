@@ -187,64 +187,12 @@ export class WebChannelAdapter extends BaseChannelAdapter {
                     },
                 };
 
+                // Route through the ChannelRegistry which handles Brain interaction.
+                // Do NOT call this.brain.streamChat() here — the registry's
+                // routeMessage handler already does that. Calling it here too
+                // would trigger two simultaneous LLM generations, burning double
+                // API credits and corrupting conversation history.
                 this.emit('message', incoming);
-
-                // Stream response from Brain
-                try {
-                    const stream = this.brain.streamChat({
-                        userId: socket.userId,
-                        workspaceId: incoming.workspaceId,
-                        conversationId: incoming.conversationId || '',
-                        messages: [{ role: 0, content: msg.content }], // USER = 0
-                        provider: msg.provider || '',
-                        model: msg.model || '',
-                        parameters: msg.parameters || {},
-                    });
-
-                    for await (const chunk of stream) {
-                        if (socket.readyState !== WebSocket.OPEN) break;
-
-                        // Map gRPC ChunkType to WebSocket event
-                        switch (chunk.type) {
-                            case 'CONTENT_DELTA':
-                                socket.send(JSON.stringify({
-                                    type: 'token',
-                                    conversationId: incoming.conversationId,
-                                    content: chunk.content_delta,
-                                }));
-                                break;
-
-                            case 'TOOL_CALL':
-                                socket.send(JSON.stringify({
-                                    type: 'tool_call',
-                                    conversationId: incoming.conversationId,
-                                    tool: chunk.tool_call,
-                                }));
-                                break;
-
-                            case 'DONE':
-                                socket.send(JSON.stringify({
-                                    type: 'done',
-                                    conversationId: incoming.conversationId,
-                                    metadata: chunk.metadata,
-                                }));
-                                break;
-
-                            case 'ERROR':
-                                socket.send(JSON.stringify({
-                                    type: 'error',
-                                    conversationId: incoming.conversationId,
-                                    error: chunk.error_message,
-                                }));
-                                break;
-                        }
-                    }
-                } catch (err) {
-                    socket.send(JSON.stringify({
-                        type: 'error',
-                        error: (err as Error).message,
-                    }));
-                }
                 break;
             }
 

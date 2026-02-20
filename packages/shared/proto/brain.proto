@@ -41,6 +41,9 @@ service BrainService {
   rpc ApproveAction(ApproveActionRequest) returns (ApproveActionResponse);
   rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
   rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+
+  // ── Workflows ──────────────────────────────────────────────
+  rpc LaunchWorkflow(LaunchWorkflowRequest) returns (stream TaskEvent);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -424,4 +427,16 @@ message TaskSummary {
 
 message ListTasksResponse {
   repeated TaskSummary tasks = 1;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Workflows
+// ═══════════════════════════════════════════════════════════════
+
+message LaunchWorkflowRequest {
+  string workflow_id = 1;
+  string user_id = 2;
+  string workspace_id = 3;
+  map<string, string> variables = 4;
+  string conversation_id = 5;
 }

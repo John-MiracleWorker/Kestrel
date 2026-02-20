@@ -1,11 +1,24 @@
 """
 Screen Analysis Skill
 Read and analyze on-screen content using OCR.
+
+Window title/app detection requires macOS — will raise a clear error on Linux/Docker.
 """
 
 import os
+import platform
+import shutil
 import subprocess
 from datetime import datetime
+
+
+def _check_macos():
+    """Raise a clear error if not running on macOS."""
+    if platform.system() != "Darwin" or not shutil.which("osascript"):
+        raise RuntimeError(
+            "This skill requires macOS with osascript. "
+            "It cannot run in a Linux/Docker environment."
+        )
 
 # ---------------------------------------------------------------------------
 # Tool Definitions
@@ -109,23 +122,25 @@ def tool_analyze_screen(query: str = None, image_path: str = None) -> dict:
             "char_count": len(text) if text else 0,
             "timestamp": datetime.now().isoformat(),
         }
-        try:
-            active_app = subprocess.run(
-                ["osascript", "-e",
-                 'tell application "System Events" to get name of first application process whose frontmost is true'],
-                capture_output=True, text=True, timeout=3
-            )
-            if active_app.returncode == 0:
-                result["active_app"] = active_app.stdout.strip()
-            window_title = subprocess.run(
-                ["osascript", "-e",
-                 'tell application "System Events" to get name of front window of (first application process whose frontmost is true)'],
-                capture_output=True, text=True, timeout=3
-            )
-            if window_title.returncode == 0:
-                result["window_title"] = window_title.stdout.strip()
-        except Exception:
-            pass
+        # Active app/window title detection requires macOS + osascript
+        if platform.system() == "Darwin" and shutil.which("osascript"):
+            try:
+                active_app = subprocess.run(
+                    ["osascript", "-e",
+                     'tell application "System Events" to get name of first application process whose frontmost is true'],
+                    capture_output=True, text=True, timeout=3
+                )
+                if active_app.returncode == 0:
+                    result["active_app"] = active_app.stdout.strip()
+                window_title = subprocess.run(
+                    ["osascript", "-e",
+                     'tell application "System Events" to get name of front window of (first application process whose frontmost is true)'],
+                    capture_output=True, text=True, timeout=3
+                )
+                if window_title.returncode == 0:
+                    result["window_title"] = window_title.stdout.strip()
+            except Exception:
+                pass
         if query:
             result["focus_query"] = query
             result["note"] = f"The user is specifically asking about: {query}. Focus your analysis on that."

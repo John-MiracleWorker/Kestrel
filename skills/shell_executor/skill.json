@@ -1,0 +1,16 @@
+{
+    "name": "shell_executor",
+    "display_name": "Shell Executor",
+    "description": "Execute shell commands in a sandboxed environment",
+    "version": "1.0.0",
+    "author": "Kestrel",
+    "icon": "🐚",
+    "category": "built-in",
+    "dependencies": [],
+    "sandbox": {
+        "image": "python:3.11-slim",
+        "memory_mb": 256,
+        "timeout_seconds": 30,
+        "network": false
+    }
+}

@@ -1,6 +1,7 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
+import Redis from 'ioredis';
 import { logger } from '../utils/logger';
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -78,7 +79,10 @@ export function generateSecureToken(length = 48): string {
 // ── Middleware Hooks ──────────────────────────────────────────────────
 
 /**
- * Fastify preHandler hook — verifies Bearer JWT access token.
+ * Fastify preHandler hook — verifies Bearer JWT access token or ksk_ API key.
+ *
+ * API keys (ksk_{keyId}_{secret}) are looked up in Redis. JWTs are verified
+ * using the configured secret.
  */
 export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
     const authHeader = req.headers.authorization;
@@ -86,6 +90,21 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
 
     if (!token) {
         return reply.status(401).send({ error: 'No token provided' });
+    }
+
+    // Check if this is a Kestrel API key (ksk_ prefix)
+    if (token.startsWith('ksk_')) {
+        const validated = await validateApiKey(token);
+        if (!validated) {
+            logger.warn('Invalid API key');
+            return reply.status(401).send({ error: 'Invalid or expired API key' });
+        }
+        req.user = {
+            id: validated.userId,
+            email: validated.email,
+            workspaces: validated.workspaces as any,
+        };
+        return;
     }
 
     const payload = verifyToken(token);
@@ -104,6 +123,40 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
         email: payload.email,
         workspaces: payload.workspaces as any,
     };
+}
+
+/**
+ * Validate a Kestrel API key (ksk_{keyId}_{secret}) against Redis.
+ * Returns the user info if valid, or null if invalid/expired.
+ */
+async function validateApiKey(fullKey: string): Promise<{ userId: string; email: string; workspaces: any[] } | null> {
+    try {
+        // ksk_{keyId}_{secret} — extract keyId
+        const parts = fullKey.split('_');
+        if (parts.length < 3 || parts[0] !== 'ksk') return null;
+        const keyId = parts[1];
+
+        const redisHost = process.env.REDIS_HOST || 'localhost';
+        const redisPort = process.env.REDIS_PORT || '6379';
+        const redis = new Redis(`redis://${redisHost}:${redisPort}`);
+
+        try {
+            const raw = await redis.get(`apikey:${keyId}`);
+            if (!raw) return null;
+
+            const data = JSON.parse(raw);
+            return {
+                userId: data.userId,
+                email: data.email,
+                workspaces: [],  // API keys don't carry workspace memberships
+            };
+        } finally {
+            await redis.quit();
+        }
+    } catch (err) {
+        logger.error('API key validation error', { error: (err as Error).message });
+        return null;
+    }
 }
 
 /**

@@ -3,6 +3,10 @@ Code execution tool — runs Python/JS/Shell in a sandboxed environment.
 
 Routes execution through the Hands gRPC service for containerized sandboxing
 with resource limits, network controls, and audit logging.
+
+SECURITY: Local fallback execution has been removed. If the Hands service
+is not available, code execution fails safely. Python's exec() cannot be
+secured via globals restriction — object introspection allows trivial escape.
 """
 
 import json
@@ -18,7 +22,14 @@ _hands_client = None
 
 
 def register_code_tools(registry, hands_client=None) -> None:
-    """Register code execution tools."""
+    """Register code execution tools.
+
+    Args:
+        registry: The tool registry to register with.
+        hands_client: The Hands gRPC client for sandboxed execution.
+            If None, code execution will return an error directing
+            the user to start the Hands service.
+    """
     global _hands_client
     _hands_client = hands_client
 
@@ -64,26 +75,25 @@ async def execute_code(
     timeout: int = 30,
 ) -> dict:
     """
-    Execute code in a sandboxed environment.
+    Execute code in a sandboxed environment via the Hands gRPC service.
 
-    If the Hands service is available, routes through gRPC for containerized
-    execution. Otherwise falls back to a restricted local execution mode.
+    If the Hands service is not available, returns an error. Local fallback
+    execution has been removed for security — Python's exec() cannot be
+    safely sandboxed via globals restriction.
     """
     timeout = min(timeout, 60)  # Cap at 60s
 
-    if _hands_client:
-        return await _execute_via_hands(language, code, timeout)
-
-    # Fallback: restricted local execution (Python only)
-    if language == "python":
-        return await _execute_python_local(code, timeout)
-    elif language == "shell":
-        return await _execute_shell_local(code, timeout)
-    else:
+    if not _hands_client:
         return {
             "success": False,
-            "error": f"Language '{language}' requires the Hands service (not available)",
+            "error": (
+                "Code execution requires the Hands service for secure sandboxing. "
+                "The Hands service is not connected. Please ensure it is running "
+                "and properly configured."
+            ),
         }
+
+    return await _execute_via_hands(language, code, timeout)
 
 
 async def _execute_via_hands(language: str, code: str, timeout: int) -> dict:
@@ -117,135 +127,4 @@ async def _execute_via_hands(language: str, code: str, timeout: int) -> dict:
 
     except Exception as e:
         logger.error(f"Hands execution failed: {e}")
-        return {"success": False, "error": str(e)}
-
-
-async def _execute_python_local(code: str, timeout: int) -> dict:
-    """
-    Restricted local Python execution.
-    Used when the Hands service is not available.
-    """
-    import asyncio
-    import io
-    import sys
-    from contextlib import redirect_stdout, redirect_stderr
-
-    # Security: block dangerous operations
-    dangerous = [
-        "import os", "import sys", "import subprocess",
-        "import shutil", "exec(", "eval(", "__import__",
-        "open(", "import socket", "import http",
-    ]
-    for pattern in dangerous:
-        if pattern in code:
-            return {
-                "success": False,
-                "error": f"Blocked: '{pattern}' is not allowed in local execution mode. "
-                         "Use the Hands service for unrestricted execution.",
-            }
-
-    stdout_buf = io.StringIO()
-    stderr_buf = io.StringIO()
-
-    try:
-        loop = asyncio.get_event_loop()
-        result = await asyncio.wait_for(
-            loop.run_in_executor(None, _run_python_restricted, code, stdout_buf, stderr_buf),
-            timeout=timeout,
-        )
-
-        output = stdout_buf.getvalue()
-        errors = stderr_buf.getvalue()
-
-        return {
-            "success": True,
-            "output": output or str(result) if result is not None else output,
-            "error": errors if errors else "",
-        }
-
-    except asyncio.TimeoutError:
-        return {"success": False, "error": f"Execution timed out after {timeout}s"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-def _run_python_restricted(code: str, stdout_buf, stderr_buf):
-    """Run Python code with redirected I/O."""
-    from contextlib import redirect_stdout, redirect_stderr
-
-    safe_globals = {
-        "__builtins__": {
-            "print": print,
-            "range": range,
-            "len": len,
-            "str": str,
-            "int": int,
-            "float": float,
-            "bool": bool,
-            "list": list,
-            "dict": dict,
-            "set": set,
-            "tuple": tuple,
-            "sorted": sorted,
-            "enumerate": enumerate,
-            "zip": zip,
-            "map": map,
-            "filter": filter,
-            "sum": sum,
-            "min": min,
-            "max": max,
-            "abs": abs,
-            "round": round,
-            "isinstance": isinstance,
-            "type": type,
-            "True": True,
-            "False": False,
-            "None": None,
-        },
-    }
-
-    with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
-        exec(code, safe_globals)
-
-    return safe_globals.get("result", None)
-
-
-async def _execute_shell_local(code: str, timeout: int) -> dict:
-    """Restricted local shell execution."""
-    import asyncio
-
-    # Security: block dangerous commands
-    dangerous = [
-        "rm -rf", "rm -r", "mkfs", "dd if=",
-        "chmod 777", ":(){", "fork", "shutdown",
-        "> /dev/sd", "format c:", "del /f /s",
-    ]
-    code_lower = code.lower()
-    for pattern in dangerous:
-        if pattern in code_lower:
-            return {
-                "success": False,
-                "error": f"Blocked: dangerous command pattern '{pattern}'",
-            }
-
-    try:
-        proc = await asyncio.create_subprocess_shell(
-            code,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout,
-        )
-
-        return {
-            "success": proc.returncode == 0,
-            "output": stdout.decode("utf-8", errors="replace"),
-            "error": stderr.decode("utf-8", errors="replace"),
-        }
-
-    except asyncio.TimeoutError:
-        proc.kill()
-        return {"success": False, "error": f"Execution timed out after {timeout}s"}
-    except Exception as e:
         return {"success": False, "error": str(e)}

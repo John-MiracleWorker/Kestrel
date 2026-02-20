@@ -1,9 +1,13 @@
 """
 Apple Calendar Skill — List, create, and search calendar events via AppleScript.
+
+Requires macOS — will raise a clear error on Linux/Docker.
 """
 
 import json
 import logging
+import platform
+import shutil
 import subprocess
 from datetime import datetime, timedelta
 
@@ -14,8 +18,19 @@ logger = logging.getLogger("libre_bird.skills.calendar")
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _check_macos():
+    """Raise a clear error if not running on macOS."""
+    if platform.system() != "Darwin" or not shutil.which("osascript"):
+        raise RuntimeError(
+            "This skill requires macOS with osascript. "
+            "It cannot run in a Linux/Docker environment. "
+            "Use OAuth-based calendar APIs (e.g., Google Calendar) instead."
+        )
+
+
 def _run_applescript(script: str) -> str:
     """Run an AppleScript and return stdout."""
+    _check_macos()
     result = subprocess.run(
         ["osascript", "-e", script],
         capture_output=True, text=True, timeout=15
