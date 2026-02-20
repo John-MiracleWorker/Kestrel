@@ -35,6 +35,8 @@ from agent.types import (
 )
 from agent.planner import TaskPlanner
 from agent.learner import TaskLearner
+from agent.memory_graph import MemoryGraph
+from agent.evidence import EvidenceChain, DecisionType
 
 logger = logging.getLogger("brain.agent.loop")
 
@@ -82,6 +84,8 @@ class AgentLoop:
         model: str = "",
         learner: Optional[TaskLearner] = None,
         checkpoint_manager=None,
+        memory_graph: Optional[MemoryGraph] = None,
+        evidence_chain: Optional[EvidenceChain] = None,
     ):
         self._provider = provider
         self._tools = tool_registry
@@ -91,6 +95,8 @@ class AgentLoop:
         self._planner = TaskPlanner(provider, model)
         self._learner = learner
         self._checkpoints = checkpoint_manager
+        self._memory_graph = memory_graph
+        self._evidence_chain = evidence_chain
 
         # Callback for approval resolution (set by the gRPC handler)
         self._approval_callback: Optional[Callable] = None
@@ -105,7 +111,7 @@ class AgentLoop:
         start_time = time.monotonic()
 
         try:
-            # ── Phase 0: Enrich with Past Lessons ────────────────
+            # ── Phase 0: Enrich with Past Lessons + Memory Graph ─
             lesson_context = ""
             if self._learner:
                 try:
@@ -116,6 +122,19 @@ class AgentLoop:
                 except Exception as e:
                     logger.warning(f"Lesson enrichment failed: {e}")
 
+            # Query the memory graph for relevant context
+            memory_context = ""
+            if self._memory_graph:
+                try:
+                    # Extract key terms from the goal for graph querying
+                    goal_terms = [w for w in task.goal.split() if len(w) > 3][:5]
+                    memory_context = await self._memory_graph.format_for_prompt(
+                        workspace_id=task.workspace_id,
+                        query_entities=goal_terms,
+                    )
+                except Exception as e:
+                    logger.warning(f"Memory graph query failed: {e}")
+
             # ── Phase 1: Planning ────────────────────────────────
             if task.status == TaskStatus.PLANNING:
                 task.status = TaskStatus.PLANNING
@@ -124,6 +143,8 @@ class AgentLoop:
                 context = self._build_context(task)
                 if lesson_context:
                     context += f"\n\n{lesson_context}"
+                if memory_context:
+                    context += f"\n\n{memory_context}"
 
                 plan = await self._planner.create_plan(
                     goal=task.goal,
@@ -132,6 +153,14 @@ class AgentLoop:
                 )
                 task.plan = plan
                 await self._persistence.update_task(task)
+
+                # Record plan decision in evidence chain
+                if self._evidence_chain:
+                    self._evidence_chain.record_plan_decision(
+                        plan_summary=f"Created {len(plan.steps)}-step plan for: {task.goal[:100]}",
+                        reasoning=f"Decomposed goal into {len(plan.steps)} steps based on available tools",
+                        confidence=0.7,
+                    )
 
                 yield TaskEvent(
                     type=TaskEventType.PLAN_CREATED,
@@ -286,6 +315,13 @@ class AgentLoop:
                 content=task.result,
                 progress=self._progress(task),
             )
+
+            # ── Phase 3b: Persist evidence chain ─────────────────
+            if self._evidence_chain:
+                try:
+                    await self._evidence_chain.persist()
+                except Exception as e:
+                    logger.warning(f"Evidence chain persistence failed: {e}")
 
             # ── Phase 4: Learn from this task ────────────────────
             if self._learner:
@@ -445,6 +481,14 @@ class AgentLoop:
                     tool_args=json.dumps(tool_args),
                     progress=self._progress(task),
                 )
+
+                # Record tool decision in evidence chain
+                if self._evidence_chain:
+                    self._evidence_chain.record_tool_decision(
+                        tool_name=tool_name,
+                        args=tool_args,
+                        reasoning=f"LLM selected {tool_name} for step: {step.description[:80]}",
+                    )
 
                 # Execute the tool
                 result = await self._tools.execute(tool_call)

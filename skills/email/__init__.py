@@ -1,14 +1,28 @@
 """
 Apple Mail Skill — Read inbox, compose and send emails via AppleScript.
+
+Requires macOS — will raise a clear error on Linux/Docker.
 """
 
 import logging
+import platform
+import shutil
 import subprocess
 
 logger = logging.getLogger("libre_bird.skills.email")
 
 
+def _check_macos():
+    """Raise a clear error if not running on macOS."""
+    if platform.system() != "Darwin" or not shutil.which("osascript"):
+        raise RuntimeError(
+            "This skill requires macOS with osascript. "
+            "It cannot run in a Linux/Docker environment."
+        )
+
+
 def _run_applescript(script: str) -> str:
+    _check_macos()
     result = subprocess.run(
         ["osascript", "-e", script],
         capture_output=True, text=True, timeout=20

@@ -1,12 +1,24 @@
 """
 Productivity Skill
 Clipboard, reminders, file operations, keyboard automation, document reader, notifications.
+
+Several functions require macOS — will raise a clear error on Linux/Docker.
 """
 
 import os
+import platform
 import subprocess
 import shutil
 from datetime import datetime
+
+
+def _check_macos():
+    """Raise a clear error if not running on macOS."""
+    if platform.system() != "Darwin" or not shutil.which("osascript"):
+        raise RuntimeError(
+            "This function requires macOS with osascript. "
+            "It cannot run in a Linux/Docker environment."
+        )
 
 
 # Clipboard history (in-memory ring buffer)
@@ -225,6 +237,7 @@ def tool_file_operations(action: str, path: str, content: str = None, destinatio
                 shutil.copy2(path, dest)
             return {"action": "copy", "from": path, "to": destination}
         elif action == "delete":
+            _check_macos()
             trash_cmd = ["osascript", "-e",
                          f'tell application "Finder" to delete POSIX file "{path}"']
             result = subprocess.run(trash_cmd, capture_output=True, text=True, timeout=5)
@@ -253,6 +266,7 @@ def tool_file_operations(action: str, path: str, content: str = None, destinatio
 
 
 def tool_keyboard(action: str, text: str) -> dict:
+    _check_macos()
     try:
         if action == "type_text":
             escaped = text.replace("\\", "\\\\").replace('"', '\\"')
@@ -398,6 +412,7 @@ def tool_read_notifications(action: str, app_name: str = None) -> dict:
         elif action == "clear":
             if not app_name:
                 return {"error": "app_name is required for 'clear' action"}
+            _check_macos()
             script = f'''
             tell application "System Events"
                 try

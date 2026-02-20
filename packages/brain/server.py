@@ -270,6 +270,11 @@ _embedding_pipeline: Optional[EmbeddingPipeline] = None
 _agent_loop = None
 _agent_persistence = None
 _running_tasks: dict[str, object] = {}
+_hands_client = None
+_cron_scheduler = None
+_webhook_handler = None
+_memory_graph = None
+_tool_registry = None
 
 
 def get_provider(name: str):
@@ -890,6 +895,32 @@ class BrainServicer:
         # Store the running task handle
         _running_tasks[task.id] = task
 
+        # Dynamically resolve provider from workspace config instead of
+        # using the hardcoded "local" provider from the global _agent_loop.
+        try:
+            pool = await get_pool()
+            ws_config = await ProviderConfig(pool).get_config(workspace_id)
+            provider_name = ws_config.get("provider", "local")
+            task_provider = get_provider(provider_name)
+        except Exception as e:
+            logger.warning(f"Failed to resolve workspace provider for task, using local: {e}")
+            task_provider = get_provider("local")
+
+        from agent.tools import build_tool_registry
+        from agent.guardrails import Guardrails
+        from agent.loop import AgentLoop
+        from agent.evidence import EvidenceChain
+        from agent.memory_graph import MemoryGraph
+
+        task_tool_registry = build_tool_registry(hands_client=_hands_client)
+        evidence_chain = EvidenceChain(task_id=task.id, pool=pool)
+        task_loop = AgentLoop(
+            provider=task_provider,
+            tool_registry=task_tool_registry,
+            guardrails=Guardrails(),
+            persistence=_agent_persistence,
+        )
+
         event_type_map = {
             "plan_created": brain_pb2.TaskEvent.EventType.PLAN_CREATED,
             "step_started": brain_pb2.TaskEvent.EventType.STEP_STARTED,
@@ -903,9 +934,9 @@ class BrainServicer:
             "task_paused": brain_pb2.TaskEvent.EventType.TASK_PAUSED,
         }
 
-        # Run the agent loop and stream events
+        # Run the task-specific agent loop and stream events
         try:
-            async for event in _agent_loop.run(task):
+            async for event in task_loop.run(task):
                 event_type_value = event.type.value if hasattr(event.type, "value") else str(event.type)
                 yield brain_pb2.TaskEvent(
                     type=event_type_map.get(event_type_value, brain_pb2.TaskEvent.EventType.THINKING),
@@ -1012,6 +1043,50 @@ class BrainServicer:
             ))
 
         return brain_pb2.ListTasksResponse(tasks=tasks)
+
+    # ── Workflows ────────────────────────────────────────────────
+
+    async def LaunchWorkflow(self, request, context):
+        """
+        Launch a workflow by converting it into a StartTask call.
+        Workflows are pre-defined goal templates with variables.
+        """
+        workflow_id = request.workflow_id
+        user_id = request.user_id
+        workspace_id = request.workspace_id
+        variables = dict(request.variables) if request.variables else {}
+        conversation_id = request.conversation_id
+
+        # Look up workflow definition from DB
+        pool = await get_pool()
+        row = await pool.fetchrow(
+            "SELECT goal_template, guardrails FROM workflows WHERE id = $1",
+            workflow_id,
+        )
+
+        if not row:
+            yield brain_pb2.TaskEvent(
+                type=brain_pb2.TaskEvent.TASK_FAILED,
+                content=f"Workflow {workflow_id} not found",
+            )
+            return
+
+        # Substitute variables into the goal template
+        goal = row["goal_template"]
+        for key, value in variables.items():
+            goal = goal.replace(f"{{{key}}}", value)
+
+        # Create a StartTask request and delegate
+        start_request = brain_pb2.StartTaskRequest(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            goal=goal,
+            conversation_id=conversation_id,
+        )
+
+        # Reuse StartTask implementation
+        async for event in self.StartTask(start_request, context):
+            yield event
 
     # ── Provider Configuration ───────────────────────────────────
 
@@ -1124,23 +1199,101 @@ async def serve():
     await _embedding_pipeline.start()
     logger.info("RAG pipelines initialized")
 
+    # Initialize Hands gRPC client for sandboxed code execution
+    global _hands_client
+    hands_host = os.getenv("HANDS_GRPC_HOST", "hands")
+    hands_port = os.getenv("HANDS_GRPC_PORT", "50052")
+    try:
+        hands_channel = grpc_aio.insecure_channel(f"{hands_host}:{hands_port}")
+        # Import hands stubs if available
+        try:
+            hands_out_dir = os.path.join(os.path.dirname(__file__), "_generated")
+            hands_proto_path = os.path.join(os.path.dirname(__file__), "../shared/proto")
+            hands_proto = os.path.join(hands_proto_path, "hands.proto")
+            if os.path.exists(hands_proto):
+                protoc.main([
+                    "grpc_tools.protoc",
+                    f"-I{hands_proto_path}",
+                    f"--python_out={hands_out_dir}",
+                    f"--grpc_python_out={hands_out_dir}",
+                    "hands.proto",
+                ])
+                import hands_pb2_grpc
+                _hands_client = hands_pb2_grpc.HandsServiceStub(hands_channel)
+                logger.info(f"Hands gRPC client connected to {hands_host}:{hands_port}")
+            else:
+                logger.warning("hands.proto not found — Hands client not initialized")
+        except Exception as e:
+            logger.warning(f"Hands gRPC client not available: {e}")
+    except Exception as e:
+        logger.warning(f"Could not connect to Hands service: {e}")
+
     # Initialize agent runtime
     from agent.tools import build_tool_registry
     from agent.guardrails import Guardrails
     from agent.loop import AgentLoop
     from agent.persistence import PostgresTaskPersistence
+    from agent.memory_graph import MemoryGraph
+    from agent.automation import CronScheduler, WebhookHandler
 
-    global _agent_loop, _agent_persistence
-    tool_registry = build_tool_registry()
+    global _agent_loop, _agent_persistence, _tool_registry, _memory_graph
+    global _cron_scheduler, _webhook_handler
+    pool = await get_pool()
+    _tool_registry = build_tool_registry(hands_client=_hands_client)
     guardrails = Guardrails()
-    _agent_persistence = PostgresTaskPersistence(pool=await get_pool())
+    _agent_persistence = PostgresTaskPersistence(pool=pool)
     _agent_loop = AgentLoop(
         provider=get_provider("local"),
-        tool_registry=tool_registry,
+        tool_registry=_tool_registry,
         guardrails=guardrails,
         persistence=_agent_persistence,
     )
-    logger.info(f"Agent runtime initialized ({len(tool_registry._definitions)} tools)")
+    logger.info(f"Agent runtime initialized ({len(_tool_registry._definitions)} tools)")
+
+    # Initialize memory graph
+    _memory_graph = MemoryGraph(pool=pool)
+    logger.info("Memory graph initialized")
+
+    # Initialize and start automation (cron scheduler + webhook handler)
+    async def launch_task_from_automation(workspace_id, user_id, goal, source="automation"):
+        """Task launcher callback for cron/webhook automation."""
+        from agent.types import AgentTask, GuardrailConfig as GCfg
+        task = AgentTask(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            goal=goal,
+            config=GCfg(),
+        )
+        await _agent_persistence.save_task(task)
+        logger.info(f"Automation task started: {task.id} — {goal} (source: {source})")
+        # Run in background
+        asyncio.create_task(_run_automation_task(task))
+
+    async def _run_automation_task(task):
+        """Run an automation-triggered task in the background."""
+        try:
+            ws_config = await ProviderConfig(pool).get_config(task.workspace_id)
+            provider_name = ws_config.get("provider", "local")
+            task_provider = get_provider(provider_name)
+            task_loop = AgentLoop(
+                provider=task_provider,
+                tool_registry=build_tool_registry(hands_client=_hands_client),
+                guardrails=Guardrails(),
+                persistence=_agent_persistence,
+            )
+            async for event in task_loop.run(task):
+                logger.debug(f"Automation task {task.id}: {event.type}")
+        except Exception as e:
+            logger.error(f"Automation task {task.id} failed: {e}")
+
+    _cron_scheduler = CronScheduler(pool=pool, task_launcher=launch_task_from_automation)
+    _webhook_handler = WebhookHandler(pool=pool, task_launcher=launch_task_from_automation)
+    try:
+        await _cron_scheduler.start()
+        await _webhook_handler.load_endpoints()
+        logger.info("Automation scheduler and webhook handler started")
+    except Exception as e:
+        logger.warning(f"Automation startup failed (non-fatal): {e}")
 
     await server.start()
     logger.info("Brain service ready")
@@ -1149,6 +1302,8 @@ async def serve():
         await server.wait_for_termination()
     except KeyboardInterrupt:
         logger.info("Shutting down Brain service...")
+        if _cron_scheduler:
+            await _cron_scheduler.stop()
         await server.stop(5)
         if _pool:
             await _pool.close()

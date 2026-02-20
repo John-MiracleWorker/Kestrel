@@ -132,10 +132,15 @@ class ToolRegistry:
             )
 
 
-def build_tool_registry() -> ToolRegistry:
+def build_tool_registry(hands_client=None) -> ToolRegistry:
     """
     Build the default tool registry with all built-in tools.
     Called during server startup.
+
+    Args:
+        hands_client: Optional Hands gRPC client for sandboxed code execution.
+            If provided, code execution routes through the Hands service.
+            If None, code execution will fail safely with an error message.
     """
     registry = ToolRegistry()
 
@@ -147,7 +152,7 @@ def build_tool_registry() -> ToolRegistry:
     from agent.tools.memory import register_memory_tools
     from agent.tools.human import register_human_tools
 
-    register_code_tools(registry)
+    register_code_tools(registry, hands_client=hands_client)
     register_web_tools(registry)
     register_file_tools(registry)
     register_data_tools(registry)

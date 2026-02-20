@@ -1,10 +1,23 @@
 """
 Apple Notes Skill
 Read, create, and search Apple Notes via AppleScript.
+
+Requires macOS — will raise a clear error on Linux/Docker.
 """
 
+import platform
+import shutil
 import subprocess
 from datetime import datetime
+
+
+def _check_macos():
+    """Raise a clear error if not running on macOS."""
+    if platform.system() != "Darwin" or not shutil.which("osascript"):
+        raise RuntimeError(
+            "This skill requires macOS with osascript. "
+            "It cannot run in a Linux/Docker environment."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +93,7 @@ TOOL_DEFINITIONS = [
 # ---------------------------------------------------------------------------
 
 def tool_notes_list(folder: str = None, limit: int = 15) -> dict:
+    _check_macos()
     try:
         if folder:
             escaped_folder = folder.replace('"', '\\"')
@@ -135,6 +149,7 @@ def tool_notes_list(folder: str = None, limit: int = 15) -> dict:
 
 
 def tool_notes_read(title: str) -> dict:
+    _check_macos()
     try:
         escaped_title = title.replace('"', '\\"')
         script = f'''
@@ -173,6 +188,7 @@ def tool_notes_read(title: str) -> dict:
 
 
 def tool_notes_create(title: str, body: str, folder: str = None) -> dict:
+    _check_macos()
     try:
         escaped_title = title.replace('"', '\\"')
         # Convert body to HTML for Notes
@@ -207,6 +223,7 @@ def tool_notes_create(title: str, body: str, folder: str = None) -> dict:
 
 
 def tool_notes_search(query: str, limit: int = 10) -> dict:
+    _check_macos()
     try:
         escaped_query = query.replace('"', '\\"').lower()
         script = f'''

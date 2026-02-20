@@ -1,0 +1,16 @@
+{
+    "name": "node_executor",
+    "display_name": "Node.js Executor",
+    "description": "Execute JavaScript/Node.js code in a sandboxed environment",
+    "version": "1.0.0",
+    "author": "Kestrel",
+    "icon": "🟢",
+    "category": "built-in",
+    "dependencies": [],
+    "sandbox": {
+        "image": "node:20-slim",
+        "memory_mb": 512,
+        "timeout_seconds": 60,
+        "network": false
+    }
+}

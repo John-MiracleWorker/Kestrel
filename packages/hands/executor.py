@@ -15,6 +15,12 @@ logger = logging.getLogger("hands.executor")
 SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "kestrel/sandbox:latest")
 MAX_CONCURRENT = int(os.getenv("SANDBOX_MAX_CONCURRENT", "10"))
 
+# When running inside Docker, the skill_path is a container-internal path
+# (e.g., /skills/web). The host Docker daemon cannot resolve this path.
+# Set HOST_SKILLS_DIR to the host-side absolute path so volume mounts work.
+HOST_SKILLS_DIR = os.getenv("HOST_SKILLS_DIR", "")
+CONTAINER_SKILLS_DIR = os.getenv("SKILLS_DIR", "/skills")
+
 
 class DockerExecutor:
     """Manages sandboxed skill execution in Docker containers."""
@@ -107,8 +113,17 @@ class DockerExecutor:
         if allowed_domains:
             env["ALLOWED_DOMAINS"] = ",".join(allowed_domains)
 
+        # Translate container-internal skill path to host path for Docker volume mounts.
+        # When running in Docker-in-Docker (DinD), the host Docker daemon needs
+        # the host-side absolute path, not the path inside the Hands container.
+        mount_path = skill_path
+        if HOST_SKILLS_DIR and CONTAINER_SKILLS_DIR and skill_path.startswith(CONTAINER_SKILLS_DIR):
+            relative = skill_path[len(CONTAINER_SKILLS_DIR):]
+            mount_path = HOST_SKILLS_DIR + relative
+            logger.debug(f"Translated skill path: {skill_path} -> {mount_path}")
+
         volumes = {
-            skill_path: {"bind": "/skill", "mode": "ro"},
+            mount_path: {"bind": "/skill", "mode": "ro"},
         }
 
         # Add allowed filesystem paths as read-only mounts

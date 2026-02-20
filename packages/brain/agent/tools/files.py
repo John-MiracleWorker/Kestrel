@@ -192,12 +192,6 @@ async def file_write(
         # Create parent directories
         resolved.parent.mkdir(parents=True, exist_ok=True)
 
-        mode = "a" if append else "w"
-        resolved.write_text(
-            content if not append else content,
-            encoding="utf-8",
-        )
-        # Use proper append mode
         if append:
             with open(resolved, "a", encoding="utf-8") as f:
                 f.write(content)

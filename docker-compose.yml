@@ -88,6 +88,8 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      HANDS_GRPC_HOST: hands
+      HANDS_GRPC_PORT: 50052
       EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
       EMBEDDINGS_DIMENSION: ${EMBEDDINGS_DIMENSION:-384}
       LOG_LEVEL: ${LOG_LEVEL:-info}
@@ -111,6 +113,9 @@ services:
       SANDBOX_MAX_CONCURRENT: ${SANDBOX_MAX_CONCURRENT:-10}
       SANDBOX_DEFAULT_TIMEOUT: ${SANDBOX_DEFAULT_TIMEOUT:-30}
       SKILLS_DIR: /skills
+      # HOST_SKILLS_DIR must be the absolute path to skills/ on the HOST machine.
+      # This is needed for Docker-in-Docker volume mounts to resolve correctly.
+      HOST_SKILLS_DIR: ${HOST_SKILLS_DIR:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
