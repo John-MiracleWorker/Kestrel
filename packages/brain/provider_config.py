@@ -8,7 +8,7 @@ a fallback chain: workspace config → env var → defaults.
 import os
 import logging
 from typing import Optional
-from .encryption import decrypt, encrypt
+from encryption import encrypt, decrypt
 
 import asyncpg
 

@@ -15,6 +15,17 @@ interface UseChatReturn {
     isConnected: boolean;
 }
 
+function generateId(): string {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+        return crypto.randomUUID();
+    }
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+        const r = Math.random() * 16 | 0;
+        const v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+    });
+}
+
 const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 15000]; // exponential backoff
 
 export function useChat(
@@ -45,7 +56,12 @@ export function useChat(
 
         ws.onmessage = (event) => {
             if (!isMountedRef.current) return;
-            const data = JSON.parse(event.data);
+            const data = JSON.parse(event.data) as {
+                type: 'token' | 'done' | 'error';
+                content?: string;
+                messageId?: string;
+                error?: string;
+            };
 
             switch (data.type) {
                 case 'token':
@@ -61,7 +77,7 @@ export function useChat(
                 case 'done':
                     if (contentRef.current) {
                         const finalMessage: Message = {
-                            id: data.messageId || crypto.randomUUID(),
+                            id: data.messageId || generateId(),
                             role: 'assistant',
                             content: contentRef.current,
                             createdAt: new Date().toISOString(),
@@ -152,7 +168,7 @@ export function useChat(
         }
 
         const userMessage: Message = {
-            id: crypto.randomUUID(),
+            id: generateId(),
             role: 'user',
             content,
             createdAt: new Date().toISOString(),
