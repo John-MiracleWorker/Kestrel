@@ -730,6 +730,54 @@ export class TelegramAdapter extends BaseChannelAdapter {
         if (!query.data || !query.message) return;
         const chatId = query.message.chat.id;
 
+        // Handle self-improvement callbacks (si_approve / si_deny)
+        if (query.data.startsWith('si_approve:') || query.data.startsWith('si_deny:')) {
+            const isApprove = query.data.startsWith('si_approve:');
+            const proposalId = query.data.substring(query.data.indexOf(':') + 1);
+            const action = isApprove ? 'approve' : 'deny';
+            const icon = isApprove ? '✅' : '❌';
+
+            await this.api('sendMessage', {
+                chat_id: chatId,
+                text: `${icon} Processing ${action} for proposal \`${proposalId.substring(0, 8)}...\``,
+                parse_mode: 'Markdown',
+            });
+
+            try {
+                // Call brain's self_improve handler via docker exec
+                const { execSync } = await import('child_process');
+                const cmd = `docker exec littlebirdalt-brain-1 python3 -c "
+import sys, json
+sys.path.insert(0, '/app')
+from agent.tools.self_improve import _handle_approval
+result = _handle_approval('${proposalId}', approved=${isApprove ? 'True' : 'False'})
+print(json.dumps(result))
+"`;
+                const output = execSync(cmd, { timeout: 15000, encoding: 'utf-8' }).trim();
+                const result = JSON.parse(output);
+
+                if (result.error) {
+                    await this.api('sendMessage', {
+                        chat_id: chatId,
+                        text: `⚠️ ${result.error}`,
+                    });
+                } else {
+                    await this.api('sendMessage', {
+                        chat_id: chatId,
+                        text: `${icon} *${result.status === 'approved' ? 'Approved' : 'Denied'}*\n${result.message || ''}`,
+                        parse_mode: 'Markdown',
+                    });
+                }
+            } catch (err) {
+                logger.error('Self-improve callback failed', { error: (err as Error).message });
+                await this.api('sendMessage', {
+                    chat_id: chatId,
+                    text: `⚠️ Failed to process: ${(err as Error).message?.substring(0, 200)}`,
+                });
+            }
+            return;
+        }
+
         // Handle approval callbacks
         if (query.data.startsWith('approve:')) {
             const approvalId = query.data.substring('approve:'.length);

@@ -121,8 +121,28 @@ def _extract_json_array(text: str) -> list | None:
     return None
 
 
-# ── Pending Proposals (in-memory store) ──────────────────────────────
-_pending_proposals: dict[str, dict] = {}
+# ── Persistent Proposals Store ───────────────────────────────────────
+_PROPOSALS_FILE = "/tmp/kestrel_proposals.json"
+
+
+def _load_proposals() -> dict[str, dict]:
+    """Load pending proposals from disk."""
+    try:
+        if os.path.exists(_PROPOSALS_FILE):
+            with open(_PROPOSALS_FILE, "r") as f:
+                return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        pass
+    return {}
+
+
+def _save_proposals(proposals: dict[str, dict]) -> None:
+    """Save pending proposals to disk."""
+    try:
+        with open(_PROPOSALS_FILE, "w") as f:
+            json.dump(proposals, f, indent=2)
+    except IOError as e:
+        logger.error(f"Failed to save proposals: {e}")
 
 
 # ── Telegram Helpers ─────────────────────────────────────────────────
@@ -299,7 +319,8 @@ async def self_improve_action(
     elif action == "deny":
         return _handle_approval(proposal_id, approved=False)
     elif action == "list_pending":
-        return {"pending": list(_pending_proposals.values()), "count": len(_pending_proposals)}
+        pending = _load_proposals()
+        return {"pending": list(pending.values()), "count": len(pending)}
     else:
         return {"error": f"Unknown action: {action}"}
 
@@ -586,7 +607,6 @@ def _run_tests(package: str = "all") -> dict:
 # ── Proposal System ─────────────────────────────────────────────────
 async def _propose_improvements() -> dict:
     """Create proposals from scan results, enrich with LLM analysis, send to Telegram."""
-    global _pending_proposals
 
     if not _last_scan_results or not _last_scan_results.get("issues"):
         return {"error": "No scan results. Run 'scan' first."}
@@ -614,6 +634,9 @@ async def _propose_improvements() -> dict:
         )
         return {"message": "No actionable improvements. Summary sent to Telegram.", "count": 0}
 
+    # Load existing proposals and add new ones
+    pending = _load_proposals()
+
     # Send top proposals to Telegram
     proposals_sent = 0
     for issue in all_proposals[:5]:  # Cap at 5 proposals per cycle
@@ -623,13 +646,16 @@ async def _propose_improvements() -> dict:
             "created_at": time.time(),
             **issue,
         }
-        _pending_proposals[proposal_id] = proposal
+        pending[proposal_id] = proposal
 
         result = _send_proposal_to_telegram(proposal)
         if result.get("ok"):
             proposals_sent += 1
         else:
             logger.error(f"Failed to send proposal {proposal_id}: {result}")
+
+    # Persist proposals to disk
+    _save_proposals(pending)
 
     # Send summary
     llm_label = f" (🧠 {len(llm_proposals)} AI-analyzed)" if llm_proposals else ""
@@ -884,20 +910,23 @@ def _handle_approval(proposal_id: str, approved: bool) -> dict:
     if not proposal_id:
         return {"error": "proposal_id is required"}
 
+    pending = _load_proposals()
+
     # Check full ID or prefix match
     matching = None
-    for pid, proposal in _pending_proposals.items():
+    for pid, proposal in pending.items():
         if pid == proposal_id or pid.startswith(proposal_id):
             matching = proposal
             proposal_id = pid
             break
 
     if not matching:
-        return {"error": f"Proposal not found: {proposal_id}", "pending": list(_pending_proposals.keys())}
+        return {"error": f"Proposal not found: {proposal_id}", "pending": list(pending.keys())}
 
     if approved:
         # Remove from pending
-        del _pending_proposals[proposal_id]
+        del pending[proposal_id]
+        _save_proposals(pending)
 
         # Notify user
         _send_summary_to_telegram(
@@ -912,7 +941,8 @@ def _handle_approval(proposal_id: str, approved: bool) -> dict:
         }
     else:
         # Remove from pending
-        del _pending_proposals[proposal_id]
+        del pending[proposal_id]
+        _save_proposals(pending)
 
         _send_summary_to_telegram(
             f"❌ <b>Denied:</b> {matching.get('description', '')[:200]}\n\n"
