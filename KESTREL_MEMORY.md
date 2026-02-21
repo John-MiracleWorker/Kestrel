@@ -60,3 +60,42 @@ _(Syncs directly with `AGENTS.md` and `.cursorrules`)_
 - Explanations must be backed by evidence from code and logs.
 - Only modify directly relevant code. Small, incremental steps are heavily encouraged.
 - No placeholder code (`# ...`) is allowed—always rewrite the entire snippet.
+
+## 6. P0: File Attachments & Live HUD (Feb 2026)
+
+- **File Attachment System**: Users can attach images, PDFs, code files via paperclip button (📎) or drag-and-drop. Gateway upload route (`POST /api/upload`) with `@fastify/multipart`. Brain processes attachments: images → base64 `inlineData` for Gemini multimodal, PDFs → text extraction via `pdfplumber`, code/text → appended to message. Frontend shows file preview chips with size/type.
+- **Live HUD Overhaul**: `LiveCanvas.tsx` completely rewritten with 6 real-time panels:
+  - Phase Indicator (THINKING/EXECUTING/DELIBERATING)
+  - Response Metrics (tok/s, time, chars, words)
+  - Tool Activity feed (live invocations + results)
+  - Council Votes (color-coded decisions)
+  - Memory Recall (recent retrievals)
+  - Agent Reasoning (internal thought preview)
+
+## 7. P1: Structured Output & Proactive Notifications (Feb 2026)
+
+- **RichContent Renderer** (`web/components/Chat/RichContent.tsx`): Parses assistant messages for structured blocks. Code blocks render with syntax label + copy button. `chart:bar`, `chart:line`, `chart:pie` blocks render CSS-only charts. `table` blocks render sortable data tables. Falls back to plain text gracefully.
+- **Notification System**: `NotificationBell.tsx` in header with unread badge, dropdown panel, mark-read. `Brain/notifications.py` NotificationRouter persists to `notifications` table, delivers via WebSocket callback, rate-limited (5/hr/user). Gateway routes: `GET /api/notifications`, `POST /api/notifications/:id/read`, `POST /api/notifications/read-all`. Types: info, success, warning, task_complete, mention.
+
+## 8. P2: Learning Feedback & MCP Tool Marketplace (Feb 2026)
+
+- **Feedback Buttons**: 👍👎 buttons on every assistant message (`FeedbackButtons` component in `ChatView.tsx`). Submits rating (-1/0/1) + optional comment to `message_feedback` table via `POST /api/workspaces/:id/feedback`.
+- **MCP Agent Tools** (`brain/agent/tools/mcp.py`): 4 new agent tools registered in ToolRegistry:
+  - `mcp_search` — Search built-in catalog (12 official servers: filesystem, github, slack, postgres, puppeteer, etc.) + live Smithery registry API. Returns ranked results.
+  - `mcp_install` — Persist MCP server config to `installed_tools` table (upsert).
+  - `mcp_list_installed` — List workspace's installed MCP servers.
+  - `mcp_uninstall` — Remove installed server.
+- **Gateway MCP routes**: `GET/POST/DELETE /api/workspaces/:id/tools`.
+- **DB**: `installed_tools` table (workspace_id, name, server_url, transport, config JSONB, tool_schemas JSONB, enabled).
+
+## 9. P3: Multi-User Collaboration (Feb 2026)
+
+- **DB tables**: `workspace_members` (role: admin/member/viewer, unique workspace+user), `workspace_invites` (email, role, token, expires_at, status).
+- **Gateway routes**: `GET /api/workspaces/:id/members`, `POST /api/workspaces/:id/members/invite` (generates secure token, 7-day expiry), `DELETE /api/workspaces/:id/members/:memberId`.
+- **DB Migration 012** (`012_feedback_members_tools.sql`): All P1-P3 tables in one migration.
+
+## 10. Architecture Notes
+
+- **Gateway ↔ Brain**: Feature routes use `brainClient.call(method, request)` generic RPC pattern. Brain's generic handler falls back gracefully for not-yet-implemented methods.
+- **Attachments**: Passed as JSON in the `parameters` map of `ChatRequest` proto to avoid proto changes.
+- **MCP Discovery**: The agent can autonomously search for, evaluate, and install MCP servers during conversations — enabling on-the-fly capability expansion similar to dynamic tool building.
