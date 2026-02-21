@@ -873,7 +873,7 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                                                         disabled={isInstalled}
                                                         onClick={async () => {
                                                             try {
-                                                                await request(`/api/workspaces/${workspaceId}/tools`, {
+                                                                await request(`/api/workspaces/${workspaceId}/mcp-tools`, {
                                                                     method: 'POST',
                                                                     body: {
                                                                         name: r.name,
@@ -913,7 +913,7 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                                         setShowAddMcp(!showAddMcp);
                                         if (!mcpLoading && mcpServers.length === 0) {
                                             setMcpLoading(true);
-                                            request(`/api/workspaces/${workspaceId}/tools`)
+                                            request(`/api/workspaces/${workspaceId}/mcp-tools`)
                                                 .then((d: any) => setMcpServers(d?.tools || []))
                                                 .catch(() => setMcpServers([]))
                                                 .finally(() => setMcpLoading(false));
@@ -969,7 +969,7 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                                             onClick={async () => {
                                                 setMcpSaving(true);
                                                 try {
-                                                    await request(`/api/workspaces/${workspaceId}/tools`, {
+                                                    await request(`/api/workspaces/${workspaceId}/mcp-tools`, {
                                                         method: 'POST',
                                                         body: {
                                                             name: mcpName,
@@ -1031,7 +1031,7 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                                                 style={{ ...S.btnGhost, padding: '4px 10px', fontSize: '0.65rem', color: '#ef4444', borderColor: '#ef4444' }}
                                                 onClick={async () => {
                                                     try {
-                                                        await request(`/api/workspaces/${workspaceId}/tools/${srv.name}`, { method: 'DELETE' });
+                                                        await request(`/api/workspaces/${workspaceId}/mcp-tools/${srv.name}`, { method: 'DELETE' });
                                                         setMcpServers(prev => prev.filter(s => s.name !== srv.name));
                                                     } catch { /* ignore */ }
                                                 }}

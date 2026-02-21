@@ -117,7 +117,7 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
 
     // ── P2: List Installed Tools ─────────────────────────────────────
     app.withTypeProvider<ZodTypeProvider>().get(
-        '/api/workspaces/:workspaceId/tools',
+        '/api/workspaces/:workspaceId/mcp-tools',
         {
             preHandler: [requireAuth, requireWorkspace],
             schema: { params: z.object({ workspaceId: z.string().uuid() }) },
@@ -135,7 +135,7 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
 
     // ── P2: Install Tool ─────────────────────────────────────────────
     app.withTypeProvider<ZodTypeProvider>().post(
-        '/api/workspaces/:workspaceId/tools',
+        '/api/workspaces/:workspaceId/mcp-tools',
         {
             preHandler: [requireAuth, requireWorkspace],
             schema: {
@@ -168,7 +168,7 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
 
     // ── P2: Uninstall Tool ───────────────────────────────────────────
     app.withTypeProvider<ZodTypeProvider>().delete(
-        '/api/workspaces/:workspaceId/tools/:toolName',
+        '/api/workspaces/:workspaceId/mcp-tools/:toolName',
         {
             preHandler: [requireAuth, requireWorkspace],
             schema: {
