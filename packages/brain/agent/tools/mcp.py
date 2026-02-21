@@ -428,3 +428,184 @@ def register_mcp_tools(registry, pool=None) -> None:
     )
 
     logger.info("MCP tools registered: mcp_search, mcp_install, mcp_list_installed, mcp_uninstall")
+
+    # ── MCP Protocol Tools (require the client) ──────────────────────
+
+    from agent.tools.mcp_client import get_mcp_pool
+
+    mcp_pool = get_mcp_pool()
+
+    async def mcp_connect(
+        name: str,
+        command: str = "",
+        env_vars: str = "",
+    ) -> dict:
+        """Connect to an MCP server and discover its tools."""
+        # If no command given, try to find from catalog or installed
+        if not command:
+            for server in BUILTIN_CATALOG:
+                if server["name"] == name:
+                    command = server["install"]
+                    break
+
+        if not command:
+            return {"error": f"No command specified for '{name}'. Use mcp_search to find it."}
+
+        # Parse env vars
+        env = {}
+        if env_vars:
+            try:
+                env = json.loads(env_vars)
+            except json.JSONDecodeError:
+                for line in env_vars.strip().split("\n"):
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        env[k.strip()] = v.strip()
+
+        result = await mcp_pool.connect(name, command, env)
+        return result
+
+    async def mcp_call(
+        server_name: str,
+        tool_name: str,
+        arguments: str = "{}",
+    ) -> dict:
+        """Call a tool on a connected MCP server."""
+        client = await mcp_pool.get_client(server_name)
+        if not client:
+            connected = mcp_pool.list_connected()
+            names = [c["name"] for c in connected]
+            return {
+                "error": f"Server '{server_name}' not connected.",
+                "connected_servers": names,
+                "hint": "Use mcp_connect first.",
+            }
+
+        try:
+            args = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except json.JSONDecodeError:
+            return {"error": f"Invalid JSON arguments: {arguments}"}
+
+        return await client.call_tool(tool_name, args)
+
+    async def mcp_disconnect(name: str = "") -> dict:
+        """Disconnect from an MCP server (or all if name is empty)."""
+        if not name:
+            await mcp_pool.disconnect_all()
+            return {"success": True, "message": "All MCP servers disconnected."}
+        return await mcp_pool.disconnect(name)
+
+    async def mcp_status() -> dict:
+        """Show status of all connected MCP servers and their tools."""
+        connected = mcp_pool.list_connected()
+        all_tools = mcp_pool.get_all_tools()
+        return {
+            "connected_servers": connected,
+            "total_tools": len(all_tools),
+            "tools": all_tools,
+        }
+
+    # Register protocol tools
+    registry.register(
+        definition=ToolDefinition(
+            name="mcp_connect",
+            description=(
+                "Connect to an MCP server by name. If it's a built-in server "
+                "(e.g., 'filesystem', 'github', 'brave-search'), just provide the name. "
+                "For custom servers, provide the command to start it. "
+                "Returns the list of tools the server provides."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the MCP server (e.g., 'filesystem', 'github')",
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Command to start the server (optional if built-in)",
+                        "default": "",
+                    },
+                    "env_vars": {
+                        "type": "string",
+                        "description": "Environment variables as JSON or KEY=VALUE lines",
+                        "default": "",
+                    },
+                },
+                "required": ["name"],
+            },
+            risk_level=RiskLevel.MEDIUM,
+            timeout_seconds=35,
+            category="mcp",
+        ),
+        handler=mcp_connect,
+    )
+
+    registry.register(
+        definition=ToolDefinition(
+            name="mcp_call",
+            description=(
+                "Call a tool on a connected MCP server. The server must be "
+                "connected first using mcp_connect. Arguments are passed as JSON."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "server_name": {
+                        "type": "string",
+                        "description": "Name of the connected MCP server",
+                    },
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Name of the tool to call",
+                    },
+                    "arguments": {
+                        "type": "string",
+                        "description": "Tool arguments as JSON string",
+                        "default": "{}",
+                    },
+                },
+                "required": ["server_name", "tool_name"],
+            },
+            risk_level=RiskLevel.MEDIUM,
+            timeout_seconds=60,
+            category="mcp",
+        ),
+        handler=mcp_call,
+    )
+
+    registry.register(
+        definition=ToolDefinition(
+            name="mcp_disconnect",
+            description="Disconnect from an MCP server (or all if no name given).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Server name to disconnect, or empty for all",
+                        "default": "",
+                    },
+                },
+            },
+            risk_level=RiskLevel.LOW,
+            timeout_seconds=10,
+            category="mcp",
+        ),
+        handler=mcp_disconnect,
+    )
+
+    registry.register(
+        definition=ToolDefinition(
+            name="mcp_status",
+            description="Show all connected MCP servers and their available tools.",
+            parameters={"type": "object", "properties": {}},
+            risk_level=RiskLevel.LOW,
+            timeout_seconds=5,
+            category="mcp",
+        ),
+        handler=mcp_status,
+    )
+
+    logger.info("MCP protocol tools registered: mcp_connect, mcp_call, mcp_disconnect, mcp_status")

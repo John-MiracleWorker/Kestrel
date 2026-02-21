@@ -174,5 +174,41 @@ def build_tool_registry(hands_client=None, vector_store=None) -> ToolRegistry:
     register_git_tools(registry)
     register_self_improve_tools(registry)
 
+    # Multi-agent delegation tool
+    from agent.tools.delegate import DELEGATE_TOOL
+    from agent.coordinator import Coordinator
+
+    # Coordinator is lazily initialized — needs the agent loop reference
+    # which is set after the registry is built
+    registry._coordinator = None
+    registry._current_task = None
+
+    async def delegate_handler(goal: str, specialist: str = "researcher") -> dict:
+        """Delegate a subtask to a specialist sub-agent."""
+        coordinator = getattr(registry, '_coordinator', None)
+        current_task = getattr(registry, '_current_task', None)
+
+        if not coordinator or not current_task:
+            return {
+                "success": False,
+                "error": "Delegation not available — agent loop not initialized for this session.",
+                "hint": "Delegation works during autonomous task mode (!goal or /task).",
+            }
+
+        if not goal:
+            return {"success": False, "error": "Goal is required"}
+
+        try:
+            result = await coordinator.delegate(
+                parent_task=current_task,
+                goal=goal,
+                specialist_type=specialist,
+            )
+            return {"success": True, "output": result}
+        except Exception as e:
+            return {"success": False, "error": f"Delegation failed: {e}"}
+
+    registry.register(definition=DELEGATE_TOOL, handler=delegate_handler)
+
     logger.info(f"Tool registry built: {len(registry._definitions)} tools")
     return registry

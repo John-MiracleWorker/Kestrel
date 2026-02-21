@@ -114,6 +114,19 @@ class AgentLoop:
         """
         start_time = time.monotonic()
 
+        # ── Wire multi-agent coordinator for this task ────────
+        try:
+            from agent.coordinator import Coordinator
+            coordinator = Coordinator(
+                agent_loop=self,
+                persistence=self._persistence,
+                tool_registry=self._tools,
+                event_callback=self._event_callback,
+            )
+            self._tools._coordinator = coordinator
+            self._tools._current_task = task
+        except Exception as e:
+            logger.warning(f"Coordinator init skipped: {e}")
         try:
             # ── Phase 0: Enrich with Past Lessons + Memory Graph ─
             lesson_context = ""
