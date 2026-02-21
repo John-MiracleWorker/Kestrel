@@ -228,7 +228,7 @@ async def self_improve_action(
     elif action == "report":
         return _last_scan_results or {"message": "No scan results. Run 'scan' first."}
     elif action == "propose":
-        return _propose_improvements()
+        return await _propose_improvements()
     elif action == "approve":
         return _handle_approval(proposal_id, approved=True)
     elif action == "deny":
