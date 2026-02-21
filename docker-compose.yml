@@ -96,7 +96,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes:
       - ${LOCAL_MODEL_DIR:-./models}:/models:ro
-      - .:/app  # Mount project root for self-improvement git operations
+      - .:/project # Mount project root for self-improvement git operations
     depends_on:
       postgres:
         condition: service_healthy

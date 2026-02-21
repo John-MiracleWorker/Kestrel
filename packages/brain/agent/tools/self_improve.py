@@ -28,7 +28,7 @@ from agent.types import RiskLevel, ToolDefinition
 
 logger = logging.getLogger("brain.agent.tools.self_improve")
 
-PROJECT_ROOT = "/app"
+PROJECT_ROOT = "/project"
 
 # ── Inactivity Guard ─────────────────────────────────────────────────
 # Self-improvement will NOT restart containers or auto-deploy unless

@@ -18,7 +18,7 @@ from agent.types import RiskLevel, ToolDefinition
 logger = logging.getLogger("brain.agent.tools.git")
 
 # Project root inside Docker
-PROJECT_ROOT = "/app"
+PROJECT_ROOT = "/project"
 MAX_DIFF_LINES = 200  # Safety: cap diff size per commit
 
 
