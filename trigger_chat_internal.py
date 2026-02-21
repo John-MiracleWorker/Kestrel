@@ -57,7 +57,7 @@ async def test_chat():
             workspace_id=workspace_id,
             messages=messages,
             provider=provider,
-            model="gemini-3-flash-preview",
+            model="gemini-2.0-flash",
             parameters=parameters
         )
         

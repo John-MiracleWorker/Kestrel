@@ -5,7 +5,7 @@ import { providers } from '../../api/client';
 const PROVIDER_MODELS: Record<string, string[]> = {
     openai: ['gpt-5-mini', 'gpt-5', 'gpt-5.1', 'gpt-5.2', 'gpt-5-nano'],
     anthropic: ['claude-haiku-4-5', 'claude-sonnet-4-5', 'claude-opus-4-6'],
-    google: ['gemini-3-flash', 'gemini-3-pro', 'gemini-2.5-flash', 'gemini-2.5-pro'],
+    google: ['gemini-2.0-flash', 'gemini-2.0-pro', 'gemini-1.5-flash', 'gemini-1.5-pro'],
     local: ['auto'],
 };
 

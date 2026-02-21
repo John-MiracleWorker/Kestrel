@@ -102,7 +102,7 @@ export function ConfigureProviderModal({ workspaceId, providerKey, providerName,
         switch (key) {
             case 'openai': return 'gpt-5-mini';
             case 'anthropic': return 'claude-haiku-4-5';
-            case 'google': return 'gemini-3-flash';
+            case 'google': return 'gemini-2.0-flash';
             case 'local': return 'llama-3-8b-instruct';
             default: return '';
         }
