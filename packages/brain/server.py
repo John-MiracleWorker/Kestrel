@@ -715,6 +715,15 @@ class BrainServicer:
                 working_memory=_vector_store,
             )
 
+            # ── Agent activity event queue ──────────────────────────
+            # Council, Coordinator, and Reflection modules push events
+            # here via callbacks; we drain them alongside the agent loop.
+            import asyncio as _asyncio
+            activity_queue = _asyncio.Queue()
+
+            async def _activity_callback(activity_type: str, data: dict):
+                await activity_queue.put({"activity_type": activity_type, **data})
+
             # Load workspace-specific dynamic skills into the tool registry
             if _skill_manager:
                 try:
@@ -770,14 +779,7 @@ class BrainServicer:
 
             full_response_parts = []
 
-            # ── Agent activity event queue ──────────────────────────
-            # Council, Coordinator, and Reflection modules push events
-            # here via callbacks; we drain them alongside the agent loop.
-            import asyncio as _asyncio
-            activity_queue = _asyncio.Queue()
-
-            async def _activity_callback(activity_type: str, data: dict):
-                await activity_queue.put({"activity_type": activity_type, **data})
+            # ── Attach activity callback to agent sub-modules ──────
 
             # Attach callback to modules if available
             if hasattr(agent_loop, '_council') and agent_loop._council:
@@ -1173,6 +1175,7 @@ class BrainServicer:
 
             # Allow "smart" title generation:
             response_chunks = []
+            logger.info(f"GenerateTitle: using provider={provider_name}, model=default, api_key={'present' if api_key else 'MISSING'}")
             try:
                 async for token in provider.stream(
                     messages=[{"role": "user", "content": prompt}],
@@ -1186,14 +1189,17 @@ class BrainServicer:
                 logger.warning(f"Title generation stream failed: {stream_err}")
 
             # If LLM failed or returned nothing, derive title from first user message
-            if not response_chunks:
+            raw_response = "".join(response_chunks).strip()
+            logger.info(f"GenerateTitle: raw_response='{raw_response[:100]}', chunks={len(response_chunks)}")
+            if not response_chunks or raw_response.startswith("[Error"):
                 first_user = next((m["content"] for m in messages if m["role"] == "user"), "")
                 generated_title = first_user[:50].strip() if first_user else "New Conversation"
             else:
-                generated_title = "".join(response_chunks).strip().strip('"')
+                generated_title = raw_response.strip('"')
 
             # Clamp to 80 chars
             generated_title = generated_title[:80] if generated_title else "New Conversation"
+            logger.info(f"GenerateTitle: final title='{generated_title}'")
             
             # Update the title in DB
             await update_conversation_title(

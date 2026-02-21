@@ -388,7 +388,8 @@ function buildPhases(
     toolActivity?: { status: string; toolName?: string } | null,
 ): PhaseData[] {
     const phases: PhaseData[] = [];
-    const byType = (prefix: string) => activities.filter((a) => a.activity_type.startsWith(prefix));
+    const byType = (prefix: string) =>
+        activities.filter((a) => a?.activity_type?.startsWith(prefix));
 
     // Memory
     const memories = byType('memory_recalled');
