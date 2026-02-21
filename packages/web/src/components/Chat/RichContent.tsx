@@ -82,14 +82,81 @@ export function RichContent({ content }: { content: string }) {
                     case 'table':
                         return <TableBlock key={i} data={block.data} />;
                     default:
-                        return <span key={i} style={{ whiteSpace: 'pre-wrap' }}>{block.content}</span>;
+                        return <MarkdownText key={i} content={block.content} />;
                 }
             })}
         </div>
     );
 }
 
-// ── CodeBlock ────────────────────────────────────────────────────────
+// ── Markdown Text ────────────────────────────────────────────────────
+function markdownToHtml(md: string): string {
+    let html = md
+        // Escape HTML
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+
+        // Headers (must be at start of line)
+        .replace(/^#### (.+)$/gm, '<h4 style="margin:12px 0 4px;font-size:0.85rem;color:var(--text-primary);font-weight:600">$1</h4>')
+        .replace(/^### (.+)$/gm, '<h3 style="margin:14px 0 4px;font-size:0.9rem;color:var(--text-primary);font-weight:600">$1</h3>')
+        .replace(/^## (.+)$/gm, '<h2 style="margin:16px 0 6px;font-size:0.95rem;color:var(--text-primary);font-weight:700">$1</h2>')
+        .replace(/^# (.+)$/gm, '<h1 style="margin:16px 0 8px;font-size:1.05rem;color:var(--text-primary);font-weight:700">$1</h1>')
+
+        // Horizontal rules
+        .replace(/^---$/gm, '<hr style="border:none;border-top:1px solid var(--border-subtle);margin:12px 0"/>')
+
+        // Bold + italic
+        .replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>')
+        // Bold
+        .replace(/\*\*(.+?)\*\*/g, '<strong style="color:var(--text-primary);font-weight:600">$1</strong>')
+        // Italic
+        .replace(/\*(.+?)\*/g, '<em>$1</em>')
+
+        // Inline code
+        .replace(/`([^`]+)`/g, '<code style="background:rgba(0,243,255,0.08);color:var(--accent-cyan);padding:1px 5px;border-radius:3px;font-family:var(--font-mono);font-size:0.85em">$1</code>')
+
+        // Links
+        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" style="color:var(--accent-cyan);text-decoration:underline">$1</a>')
+
+        // Bullet lists (- or * at start of line)
+        .replace(/^(?:[-*]) (.+)$/gm, '<li style="margin-left:16px;padding:2px 0;list-style:disc outside">$1</li>')
+
+        // Numbered lists
+        .replace(/^(\d+)\. (.+)$/gm, '<li style="margin-left:16px;padding:2px 0;list-style:decimal outside" value="$1">$2</li>')
+
+        // Wrap consecutive <li> in <ul>/<ol>
+        .replace(/((?:<li[^>]*>.*<\/li>\n?)+)/g, '<ul style="margin:4px 0;padding-left:8px">$1</ul>')
+
+        // Paragraphs: split on double newlines
+        .replace(/\n\n+/g, '</p><p style="margin:8px 0">')
+
+        // Single newlines → <br>
+        .replace(/\n/g, '<br/>');
+
+    // Wrap in paragraph
+    html = '<p style="margin:0">' + html + '</p>';
+
+    // Clean up empty paragraphs
+    html = html.replace(/<p style="margin:0"><\/p>/g, '');
+    html = html.replace(/<p style="margin:8px 0"><\/p>/g, '');
+
+    return html;
+}
+
+function MarkdownText({ content }: { content: string }) {
+    const html = React.useMemo(() => markdownToHtml(content), [content]);
+    return (
+        <div
+            style={{
+                lineHeight: 1.65,
+                color: 'var(--text-secondary, #d1d5db)',
+                fontSize: '0.92rem',
+            }}
+            dangerouslySetInnerHTML={{ __html: html }}
+        />
+    );
+}
 function CodeBlock({ code, language }: { code: string; language: string }) {
     const [copied, setCopied] = useState(false);
 

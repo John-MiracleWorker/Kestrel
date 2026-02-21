@@ -132,13 +132,15 @@ export function useChat(
 
                 case 'token':
                     contentRef.current += data.content;
-                    setStreamingMessage({
-                        id: data.messageId || 'streaming',
+                    setStreamingMessage((prev) => ({
+                        id: prev?.id || data.messageId || 'streaming',
                         role: 'assistant',
                         content: contentRef.current,
                         isStreaming: true,
-                        toolActivity: null, // Clear tool activity when content arrives
-                    });
+                        // Keep last toolActivity visible instead of clearing
+                        toolActivity: prev?.toolActivity ?? null,
+                        agentActivities: prev?.agentActivities,
+                    }));
                     break;
 
                 case 'done':

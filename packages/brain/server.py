@@ -902,7 +902,7 @@ class BrainServicer:
                     yield self._make_response(
                         chunk_type=0,
                         metadata={
-                            "agent_status": "tool_call",
+                            "agent_status": "calling",
                             "tool_name": event.tool_name,
                             "tool_args": event.tool_args[:200] if event.tool_args else "",
                         },
@@ -914,9 +914,9 @@ class BrainServicer:
                     yield self._make_response(
                         chunk_type=0,
                         metadata={
-                            "agent_status": "tool_result",
+                            "agent_status": "result",
                             "tool_name": event.tool_name,
-                            "result_preview": result_preview,
+                            "tool_result": result_preview,
                         },
                     )
 

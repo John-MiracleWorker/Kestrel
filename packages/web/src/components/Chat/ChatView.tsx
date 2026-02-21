@@ -554,16 +554,16 @@ function buildPhases(
     // Tools (from toolActivity state)
     if (toolActivity) {
         const toolItems = activities.filter(
-            (a) => a.activity_type === 'tool_calling' || a.activity_type === 'tool_result',
+            (a) => a.activity_type === 'tool_calling' || a.activity_type === 'tool_result' || a.activity_type === 'calling' || a.activity_type === 'result',
         );
         const toolLabel =
             toolActivity.status === 'thinking'
                 ? 'Reasoning'
                 : toolActivity.status === 'planning'
                     ? 'Planning'
-                    : toolActivity.status === 'tool_calling'
+                    : (toolActivity.status === 'calling' || toolActivity.status === 'tool_calling')
                         ? toolActivity.toolName || 'Tool'
-                        : toolActivity.status === 'tool_result'
+                        : (toolActivity.status === 'result' || toolActivity.status === 'tool_result')
                             ? `${toolActivity.toolName} ✓`
                             : 'Working';
         phases.push({
@@ -571,7 +571,7 @@ function buildPhases(
             icon: '⚡',
             label: toolLabel,
             color: '#8b5cf6',
-            summary: toolActivity.status === 'tool_result' ? 'done' : '…',
+            summary: (toolActivity.status === 'result' || toolActivity.status === 'tool_result') ? 'done' : '…',
             items: toolItems,
         });
     }
