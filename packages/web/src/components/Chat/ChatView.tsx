@@ -2,13 +2,6 @@ import { useState, useRef, useEffect, type FormEvent } from 'react';
 import type { Message } from '../../api/client';
 import { providers } from '../../api/client';
 
-const PROVIDER_MODELS: Record<string, string[]> = {
-    openai: ['gpt-5-mini', 'gpt-5', 'gpt-5.1', 'gpt-5.2', 'gpt-5-nano'],
-    anthropic: ['claude-haiku-4-5', 'claude-sonnet-4-5', 'claude-opus-4-6'],
-    google: ['gemini-3.1-pro', 'gemini-3-deep-think', 'gemini-3-pro', 'gemini-3-flash', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'],
-    local: ['auto'],
-};
-
 interface ChatViewProps {
     workspaceId: string | null;
     messages: Message[];
@@ -24,6 +17,7 @@ interface ChatViewProps {
             toolResult?: string;
             thinking?: string;
         } | null;
+        agentActivities?: Array<{ activity_type: string; [key: string]: unknown }>;
     } | null;
     onSendMessage: (content: string, provider?: string, model?: string) => void;
     isConnected: boolean;
@@ -70,9 +64,10 @@ export function ChatView({
         }
 
         setLoadingModels(true);
-        providers.listModels(workspaceId, selectedProvider)
-            .then(models => {
-                const modelIds = models.map(m => m.id);
+        providers
+            .listModels(workspaceId, selectedProvider)
+            .then((models) => {
+                const modelIds = models.map((m) => m.id);
                 setAvailableModels(modelIds);
                 if (modelIds.length > 0) {
                     setSelectedModel(modelIds[0]);
@@ -80,7 +75,7 @@ export function ChatView({
                     setSelectedModel('');
                 }
             })
-            .catch(err => {
+            .catch((err) => {
                 console.error('Failed to fetch models:', err);
                 setAvailableModels([]);
                 setSelectedModel('');
@@ -109,24 +104,28 @@ export function ChatView({
     }
 
     return (
-        <div style={{
-            display: 'flex',
-            flexDirection: 'column',
-            height: '100%',
-            background: 'var(--bg-terminal)',
-            fontFamily: 'var(--font-mono)',
-            color: 'var(--text-primary)',
-        }}>
-            {/* Header */}
-            <header style={{
-                height: '60px',
+        <div
+            style={{
                 display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                padding: '0 24px',
-                borderBottom: '1px solid var(--border-color)',
-                background: 'var(--bg-panel)',
-            }}>
+                flexDirection: 'column',
+                height: '100%',
+                background: 'var(--bg-terminal)',
+                fontFamily: 'var(--font-mono)',
+                color: 'var(--text-primary)',
+            }}
+        >
+            {/* Header */}
+            <header
+                style={{
+                    height: '60px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    padding: '0 24px',
+                    borderBottom: '1px solid var(--border-color)',
+                    background: 'var(--bg-panel)',
+                }}
+            >
                 <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
                     <span style={{ color: 'var(--accent-green)', fontWeight: 'bold' }}>&gt;</span>
                     <h2 style={{ fontSize: '0.9rem', fontWeight: 600, margin: 0 }}>
@@ -135,7 +134,6 @@ export function ChatView({
                 </div>
 
                 <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
-
                     {/* Model Selector */}
                     <div style={{ display: 'flex', gap: '8px' }}>
                         <select
@@ -160,7 +158,9 @@ export function ChatView({
                                     <option value="">LOADING...</option>
                                 ) : availableModels.length > 0 ? (
                                     availableModels.map((m) => (
-                                        <option key={m} value={m}>{m.toUpperCase()}</option>
+                                        <option key={m} value={m}>
+                                            {m.toUpperCase()}
+                                        </option>
                                     ))
                                 ) : (
                                     <option value="">NO_MODELS</option>
@@ -170,13 +170,16 @@ export function ChatView({
                     </div>
 
                     {/* Connection Status */}
-                    <div style={{
-                        width: '10px',
-                        height: '10px',
-                        borderRadius: '50%',
-                        background: isConnected ? 'var(--accent-green)' : 'var(--accent-error)',
-                        boxShadow: `0 0 8px ${isConnected ? 'var(--accent-green)' : 'var(--accent-error)'}`
-                    }} title={isConnected ? "System Online" : "System Offline"} />
+                    <div
+                        style={{
+                            width: '10px',
+                            height: '10px',
+                            borderRadius: '50%',
+                            background: isConnected ? 'var(--accent-green)' : 'var(--accent-error)',
+                            boxShadow: `0 0 8px ${isConnected ? 'var(--accent-green)' : 'var(--accent-error)'}`,
+                        }}
+                        title={isConnected ? 'System Online' : 'System Offline'}
+                    />
 
                     {/* Toggle Canvas */}
                     <button
@@ -188,7 +191,7 @@ export function ChatView({
                             padding: '4px 12px',
                             fontSize: '0.75rem',
                             cursor: 'pointer',
-                            borderRadius: '2px'
+                            borderRadius: '2px',
                         }}
                     >
                         Toggle HUD
@@ -197,34 +200,40 @@ export function ChatView({
             </header>
 
             {/* Messages Area */}
-            <div style={{
-                flex: 1,
-                overflowY: 'auto',
-                padding: '24px',
-                scrollBehavior: 'smooth'
-            }}>
+            <div
+                style={{
+                    flex: 1,
+                    overflowY: 'auto',
+                    padding: '24px',
+                    scrollBehavior: 'smooth',
+                }}
+            >
                 {messages.length === 0 && !streamingMessage && (
-                    <div style={{
-                        display: 'flex',
-                        flexDirection: 'column',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        height: '100%',
-                        color: 'var(--text-dim)',
-                        opacity: 0.5
-                    }}>
+                    <div
+                        style={{
+                            display: 'flex',
+                            flexDirection: 'column',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            height: '100%',
+                            color: 'var(--text-dim)',
+                            opacity: 0.5,
+                        }}
+                    >
                         <div style={{ fontSize: '4rem', marginBottom: '16px' }}>_</div>
                         <p>READY FOR INPUT</p>
                     </div>
                 )}
 
-                <div style={{
-                    maxWidth: '900px',
-                    margin: '0 auto',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: '24px',
-                }}>
+                <div
+                    style={{
+                        maxWidth: '900px',
+                        margin: '0 auto',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '24px',
+                    }}
+                >
                     {messages.map((msg) => (
                         <MessageBubble key={msg.id} message={msg} />
                     ))}
@@ -234,6 +243,7 @@ export function ChatView({
                             message={streamingMessage}
                             isStreaming
                             toolActivity={streamingMessage.toolActivity}
+                            agentActivities={streamingMessage.agentActivities}
                         />
                     )}
 
@@ -242,11 +252,13 @@ export function ChatView({
             </div>
 
             {/* Input Area */}
-            <div style={{
-                padding: '24px',
-                borderTop: '1px solid var(--border-color)',
-                background: 'var(--bg-panel)'
-            }}>
+            <div
+                style={{
+                    padding: '24px',
+                    borderTop: '1px solid var(--border-color)',
+                    background: 'var(--bg-panel)',
+                }}
+            >
                 <form
                     onSubmit={handleSubmit}
                     style={{
@@ -255,20 +267,29 @@ export function ChatView({
                         position: 'relative',
                         display: 'flex',
                         gap: '12px',
-                        alignItems: 'flex-end'
+                        alignItems: 'flex-end',
                     }}
                 >
-                    <span style={{ color: 'var(--accent-cyan)', paddingBottom: '12px', fontWeight: 'bold' }}>$</span>
-                    <div style={{
-                        flex: 1,
-                        background: 'rgba(0,0,0,0.3)',
-                        border: '1px solid var(--text-dim)',
-                        borderRadius: '4px',
-                        padding: '12px',
-                        transition: 'border-color 0.2s'
-                    }}
-                        onFocus={(e) => e.currentTarget.style.borderColor = 'var(--accent-cyan)'}
-                        onBlur={(e) => e.currentTarget.style.borderColor = 'var(--text-dim)'}
+                    <span
+                        style={{
+                            color: 'var(--accent-cyan)',
+                            paddingBottom: '12px',
+                            fontWeight: 'bold',
+                        }}
+                    >
+                        $
+                    </span>
+                    <div
+                        style={{
+                            flex: 1,
+                            background: 'rgba(0,0,0,0.3)',
+                            border: '1px solid var(--text-dim)',
+                            borderRadius: '4px',
+                            padding: '12px',
+                            transition: 'border-color 0.2s',
+                        }}
+                        onFocus={(e) => (e.currentTarget.style.borderColor = 'var(--accent-cyan)')}
+                        onBlur={(e) => (e.currentTarget.style.borderColor = 'var(--text-dim)')}
                         tabIndex={-1}
                     >
                         <textarea
@@ -287,7 +308,7 @@ export function ChatView({
                                 outline: 'none',
                                 color: 'var(--text-primary)',
                                 fontFamily: 'var(--font-mono)',
-                                lineHeight: '1.5'
+                                lineHeight: '1.5',
                             }}
                         />
                     </div>
@@ -304,7 +325,7 @@ export function ChatView({
                             fontWeight: 'bold',
                             fontFamily: 'var(--font-mono)',
                             height: '46px',
-                            opacity: isConnected ? 1 : 0.5
+                            opacity: isConnected ? 1 : 0.5,
                         }}
                     >
                         SEND
@@ -335,115 +356,549 @@ export function ChatView({
     );
 }
 
+/* ── KestrelProcessBar ────────────────────────────────────────────── */
+
+type Activity = { activity_type: string; [key: string]: unknown };
+
+interface PhaseData {
+    key: string;
+    icon: string;
+    label: string;
+    color: string;
+    summary: string;
+    items: Activity[];
+}
+
+const VOTE_COLORS: Record<string, string> = {
+    approve: '#22c55e',
+    reject: '#ef4444',
+    conditional: '#f59e0b',
+    abstain: '#6b7280',
+};
+const ROLE_ICONS: Record<string, string> = {
+    architect: '🏗️',
+    implementer: '⚙️',
+    security: '🔒',
+    devils_advocate: '😈',
+    user_advocate: '👤',
+};
+
+function buildPhases(
+    activities: Activity[],
+    toolActivity?: { status: string; toolName?: string } | null,
+): PhaseData[] {
+    const phases: PhaseData[] = [];
+    const byType = (prefix: string) => activities.filter((a) => a.activity_type.startsWith(prefix));
+
+    // Memory
+    const memories = byType('memory_recalled');
+    if (memories.length > 0) {
+        const count = (memories[0].count as number) || 0;
+        phases.push({
+            key: 'memory',
+            icon: '🧠',
+            label: 'Memory',
+            color: '#06b6d4',
+            summary: `${count} recalled`,
+            items: memories,
+        });
+    }
+
+    // Lessons
+    const lessons = byType('lessons_loaded');
+    if (lessons.length > 0) {
+        const count = (lessons[0].count as number) || 0;
+        phases.push({
+            key: 'lessons',
+            icon: '📖',
+            label: 'Lessons',
+            color: '#8b5cf6',
+            summary: `${count} loaded`,
+            items: lessons,
+        });
+    }
+
+    // Skills
+    const skills = byType('skill_activated');
+    if (skills.length > 0) {
+        const count = (skills[0].count as number) || 0;
+        phases.push({
+            key: 'skills',
+            icon: '🔧',
+            label: 'Skills',
+            color: '#f97316',
+            summary: `${count} active`,
+            items: skills,
+        });
+    }
+
+    // Plan
+    const plans = byType('plan_created');
+    if (plans.length > 0) {
+        const stepCount = (plans[0].step_count as number) || 0;
+        phases.push({
+            key: 'plan',
+            icon: '📋',
+            label: 'Plan',
+            color: '#3b82f6',
+            summary: `${stepCount} steps`,
+            items: plans,
+        });
+    }
+
+    // Tools (from toolActivity state)
+    if (toolActivity) {
+        const toolItems = activities.filter(
+            (a) => a.activity_type === 'tool_calling' || a.activity_type === 'tool_result',
+        );
+        const toolLabel =
+            toolActivity.status === 'thinking'
+                ? 'Reasoning'
+                : toolActivity.status === 'planning'
+                  ? 'Planning'
+                  : toolActivity.status === 'tool_calling'
+                    ? toolActivity.toolName || 'Tool'
+                    : toolActivity.status === 'tool_result'
+                      ? `${toolActivity.toolName} ✓`
+                      : 'Working';
+        phases.push({
+            key: 'tools',
+            icon: '⚡',
+            label: toolLabel,
+            color: '#8b5cf6',
+            summary: toolActivity.status === 'tool_result' ? 'done' : '…',
+            items: toolItems,
+        });
+    }
+
+    // Council
+    const council = byType('council_');
+    if (council.length > 0) {
+        const verdict = council.find((a) => a.activity_type === 'council_verdict');
+        const consensus = verdict
+            ? (verdict.has_consensus as boolean)
+                ? 'consensus'
+                : 'divided'
+            : '…';
+        phases.push({
+            key: 'council',
+            icon: '🤔',
+            label: 'Council',
+            color: '#f59e0b',
+            summary: consensus,
+            items: council,
+        });
+    }
+
+    // Delegation
+    const delegation = byType('delegation_');
+    if (delegation.length > 0) {
+        const done = delegation.find((a) => a.activity_type === 'delegation_complete');
+        phases.push({
+            key: 'delegation',
+            icon: '🔀',
+            label: 'Delegation',
+            color: '#3b82f6',
+            summary: done ? String(done.specialist) : '…',
+            items: delegation,
+        });
+    }
+
+    // Reflection
+    const reflection = byType('reflection_');
+    if (reflection.length > 0) {
+        const verdict = reflection.find((a) => a.activity_type === 'reflection_verdict');
+        const conf = verdict ? `${((verdict.confidence as number) * 100).toFixed(0)}%` : '…';
+        phases.push({
+            key: 'reflection',
+            icon: '🔍',
+            label: 'Reflection',
+            color: '#a855f7',
+            summary: conf,
+            items: reflection,
+        });
+    }
+
+    // Evidence
+    const evidence = byType('evidence_summary');
+    if (evidence.length > 0) {
+        const count = (evidence[0].decision_count as number) || 0;
+        phases.push({
+            key: 'evidence',
+            icon: '📎',
+            label: 'Evidence',
+            color: '#14b8a6',
+            summary: `${count} decisions`,
+            items: evidence,
+        });
+    }
+
+    // Confidence (from reflection verdict)
+    const reflVerdict = activities.find((a) => a.activity_type === 'reflection_verdict');
+    if (reflVerdict) {
+        const conf = ((reflVerdict.confidence as number) || 0) * 100;
+        phases.push({
+            key: 'confidence',
+            icon: '🎯',
+            label: 'Confidence',
+            color: conf >= 80 ? '#22c55e' : conf >= 50 ? '#f59e0b' : '#ef4444',
+            summary: `${conf.toFixed(0)}%`,
+            items: [reflVerdict],
+        });
+    }
+
+    // Tokens
+    const tokens = byType('token_usage');
+    if (tokens.length > 0) {
+        const total = (tokens[0].total_tokens as number) || 0;
+        const display = total >= 1000 ? `${(total / 1000).toFixed(1)}k` : String(total);
+        phases.push({
+            key: 'tokens',
+            icon: '💰',
+            label: 'Tokens',
+            color: '#6b7280',
+            summary: display,
+            items: tokens,
+        });
+    }
+
+    return phases;
+}
+
+function KestrelProcessBar({
+    activities,
+    toolActivity,
+}: {
+    activities: Activity[];
+    toolActivity?: {
+        status: string;
+        toolName?: string;
+        toolArgs?: string;
+        toolResult?: string;
+        thinking?: string;
+    } | null;
+}) {
+    const [expanded, setExpanded] = useState<string | null>(null);
+    const phases = buildPhases(activities, toolActivity);
+
+    if (phases.length === 0 && !toolActivity) return null;
+
+    const toggle = (key: string) => setExpanded((prev) => (prev === key ? null : key));
+    const expandedPhase = phases.find((p) => p.key === expanded);
+
+    return (
+        <div style={{ marginBottom: '10px' }}>
+            {/* Compact pill bar */}
+            <div
+                style={{
+                    display: 'flex',
+                    flexWrap: 'wrap',
+                    gap: '4px',
+                    alignItems: 'center',
+                    fontFamily: 'var(--font-mono)',
+                    fontSize: '0.72rem',
+                }}
+            >
+                {phases.map((phase, idx) => (
+                    <span key={phase.key} style={{ display: 'contents' }}>
+                        {idx > 0 && (
+                            <span
+                                style={{
+                                    color: 'var(--text-dim)',
+                                    fontSize: '0.6rem',
+                                    margin: '0 1px',
+                                }}
+                            >
+                                →
+                            </span>
+                        )}
+                        <button
+                            onClick={() => toggle(phase.key)}
+                            style={{
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '4px',
+                                padding: '3px 8px',
+                                border:
+                                    expanded === phase.key
+                                        ? `1px solid ${phase.color}`
+                                        : '1px solid transparent',
+                                borderRadius: '12px',
+                                background: `${phase.color}15`,
+                                color: phase.color,
+                                cursor: 'pointer',
+                                fontFamily: 'inherit',
+                                fontSize: 'inherit',
+                                fontWeight: 500,
+                                transition: 'all 0.2s',
+                                animation: 'pill-fade-in 0.3s ease-out',
+                            }}
+                        >
+                            <span>{phase.icon}</span>
+                            <span>{phase.summary}</span>
+                        </button>
+                    </span>
+                ))}
+            </div>
+
+            {/* Expanded detail panel */}
+            {expandedPhase && (
+                <div
+                    style={{
+                        marginTop: '6px',
+                        padding: '8px 12px',
+                        borderRadius: '6px',
+                        border: `1px solid ${expandedPhase.color}33`,
+                        background: `${expandedPhase.color}08`,
+                        fontSize: '0.75rem',
+                        fontFamily: 'var(--font-mono)',
+                        animation: 'pill-fade-in 0.2s ease-out',
+                    }}
+                >
+                    <div
+                        style={{ color: expandedPhase.color, fontWeight: 600, marginBottom: '6px' }}
+                    >
+                        {expandedPhase.icon} {expandedPhase.label}
+                    </div>
+                    {expandedPhase.items.map((item, idx) => (
+                        <PhaseDetail key={idx} item={item} phaseKey={expandedPhase.key} />
+                    ))}
+                </div>
+            )}
+
+            <style>{`
+                @keyframes pill-fade-in {
+                    from { opacity: 0; transform: translateY(-2px); }
+                    to { opacity: 1; transform: translateY(0); }
+                }
+            `}</style>
+        </div>
+    );
+}
+
+function PhaseDetail({ item, phaseKey }: { item: Activity; phaseKey: string }) {
+    const dim = { color: 'var(--text-dim)' };
+
+    // Memory — show entities and preview
+    if (phaseKey === 'memory') {
+        return (
+            <div style={dim}>
+                Queried: {String((item.entities as string[])?.join(', ') || '—')}
+                <br />
+                {String((item.preview as string)?.substring(0, 150) || '')}
+            </div>
+        );
+    }
+
+    // Plan — show numbered steps
+    if (phaseKey === 'plan' && item.steps) {
+        return (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                {(item.steps as Array<{ index: number; description: string }>).map((step, i) => (
+                    <div key={i} style={{ ...dim, display: 'flex', gap: '6px' }}>
+                        <span style={{ color: '#3b82f6', minWidth: '16px' }}>
+                            {step.index + 1}.
+                        </span>
+                        <span>{step.description}</span>
+                    </div>
+                ))}
+            </div>
+        );
+    }
+
+    // Council opinions — show role, vote, analysis
+    if (item.activity_type === 'council_opinion') {
+        const voteColor = VOTE_COLORS[item.vote as string] || '#888';
+        return (
+            <div
+                style={{
+                    display: 'flex',
+                    gap: '8px',
+                    padding: '2px 0',
+                    borderBottom: '1px solid rgba(255,255,255,0.05)',
+                }}
+            >
+                <span style={{ minWidth: '24px' }}>{ROLE_ICONS[item.role as string] || '•'}</span>
+                <span
+                    style={{
+                        color: voteColor,
+                        fontWeight: 600,
+                        minWidth: '90px',
+                        textTransform: 'uppercase',
+                    }}
+                >
+                    {String(item.vote)}
+                </span>
+                <span style={dim}>
+                    {String((item.analysis as string)?.substring(0, 120) || '')}
+                </span>
+            </div>
+        );
+    }
+
+    // Council verdict
+    if (item.activity_type === 'council_verdict') {
+        return (
+            <div
+                style={{
+                    color: (item.has_consensus as boolean) ? '#22c55e' : '#ef4444',
+                    fontWeight: 600,
+                    marginTop: '4px',
+                }}
+            >
+                {(item.has_consensus as boolean) ? '✓ CONSENSUS REACHED' : '⚠ NO CONSENSUS'}
+                {item.requires_user_review ? ' — User review required' : ''}
+            </div>
+        );
+    }
+
+    // Reflection critique
+    if (item.activity_type === 'reflection_critique') {
+        const sevColor =
+            item.severity === 'critical'
+                ? '#ef4444'
+                : item.severity === 'high'
+                  ? '#f59e0b'
+                  : '#6b7280';
+        return (
+            <div style={{ display: 'flex', gap: '8px', padding: '2px 0' }}>
+                <span
+                    style={{
+                        color: sevColor,
+                        fontWeight: 600,
+                        textTransform: 'uppercase',
+                        fontSize: '0.68rem',
+                        minWidth: '55px',
+                    }}
+                >
+                    {String(item.severity)}
+                </span>
+                <span style={dim}>
+                    {String((item.description as string)?.substring(0, 150) || '')}
+                </span>
+            </div>
+        );
+    }
+
+    // Evidence decisions
+    if (phaseKey === 'evidence' && item.decisions) {
+        return (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                {(item.decisions as Array<{ type: string; description: string }>).map((d, i) => (
+                    <div key={i} style={{ ...dim, display: 'flex', gap: '6px' }}>
+                        <span style={{ color: '#14b8a6', minWidth: '80px' }}>{d.type}</span>
+                        <span>{d.description}</span>
+                    </div>
+                ))}
+            </div>
+        );
+    }
+
+    // Token usage
+    if (phaseKey === 'tokens') {
+        return (
+            <div style={dim}>
+                Total: {String(item.total_tokens)} tokens · {String(item.iterations)} iterations ·{' '}
+                {String(item.tool_calls)} tool calls
+            </div>
+        );
+    }
+
+    // Generic — show preview or message
+    const text = String(item.preview || item.message || item.description || '');
+    if (text) return <div style={dim}>{text.substring(0, 200)}</div>;
+    return null;
+}
+
+/* ── Message Bubble ───────────────────────────────────────────────── */
+
 function MessageBubble({
     message,
     isStreaming = false,
     toolActivity,
+    agentActivities = [],
 }: {
     message: { role: string; content: string };
     isStreaming?: boolean;
-    toolActivity?: { status: string; toolName?: string; toolArgs?: string; toolResult?: string; thinking?: string } | null;
+    toolActivity?: {
+        status: string;
+        toolName?: string;
+        toolArgs?: string;
+        toolResult?: string;
+        thinking?: string;
+    } | null;
+    agentActivities?: Array<{ activity_type: string; [key: string]: unknown }>;
 }) {
     const isUser = message.role === 'user';
 
     return (
-        <div style={{
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: isUser ? 'flex-end' : 'flex-start',
-            maxWidth: '100%'
-        }}>
-            <div style={{
-                fontSize: '0.75rem',
-                color: isUser ? 'var(--accent-cyan)' : 'var(--accent-purple)',
-                marginBottom: '4px',
-                fontFamily: 'var(--font-mono)',
-                fontWeight: 600
-            }}>
+        <div
+            style={{
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: isUser ? 'flex-end' : 'flex-start',
+                maxWidth: '100%',
+            }}
+        >
+            <div
+                style={{
+                    fontSize: '0.75rem',
+                    color: isUser ? 'var(--accent-cyan)' : 'var(--accent-purple)',
+                    marginBottom: '4px',
+                    fontFamily: 'var(--font-mono)',
+                    fontWeight: 600,
+                }}
+            >
                 {isUser ? 'USER_INPUT' : 'SYSTEM_RESPONSE'}
             </div>
 
-            <div style={{
-                maxWidth: '85%',
-                padding: '12px 16px',
-                background: isUser ? 'rgba(0, 243, 255, 0.1)' : 'transparent',
-                border: isUser ? '1px solid var(--accent-cyan)' : 'none',
-                borderLeft: !isUser ? '3px solid var(--accent-purple)' : undefined,
-                color: 'var(--text-primary)',
-                fontFamily: isUser ? 'var(--font-mono)' : 'var(--font-sans)',
-                lineHeight: 1.6,
-                fontSize: '0.95rem',
-                whiteSpace: 'pre-wrap',
-                position: 'relative',
-                boxShadow: isUser ? '0 0 10px rgba(0, 243, 255, 0.05)' : 'none'
-            }}>
-                {!message.content && isStreaming && !toolActivity && (
-                    <span style={{
-                        fontFamily: 'var(--font-mono)',
-                        fontSize: '0.85rem',
-                        color: 'var(--accent-purple)',
-                        opacity: 0.8,
-                    }}>
-                        <span className="thinking-dots">thinking</span>
-                    </span>
-                )}
-                {/* Tool Activity Indicator */}
-                {isStreaming && toolActivity && (
-                    <div style={{
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: '6px',
-                        marginBottom: message.content ? '12px' : '0',
-                    }}>
-                        <div style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '8px',
-                            fontFamily: 'var(--font-mono)',
-                            fontSize: '0.8rem',
-                            padding: '6px 10px',
-                            borderRadius: '4px',
-                            background: 'rgba(139, 92, 246, 0.08)',
-                            border: '1px solid rgba(139, 92, 246, 0.2)',
-                        }}>
-                            <span style={{
-                                display: 'inline-block',
-                                width: '6px',
-                                height: '6px',
-                                borderRadius: '50%',
-                                background: toolActivity.status === 'tool_result'
-                                    ? 'var(--accent-green)'
-                                    : 'var(--accent-purple)',
-                                animation: toolActivity.status === 'tool_result'
-                                    ? 'none'
-                                    : 'agent-pulse 1.2s ease-in-out infinite',
-                                boxShadow: toolActivity.status === 'tool_result'
-                                    ? '0 0 6px var(--accent-green)'
-                                    : '0 0 6px var(--accent-purple)',
-                            }} />
-                            <span style={{ color: 'var(--accent-purple)' }}>
-                                {toolActivity.status === 'thinking' && '🧠 Reasoning...'}
-                                {toolActivity.status === 'planning' && '📋 Planning...'}
-                                {toolActivity.status === 'tool_calling' && (
-                                    <>⚡ Using <strong>{toolActivity.toolName}</strong></>
-                                )}
-                                {toolActivity.status === 'tool_result' && (
-                                    <>✓ <strong>{toolActivity.toolName}</strong> complete</>
-                                )}
-                            </span>
-                        </div>
-                    </div>
+            <div
+                style={{
+                    maxWidth: '85%',
+                    padding: '12px 16px',
+                    background: isUser ? 'rgba(0, 243, 255, 0.1)' : 'transparent',
+                    border: isUser ? '1px solid var(--accent-cyan)' : 'none',
+                    borderLeft: !isUser ? '3px solid var(--accent-purple)' : undefined,
+                    color: 'var(--text-primary)',
+                    fontFamily: isUser ? 'var(--font-mono)' : 'var(--font-sans)',
+                    lineHeight: 1.6,
+                    fontSize: '0.95rem',
+                    whiteSpace: 'pre-wrap',
+                    position: 'relative',
+                    boxShadow: isUser ? '0 0 10px rgba(0, 243, 255, 0.05)' : 'none',
+                }}
+            >
+                {!message.content &&
+                    isStreaming &&
+                    !toolActivity &&
+                    agentActivities.length === 0 && (
+                        <span
+                            style={{
+                                fontFamily: 'var(--font-mono)',
+                                fontSize: '0.85rem',
+                                color: 'var(--accent-purple)',
+                                opacity: 0.8,
+                            }}
+                        >
+                            <span className="thinking-dots">thinking</span>
+                        </span>
+                    )}
+                {/* KestrelProcessBar — unified tool + agent activity display */}
+                {isStreaming && (toolActivity || agentActivities.length > 0) && (
+                    <KestrelProcessBar activities={agentActivities} toolActivity={toolActivity} />
                 )}
                 {message.content}
                 {isStreaming && message.content && (
-                    <span style={{
-                        display: 'inline-block',
-                        width: '8px',
-                        height: '14px',
-                        background: 'var(--accent-cyan)',
-                        marginLeft: '4px',
-                        animation: 'blink 1s step-end infinite'
-                    }} />
+                    <span
+                        style={{
+                            display: 'inline-block',
+                            width: '8px',
+                            height: '14px',
+                            background: 'var(--accent-cyan)',
+                            marginLeft: '4px',
+                            animation: 'blink 1s step-end infinite',
+                        }}
+                    />
                 )}
             </div>
             <style>{`

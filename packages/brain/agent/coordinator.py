@@ -99,10 +99,16 @@ class Coordinator:
     tool registries and specialized personas.
     """
 
-    def __init__(self, agent_loop, persistence, tool_registry):
+    def __init__(self, agent_loop, persistence, tool_registry, event_callback=None):
         self._loop = agent_loop
         self._persistence = persistence
         self._full_registry = tool_registry
+        self._event_callback = event_callback
+
+    async def _emit(self, activity_type: str, data: dict):
+        """Emit an agent activity event to the UI."""
+        if self._event_callback:
+            await self._event_callback(activity_type, data)
 
     async def delegate(
         self,
@@ -118,6 +124,13 @@ class Coordinator:
         spec = SPECIALISTS.get(specialist_type)
         if not spec:
             return f"Unknown specialist type: {specialist_type}. Available: {list(SPECIALISTS.keys())}"
+
+        await self._emit("delegation_started", {
+            "specialist": spec.name,
+            "type": specialist_type,
+            "goal": goal[:200],
+            "tools": spec.allowed_tools,
+        })
 
         # Create child task
         import uuid
@@ -172,14 +185,31 @@ class Coordinator:
         result_parts = []
         try:
             async for event in child_loop.run(child_task):
-                # Bubble up events (could be forwarded to parent's stream)
+                # Forward tool activity from sub-agent
+                if event.type.name == "TOOL_CALLED":
+                    await self._emit("delegation_progress", {
+                        "specialist": spec.name,
+                        "tool": event.tool_name,
+                        "status": "tool_calling",
+                    })
                 if event.type.name in ("TASK_COMPLETE", "TASK_FAILED"):
                     result_parts.append(event.content)
         except Exception as e:
             logger.error(f"Sub-agent {child_task.id} failed: {e}")
+            await self._emit("delegation_complete", {
+                "specialist": spec.name,
+                "status": "failed",
+                "result": str(e)[:200],
+            })
             return f"Sub-agent ({spec.name}) failed: {e}"
 
-        return "\n".join(result_parts) if result_parts else "Sub-agent completed with no output."
+        result = "\n".join(result_parts) if result_parts else "Sub-agent completed with no output."
+        await self._emit("delegation_complete", {
+            "specialist": spec.name,
+            "status": "complete",
+            "result": result[:300],
+        })
+        return result
 
     def get_specialist_info(self) -> list[dict]:
         """Return descriptions of available specialists for tool schema."""

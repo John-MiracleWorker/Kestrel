@@ -1,12 +1,18 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createChatSocket, conversations, forceRefresh, type Message } from '../api/client';
 
+interface AgentActivity {
+    activity_type: string;
+    [key: string]: unknown;
+}
+
 interface ToolActivity {
-    status: string;       // 'thinking' | 'planning' | 'tool_calling' | 'tool_result'
+    status: string; // 'thinking' | 'planning' | 'tool_calling' | 'tool_result' | 'agent_activity'
     toolName?: string;
     toolArgs?: string;
     toolResult?: string;
     thinking?: string;
+    activity?: AgentActivity;
 }
 
 interface StreamingMessage {
@@ -15,6 +21,7 @@ interface StreamingMessage {
     content: string;
     isStreaming: boolean;
     toolActivity?: ToolActivity | null;
+    agentActivities?: AgentActivity[];
 }
 
 interface UseChatReturn {
@@ -47,6 +54,7 @@ export function useChat(
     const [isConnected, setIsConnected] = useState(false);
     const wsRef = useRef<WebSocket | null>(null);
     const contentRef = useRef('');
+    const activitiesRef = useRef<AgentActivity[]>([]);
     const reconnectAttemptRef = useRef(0);
     const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const isMountedRef = useRef(true);
@@ -90,22 +98,37 @@ export function useChat(
                     }
                     break;
 
-                case 'tool_activity':
-                    // Agent is using tools — update the streaming message with activity info
-                    setStreamingMessage(prev => ({
+                case 'tool_activity': {
+                    // Check if this is an agent_activity event (council/coordinator/reflection)
+                    const isAgentActivity = data.status === 'agent_activity';
+                    if (isAgentActivity) {
+                        try {
+                            const activityData = JSON.parse(
+                                String((data as Record<string, unknown>).activity || '{}'),
+                            ) as AgentActivity;
+                            activitiesRef.current = [...activitiesRef.current, activityData];
+                        } catch {
+                            /* ignore parse errors */
+                        }
+                    }
+                    setStreamingMessage((prev) => ({
                         id: prev?.id || data.messageId || 'streaming',
                         role: 'assistant',
                         content: prev?.content || contentRef.current || '',
                         isStreaming: true,
-                        toolActivity: {
-                            status: data.status || 'thinking',
-                            toolName: data.toolName,
-                            toolArgs: data.toolArgs,
-                            toolResult: data.toolResult,
-                            thinking: data.thinking,
-                        },
+                        toolActivity: isAgentActivity
+                            ? (prev?.toolActivity ?? null)
+                            : {
+                                  status: data.status || 'thinking',
+                                  toolName: data.toolName,
+                                  toolArgs: data.toolArgs,
+                                  toolResult: data.toolResult,
+                                  thinking: data.thinking,
+                              },
+                        agentActivities: [...activitiesRef.current],
                     }));
                     break;
+                }
 
                 case 'token':
                     contentRef.current += data.content;
@@ -114,7 +137,7 @@ export function useChat(
                         role: 'assistant',
                         content: contentRef.current,
                         isStreaming: true,
-                        toolActivity: null,  // Clear tool activity when content arrives
+                        toolActivity: null, // Clear tool activity when content arrives
                     });
                     break;
 
@@ -130,6 +153,7 @@ export function useChat(
                     }
                     setStreamingMessage(null);
                     contentRef.current = '';
+                    activitiesRef.current = [];
                     break;
 
                 case 'error': {

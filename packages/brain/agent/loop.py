@@ -87,6 +87,7 @@ class AgentLoop:
         memory_graph: Optional[MemoryGraph] = None,
         evidence_chain: Optional[EvidenceChain] = None,
         api_key: str = "",
+        event_callback=None,
     ):
         self._provider = provider
         self._tools = tool_registry
@@ -99,6 +100,7 @@ class AgentLoop:
         self._checkpoints = checkpoint_manager
         self._memory_graph = memory_graph
         self._evidence_chain = evidence_chain
+        self._event_callback = event_callback
 
         # Callback for approval resolution (set by the gRPC handler)
         self._approval_callback: Optional[Callable] = None
@@ -121,6 +123,12 @@ class AgentLoop:
                         workspace_id=task.workspace_id,
                         goal=task.goal,
                     )
+                    if lesson_context and self._event_callback:
+                        lesson_count = lesson_context.count('\n') + 1
+                        await self._event_callback("lessons_loaded", {
+                            "count": lesson_count,
+                            "preview": lesson_context[:150],
+                        })
                 except Exception as e:
                     logger.warning(f"Lesson enrichment failed: {e}")
 
@@ -134,6 +142,13 @@ class AgentLoop:
                         workspace_id=task.workspace_id,
                         query_entities=goal_terms,
                     )
+                    if memory_context and self._event_callback:
+                        mem_lines = [l for l in memory_context.split('\n') if l.strip()]
+                        await self._event_callback("memory_recalled", {
+                            "count": len(mem_lines),
+                            "entities": goal_terms,
+                            "preview": memory_context[:200],
+                        })
                 except Exception as e:
                     logger.warning(f"Memory graph query failed: {e}")
 
@@ -155,6 +170,16 @@ class AgentLoop:
                 )
                 task.plan = plan
                 await self._persistence.update_task(task)
+
+                # Emit plan for UI process bar
+                if self._event_callback:
+                    await self._event_callback("plan_created", {
+                        "step_count": len(plan.steps),
+                        "steps": [
+                            {"index": s.index, "description": s.description[:100]}
+                            for s in plan.steps[:6]
+                        ],
+                    })
 
                 # Record plan decision in evidence chain
                 if self._evidence_chain:
@@ -317,6 +342,24 @@ class AgentLoop:
             task.result = "\n".join(results) if results else "Task completed successfully."
 
             await self._persistence.update_task(task)
+
+            # Emit final process bar events
+            if self._event_callback:
+                # Token usage
+                await self._event_callback("token_usage", {
+                    "total_tokens": task.token_usage,
+                    "iterations": task.iterations,
+                    "tool_calls": task.tool_calls_count,
+                })
+                # Evidence summary
+                if self._evidence_chain and self._evidence_chain._decisions:
+                    await self._event_callback("evidence_summary", {
+                        "decision_count": len(self._evidence_chain._decisions),
+                        "decisions": [
+                            {"type": d.decision_type.value, "description": d.description[:80]}
+                            for d in self._evidence_chain._decisions[:5]
+                        ],
+                    })
 
             yield TaskEvent(
                 type=TaskEventType.TASK_COMPLETE,

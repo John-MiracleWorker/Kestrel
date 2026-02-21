@@ -183,6 +183,7 @@ class CouncilSession:
         llm_provider=None,
         model: str = "",
         roles: list[CouncilRole] = None,
+        event_callback=None,
     ):
         self._llm = llm_provider
         self._model = model
@@ -193,6 +194,12 @@ class CouncilSession:
             CouncilRole.DEVILS_ADVOCATE,
             CouncilRole.USER_ADVOCATE,
         ]
+        self._event_callback = event_callback
+
+    async def _emit(self, activity_type: str, data: dict):
+        """Emit an agent activity event to the UI."""
+        if self._event_callback:
+            await self._event_callback(activity_type, data)
 
     async def deliberate(
         self,
@@ -202,31 +209,49 @@ class CouncilSession:
     ) -> CouncilVerdict:
         """
         Run the full council deliberation process.
-
-        Args:
-            proposal: The plan/approach to evaluate
-            context: Additional context (task goal, constraints, etc.)
-            include_debate: Whether to run a debate round between members
-
-        Returns:
-            CouncilVerdict with consensus and synthesized feedback
         """
         verdict = CouncilVerdict(proposal=proposal)
+
+        await self._emit("council_started", {
+            "topic": proposal[:200],
+            "roles": [r.value for r in self._roles],
+            "member_count": len(self._roles),
+        })
 
         # ── Phase 1: Independent evaluation ──────────────────────
         opinions = []
         for role in self._roles:
             opinion = await self._get_evaluation(role, proposal, context)
             opinions.append(opinion)
+            await self._emit("council_opinion", {
+                "role": role.value,
+                "vote": opinion.vote.value,
+                "confidence": opinion.confidence,
+                "analysis": opinion.analysis[:300],
+                "concerns": opinion.concerns[:3],
+            })
 
         # ── Phase 2: Cross-critique (debate round) ───────────────
         if include_debate and len(opinions) >= 2:
+            await self._emit("council_debate", {
+                "phase": "cross_critique",
+                "message": "Members reviewing each other's positions...",
+            })
             opinions = await self._run_debate_round(opinions, proposal)
 
         verdict.opinions = opinions
 
         # ── Phase 3: Synthesize verdict ──────────────────────────
         self._synthesize_verdict(verdict)
+
+        await self._emit("council_verdict", {
+            "consensus": verdict.consensus.value if verdict.consensus else "none",
+            "confidence": verdict.consensus_confidence,
+            "has_consensus": verdict.has_consensus,
+            "requires_user_review": verdict.requires_user_review,
+            "concerns": verdict.synthesized_concerns[:3],
+            "suggestions": verdict.synthesized_suggestions[:3],
+        })
 
         logger.info(
             f"Council verdict: consensus={'yes' if verdict.has_consensus else 'no'}, "

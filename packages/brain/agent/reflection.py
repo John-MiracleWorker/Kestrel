@@ -155,10 +155,16 @@ class ReflectionEngine:
     the plan is revised or execution is blocked pending user approval.
     """
 
-    def __init__(self, llm_provider=None, model: str = ""):
+    def __init__(self, llm_provider=None, model: str = "", event_callback=None):
         self._llm = llm_provider
         self._model = model
         self._reflection_history: list[ReflectionResult] = []
+        self._event_callback = event_callback
+
+    async def _emit(self, activity_type: str, data: dict):
+        """Emit an agent activity event to the UI."""
+        if self._event_callback:
+            await self._event_callback(activity_type, data)
 
     async def reflect(
         self,
@@ -168,17 +174,16 @@ class ReflectionEngine:
     ) -> ReflectionResult:
         """
         Run a full reflection cycle on a plan.
-
-        Steps:
-          1. Red-team critique
-          2. Parse and score critiques
-          3. Strengthen the plan if issues found
-          4. Return confidence assessment
         """
         import time
         start = time.time()
 
         result = ReflectionResult(plan_summary=plan[:500])
+
+        await self._emit("reflection_started", {
+            "plan_summary": plan[:200],
+            "task_goal": task_goal[:200],
+        })
 
         # ── Step 1: Red-team critique ────────────────────────────
         critique_raw = await self._run_red_team(plan, context)
@@ -190,6 +195,15 @@ class ReflectionEngine:
         result.estimated_risk_level = parsed["overall_risk_level"]
         result.should_proceed = parsed["should_proceed"]
         result.alternatives_considered = parsed["alternatives"]
+
+        # Emit each critique point
+        for critique in result.critique_points:
+            await self._emit("reflection_critique", {
+                "category": critique.category.value,
+                "severity": critique.severity,
+                "description": critique.description[:200],
+                "suggestion": critique.suggestion[:200] if critique.suggestion else "",
+            })
 
         # ── Step 2: Strengthen if needed ─────────────────────────
         high_severity = [
@@ -210,6 +224,15 @@ class ReflectionEngine:
 
         # Store in history
         self._reflection_history.append(result)
+
+        await self._emit("reflection_verdict", {
+            "confidence": result.confidence_score,
+            "risk_level": result.estimated_risk_level,
+            "should_proceed": result.should_proceed,
+            "critique_count": len(result.critique_points),
+            "high_severity_count": len(high_severity),
+            "time_ms": result.reflection_time_ms,
+        })
 
         logger.info(
             f"Reflection complete: {len(result.critique_points)} critiques, "

@@ -721,6 +721,10 @@ class BrainServicer:
                     skill_count = await _skill_manager.load_workspace_skills(workspace_id)
                     if skill_count:
                         logger.info(f"Loaded {skill_count} custom skills for workspace")
+                        await _activity_callback("skill_activated", {
+                            "count": skill_count,
+                            "message": f"{skill_count} workspace skills loaded",
+                        })
                 except Exception as e:
                     logger.warning(f"Failed to load workspace skills: {e}")
 
@@ -739,6 +743,7 @@ class BrainServicer:
                 learner=task_learner,
                 evidence_chain=evidence_chain,
                 checkpoint_manager=checkpoint_mgr,
+                event_callback=_activity_callback,
             )
 
             # Inject persona context into the system prompt if available
@@ -765,7 +770,35 @@ class BrainServicer:
 
             full_response_parts = []
 
+            # ── Agent activity event queue ──────────────────────────
+            # Council, Coordinator, and Reflection modules push events
+            # here via callbacks; we drain them alongside the agent loop.
+            import asyncio as _asyncio
+            activity_queue = _asyncio.Queue()
+
+            async def _activity_callback(activity_type: str, data: dict):
+                await activity_queue.put({"activity_type": activity_type, **data})
+
+            # Attach callback to modules if available
+            if hasattr(agent_loop, '_council') and agent_loop._council:
+                agent_loop._council._event_callback = _activity_callback
+            if hasattr(agent_loop, '_coordinator') and agent_loop._coordinator:
+                agent_loop._coordinator._event_callback = _activity_callback
+            if hasattr(agent_loop, '_reflection') and agent_loop._reflection:
+                agent_loop._reflection._event_callback = _activity_callback
+
             async for event in agent_loop.run(chat_task):
+                # First, drain any queued agent activity events
+                while not activity_queue.empty():
+                    activity = activity_queue.get_nowait()
+                    yield self._make_response(
+                        chunk_type=0,
+                        metadata={
+                            "agent_status": "agent_activity",
+                            "activity": json.dumps(activity),
+                        },
+                    )
+
                 event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
 
                 if event_type == "thinking":

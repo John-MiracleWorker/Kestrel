@@ -311,6 +311,7 @@ class TaskEventType(str, Enum):
     DELEGATION_STARTED = "delegation_started"
     DELEGATION_COMPLETE = "delegation_complete"
     CHECKPOINT_SAVED = "checkpoint_saved"
+    AGENT_ACTIVITY = "agent_activity"
 
 
 @dataclass
