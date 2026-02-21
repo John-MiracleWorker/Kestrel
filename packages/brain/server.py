@@ -689,6 +689,12 @@ class BrainServicer:
             else:
                 messages.insert(0, {"role": "system", "content": base_prompt})
 
+            # Inject current date/time so the LLM knows the actual year
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            time_block = f"\n\n## Current Date & Time\nToday is {now.strftime('%A, %B %d, %Y')} (UTC: {now.strftime('%Y-%m-%dT%H:%M:%SZ')}). Use this for all time-sensitive queries."
+            messages[0]["content"] += time_block
+
             logger.info(f"Using provider={provider_name}, model={model}")
 
             # ── 3. Save user message before streaming ───────────────

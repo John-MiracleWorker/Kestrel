@@ -683,102 +683,152 @@ function KestrelProcessBar({
         thinking?: string;
     } | null;
 }) {
-    const [expanded, setExpanded] = useState<string | null>(null);
     const phases = buildPhases(activities, toolActivity);
 
     if (phases.length === 0 && !toolActivity) return null;
 
-    const toggle = (key: string) => setExpanded((prev) => (prev === key ? null : key));
-    const expandedPhase = phases.find((p) => p.key === expanded);
+    // Determine current active status label
+    const currentLabel = toolActivity
+        ? toolActivity.status === 'thinking'
+            ? '🧠 Reasoning…'
+            : toolActivity.status === 'planning'
+                ? '📋 Planning…'
+                : (toolActivity.status === 'calling' || toolActivity.status === 'tool_calling')
+                    ? `⚡ Using ${toolActivity.toolName || 'tool'}…`
+                    : (toolActivity.status === 'result' || toolActivity.status === 'tool_result')
+                        ? `✅ ${toolActivity.toolName || 'Tool'} complete`
+                        : '🔄 Working…'
+        : '🔄 Processing…';
+
+    const isActive = toolActivity?.status === 'calling' || toolActivity?.status === 'thinking' || toolActivity?.status === 'planning';
+    const isDone = toolActivity?.status === 'result';
+    const accentColor = isActive ? '#a855f7' : isDone ? '#10b981' : '#00f3ff';
 
     return (
-        <div style={{ marginBottom: '10px' }}>
-            {/* Compact pill bar */}
-            <div
-                style={{
+        <div style={{
+            marginBottom: '12px',
+            borderRadius: '8px',
+            overflow: 'hidden',
+            border: `1px solid ${accentColor}44`,
+            background: `linear-gradient(135deg, ${accentColor}08, ${accentColor}15)`,
+            animation: 'processbar-in 0.3s ease-out',
+        }}>
+            {/* Animated progress line */}
+            {isActive && (
+                <div style={{
+                    height: '2px',
+                    background: `linear-gradient(90deg, transparent, ${accentColor}, transparent)`,
+                    animation: 'progress-slide 1.5s ease-in-out infinite',
+                }} />
+            )}
+
+            {/* Main status */}
+            <div style={{
+                padding: '10px 14px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '10px',
+            }}>
+                {/* Pulsing dot */}
+                {isActive && (
+                    <div style={{
+                        width: '8px',
+                        height: '8px',
+                        borderRadius: '50%',
+                        background: accentColor,
+                        boxShadow: `0 0 8px ${accentColor}`,
+                        animation: 'pulse-dot 1.2s ease-in-out infinite',
+                        flexShrink: 0,
+                    }} />
+                )}
+                <span style={{
+                    fontFamily: 'var(--font-mono)',
+                    fontSize: '0.82rem',
+                    fontWeight: 600,
+                    color: accentColor,
+                    letterSpacing: '0.02em',
+                }}>
+                    {currentLabel}
+                </span>
+                {toolActivity?.toolArgs && isActive && (
+                    <span style={{
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: '0.7rem',
+                        color: 'var(--text-dim)',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                        maxWidth: '200px',
+                    }}>
+                        {toolActivity.toolArgs.slice(0, 60)}
+                    </span>
+                )}
+            </div>
+
+            {/* Phase pills (completed phases) */}
+            {phases.length > 1 && (
+                <div style={{
+                    padding: '0 14px 10px',
                     display: 'flex',
                     flexWrap: 'wrap',
-                    gap: '4px',
-                    alignItems: 'center',
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: '0.72rem',
-                }}
-            >
-                {phases.map((phase, idx) => (
-                    <span key={phase.key} style={{ display: 'contents' }}>
-                        {idx > 0 && (
-                            <span
-                                style={{
-                                    color: 'var(--text-dim)',
-                                    fontSize: '0.6rem',
-                                    margin: '0 1px',
-                                }}
-                            >
-                                →
-                            </span>
-                        )}
-                        <button
-                            onClick={() => toggle(phase.key)}
+                    gap: '6px',
+                }}>
+                    {phases.map((phase) => (
+                        <span
+                            key={phase.key}
                             style={{
                                 display: 'inline-flex',
                                 alignItems: 'center',
                                 gap: '4px',
-                                padding: '3px 8px',
-                                border:
-                                    expanded === phase.key
-                                        ? `1px solid ${phase.color}`
-                                        : '1px solid transparent',
+                                padding: '2px 10px',
                                 borderRadius: '12px',
-                                background: `${phase.color}15`,
+                                background: `${phase.color}20`,
+                                border: `1px solid ${phase.color}40`,
+                                fontFamily: 'var(--font-mono)',
+                                fontSize: '0.68rem',
                                 color: phase.color,
-                                cursor: 'pointer',
-                                fontFamily: 'inherit',
-                                fontSize: 'inherit',
                                 fontWeight: 500,
-                                transition: 'all 0.2s',
-                                animation: 'pill-fade-in 0.3s ease-out',
                             }}
                         >
-                            <span>{phase.icon}</span>
-                            <span>{phase.summary}</span>
-                        </button>
-                    </span>
-                ))}
-            </div>
-
-            {/* Expanded detail panel */}
-            {expandedPhase && (
-                <div
-                    style={{
-                        marginTop: '6px',
-                        padding: '8px 12px',
-                        borderRadius: '6px',
-                        border: `1px solid ${expandedPhase.color}33`,
-                        background: `${expandedPhase.color}08`,
-                        fontSize: '0.75rem',
-                        fontFamily: 'var(--font-mono)',
-                        animation: 'pill-fade-in 0.2s ease-out',
-                    }}
-                >
-                    <div
-                        style={{ color: expandedPhase.color, fontWeight: 600, marginBottom: '6px' }}
-                    >
-                        {expandedPhase.icon} {expandedPhase.label}
-                    </div>
-                    {expandedPhase.items.map((item, idx) => (
-                        <PhaseDetail key={idx} item={item} phaseKey={expandedPhase.key} />
+                            {phase.icon} {phase.label}
+                        </span>
                     ))}
                 </div>
             )}
 
+            {/* Thinking preview */}
+            {toolActivity?.thinking && (
+                <div style={{
+                    padding: '0 14px 10px',
+                    fontFamily: 'var(--font-mono)',
+                    fontSize: '0.7rem',
+                    color: 'var(--text-dim)',
+                    lineHeight: 1.4,
+                    maxHeight: '40px',
+                    overflow: 'hidden',
+                    opacity: 0.7,
+                }}>
+                    💭 {toolActivity.thinking.slice(0, 150)}
+                </div>
+            )}
+
             <style>{`
-                @keyframes pill-fade-in {
-                    from { opacity: 0; transform: translateY(-2px); }
+                @keyframes processbar-in {
+                    from { opacity: 0; transform: translateY(-4px); }
                     to { opacity: 1; transform: translateY(0); }
+                }
+                @keyframes progress-slide {
+                    0% { transform: translateX(-100%); }
+                    100% { transform: translateX(100%); }
+                }
+                @keyframes pulse-dot {
+                    0%, 100% { opacity: 1; transform: scale(1); }
+                    50% { opacity: 0.4; transform: scale(0.8); }
                 }
             `}</style>
         </div>
     );
+
 }
 
 function PhaseDetail({ item, phaseKey }: { item: Activity; phaseKey: string }) {
