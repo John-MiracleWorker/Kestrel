@@ -22,6 +22,7 @@ import providerRoutes from './routes/providers';
 import telegramWebhookRoutes from './routes/webhooks/telegram';
 import whatsappWebhookRoutes from './routes/webhooks/whatsapp';
 import taskRoutes from './routes/tasks';
+import integrationRoutes from './routes/integrations';
 
 dotenv.config();
 
@@ -174,26 +175,30 @@ async function start() {
         // 5. Set up metrics
         setupMetrics(app);
 
-        // 6. Start Fastify HTTP server
+        // 6. Create channel registry + register integration routes (BEFORE listen)
+        channelRegistry = new ChannelRegistry(brainClient);
+
+        await integrationRoutes(app, {
+            channelRegistry,
+            defaultWorkspaceId: process.env.DEFAULT_WORKSPACE_ID || 'default',
+        });
+
+        // 7. Start Fastify HTTP server
         await app.listen({ port: config.port, host: config.host });
         logger.info(`Gateway listening on ${config.host}:${config.port}`);
 
-        // 7. Set up channel registry + WebSocket adapter
+        // 8. Set up WebSocket adapter (requires server to be listening)
         const server = app.server;
         const wss = new WebSocketServer({ server, path: config.wsPath });
-
-        channelRegistry = new ChannelRegistry(brainClient);
 
         const webAdapter = new WebChannelAdapter(wss, sessionManager, brainClient, config.jwtSecret);
         await channelRegistry.register(webAdapter);
         logger.info(`WebSocket server on ${config.wsPath}`);
 
-        // Future adapters — conditionally enabled via env vars
-
-        // Telegram
+        // Telegram (from env var — settings UI uses /integrations/telegram route instead)
         if (telegramAdapter) {
             await channelRegistry.register(telegramAdapter);
-            logger.info('Telegram adapter enabled');
+            logger.info('Telegram adapter enabled (env var)');
         }
 
         // WhatsApp (Twilio)

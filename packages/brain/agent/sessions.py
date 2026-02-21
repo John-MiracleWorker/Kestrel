@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Agent-to-Agent Session Management — cross-session messaging and discovery.
 

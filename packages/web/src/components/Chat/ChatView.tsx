@@ -17,6 +17,13 @@ interface ChatViewProps {
         role: 'assistant';
         content: string;
         isStreaming: boolean;
+        toolActivity?: {
+            status: string;
+            toolName?: string;
+            toolArgs?: string;
+            toolResult?: string;
+            thinking?: string;
+        } | null;
     } | null;
     onSendMessage: (content: string, provider?: string, model?: string) => void;
     isConnected: boolean;
@@ -226,6 +233,7 @@ export function ChatView({
                         <MessageBubble
                             message={streamingMessage}
                             isStreaming
+                            toolActivity={streamingMessage.toolActivity}
                         />
                     )}
 
@@ -330,9 +338,11 @@ export function ChatView({
 function MessageBubble({
     message,
     isStreaming = false,
+    toolActivity,
 }: {
     message: { role: string; content: string };
     isStreaming?: boolean;
+    toolActivity?: { status: string; toolName?: string; toolArgs?: string; toolResult?: string; thinking?: string } | null;
 }) {
     const isUser = message.role === 'user';
 
@@ -367,8 +377,65 @@ function MessageBubble({
                 position: 'relative',
                 boxShadow: isUser ? '0 0 10px rgba(0, 243, 255, 0.05)' : 'none'
             }}>
+                {!message.content && isStreaming && !toolActivity && (
+                    <span style={{
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: '0.85rem',
+                        color: 'var(--accent-purple)',
+                        opacity: 0.8,
+                    }}>
+                        <span className="thinking-dots">thinking</span>
+                    </span>
+                )}
+                {/* Tool Activity Indicator */}
+                {isStreaming && toolActivity && (
+                    <div style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '6px',
+                        marginBottom: message.content ? '12px' : '0',
+                    }}>
+                        <div style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px',
+                            fontFamily: 'var(--font-mono)',
+                            fontSize: '0.8rem',
+                            padding: '6px 10px',
+                            borderRadius: '4px',
+                            background: 'rgba(139, 92, 246, 0.08)',
+                            border: '1px solid rgba(139, 92, 246, 0.2)',
+                        }}>
+                            <span style={{
+                                display: 'inline-block',
+                                width: '6px',
+                                height: '6px',
+                                borderRadius: '50%',
+                                background: toolActivity.status === 'tool_result'
+                                    ? 'var(--accent-green)'
+                                    : 'var(--accent-purple)',
+                                animation: toolActivity.status === 'tool_result'
+                                    ? 'none'
+                                    : 'agent-pulse 1.2s ease-in-out infinite',
+                                boxShadow: toolActivity.status === 'tool_result'
+                                    ? '0 0 6px var(--accent-green)'
+                                    : '0 0 6px var(--accent-purple)',
+                            }} />
+                            <span style={{ color: 'var(--accent-purple)' }}>
+                                {toolActivity.status === 'thinking' && '🧠 Reasoning...'}
+                                {toolActivity.status === 'planning' && '📋 Planning...'}
+                                {toolActivity.status === 'tool_calling' && (
+                                    <>⚡ Using <strong>{toolActivity.toolName}</strong></>
+                                )}
+                                {toolActivity.status === 'tool_result' && (
+                                    <>✓ <strong>{toolActivity.toolName}</strong> complete</>
+                                )}
+                            </span>
+                        </div>
+                    </div>
+                )}
                 {message.content}
-                {isStreaming && (
+                {isStreaming && message.content && (
                     <span style={{
                         display: 'inline-block',
                         width: '8px',
@@ -381,6 +448,18 @@ function MessageBubble({
             </div>
             <style>{`
                 @keyframes blink { 50% { opacity: 0; } }
+                @keyframes thinking-pulse {
+                    0%, 100% { opacity: 0.4; }
+                    50% { opacity: 1; }
+                }
+                .thinking-dots::after {
+                    content: '...';
+                    animation: thinking-pulse 1.5s ease-in-out infinite;
+                }
+                @keyframes agent-pulse {
+                    0%, 100% { opacity: 0.4; transform: scale(1); }
+                    50% { opacity: 1; transform: scale(1.3); }
+                }
             `}</style>
         </div>
     );

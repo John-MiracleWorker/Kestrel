@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Token & Cost Observability — real-time metrics for agent execution.
 

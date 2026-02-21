@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 State Checkpointing — save and restore agent task state for rollback.
 

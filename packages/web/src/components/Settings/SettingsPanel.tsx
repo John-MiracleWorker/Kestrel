@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { ConfigureProviderModal } from './ConfigureProviderModal';
-import { providers, apiKeys, type ApiKey } from '../../api/client';
+import { providers, apiKeys, tools as toolsApi, workspaces, integrations, capabilities as capsApi, type ApiKey, type ToolInfo, type CapabilityItem } from '../../api/client';
+
+/* ── Types ─────────────────────────────────────────────────────────── */
 
 interface SettingsPanelProps {
     onClose: () => void;
@@ -10,28 +11,332 @@ interface SettingsPanelProps {
     workspaceId: string;
 }
 
+interface ProviderConfig {
+    provider: string;
+    model?: string;
+    temperature?: number;
+    maxTokens?: number;
+    max_tokens?: number;
+    systemPrompt?: string;
+    system_prompt?: string;
+    ragEnabled?: boolean;
+    rag_enabled?: boolean;
+    ragTopK?: number;
+    rag_top_k?: number;
+    ragMinSimilarity?: number;
+    rag_min_similarity?: number;
+    isDefault?: boolean;
+    is_default?: boolean;
+    apiKey?: string;
+    apiKeyEncrypted?: string;
+    api_key_encrypted?: string;
+}
+
+type TabId = 'model' | 'persona' | 'memory' | 'tools' | 'agent' | 'capabilities' | 'integrations' | 'api-keys' | 'general' | 'profile';
+
+const KEY_MASKS = ['***', '••••••••••••'];
+const isKeyMasked = (key: string) => KEY_MASKS.includes(key);
+const DISPLAY_MASK = '••••••••••••';
+
+const PROVIDER_META: Record<string, { name: string; icon: string; requiresKey: boolean }> = {
+    local: { name: 'Local (llama.cpp)', icon: '⚡', requiresKey: false },
+    openai: { name: 'OpenAI', icon: '◈', requiresKey: true },
+    anthropic: { name: 'Anthropic', icon: '◆', requiresKey: true },
+    google: { name: 'Google Gemini', icon: '◉', requiresKey: true },
+};
+
+const RISK_COLORS: Record<string, string> = {
+    low: '#00ff9d',
+    medium: '#00f3ff',
+    high: '#ff9d00',
+    critical: '#ff0055',
+};
+
+const CATEGORY_ICONS: Record<string, string> = {
+    code: '⟨/⟩',
+    web: '◎',
+    file: '▤',
+    memory: '⬡',
+    data: '▦',
+    control: '⊕',
+    skill: '✦',
+    general: '○',
+};
+
+/* ── Styles ────────────────────────────────────────────────────────── */
+
+const S = {
+    backdrop: {
+        position: 'fixed' as const, inset: 0, zIndex: 9999,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(6px)',
+    },
+    panel: {
+        display: 'flex', width: '100%', maxWidth: 860, height: '85vh',
+        background: '#0a0a0a', border: '1px solid #222',
+        borderRadius: '6px', overflow: 'hidden',
+        fontFamily: "'JetBrains Mono', monospace",
+        animation: 'scaleIn 0.2s ease-out',
+    },
+    nav: {
+        width: 200, minWidth: 200, borderRight: '1px solid #222',
+        display: 'flex', flexDirection: 'column' as const,
+        background: '#080808', padding: '16px 0',
+    },
+    navHeader: {
+        padding: '0 16px 12px', fontSize: '0.7rem', fontWeight: 600,
+        color: '#00f3ff', letterSpacing: '0.1em', textTransform: 'uppercase' as const,
+        borderBottom: '1px solid #1a1a1a', marginBottom: '4px',
+    },
+    navSection: {
+        padding: '8px 16px 4px', fontSize: '0.6rem', fontWeight: 600,
+        color: '#333', letterSpacing: '0.1em', textTransform: 'uppercase' as const,
+    },
+    navItem: (active: boolean) => ({
+        display: 'flex', alignItems: 'center', gap: '10px',
+        padding: '9px 16px', cursor: 'pointer', fontSize: '0.78rem',
+        color: active ? '#00f3ff' : '#888', fontWeight: active ? 600 : 400,
+        background: active ? 'rgba(0,243,255,0.06)' : 'transparent',
+        borderLeft: `2px solid ${active ? '#00f3ff' : 'transparent'}`,
+        transition: 'all 0.15s', fontFamily: "'JetBrains Mono', monospace",
+        border: 'none', borderRight: 'none', borderTop: 'none', borderBottom: 'none',
+        borderLeftWidth: '2px', borderLeftStyle: 'solid' as const,
+        borderLeftColor: active ? '#00f3ff' : 'transparent',
+        textAlign: 'left' as const, width: '100%',
+    }),
+    content: {
+        flex: 1, overflow: 'auto', padding: '24px 28px',
+    },
+    sectionTitle: {
+        fontSize: '0.7rem', fontWeight: 600, color: '#555',
+        letterSpacing: '0.08em', textTransform: 'uppercase' as const,
+        marginBottom: '16px', paddingBottom: '8px',
+        borderBottom: '1px solid #1a1a1a',
+    },
+    label: {
+        fontSize: '0.75rem', fontWeight: 500, color: '#888',
+        marginBottom: '6px', display: 'block',
+    },
+    input: {
+        width: '100%', padding: '10px 12px', fontSize: '0.8rem',
+        fontFamily: "'JetBrains Mono', monospace",
+        background: '#111', border: '1px solid #333', borderRadius: '4px',
+        color: '#e0e0e0', outline: 'none', transition: 'border-color 0.2s',
+    },
+    textarea: {
+        width: '100%', padding: '12px', fontSize: '0.8rem', minHeight: 160,
+        fontFamily: "'JetBrains Mono', monospace",
+        background: '#111', border: '1px solid #333', borderRadius: '4px',
+        color: '#e0e0e0', outline: 'none', resize: 'vertical' as const,
+        lineHeight: 1.5, transition: 'border-color 0.2s',
+    },
+    select: {
+        width: '100%', padding: '10px 12px', fontSize: '0.8rem',
+        fontFamily: "'JetBrains Mono', monospace",
+        background: '#111', border: '1px solid #333', borderRadius: '4px',
+        color: '#e0e0e0', outline: 'none', cursor: 'pointer',
+        appearance: 'none' as const,
+        backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E")`,
+        backgroundRepeat: 'no-repeat', backgroundPosition: 'right 12px center',
+    },
+    field: {
+        marginBottom: '20px',
+    },
+    providerCard: (active: boolean) => ({
+        display: 'flex', alignItems: 'center', gap: '12px',
+        padding: '12px 14px', cursor: 'pointer',
+        background: active ? 'rgba(0,243,255,0.06)' : '#111',
+        border: `1px solid ${active ? '#00f3ff' : '#222'}`,
+        borderRadius: '4px', transition: 'all 0.15s',
+    }),
+    slider: {
+        width: '100%', height: '4px', appearance: 'none' as const,
+        background: '#333', borderRadius: '2px', outline: 'none',
+        cursor: 'pointer',
+    },
+    toggle: (on: boolean) => ({
+        width: 40, height: 22, borderRadius: '11px', position: 'relative' as const,
+        background: on ? '#00f3ff' : '#333', cursor: 'pointer',
+        transition: 'background 0.2s', border: 'none', padding: 0,
+        display: 'inline-flex', alignItems: 'center', flexShrink: 0,
+    }),
+    toggleDot: (on: boolean) => ({
+        width: 16, height: 16, borderRadius: '50%', background: '#0a0a0a',
+        position: 'absolute' as const, top: 3,
+        left: on ? 21 : 3, transition: 'left 0.2s',
+    }),
+    btnPrimary: {
+        padding: '10px 20px', fontSize: '0.8rem', fontWeight: 600,
+        fontFamily: "'JetBrains Mono', monospace",
+        background: '#00f3ff', color: '#000', border: 'none',
+        borderRadius: '4px', cursor: 'pointer', transition: 'opacity 0.15s',
+    },
+    btnGhost: {
+        padding: '10px 20px', fontSize: '0.8rem',
+        fontFamily: "'JetBrains Mono', monospace",
+        background: 'transparent', color: '#888',
+        border: '1px solid #333', borderRadius: '4px',
+        cursor: 'pointer', transition: 'all 0.15s',
+    },
+    badge: {
+        fontSize: '0.65rem', padding: '2px 8px', borderRadius: '3px',
+        background: '#00f3ff', color: '#000', fontWeight: 700,
+        letterSpacing: '0.05em',
+    },
+    successBox: {
+        padding: '10px 14px', marginBottom: '16px', borderRadius: '4px',
+        background: 'rgba(0,255,157,0.06)', border: '1px solid rgba(0,255,157,0.3)',
+        color: '#00ff9d', fontSize: '0.8rem',
+    },
+    closeBtn: {
+        position: 'absolute' as const, top: 12, right: 12,
+        background: 'none', border: 'none', color: '#555', cursor: 'pointer',
+        padding: '4px', fontSize: '1rem', lineHeight: 1,
+    },
+    toolCard: {
+        display: 'flex', alignItems: 'center', gap: '12px',
+        padding: '12px 14px', background: '#111', border: '1px solid #1a1a1a',
+        borderRadius: '4px', marginBottom: '8px',
+    },
+};
+
+/* ── Component ────────────────────────────────────────────────────── */
+
 export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId }: SettingsPanelProps) {
-    const [activeTab, setActiveTab] = useState<'profile' | 'providers' | 'api-keys'>('profile');
-    const [configuringProvider, setConfiguringProvider] = useState<{ key: string; name: string } | null>(null);
+    const [activeTab, setActiveTab] = useState<TabId>('model');
     const [saveStatus, setSaveStatus] = useState<string | null>(null);
-    const [providerConfigs, setProviderConfigs] = useState<any[]>([]);
+    const [error, setError] = useState<string | null>(null);
+    const [saving, setSaving] = useState(false);
+
+    // Provider state
+    const [providerConfigs, setProviderConfigs] = useState<ProviderConfig[]>([]);
+    const [selectedProvider, setSelectedProvider] = useState('google');
+    const [apiKeyInput, setApiKeyInput] = useState('');
+    const [model, setModel] = useState('');
+    const [temperature, setTemperature] = useState(0.7);
+    const [maxTokens, setMaxTokens] = useState(4096);
+    const [availableModels, setAvailableModels] = useState<any[]>([]);
+
+    // Persona state
+    const [systemPrompt, setSystemPrompt] = useState('');
+
+    // Memory state
+    const [ragEnabled, setRagEnabled] = useState(true);
+    const [ragTopK, setRagTopK] = useState(5);
+    const [ragMinSimilarity, setRagMinSimilarity] = useState(0.3);
+
+    // Tools state
+    const [toolsList, setToolsList] = useState<ToolInfo[]>([]);
+    const [toolsLoading, setToolsLoading] = useState(false);
+    const [disabledTools, setDisabledTools] = useState<Set<string>>(new Set());
+    const [showCreateTool, setShowCreateTool] = useState(false);
+    const [newToolName, setNewToolName] = useState('');
+    const [newToolDesc, setNewToolDesc] = useState('');
+    const [newToolCode, setNewToolCode] = useState('');
+
+    // Agent/guardrails state
+    const [maxIterations, setMaxIterations] = useState(25);
+    const [maxToolCalls, setMaxToolCalls] = useState(50);
+    const [maxWallTime, setMaxWallTime] = useState(600);
+    const [autoApproveRisk, setAutoApproveRisk] = useState('medium');
+
+    // Integration state
+    const [telegramToken, setTelegramToken] = useState('');
+    const [telegramEnabled, setTelegramEnabled] = useState(false);
+    const [telegramStatus, setTelegramStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
+
+    // API Keys state
     const [keysList, setKeysList] = useState<ApiKey[]>([]);
     const [keysLoading, setKeysLoading] = useState(false);
     const [newKeyName, setNewKeyName] = useState('');
     const [createdKey, setCreatedKey] = useState<{ key: string; name: string } | null>(null);
-    const [keyError, setKeyError] = useState<string | null>(null);
 
-    // Assuming currentWorkspace is derived from workspaceId or passed as a prop.
-    // For this change, we'll use workspaceId directly where currentWorkspace.id was implied.
-    const currentWorkspace = { id: workspaceId };
+    // Profile state
+    const [displayName, setDisplayName] = useState(userDisplayName || '');
+
+    // Capabilities state
+    const [capsList, setCapsList] = useState<CapabilityItem[]>([]);
+    const [capsLoading, setCapsLoading] = useState(false);
+
+    /* ── Load configs ─────────────────────────────────────────────── */
+
+    const loadConfigs = useCallback(async () => {
+        try {
+            const data: any = await providers.list(workspaceId);
+            const configs: ProviderConfig[] = data?.configs || [];
+            setProviderConfigs(configs);
+
+            const defaultConfig = configs.find((c: ProviderConfig) =>
+                c.isDefault || c.is_default
+            ) || configs[0];
+
+            if (defaultConfig) {
+                setSelectedProvider(defaultConfig.provider);
+                setModel(defaultConfig.model || '');
+                setTemperature(defaultConfig.temperature ?? 0.7);
+                setMaxTokens(defaultConfig.max_tokens ?? defaultConfig.maxTokens ?? 4096);
+                setSystemPrompt(defaultConfig.system_prompt ?? defaultConfig.systemPrompt ?? '');
+                setRagEnabled(defaultConfig.rag_enabled ?? defaultConfig.ragEnabled ?? true);
+                setRagTopK(defaultConfig.rag_top_k ?? defaultConfig.ragTopK ?? 5);
+                setRagMinSimilarity(defaultConfig.rag_min_similarity ?? defaultConfig.ragMinSimilarity ?? 0.3);
+
+                const remoteKey = defaultConfig.apiKey || defaultConfig.apiKeyEncrypted || defaultConfig.api_key_encrypted;
+                if (remoteKey && (remoteKey.startsWith('provider_key:') || isKeyMasked(remoteKey))) {
+                    setApiKeyInput(DISPLAY_MASK);
+                } else {
+                    setApiKeyInput(remoteKey || '');
+                }
+            }
+        } catch {
+            setProviderConfigs([]);
+        }
+    }, [workspaceId]);
+
+    useEffect(() => { loadConfigs(); }, [loadConfigs]);
+
+    const handleProviderSelect = (providerKey: string) => {
+        setSelectedProvider(providerKey);
+        const config = providerConfigs.find(c => c.provider === providerKey);
+        if (config) {
+            setModel(config.model || '');
+            setTemperature(config.temperature ?? 0.7);
+            setMaxTokens(config.max_tokens ?? config.maxTokens ?? 4096);
+            setSystemPrompt(config.system_prompt ?? config.systemPrompt ?? '');
+            setRagEnabled(config.rag_enabled ?? config.ragEnabled ?? true);
+            setRagTopK(config.rag_top_k ?? config.ragTopK ?? 5);
+            setRagMinSimilarity(config.rag_min_similarity ?? config.ragMinSimilarity ?? 0.3);
+            const remoteKey = config.apiKey || config.apiKeyEncrypted || config.api_key_encrypted;
+            if (remoteKey && (remoteKey.startsWith('provider_key:') || isKeyMasked(remoteKey))) {
+                setApiKeyInput(DISPLAY_MASK);
+            } else {
+                setApiKeyInput(remoteKey || '');
+            }
+        } else {
+            setModel(''); setTemperature(0.7); setMaxTokens(4096); setApiKeyInput('');
+        }
+    };
 
     useEffect(() => {
-        providers.list(workspaceId)
-            .then((data: any) => setProviderConfigs(data?.configs || []))
-            .catch(() => setProviderConfigs([]));
-    }, [activeTab, workspaceId, configuringProvider]); // re-fetch after modal closes
+        const timer = setTimeout(() => {
+            const keyToSend = isKeyMasked(apiKeyInput) ? undefined : apiKeyInput;
+            providers.listModels(workspaceId, selectedProvider, keyToSend)
+                .then(models => setAvailableModels(models || []))
+                .catch(() => setAvailableModels([]));
+        }, 500);
+        return () => clearTimeout(timer);
+    }, [workspaceId, selectedProvider, apiKeyInput]);
 
-    // Load API Keys when that tab is active
+    // Load tools
+    useEffect(() => {
+        if (activeTab !== 'tools') return;
+        setToolsLoading(true);
+        toolsApi.list(workspaceId)
+            .then(data => setToolsList(data?.tools || []))
+            .catch(() => setToolsList([]))
+            .finally(() => setToolsLoading(false));
+    }, [activeTab, workspaceId]);
+
+    // Load API keys
     useEffect(() => {
         if (activeTab !== 'api-keys') return;
         setKeysLoading(true);
@@ -41,21 +346,112 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
             .finally(() => setKeysLoading(false));
     }, [activeTab]);
 
-    const handleCreateKey = async () => {
-        if (!newKeyName.trim()) {
-            setKeyError('Key name is required');
-            return;
+    // Load workspace settings (guardrails)
+    useEffect(() => {
+        workspaces.get(workspaceId)
+            .then((data: any) => {
+                const ws = data?.workspace || data;
+                const settings = ws?.settings || {};
+                if (settings.guardrails) {
+                    setMaxIterations(settings.guardrails.maxIterations ?? 25);
+                    setMaxToolCalls(settings.guardrails.maxToolCalls ?? 50);
+                    setMaxWallTime(settings.guardrails.maxWallTime ?? 600);
+                    setAutoApproveRisk(settings.guardrails.autoApproveRisk ?? 'medium');
+                }
+                if (settings.disabledTools) {
+                    setDisabledTools(new Set(settings.disabledTools));
+                }
+            })
+            .catch(() => { });
+
+        // Load real integration status
+        integrations.status(workspaceId)
+            .then((data: any) => {
+                if (data?.telegram) {
+                    setTelegramStatus(data.telegram.status as any);
+                    setTelegramEnabled(data.telegram.connected);
+                }
+            })
+            .catch(() => { });
+    }, [workspaceId]);
+
+    // Load capabilities when capabilities tab is active
+    useEffect(() => {
+        if (activeTab !== 'capabilities') return;
+        setCapsLoading(true);
+        capsApi.get(workspaceId)
+            .then(setCapsList)
+            .catch(() => setCapsList([]))
+            .finally(() => setCapsLoading(false));
+    }, [activeTab, workspaceId]);
+
+    /* ── Save ─────────────────────────────────────────────────────── */
+
+    const handleSave = async () => {
+        setSaving(true);
+        setError(null);
+        setSaveStatus(null);
+        try {
+            // Save provider config
+            const payload: Record<string, unknown> = {
+                model, temperature, maxTokens, systemPrompt,
+                ragEnabled, ragTopK, ragMinSimilarity, isDefault: true,
+            };
+            if (apiKeyInput && !isKeyMasked(apiKeyInput)) {
+                payload.apiKey = apiKeyInput;
+            }
+            await providers.set(workspaceId, selectedProvider, payload);
+
+            // Save agent guardrails as workspace settings
+            await workspaces.update(workspaceId, {
+                settings: {
+                    guardrails: {
+                        maxIterations,
+                        maxToolCalls,
+                        maxWallTime,
+                        autoApproveRisk,
+                    },
+                },
+            });
+
+            // Connect/disconnect Telegram if token was changed
+            if (telegramEnabled && telegramToken && !isKeyMasked(telegramToken)) {
+                setTelegramStatus('connecting');
+                try {
+                    const result = await integrations.connectTelegram(workspaceId, telegramToken, true);
+                    setTelegramStatus(result.status === 'connected' ? 'connected' : 'disconnected');
+                } catch (telegramErr: any) {
+                    setTelegramStatus('disconnected');
+                    setError(telegramErr.message || 'Failed to connect Telegram');
+                    return;
+                }
+            } else if (!telegramEnabled) {
+                try {
+                    await integrations.disconnectTelegram(workspaceId);
+                    setTelegramStatus('disconnected');
+                } catch { /* ignore */ }
+            }
+
+            setSaveStatus('Configuration saved');
+            setTimeout(() => setSaveStatus(null), 3000);
+            await loadConfigs();
+        } catch (err: any) {
+            setError(err.message || 'Failed to save');
+        } finally {
+            setSaving(false);
         }
-        setKeyError(null);
+    };
+
+    const handleCreateKey = async () => {
+        if (!newKeyName.trim()) return;
         try {
             const result = await apiKeys.create(newKeyName.trim());
             setCreatedKey({ key: result.key, name: result.name });
             setNewKeyName('');
-            // Refresh list
             const data: any = await apiKeys.list();
             setKeysList(data?.keys || []);
         } catch (err: any) {
-            setKeyError(err.message || 'Failed to create API key');
+            setError(err.message || 'Failed to create key');
         }
     };
 
@@ -64,307 +460,660 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
             await apiKeys.revoke(id);
             setKeysList(prev => prev.filter(k => k.id !== id));
         } catch (err: any) {
-            setKeyError(err.message || 'Failed to revoke key');
+            setError(err.message || 'Failed to revoke key');
         }
     };
 
-    const tabs = [
-        { id: 'profile' as const, label: 'Profile', icon: '👤' },
-        { id: 'providers' as const, label: 'Providers', icon: '🤖' },
-        { id: 'api-keys' as const, label: 'API Keys', icon: '🔑' },
+    const toggleTool = (toolName: string) => {
+        setDisabledTools(prev => {
+            const next = new Set(prev);
+            if (next.has(toolName)) next.delete(toolName);
+            else next.add(toolName);
+            return next;
+        });
+    };
+
+    /* ── Tabs config ──────────────────────────────────────────────── */
+
+    const tabs: { id: TabId; label: string; icon: string; section?: string }[] = [
+        { id: 'model', label: 'AI Model', icon: '◈', section: 'KESTREL' },
+        { id: 'persona', label: 'Persona', icon: '◎' },
+        { id: 'memory', label: 'Memory', icon: '⬡' },
+        { id: 'tools', label: 'Tools', icon: '⟐' },
+        { id: 'agent', label: 'Agent', icon: '⊛' },
+        { id: 'capabilities', label: 'Capabilities', icon: '⚙' },
+        { id: 'integrations', label: 'Integrations', icon: '⊞', section: 'CONNECT' },
+        { id: 'api-keys', label: 'API Keys', icon: '⟐' },
+        { id: 'general', label: 'Workspace', icon: '⊞', section: 'ACCOUNT' },
+        { id: 'profile', label: 'Profile', icon: '⊙' },
     ];
 
-    const handleSaveProfile = () => {
-        // TODO: wire to API when backend supports profile updates
-        setSaveStatus('Profile saved!');
-        setTimeout(() => setSaveStatus(null), 2000);
-    };
+    /* ── Render helpers ───────────────────────────────────────────── */
 
-    // Don't close backdrop when a sub-modal is open
-    const handleBackdropClick = () => {
-        if (!configuringProvider) {
-            onClose();
-        }
-    };
+    const Toggle = ({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) => (
+        <button style={S.toggle(value)} onClick={() => onChange(!value)} type="button">
+            <span style={S.toggleDot(value)} />
+        </button>
+    );
 
-    return (
-        <>
-            {createPortal(
-                <div style={{
-                    position: 'fixed',
-                    inset: 0,
-                    zIndex: 9999,
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    background: 'rgba(0, 0, 0, 0.6)',
-                    backdropFilter: 'blur(4px)',
-                }} onClick={handleBackdropClick}>
-                    <div
-                        className="card-glass animate-fade-in"
-                        style={{
-                            width: '100%',
-                            maxWidth: 640,
-                            maxHeight: '80vh',
-                            overflow: 'auto',
-                            padding: 0,
-                        }}
-                        onClick={(e) => e.stopPropagation()}
-                    >
-                        {/* Header */}
-                        <div style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'space-between',
-                            padding: 'var(--space-4) var(--space-6)',
-                            borderBottom: '1px solid var(--color-border)',
-                        }}>
-                            <h2 style={{ fontSize: '1.125rem', fontWeight: 600 }}>Settings</h2>
-                            <button className="btn btn-ghost" onClick={onClose}>
-                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                    <line x1="18" y1="6" x2="6" y2="18" />
-                                    <line x1="6" y1="6" x2="18" y2="18" />
-                                </svg>
+    const SliderField = ({ label, value, onChange, min, max, step, format }: {
+        label: string; value: number; onChange: (v: number) => void;
+        min: number; max: number; step: number; format?: (v: number) => string;
+    }) => (
+        <div style={S.field}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                <label style={S.label}>{label}</label>
+                <span style={{ fontSize: '0.8rem', color: '#00f3ff', fontWeight: 600, fontFamily: "'JetBrains Mono', monospace" }}>
+                    {format ? format(value) : value}
+                </span>
+            </div>
+            <input
+                type="range" min={min} max={max} step={step} value={value}
+                onChange={e => onChange(parseFloat(e.target.value))} style={S.slider}
+            />
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '4px' }}>
+                <span style={{ fontSize: '0.65rem', color: '#444' }}>{min}</span>
+                <span style={{ fontSize: '0.65rem', color: '#444' }}>{max}</span>
+            </div>
+        </div>
+    );
+
+    const RiskBadge = ({ level }: { level: string }) => (
+        <span style={{
+            fontSize: '0.6rem', padding: '2px 6px', borderRadius: '3px',
+            border: `1px solid ${RISK_COLORS[level] || '#555'}`,
+            color: RISK_COLORS[level] || '#555', fontWeight: 600,
+            textTransform: 'uppercase' as const, letterSpacing: '0.05em',
+        }}>
+            {level}
+        </span>
+    );
+
+    /* ── Tab content ──────────────────────────────────────────────── */
+
+    const renderContent = () => {
+        switch (activeTab) {
+            case 'model':
+                return (
+                    <div>
+                        <div style={S.sectionTitle}>// PROVIDER</div>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '24px' }}>
+                            {Object.entries(PROVIDER_META).map(([key, meta]) => {
+                                const active = selectedProvider === key;
+                                const config = providerConfigs.find(c => c.provider === key);
+                                const isDefault = config?.isDefault || config?.is_default;
+                                return (
+                                    <div key={key} style={S.providerCard(active)} onClick={() => handleProviderSelect(key)}>
+                                        <span style={{ fontSize: '1.1rem', color: active ? '#00f3ff' : '#555' }}>{meta.icon}</span>
+                                        <div style={{ flex: 1 }}>
+                                            <div style={{ fontSize: '0.8rem', fontWeight: 500, color: active ? '#e0e0e0' : '#888' }}>{meta.name}</div>
+                                            <div style={{ fontSize: '0.65rem', color: '#444', marginTop: '2px' }}>{meta.requiresKey ? 'Cloud API' : 'On-device'}</div>
+                                        </div>
+                                        {isDefault && <span style={S.badge}>DEFAULT</span>}
+                                    </div>
+                                );
+                            })}
+                        </div>
+
+                        {PROVIDER_META[selectedProvider]?.requiresKey && (
+                            <div>
+                                <div style={S.sectionTitle}>// API KEY</div>
+                                <div style={S.field}>
+                                    <input style={S.input} type="password" value={apiKeyInput}
+                                        onChange={e => setApiKeyInput(e.target.value)}
+                                        placeholder={`Enter ${PROVIDER_META[selectedProvider]?.name} API key`}
+                                        onFocus={e => { e.target.style.borderColor = '#00f3ff'; }}
+                                        onBlur={e => { e.target.style.borderColor = '#333'; }}
+                                    />
+                                </div>
+                            </div>
+                        )}
+
+                        <div style={S.sectionTitle}>// MODEL</div>
+                        <div style={S.field}>
+                            <select style={S.select} value={model} onChange={e => setModel(e.target.value)}>
+                                <option value="">— Select model —</option>
+                                {availableModels.map(m => (
+                                    <option key={m.id} value={m.id}>{m.name || m.id}</option>
+                                ))}
+                            </select>
+                            {model && (
+                                <div style={{ fontSize: '0.7rem', color: '#555', marginTop: '6px' }}>
+                                    Active: <span style={{ color: '#00ff9d' }}>{model}</span>
+                                </div>
+                            )}
+                        </div>
+
+                        <div style={S.sectionTitle}>// PARAMETERS</div>
+                        <SliderField label="Temperature" value={temperature} onChange={setTemperature}
+                            min={0} max={2} step={0.1} format={v => v.toFixed(1)} />
+                        <div style={S.field}>
+                            <label style={S.label}>Max Tokens</label>
+                            <input style={S.input} type="number" value={maxTokens}
+                                onChange={e => setMaxTokens(Math.max(1, Math.min(32768, parseInt(e.target.value) || 1)))}
+                                min={1} max={32768}
+                                onFocus={e => { e.target.style.borderColor = '#00f3ff'; }}
+                                onBlur={e => { e.target.style.borderColor = '#333'; }} />
+                            <div style={{ fontSize: '0.65rem', color: '#444', marginTop: '4px' }}>Range: 1 – 32,768</div>
+                        </div>
+                    </div>
+                );
+
+            case 'persona':
+                return (
+                    <div>
+                        <div style={S.sectionTitle}>// SYSTEM PROMPT</div>
+                        <p style={{ fontSize: '0.75rem', color: '#666', marginBottom: '16px', lineHeight: 1.5 }}>
+                            Define Kestrel's personality, instructions, and behavior. Leave empty for the default autonomous agent persona.
+                        </p>
+                        <div style={S.field}>
+                            <textarea style={S.textarea} value={systemPrompt}
+                                onChange={e => setSystemPrompt(e.target.value)}
+                                placeholder={`You are Kestrel, an autonomous AI agent...\n\nCustomize tone, role, domain expertise, or specific instructions here.`}
+                                onFocus={e => { e.target.style.borderColor = '#00f3ff'; }}
+                                onBlur={e => { e.target.style.borderColor = '#333'; }} />
+                            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '6px' }}>
+                                <span style={{ fontSize: '0.65rem', color: '#444' }}>{systemPrompt.length} characters</span>
+                                {systemPrompt && (
+                                    <button style={{ ...S.btnGhost, padding: '4px 10px', fontSize: '0.7rem' }}
+                                        onClick={() => setSystemPrompt('')}>Reset to default</button>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                );
+
+            case 'memory':
+                return (
+                    <div>
+                        <div style={S.sectionTitle}>// RAG RETRIEVAL</div>
+                        <p style={{ fontSize: '0.75rem', color: '#666', marginBottom: '20px', lineHeight: 1.5 }}>
+                            Control how Kestrel retrieves context from conversation memory and workspace knowledge.
+                        </p>
+                        <div style={{ ...S.field, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                            <div>
+                                <label style={{ ...S.label, marginBottom: 0 }}>Enable Memory Retrieval</label>
+                                <div style={{ fontSize: '0.7rem', color: '#444', marginTop: '4px' }}>Augment responses with relevant past context</div>
+                            </div>
+                            <Toggle value={ragEnabled} onChange={setRagEnabled} />
+                        </div>
+                        {ragEnabled && (
+                            <div style={{ borderTop: '1px solid #1a1a1a', paddingTop: '20px', marginTop: '4px' }}>
+                                <SliderField label="Retrieval Count (top-k)" value={ragTopK}
+                                    onChange={v => setRagTopK(Math.round(v))} min={1} max={20} step={1}
+                                    format={v => `${v} chunks`} />
+                                <SliderField label="Similarity Threshold" value={ragMinSimilarity}
+                                    onChange={setRagMinSimilarity} min={0} max={1} step={0.05}
+                                    format={v => `${(v * 100).toFixed(0)}%`} />
+                                <div style={{ padding: '12px', background: '#0d0d0d', borderRadius: '4px', border: '1px solid #1a1a1a' }}>
+                                    <div style={{ fontSize: '0.7rem', color: '#666', lineHeight: 1.6 }}>
+                                        <span style={{ color: '#00f3ff' }}>top-k = {ragTopK}</span> — chunks retrieved per query<br />
+                                        <span style={{ color: '#00f3ff' }}>threshold = {(ragMinSimilarity * 100).toFixed(0)}%</span> — minimum similarity
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                );
+
+            case 'tools':
+                return (
+                    <div>
+                        <div style={S.sectionTitle}>// TOOL REGISTRY</div>
+                        <p style={{ fontSize: '0.75rem', color: '#666', marginBottom: '12px', lineHeight: 1.5 }}>
+                            Manage the tools Kestrel can use. Disable tools to restrict capabilities.
+                            Kestrel can also create new tools on the fly (with your approval).
+                        </p>
+
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                            <span style={{ fontSize: '0.7rem', color: '#444' }}>
+                                {toolsList.length} tools registered · {disabledTools.size} disabled
+                            </span>
+                            <button style={{ ...S.btnGhost, padding: '6px 14px', fontSize: '0.7rem' }}
+                                onClick={() => setShowCreateTool(!showCreateTool)}>
+                                {showCreateTool ? '✕ Cancel' : '+ Create Tool'}
                             </button>
                         </div>
 
-                        {/* Tabs */}
-                        <div style={{
-                            display: 'flex',
-                            gap: 'var(--space-1)',
-                            padding: 'var(--space-3) var(--space-6)',
-                            borderBottom: '1px solid var(--color-border)',
-                        }}>
-                            {tabs.map((tab) => (
-                                <button
-                                    key={tab.id}
-                                    className="btn"
-                                    style={{
-                                        padding: 'var(--space-2) var(--space-3)',
-                                        background: activeTab === tab.id ? 'var(--color-bg-hover)' : 'transparent',
-                                        color: activeTab === tab.id ? 'var(--color-text)' : 'var(--color-text-secondary)',
-                                        borderRadius: 'var(--radius-sm)',
-                                        fontSize: '0.8125rem',
-                                    }}
-                                    onClick={() => setActiveTab(tab.id)}
-                                >
-                                    <span>{tab.icon}</span> {tab.label}
-                                </button>
-                            ))}
+                        {showCreateTool && (
+                            <div style={{
+                                padding: '16px', marginBottom: '16px', background: '#0d0d0d',
+                                border: '1px solid #1a1a1a', borderRadius: '4px',
+                            }}>
+                                <div style={{ ...S.sectionTitle, marginBottom: '12px' }}>// NEW TOOL</div>
+                                <div style={S.field}>
+                                    <label style={S.label}>Tool Name</label>
+                                    <input style={S.input} value={newToolName}
+                                        onChange={e => setNewToolName(e.target.value)}
+                                        placeholder="e.g. calculate_average"
+                                        onFocus={e => { e.target.style.borderColor = '#00f3ff'; }}
+                                        onBlur={e => { e.target.style.borderColor = '#333'; }} />
+                                </div>
+                                <div style={S.field}>
+                                    <label style={S.label}>Description</label>
+                                    <input style={S.input} value={newToolDesc}
+                                        onChange={e => setNewToolDesc(e.target.value)}
+                                        placeholder="What does this tool do?"
+                                        onFocus={e => { e.target.style.borderColor = '#00f3ff'; }}
+                                        onBlur={e => { e.target.style.borderColor = '#333'; }} />
+                                </div>
+                                <div style={S.field}>
+                                    <label style={S.label}>Python Code</label>
+                                    <textarea style={{ ...S.textarea, minHeight: 120, fontSize: '0.75rem' }}
+                                        value={newToolCode}
+                                        onChange={e => setNewToolCode(e.target.value)}
+                                        placeholder={`def run(args):\n    # args is a dict of parameters\n    result = args['numbers']\n    return sum(result) / len(result)`}
+                                        onFocus={e => { e.target.style.borderColor = '#00f3ff'; }}
+                                        onBlur={e => { e.target.style.borderColor = '#333'; }} />
+                                </div>
+                                <div style={{ display: 'flex', gap: '8px' }}>
+                                    <button style={S.btnPrimary} onClick={() => {
+                                        // TODO: Wire to create_skill via agent loop
+                                        setShowCreateTool(false);
+                                        setNewToolName(''); setNewToolDesc(''); setNewToolCode('');
+                                    }}>Create Tool</button>
+                                    <div style={{ fontSize: '0.65rem', color: '#666', display: 'flex', alignItems: 'center' }}>
+                                        Requires approval before use
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {toolsLoading ? (
+                            <div style={{ textAlign: 'center', color: '#444', padding: '24px', fontSize: '0.8rem' }}>
+                                Loading tools...
+                            </div>
+                        ) : (
+                            <div>
+                                {toolsList.map(tool => {
+                                    const isDisabled = disabledTools.has(tool.name);
+                                    const isSystem = ['task_complete', 'ask_human'].includes(tool.name);
+                                    return (
+                                        <div key={tool.name} style={{
+                                            ...S.toolCard,
+                                            opacity: isDisabled ? 0.4 : 1,
+                                            transition: 'opacity 0.2s',
+                                        }}>
+                                            <span style={{ fontSize: '1rem', width: '24px', textAlign: 'center', color: '#555' }}>
+                                                {CATEGORY_ICONS[tool.category] || '○'}
+                                            </span>
+                                            <div style={{ flex: 1 }}>
+                                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                                                    <span style={{ fontSize: '0.8rem', fontWeight: 500, color: '#e0e0e0' }}>{tool.name}</span>
+                                                    <RiskBadge level={tool.riskLevel} />
+                                                    <span style={{
+                                                        fontSize: '0.6rem', padding: '1px 6px', borderRadius: '3px',
+                                                        background: '#1a1a1a', color: '#555',
+                                                    }}>{tool.category}</span>
+                                                </div>
+                                                <div style={{ fontSize: '0.7rem', color: '#666' }}>{tool.description}</div>
+                                            </div>
+                                            {!isSystem && (
+                                                <Toggle value={!isDisabled} onChange={() => toggleTool(tool.name)} />
+                                            )}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        )}
+                    </div>
+                );
+
+            case 'agent':
+                return (
+                    <div>
+                        <div style={S.sectionTitle}>// AUTONOMY</div>
+                        <p style={{ fontSize: '0.75rem', color: '#666', marginBottom: '20px', lineHeight: 1.5 }}>
+                            Control how far Kestrel can go autonomously. These guardrails apply to all tasks.
+                        </p>
+
+                        <SliderField label="Max Iterations" value={maxIterations}
+                            onChange={v => setMaxIterations(Math.round(v))} min={1} max={100} step={1}
+                            format={v => `${v} iterations`} />
+
+                        <SliderField label="Max Tool Calls" value={maxToolCalls}
+                            onChange={v => setMaxToolCalls(Math.round(v))} min={1} max={200} step={1}
+                            format={v => `${v} calls`} />
+
+                        <SliderField label="Max Wall Time" value={maxWallTime}
+                            onChange={v => setMaxWallTime(Math.round(v))} min={30} max={3600} step={30}
+                            format={v => v >= 60 ? `${Math.floor(v / 60)}m ${v % 60}s` : `${v}s`} />
+
+                        <div style={S.sectionTitle}>// APPROVAL POLICY</div>
+                        <p style={{ fontSize: '0.75rem', color: '#666', marginBottom: '16px', lineHeight: 1.5 }}>
+                            Auto-approve tool calls at or below this risk level. Higher-risk actions always need your OK.
+                        </p>
+                        <div style={S.field}>
+                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px' }}>
+                                {(['low', 'medium', 'high', 'critical'] as const).map(level => (
+                                    <button key={level} type="button" style={{
+                                        padding: '10px', borderRadius: '4px', cursor: 'pointer',
+                                        fontFamily: "'JetBrains Mono', monospace", fontSize: '0.75rem',
+                                        fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em',
+                                        background: autoApproveRisk === level ? 'rgba(0,243,255,0.08)' : '#111',
+                                        border: `1px solid ${autoApproveRisk === level ? RISK_COLORS[level] : '#222'}`,
+                                        color: RISK_COLORS[level],
+                                        transition: 'all 0.15s',
+                                    }} onClick={() => setAutoApproveRisk(level)}>
+                                        {level}
+                                    </button>
+                                ))}
+                            </div>
+                            <div style={{ fontSize: '0.65rem', color: '#444', marginTop: '8px' }}>
+                                {autoApproveRisk === 'low' && 'Only safe, read-only operations run automatically.'}
+                                {autoApproveRisk === 'medium' && 'Web browsing and file writes run without approval.'}
+                                {autoApproveRisk === 'high' && 'Code execution and most actions run automatically.'}
+                                {autoApproveRisk === 'critical' && '⚠ All operations run without approval. Use with caution.'}
+                            </div>
                         </div>
 
-                        {/* Content */}
-                        <div style={{ padding: 'var(--space-6)' }}>
-                            {activeTab === 'profile' && (
-                                <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
-                                    <div className="form-group">
-                                        <label>Display Name</label>
-                                        <input className="input" defaultValue={userDisplayName} placeholder="Your name" />
-                                    </div>
-                                    <div className="form-group">
-                                        <label>Email</label>
-                                        <input className="input" defaultValue={userEmail} disabled
-                                            style={{ opacity: 0.6 }} />
-                                    </div>
-                                    <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
-                                        <button className="btn btn-primary" onClick={handleSaveProfile}>
-                                            Save Changes
-                                        </button>
-                                        {saveStatus && (
-                                            <span style={{ color: 'var(--color-success, #22c55e)', fontSize: '0.875rem' }}>
-                                                ✓ {saveStatus}
-                                            </span>
-                                        )}
-                                    </div>
-                                </div>
-                            )}
-
-                            {activeTab === 'providers' && (
-                                <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
-                                    <p style={{ color: 'var(--color-text-secondary)', fontSize: '0.875rem' }}>
-                                        Configure which LLM provider to use for this workspace.
-                                    </p>
-
-                                    {['Local (llama.cpp)', 'OpenAI', 'Anthropic', 'Google'].map((name) => {
-                                        const key = name.toLowerCase().split(' ')[0];
-                                        const config = providerConfigs.find((c: any) => c.provider === key);
-                                        const isDefault = config?.isDefault || config?.is_default;
-
-                                        return (
-                                            <div key={name} className="card" style={{
-                                                display: 'flex',
-                                                alignItems: 'center',
-                                                justifyContent: 'space-between',
-                                                padding: 'var(--space-4)',
-                                                border: isDefault ? '1px solid var(--color-primary)' : undefined
-                                            }}>
-                                                <div>
-                                                    <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
-                                                        <p style={{ fontWeight: 500 }}>{name}</p>
-                                                        {isDefault && (
-                                                            <span style={{
-                                                                fontSize: '0.75rem',
-                                                                padding: '2px 6px',
-                                                                borderRadius: '4px',
-                                                                background: 'var(--color-primary)',
-                                                                color: 'white',
-                                                                fontWeight: 600
-                                                            }}>
-                                                                Default
-                                                            </span>
-                                                        )}
-                                                    </div>
-                                                    <p style={{
-                                                        fontSize: '0.8125rem',
-                                                        color: 'var(--color-text-tertiary)',
-                                                    }}>
-                                                        {name === 'Local (llama.cpp)'
-                                                            ? 'On-device inference — no API key needed'
-                                                            : 'Cloud provider — requires API key'}
-                                                    </p>
-                                                </div>
-                                                <button
-                                                    className="btn btn-secondary"
-                                                    onClick={(e) => {
-                                                        e.stopPropagation();
-                                                        setConfiguringProvider({ key, name });
-                                                    }}
-                                                >
-                                                    Configure
-                                                </button>
-                                            </div>
-                                        );
-                                    })}
-                                </div>
-                            )}
-
-                            {activeTab === 'api-keys' && (
-                                <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
-                                    <p style={{ color: 'var(--color-text-secondary)', fontSize: '0.875rem' }}>
-                                        API keys let you access Kestrel programmatically. Keys are shown only once at creation.
-                                    </p>
-
-                                    {/* One-time key reveal */}
-                                    {createdKey && (
-                                        <div style={{
-                                            padding: 'var(--space-4)',
-                                            background: 'rgba(34, 197, 94, 0.08)',
-                                            border: '1px solid rgba(34, 197, 94, 0.3)',
-                                            borderRadius: 'var(--radius-md)',
-                                        }}>
-                                            <p style={{ fontSize: '0.8125rem', fontWeight: 600, color: 'var(--color-success)', marginBottom: 'var(--space-2)' }}>
-                                                Key created: {createdKey.name}
-                                            </p>
-                                            <p style={{ fontSize: '0.75rem', color: 'var(--color-text-secondary)', marginBottom: 'var(--space-2)' }}>
-                                                Copy this now — it won't be shown again.
-                                            </p>
-                                            <div style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }}>
-                                                <code style={{
-                                                    flex: 1,
-                                                    padding: 'var(--space-2) var(--space-3)',
-                                                    background: 'var(--color-bg-surface)',
-                                                    borderRadius: 'var(--radius-sm)',
-                                                    fontSize: '0.75rem',
-                                                    wordBreak: 'break-all',
-                                                    fontFamily: 'monospace',
-                                                }}>
-                                                    {createdKey.key}
-                                                </code>
-                                                <button
-                                                    className="btn btn-secondary"
-                                                    style={{ flexShrink: 0, fontSize: '0.75rem' }}
-                                                    onClick={() => navigator.clipboard.writeText(createdKey.key)}
-                                                >
-                                                    Copy
-                                                </button>
-                                            </div>
-                                            <button
-                                                className="btn btn-ghost"
-                                                style={{ fontSize: '0.75rem', marginTop: 'var(--space-2)' }}
-                                                onClick={() => setCreatedKey(null)}
-                                            >
-                                                Dismiss
-                                            </button>
-                                        </div>
-                                    )}
-
-                                    {/* Create new key */}
-                                    <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
-                                        <input
-                                            className="input"
-                                            type="text"
-                                            placeholder="Key name (e.g. My Script)"
-                                            value={newKeyName}
-                                            onChange={e => setNewKeyName(e.target.value)}
-                                            onKeyDown={e => e.key === 'Enter' && handleCreateKey()}
-                                            style={{ flex: 1 }}
-                                        />
-                                        <button className="btn btn-primary" onClick={handleCreateKey}>
-                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                                <path d="M12 5v14M5 12h14" />
-                                            </svg>
-                                            Create
-                                        </button>
-                                    </div>
-                                    {keyError && <p style={{ color: 'var(--color-error)', fontSize: '0.8125rem' }}>{keyError}</p>}
-
-                                    {/* Keys list */}
-                                    {keysLoading ? (
-                                        <div style={{ textAlign: 'center', color: 'var(--color-text-tertiary)', padding: 'var(--space-4)' }}>
-                                            Loading keys...
-                                        </div>
-                                    ) : keysList.length === 0 ? (
-                                        <div className="card" style={{
-                                            textAlign: 'center',
-                                            padding: 'var(--space-8)',
-                                            color: 'var(--color-text-tertiary)',
-                                            fontSize: '0.875rem',
-                                        }}>
-                                            No API keys yet. Create one above.
-                                        </div>
-                                    ) : (
-                                        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
-                                            {keysList.map(k => (
-                                                <div key={k.id} className="card" style={{
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    justifyContent: 'space-between',
-                                                    padding: 'var(--space-3) var(--space-4)',
-                                                }}>
-                                                    <div>
-                                                        <div style={{ fontWeight: 500, fontSize: '0.875rem' }}>{k.name}</div>
-                                                        <div style={{ fontSize: '0.75rem', color: 'var(--color-text-tertiary)', marginTop: 2 }}>
-                                                            Expires {new Date(k.expiresAt).toLocaleDateString()}
-                                                        </div>
-                                                    </div>
-                                                    <button
-                                                        className="btn btn-ghost"
-                                                        style={{ color: 'var(--color-error)', fontSize: '0.8125rem' }}
-                                                        onClick={() => handleRevokeKey(k.id)}
-                                                    >
-                                                        Revoke
-                                                    </button>
-                                                </div>
-                                            ))}
-                                        </div>
-                                    )}
-                                </div>
-                            )}
+                        <div style={{ padding: '14px', background: '#0d0d0d', borderRadius: '4px', border: '1px solid #1a1a1a', marginTop: '8px' }}>
+                            <div style={{ fontSize: '0.7rem', color: '#666', lineHeight: 1.6 }}>
+                                <span style={{ color: '#00ff9d' }}>✦ Self-Extending:</span> Kestrel can create new tools during tasks using
+                                the <span style={{ color: '#00f3ff' }}>create_skill</span> tool.
+                                All skill creations require your explicit approval regardless of the auto-approve policy.
+                            </div>
                         </div>
                     </div>
-                </div>,
-                document.body
-            )}
+                );
 
-            {configuringProvider && createPortal(
-                <ConfigureProviderModal
-                    workspaceId={workspaceId}
-                    providerKey={configuringProvider.key}
-                    providerName={configuringProvider.name}
-                    onClose={() => setConfiguringProvider(null)}
-                />,
-                document.body
-            )}
-        </>
+            case 'capabilities':
+                return (
+                    <div>
+                        <div style={S.sectionTitle}>CAPABILITIES</div>
+                        <div style={{ color: '#666', fontSize: '0.75rem', marginBottom: '16px' }}>
+                            All active agent subsystems. These features run continuously in the background.
+                        </div>
+                        {capsLoading ? (
+                            <div style={{ color: '#555', fontSize: '0.8rem' }}>Loading capabilities...</div>
+                        ) : capsList.length === 0 ? (
+                            <div style={{ color: '#555', fontSize: '0.8rem' }}>No capabilities data.</div>
+                        ) : (
+                            ['intelligence', 'safety', 'automation', 'tools'].map(cat => {
+                                const items = capsList.filter(c => c.category === cat);
+                                if (!items.length) return null;
+                                return (
+                                    <div key={cat} style={{ marginBottom: '20px' }}>
+                                        <div style={{ fontSize: '0.65rem', fontWeight: 600, color: '#444', letterSpacing: '0.08em', textTransform: 'uppercase' as const, marginBottom: '8px' }}>
+                                            {cat}
+                                        </div>
+                                        {items.map(cap => (
+                                            <div key={cap.name} style={{
+                                                display: 'flex', alignItems: 'center', gap: '12px',
+                                                padding: '12px 14px', background: '#111', border: '1px solid #1a1a1a',
+                                                borderRadius: '4px', marginBottom: '6px',
+                                            }}>
+                                                <span style={{ fontSize: '1.2rem', width: '28px', textAlign: 'center' }}>{cap.icon}</span>
+                                                <div style={{ flex: 1 }}>
+                                                    <div style={{ fontSize: '0.82rem', fontWeight: 600, color: '#e0e0e0' }}>{cap.name}</div>
+                                                    <div style={{ fontSize: '0.7rem', color: '#666', marginTop: '2px' }}>{cap.description}</div>
+                                                    {cap.stats && Object.keys(cap.stats).length > 0 && (
+                                                        <div style={{ fontSize: '0.65rem', color: '#00f3ff', marginTop: '4px' }}>
+                                                            {Object.entries(cap.stats).map(([k, v]) => `${k}: ${v}`).join(' · ')}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                                <span style={{
+                                                    fontSize: '0.6rem', fontWeight: 600, letterSpacing: '0.05em',
+                                                    padding: '3px 8px', borderRadius: '3px',
+                                                    background: cap.status === 'active' ? 'rgba(0,243,255,0.1)' : 'rgba(255,255,255,0.05)',
+                                                    color: cap.status === 'active' ? '#00f3ff' : '#555',
+                                                    border: `1px solid ${cap.status === 'active' ? 'rgba(0,243,255,0.2)' : '#333'}`,
+                                                    textTransform: 'uppercase' as const,
+                                                }}>
+                                                    {cap.status === 'active' ? '● ACTIVE' : cap.status}
+                                                </span>
+                                            </div>
+                                        ))}
+                                    </div>
+                                );
+                            })
+                        )}
+                    </div>
+                );
+
+            case 'integrations':
+                return (
+                    <div>
+                        <div style={S.sectionTitle}>// INTEGRATIONS</div>
+                        <p style={{ fontSize: '0.75rem', color: '#666', marginBottom: '20px', lineHeight: 1.5 }}>
+                            Connect Kestrel to external services. Messages from integrations are routed through the same agent loop.
+                        </p>
+
+                        {/* Telegram */}
+                        <div style={{
+                            padding: '16px', background: '#111', border: '1px solid #1a1a1a',
+                            borderRadius: '4px', marginBottom: '12px',
+                        }}>
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                                    <span style={{ fontSize: '1.2rem' }}>✈</span>
+                                    <div>
+                                        <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#e0e0e0' }}>Telegram</div>
+                                        <div style={{ fontSize: '0.65rem', color: '#444' }}>Bot API integration</div>
+                                    </div>
+                                </div>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                                    <span style={{
+                                        fontSize: '0.6rem', padding: '2px 8px', borderRadius: '3px',
+                                        background: telegramStatus === 'connected' ? 'rgba(0,255,157,0.1)' : '#1a1a1a',
+                                        color: telegramStatus === 'connected' ? '#00ff9d' : '#555',
+                                        border: `1px solid ${telegramStatus === 'connected' ? 'rgba(0,255,157,0.3)' : '#222'}`,
+                                    }}>
+                                        {telegramStatus.toUpperCase()}
+                                    </span>
+                                    <Toggle value={telegramEnabled} onChange={setTelegramEnabled} />
+                                </div>
+                            </div>
+                            {telegramEnabled && (
+                                <div>
+                                    <div style={S.field}>
+                                        <label style={S.label}>Bot Token</label>
+                                        <input style={S.input} type="password" value={telegramToken}
+                                            onChange={e => setTelegramToken(e.target.value)}
+                                            placeholder="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+                                            onFocus={e => { e.target.style.borderColor = '#00f3ff'; }}
+                                            onBlur={e => { e.target.style.borderColor = '#333'; }} />
+                                        <div style={{ fontSize: '0.65rem', color: '#444', marginTop: '4px' }}>
+                                            Get a token from <span style={{ color: '#00f3ff' }}>@BotFather</span> on Telegram
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Discord (coming soon) */}
+                        <div style={{
+                            padding: '16px', background: '#111', border: '1px solid #1a1a1a',
+                            borderRadius: '4px', marginBottom: '12px', opacity: 0.5,
+                        }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                                <span style={{ fontSize: '1.2rem' }}>⊕</span>
+                                <div style={{ flex: 1 }}>
+                                    <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#e0e0e0' }}>Discord</div>
+                                    <div style={{ fontSize: '0.65rem', color: '#444' }}>Bot integration</div>
+                                </div>
+                                <span style={{ fontSize: '0.6rem', padding: '2px 8px', borderRadius: '3px', background: '#1a1a1a', color: '#444' }}>
+                                    COMING SOON
+                                </span>
+                            </div>
+                        </div>
+
+                        {/* Webhook */}
+                        <div style={{
+                            padding: '16px', background: '#111', border: '1px solid #1a1a1a',
+                            borderRadius: '4px', marginBottom: '12px', opacity: 0.5,
+                        }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                                <span style={{ fontSize: '1.2rem' }}>⟐</span>
+                                <div style={{ flex: 1 }}>
+                                    <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#e0e0e0' }}>Webhooks</div>
+                                    <div style={{ fontSize: '0.65rem', color: '#444' }}>Custom HTTP endpoints</div>
+                                </div>
+                                <span style={{ fontSize: '0.6rem', padding: '2px 8px', borderRadius: '3px', background: '#1a1a1a', color: '#444' }}>
+                                    COMING SOON
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                );
+
+            case 'api-keys':
+                return (
+                    <div>
+                        <div style={S.sectionTitle}>// API KEYS</div>
+                        <p style={{ fontSize: '0.75rem', color: '#666', marginBottom: '20px', lineHeight: 1.5 }}>
+                            Access Kestrel programmatically. Keys are shown only once at creation.
+                        </p>
+
+                        {createdKey && (
+                            <div style={S.successBox}>
+                                <div style={{ fontWeight: 600, marginBottom: '6px' }}>✓ Key created: {createdKey.name}</div>
+                                <div style={{ fontSize: '0.7rem', marginBottom: '8px', opacity: 0.8 }}>Copy now — it won't be shown again.</div>
+                                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                                    <code style={{
+                                        flex: 1, padding: '8px 10px', background: '#0a0a0a', borderRadius: '3px',
+                                        fontSize: '0.7rem', wordBreak: 'break-all',
+                                        border: '1px solid rgba(0,255,157,0.2)', color: '#00ff9d',
+                                    }}>{createdKey.key}</code>
+                                    <button style={{ ...S.btnGhost, padding: '8px 12px', fontSize: '0.7rem', flexShrink: 0 }}
+                                        onClick={() => navigator.clipboard.writeText(createdKey.key)}>Copy</button>
+                                </div>
+                                <button style={{ ...S.btnGhost, padding: '4px 10px', fontSize: '0.65rem', marginTop: '8px', borderColor: 'transparent' }}
+                                    onClick={() => setCreatedKey(null)}>Dismiss</button>
+                            </div>
+                        )}
+
+                        <div style={{ display: 'flex', gap: '8px', marginBottom: '20px' }}>
+                            <input style={{ ...S.input, flex: 1 }} placeholder="Key name (e.g. CI Pipeline)"
+                                value={newKeyName} onChange={e => setNewKeyName(e.target.value)}
+                                onKeyDown={e => e.key === 'Enter' && handleCreateKey()}
+                                onFocus={e => { e.target.style.borderColor = '#00f3ff'; }}
+                                onBlur={e => { e.target.style.borderColor = '#333'; }} />
+                            <button style={S.btnPrimary} onClick={handleCreateKey}>+ Create</button>
+                        </div>
+
+                        {keysLoading ? (
+                            <div style={{ textAlign: 'center', color: '#444', padding: '24px', fontSize: '0.8rem' }}>Loading keys...</div>
+                        ) : keysList.length === 0 ? (
+                            <div style={{
+                                textAlign: 'center', padding: '32px', color: '#444', fontSize: '0.8rem',
+                                border: '1px dashed #222', borderRadius: '4px',
+                            }}>No API keys yet</div>
+                        ) : (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                                {keysList.map(k => (
+                                    <div key={k.id} style={{
+                                        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                                        padding: '10px 14px', background: '#111', border: '1px solid #1a1a1a', borderRadius: '4px',
+                                    }}>
+                                        <div>
+                                            <div style={{ fontSize: '0.8rem', fontWeight: 500, color: '#e0e0e0' }}>{k.name}</div>
+                                            <div style={{ fontSize: '0.65rem', color: '#444', marginTop: '2px' }}>
+                                                Expires {new Date(k.expiresAt).toLocaleDateString()}
+                                            </div>
+                                        </div>
+                                        <button style={{ ...S.btnGhost, padding: '6px 12px', fontSize: '0.7rem', color: '#ff0055', borderColor: 'rgba(255,0,85,0.3)' }}
+                                            onClick={() => handleRevokeKey(k.id)}>Revoke</button>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                );
+
+            case 'general':
+                return (
+                    <div>
+                        <div style={S.sectionTitle}>// WORKSPACE</div>
+                        <div style={S.field}>
+                            <label style={S.label}>Workspace Name</label>
+                            <input style={S.input} defaultValue="John-MiracleWorker's Workspace" placeholder="Workspace name"
+                                onFocus={e => { e.target.style.borderColor = '#00f3ff'; }}
+                                onBlur={e => { e.target.style.borderColor = '#333'; }} />
+                        </div>
+                        <div style={S.field}>
+                            <label style={S.label}>Description</label>
+                            <textarea style={{ ...S.textarea, minHeight: 80 }} placeholder="What is this workspace for?"
+                                onFocus={e => { e.target.style.borderColor = '#00f3ff'; }}
+                                onBlur={e => { e.target.style.borderColor = '#333'; }} />
+                        </div>
+                        <div style={{ ...S.sectionTitle, marginTop: '32px' }}>// DANGER ZONE</div>
+                        <div style={{
+                            padding: '16px', border: '1px solid rgba(255,0,85,0.2)',
+                            borderRadius: '4px', background: 'rgba(255,0,85,0.03)',
+                        }}>
+                            <div style={{ fontSize: '0.8rem', fontWeight: 500, color: '#ff0055', marginBottom: '6px' }}>Delete Workspace</div>
+                            <div style={{ fontSize: '0.7rem', color: '#666', marginBottom: '12px' }}>
+                                This will permanently delete the workspace and all conversations.
+                            </div>
+                            <button style={{ ...S.btnGhost, color: '#ff0055', borderColor: 'rgba(255,0,85,0.3)', fontSize: '0.75rem' }}>
+                                Delete Workspace
+                            </button>
+                        </div>
+                    </div>
+                );
+
+            case 'profile':
+                return (
+                    <div>
+                        <div style={S.sectionTitle}>// PROFILE</div>
+                        <div style={S.field}>
+                            <label style={S.label}>Display Name</label>
+                            <input style={S.input} value={displayName} onChange={e => setDisplayName(e.target.value)}
+                                placeholder="Your name"
+                                onFocus={e => { e.target.style.borderColor = '#00f3ff'; }}
+                                onBlur={e => { e.target.style.borderColor = '#333'; }} />
+                        </div>
+                        <div style={S.field}>
+                            <label style={S.label}>Email</label>
+                            <input style={{ ...S.input, opacity: 0.5, cursor: 'not-allowed' }} defaultValue={userEmail} disabled />
+                            <div style={{ fontSize: '0.65rem', color: '#444', marginTop: '4px' }}>Email cannot be changed</div>
+                        </div>
+                        <div style={{ ...S.sectionTitle, marginTop: '32px' }}>// SESSION</div>
+                        <button style={{ ...S.btnGhost, color: '#ff0055', borderColor: 'rgba(255,0,85,0.3)' }}>Sign Out</button>
+                    </div>
+                );
+        }
+    };
+
+    /* ── Main render ──────────────────────────────────────────────── */
+
+    return createPortal(
+        <div style={S.backdrop} onClick={onClose}>
+            <div style={S.panel} onClick={e => e.stopPropagation()}>
+                <nav style={S.nav}>
+                    <div style={S.navHeader}>⚙ System Config</div>
+                    {tabs.map(tab => (
+                        <div key={tab.id}>
+                            {tab.section && <div style={S.navSection}>{tab.section}</div>}
+                            <button style={S.navItem(activeTab === tab.id)} onClick={() => setActiveTab(tab.id)}>
+                                <span style={{ fontSize: '0.9rem', width: '18px', textAlign: 'center' }}>{tab.icon}</span>
+                                {tab.label}
+                            </button>
+                        </div>
+                    ))}
+                    <div style={{ marginTop: 'auto', padding: '16px' }}>
+                        {saveStatus && (
+                            <div style={{ fontSize: '0.7rem', color: '#00ff9d', marginBottom: '8px', textAlign: 'center' }}>
+                                ✓ {saveStatus}
+                            </div>
+                        )}
+                        {error && (
+                            <div style={{ fontSize: '0.7rem', color: '#ff0055', marginBottom: '8px', textAlign: 'center' }}>✗ {error}</div>
+                        )}
+                        <button style={{ ...S.btnPrimary, width: '100%', opacity: saving ? 0.5 : 1 }}
+                            onClick={handleSave} disabled={saving}>
+                            {saving ? 'Saving...' : 'Save Changes'}
+                        </button>
+                    </div>
+                </nav>
+                <div style={S.content}>
+                    <button style={S.closeBtn} onClick={onClose}>✕</button>
+                    {renderContent()}
+                </div>
+            </div>
+        </div>,
+        document.body
     );
 }

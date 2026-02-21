@@ -86,12 +86,14 @@ class AgentLoop:
         checkpoint_manager=None,
         memory_graph: Optional[MemoryGraph] = None,
         evidence_chain: Optional[EvidenceChain] = None,
+        api_key: str = "",
     ):
         self._provider = provider
         self._tools = tool_registry
         self._guardrails = guardrails
         self._persistence = persistence
         self._model = model
+        self._api_key = api_key
         self._planner = TaskPlanner(provider, model)
         self._learner = learner
         self._checkpoints = checkpoint_manager
@@ -278,8 +280,11 @@ class AgentLoop:
                             return
 
                 # ── Reflect: Should we replan? ───────────────────
+                # Skip reflection if budget is already exhausted
+                budget_ok = self._guardrails.check_budget(task) is None
                 if (
-                    step
+                    budget_ok
+                    and step
                     and step.status == StepStatus.COMPLETE
                     and task.iterations % 5 == 0
                     and task.plan.revision_count < 3
@@ -304,7 +309,11 @@ class AgentLoop:
             results = []
             for s in task.plan.steps:
                 if s.result:
-                    results.append(f"**{s.description}**: {s.result}")
+                    # In chat mode, use raw result without step description prefix
+                    if task.messages:
+                        results.append(s.result)
+                    else:
+                        results.append(f"**{s.description}**: {s.result}")
             task.result = "\n".join(results) if results else "Task completed successfully."
 
             await self._persistence.update_task(task)
@@ -371,32 +380,13 @@ class AgentLoop:
         ) or "(none yet)"
 
         done, total = task.plan.progress
-        system_prompt = AGENT_SYSTEM_PROMPT.format(
-            goal=task.goal,
-            step_description=step.description,
-            step_index=step.index + 1,
-            total_steps=total,
-            iteration=task.iterations,
-            max_iterations=task.config.max_iterations,
-            observations=observations,
-        )
 
-        # Build messages: system + conversation history for this step
-        messages = [{"role": "system", "content": system_prompt}]
-
-        # Add step-specific messages
-        if not step.tool_calls:
-            messages.append({
-                "role": "user",
-                "content": f"Execute this step: {step.description}",
-            })
-        else:
-            # Replay tool call history for context
-            messages.append({
-                "role": "user",
-                "content": f"Continue executing: {step.description}",
-            })
-            for tc in step.tool_calls[-6:]:  # Last 6 tool calls for context
+        # If the task has pre-built messages (from chat), use those
+        # Otherwise, build agent-specific messages
+        if task.messages:
+            messages = list(task.messages)  # Copy to avoid mutation
+            # Add tool call history from this step if any
+            for tc in step.tool_calls[-6:]:
                 messages.append({
                     "role": "assistant",
                     "content": None,
@@ -407,6 +397,8 @@ class AgentLoop:
                             "name": tc.get("tool", ""),
                             "arguments": json.dumps(tc.get("args", {})),
                         },
+                        # Preserve Gemini raw part (includes thought_signature)
+                        **({"_gemini_raw_part": tc["_gemini_raw_part"]} if "_gemini_raw_part" in tc else {}),
                     }],
                 })
                 messages.append({
@@ -414,6 +406,52 @@ class AgentLoop:
                     "tool_call_id": tc.get("id", "call_1"),
                     "content": tc.get("result", ""),
                 })
+        else:
+            system_prompt = AGENT_SYSTEM_PROMPT.format(
+                goal=task.goal,
+                step_description=step.description,
+                step_index=step.index + 1,
+                total_steps=total,
+                iteration=task.iterations,
+                max_iterations=task.config.max_iterations,
+                observations=observations,
+            )
+
+            # Build messages: system + conversation history for this step
+            messages = [{"role": "system", "content": system_prompt}]
+
+            # Add step-specific messages
+            if not step.tool_calls:
+                messages.append({
+                    "role": "user",
+                    "content": f"Execute this step: {step.description}",
+                })
+            else:
+                # Replay tool call history for context
+                messages.append({
+                    "role": "user",
+                    "content": f"Continue executing: {step.description}",
+                })
+                for tc in step.tool_calls[-6:]:  # Last 6 tool calls for context
+                    messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": tc.get("id", "call_1"),
+                            "type": "function",
+                            "function": {
+                                "name": tc.get("tool", ""),
+                                "arguments": json.dumps(tc.get("args", {})),
+                            },
+                            # Preserve Gemini raw part (includes thought_signature)
+                            **({"_gemini_raw_part": tc["_gemini_raw_part"]} if "_gemini_raw_part" in tc else {}),
+                        }],
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.get("id", "call_1"),
+                        "content": tc.get("result", ""),
+                    })
 
         # Get available tools as OpenAI function schemas
         tool_schemas = [t.to_openai_schema() for t in self._tools.list_tools()]
@@ -425,6 +463,7 @@ class AgentLoop:
             tools=tool_schemas,
             temperature=0.2,
             max_tokens=4096,
+            api_key=self._api_key,
         )
 
         # ── Handle LLM response ─────────────────────────────────
@@ -494,6 +533,24 @@ class AgentLoop:
                 result = await self._tools.execute(tool_call)
                 task.tool_calls_count += 1
 
+                # Inline budget check — stop immediately if limits exceeded
+                budget_error = self._guardrails.check_budget(task)
+                if budget_error:
+                    logger.warning(f"Budget exceeded mid-step: {budget_error}")
+                    step.status = StepStatus.COMPLETE
+                    step.result = f"Stopped: {budget_error}"
+                    step.completed_at = datetime.now(timezone.utc)
+                    await self._persistence.update_task(task)
+                    yield TaskEvent(
+                        type=TaskEventType.TOOL_RESULT,
+                        task_id=task.id,
+                        step_id=step.id,
+                        tool_name=tool_name,
+                        tool_result=result.output if result.success else result.error,
+                        progress=self._progress(task),
+                    )
+                    return  # Exit _reason_and_act, outer loop will catch FAILED
+
                 # Record in step history
                 step.tool_calls.append({
                     "id": tool_call.id,
@@ -502,6 +559,8 @@ class AgentLoop:
                     "result": result.output if result.success else result.error,
                     "success": result.success,
                     "time_ms": result.execution_time_ms,
+                    # Preserve Gemini raw part for thought_signature support
+                    **({"_gemini_raw_part": tc_data["_gemini_raw_part"]} if "_gemini_raw_part" in tc_data else {}),
                 })
 
                 yield TaskEvent(
@@ -526,28 +585,37 @@ class AgentLoop:
                 await self._persistence.update_task(task)
 
         elif response.get("content"):
-            # LLM returned text (thinking/reflection)
-            thinking = response["content"]
-            yield TaskEvent(
-                type=TaskEventType.THINKING,
-                task_id=task.id,
-                step_id=step.id,
-                content=thinking,
-                progress=self._progress(task),
-            )
+            text = response["content"]
 
-            # If the LLM is done thinking without a tool call,
-            # it might mean the step is simple enough to complete directly
-            if any(phrase in thinking.lower() for phrase in [
-                "step is complete",
-                "this step is done",
-                "completed this step",
-                "no tools needed",
-            ]):
+            # In chat mode (task.messages is set), a plain text response
+            # IS the final answer — not intermediate thinking.
+            if task.messages:
                 step.status = StepStatus.COMPLETE
-                step.result = thinking
+                step.result = text
                 step.completed_at = datetime.now(timezone.utc)
                 await self._persistence.update_task(task)
+            else:
+                # Autonomous task mode — text without a tool call is thinking
+                yield TaskEvent(
+                    type=TaskEventType.THINKING,
+                    task_id=task.id,
+                    step_id=step.id,
+                    content=text,
+                    progress=self._progress(task),
+                )
+
+                # If the LLM is done thinking without a tool call,
+                # it might mean the step is simple enough to complete directly
+                if any(phrase in text.lower() for phrase in [
+                    "step is complete",
+                    "this step is done",
+                    "completed this step",
+                    "no tools needed",
+                ]):
+                    step.status = StepStatus.COMPLETE
+                    step.result = text
+                    step.completed_at = datetime.now(timezone.utc)
+                    await self._persistence.update_task(task)
 
     async def _wait_for_approval(self, task: AgentTask) -> bool:
         """

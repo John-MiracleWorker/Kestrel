@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Agent Reflection & Self-Critique — systematic red-teaming of plans
 before execution.

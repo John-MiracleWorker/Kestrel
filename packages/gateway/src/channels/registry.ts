@@ -12,6 +12,7 @@ import { logger } from '../utils/logger';
 export class ChannelRegistry {
     private adapters = new Map<ChannelType, BaseChannelAdapter>();
     private userChannels = new Map<string, Set<ChannelType>>(); // userId → active channels
+    private knownConversations = new Map<string, string>(); // channelKey → conversationId
 
     constructor(private brain: BrainClient) { }
 
@@ -119,12 +120,19 @@ export class ChannelRegistry {
             );
         }
 
+        // For external channels (Telegram, Discord, etc.), the conversation
+        // may not exist in Brain's database yet. Pass empty conversationId
+        // to let Brain auto-create, then track the returned ID for continuity.
+        const conversationKey = `${channel}:${msg.userId}:${msg.conversationId}`;
+        const knownConvId = this.knownConversations.get(conversationKey);
+        const useConversationId = knownConvId || '';
+
         // Stream response from Brain
         try {
             const stream = this.brain.streamChat({
                 userId: msg.userId,
                 workspaceId: msg.workspaceId,
-                conversationId: msg.conversationId || '',
+                conversationId: useConversationId,
                 messages: [{ role: 0, content: msg.content }], // USER = 0
                 provider: '',   // Use workspace default
                 model: '',      // Use workspace default
@@ -140,10 +148,16 @@ export class ChannelRegistry {
                         break;
 
                     case 'DONE': {
+                        // Capture conversation ID from Brain for future messages
+                        const returnedConvId = chunk.conversation_id;
+                        if (returnedConvId && msg.conversationId) {
+                            this.knownConversations.set(conversationKey, returnedConvId);
+                        }
+
                         // Send complete response back through the channel
                         if (fullContent) {
                             const outgoing: OutgoingMessage = {
-                                conversationId: msg.conversationId || '',
+                                conversationId: returnedConvId || msg.conversationId || '',
                                 content: fullContent,
                                 options: { markdown: true },
                             };

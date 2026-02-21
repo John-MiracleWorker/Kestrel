@@ -137,7 +137,7 @@ class DockerExecutor:
             "environment": env,
             "volumes": volumes,
             "mem_limit": f"{limits['memory_mb']}m",
-            "cpus": limits["cpu_limit"],
+            "nano_cpus": int(limits["cpu_limit"] * 1e9),
             "network_disabled": not limits.get("network", False),
             "read_only": not limits.get("fs_write", False),
             "detach": True,

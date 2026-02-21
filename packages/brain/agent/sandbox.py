@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Docker Sandbox Mode — per-session container isolation for untrusted inputs.
 

@@ -132,7 +132,7 @@ class ToolRegistry:
             )
 
 
-def build_tool_registry(hands_client=None) -> ToolRegistry:
+def build_tool_registry(hands_client=None, vector_store=None) -> ToolRegistry:
     """
     Build the default tool registry with all built-in tools.
     Called during server startup.
@@ -141,6 +141,7 @@ def build_tool_registry(hands_client=None) -> ToolRegistry:
         hands_client: Optional Hands gRPC client for sandboxed code execution.
             If provided, code execution routes through the Hands service.
             If None, code execution will fail safely with an error message.
+        vector_store: Optional VectorStore for memory tools.
     """
     registry = ToolRegistry()
 
@@ -151,13 +152,17 @@ def build_tool_registry(hands_client=None) -> ToolRegistry:
     from agent.tools.data import register_data_tools
     from agent.tools.memory import register_memory_tools
     from agent.tools.human import register_human_tools
+    from agent.tools.moltbook import register_moltbook_tools
+    from agent.tools.schedule import register_schedule_tools
 
     register_code_tools(registry, hands_client=hands_client)
     register_web_tools(registry)
     register_file_tools(registry)
     register_data_tools(registry)
-    register_memory_tools(registry)
+    register_memory_tools(registry, vector_store=vector_store)
     register_human_tools(registry)
+    register_moltbook_tools(registry)
+    register_schedule_tools(registry)
 
     logger.info(f"Tool registry built: {len(registry._definitions)} tools")
     return registry

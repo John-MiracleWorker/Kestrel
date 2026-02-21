@@ -5,6 +5,7 @@ import { Sidebar } from './components/Sidebar/Sidebar';
 import { ChatView } from './components/Chat/ChatView';
 import { SettingsPanel } from './components/Settings/SettingsPanel';
 import { LiveCanvas } from './components/Layout/LiveCanvas';
+import { MoltbookPanel } from './components/Moltbook/MoltbookPanel';
 import { useChat } from './hooks/useChat';
 import { conversations, type Workspace, type Conversation, type Message } from './api/client';
 
@@ -14,6 +15,7 @@ export default function App() {
     const [currentConversation, setCurrentConversation] = useState<Conversation | null>(null);
     const [initialMessages, setInitialMessages] = useState<Message[]>([]);
     const [showSettings, setShowSettings] = useState(false);
+    const [showMoltbook, setShowMoltbook] = useState(false);
     const autoCreateAttempted = useRef<string | null>(null);
     const [showCanvas, setShowCanvas] = useState(true); // Default to open for the look
 
@@ -87,6 +89,7 @@ export default function App() {
                 onSelectConversation={setCurrentConversation}
                 onNewConversation={handleNewConversation}
                 onOpenSettings={() => setShowSettings(true)}
+                onOpenMoltbook={() => setShowMoltbook(true)}
                 onLogout={logout}
             />
 
@@ -117,6 +120,12 @@ export default function App() {
                     workspaceId={currentWorkspace?.id || ''}
                 />
             )}
+
+            <MoltbookPanel
+                workspaceId={currentWorkspace?.id || ''}
+                isVisible={showMoltbook}
+                onClose={() => setShowMoltbook(false)}
+            />
         </div>
     );
 }

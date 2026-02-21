@@ -10,8 +10,25 @@ import logging
 from typing import AsyncIterator
 
 import httpx
+import re
 
 logger = logging.getLogger("brain.providers.cloud")
+
+
+def _safe_raise(resp: httpx.Response):
+    """raise_for_status() but scrub API keys from the error message."""
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        # Log the actual response body for debugging
+        try:
+            error_body = resp.json()
+            logging.getLogger('brain.providers').error(f"API error response body: {json.dumps(error_body, indent=2)[:2000]}")
+        except Exception:
+            logging.getLogger('brain.providers').error(f"API error response text: {resp.text[:1000]}")
+        # Scrub key=... from the URL in the error message
+        clean_msg = re.sub(r'key=[A-Za-z0-9_-]+', 'key=***', str(e))
+        raise httpx.HTTPStatusError(clean_msg, request=e.request, response=e.response) from None
 
 # ── API Keys ──────────────────────────────────────────────────────────
 PROVIDER_CONFIGS = {
@@ -27,7 +44,7 @@ PROVIDER_CONFIGS = {
     },
     "google": {
         "api_key_env": "GOOGLE_API_KEY",
-        "default_model": os.getenv("GOOGLE_DEFAULT_MODEL", "gemini-3.1-pro"),
+        "default_model": os.getenv("GOOGLE_DEFAULT_MODEL", "gemini-3-flash-preview"),
         "base_url": "https://generativelanguage.googleapis.com/v1beta/models",
     },
 }
@@ -65,14 +82,14 @@ MODEL_CATALOG = {
     },
     "google": {
         "flagship": [
-            {"id": "gemini-3.1-pro",          "ctx": "2M",   "desc": "Multimodal flagship — deep reasoning, rich visuals (ARC-AGI-2 winner)"},
-            {"id": "gemini-3-deep-think",     "ctx": "1M",   "desc": "Specialized reasoning — science, research, engineering"},
-            {"id": "gemini-3-pro",            "ctx": "1M",   "desc": "Previous flagship — still highly capable"},
+            {"id": "gemini-3.1-pro-preview",    "ctx": "2M",   "desc": "Multimodal flagship — deep reasoning, rich visuals (ARC-AGI-2 winner)"},
+            {"id": "gemini-3-deep-think-preview", "ctx": "1M", "desc": "Specialized reasoning — science, research, engineering"},
+            {"id": "gemini-3-pro-preview",      "ctx": "1M",   "desc": "Previous flagship — still highly capable"},
         ],
         "efficient": [
-            {"id": "gemini-3-flash",          "ctx": "1M",   "desc": "Speed-optimized — price-performance leader"},
-            {"id": "gemini-2.5-flash",        "ctx": "1M",   "desc": "Stable workhorse — high-volume, audio output"},
-            {"id": "gemini-2.5-flash-lite",   "ctx": "1M",   "desc": "Ultra-cheap — high-throughput services"},
+            {"id": "gemini-3-flash-preview",    "ctx": "1M",   "desc": "Speed-optimized — price-performance leader"},
+            {"id": "gemini-2.5-flash-preview-04-17", "ctx": "1M", "desc": "Stable workhorse — high-volume, audio output"},
+            {"id": "gemini-2.5-flash-lite-preview-06-17", "ctx": "1M", "desc": "Ultra-cheap — high-throughput services"},
         ],
     },
 }
@@ -146,7 +163,7 @@ class CloudProvider:
             async with client.stream(
                 "POST", self._config["base_url"], json=payload, headers=headers
             ) as resp:
-                resp.raise_for_status()
+                _safe_raise(resp)
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
                         continue
@@ -192,7 +209,7 @@ class CloudProvider:
             async with client.stream(
                 "POST", self._config["base_url"], json=payload, headers=headers
             ) as resp:
-                resp.raise_for_status()
+                _safe_raise(resp)
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
                         continue
@@ -232,25 +249,48 @@ class CloudProvider:
         if system_instruction:
             payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
 
-        async with httpx.AsyncClient(timeout=120) as client:
-            async with client.stream("POST", url, json=payload) as resp:
-                if resp.status_code != 200:
-                   error_body = await resp.aread()
-                   logger.error(f"Google API Error: {error_body.decode('utf-8')}")
-                   resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[6:]
-                    try:
-                        chunk = json.loads(data)
-                        parts = chunk.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                        for part in parts:
-                            token = part.get("text", "")
-                            if token:
-                                yield token
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        continue
+        # Retry loop for transient errors (503 high demand)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=120) as client:
+                    async with client.stream("POST", url, json=payload) as resp:
+                        if resp.status_code == 503 and attempt < max_retries - 1:
+                            error_body = await resp.aread()
+                            logger.warning(f"Google API 503 (attempt {attempt+1}/{max_retries}), retrying...")
+                            await asyncio.sleep(2 ** attempt)  # 1s, 2s backoff
+                            continue
+                        if resp.status_code != 200:
+                            error_body = await resp.aread()
+                            # Sanitize API key from error logs
+                            safe_error = error_body.decode('utf-8')
+                            logger.error(f"Google API Error ({resp.status_code}): {safe_error}")
+                            raise Exception(f"Google API error {resp.status_code}: {self._sanitize_error(safe_error)}")
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            data = line[6:]
+                            try:
+                                chunk = json.loads(data)
+                                parts = chunk.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                                for part in parts:
+                                    token = part.get("text", "")
+                                    if token:
+                                        yield token
+                            except (json.JSONDecodeError, KeyError, IndexError):
+                                continue
+                        return  # Success — exit retry loop
+            except httpx.HTTPStatusError:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                raise
+
+    @staticmethod
+    def _sanitize_error(error_text: str) -> str:
+        """Remove API keys from error messages before sending to clients."""
+        import re
+        return re.sub(r'key=[A-Za-z0-9_-]+', 'key=***', error_text)
 
     async def list_models(self, api_key: str = "") -> list[dict]:
         """List available models from the provider."""
@@ -261,7 +301,7 @@ class CloudProvider:
         if self.provider == "openai":
             return await self._list_openai_models(request_key)
         elif self.provider == "anthropic":
-            return self._list_anthropic_models() # Anthropic has no public list endpoint yet
+            return await self._list_anthropic_models(request_key)
         elif self.provider == "google":
             return await self._list_google_models(request_key)
         return []
@@ -273,7 +313,7 @@ class CloudProvider:
         async with httpx.AsyncClient(timeout=30) as client:
             try:
                 resp = await client.get("https://api.openai.com/v1/models", headers=headers)
-                resp.raise_for_status()
+                _safe_raise(resp)
                 data = resp.json()
                 models = []
                 for m in data.get("data", []):
@@ -284,14 +324,49 @@ class CloudProvider:
                             "name": m["id"],
                             "context_window": "128k" # Placeholder, strict context not in list endpoint
                         })
-                return sorted(models, key=lambda x: x["id"], reverse=True)
+                if models:
+                    logger.info(f"Fetched {len(models)} models from OpenAI API")
+                    return sorted(models, key=lambda x: x["id"], reverse=True)
             except Exception as e:
                 logger.error(f"Failed to list OpenAI models: {e}")
-                return []
 
-    def _list_anthropic_models(self) -> list[dict]:
-        # Return hardcoded list as Anthropic doesn't have a simple list endpoint purely for models
-        # Updated for 2026 availability
+        # Fallback: hardcoded list (only used when API is unreachable)
+        logger.warning("Using hardcoded OpenAI model list as fallback")
+        return [
+            {"id": "gpt-5-mini", "name": "GPT-5 Mini", "context_window": "128k"},
+            {"id": "gpt-5", "name": "GPT-5", "context_window": "128k"},
+            {"id": "gpt-4.1-mini", "name": "GPT-4.1 Mini", "context_window": "128k"},
+        ]
+
+    async def _list_anthropic_models(self, api_key: str) -> list[dict]:
+        # Try dynamic API listing first
+        try:
+            headers = {
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            }
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get("https://api.anthropic.com/v1/models", headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    api_models = []
+                    for m in data.get("data", []):
+                        model_id = m.get("id", "")
+                        api_models.append({
+                            "id": model_id,
+                            "name": m.get("display_name", model_id),
+                            "context_window": str(m.get("context_window", "200k"))
+                        })
+                    if api_models:
+                        logger.info(f"Fetched {len(api_models)} models from Anthropic API")
+                        return sorted(api_models, key=lambda x: x["id"], reverse=True)
+                else:
+                    logger.warning(f"Failed to fetch Anthropic models: {resp.status_code}")
+        except Exception as e:
+            logger.error(f"Error fetching Anthropic models: {e}")
+
+        # Fallback: hardcoded list (only used when API is unreachable)
+        logger.warning("Using hardcoded Anthropic model list as fallback")
         return [
             {"id": "claude-opus-4-6", "name": "Claude Opus 4.6", "context_window": "200k"},
             {"id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5", "context_window": "200k"},
@@ -301,20 +376,9 @@ class CloudProvider:
     async def _list_google_models(self, api_key: str) -> list[dict]:
         if not api_key:
             return []
-        
-        # Hardcoded list of 2026 Gemini models to ensure availability
-        # The API might be versioned or restricted, so we prioritize these
-        common_models = [
-            {"id": "gemini-3.1-pro", "name": "Gemini 3.1 Pro", "context_window": "2M"},
-            {"id": "gemini-3-deep-think", "name": "Gemini 3 Deep Think", "context_window": "1M"},
-            {"id": "gemini-3-pro", "name": "Gemini 3 Pro", "context_window": "1M"},
-            {"id": "gemini-3-flash", "name": "Gemini 3 Flash", "context_window": "1M"},
-            {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash", "context_window": "1M"},
-            {"id": "gemini-2.5-flash-lite", "name": "Gemini 2.5 Flash Lite", "context_window": "1M"},
-        ]
 
+        # Try dynamic API listing first — this is the source of truth
         try:
-            # We still try to fetch from API to get any new/custom ones, but we'll merge
             url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
             async with httpx.AsyncClient() as client:
                 resp = await client.get(url, timeout=10.0)
@@ -322,23 +386,30 @@ class CloudProvider:
                     data = resp.json()
                     api_models = []
                     for m in data.get("models", []):
-                        # Filter for generation models
+                        # Filter for models that support generateContent
                         if "generateContent" in m.get("supportedGenerationMethods", []):
                             name_id = m["name"].split("/")[-1]
-                            # Avoid duplicates from hardcoded list
-                            if not any(cm["id"] == name_id for cm in common_models):
-                                api_models.append({
-                                    "id": name_id,
-                                    "name": m.get("displayName", name_id),
-                                    "context_window": str(m.get("inputTokenLimit", "Unknown"))
-                                })
-                    return common_models + api_models
+                            api_models.append({
+                                "id": name_id,
+                                "name": m.get("displayName", name_id),
+                                "context_window": str(m.get("inputTokenLimit", "Unknown"))
+                            })
+                    if api_models:
+                        logger.info(f"Fetched {len(api_models)} models from Google API")
+                        return api_models
                 else:
                     logging.warning(f"Failed to fetch Google models: {resp.status_code} - {resp.text}")
-                    return common_models
         except Exception as e:
             logging.error(f"Error fetching Google models: {e}")
-            return common_models
+
+        # Fallback: hardcoded model IDs (only used when API is unreachable)
+        # These must match actual Google API model IDs
+        logger.warning("Using hardcoded Google model list as fallback")
+        return [
+            {"id": "gemini-3-flash-preview", "name": "Gemini 3 Flash", "context_window": "1M"},
+            {"id": "gemini-2.5-flash-preview-04-17", "name": "Gemini 2.5 Flash", "context_window": "1M"},
+            {"id": "gemini-2.5-flash-lite-preview-06-17", "name": "Gemini 2.5 Flash Lite", "context_window": "1M"},
+        ]
 
     async def generate(
         self,
@@ -392,7 +463,7 @@ class CloudProvider:
 
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(self._config["base_url"], json=payload, headers=headers)
-            resp.raise_for_status()
+            _safe_raise(resp)
             data = resp.json()
             choice = data.get("choices", [{}])[0].get("message", {})
             return {
@@ -437,7 +508,7 @@ class CloudProvider:
 
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(self._config["base_url"], json=payload, headers=headers)
-            resp.raise_for_status()
+            _safe_raise(resp)
             data = resp.json()
 
         # Convert Anthropic response to OpenAI-style format
@@ -465,14 +536,22 @@ class CloudProvider:
             if msg["role"] == "system":
                 system_instruction = msg["content"]
             elif msg.get("tool_calls"):
-                parts = [
-                    {"functionCall": {"name": tc["function"]["name"], "args": json.loads(tc["function"]["arguments"])}}
-                    for tc in msg["tool_calls"]
-                ]
+                parts = []
+                for tc in msg["tool_calls"]:
+                    # If the raw Gemini functionCall part was preserved (with thought_signature),
+                    # use it directly — Gemini 3 requires thought_signature to be sent back.
+                    raw_part = tc.get("_gemini_raw_part")
+                    if raw_part:
+                        parts.append(raw_part)
+                    else:
+                        parts.append({"functionCall": {"name": tc["function"]["name"], "args": json.loads(tc["function"]["arguments"])}})
                 contents.append({"role": "model", "parts": parts})
             elif msg["role"] == "tool":
+                # Gemini requires functionResponse.name to match the functionCall.name
+                tool_call_id = msg.get("tool_call_id", "")
+                tool_name = tool_call_id.replace("call_", "", 1) if tool_call_id.startswith("call_") else msg.get("name", "tool_result")
                 contents.append({"role": "user", "parts": [{"functionResponse": {
-                    "name": "tool_result",
+                    "name": tool_name,
                     "response": {"result": msg.get("content", "")},
                 }}]})
             else:
@@ -487,16 +566,48 @@ class CloudProvider:
         if system_instruction:
             payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
         if tools:
-            payload["tools"] = [{"functionDeclarations": [
-                {"name": t.get("name"), "description": t.get("description", ""),
-                 "parameters": t.get("parameters", {})}
-                for t in tools
-            ]}]
+            # Tools arrive in OpenAI format: {type: "function", function: {name, desc, params}}
+            func_decls = []
+            for t in tools:
+                func = t.get("function", t)  # Handle both wrapped and unwrapped
+                decl = {
+                    "name": func.get("name", ""),
+                    "description": func.get("description", ""),
+                }
+                params = func.get("parameters", {})
+                if params and params.get("properties"):
+                    decl["parameters"] = params
+                func_decls.append(decl)
+            if func_decls:
+                payload["tools"] = [{"functionDeclarations": func_decls}]
+
+        # Debug: log contents structure for tool-using requests
+        has_tool_response = any(
+            any("functionResponse" in p for p in c.get("parts", []))
+            for c in contents
+        )
+        if has_tool_response:
+            import logging as _log
+            _log.getLogger('brain.providers').info(f"Gemini tool payload contents: {json.dumps(contents, indent=2, default=str)[:3000]}")
+
+        # Retry with exponential backoff for transient errors (503, 429, 500)
+        max_retries = 3
+        base_delay = 1.0
+        last_error = None
 
         async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+            for attempt in range(max_retries + 1):
+                resp = await client.post(url, json=payload)
+                if resp.status_code in (503, 429, 500) and attempt < max_retries:
+                    delay = base_delay * (2 ** attempt)
+                    logging.getLogger('brain.providers').warning(
+                        f"Gemini API {resp.status_code}, retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                _safe_raise(resp)
+                data = resp.json()
+                break
 
         parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
         content_text = ""
@@ -513,6 +624,8 @@ class CloudProvider:
                         "name": fc.get("name", ""),
                         "arguments": json.dumps(fc.get("args", {})),
                     },
+                    # Preserve the raw Gemini part (includes thought_signature for Gemini 3)
+                    "_gemini_raw_part": part,
                 })
 
         return {"content": content_text, "tool_calls": tool_calls}

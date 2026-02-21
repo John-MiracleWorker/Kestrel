@@ -151,6 +151,62 @@ export const workspaces = {
     delete: (id: string) => request(`/workspaces/${id}`, { method: 'DELETE' }),
 };
 
+// ── Moltbook ────────────────────────────────────────────────────────
+export interface MoltbookActivityItem {
+    id: string;
+    action: string;
+    title: string;
+    content: string;
+    submolt: string;
+    post_id: string;
+    url: string;
+    created_at: string;
+}
+
+export const moltbook = {
+    getActivity: (workspaceId: string, limit = 20) =>
+        request<{ activity: MoltbookActivityItem[] }>(
+            `/workspaces/${workspaceId}/moltbook/activity?limit=${limit}`,
+        ).then(res => res.activity),
+};
+
+// ── Capabilities ────────────────────────────────────────────────────
+
+export interface CapabilityItem {
+    name: string;
+    description: string;
+    status: 'active' | 'available' | 'disabled';
+    category: string;
+    icon: string;
+    stats?: Record<string, string>;
+}
+
+export const capabilities = {
+    get: (workspaceId: string) =>
+        request<{ capabilities: CapabilityItem[] }>(
+            `/workspaces/${workspaceId}/capabilities`,
+        ).then(res => res.capabilities),
+};
+
+// ── Workflows ───────────────────────────────────────────────────────
+
+export interface WorkflowItem {
+    id: string;
+    name: string;
+    description: string;
+    icon: string;
+    category: string;
+    goalTemplate: string;
+    tags: string[];
+}
+
+export const workflows = {
+    list: (category?: string) =>
+        request<{ workflows: WorkflowItem[] }>(
+            `/workflows${category ? `?category=${category}` : ''}`,
+        ).then(res => res.workflows),
+};
+
 // ── Conversations ───────────────────────────────────────────────────
 // ── Conversations ───────────────────────────────────────────────────
 export const conversations = {
@@ -183,6 +239,7 @@ export const conversations = {
             `/workspaces/${workspaceId}/conversations/${conversationId}/generate-title`,
             {
                 method: 'POST',
+                body: {},
             },
         ).then((res) => res.title),
 };
@@ -215,6 +272,36 @@ export const apiKeys = {
     revoke: (id: string) => request(`/api-keys/${id}`, { method: 'DELETE' }),
 };
 
+// ── Tools ───────────────────────────────────────────────────────────
+export const tools = {
+    list: (workspaceId: string) =>
+        request<{ tools: ToolInfo[] }>(`/workspaces/${workspaceId}/tools`),
+};
+
+export interface ToolInfo {
+    name: string;
+    description: string;
+    category: string;
+    riskLevel: string;
+    enabled: boolean;
+}
+
+// ── Integrations ────────────────────────────────────────────────────
+export const integrations = {
+    status: (workspaceId: string) =>
+        request<{ telegram: { connected: boolean; status: string } }>(`/workspaces/${workspaceId}/integrations/status`),
+    connectTelegram: (workspaceId: string, token: string, enabled: boolean) =>
+        request<{ success: boolean; status: string }>(
+            `/workspaces/${workspaceId}/integrations/telegram`,
+            { method: 'POST', body: { token, enabled } }
+        ),
+    disconnectTelegram: (workspaceId: string) =>
+        request<{ success: boolean; status: string }>(
+            `/workspaces/${workspaceId}/integrations/telegram`,
+            { method: 'DELETE' }
+        ),
+};
+
 // ── WebSocket ───────────────────────────────────────────────────────
 export function createChatSocket(): WebSocket {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -232,6 +319,7 @@ export interface Workspace {
     name: string;
     role: string;
     createdAt: string;
+    settings?: Record<string, any>;
 }
 
 export interface Conversation {

@@ -176,7 +176,10 @@ export default async function workspaceRoutes(app: FastifyInstance, deps: Worksp
     // ── Generate Title ───────────────────────────────────────────────
     typedApp.post('/api/workspaces/:workspaceId/conversations/:conversationId/generate-title', {
         preHandler: [requireAuth, requireWorkspace],
-        schema: { params: conversationParamsSchema }
+        schema: {
+            params: conversationParamsSchema,
+            body: z.any().optional()
+        }
     }, async (req, reply) => {
         const user = req.user!;
         const { workspaceId, conversationId } = req.params as ConversationParams;
@@ -274,6 +277,24 @@ export default async function workspaceRoutes(app: FastifyInstance, deps: Worksp
         } catch (err: any) {
             logger.error('Accept invite failed', { error: err.message });
             return reply.status(400).send({ error: err.message });
+        }
+    });
+
+    // ── GET /api/workspaces/:workspaceId/moltbook/activity ──────────
+    typedApp.get('/api/workspaces/:workspaceId/moltbook/activity', {
+        preHandler: [requireAuth, requireWorkspace],
+    }, async (req, reply) => {
+        const { workspaceId } = req.params as { workspaceId: string };
+        const { limit } = req.query as { limit?: string };
+        try {
+            const result = await brainClient.call('GetMoltbookActivity', {
+                workspace_id: workspaceId,
+                limit: parseInt(limit || '20', 10),
+            });
+            return { activity: result.activity || [] };
+        } catch (err: any) {
+            logger.error('Moltbook activity fetch failed', { error: err.message });
+            return { activity: [] };
         }
     });
 }

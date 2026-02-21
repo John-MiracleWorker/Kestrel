@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Agent Council — multi-agent swarm debate and consensus.
 

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Workflow Templates — pre-built, reusable agent task templates.
 

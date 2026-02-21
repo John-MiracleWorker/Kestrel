@@ -1,11 +1,20 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createChatSocket, conversations, forceRefresh, type Message } from '../api/client';
 
+interface ToolActivity {
+    status: string;       // 'thinking' | 'planning' | 'tool_calling' | 'tool_result'
+    toolName?: string;
+    toolArgs?: string;
+    toolResult?: string;
+    thinking?: string;
+}
+
 interface StreamingMessage {
     id: string;
     role: 'assistant';
     content: string;
     isStreaming: boolean;
+    toolActivity?: ToolActivity | null;
 }
 
 interface UseChatReturn {
@@ -57,13 +66,47 @@ export function useChat(
         ws.onmessage = (event) => {
             if (!isMountedRef.current) return;
             const data = JSON.parse(event.data as string) as {
-                type: 'token' | 'done' | 'error';
+                type: 'token' | 'done' | 'error' | 'thinking' | 'tool_activity';
                 content?: string;
                 messageId?: string;
                 error?: string;
+                status?: string;
+                toolName?: string;
+                toolArgs?: string;
+                toolResult?: string;
+                thinking?: string;
             };
 
             switch (data.type) {
+                case 'thinking':
+                    // Show thinking indicator before first token arrives
+                    if (!contentRef.current) {
+                        setStreamingMessage({
+                            id: data.messageId || 'streaming',
+                            role: 'assistant',
+                            content: '',
+                            isStreaming: true,
+                        });
+                    }
+                    break;
+
+                case 'tool_activity':
+                    // Agent is using tools — update the streaming message with activity info
+                    setStreamingMessage(prev => ({
+                        id: prev?.id || data.messageId || 'streaming',
+                        role: 'assistant',
+                        content: prev?.content || contentRef.current || '',
+                        isStreaming: true,
+                        toolActivity: {
+                            status: data.status || 'thinking',
+                            toolName: data.toolName,
+                            toolArgs: data.toolArgs,
+                            toolResult: data.toolResult,
+                            thinking: data.thinking,
+                        },
+                    }));
+                    break;
+
                 case 'token':
                     contentRef.current += data.content;
                     setStreamingMessage({
@@ -71,6 +114,7 @@ export function useChat(
                         role: 'assistant',
                         content: contentRef.current,
                         isStreaming: true,
+                        toolActivity: null,  // Clear tool activity when content arrives
                     });
                     break;
 

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Model Failover — automatic fallback when an LLM provider fails.
 

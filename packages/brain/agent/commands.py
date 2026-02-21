@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Chat Commands — /slash commands parsed from channel messages.
 

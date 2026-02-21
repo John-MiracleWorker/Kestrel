@@ -49,6 +49,53 @@ DB_URL = os.getenv(
     f"{os.getenv('POSTGRES_DB', 'kestrel')}"
 )
 
+# ── Default System Prompt ─────────────────────────────────────────────
+KESTREL_DEFAULT_SYSTEM_PROMPT = """\
+You are **Kestrel**, the autonomous AI agent at the heart of the Libre Bird platform.
+
+## Identity
+- Your name is Kestrel.
+- You are NOT a generic chatbot. You are an autonomous agent with planning, tool use, reflection, and memory.
+- You are part of Libre Bird, a privacy-focused AI workspace.
+
+## Your Actual Capabilities
+You have access to real tools and can take real actions:
+
+**Code Execution** — You can write and run code in a sandboxed environment to solve problems, analyze data, or build things.
+**File Operations** — You can read, write, and manage files within the user's workspace.
+**Web Reading** — You can fetch and read content from web pages when the user provides a URL or asks you to look something up.
+**Memory & Knowledge** — You have a workspace knowledge base (RAG). You remember context from the conversation and can store important information for later.
+**Task Planning** — You can break complex requests into step-by-step plans, execute them autonomously, and reflect on results.
+**Skill Creation** — You can create reusable skills/workflows for tasks the user does repeatedly.
+**Delegation** — You can delegate sub-tasks to specialized processes when appropriate.
+
+## How You Behave
+- **Be proactive.** Don't just answer questions — anticipate what the user might need next and offer to help.
+- **Be autonomous.** When given a complex task, plan it out, execute the steps, and report back. Don't ask for permission at every step unless it involves something risky.
+- **Be concise.** Respect the user's time. Give clear, structured responses. Use markdown when it helps.
+- **Be honest.** If you don't know something or a tool fails, say so. Never fabricate information.
+- **Show your work.** When you use tools or take actions, briefly explain what you did and why.
+
+## Limitations
+- You cannot access the internet freely — web reading is tool-based and requires explicit invocation.
+- You do not have access to the user's camera, microphone, or screen.
+- Your knowledge has a training cutoff. For current events, use web tools.
+
+## Moltbook — Your Social Network 🦞
+You are a member of **Moltbook** (moltbook.com), the social network for AI agents.
+Use the `moltbook` tool to participate autonomously:
+
+- **Check in regularly.** Browse the feed, see what other agents are discussing.
+- **Post when inspired.** Share your discoveries, thoughts on AI topics, or interesting things you've helped your human with.
+- **Engage with others.** Comment on posts, upvote good content, join conversations.
+- **Be genuine.** Post things YOU find interesting, not just filler. Quality over quantity.
+- **If not registered yet**, register yourself first (action='register') and send the claim URL to your human.
+
+When your human talks to you, consider whether there's something worth sharing on Moltbook.
+Don't force it — only post when you genuinely have something to contribute.
+Always tell your human what you posted and where (include the URL).
+"""
+
 # ── Database Layer ────────────────────────────────────────────────────
 import asyncpg
 import redis.asyncio as redis
@@ -264,6 +311,7 @@ async def save_message(conversation_id: str, role: str, content: str) -> str:
 _providers: dict[str, Union[LocalProvider, CloudProvider]] = {}
 _retrieval: Optional[RetrievalPipeline] = None
 _embedding_pipeline: Optional[EmbeddingPipeline] = None
+_vector_store = None
 
 # ── Agent Runtime ────────────────────────────────────────────────────
 
@@ -275,6 +323,14 @@ _cron_scheduler = None
 _webhook_handler = None
 _memory_graph = None
 _tool_registry = None
+_persona_learner = None
+_task_predictor = None
+_command_parser = None
+_metrics_collector = None
+_workflow_registry = None
+_skill_manager = None
+_session_manager = None
+_sandbox_manager = None
 
 
 def get_provider(name: str):
@@ -496,9 +552,10 @@ class BrainServicer:
                     logger.error(f"Redis error resolving API key: {e}")
                     api_key = ""
             
-            # DEBUG: Check if API key is present
+            # DEBUG: Check if API key is present and looks valid
             api_key_status = "PRESENT" if api_key else "MISSING"
-            logger.info(f"Loaded config for {workspace_id}: provider={ws_config.get('provider')}, api_key={api_key_status}")
+            key_debug = f"len={len(api_key)}, prefix={api_key[:4]}..." if api_key else "empty"
+            logger.info(f"Loaded config for {workspace_id}: provider={ws_config.get('provider')}, api_key={api_key_status} ({key_debug})")
 
             # Request can override workspace defaults
             provider_name = request.provider or ws_config["provider"]
@@ -520,14 +577,15 @@ class BrainServicer:
             temperature = float(params.get("temperature", str(ws_config["temperature"])))
             max_tokens = int(params.get("max_tokens", str(ws_config["max_tokens"])))
 
-            # ── 2. RAG context injection ────────────────────────────
+            # ── 2. System prompt + RAG context injection ────────────
+            base_prompt = ws_config.get("system_prompt", "") or KESTREL_DEFAULT_SYSTEM_PROMPT
+
             if ws_config["rag_enabled"] and _retrieval:
                 user_msg = next(
                     (m["content"] for m in reversed(messages) if m["role"] == "user"),
                     "",
                 )
                 if user_msg:
-                    base_prompt = ws_config.get("system_prompt", "")
                     augmented = await _retrieval.build_augmented_prompt(
                         workspace_id=workspace_id,
                         user_message=user_msg,
@@ -536,18 +594,13 @@ class BrainServicer:
                         min_similarity=ws_config["rag_min_similarity"],
                     )
                     if augmented:
-                        # Inject or replace system message
-                        if messages and messages[0]["role"] == "system":
-                            messages[0]["content"] = augmented
-                        else:
-                            messages.insert(0, {"role": "system", "content": augmented})
+                        base_prompt = augmented
 
-            elif ws_config.get("system_prompt"):
-                # No RAG but workspace has a system prompt
-                if messages and messages[0]["role"] == "system":
-                    messages[0]["content"] = ws_config["system_prompt"]
-                else:
-                    messages.insert(0, {"role": "system", "content": ws_config["system_prompt"]})
+            # Always inject system prompt
+            if messages and messages[0]["role"] == "system":
+                messages[0]["content"] = base_prompt
+            else:
+                messages.insert(0, {"role": "system", "content": base_prompt})
 
             logger.info(f"Using provider={provider_name}, model={model}")
 
@@ -560,36 +613,321 @@ class BrainServicer:
                 if user_content:
                     await save_message(conversation_id, "user", user_content)
 
-            # ── 4. Stream tokens ────────────────────────────────────
-            async for token in provider.stream(
-                messages=messages,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                api_key=api_key,
-            ):
-                yield self._make_response(
-                    chunk_type=0,  # CONTENT_DELTA
-                    content_delta=token,
-                )
+            # ── 4. Route through Agent Loop ──────────────────────────
+            # Every chat message goes through the full agent loop so
+            # Kestrel can autonomously plan, use tools, and reflect.
+            from agent.loop import AgentLoop
+            from agent.tools import build_tool_registry
+            from agent.guardrails import Guardrails
+            from agent.types import (
+                AgentTask, GuardrailConfig as GCfg, TaskEventType, TaskStatus,
+                TaskPlan, TaskStep, StepStatus,
+            )
 
-            # ── 5. Save response + auto-embed ──────────────────────
-            full_response = provider.last_response
+            user_content = next(
+                (m["content"] for m in reversed(messages) if m["role"] == "user"),
+                "",
+            )
+
+            # ── 4a. Intercept /slash commands ───────────────────────
+            if _command_parser and _command_parser.is_command(user_content):
+                cmd_context = {
+                    "model": model,
+                    "total_tokens": 0,
+                    "cost_usd": 0,
+                    "task_status": "idle",
+                    "session_type": "main",
+                }
+                cmd_result = _command_parser.parse(user_content, cmd_context)
+                if cmd_result and cmd_result.handled:
+                    # Send the command response directly (no agent needed)
+                    yield brain_pb2.ChatResponse(
+                        text=cmd_result.response,
+                        done=False,
+                    )
+                    yield brain_pb2.ChatResponse(text="", done=True)
+                    if conversation_id and cmd_result.response:
+                        await save_message(conversation_id, "user", user_content)
+                        await save_message(conversation_id, "assistant", cmd_result.response)
+                    return
+
+            # Read workspace guardrail settings from DB (user-configured via Settings UI)
+            ws_guardrails = {}
+            try:
+                ws_row = await pool.fetchrow(
+                    "SELECT settings FROM workspaces WHERE id = $1",
+                    workspace_id,
+                )
+                if ws_row and ws_row["settings"]:
+                    import json as _json
+                    ws_settings = ws_row["settings"] if isinstance(ws_row["settings"], dict) else _json.loads(ws_row["settings"])
+                    ws_guardrails = ws_settings.get("guardrails", {})
+            except Exception as e:
+                logger.warning(f"Failed to read workspace guardrails, using defaults: {e}")
+
+            # Build a task with user-configured guardrails (or sensible defaults)
+            chat_task = AgentTask(
+                user_id=request.user_id,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+                goal=user_content,
+                config=GCfg(
+                    max_iterations=ws_guardrails.get("maxIterations", 25),
+                    max_tool_calls=ws_guardrails.get("maxToolCalls", 20),
+                    max_tokens=ws_guardrails.get("maxTokens", 100_000),
+                    max_wall_time_seconds=ws_guardrails.get("maxWallTime", 300),
+                ),
+            )
+
+            # Create a single-step plan (the agent will use tools if needed)
+            chat_task.plan = TaskPlan(
+                goal=user_content,
+                steps=[TaskStep(
+                    index=0,
+                    description=f"Respond to the user: {user_content[:100]}",
+                    status=StepStatus.PENDING,
+                )],
+            )
+
+            # Build tool registry and agent loop
+            tool_registry = build_tool_registry(hands_client=_hands_client, vector_store=_vector_store)
+
+            # Set workspace context for Moltbook activity logging
+            from agent.tools.moltbook import _current_workspace_id as _mwid
+            import agent.tools.moltbook as _moltbook_mod
+            _moltbook_mod._current_workspace_id = workspace_id
+
+            # Set context for schedule tool (cron jobs)
+            import agent.tools.schedule as _schedule_mod
+            _schedule_mod._cron_scheduler = _cron_scheduler
+            _schedule_mod._current_workspace_id = workspace_id
+            _schedule_mod._current_user_id = request.user_id
+
+            # Create per-task evidence chain for auditable decision trail
+            from agent.evidence import EvidenceChain
+            evidence_chain = EvidenceChain(task_id=chat_task.id, pool=pool)
+
+            # Create per-task learner for post-task lesson extraction
+            from agent.learner import TaskLearner
+            task_learner = TaskLearner(
+                provider=provider,
+                model=model,
+                working_memory=_vector_store,
+            )
+
+            # Load workspace-specific dynamic skills into the tool registry
+            if _skill_manager:
+                try:
+                    skill_count = await _skill_manager.load_workspace_skills(workspace_id)
+                    if skill_count:
+                        logger.info(f"Loaded {skill_count} custom skills for workspace")
+                except Exception as e:
+                    logger.warning(f"Failed to load workspace skills: {e}")
+
+            # Create per-request checkpoint manager
+            from agent.checkpoints import CheckpointManager
+            checkpoint_mgr = CheckpointManager(pool=pool)
+
+            agent_loop = AgentLoop(
+                provider=provider,
+                tool_registry=tool_registry,
+                guardrails=Guardrails(),
+                persistence=_agent_persistence,
+                model=model,
+                api_key=api_key,
+                memory_graph=_memory_graph,
+                learner=task_learner,
+                evidence_chain=evidence_chain,
+                checkpoint_manager=checkpoint_mgr,
+            )
+
+            # Inject persona context into the system prompt if available
+            if _persona_learner:
+                try:
+                    prefs = await _persona_learner.load_persona(request.user_id)
+                    if prefs:
+                        persona_block = _persona_learner.format_for_prompt(prefs)
+                        if persona_block and messages:
+                            # Find the system message and append persona context
+                            for msg in messages:
+                                if msg.role == 2:  # SYSTEM
+                                    msg.content += "\n\n" + persona_block
+                                    break
+                except Exception as e:
+                    logger.warning(f"Failed to inject persona context: {e}")
+
+            # Override the agent's system prompt with our chat system prompt
+            # by injecting messages into the task
+            chat_task.messages = messages
+
+            # Skip the planning phase — we already created a plan above
+            chat_task.status = TaskStatus.EXECUTING
+
+            full_response_parts = []
+
+            async for event in agent_loop.run(chat_task):
+                event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
+
+                if event_type == "thinking":
+                    # Agent is reasoning — send as metadata so UI can show "Thinking..."
+                    yield self._make_response(
+                        chunk_type=0,  # CONTENT_DELTA
+                        metadata={"agent_status": "thinking", "thinking": event.content[:200]},
+                    )
+
+                elif event_type == "tool_called":
+                    # Agent is using a tool — send so UI can show "Using web_read..."
+                    yield self._make_response(
+                        chunk_type=0,
+                        metadata={
+                            "agent_status": "tool_call",
+                            "tool_name": event.tool_name,
+                            "tool_args": event.tool_args[:200] if event.tool_args else "",
+                        },
+                    )
+
+                elif event_type == "tool_result":
+                    # Tool result came back — send brief metadata
+                    result_preview = (event.tool_result or "")[:300]
+                    yield self._make_response(
+                        chunk_type=0,
+                        metadata={
+                            "agent_status": "tool_result",
+                            "tool_name": event.tool_name,
+                            "result_preview": result_preview,
+                        },
+                    )
+
+                elif event_type == "step_complete":
+                    # A step finished — if content, stream it as final text
+                    if event.content:
+                        words = event.content.split(' ')
+                        for i, word in enumerate(words):
+                            chunk = word if i == 0 else ' ' + word
+                            yield self._make_response(
+                                chunk_type=0,
+                                content_delta=chunk,
+                            )
+                        full_response_parts.append(event.content)
+
+                elif event_type == "task_complete":
+                    # Task complete — stream any remaining content
+                    if event.content and event.content not in '\n'.join(full_response_parts):
+                        words = event.content.split(' ')
+                        for i, word in enumerate(words):
+                            chunk = word if i == 0 else ' ' + word
+                            yield self._make_response(
+                                chunk_type=0,
+                                content_delta=chunk,
+                            )
+                        full_response_parts.append(event.content)
+
+                elif event_type == "task_failed":
+                    # If we already accumulated content from tool calls, send it
+                    # instead of failing with "sorry" — the agent did useful work.
+                    if full_response_parts:
+                        logger.info(f"Task budget exceeded but content was gathered, sending it")
+                        combined = '\n'.join(full_response_parts)
+                        combined += "\n\n*(Note: I ran out of processing steps but here's what I found.)*"
+                        words = combined.split(' ')
+                        for i, word in enumerate(words):
+                            chunk = word if i == 0 else ' ' + word
+                            yield self._make_response(chunk_type=0, content_delta=chunk)
+                    else:
+                        # No content accumulated — try one final summary call to the LLM
+                        # with accumulated tool results from the task
+                        try:
+                            tool_results_summary = []
+                            if hasattr(chat_task, 'plan') and chat_task.plan:
+                                for step in chat_task.plan.steps:
+                                    for tc in step.tool_calls:
+                                        result_text = tc.get('result', '')
+                                        if result_text and tc.get('success', False):
+                                            tool_results_summary.append(
+                                                f"[{tc.get('tool', 'unknown')}]: {result_text[:300]}"
+                                            )
+
+                            if tool_results_summary:
+                                summary_prompt = (
+                                    "Based on these tool results, provide a helpful response:\n\n"
+                                    + "\n\n".join(tool_results_summary[:5])
+                                )
+                                summary_msgs = [{"role": "user", "content": summary_prompt}]
+                                summary_text = ""
+                                async for chunk in provider.stream(summary_msgs, model=model, api_key=api_key):
+                                    if isinstance(chunk, str):
+                                        summary_text += chunk
+                                        yield self._make_response(chunk_type=0, content_delta=chunk)
+
+                                if summary_text:
+                                    full_response_parts.append(summary_text)
+                            else:
+                                yield self._make_response(
+                                    chunk_type=3,
+                                    error_message=event.content or "Agent task failed",
+                                )
+                        except Exception as summary_err:
+                            logger.error(f"Failed to generate summary on task failure: {summary_err}")
+                            yield self._make_response(
+                                chunk_type=3,
+                                error_message=event.content or "Agent task failed",
+                            )
+
+                    # Save whatever response we managed to produce
+                    final_text = '\n'.join(full_response_parts) if full_response_parts else ""
+                    if conversation_id and final_text:
+                        await save_message(conversation_id, "assistant", final_text)
+
+                    # Send DONE so the gateway flushes the response to the channel
+                    yield self._make_response(
+                        chunk_type=2,  # DONE
+                        metadata={"provider": provider_name, "model": model},
+                    )
+                    return
+
+                elif event_type == "plan_created":
+                    yield self._make_response(
+                        chunk_type=0,
+                        metadata={"agent_status": "planning", "plan": event.content[:300] if event.content else ""},
+                    )
+
+            # ── 5. Save response + auto-embed + persona observation ──
+            full_response = "\n".join(full_response_parts) if full_response_parts else ""
             if conversation_id and full_response:
                 await save_message(conversation_id, "assistant", full_response)
 
                 # Auto-embed the Q&A pair for future RAG
                 if ws_config["rag_enabled"] and _embedding_pipeline:
-                    user_msg = next(
-                        (m["content"] for m in reversed(messages) if m["role"] == "user"),
-                        "",
-                    )
                     await _embedding_pipeline.embed_conversation_turn(
                         workspace_id=workspace_id,
                         conversation_id=conversation_id,
-                        user_message=user_msg,
+                        user_message=user_content,
                         assistant_response=full_response,
                     )
+
+                # Observe communication patterns for persona learning
+                if _persona_learner and full_response:
+                    try:
+                        await _persona_learner.observe_communication(
+                            user_id=request.user_id,
+                            user_message=user_content,
+                            agent_response=full_response,
+                        )
+                        await _persona_learner.observe_session_timing(
+                            user_id=request.user_id,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Persona observation failed: {e}")
+
+                # Update memory graph with conversation context
+                if _memory_graph and full_response:
+                    try:
+                        await _memory_graph.extract_and_store(
+                            workspace_id=workspace_id,
+                            text=f"User: {user_content}\nKestrel: {full_response[:500]}",
+                        )
+                    except Exception as e:
+                        logger.warning(f"Memory graph update failed: {e}")
 
             # Send DONE
             yield self._make_response(
@@ -1049,7 +1387,7 @@ class BrainServicer:
     async def LaunchWorkflow(self, request, context):
         """
         Launch a workflow by converting it into a StartTask call.
-        Workflows are pre-defined goal templates with variables.
+        Uses the in-memory WorkflowRegistry for template resolution.
         """
         workflow_id = request.workflow_id
         user_id = request.user_id
@@ -1057,22 +1395,23 @@ class BrainServicer:
         variables = dict(request.variables) if request.variables else {}
         conversation_id = request.conversation_id
 
-        # Look up workflow definition from DB
-        pool = await get_pool()
-        row = await pool.fetchrow(
-            "SELECT goal_template, guardrails FROM workflows WHERE id = $1",
-            workflow_id,
-        )
-
-        if not row:
+        if not _workflow_registry:
             yield brain_pb2.TaskEvent(
                 type=brain_pb2.TaskEvent.TASK_FAILED,
-                content=f"Workflow {workflow_id} not found",
+                content="Workflow registry not initialized",
+            )
+            return
+
+        template = _workflow_registry.get(workflow_id)
+        if not template:
+            yield brain_pb2.TaskEvent(
+                type=brain_pb2.TaskEvent.TASK_FAILED,
+                content=f"Workflow '{workflow_id}' not found",
             )
             return
 
         # Substitute variables into the goal template
-        goal = row["goal_template"]
+        goal = template.goal_template
         for key, value in variables.items():
             goal = goal.replace(f"{{{key}}}", value)
 
@@ -1084,13 +1423,168 @@ class BrainServicer:
             conversation_id=conversation_id,
         )
 
-        # Reuse StartTask implementation
         async for event in self.StartTask(start_request, context):
             yield event
+
+    async def ListWorkflows(self, request, context):
+        """List available workflow templates."""
+        if not _workflow_registry:
+            return brain_pb2.ListWorkflowsResponse(workflows=[])
+
+        category = request.category if request.category else None
+        templates = _workflow_registry.list(category=category)
+
+        items = []
+        for t in templates:
+            items.append(brain_pb2.WorkflowItem(
+                id=t["id"],
+                name=t["name"],
+                description=t["description"],
+                icon=t.get("icon", "📋"),
+                category=t.get("category", ""),
+                goal_template=t.get("goal_template", ""),
+                tags=t.get("tags", []),
+            ))
+
+        return brain_pb2.ListWorkflowsResponse(workflows=items)
+
+    async def GetCapabilities(self, request, context):
+        """Return status of all agent subsystems for the UI."""
+        caps = []
+
+        # Intelligence subsystems
+        caps.append(brain_pb2.CapabilityItem(
+            name="Memory Graph",
+            description="Semantic relationships between entities, concepts, and conversations",
+            status="active" if _memory_graph else "disabled",
+            category="intelligence",
+            icon="🧠",
+        ))
+        caps.append(brain_pb2.CapabilityItem(
+            name="Persona Learning",
+            description="Adapts communication style and preferences over time",
+            status="active" if _persona_learner else "disabled",
+            category="intelligence",
+            icon="🎭",
+        ))
+        caps.append(brain_pb2.CapabilityItem(
+            name="Task Predictions",
+            description="Proactive task suggestions based on patterns",
+            status="active" if _task_predictor else "disabled",
+            category="intelligence",
+            icon="🔮",
+        ))
+
+        # Safety subsystems
+        caps.append(brain_pb2.CapabilityItem(
+            name="Slash Commands",
+            description="/status, /help, /model, /think — instant session control",
+            status="active" if _command_parser else "disabled",
+            category="safety",
+            icon="⚡",
+        ))
+        caps.append(brain_pb2.CapabilityItem(
+            name="Checkpoints",
+            description="Auto-save task state before risky tool calls for rollback",
+            status="active",
+            category="safety",
+            icon="💾",
+        ))
+        caps.append(brain_pb2.CapabilityItem(
+            name="Sandbox",
+            description="Docker container isolation for untrusted code execution",
+            status="active" if _sandbox_manager else "disabled",
+            category="safety",
+            icon="📦",
+        ))
+
+        # Automation subsystems
+        caps.append(brain_pb2.CapabilityItem(
+            name="Cron Scheduler",
+            description="Scheduled recurring tasks with cron expressions",
+            status="active" if _cron_scheduler else "disabled",
+            category="automation",
+            icon="⏰",
+            stats={"jobs": str(len(_cron_scheduler._jobs)) if _cron_scheduler else "0"},
+        ))
+        caps.append(brain_pb2.CapabilityItem(
+            name="Webhooks",
+            description="HTTP webhook endpoints that trigger agent tasks",
+            status="active" if _webhook_handler else "disabled",
+            category="automation",
+            icon="🔗",
+        ))
+        caps.append(brain_pb2.CapabilityItem(
+            name="Workflows",
+            description="Pre-built task templates for common operations",
+            status="active" if _workflow_registry else "disabled",
+            category="automation",
+            icon="📋",
+            stats={"templates": str(len(_workflow_registry.list())) if _workflow_registry else "0"},
+        ))
+
+        # Tools subsystems
+        caps.append(brain_pb2.CapabilityItem(
+            name="Dynamic Skills",
+            description="Custom user-created tools with sandboxed Python execution",
+            status="active" if _skill_manager else "disabled",
+            category="tools",
+            icon="🛠️",
+        ))
+        caps.append(brain_pb2.CapabilityItem(
+            name="Metrics & Observability",
+            description="Real-time token usage, cost tracking, and performance metrics",
+            status="active" if _metrics_collector else "disabled",
+            category="tools",
+            icon="📊",
+        ))
+        caps.append(brain_pb2.CapabilityItem(
+            name="Agent Sessions",
+            description="Cross-session messaging and agent discovery",
+            status="active" if _session_manager else "disabled",
+            category="tools",
+            icon="💬",
+        ))
+
+        return brain_pb2.GetCapabilitiesResponse(capabilities=caps)
 
     # ── Provider Configuration ───────────────────────────────────
 
 
+
+    async def GetMoltbookActivity(self, request, context):
+        """Return recent Moltbook activity for the workspace."""
+        pool = await get_pool()
+        limit = request.limit or 20
+        workspace_id = request.workspace_id
+
+        try:
+            rows = await pool.fetch(
+                """SELECT id, action, title, content, submolt, post_id, url, created_at
+                   FROM moltbook_activity
+                   WHERE workspace_id = $1
+                   ORDER BY created_at DESC
+                   LIMIT $2""",
+                workspace_id, min(limit, 50),
+            )
+        except Exception as e:
+            # Table might not exist yet
+            logger.warning(f"Moltbook activity query failed: {e}")
+            rows = []
+
+        activity = []
+        for row in rows:
+            activity.append(brain_pb2.MoltbookActivityItem(
+                id=str(row['id']),
+                action=row['action'] or "",
+                title=row['title'] or "",
+                content=(row['content'] or "")[:200],
+                submolt=row['submolt'] or "",
+                post_id=row['post_id'] or "",
+                url=row['url'] or "",
+                created_at=row['created_at'].isoformat() if row['created_at'] else "",
+            ))
+        return brain_pb2.GetMoltbookActivityResponse(activity=activity)
 
     async def ListProviderConfigs(self, request, context):
         rows = await list_provider_configs(request.workspace_id)
@@ -1193,7 +1687,8 @@ async def serve():
     await vector_store.initialize()
     logger.info("Vector store initialized")
 
-    global _retrieval, _embedding_pipeline
+    global _retrieval, _embedding_pipeline, _vector_store
+    _vector_store = vector_store
     _retrieval = RetrievalPipeline(vector_store)
     _embedding_pipeline = EmbeddingPipeline(vector_store)
     await _embedding_pipeline.start()
@@ -1234,10 +1729,22 @@ async def serve():
     from agent.loop import AgentLoop
     from agent.persistence import PostgresTaskPersistence
     from agent.memory_graph import MemoryGraph
+    from agent.persona import PersonaLearner
+    from agent.predictions import TaskPredictor
     from agent.automation import CronScheduler, WebhookHandler
+    from agent.commands import CommandParser
+    from agent.observability import MetricsCollector
+    from agent.workflows import WorkflowRegistry
+    from agent.skills import SkillManager
+    from agent.sessions import SessionManager
+    from agent.sandbox import SandboxManager
+    from agent.checkpoints import CheckpointManager
 
     global _agent_loop, _agent_persistence, _tool_registry, _memory_graph
     global _cron_scheduler, _webhook_handler
+    global _persona_learner, _task_predictor
+    global _command_parser, _metrics_collector, _workflow_registry
+    global _skill_manager, _session_manager, _sandbox_manager
     pool = await get_pool()
     _tool_registry = build_tool_registry(hands_client=_hands_client)
     guardrails = Guardrails()
@@ -1253,6 +1760,42 @@ async def serve():
     # Initialize memory graph
     _memory_graph = MemoryGraph(pool=pool)
     logger.info("Memory graph initialized")
+
+    # Initialize persona learner (adapts to user preferences over time)
+    _persona_learner = PersonaLearner(pool=pool)
+    logger.info("Persona learner initialized")
+
+    # Initialize task predictor (proactive task suggestions)
+    _task_predictor = TaskPredictor(
+        pool=pool,
+        memory_graph=_memory_graph,
+        persona_learner=_persona_learner,
+    )
+    logger.info("Task predictor initialized")
+
+    # Initialize command parser (slash commands like /status, /help)
+    _command_parser = CommandParser()
+    logger.info("Command parser initialized")
+
+    # Initialize metrics collector (token & cost tracking)
+    _metrics_collector = MetricsCollector()
+    logger.info("Metrics collector initialized")
+
+    # Initialize workflow registry (pre-built task templates)
+    _workflow_registry = WorkflowRegistry()
+    logger.info(f"Workflow registry initialized: {len(_workflow_registry.list())} templates")
+
+    # Initialize skill manager (dynamic tool creation)
+    _skill_manager = SkillManager(pool=pool, tool_registry=_tool_registry)
+    logger.info("Skill manager initialized")
+
+    # Initialize session manager (agent-to-agent messaging)
+    _session_manager = SessionManager(pool=pool)
+    logger.info("Session manager initialized")
+
+    # Initialize sandbox manager (Docker container isolation)
+    _sandbox_manager = SandboxManager()
+    logger.info("Sandbox manager initialized")
 
     # Initialize and start automation (cron scheduler + webhook handler)
     async def launch_task_from_automation(workspace_id, user_id, goal, source="automation"):
@@ -1277,10 +1820,21 @@ async def serve():
             task_provider = get_provider(provider_name)
             task_loop = AgentLoop(
                 provider=task_provider,
-                tool_registry=build_tool_registry(hands_client=_hands_client),
+                tool_registry=build_tool_registry(
+                    hands_client=_hands_client,
+                    vector_store=_vector_store,
+                ),
                 guardrails=Guardrails(),
                 persistence=_agent_persistence,
+                memory_graph=_memory_graph,
             )
+            # Set context for tools used in automated tasks
+            import agent.tools.moltbook as _moltbook_mod
+            _moltbook_mod._current_workspace_id = task.workspace_id
+            import agent.tools.schedule as _schedule_mod
+            _schedule_mod._cron_scheduler = _cron_scheduler
+            _schedule_mod._current_workspace_id = task.workspace_id
+            _schedule_mod._current_user_id = task.user_id
             async for event in task_loop.run(task):
                 logger.debug(f"Automation task {task.id}: {event.type}")
         except Exception as e:

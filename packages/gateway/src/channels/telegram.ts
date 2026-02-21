@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import {
     BaseChannelAdapter,
     ChannelType,
@@ -399,7 +399,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
             channel: 'telegram',
             userId,
             workspaceId: this.config.defaultWorkspaceId,
-            conversationId: `tg-${msg.chat.id}`,
+            conversationId: this.resolveConversationId(msg.chat.id),
             content: text,
             attachments: attachments.length ? attachments : undefined,
             metadata: {
@@ -442,7 +442,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
             channel: 'telegram',
             userId,
             workspaceId: this.config.defaultWorkspaceId,
-            conversationId: `tg-task-${msg.chat.id}-${Date.now()}`,
+            conversationId: this.resolveConversationId(msg.chat.id, `task-${Date.now()}`),
             content: goal,
             metadata: {
                 channelUserId: String(from.id),
@@ -571,7 +571,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
                         channel: 'telegram',
                         userId,
                         workspaceId: this.config.defaultWorkspaceId,
-                        conversationId: `tg-${chatId}`,
+                        conversationId: this.resolveConversationId(chatId),
                         content: `/cancel ${taskId}`,
                         metadata: {
                             channelUserId: String(msg.from.id),
@@ -749,7 +749,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
             channel: 'telegram',
             userId,
             workspaceId: this.config.defaultWorkspaceId,
-            conversationId: `tg-${chatId}`,
+            conversationId: this.resolveConversationId(chatId),
             content: query.data,
             metadata: {
                 channelUserId: String(query.from.id),
@@ -797,10 +797,38 @@ export class TelegramAdapter extends BaseChannelAdapter {
         const existing = this.userIdMap.get(chatId);
         if (existing) return existing;
 
-        const userId = `tg-${from.id}`;
+        // Generate a deterministic UUID from the Telegram user ID
+        // Brain requires valid UUIDs — this ensures the same TG user
+        // always maps to the same Kestrel user ID.
+        const userId = this.deterministicUUID(`telegram-user:${from.id}`);
+
         this.userIdMap.set(chatId, userId);
         this.chatIdMap.set(userId, chatId);
         return userId;
+    }
+
+    /**
+     * Generate a deterministic UUID from an arbitrary seed string.
+     */
+    private deterministicUUID(seed: string): string {
+        const hash = createHash('sha256').update(seed).digest('hex');
+        return [
+            hash.substring(0, 8),
+            hash.substring(8, 12),
+            '4' + hash.substring(13, 16),
+            ((parseInt(hash[16], 16) & 0x3) | 0x8).toString(16) + hash.substring(17, 20),
+            hash.substring(20, 32),
+        ].join('-');
+    }
+
+    /**
+     * Generate a deterministic conversation UUID from a chat ID.
+     */
+    private resolveConversationId(chatId: number, suffix?: string): string {
+        const seed = suffix
+            ? `telegram-conv:${chatId}:${suffix}`
+            : `telegram-conv:${chatId}`;
+        return this.deterministicUUID(seed);
     }
 
     // ── Helpers ────────────────────────────────────────────────────

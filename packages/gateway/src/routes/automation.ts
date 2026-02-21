@@ -343,4 +343,24 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
             }
         }
     });
+
+    // ══════════════════════════════════════════════════════════════════
+    // CAPABILITIES
+    // ══════════════════════════════════════════════════════════════════
+
+    // Get all agent capability statuses
+    typedApp.get('/api/workspaces/:workspaceId/capabilities', {
+        preHandler: [requireAuth, requireWorkspace],
+        schema: { params: workspaceParamsSchema }
+    }, async (req) => {
+        const { workspaceId } = req.params as WorkspaceParams;
+
+        try {
+            const result = await brainClient.getCapabilities(workspaceId);
+            return { capabilities: result.capabilities || [] };
+        } catch (err: any) {
+            logger.error('Get capabilities failed', { error: err.message });
+            return { capabilities: [] };
+        }
+    });
 }

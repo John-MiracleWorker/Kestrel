@@ -99,6 +99,9 @@ async def execute_code(
 async def _execute_via_hands(language: str, code: str, timeout: int) -> dict:
     """Execute code via the Hands gRPC service."""
     try:
+        # Import proto types
+        import hands_pb2
+
         # Map language to skill name
         skill_map = {
             "python": "python_executor",
@@ -108,21 +111,39 @@ async def _execute_via_hands(language: str, code: str, timeout: int) -> dict:
 
         skill_name = skill_map.get(language, "python_executor")
 
-        # Call Hands service
-        result = await _hands_client.execute_skill(
+        # Build protobuf request
+        request = hands_pb2.SkillExecutionRequest(
             skill_name=skill_name,
             function_name="run",
             arguments=json.dumps({"code": code}),
-            timeout_seconds=timeout,
-            memory_mb=512,
-            network_enabled=False,
+            limits=hands_pb2.ResourceLimits(
+                timeout_seconds=timeout,
+                memory_mb=512,
+                network_enabled=False,
+            ),
         )
 
+        # Call Hands service (streaming response)
+        output_parts = []
+        error_parts = []
+        status = "RUNNING"
+        exec_time = 0
+
+        async for chunk in _hands_client.ExecuteSkill(request):
+            if chunk.output:
+                output_parts.append(chunk.output)
+            if chunk.error:
+                error_parts.append(chunk.error)
+            if chunk.execution_time_ms:
+                exec_time = chunk.execution_time_ms
+            # Map proto enum to string
+            status = hands_pb2.SkillExecutionResponse.Status.Name(chunk.status)
+
         return {
-            "success": result.get("status") == "SUCCESS",
-            "output": result.get("output", ""),
-            "error": result.get("error", ""),
-            "execution_time_ms": result.get("execution_time_ms", 0),
+            "success": status == "SUCCESS",
+            "output": "".join(output_parts),
+            "error": "".join(error_parts),
+            "execution_time_ms": exec_time,
         }
 
     except Exception as e:

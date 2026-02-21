@@ -258,15 +258,7 @@ export class BrainClient {
     }
 
     async updateWorkspace(workspaceId: string, data: { name?: string; description?: string; settings?: any }): Promise<any> {
-        return new Promise((resolve, reject) => {
-            this.client.UpdateWorkspace(
-                { workspace_id: workspaceId, ...data },
-                (err: any, response: any) => {
-                    if (err) reject(new Error(err.details || err.message));
-                    else resolve(response);
-                }
-            );
-        });
+        return this.call('UpdateWorkspace', { workspace_id: workspaceId, ...data });
     }
 
     async deleteWorkspace(workspaceId: string): Promise<void> {
@@ -524,5 +516,9 @@ export class BrainClient {
         for await (const chunk of stream) {
             yield chunk;
         }
+    }
+
+    async getCapabilities(workspaceId: string): Promise<any> {
+        return this.call('GetCapabilities', { workspace_id: workspaceId });
     }
 }

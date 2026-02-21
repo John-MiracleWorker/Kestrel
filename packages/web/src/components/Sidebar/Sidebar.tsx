@@ -8,6 +8,7 @@ interface SidebarProps {
     onSelectConversation: (conv: Conversation) => void;
     onNewConversation: () => void;
     onOpenSettings: () => void;
+    onOpenMoltbook: () => void;
     onLogout: () => void;
 }
 
@@ -18,6 +19,7 @@ export function Sidebar({
     onSelectConversation,
     onNewConversation,
     onOpenSettings,
+    onOpenMoltbook,
     onLogout,
 }: SidebarProps) {
     const [workspaceList, setWorkspaceList] = useState<Workspace[]>([]);
@@ -324,11 +326,27 @@ export function Sidebar({
                     fontSize: '0.75rem',
                     display: 'flex',
                     justifyContent: 'space-between',
+                    alignItems: 'center',
                     color: 'var(--text-dim)'
                 }}>
                     <button onClick={onOpenSettings} style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
                         <span style={{ color: 'var(--accent-green)' }}>●</span> SYSTEM_CONFIG
                     </button>
+                    <button
+                        onClick={onOpenMoltbook}
+                        title="Moltbook Activity"
+                        style={{
+                            cursor: 'pointer',
+                            fontSize: '1.1rem',
+                            background: 'transparent',
+                            border: 'none',
+                            padding: '2px 6px',
+                            borderRadius: '4px',
+                            transition: 'background 0.2s',
+                        }}
+                        onMouseEnter={e => (e.currentTarget.style.background = 'rgba(168, 85, 247, 0.15)')}
+                        onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+                    >🦞</button>
                     <button onClick={onLogout} style={{ cursor: 'pointer' }}>
                         LOGOUT
                     </button>

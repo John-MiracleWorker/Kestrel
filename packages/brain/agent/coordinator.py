@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Multi-Agent Coordinator — orchestrates specialist sub-agents.
 

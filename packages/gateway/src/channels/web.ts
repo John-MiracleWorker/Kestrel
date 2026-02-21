@@ -172,27 +172,105 @@ export class WebChannelAdapter extends BaseChannelAdapter {
     private async handleMessage(socket: AuthenticatedSocket, msg: any): Promise<void> {
         switch (msg.type) {
             case 'chat': {
-                // Forward to Brain for LLM processing
-                const incoming: IncomingMessage = {
-                    id: randomUUID(),
-                    channel: 'web',
-                    userId: socket.userId,
-                    workspaceId: msg.workspaceId || 'default',
-                    conversationId: msg.conversationId,
-                    content: msg.content,
-                    metadata: {
-                        channelUserId: socket.userId,
-                        channelMessageId: randomUUID(),
-                        timestamp: new Date(),
-                    },
-                };
+                // Stream directly from Brain → WebSocket client.
+                // We bypass the generic registry routeMessage because it
+                // accumulates the full response and sends {type:'message'},
+                // but the frontend expects streaming {type:'token'|'done'|'error'}.
+                const messageId = randomUUID();
 
-                // Route through the ChannelRegistry which handles Brain interaction.
-                // Do NOT call this.brain.streamChat() here — the registry's
-                // routeMessage handler already does that. Calling it here too
-                // would trigger two simultaneous LLM generations, burning double
-                // API credits and corrupting conversation history.
-                this.emit('message', incoming);
+                // Send a "thinking" indicator immediately so the user knows we're working
+                if (socket.readyState === WebSocket.OPEN) {
+                    socket.send(JSON.stringify({
+                        type: 'thinking',
+                        messageId,
+                    }));
+                }
+
+                try {
+                    const stream = this.brain.streamChat({
+                        userId: socket.userId,
+                        workspaceId: msg.workspaceId || 'default',
+                        conversationId: msg.conversationId || '',
+                        messages: [{ role: 0, content: msg.content }], // USER = 0
+                        provider: msg.provider || '',
+                        model: msg.model || '',
+                        parameters: {},
+                    });
+
+                    let doneSent = false;
+
+                    for await (const chunk of stream) {
+                        if (socket.readyState !== WebSocket.OPEN) break;
+
+                        // Debug: log raw chunk type to diagnose streaming
+                        logger.info('Stream chunk received', {
+                            rawType: chunk.type,
+                            typeOf: typeof chunk.type,
+                            hasContentDelta: !!chunk.content_delta,
+                            contentLen: chunk.content_delta?.length || 0
+                        });
+
+                        // gRPC protobuf enums are numbers:
+                        // 0 = CONTENT_DELTA, 1 = TOOL_CALL, 2 = DONE, 3 = ERROR
+                        const enumMap: Record<string, number> = { 'CONTENT_DELTA': 0, 'TOOL_CALL': 1, 'DONE': 2, 'ERROR': 3 };
+                        const chunkType = typeof chunk.type === 'number' ? chunk.type :
+                            (enumMap[chunk.type as string] ?? -1);
+
+                        switch (chunkType) {
+                            case 0: // CONTENT_DELTA
+                                // Check for agent metadata (tool activity events)
+                                if (chunk.metadata?.agent_status && !chunk.content_delta) {
+                                    socket.send(JSON.stringify({
+                                        type: 'tool_activity',
+                                        status: chunk.metadata.agent_status,
+                                        toolName: chunk.metadata.tool_name || '',
+                                        toolArgs: chunk.metadata.tool_args || '',
+                                        toolResult: chunk.metadata.tool_result || '',
+                                        thinking: chunk.metadata.thinking || '',
+                                        messageId,
+                                    }));
+                                } else if (chunk.content_delta) {
+                                    socket.send(JSON.stringify({
+                                        type: 'token',
+                                        content: chunk.content_delta,
+                                        messageId,
+                                    }));
+                                }
+                                break;
+
+                            case 2: // DONE
+                                doneSent = true;
+                                socket.send(JSON.stringify({
+                                    type: 'done',
+                                    messageId,
+                                }));
+                                break;
+
+                            case 3: // ERROR
+                                doneSent = true;
+                                socket.send(JSON.stringify({
+                                    type: 'error',
+                                    error: chunk.error_message || 'Unknown error from Brain',
+                                    messageId,
+                                }));
+                                break;
+                        }
+                    }
+
+                    // Safety: if the stream ended without an explicit DONE, send one
+                    if (!doneSent && socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify({ type: 'done', messageId }));
+                    }
+                } catch (err) {
+                    logger.error('Brain stream failed', { userId: socket.userId, error: (err as Error).message });
+                    if (socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify({
+                            type: 'error',
+                            error: (err as Error).message || 'Failed to process message',
+                            messageId,
+                        }));
+                    }
+                }
                 break;
             }
 

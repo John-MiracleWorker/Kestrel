@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Dynamic Skill Creation — agents create and register new tools at runtime.
 

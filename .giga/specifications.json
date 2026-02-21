@@ -1,0 +1,22 @@
+[
+  {
+    "fileName": "main-overview.mdc",
+    "description": "Complete system overview detailing the multi-agent workspace environment, security architecture, and core component interactions"
+  },
+  {
+    "fileName": "agent-architecture.mdc",
+    "description": "Detailed documentation of the agent system including the evidence chain, memory graph, council deliberation system, and persona learning algorithms"
+  },
+  {
+    "fileName": "security-model.mdc",
+    "description": "Comprehensive documentation of the security implementation including tool registry, code execution sandboxing, workspace security, and risk management systems"
+  },
+  {
+    "fileName": "memory-system.mdc",
+    "description": "Technical specification of the two-tier memory architecture, semantic search implementation, vector embeddings, and knowledge persistence mechanisms"
+  },
+  {
+    "fileName": "data-flow.mdc",
+    "description": "Documentation of data flow patterns between components including inter-agent communication, tool execution pipeline, and memory retrieval processes"
+  }
+]
