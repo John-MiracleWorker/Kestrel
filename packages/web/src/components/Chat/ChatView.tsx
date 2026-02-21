@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect, type FormEvent } from 'react';
 import type { Message } from '../../api/client';
 import { providers, uploadFiles } from '../../api/client';
+import { RichContent } from './RichContent';
+import { NotificationBell } from '../Layout/NotificationBell';
 
 interface ChatViewProps {
     workspaceId: string | null;
@@ -233,6 +235,9 @@ export function ChatView({
                     >
                         Toggle HUD
                     </button>
+
+                    {/* Notification Bell */}
+                    <NotificationBell />
                 </div>
             </header>
 
@@ -910,6 +915,73 @@ function PhaseDetail({ item, phaseKey }: { item: Activity; phaseKey: string }) {
     return null;
 }
 
+/* ── Feedback Buttons ─────────────────────────────────────────────── */
+
+function FeedbackButtons({ messageId }: { messageId: string }) {
+    const [selected, setSelected] = useState<'up' | 'down' | null>(null);
+
+    const submitFeedback = async (rating: 1 | -1) => {
+        const next = rating === 1 ? 'up' : 'down';
+        if (selected === next) return; // Already selected
+        setSelected(next);
+        try {
+            // Best effort — don't block UI
+            const token = localStorage.getItem('kestrel_refresh');
+            if (token) {
+                await fetch('/api/workspaces/default/feedback', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        conversationId: '00000000-0000-0000-0000-000000000000',
+                        messageId,
+                        rating,
+                        comment: '',
+                    }),
+                });
+            }
+        } catch { /* silent */ }
+    };
+
+    return (
+        <div style={{ display: 'flex', gap: '4px', marginTop: '4px', marginLeft: '3px' }}>
+            <button
+                onClick={() => submitFeedback(1)}
+                style={{
+                    background: selected === 'up' ? 'rgba(16,185,129,0.15)' : 'transparent',
+                    border: 'none',
+                    color: selected === 'up' ? '#10b981' : 'var(--text-dim)',
+                    cursor: 'pointer',
+                    padding: '2px 6px',
+                    borderRadius: '4px',
+                    fontSize: '0.8rem',
+                    transition: 'all 0.2s',
+                    opacity: selected && selected !== 'up' ? 0.3 : 0.6,
+                }}
+                title="Good response"
+            >
+                👍
+            </button>
+            <button
+                onClick={() => submitFeedback(-1)}
+                style={{
+                    background: selected === 'down' ? 'rgba(239,68,68,0.15)' : 'transparent',
+                    border: 'none',
+                    color: selected === 'down' ? '#ef4444' : 'var(--text-dim)',
+                    cursor: 'pointer',
+                    padding: '2px 6px',
+                    borderRadius: '4px',
+                    fontSize: '0.8rem',
+                    transition: 'all 0.2s',
+                    opacity: selected && selected !== 'down' ? 0.3 : 0.6,
+                }}
+                title="Bad response"
+            >
+                👎
+            </button>
+        </div>
+    );
+}
+
 /* ── Message Bubble ───────────────────────────────────────────────── */
 
 function MessageBubble({
@@ -987,7 +1059,7 @@ function MessageBubble({
                 {isStreaming && (toolActivity || agentActivities.length > 0) && (
                     <KestrelProcessBar activities={agentActivities} toolActivity={toolActivity} />
                 )}
-                {message.content}
+                {isUser ? message.content : <RichContent content={message.content} />}
                 {isStreaming && message.content && (
                     <span
                         style={{
@@ -1001,6 +1073,10 @@ function MessageBubble({
                     />
                 )}
             </div>
+            {/* Feedback buttons for assistant messages */}
+            {!isUser && message.content && !isStreaming && (
+                <FeedbackButtons messageId={(message as { id?: string }).id || ''} />
+            )}
             <style>{`
                 @keyframes blink { 50% { opacity: 0; } }
                 @keyframes thinking-pulse {

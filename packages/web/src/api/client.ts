@@ -71,7 +71,7 @@ export async function forceRefresh(): Promise<boolean> {
     return tryRefresh();
 }
 
-async function request<T = unknown>(url: string, options: RequestOptions = {}): Promise<T> {
+export async function request<T = unknown>(url: string, options: RequestOptions = {}): Promise<T> {
     const headers: Record<string, string> = {
         'Content-Type': 'application/json',
         ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),

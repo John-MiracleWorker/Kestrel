@@ -164,5 +164,9 @@ def build_tool_registry(hands_client=None, vector_store=None) -> ToolRegistry:
     register_moltbook_tools(registry)
     register_schedule_tools(registry)
 
+    # MCP discovery + management tools
+    from agent.tools.mcp import register_mcp_tools
+    register_mcp_tools(registry)
+
     logger.info(f"Tool registry built: {len(registry._definitions)} tools")
     return registry

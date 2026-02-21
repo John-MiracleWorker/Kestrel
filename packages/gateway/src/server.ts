@@ -25,6 +25,7 @@ import taskRoutes from './routes/tasks';
 import integrationRoutes from './routes/integrations';
 import automationRoutes from './routes/automation';
 import uploadRoutes from './routes/upload';
+import { featureRoutes } from './routes/features';
 
 dotenv.config();
 
@@ -175,6 +176,7 @@ async function start() {
         await taskRoutes(app, { brainClient });
         await automationRoutes(app, { brainClient });
         await uploadRoutes(app);
+        await featureRoutes(app, { brainClient });
 
         if (telegramAdapter) {
             await telegramWebhookRoutes(app, { telegramAdapter });
