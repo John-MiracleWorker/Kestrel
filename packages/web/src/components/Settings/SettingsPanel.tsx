@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { providers, apiKeys, tools as toolsApi, workspaces, integrations, capabilities as capsApi, type ApiKey, type ToolInfo, type CapabilityItem } from '../../api/client';
+import { providers, apiKeys, tools as toolsApi, workspaces, integrations, capabilities as capsApi, request, type ApiKey, type ToolInfo, type CapabilityItem } from '../../api/client';
 
 /* ── Types ─────────────────────────────────────────────────────────── */
 
@@ -233,6 +233,23 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
     const [newToolName, setNewToolName] = useState('');
     const [newToolDesc, setNewToolDesc] = useState('');
     const [newToolCode, setNewToolCode] = useState('');
+
+    // MCP Servers state
+    interface McpServer {
+        id?: string; name: string; description: string; server_url: string;
+        transport: string; enabled: boolean; installed_at?: string;
+    }
+    const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
+    const [mcpLoading, setMcpLoading] = useState(false);
+    const [showAddMcp, setShowAddMcp] = useState(false);
+    const [mcpName, setMcpName] = useState('');
+    const [mcpUrl, setMcpUrl] = useState('');
+    const [mcpDesc, setMcpDesc] = useState('');
+    const [mcpTransport, setMcpTransport] = useState<'stdio' | 'http' | 'sse'>('stdio');
+    const [mcpSaving, setMcpSaving] = useState(false);
+    const [mcpSearchQuery, setMcpSearchQuery] = useState('');
+    const [mcpSearchResults, setMcpSearchResults] = useState<Array<{ name: string; description: string; transport: string; source: string }>>([]);
+    const [mcpSearching, setMcpSearching] = useState(false);
 
     // Agent/guardrails state
     const [maxIterations, setMaxIterations] = useState(25);
@@ -756,6 +773,280 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                                 })}
                             </div>
                         )}
+
+                        {/* ── MCP Servers ─────────────────────────────── */}
+                        <div style={{ marginTop: '32px', borderTop: '1px solid #1a1a1a', paddingTop: '24px' }}>
+                            <div style={S.sectionTitle}>// MCP SERVERS</div>
+                            <p style={{ fontSize: '0.75rem', color: '#666', marginBottom: '12px', lineHeight: 1.5 }}>
+                                Connect external MCP (Model Context Protocol) servers to give Kestrel new capabilities.
+                                Servers can provide file access, database queries, API integrations, and more.
+                            </p>
+
+                            {/* Search Bar */}
+                            <div style={{ marginBottom: '16px' }}>
+                                <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+                                    <input
+                                        style={{ ...S.input, flex: 1, borderColor: mcpSearching ? '#a855f7' : '#333' }}
+                                        value={mcpSearchQuery}
+                                        onChange={e => setMcpSearchQuery(e.target.value)}
+                                        placeholder="Search MCP servers...  e.g. github, database, slack"
+                                        onKeyDown={async e => {
+                                            if (e.key === 'Enter' && mcpSearchQuery.trim()) {
+                                                setMcpSearching(true);
+                                                try {
+                                                    const d = (await request(`/api/mcp/search?q=${encodeURIComponent(mcpSearchQuery)}`)) as {
+                                                        results?: Array<{ name: string; description: string; transport: string; source: string }>;
+                                                    };
+                                                    setMcpSearchResults(d?.results || []);
+                                                } catch { setMcpSearchResults([]); }
+                                                finally { setMcpSearching(false); }
+                                            }
+                                        }}
+                                        onFocus={e => { e.target.style.borderColor = '#a855f7'; }}
+                                        onBlur={e => { if (!mcpSearching) e.target.style.borderColor = '#333'; }}
+                                    />
+                                    <button
+                                        style={{ ...S.btnPrimary, background: '#a855f7', padding: '8px 16px', fontSize: '0.75rem', opacity: mcpSearching ? 0.5 : 1 }}
+                                        disabled={mcpSearching || !mcpSearchQuery.trim()}
+                                        onClick={async () => {
+                                            if (!mcpSearchQuery.trim()) return;
+                                            setMcpSearching(true);
+                                            try {
+                                                const d = (await request(`/api/mcp/search?q=${encodeURIComponent(mcpSearchQuery)}`)) as {
+                                                    results?: Array<{ name: string; description: string; transport: string; source: string }>;
+                                                };
+                                                setMcpSearchResults(d?.results || []);
+                                            } catch { setMcpSearchResults([]); }
+                                            finally { setMcpSearching(false); }
+                                        }}
+                                    >
+                                        {mcpSearching ? '...' : '🔍'}
+                                    </button>
+                                </div>
+
+                                {/* Marketplace Link */}
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                    <span style={{ fontSize: '0.65rem', color: '#555' }}>Searches official MCP catalog + Smithery registry</span>
+                                    <a
+                                        href="https://smithery.ai"
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        style={{
+                                            fontSize: '0.68rem', color: '#a855f7', textDecoration: 'none',
+                                            fontFamily: "'JetBrains Mono', monospace",
+                                            borderBottom: '1px dotted #a855f7',
+                                        }}
+                                    >
+                                        Browse Marketplace →
+                                    </a>
+                                </div>
+
+                                {/* Search Results */}
+                                {mcpSearchResults.length > 0 && (
+                                    <div style={{ marginTop: '12px', maxHeight: '280px', overflowY: 'auto' }}>
+                                        {mcpSearchResults.map(r => {
+                                            const isInstalled = mcpServers.some(s => s.name === r.name);
+                                            return (
+                                                <div key={r.name} style={{
+                                                    display: 'flex', alignItems: 'center', gap: '10px',
+                                                    padding: '10px 12px', background: '#0d0d0d',
+                                                    border: '1px solid #1a1a1a', borderRadius: '4px',
+                                                    marginBottom: '6px', opacity: isInstalled ? 0.5 : 1,
+                                                }}>
+                                                    <span style={{ fontSize: '0.85rem', color: r.source === 'official' ? '#00f3ff' : '#a855f7', flexShrink: 0 }}>
+                                                        {r.source === 'official' ? '★' : '◆'}
+                                                    </span>
+                                                    <div style={{ flex: 1, minWidth: 0 }}>
+                                                        <div style={{ fontSize: '0.75rem', fontWeight: 500, color: '#e0e0e0', marginBottom: '2px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                            {r.name}
+                                                        </div>
+                                                        <div style={{ fontSize: '0.65rem', color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                            {r.description}
+                                                        </div>
+                                                    </div>
+                                                    <button
+                                                        style={{
+                                                            ...S.btnGhost, padding: '4px 12px', fontSize: '0.65rem',
+                                                            color: isInstalled ? '#555' : '#10b981',
+                                                            borderColor: isInstalled ? '#333' : '#10b981',
+                                                        }}
+                                                        disabled={isInstalled}
+                                                        onClick={async () => {
+                                                            try {
+                                                                await request(`/api/workspaces/${workspaceId}/tools`, {
+                                                                    method: 'POST',
+                                                                    body: {
+                                                                        name: r.name,
+                                                                        description: r.description,
+                                                                        serverUrl: `npx -y ${r.name}`,
+                                                                        transport: r.transport || 'stdio',
+                                                                    },
+                                                                });
+                                                                setMcpServers(prev => [...prev, {
+                                                                    name: r.name, description: r.description,
+                                                                    server_url: `npx -y ${r.name}`,
+                                                                    transport: r.transport || 'stdio', enabled: true,
+                                                                }]);
+                                                                setSaveStatus(`Installed ${r.name}`);
+                                                                setTimeout(() => setSaveStatus(null), 2000);
+                                                            } catch {
+                                                                setError('Failed to install');
+                                                                setTimeout(() => setError(null), 3000);
+                                                            }
+                                                        }}
+                                                    >
+                                                        {isInstalled ? 'Installed' : '+ Install'}
+                                                    </button>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                )}
+                            </div>
+
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                                <span style={{ fontSize: '0.7rem', color: '#444' }}>
+                                    {mcpServers.length} servers connected
+                                </span>
+                                <button style={{ ...S.btnGhost, padding: '6px 14px', fontSize: '0.7rem' }}
+                                    onClick={() => {
+                                        setShowAddMcp(!showAddMcp);
+                                        if (!mcpLoading && mcpServers.length === 0) {
+                                            setMcpLoading(true);
+                                            request(`/api/workspaces/${workspaceId}/tools`)
+                                                .then((d: any) => setMcpServers(d?.tools || []))
+                                                .catch(() => setMcpServers([]))
+                                                .finally(() => setMcpLoading(false));
+                                        }
+                                    }}>
+                                    {showAddMcp ? '✕ Cancel' : '+ Add MCP Server'}
+                                </button>
+                            </div>
+
+                            {showAddMcp && (
+                                <div style={{
+                                    padding: '16px', marginBottom: '16px', background: '#0d0d0d',
+                                    border: '1px solid #1a1a1a', borderRadius: '4px',
+                                }}>
+                                    <div style={{ ...S.sectionTitle, marginBottom: '12px' }}>// ADD MCP SERVER</div>
+                                    <div style={S.field}>
+                                        <label style={S.label}>Server Name</label>
+                                        <input style={S.input} value={mcpName}
+                                            onChange={e => setMcpName(e.target.value)}
+                                            placeholder="e.g. filesystem, github, postgres"
+                                            onFocus={e => { e.target.style.borderColor = '#a855f7'; }}
+                                            onBlur={e => { e.target.style.borderColor = '#333'; }} />
+                                    </div>
+                                    <div style={S.field}>
+                                        <label style={S.label}>Server URL / Command</label>
+                                        <input style={S.input} value={mcpUrl}
+                                            onChange={e => setMcpUrl(e.target.value)}
+                                            placeholder="npx -y @modelcontextprotocol/server-filesystem /path"
+                                            onFocus={e => { e.target.style.borderColor = '#a855f7'; }}
+                                            onBlur={e => { e.target.style.borderColor = '#333'; }} />
+                                    </div>
+                                    <div style={S.field}>
+                                        <label style={S.label}>Description (optional)</label>
+                                        <input style={S.input} value={mcpDesc}
+                                            onChange={e => setMcpDesc(e.target.value)}
+                                            placeholder="What does this server provide?"
+                                            onFocus={e => { e.target.style.borderColor = '#a855f7'; }}
+                                            onBlur={e => { e.target.style.borderColor = '#333'; }} />
+                                    </div>
+                                    <div style={S.field}>
+                                        <label style={S.label}>Transport</label>
+                                        <select style={S.select} value={mcpTransport}
+                                            onChange={e => setMcpTransport(e.target.value as 'stdio' | 'http' | 'sse')}>
+                                            <option value="stdio">stdio (local process)</option>
+                                            <option value="http">HTTP (remote)</option>
+                                            <option value="sse">SSE (server-sent events)</option>
+                                        </select>
+                                    </div>
+                                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                                        <button
+                                            style={{ ...S.btnPrimary, background: '#a855f7', opacity: mcpSaving ? 0.5 : 1 }}
+                                            disabled={mcpSaving || !mcpName || !mcpUrl}
+                                            onClick={async () => {
+                                                setMcpSaving(true);
+                                                try {
+                                                    await request(`/api/workspaces/${workspaceId}/tools`, {
+                                                        method: 'POST',
+                                                        body: {
+                                                            name: mcpName,
+                                                            description: mcpDesc,
+                                                            serverUrl: mcpUrl,
+                                                            transport: mcpTransport,
+                                                        },
+                                                    });
+                                                    setMcpServers(prev => [...prev, {
+                                                        name: mcpName, description: mcpDesc,
+                                                        server_url: mcpUrl, transport: mcpTransport, enabled: true,
+                                                    }]);
+                                                    setMcpName(''); setMcpUrl(''); setMcpDesc('');
+                                                    setMcpTransport('stdio'); setShowAddMcp(false);
+                                                    setSaveStatus('MCP server added');
+                                                    setTimeout(() => setSaveStatus(null), 2000);
+                                                } catch {
+                                                    setError('Failed to add MCP server');
+                                                    setTimeout(() => setError(null), 3000);
+                                                } finally { setMcpSaving(false); }
+                                            }}
+                                        >
+                                            {mcpSaving ? 'Adding...' : 'Add Server'}
+                                        </button>
+                                        <span style={{ fontSize: '0.65rem', color: '#666' }}>
+                                            Kestrel will connect on next message
+                                        </span>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Installed MCP server list */}
+                            {mcpLoading ? (
+                                <div style={{ textAlign: 'center', color: '#444', padding: '16px', fontSize: '0.78rem' }}>
+                                    Loading servers...
+                                </div>
+                            ) : mcpServers.length > 0 ? (
+                                <div>
+                                    {mcpServers.map(srv => (
+                                        <div key={srv.name} style={{
+                                            ...S.toolCard,
+                                            borderLeft: `2px solid ${srv.enabled ? '#a855f7' : '#333'}`,
+                                            opacity: srv.enabled ? 1 : 0.5,
+                                        }}>
+                                            <span style={{ fontSize: '1rem', width: '24px', textAlign: 'center', color: '#a855f7' }}>⧉</span>
+                                            <div style={{ flex: 1, minWidth: 0 }}>
+                                                <div style={{ fontSize: '0.8rem', fontWeight: 500, color: '#e0e0e0', marginBottom: '2px' }}>
+                                                    {srv.name}
+                                                </div>
+                                                <div style={{ fontSize: '0.68rem', color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                    {srv.description || srv.server_url}
+                                                </div>
+                                                <div style={{ fontSize: '0.6rem', color: '#444', marginTop: '3px' }}>
+                                                    {srv.transport.toUpperCase()}
+                                                    {srv.installed_at && ` · Added ${new Date(srv.installed_at).toLocaleDateString()}`}
+                                                </div>
+                                            </div>
+                                            <button
+                                                style={{ ...S.btnGhost, padding: '4px 10px', fontSize: '0.65rem', color: '#ef4444', borderColor: '#ef4444' }}
+                                                onClick={async () => {
+                                                    try {
+                                                        await request(`/api/workspaces/${workspaceId}/tools/${srv.name}`, { method: 'DELETE' });
+                                                        setMcpServers(prev => prev.filter(s => s.name !== srv.name));
+                                                    } catch { /* ignore */ }
+                                                }}
+                                            >
+                                                Remove
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
+                            ) : (
+                                <div style={{ textAlign: 'center', color: '#333', padding: '20px', fontSize: '0.75rem' }}>
+                                    No MCP servers connected. Add one above or let Kestrel discover servers automatically.
+                                </div>
+                            )}
+                        </div>
                     </div>
                 );
 

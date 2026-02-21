@@ -267,4 +267,71 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
             }
         },
     );
+
+    // ── P2: Search MCP Servers (Smithery registry) ───────────────────
+    const BUILTIN_MCP_CATALOG = [
+        { name: '@modelcontextprotocol/server-filesystem', description: 'Read/write local files and directories', transport: 'stdio', category: 'files' },
+        { name: '@modelcontextprotocol/server-github', description: 'GitHub repos, issues, PRs, and code search', transport: 'stdio', category: 'dev' },
+        { name: '@modelcontextprotocol/server-postgres', description: 'Query PostgreSQL databases', transport: 'stdio', category: 'data' },
+        { name: '@modelcontextprotocol/server-sqlite', description: 'Query SQLite databases', transport: 'stdio', category: 'data' },
+        { name: '@modelcontextprotocol/server-slack', description: 'Read/send Slack messages and channels', transport: 'stdio', category: 'comms' },
+        { name: '@modelcontextprotocol/server-puppeteer', description: 'Browser automation and web scraping', transport: 'stdio', category: 'web' },
+        { name: '@modelcontextprotocol/server-brave-search', description: 'Web search via Brave Search API', transport: 'stdio', category: 'web' },
+        { name: '@modelcontextprotocol/server-memory', description: 'Persistent key-value memory storage', transport: 'stdio', category: 'memory' },
+        { name: '@modelcontextprotocol/server-google-maps', description: 'Google Maps geocoding, directions, places', transport: 'stdio', category: 'geo' },
+        { name: '@modelcontextprotocol/server-fetch', description: 'HTTP requests to external APIs', transport: 'stdio', category: 'web' },
+        { name: '@modelcontextprotocol/server-sequential-thinking', description: 'Step-by-step reasoning and problem solving', transport: 'stdio', category: 'reasoning' },
+        { name: '@modelcontextprotocol/server-everything', description: 'Kitchen-sink demo of all MCP features', transport: 'stdio', category: 'demo' },
+    ];
+
+    app.withTypeProvider<ZodTypeProvider>().get(
+        '/api/mcp/search',
+        {
+            preHandler: [requireAuth],
+            schema: {
+                querystring: z.object({
+                    q: z.string().min(1).max(100),
+                }),
+            },
+        },
+        async (request, reply) => {
+            const { q } = request.query as { q: string };
+            const query = q.toLowerCase();
+
+            // Search built-in catalog first
+            const builtinResults = BUILTIN_MCP_CATALOG
+                .filter(s => s.name.toLowerCase().includes(query) || s.description.toLowerCase().includes(query) || s.category.includes(query))
+                .map(s => ({ ...s, source: 'official' }));
+
+            // Search Smithery registry
+            let smitheryResults: Array<{ name: string; description: string; transport: string; source: string }> = [];
+            try {
+                const res = await fetch(`https://registry.smithery.ai/servers?q=${encodeURIComponent(q)}&pageSize=10`, {
+                    headers: { 'Accept': 'application/json' },
+                    signal: AbortSignal.timeout(5000),
+                });
+                if (res.ok) {
+                    const data = await res.json() as { servers?: Array<{ qualifiedName: string; displayName: string; description: string }> };
+                    smitheryResults = (data.servers || []).map(s => ({
+                        name: s.qualifiedName || s.displayName,
+                        description: (s.description || '').slice(0, 200),
+                        transport: 'stdio',
+                        source: 'smithery',
+                    }));
+                }
+            } catch {
+                // Smithery timeout or unavailable — return builtin only
+            }
+
+            // Deduplicate and combine
+            const seen = new Set<string>();
+            const results = [...builtinResults, ...smitheryResults].filter(r => {
+                if (seen.has(r.name)) return false;
+                seen.add(r.name);
+                return true;
+            });
+
+            return reply.send({ results: results.slice(0, 20) });
+        },
+    );
 }
