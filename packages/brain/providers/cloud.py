@@ -44,7 +44,7 @@ PROVIDER_CONFIGS = {
     },
     "google": {
         "api_key_env": "GOOGLE_API_KEY",
-        "default_model": os.getenv("GOOGLE_DEFAULT_MODEL", "gemini-3-flash-preview"),
+        "default_model": os.getenv("GOOGLE_DEFAULT_MODEL", "gemini-3.1-pro-preview"),
         "base_url": "https://generativelanguage.googleapis.com/v1beta/models",
     },
 }
