@@ -23,6 +23,7 @@ import telegramWebhookRoutes from './routes/webhooks/telegram';
 import whatsappWebhookRoutes from './routes/webhooks/whatsapp';
 import taskRoutes from './routes/tasks';
 import integrationRoutes from './routes/integrations';
+import automationRoutes from './routes/automation';
 
 dotenv.config();
 
@@ -163,6 +164,7 @@ async function start() {
 
         await providerRoutes(app, deps);
         await taskRoutes(app, { brainClient });
+        await automationRoutes(app, { brainClient });
 
         if (telegramAdapter) {
             await telegramWebhookRoutes(app, { telegramAdapter });
