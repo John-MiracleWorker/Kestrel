@@ -16,7 +16,7 @@
   "dependencies": {
     "@fastify/cors": "^9.0.0",
     "@fastify/helmet": "^11.1.1",
-    "@fastify/multipart": "^9.4.0",
+    "@fastify/multipart": "^8.3.1",
     "@fastify/rate-limit": "^8.0.0",
     "@fastify/static": "^9.0.0",
     "@grpc/grpc-js": "^1.10.0",
