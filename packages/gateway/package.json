@@ -14,11 +14,11 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@fastify/cors": "^9.0.0",
-    "@fastify/helmet": "^11.1.1",
+    "@fastify/cors": "^8.5.0",
+    "@fastify/helmet": "10",
     "@fastify/multipart": "^8.3.1",
-    "@fastify/rate-limit": "^8.0.0",
-    "@fastify/static": "^9.0.0",
+    "@fastify/rate-limit": "^7.6.0",
+    "@fastify/static": "^6.12.0",
     "@grpc/grpc-js": "^1.10.0",
     "@grpc/proto-loader": "^0.7.10",
     "dotenv": "^16.4.0",
