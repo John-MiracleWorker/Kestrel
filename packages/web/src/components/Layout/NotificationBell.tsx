@@ -46,7 +46,7 @@ export function NotificationBell() {
     // Fetch notifications on mount and every 30s
     const fetchNotifications = useCallback(async () => {
         try {
-            const data = (await request('/api/notifications?limit=20')) as {
+            const data = (await request('/notifications?limit=20')) as {
                 notifications?: Notification[];
             };
             setNotifications(data.notifications || []);
@@ -74,7 +74,7 @@ export function NotificationBell() {
 
     const markRead = async (id: string) => {
         try {
-            await request(`/api/notifications/${id}/read`, { method: 'POST' });
+            await request(`/notifications/${id}/read`, { method: 'POST' });
             setNotifications((prev) =>
                 prev.map((n) => (n.id === id ? { ...n, read: true } : n)),
             );
@@ -83,7 +83,7 @@ export function NotificationBell() {
 
     const markAllRead = async () => {
         try {
-            await request('/api/notifications/read-all', { method: 'POST' });
+            await request('/notifications/read-all', { method: 'POST' });
             setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
         } catch { /* ignore */ }
     };
