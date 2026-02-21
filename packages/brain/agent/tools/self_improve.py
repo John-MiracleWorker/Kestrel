@@ -519,8 +519,8 @@ def _run_tests(package: str = "all") -> dict:
 
 
 # ── Proposal System ─────────────────────────────────────────────────
-def _propose_improvements() -> dict:
-    """Create proposals from scan results and send them to Telegram."""
+async def _propose_improvements() -> dict:
+    """Create proposals from scan results, enrich with LLM analysis, send to Telegram."""
     global _pending_proposals
 
     if not _last_scan_results or not _last_scan_results.get("issues"):
@@ -535,7 +535,13 @@ def _propose_improvements() -> dict:
         and "node_modules" not in i.get("file", "")
     ]
 
-    if not actionable:
+    # Step 1: LLM deep analysis on the top candidate files
+    llm_proposals = await _llm_analyze(actionable[:10])
+
+    # Combine static + LLM proposals (LLM proposals go first — they're smarter)
+    all_proposals = llm_proposals + actionable
+
+    if not all_proposals:
         _send_summary_to_telegram(
             "🤖 <b>Kestrel Self-Improvement</b>\n\n"
             "✅ No actionable improvements found. Codebase is clean!\n\n"
@@ -543,9 +549,9 @@ def _propose_improvements() -> dict:
         )
         return {"message": "No actionable improvements. Summary sent to Telegram.", "count": 0}
 
-    # Create proposals and send each to Telegram
+    # Send top proposals to Telegram
     proposals_sent = 0
-    for issue in actionable[:5]:  # Cap at 5 proposals per cycle
+    for issue in all_proposals[:5]:  # Cap at 5 proposals per cycle
         proposal_id = str(uuid.uuid4())
         proposal = {
             "id": proposal_id,
@@ -561,18 +567,253 @@ def _propose_improvements() -> dict:
             logger.error(f"Failed to send proposal {proposal_id}: {result}")
 
     # Send summary
+    llm_label = f" (🧠 {len(llm_proposals)} AI-analyzed)" if llm_proposals else ""
     _send_summary_to_telegram(
         f"🤖 <b>Kestrel Self-Improvement Scan Complete</b>\n\n"
         f"📊 {_last_scan_results.get('total_issues', 0)} issues found\n"
-        f"📨 {proposals_sent} proposals sent for approval\n\n"
+        f"📨 {proposals_sent} proposals sent for approval{llm_label}\n\n"
         f"Reply with ✅ to approve or ❌ to deny each proposal."
     )
 
     return {
         "proposals_sent": proposals_sent,
+        "llm_proposals": len(llm_proposals),
         "total_actionable": len(actionable),
-        "message": f"Sent {proposals_sent} proposals to Telegram for approval",
+        "message": f"Sent {proposals_sent} proposals to Telegram ({len(llm_proposals)} AI-enhanced)",
     }
+
+
+# ── LLM-Powered Deep Analysis ───────────────────────────────────────
+async def _llm_analyze(candidate_issues: list[dict]) -> list[dict]:
+    """
+    Send the codebase to the user's preferred cloud LLM for deep analysis.
+    
+    Two-phase approach:
+    1. Build a full project tree + file summaries so the LLM sees the architecture
+    2. Send the most important source files for deep code review
+    
+    The LLM reviews the full picture and provides intelligent suggestions for:
+    - Logic bugs and edge cases
+    - Architecture improvements  
+    - Performance optimizations
+    - Security vulnerabilities
+    - Better error handling
+    - Refactoring opportunities
+    """
+
+    # Determine the user's preferred provider
+    provider_name = os.getenv("DEFAULT_LLM_PROVIDER", "google")
+    if provider_name == "local":
+        provider_name = "google"  # Fall back to cloud for analysis
+
+    try:
+        from providers.cloud import CloudProvider
+        provider = CloudProvider(provider_name)
+        if not provider.is_ready():
+            logger.warning(f"CloudProvider '{provider_name}' not ready (no API key?). Skipping LLM analysis.")
+            return []
+    except Exception as e:
+        logger.error(f"Failed to initialize CloudProvider: {e}")
+        return []
+
+    # ── Phase 1: Build codebase overview ──────────────────────────────
+    tree_lines = []
+    file_summaries = []
+    
+    for pkg_name, pkg_info in PACKAGES.items():
+        pkg_path = os.path.join(PROJECT_ROOT, pkg_info["path"])
+        if not os.path.exists(pkg_path):
+            continue
+        
+        tree_lines.append(f"\n📦 {pkg_name} ({pkg_info['lang']})")
+        ext = pkg_info["ext"]
+        
+        for root, dirs, files in os.walk(pkg_path):
+            dirs[:] = [d for d in dirs if d not in (
+                "node_modules", "__pycache__", ".git", "dist", "build", ".next", 
+                "venv", ".venv", "coverage", "test", "tests"
+            )]
+            
+            depth = root.replace(pkg_path, "").count(os.sep)
+            indent = "  " * (depth + 1)
+            rel_dir = os.path.relpath(root, os.path.join(PROJECT_ROOT, pkg_info["path"]))
+            if rel_dir != ".":
+                tree_lines.append(f"{indent}📁 {rel_dir}/")
+            
+            for fname in sorted(files):
+                if not (fname.endswith(ext) or fname.endswith(".ts") or fname.endswith(".tsx")):
+                    continue
+                filepath = os.path.join(root, fname)
+                try:
+                    content = open(filepath, "r", errors="ignore").read()
+                    line_count = content.count("\n") + 1
+                    tree_lines.append(f"{indent}  {fname} ({line_count} lines)")
+                    
+                    # Extract key exports/classes/functions for summary
+                    if pkg_info["lang"] == "python" and fname.endswith(".py"):
+                        try:
+                            tree = ast.parse(content, filename=fname)
+                            names = []
+                            for node in ast.iter_child_nodes(tree):
+                                if isinstance(node, ast.ClassDef):
+                                    names.append(f"class {node.name}")
+                                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                    names.append(f"def {node.name}")
+                            if names:
+                                rel = os.path.relpath(filepath, PROJECT_ROOT)
+                                file_summaries.append(f"  {rel}: {', '.join(names[:8])}")
+                        except SyntaxError:
+                            pass
+                    elif fname.endswith((".ts", ".tsx")):
+                        # Quick TS export scan
+                        exports = re.findall(r'export\s+(?:default\s+)?(?:function|class|const|interface|type)\s+(\w+)', content)
+                        if exports:
+                            rel = os.path.relpath(filepath, PROJECT_ROOT)
+                            file_summaries.append(f"  {rel}: {', '.join(exports[:8])}")
+                except Exception:
+                    continue
+
+    codebase_tree = "\n".join(tree_lines)
+    key_exports = "\n".join(file_summaries[:40])
+
+    # ── Phase 2: Collect source files for deep review ─────────────────
+    files_to_analyze: dict[str, str] = {}
+    
+    # Include flagged files from static analysis
+    for issue in (candidate_issues or []):
+        filepath = os.path.join(PROJECT_ROOT, issue.get("file", ""))
+        if filepath in files_to_analyze or not os.path.exists(filepath):
+            continue
+        try:
+            content = open(filepath, "r", errors="ignore").read()
+            lines = content.split("\n")
+            if len(lines) > 300:
+                content = "\n".join(lines[:300]) + f"\n\n... ({len(lines)} total lines, truncated)"
+            files_to_analyze[issue.get("file", "")] = content
+        except Exception:
+            continue
+        if len(files_to_analyze) >= 3:
+            break
+
+    # Also include key architectural files even if no static issues
+    key_files = [
+        "packages/brain/server.py",
+        "packages/brain/agent/loop.py",
+        "packages/brain/agent/coordinator.py",
+        "packages/gateway/src/server.ts",
+        "packages/gateway/src/routes/features.ts",
+    ]
+    for kf in key_files:
+        if len(files_to_analyze) >= 5:
+            break
+        if kf in files_to_analyze:
+            continue
+        filepath = os.path.join(PROJECT_ROOT, kf)
+        if os.path.exists(filepath):
+            try:
+                content = open(filepath, "r", errors="ignore").read()
+                lines = content.split("\n")
+                if len(lines) > 200:
+                    content = "\n".join(lines[:200]) + f"\n\n... ({len(lines)} total lines, truncated)"
+                files_to_analyze[kf] = content
+            except Exception:
+                continue
+
+    files_section = "\n\n".join(
+        f"### {fname}\n```\n{content}\n```"
+        for fname, content in files_to_analyze.items()
+    )
+
+    issues_section = ""
+    if candidate_issues:
+        issues_section = "## Static Analysis Already Found\n" + "\n".join(
+            f"- [{i.get('severity')}] {i.get('file')}:{i.get('line', '?')} — {i.get('description', '')}"
+            for i in candidate_issues[:10]
+        )
+
+    # ── Phase 3: LLM prompt ──────────────────────────────────────────
+    prompt = f"""You are Kestrel's self-improvement engine. You are analyzing the FULL Kestrel AI platform codebase to find the most impactful improvements.
+
+## Codebase Structure
+{codebase_tree}
+
+## Key Exports / Definitions
+{key_exports}
+
+{issues_section}
+
+## Source Files (for deep review)
+{files_section}
+
+## Your Task
+Think DEEPLY and SYSTEM-WIDE. Consider:
+1. **Logic bugs** — edge cases, race conditions, off-by-one errors, null safety
+2. **Architecture** — coupling issues, missing abstractions, circular dependencies, design patterns that would improve the system
+3. **Performance** — unnecessary allocations, N+1 patterns, blocking calls in async code, missing caches
+4. **Security** — injection risks, auth bypasses, data leaks, missing input validation
+5. **Error handling** — unhandled failures, silent swallows, missing retries, error messages that leak internals
+6. **Code quality** — dead code paths, unclear naming, missing types, code that should be shared between packages
+7. **Missing features** — gaps in the system, obvious improvements, integration opportunities
+
+Be specific and actionable. Don't flag trivial style issues.
+
+Respond with a JSON array of improvement proposals. Each proposal should have:
+- "type": one of "bug", "architecture", "performance", "security", "error_handling", "quality", "feature"
+- "severity": one of "critical", "high", "medium"
+- "file": relative file path
+- "line": approximate line number (0 if system-wide)
+- "description": clear description of the issue (2-3 sentences)
+- "suggestion": specific fix suggestion (2-4 sentences, be concrete)
+
+Return ONLY the JSON array, no markdown code fences. Limit to 5 most impactful proposals."""
+
+    try:
+        logger.info(f"LLM analysis: sending {len(files_to_analyze)} files + codebase tree to {provider_name}...")
+        response = await provider.generate(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=3000,
+        )
+
+        # Parse the JSON response
+        response = response.strip()
+        # Strip markdown code fences if present
+        if response.startswith("```"):
+            lines = response.split("\n")
+            response = "\n".join(lines[1:])
+            if response.endswith("```"):
+                response = response[:-3]
+            response = response.strip()
+
+        proposals = json.loads(response)
+        if not isinstance(proposals, list):
+            proposals = [proposals]
+
+        # Tag each as LLM-generated and add package info
+        for p in proposals:
+            p["source"] = "llm"
+            p["llm_provider"] = provider_name
+            fpath = p.get("file", "")
+            if "brain" in fpath:
+                p["package"] = "brain"
+            elif "gateway" in fpath:
+                p["package"] = "gateway"
+            elif "web" in fpath:
+                p["package"] = "web"
+            else:
+                p["package"] = "unknown"
+
+        logger.info(f"LLM analysis: got {len(proposals)} proposals from {provider_name}")
+        return proposals
+
+    except json.JSONDecodeError as e:
+        logger.error(f"LLM response wasn't valid JSON: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"LLM analysis failed: {e}")
+        return []
+
+
 
 
 def _handle_approval(proposal_id: str, approved: bool) -> dict:

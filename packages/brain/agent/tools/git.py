@@ -21,6 +21,16 @@ logger = logging.getLogger("brain.agent.tools.git")
 PROJECT_ROOT = "/project"
 MAX_DIFF_LINES = 200  # Safety: cap diff size per commit
 
+# Admin guard: only the admin user can push/deploy to GitHub.
+# Other users can only make local changes.
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "")
+
+def _is_admin(user_id: str = "") -> bool:
+    """Check if the current operation is from the admin user."""
+    if not ADMIN_USER_ID:
+        return True  # No admin set = allow all (single-user mode)
+    return user_id == ADMIN_USER_ID
+
 
 def register_git_tools(registry) -> None:
     """Register git operations tool."""
@@ -146,10 +156,14 @@ async def git_action(
     elif action == "commit":
         return _git_commit(message)
     elif action == "push":
+        if not _is_admin():
+            return {"error": "🔒 Push is admin-only. Your changes remain local. Ask the admin to push."}
         return _git_push()
     elif action == "log":
         return _git_log(count)
     elif action == "deploy":
+        if not _is_admin():
+            return {"error": "🔒 Deploy is admin-only. Your changes remain local. Ask the admin to deploy."}
         return await _git_deploy()
     else:
         return {"error": f"Unknown git action: {action}"}
