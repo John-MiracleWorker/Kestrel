@@ -334,4 +334,30 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
             return reply.send({ results: results.slice(0, 20) });
         },
     );
+
+    // ── Background Processes / Scheduled Jobs ───────────────────────
+    app.withTypeProvider<ZodTypeProvider>().get(
+        '/api/workspaces/:workspaceId/processes',
+        {
+            preHandler: [requireAuth, requireWorkspace],
+            schema: { params: z.object({ workspaceId: z.string().uuid() }) },
+        },
+        async (request, reply) => {
+            const { workspaceId } = (request as any).params;
+            try {
+                const result = await brainClient.call('ListProcesses', { workspaceId });
+                return reply.send({
+                    processes: result?.processes || [],
+                    running: result?.running || 0,
+                });
+            } catch {
+                // Fallback: return mock structure if Brain method not ready
+                return reply.send({
+                    processes: [],
+                    running: 0,
+                    hint: 'Brain ListProcesses not implemented yet — showing empty',
+                });
+            }
+        },
+    );
 }

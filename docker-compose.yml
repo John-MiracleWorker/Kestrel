@@ -92,9 +92,11 @@ services:
       HANDS_GRPC_PORT: 50052
       EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
       EMBEDDINGS_DIMENSION: ${EMBEDDINGS_DIMENSION:-384}
+      GITHUB_PAT: ${GITHUB_PAT:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes:
       - ${LOCAL_MODEL_DIR:-./models}:/models:ro
+      - .:/app  # Mount project root for self-improvement git operations
     depends_on:
       postgres:
         condition: service_healthy

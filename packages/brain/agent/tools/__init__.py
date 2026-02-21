@@ -168,5 +168,11 @@ def build_tool_registry(hands_client=None, vector_store=None) -> ToolRegistry:
     from agent.tools.mcp import register_mcp_tools
     register_mcp_tools(registry)
 
+    # Self-improvement + git tools
+    from agent.tools.git import register_git_tools
+    from agent.tools.self_improve import register_self_improve_tools
+    register_git_tools(registry)
+    register_self_improve_tools(registry)
+
     logger.info(f"Tool registry built: {len(registry._definitions)} tools")
     return registry

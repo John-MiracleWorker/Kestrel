@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { workspaces, conversations, type Workspace, type Conversation } from '../../api/client';
+import { ProcessesPanel } from './ProcessesPanel';
 
 interface SidebarProps {
     currentWorkspace: Workspace | null;
@@ -29,6 +30,7 @@ export function Sidebar({
     const [editingConversationId, setEditingConversationId] = useState<string | null>(null);
     const [editTitle, setEditTitle] = useState('');
     const [deleteConfirmationId, setDeleteConfirmationId] = useState<string | null>(null);
+    const [showProcesses, setShowProcesses] = useState(false);
 
     // Load workspaces
     useEffect(() => {
@@ -333,6 +335,21 @@ export function Sidebar({
                         <span style={{ color: 'var(--accent-green)' }}>●</span> SYSTEM_CONFIG
                     </button>
                     <button
+                        onClick={() => setShowProcesses(true)}
+                        title="Background Processes"
+                        style={{
+                            cursor: 'pointer',
+                            fontSize: '1.1rem',
+                            background: 'transparent',
+                            border: 'none',
+                            padding: '2px 6px',
+                            borderRadius: '4px',
+                            transition: 'background 0.2s',
+                        }}
+                        onMouseEnter={e => (e.currentTarget.style.background = 'rgba(0, 243, 255, 0.15)')}
+                        onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+                    >⚙</button>
+                    <button
                         onClick={onOpenMoltbook}
                         title="Moltbook Activity"
                         style={{
@@ -395,6 +412,14 @@ export function Sidebar({
                         </div>
                     </div>
                 </div>
+            )}
+
+            {/* Processes Panel */}
+            {showProcesses && currentWorkspace && (
+                <ProcessesPanel
+                    workspaceId={currentWorkspace.id}
+                    onClose={() => setShowProcesses(false)}
+                />
             )}
 
         </>
