@@ -56,6 +56,71 @@ def get_inactivity_seconds() -> float:
     return time.time() - _last_user_activity
 
 
+# ── JSON Extraction Helper ───────────────────────────────────────────
+def _extract_json_array(text: str) -> list | None:
+    """
+    Robustly extract a JSON array from LLM response text.
+    Handles: raw JSON, markdown code fences, JSON embedded in prose.
+    """
+    if not text or not text.strip():
+        return None
+
+    text = text.strip()
+
+    # 1. Direct parse
+    try:
+        result = json.loads(text)
+        return result if isinstance(result, list) else [result]
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Strip markdown code fences (```json ... ``` or ``` ... ```)
+    fence_match = re.search(r'```(?:json)?\s*\n(.*?)```', text, re.DOTALL)
+    if fence_match:
+        try:
+            result = json.loads(fence_match.group(1).strip())
+            return result if isinstance(result, list) else [result]
+        except json.JSONDecodeError:
+            pass
+
+    # 3. Find JSON array by bracket matching — find first [ and last ]
+    first_bracket = text.find('[')
+    last_bracket = text.rfind(']')
+    if first_bracket != -1 and last_bracket > first_bracket:
+        candidate = text[first_bracket:last_bracket + 1]
+        try:
+            result = json.loads(candidate)
+            return result if isinstance(result, list) else [result]
+        except json.JSONDecodeError:
+            pass
+
+    # 4. Try finding a JSON object (single proposal)
+    first_brace = text.find('{')
+    last_brace = text.rfind('}')
+    if first_brace != -1 and last_brace > first_brace:
+        candidate = text[first_brace:last_brace + 1]
+        try:
+            result = json.loads(candidate)
+            return [result]
+        except json.JSONDecodeError:
+            pass
+
+    # 5. Truncation recovery: if array started but was cut off, close it
+    first_bracket = text.find('[')
+    if first_bracket != -1:
+        # Find the last complete object (last })
+        last_brace = text.rfind('}')
+        if last_brace > first_bracket:
+            candidate = text[first_bracket:last_brace + 1] + ']'
+            try:
+                result = json.loads(candidate)
+                return result if isinstance(result, list) else [result]
+            except json.JSONDecodeError:
+                pass
+
+    return None
+
+
 # ── Pending Proposals (in-memory store) ──────────────────────────────
 _pending_proposals: dict[str, dict] = {}
 
@@ -772,20 +837,18 @@ Return ONLY the JSON array, no markdown code fences. Limit to 5 most impactful p
         response = await provider.generate(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
-            max_tokens=3000,
+            max_tokens=8192,
         )
 
-        # Parse the JSON response
+        # Parse the JSON response — robust extraction
         response = response.strip()
-        # Strip markdown code fences if present
-        if response.startswith("```"):
-            lines = response.split("\n")
-            response = "\n".join(lines[1:])
-            if response.endswith("```"):
-                response = response[:-3]
-            response = response.strip()
+        proposals = _extract_json_array(response)
 
-        proposals = json.loads(response)
+        if proposals is None:
+            logger.error(f"Could not extract JSON from LLM response ({len(response)} chars)")
+            logger.debug(f"Raw response preview: {response[:300]}")
+            return []
+
         if not isinstance(proposals, list):
             proposals = [proposals]
 

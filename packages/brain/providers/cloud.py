@@ -274,6 +274,9 @@ class CloudProvider:
                                 chunk = json.loads(data)
                                 parts = chunk.get("candidates", [{}])[0].get("content", {}).get("parts", [])
                                 for part in parts:
+                                    # Skip thinking model internal reasoning
+                                    if part.get("thoughtSignature"):
+                                        continue
                                     token = part.get("text", "")
                                     if token:
                                         yield token
