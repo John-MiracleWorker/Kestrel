@@ -37,24 +37,38 @@ export function setOnAuthExpired(callback: () => void) {
     onAuthExpired = callback;
 }
 
+let refreshPromise: Promise<boolean> | null = null;
+
 async function tryRefresh(): Promise<boolean> {
     if (!refreshToken) return false;
 
-    try {
-        const res = await fetch(`${BASE_URL}/auth/refresh`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ refreshToken }),
-        });
+    if (refreshPromise) return refreshPromise;
 
-        if (!res.ok) return false;
+    refreshPromise = (async () => {
+        try {
+            const res = await fetch(`${BASE_URL}/auth/refresh`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ refreshToken }),
+            });
 
-        const data = await res.json();
-        setTokens(data.accessToken, data.refreshToken);
-        return true;
-    } catch {
-        return false;
-    }
+            if (!res.ok) return false;
+
+            const data = (await res.json()) as { accessToken: string; refreshToken: string };
+            setTokens(data.accessToken, data.refreshToken);
+            return true;
+        } catch {
+            return false;
+        } finally {
+            refreshPromise = null;
+        }
+    })();
+
+    return refreshPromise;
+}
+
+export async function forceRefresh(): Promise<boolean> {
+    return tryRefresh();
 }
 
 async function request<T = unknown>(url: string, options: RequestOptions = {}): Promise<T> {
@@ -92,11 +106,13 @@ async function request<T = unknown>(url: string, options: RequestOptions = {}): 
     }
 
     if (!res.ok) {
-        const error = await res.json().catch(() => ({ error: res.statusText }));
+        const error = (await res.json().catch(() => ({ error: res.statusText }))) as {
+            error?: string;
+        };
         throw new Error(error.error || res.statusText);
     }
 
-    return res.json();
+    return res.json() as Promise<T>;
 }
 
 // ── Auth ────────────────────────────────────────────────────────────
@@ -108,7 +124,12 @@ export const auth = {
         }),
 
     login: (email: string, password: string) =>
-        request<{ accessToken: string; refreshToken: string; user: unknown; workspaces: unknown[] }>('/auth/login', {
+        request<{
+            accessToken: string;
+            refreshToken: string;
+            user: unknown;
+            workspaces: unknown[];
+        }>('/auth/login', {
             method: 'POST',
             body: { email, password },
         }),
@@ -136,34 +157,49 @@ export const conversations = {
     list: (workspaceId: string) =>
         request<{ conversations: Conversation[] }>(`/workspaces/${workspaceId}/conversations`),
     create: (workspaceId: string) =>
-        request<{ conversation: Conversation }>(`/workspaces/${workspaceId}/conversations`, { method: 'POST', body: {} })
-            .then(res => res.conversation),
+        request<{ conversation: Conversation }>(`/workspaces/${workspaceId}/conversations`, {
+            method: 'POST',
+            body: {},
+        }).then((res) => res.conversation),
     messages: (workspaceId: string, conversationId: string) =>
-        request<{ messages: Message[] }>(`/workspaces/${workspaceId}/conversations/${conversationId}/messages`),
+        request<{ messages: Message[] }>(
+            `/workspaces/${workspaceId}/conversations/${conversationId}/messages`,
+        ),
     delete: (workspaceId: string, conversationId: string) =>
-        request<{ success: boolean }>(`/workspaces/${workspaceId}/conversations/${conversationId}`, { method: 'DELETE' }),
+        request<{ success: boolean }>(
+            `/workspaces/${workspaceId}/conversations/${conversationId}`,
+            { method: 'DELETE' },
+        ),
     rename: (workspaceId: string, conversationId: string, title: string) =>
-        request<{ conversation: Conversation }>(`/workspaces/${workspaceId}/conversations/${conversationId}`, {
-            method: 'PATCH',
-            body: { title }
-        }).then(res => res.conversation),
+        request<{ conversation: Conversation }>(
+            `/workspaces/${workspaceId}/conversations/${conversationId}`,
+            {
+                method: 'PATCH',
+                body: { title },
+            },
+        ).then((res) => res.conversation),
     generateTitle: (workspaceId: string, conversationId: string) =>
-        request<{ title: string }>(`/workspaces/${workspaceId}/conversations/${conversationId}/generate-title`, {
-            method: 'POST'
-        }).then(res => res.title),
+        request<{ title: string }>(
+            `/workspaces/${workspaceId}/conversations/${conversationId}/generate-title`,
+            {
+                method: 'POST',
+            },
+        ).then((res) => res.title),
 };
 
 // ── Providers ───────────────────────────────────────────────────────
 export const providers = {
     catalog: () => request<{ providers: ProviderInfo[] }>('/providers'),
-    list: (workspaceId: string) =>
-        request(`/workspaces/${workspaceId}/providers`),
+    list: (workspaceId: string) => request(`/workspaces/${workspaceId}/providers`),
     listModels: (workspaceId: string, provider: string, apiKey?: string) =>
         request<{ models: { id: string; name: string; context_window: string }[] }>(
-            `/workspaces/${workspaceId}/providers/${provider}/models${apiKey ? `?apiKey=${encodeURIComponent(apiKey)}` : ''}`
-        ).then(res => res.models),
+            `/workspaces/${workspaceId}/providers/${provider}/models${apiKey ? `?apiKey=${encodeURIComponent(apiKey)}` : ''}`,
+        ).then((res) => res.models),
     set: (workspaceId: string, provider: string, config: Record<string, unknown>) =>
-        request(`/workspaces/${workspaceId}/providers/${provider}`, { method: 'PUT', body: config }),
+        request(`/workspaces/${workspaceId}/providers/${provider}`, {
+            method: 'PUT',
+            body: config,
+        }),
     delete: (workspaceId: string, provider: string) =>
         request(`/workspaces/${workspaceId}/providers/${provider}`, { method: 'DELETE' }),
 };
@@ -172,7 +208,10 @@ export const providers = {
 export const apiKeys = {
     list: () => request<{ keys: ApiKey[] }>('/api-keys'),
     create: (name: string, expiresInDays?: number) =>
-        request<{ id: string; name: string; key: string; expiresAt: string }>('/api-keys', { method: 'POST', body: { name, expiresInDays } }),
+        request<{ id: string; name: string; key: string; expiresAt: string }>('/api-keys', {
+            method: 'POST',
+            body: { name, expiresInDays },
+        }),
     revoke: (id: string) => request(`/api-keys/${id}`, { method: 'DELETE' }),
 };
 
@@ -271,7 +310,7 @@ export const tasks = {
     /**
      * Start a task via SSE — returns an EventSource that emits TaskEvent objects.
      */
-    start: (workspaceId: string, options: StartTaskOptions): EventSource => {
+    start: (workspaceId: string, _options: StartTaskOptions): EventSource => {
         // We POST and receive SSE, so we use fetch + ReadableStream
         const url = `${BASE_URL}/workspaces/${workspaceId}/tasks`;
         const eventSource = new EventSource(url); // Fallback — actual impl in hook

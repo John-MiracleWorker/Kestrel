@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { createChatSocket, conversations, type Message } from '../api/client';
+import { createChatSocket, conversations, forceRefresh, type Message } from '../api/client';
 
 interface StreamingMessage {
     id: string;
@@ -20,8 +20,8 @@ function generateId(): string {
         return crypto.randomUUID();
     }
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
-        const r = Math.random() * 16 | 0;
-        const v = c === 'x' ? r : (r & 0x3 | 0x8);
+        const r = (Math.random() * 16) | 0;
+        const v = c === 'x' ? r : (r & 0x3) | 0x8;
         return v.toString(16);
     });
 }
@@ -56,7 +56,7 @@ export function useChat(
 
         ws.onmessage = (event) => {
             if (!isMountedRef.current) return;
-            const data = JSON.parse(event.data) as {
+            const data = JSON.parse(event.data as string) as {
                 type: 'token' | 'done' | 'error';
                 content?: string;
                 messageId?: string;
@@ -82,7 +82,7 @@ export function useChat(
                             content: contentRef.current,
                             createdAt: new Date().toISOString(),
                         };
-                        setMessages(prev => [...prev, finalMessage]);
+                        setMessages((prev) => [...prev, finalMessage]);
                     }
                     setStreamingMessage(null);
                     contentRef.current = '';
@@ -96,7 +96,7 @@ export function useChat(
                         content: `[Error: ${data.error || 'Unknown error'}]`,
                         createdAt: new Date().toISOString(),
                     };
-                    setMessages(prev => [...prev, errorMessage]);
+                    setMessages((prev) => [...prev, errorMessage]);
                     setStreamingMessage(null);
                     contentRef.current = '';
                     break;
@@ -104,9 +104,16 @@ export function useChat(
             }
         };
 
-        const handleDisconnect = () => {
+        const handleDisconnect = async (event: CloseEvent) => {
             if (!isMountedRef.current) return;
             setIsConnected(false);
+
+            // If disconnected due to an invalid/expired token, force a refresh
+            if (event.code === 4001 || event.code === 4008) {
+                const refreshed = await forceRefresh();
+                if (!refreshed) return; // Completely dead session; client.ts handles HTTP logout
+            }
+
             // Schedule reconnect with backoff
             const attempt = reconnectAttemptRef.current;
             const delay = RECONNECT_DELAYS[Math.min(attempt, RECONNECT_DELAYS.length - 1)];
@@ -144,18 +151,19 @@ export function useChat(
             conversationId &&
             !titleGeneratedRef.current &&
             messages.length >= 2 &&
-            messages.some(m => m.role === 'user') &&
-            messages.some(m => m.role === 'assistant')
+            messages.some((m) => m.role === 'user') &&
+            messages.some((m) => m.role === 'assistant')
         ) {
             titleGeneratedRef.current = true;
-            conversations.generateTitle(workspaceId, conversationId)
-                .then(newTitle => {
+            conversations
+                .generateTitle(workspaceId, conversationId)
+                .then((newTitle) => {
                     const event = new CustomEvent('conversation-title-changed', {
-                        detail: { conversationId, newTitle }
+                        detail: { conversationId, newTitle },
                     });
                     window.dispatchEvent(event);
                 })
-                .catch(err => console.error('Failed to auto-generate title:', err));
+                .catch((err) => console.error('Failed to auto-generate title:', err));
         }
     }, [messages, workspaceId, conversationId]);
 
@@ -169,31 +177,36 @@ export function useChat(
         setMessages(initialMessages);
     }, [initialMessages]);
 
-    const sendMessage = useCallback((content: string, provider?: string, model?: string) => {
-        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-            console.warn('WebSocket not ready, message dropped');
-            return;
-        }
+    const sendMessage = useCallback(
+        (content: string, provider?: string, model?: string) => {
+            if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+                console.warn('WebSocket not ready, message dropped');
+                return;
+            }
 
-        const userMessage: Message = {
-            id: generateId(),
-            role: 'user',
-            content,
-            createdAt: new Date().toISOString(),
-        };
+            const userMessage: Message = {
+                id: generateId(),
+                role: 'user',
+                content,
+                createdAt: new Date().toISOString(),
+            };
 
-        setMessages(prev => [...prev, userMessage]);
-        contentRef.current = '';
+            setMessages((prev) => [...prev, userMessage]);
+            contentRef.current = '';
 
-        wsRef.current.send(JSON.stringify({
-            type: 'chat',
-            workspaceId,
-            conversationId,
-            content,
-            ...(provider ? { provider } : {}),
-            ...(model ? { model } : {}),
-        }));
-    }, [workspaceId, conversationId]);
+            wsRef.current.send(
+                JSON.stringify({
+                    type: 'chat',
+                    workspaceId,
+                    conversationId,
+                    content,
+                    ...(provider ? { provider } : {}),
+                    ...(model ? { model } : {}),
+                }),
+            );
+        },
+        [workspaceId, conversationId],
+    );
 
     return { messages, streamingMessage, sendMessage, isConnected };
 }
