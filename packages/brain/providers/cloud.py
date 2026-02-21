@@ -27,7 +27,7 @@ PROVIDER_CONFIGS = {
     },
     "google": {
         "api_key_env": "GOOGLE_API_KEY",
-        "default_model": os.getenv("GOOGLE_DEFAULT_MODEL", "gemini-2.0-flash"),
+        "default_model": os.getenv("GOOGLE_DEFAULT_MODEL", "gemini-3.1-pro"),
         "base_url": "https://generativelanguage.googleapis.com/v1beta/models",
     },
 }
@@ -65,12 +65,14 @@ MODEL_CATALOG = {
     },
     "google": {
         "flagship": [
-            {"id": "gemini-2.0-pro",          "ctx": "1M",   "desc": "Multimodal flagship — deep reasoning, rich visuals"},
-            {"id": "gemini-1.5-pro",          "ctx": "2M",   "desc": "Heavy-duty reasoning over complex contexts"},
+            {"id": "gemini-3.1-pro",          "ctx": "2M",   "desc": "Multimodal flagship — deep reasoning, rich visuals (ARC-AGI-2 winner)"},
+            {"id": "gemini-3-deep-think",     "ctx": "1M",   "desc": "Specialized reasoning — science, research, engineering"},
+            {"id": "gemini-3-pro",            "ctx": "1M",   "desc": "Previous flagship — still highly capable"},
         ],
         "efficient": [
-            {"id": "gemini-2.0-flash",        "ctx": "1M",   "desc": "Speed-optimized — price-performance leader (default)"},
-            {"id": "gemini-1.5-flash",        "ctx": "1M",   "desc": "Stable workhorse — high-volume, audio output"},
+            {"id": "gemini-3-flash",          "ctx": "1M",   "desc": "Speed-optimized — price-performance leader"},
+            {"id": "gemini-2.5-flash",        "ctx": "1M",   "desc": "Stable workhorse — high-volume, audio output"},
+            {"id": "gemini-2.5-flash-lite",   "ctx": "1M",   "desc": "Ultra-cheap — high-throughput services"},
         ],
     },
 }
@@ -303,10 +305,12 @@ class CloudProvider:
         # Hardcoded list of 2026 Gemini models to ensure availability
         # The API might be versioned or restricted, so we prioritize these
         common_models = [
-            {"id": "gemini-2.0-pro", "name": "Gemini 2.0 Pro", "context_window": "1M"},
-            {"id": "gemini-2.0-flash", "name": "Gemini 2.0 Flash", "context_window": "1M"},
-            {"id": "gemini-1.5-pro", "name": "Gemini 1.5 Pro", "context_window": "1M"},
-            {"id": "gemini-1.5-flash", "name": "Gemini 1.5 Flash", "context_window": "1M"},
+            {"id": "gemini-3.1-pro", "name": "Gemini 3.1 Pro", "context_window": "2M"},
+            {"id": "gemini-3-deep-think", "name": "Gemini 3 Deep Think", "context_window": "1M"},
+            {"id": "gemini-3-pro", "name": "Gemini 3 Pro", "context_window": "1M"},
+            {"id": "gemini-3-flash", "name": "Gemini 3 Flash", "context_window": "1M"},
+            {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash", "context_window": "1M"},
+            {"id": "gemini-2.5-flash-lite", "name": "Gemini 2.5 Flash Lite", "context_window": "1M"},
         ]
 
         try:
