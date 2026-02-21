@@ -577,6 +577,93 @@ class BrainServicer:
             temperature = float(params.get("temperature", str(ws_config["temperature"])))
             max_tokens = int(params.get("max_tokens", str(ws_config["max_tokens"])))
 
+            # ── 1b. Process file attachments ─────────────────────────
+            attachment_parts = []  # For multimodal (images)
+            attachment_text = []   # For text/code/PDF files
+            if params.get("attachments"):
+                try:
+                    attachments = json.loads(params["attachments"])
+                    import base64
+                    import httpx as _httpx
+
+                    for att in attachments:
+                        mime = att.get("mimeType", "application/octet-stream")
+                        file_url = att.get("url", "")
+                        filename = att.get("filename", "file")
+
+                        if not file_url:
+                            continue
+
+                        # Download the file (could be a local gateway URL or external)
+                        try:
+                            if file_url.startswith("/"):
+                                # Local gateway file — construct full URL
+                                gateway_url = os.environ.get("GATEWAY_URL", "http://gateway:8741")
+                                file_url = f"{gateway_url}{file_url}"
+
+                            async with _httpx.AsyncClient(timeout=30) as client:
+                                resp = await client.get(file_url)
+                                resp.raise_for_status()
+                                file_bytes = resp.content
+                        except Exception as dl_err:
+                            logger.warning(f"Failed to download attachment {filename}: {dl_err}")
+                            attachment_text.append(f"[Attachment: {filename} — failed to download]")
+                            continue
+
+                        if mime.startswith("image/"):
+                            # Images → base64 for multimodal LLM
+                            b64 = base64.b64encode(file_bytes).decode("utf-8")
+                            attachment_parts.append({
+                                "mime_type": mime,
+                                "data": b64,
+                                "filename": filename,
+                            })
+                            logger.info(f"Processed image attachment: {filename} ({len(file_bytes)} bytes)")
+                        elif mime == "application/pdf":
+                            # PDF → extract text
+                            try:
+                                import io
+                                try:
+                                    import pdfplumber
+                                    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                                        text = "\n".join(
+                                            page.extract_text() or "" for page in pdf.pages[:20]
+                                        )
+                                except ImportError:
+                                    text = "[PDF text extraction unavailable — install pdfplumber]"
+                                attachment_text.append(f"\n--- Attached PDF: {filename} ---\n{text[:8000]}\n--- End PDF ---\n")
+                                logger.info(f"Extracted text from PDF: {filename}")
+                            except Exception as pdf_err:
+                                logger.warning(f"PDF extraction failed for {filename}: {pdf_err}")
+                                attachment_text.append(f"[PDF: {filename} — extraction failed]")
+                        else:
+                            # Text / code files → read as UTF-8
+                            try:
+                                text = file_bytes.decode("utf-8", errors="replace")
+                                attachment_text.append(f"\n--- Attached file: {filename} ---\n{text[:8000]}\n--- End file ---\n")
+                                logger.info(f"Read text attachment: {filename} ({len(file_bytes)} bytes)")
+                            except Exception:
+                                attachment_text.append(f"[File: {filename} — could not read as text]")
+
+                except json.JSONDecodeError:
+                    logger.warning("Invalid attachments JSON in parameters")
+                except Exception as att_err:
+                    logger.warning(f"Attachment processing error: {att_err}")
+
+            # Inject text attachments into the last user message content
+            if attachment_text:
+                for i in range(len(messages) - 1, -1, -1):
+                    if messages[i]["role"] == "user":
+                        messages[i]["content"] += "\n" + "\n".join(attachment_text)
+                        break
+
+            # Tag the last user message with image attachments for the provider
+            if attachment_parts:
+                for i in range(len(messages) - 1, -1, -1):
+                    if messages[i]["role"] == "user":
+                        messages[i]["_attachments"] = attachment_parts
+                        break
+
             # ── 2. System prompt + RAG context injection ────────────
             base_prompt = ws_config.get("system_prompt", "") or KESTREL_DEFAULT_SYSTEM_PROMPT
 

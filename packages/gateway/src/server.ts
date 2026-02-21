@@ -24,6 +24,7 @@ import whatsappWebhookRoutes from './routes/webhooks/whatsapp';
 import taskRoutes from './routes/tasks';
 import integrationRoutes from './routes/integrations';
 import automationRoutes from './routes/automation';
+import uploadRoutes from './routes/upload';
 
 dotenv.config();
 
@@ -55,6 +56,14 @@ app.register(import('@fastify/helmet'), {
 app.register(import('@fastify/cors'), {
     origin: config.corsOrigin,
     credentials: true,
+});
+
+// Multipart support for file uploads
+app.register(import('@fastify/multipart'), {
+    limits: {
+        fileSize: 10 * 1024 * 1024,  // 10 MB
+        files: 5,                     // Max 5 files per request
+    },
 });
 
 // Global Error Handler
@@ -165,6 +174,7 @@ async function start() {
         await providerRoutes(app, deps);
         await taskRoutes(app, { brainClient });
         await automationRoutes(app, { brainClient });
+        await uploadRoutes(app);
 
         if (telegramAdapter) {
             await telegramWebhookRoutes(app, { telegramAdapter });

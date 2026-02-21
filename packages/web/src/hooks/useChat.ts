@@ -27,7 +27,7 @@ interface StreamingMessage {
 interface UseChatReturn {
     messages: Message[];
     streamingMessage: StreamingMessage | null;
-    sendMessage: (content: string, provider?: string, model?: string) => void;
+    sendMessage: (content: string, provider?: string, model?: string, attachments?: Array<{ url: string; filename: string; mimeType: string; size: number }>) => void;
     isConnected: boolean;
 }
 
@@ -119,12 +119,12 @@ export function useChat(
                         toolActivity: isAgentActivity
                             ? (prev?.toolActivity ?? null)
                             : {
-                                  status: data.status || 'thinking',
-                                  toolName: data.toolName,
-                                  toolArgs: data.toolArgs,
-                                  toolResult: data.toolResult,
-                                  thinking: data.thinking,
-                              },
+                                status: data.status || 'thinking',
+                                toolName: data.toolName,
+                                toolArgs: data.toolArgs,
+                                toolResult: data.toolResult,
+                                thinking: data.thinking,
+                            },
                         agentActivities: [...activitiesRef.current],
                     }));
                     break;
@@ -246,7 +246,7 @@ export function useChat(
     }, [initialMessages]);
 
     const sendMessage = useCallback(
-        (content: string, provider?: string, model?: string) => {
+        (content: string, provider?: string, model?: string, attachments?: Array<{ url: string; filename: string; mimeType: string; size: number }>) => {
             if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
                 console.warn('WebSocket not ready, message dropped');
                 return;
@@ -270,6 +270,7 @@ export function useChat(
                     content,
                     ...(provider ? { provider } : {}),
                     ...(model ? { model } : {}),
+                    ...(attachments?.length ? { attachments } : {}),
                 }),
             );
         },

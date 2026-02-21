@@ -110,6 +110,8 @@ export default function App() {
                 activeTask={streamingMessage ? "PROCESSING_USER_QUERY" : "SYSTEM_READY"}
                 isStreaming={!!streamingMessage}
                 content={streamingMessage?.content}
+                toolActivity={streamingMessage?.toolActivity}
+                agentActivities={streamingMessage?.agentActivities}
             />
 
             {showSettings && (

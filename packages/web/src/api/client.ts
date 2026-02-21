@@ -115,6 +115,50 @@ async function request<T = unknown>(url: string, options: RequestOptions = {}): 
     return res.json() as Promise<T>;
 }
 
+// ── File Upload ─────────────────────────────────────────────────────
+export interface UploadedFile {
+    id: string;
+    filename: string;
+    mimeType: string;
+    size: number;
+    url: string;
+}
+
+export async function uploadFiles(files: File[]): Promise<UploadedFile[]> {
+    const formData = new FormData();
+    files.forEach((f) => formData.append('file', f));
+
+    const headers: Record<string, string> = {};
+    if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+
+    let res = await fetch(`${BASE_URL}/upload`, {
+        method: 'POST',
+        headers,
+        body: formData,
+    });
+
+    // Auto-refresh on 401
+    if (res.status === 401 && refreshToken) {
+        const refreshed = await tryRefresh();
+        if (refreshed) {
+            headers.Authorization = `Bearer ${accessToken}`;
+            res = await fetch(`${BASE_URL}/upload`, {
+                method: 'POST',
+                headers,
+                body: formData,
+            });
+        }
+    }
+
+    if (!res.ok) {
+        const err = (await res.json().catch(() => ({ error: res.statusText }))) as { error?: string };
+        throw new Error(err.error || 'Upload failed');
+    }
+
+    const data = (await res.json()) as { files: UploadedFile[] };
+    return data.files;
+}
+
 // ── Auth ────────────────────────────────────────────────────────────
 export const auth = {
     register: (email: string, password: string, displayName?: string) =>

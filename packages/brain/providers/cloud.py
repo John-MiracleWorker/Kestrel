@@ -556,7 +556,17 @@ class CloudProvider:
                 }}]})
             else:
                 role = "user" if msg["role"] == "user" else "model"
-                contents.append({"role": role, "parts": [{"text": msg.get("content") or ""}]})
+                parts = [{"text": msg.get("content") or ""}]
+                # Inject multimodal attachments (images as inline_data)
+                if msg.get("_attachments"):
+                    for att in msg["_attachments"]:
+                        parts.append({
+                            "inlineData": {
+                                "mimeType": att["mime_type"],
+                                "data": att["data"],
+                            }
+                        })
+                contents.append({"role": role, "parts": parts})
 
         url = f"{self._config['base_url']}/{model}:generateContent?key={api_key}"
         payload: dict = {

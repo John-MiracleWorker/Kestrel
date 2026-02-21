@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, type FormEvent } from 'react';
 import type { Message } from '../../api/client';
-import { providers } from '../../api/client';
+import { providers, uploadFiles } from '../../api/client';
 
 interface ChatViewProps {
     workspaceId: string | null;
@@ -17,9 +17,9 @@ interface ChatViewProps {
             toolResult?: string;
             thinking?: string;
         } | null;
-        agentActivities?: Array<{ activity_type: string; [key: string]: unknown }>;
+        agentActivities?: Array<{ activity_type: string;[key: string]: unknown }>;
     } | null;
-    onSendMessage: (content: string, provider?: string, model?: string) => void;
+    onSendMessage: (content: string, provider?: string, model?: string, attachments?: Array<{ url: string; filename: string; mimeType: string; size: number }>) => void;
     isConnected: boolean;
     conversationTitle?: string;
     onToggleCanvas?: () => void;
@@ -42,6 +42,9 @@ export function ChatView({
 
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLTextAreaElement>(null);
+    const fileInputRef = useRef<HTMLInputElement>(null);
+    const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+    const [isUploading, setIsUploading] = useState(false);
 
     // Auto-scroll on new messages
     useEffect(() => {
@@ -86,9 +89,43 @@ export function ChatView({
     function handleSubmit(e: FormEvent) {
         e.preventDefault();
         const trimmed = input.trim();
-        if (!trimmed) return;
-        onSendMessage(trimmed, selectedProvider || undefined, selectedModel || undefined);
-        setInput('');
+        if (!trimmed && pendingFiles.length === 0) return;
+        if (isUploading) return;
+
+        if (pendingFiles.length > 0) {
+            setIsUploading(true);
+            uploadFiles(pendingFiles)
+                .then((uploaded) => {
+                    const attachments = uploaded.map((f) => ({
+                        url: f.url,
+                        filename: f.filename,
+                        mimeType: f.mimeType,
+                        size: f.size,
+                    }));
+                    onSendMessage(trimmed || 'Analyze these files', selectedProvider || undefined, selectedModel || undefined, attachments);
+                    setInput('');
+                    setPendingFiles([]);
+                })
+                .catch((err) => console.error('Upload failed:', err))
+                .finally(() => setIsUploading(false));
+        } else {
+            onSendMessage(trimmed, selectedProvider || undefined, selectedModel || undefined);
+            setInput('');
+        }
+    }
+
+    function handleAttach() {
+        fileInputRef.current?.click();
+    }
+
+    function handleFilesSelected(e: React.ChangeEvent<HTMLInputElement>) {
+        const files = Array.from(e.target.files || []);
+        setPendingFiles((prev) => [...prev, ...files].slice(0, 5)); // Max 5
+        if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+
+    function removeFile(index: number) {
+        setPendingFiles((prev) => prev.filter((_, i) => i !== index));
     }
 
     function handleProviderChange(provider: string) {
@@ -291,7 +328,42 @@ export function ChatView({
                         onFocus={(e) => (e.currentTarget.style.borderColor = 'var(--accent-cyan)')}
                         onBlur={(e) => (e.currentTarget.style.borderColor = 'var(--text-dim)')}
                         tabIndex={-1}
+                        onDragOver={(e) => { e.preventDefault(); e.currentTarget.style.borderColor = 'var(--accent-purple)'; }}
+                        onDragLeave={(e) => { e.currentTarget.style.borderColor = 'var(--text-dim)'; }}
+                        onDrop={(e) => {
+                            e.preventDefault();
+                            e.currentTarget.style.borderColor = 'var(--text-dim)';
+                            const files = Array.from(e.dataTransfer.files);
+                            if (files.length) setPendingFiles((prev) => [...prev, ...files].slice(0, 5));
+                        }}
                     >
+                        {/* Pending file chips */}
+                        {pendingFiles.length > 0 && (
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '8px' }}>
+                                {pendingFiles.map((f, i) => (
+                                    <div key={i} style={{
+                                        display: 'flex', alignItems: 'center', gap: '4px',
+                                        background: 'rgba(0,243,255,0.1)', border: '1px solid var(--accent-cyan)',
+                                        borderRadius: '4px', padding: '4px 8px', fontSize: '0.75rem',
+                                        color: 'var(--accent-cyan)', fontFamily: 'var(--font-mono)',
+                                    }}>
+                                        <span>{f.type.startsWith('image/') ? '🖼️' : '📄'}</span>
+                                        <span style={{ maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                                        <span style={{ color: 'var(--text-dim)', fontSize: '0.65rem' }}>
+                                            {(f.size / 1024).toFixed(0)}KB
+                                        </span>
+                                        <button
+                                            type="button"
+                                            onClick={() => removeFile(i)}
+                                            style={{
+                                                background: 'none', border: 'none', color: 'var(--text-dim)',
+                                                cursor: 'pointer', padding: '0 2px', fontSize: '0.8rem',
+                                            }}
+                                        >✕</button>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
                         <textarea
                             ref={inputRef}
                             value={input}
@@ -312,23 +384,50 @@ export function ChatView({
                             }}
                         />
                     </div>
+                    {/* Hidden file input */}
+                    <input
+                        ref={fileInputRef}
+                        type="file"
+                        multiple
+                        accept="image/*,.pdf,.txt,.md,.py,.js,.ts,.tsx,.jsx,.json,.csv,.xml,.yaml,.yml,.html,.css,.sh,.sql,.java,.cpp,.c,.h,.go,.rs,.rb,.swift,.kt"
+                        style={{ display: 'none' }}
+                        onChange={handleFilesSelected}
+                    />
+                    {/* Attach button */}
+                    <button
+                        type="button"
+                        onClick={handleAttach}
+                        title="Attach files (images, code, PDFs)"
+                        style={{
+                            background: pendingFiles.length > 0 ? 'rgba(168,85,247,0.2)' : 'transparent',
+                            color: pendingFiles.length > 0 ? 'var(--accent-purple)' : 'var(--text-dim)',
+                            border: '1px solid ' + (pendingFiles.length > 0 ? 'var(--accent-purple)' : 'var(--text-dim)'),
+                            padding: '10px 12px',
+                            borderRadius: '4px',
+                            cursor: 'pointer',
+                            fontFamily: 'var(--font-mono)',
+                            height: '46px',
+                            fontSize: '1.1rem',
+                            transition: 'all 0.2s',
+                        }}
+                    >📎</button>
                     <button
                         type="submit"
-                        disabled={!input.trim() || !isConnected}
+                        disabled={(!input.trim() && pendingFiles.length === 0) || !isConnected || isUploading}
                         style={{
-                            background: input.trim() ? 'var(--accent-cyan)' : 'transparent',
-                            color: input.trim() ? '#000' : 'var(--text-dim)',
+                            background: (input.trim() || pendingFiles.length > 0) ? (isUploading ? 'var(--accent-purple)' : 'var(--accent-cyan)') : 'transparent',
+                            color: (input.trim() || pendingFiles.length > 0) ? '#000' : 'var(--text-dim)',
                             border: '1px solid var(--accent-cyan)',
                             padding: '10px 20px',
                             borderRadius: '4px',
-                            cursor: input.trim() ? 'pointer' : 'not-allowed',
+                            cursor: (input.trim() || pendingFiles.length > 0) ? 'pointer' : 'not-allowed',
                             fontWeight: 'bold',
                             fontFamily: 'var(--font-mono)',
                             height: '46px',
                             opacity: isConnected ? 1 : 0.5,
                         }}
                     >
-                        SEND
+                        {isUploading ? 'UPLOADING...' : 'SEND'}
                     </button>
                 </form>
             </div>
@@ -352,13 +451,13 @@ export function ChatView({
                     color: var(--text-primary);
                 }
             `}</style>
-        </div>
+        </div >
     );
 }
 
 /* ── KestrelProcessBar ────────────────────────────────────────────── */
 
-type Activity = { activity_type: string; [key: string]: unknown };
+type Activity = { activity_type: string;[key: string]: unknown };
 
 interface PhaseData {
     key: string;
@@ -456,12 +555,12 @@ function buildPhases(
             toolActivity.status === 'thinking'
                 ? 'Reasoning'
                 : toolActivity.status === 'planning'
-                  ? 'Planning'
-                  : toolActivity.status === 'tool_calling'
-                    ? toolActivity.toolName || 'Tool'
-                    : toolActivity.status === 'tool_result'
-                      ? `${toolActivity.toolName} ✓`
-                      : 'Working';
+                    ? 'Planning'
+                    : toolActivity.status === 'tool_calling'
+                        ? toolActivity.toolName || 'Tool'
+                        : toolActivity.status === 'tool_result'
+                            ? `${toolActivity.toolName} ✓`
+                            : 'Working';
         phases.push({
             key: 'tools',
             icon: '⚡',
@@ -759,8 +858,8 @@ function PhaseDetail({ item, phaseKey }: { item: Activity; phaseKey: string }) {
             item.severity === 'critical'
                 ? '#ef4444'
                 : item.severity === 'high'
-                  ? '#f59e0b'
-                  : '#6b7280';
+                    ? '#f59e0b'
+                    : '#6b7280';
         return (
             <div style={{ display: 'flex', gap: '8px', padding: '2px 0' }}>
                 <span
@@ -828,7 +927,7 @@ function MessageBubble({
         toolResult?: string;
         thinking?: string;
     } | null;
-    agentActivities?: Array<{ activity_type: string; [key: string]: unknown }>;
+    agentActivities?: Array<{ activity_type: string;[key: string]: unknown }>;
 }) {
     const isUser = message.role === 'user';
 

@@ -187,6 +187,12 @@ export class WebChannelAdapter extends BaseChannelAdapter {
                 }
 
                 try {
+                    // Build parameters — include attachments if present
+                    const parameters: Record<string, string> = {};
+                    if (msg.attachments?.length) {
+                        parameters.attachments = JSON.stringify(msg.attachments);
+                    }
+
                     const stream = this.brain.streamChat({
                         userId: socket.userId,
                         workspaceId: msg.workspaceId || 'default',
@@ -194,7 +200,7 @@ export class WebChannelAdapter extends BaseChannelAdapter {
                         messages: [{ role: 0, content: msg.content }], // USER = 0
                         provider: msg.provider || '',
                         model: msg.model || '',
-                        parameters: {},
+                        parameters,
                     });
 
                     let doneSent = false;
