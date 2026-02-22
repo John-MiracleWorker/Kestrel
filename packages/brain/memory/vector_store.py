@@ -98,14 +98,17 @@ class VectorStore:
         """Store a memory with its embedding."""
         embedding = await self.embed(content)
 
+        import json as _json
+        metadata_json = _json.dumps(metadata or {})
+
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """INSERT INTO memory_embeddings
                    (workspace_id, content, source_type, source_id, embedding, metadata)
-                   VALUES ($1, $2, $3, $4, $5::vector, $6)
+                   VALUES ($1, $2, $3, $4, $5::vector, $6::jsonb)
                    RETURNING id""",
                 workspace_id, content, source_type, source_id,
-                str(embedding), metadata or {},
+                str(embedding), metadata_json,
             )
             return str(row["id"])
 
