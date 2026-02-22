@@ -88,6 +88,27 @@ SPECIALISTS = {
             "ask_human", "task_complete",
         ],
     ),
+    "explorer": SpecialistConfig(
+        name="Code Explorer",
+        persona=(
+            "You are a code exploration specialist. Your job is to deeply "
+            "analyze codebases using host filesystem tools. Strategy:\n"
+            "1. Use project_recall(name) to check for cached context\n"
+            "2. Use host_tree(path) for full project structure (ONE call)\n"
+            "3. Use host_batch_read(paths) to read multiple key files at once\n"
+            "4. Use host_find(pattern) to locate specific files\n"
+            "5. Use host_search(query) to grep across files\n"
+            "Report your findings clearly and thoroughly."
+        ),
+        allowed_tools=[
+            "project_recall", "host_tree", "host_batch_read", "host_read",
+            "host_find", "host_search", "host_list",
+            "memory_store", "memory_search",
+            "task_complete",
+        ],
+        max_iterations=20,
+        max_tool_calls=40,
+    ),
 }
 
 
@@ -232,6 +253,59 @@ class Coordinator:
             "result": result[:300],
         })
         return result
+
+    async def delegate_parallel(
+        self,
+        parent_task: AgentTask,
+        subtasks: list[dict],
+    ) -> list[str]:
+        """
+        Run multiple specialist sub-agents in parallel.
+
+        Each subtask dict should have 'goal' and 'specialist' keys.
+        Returns a list of result strings, one per subtask.
+        """
+        import asyncio
+
+        max_parallel = 5
+        if len(subtasks) > max_parallel:
+            subtasks = subtasks[:max_parallel]
+            logger.warning(f"Capped parallel subtasks to {max_parallel}")
+
+        await self._emit("parallel_delegation_started", {
+            "count": len(subtasks),
+            "subtasks": [
+                {"goal": s.get("goal", "")[:100], "specialist": s.get("specialist", "explorer")}
+                for s in subtasks
+            ],
+        })
+
+        async def _run_one(subtask: dict, index: int) -> str:
+            goal = subtask.get("goal", "")
+            specialist = subtask.get("specialist", "explorer")
+            try:
+                result = await self.delegate(parent_task, goal, specialist)
+                return result
+            except Exception as e:
+                return f"Subtask {index} failed: {e}"
+
+        coros = [_run_one(s, i) for i, s in enumerate(subtasks)]
+        results = await asyncio.gather(*coros, return_exceptions=True)
+
+        # Convert exceptions to strings
+        final = []
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                final.append(f"Subtask {i} error: {r}")
+            else:
+                final.append(str(r))
+
+        await self._emit("parallel_delegation_complete", {
+            "count": len(final),
+            "successful": sum(1 for r in final if not r.startswith("Subtask")),
+        })
+
+        return final
 
     def get_specialist_info(self) -> list[dict]:
         """Return descriptions of available specialists for tool schema."""

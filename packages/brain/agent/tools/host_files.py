@@ -219,6 +219,80 @@ async def host_read(
         return {"error": f"Failed to read file: {e}"}
 
 
+async def host_batch_read(
+    paths: list,
+    max_lines_per_file: int = 150,
+    workspace_id: str = "default",
+) -> dict:
+    """Read multiple files in a single call. Returns all contents together."""
+    MAX_FILES = 10
+    MAX_BYTES_PER_FILE = 50_000
+    MAX_TOTAL_BYTES = 200_000
+
+    if not paths:
+        return {"error": "No paths provided. Pass a list of file paths."}
+
+    if len(paths) > MAX_FILES:
+        return {"error": f"Too many files ({len(paths)}). Maximum is {MAX_FILES}."}
+
+    mounts = _get_host_mounts()
+    results = []
+    total_bytes = 0
+
+    for file_path in paths:
+        entry = {"path": file_path}
+        try:
+            resolved = _resolve_host_path(file_path, mounts)
+
+            if not resolved.exists():
+                entry["error"] = "File not found"
+                results.append(entry)
+                continue
+
+            if not resolved.is_file():
+                entry["error"] = "Not a file"
+                results.append(entry)
+                continue
+
+            size = resolved.stat().st_size
+            if size > MAX_BYTES_PER_FILE:
+                entry["error"] = f"File too large ({size:,} bytes, max {MAX_BYTES_PER_FILE:,})"
+                entry["size_bytes"] = size
+                results.append(entry)
+                continue
+
+            if total_bytes + size > MAX_TOTAL_BYTES:
+                entry["error"] = f"Total batch size exceeded ({MAX_TOTAL_BYTES:,} bytes)"
+                results.append(entry)
+                continue
+
+            content = resolved.read_text(encoding="utf-8", errors="replace")
+            lines = content.split("\n")
+            if len(lines) > max_lines_per_file:
+                content = "\n".join(lines[:max_lines_per_file])
+                entry["truncated_at_line"] = max_lines_per_file
+                entry["total_lines"] = len(lines)
+
+            total_bytes += len(content)
+            entry["content"] = content
+            entry["lines"] = min(len(lines), max_lines_per_file)
+            entry["path"] = _container_to_host_path(resolved)
+
+        except ValueError as e:
+            entry["error"] = str(e)
+        except Exception as e:
+            entry["error"] = f"Read failed: {e}"
+
+        results.append(entry)
+
+    return {
+        "files": results,
+        "count": len(results),
+        "successful": sum(1 for r in results if "content" in r),
+        "total_bytes": total_bytes,
+    }
+
+
 async def host_list(
     path: str = ".",
     recursive: bool = False,
@@ -797,6 +871,39 @@ def register_host_file_tools(registry, vector_store=None) -> None:
             category="host_file",
         ),
         handler=host_read,
+    )
+
+    registry.register(
+        definition=ToolDefinition(
+            name="host_batch_read",
+            description=(
+                "Read MULTIPLE files from the host filesystem in a single call. "
+                "Pass a list of paths and get all contents back at once. "
+                "USE THIS instead of calling host_read multiple times — "
+                "it's 10x faster for reading multiple files (e.g. during code audits). "
+                "Maximum 10 files per call, 50KB per file."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of file paths to read (absolute paths)",
+                    },
+                    "max_lines_per_file": {
+                        "type": "integer",
+                        "description": "Max lines per file (default 150)",
+                        "default": 150,
+                    },
+                },
+                "required": ["paths"],
+            },
+            risk_level=RiskLevel.LOW,
+            timeout_seconds=30,
+            category="host_file",
+        ),
+        handler=host_batch_read,
     )
 
     registry.register(

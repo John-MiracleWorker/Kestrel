@@ -190,8 +190,8 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
     register_git_tools(registry)
     register_self_improve_tools(registry)
 
-    # Multi-agent delegation tool
-    from agent.tools.delegate import DELEGATE_TOOL
+    # Multi-agent delegation tools
+    from agent.tools.delegate import DELEGATE_TOOL, DELEGATE_PARALLEL_TOOL
     from agent.coordinator import Coordinator
 
     # Coordinator is lazily initialized — needs the agent loop reference
@@ -225,6 +225,39 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
             return {"success": False, "error": f"Delegation failed: {e}"}
 
     registry.register(definition=DELEGATE_TOOL, handler=delegate_handler)
+
+    async def delegate_parallel_handler(subtasks: list = None) -> dict:
+        """Run multiple specialist sub-agents in parallel."""
+        coordinator = getattr(registry, '_coordinator', None)
+        current_task = getattr(registry, '_current_task', None)
+
+        if not coordinator or not current_task:
+            return {
+                "success": False,
+                "error": "Delegation not available — agent loop not initialized.",
+                "hint": "Delegation works during autonomous task mode.",
+            }
+
+        if not subtasks:
+            return {"success": False, "error": "At least one subtask is required"}
+
+        if not hasattr(coordinator, 'delegate_parallel'):
+            return {"success": False, "error": "Coordinator does not support parallel delegation"}
+
+        try:
+            results = await coordinator.delegate_parallel(
+                parent_task=current_task,
+                subtasks=subtasks,
+            )
+            return {
+                "success": True,
+                "results": results,
+                "count": len(results),
+            }
+        except Exception as e:
+            return {"success": False, "error": f"Parallel delegation failed: {e}"}
+
+    registry.register(definition=DELEGATE_PARALLEL_TOOL, handler=delegate_parallel_handler)
 
     logger.info(f"Tool registry built: {len(registry._definitions)} tools")
     return registry
