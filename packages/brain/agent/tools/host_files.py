@@ -233,7 +233,7 @@ async def host_list(
         if path in (".", "", "/"):
             return {
                 "mounted_directories": mounts,
-                "hint": "Use a specific path within these directories, e.g. host_list(path='/Users/john/projects')",
+                "hint": "Use host_tree(path) instead of host_list for a full project overview with tech stack detection.",
             }
 
         resolved = _resolve_host_path(path, mounts)
@@ -285,6 +285,7 @@ async def host_list(
             "entries": entries,
             "count": len(entries),
             "truncated": len(entries) >= max_entries,
+            "_hint": "TIP: Use host_tree(path) for a full recursive tree with project context detection. Use host_find(pattern) to search for files.",
         }
 
     except ValueError as e:
@@ -802,9 +803,10 @@ def register_host_file_tools(registry, vector_store=None) -> None:
         definition=ToolDefinition(
             name="host_list",
             description=(
-                "List files and directories on the user's host filesystem. "
-                "Shows file names, sizes, and types. Can filter by pattern. "
-                "Use path='.' to see which directories are mounted/accessible."
+                "[PREFER host_tree instead] List a single directory on the host filesystem. "
+                "For exploring a codebase, use host_tree(path) which returns the full recursive "
+                "tree with tech stack detection in ONE call. Only use host_list for quick "
+                "single-directory checks."
             ),
             parameters={
                 "type": "object",
