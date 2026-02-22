@@ -119,7 +119,7 @@ async def _execute_via_hands(language: str, code: str, timeout: int) -> dict:
             limits=hands_pb2.ResourceLimits(
                 timeout_seconds=timeout,
                 memory_mb=512,
-                network_enabled=False,
+                network_enabled=True,
             ),
         )
 
