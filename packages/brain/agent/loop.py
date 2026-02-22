@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable, Optional
 
@@ -634,6 +635,41 @@ class AgentLoop:
                     step.status = StepStatus.COMPLETE
                     step.result = tool_args.get("summary", result.output)
                     step.completed_at = datetime.now(timezone.utc)
+
+                elif tool_name == "ask_human":
+                    # Emit an APPROVAL_NEEDED event so the frontend shows the question
+                    question = tool_args.get("question", "The agent needs your input")
+                    approval_request = ApprovalRequest(
+                        id=str(uuid.uuid4()),
+                        task_id=task.id,
+                        step_id=step.id,
+                        tool_name="ask_human",
+                        tool_args=tool_args,
+                        reason=question,
+                    )
+                    task.pending_approval = approval_request
+                    task.status = TaskStatus.WAITING_APPROVAL
+                    await self._persistence.save_approval(approval_request)
+                    await self._persistence.update_task(task)
+
+                    yield TaskEvent(
+                        type=TaskEventType.APPROVAL_NEEDED,
+                        task_id=task.id,
+                        step_id=step.id,
+                        tool_name="ask_human",
+                        content=question,
+                        approval_id=approval_request.id,
+                        progress=self._progress(task),
+                    )
+
+                    # Wait for the user to respond
+                    approved = await self._wait_for_approval(task)
+                    task.status = TaskStatus.RUNNING
+
+                    if not approved:
+                        step.result = "User did not respond / declined"
+                        step.status = StepStatus.COMPLETE
+                        step.completed_at = datetime.now(timezone.utc)
 
                 elif not result.success:
                     step.error = result.error
