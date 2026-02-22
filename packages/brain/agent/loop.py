@@ -29,6 +29,7 @@ from agent.types import (
     TaskEvent,
     TaskEventType,
     TaskPlan,
+    TaskStep,
     TaskStatus,
     ToolCall,
     ToolDefinition,
