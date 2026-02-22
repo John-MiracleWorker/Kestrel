@@ -366,6 +366,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
             attachments.push({
                 type: 'image',
                 url: `tg://${largest.file_id}`,
+                mimeType: 'image/jpeg',
                 size: largest.file_size,
             });
         }
