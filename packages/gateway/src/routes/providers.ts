@@ -203,105 +203,79 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
         }
     );
 
+    const toolCacheTtlSeconds = 60 * 10;
+
+    type WorkspaceTool = {
+        name: string;
+        description: string;
+        category: string;
+        riskLevel: string;
+        enabled: boolean;
+    };
+
+    type CachedToolList = {
+        tools: WorkspaceTool[];
+        cachedAt: string;
+    };
+
+    const getToolCacheKey = (workspaceId: string) => `workspace:${workspaceId}:tools:catalog`;
+
     // ── GET /api/workspaces/:workspaceId/tools ──────────────────────
-    // List available agent tools (matches brain ToolRegistry)
+    // List available agent tools
     typedApp.get(
         '/api/workspaces/:workspaceId/tools',
         {
             preHandler: [requireAuth, requireWorkspace],
             schema: { params: workspaceParamsSchema }
         },
-        async (_req, _reply) => {
-            // Static tool catalog matching brain's build_tool_registry()
-            // TODO: Wire to brain gRPC ListTools when proto is updated
-            return {
-                tools: [
-                    {
-                        name: 'code_execute',
-                        description: 'Execute Python, JavaScript, or shell commands in a sandboxed environment',
-                        category: 'code',
-                        riskLevel: 'medium',
-                        enabled: true,
-                    },
-                    {
-                        name: 'web_search',
-                        description: 'Search the web for information using DuckDuckGo',
-                        category: 'web',
-                        riskLevel: 'low',
-                        enabled: true,
-                    },
-                    {
-                        name: 'web_browse',
-                        description: 'Fetch and read the content of a web page',
-                        category: 'web',
-                        riskLevel: 'medium',
-                        enabled: true,
-                    },
-                    {
-                        name: 'file_read',
-                        description: 'Read the contents of a file from the workspace',
-                        category: 'file',
-                        riskLevel: 'low',
-                        enabled: true,
-                    },
-                    {
-                        name: 'file_write',
-                        description: 'Write content to a file in the workspace',
-                        category: 'file',
-                        riskLevel: 'medium',
-                        enabled: true,
-                    },
-                    {
-                        name: 'file_list',
-                        description: 'List files and directories in a path',
-                        category: 'file',
-                        riskLevel: 'low',
-                        enabled: true,
-                    },
-                    {
-                        name: 'memory_store',
-                        description: 'Store information in long-term memory for later retrieval',
-                        category: 'memory',
-                        riskLevel: 'low',
-                        enabled: true,
-                    },
-                    {
-                        name: 'memory_search',
-                        description: 'Search long-term memory for relevant information',
-                        category: 'memory',
-                        riskLevel: 'low',
-                        enabled: true,
-                    },
-                    {
-                        name: 'data_analyze',
-                        description: 'Analyze structured data (CSV, JSON) with statistical operations',
-                        category: 'data',
-                        riskLevel: 'low',
-                        enabled: true,
-                    },
-                    {
-                        name: 'ask_human',
-                        description: 'Ask the user a question and wait for their response',
-                        category: 'control',
-                        riskLevel: 'low',
-                        enabled: true,
-                    },
-                    {
-                        name: 'task_complete',
-                        description: 'Mark the current step or task as complete',
-                        category: 'control',
-                        riskLevel: 'low',
-                        enabled: true,
-                    },
-                    {
-                        name: 'create_skill',
-                        description: 'Create a new reusable tool by defining a Python function (requires approval)',
-                        category: 'skill',
-                        riskLevel: 'high',
-                        enabled: true,
-                    },
-                ],
-            };
+        async (req, reply) => {
+            const { workspaceId } = req.params as WorkspaceParams;
+            const cacheKey = getToolCacheKey(workspaceId);
+
+            try {
+                const response = await brainClient.call('ListTools', {
+                    workspace_id: workspaceId,
+                }) as { tools?: any[] };
+
+                const tools: WorkspaceTool[] = (response.tools || []).map((tool: any) => ({
+                    name: tool.name,
+                    description: tool.description,
+                    category: tool.category,
+                    riskLevel: tool.risk_level || tool.riskLevel || 'low',
+                    enabled: Boolean(tool.enabled),
+                }));
+
+                const cachedAt = new Date().toISOString();
+                const payload: CachedToolList = { tools, cachedAt };
+                await redis.set(cacheKey, JSON.stringify(payload), 'EX', toolCacheTtlSeconds);
+
+                return {
+                    tools,
+                    stale: false,
+                    cachedAt,
+                };
+            } catch (err: any) {
+                logger.error('ListTools failed; attempting cached fallback', {
+                    workspaceId,
+                    error: err?.message,
+                });
+
+                const cachedRaw = await redis.get(cacheKey);
+                if (cachedRaw) {
+                    const cached = JSON.parse(cachedRaw) as CachedToolList;
+                    return {
+                        tools: cached.tools,
+                        stale: true,
+                        cachedAt: cached.cachedAt,
+                    };
+                }
+
+                return reply.status(503).send({
+                    error: 'Tool catalog unavailable',
+                    tools: [],
+                    stale: true,
+                });
+            }
         }
     );
 }
