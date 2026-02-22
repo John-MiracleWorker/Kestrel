@@ -150,6 +150,31 @@ class BrainServiceStub(object):
                 request_serializer=brain__pb2.ListTasksRequest.SerializeToString,
                 response_deserializer=brain__pb2.ListTasksResponse.FromString,
                 _registered_method=True)
+        self.LaunchWorkflow = channel.unary_stream(
+                '/kestrel.brain.BrainService/LaunchWorkflow',
+                request_serializer=brain__pb2.LaunchWorkflowRequest.SerializeToString,
+                response_deserializer=brain__pb2.TaskEvent.FromString,
+                _registered_method=True)
+        self.ListWorkflows = channel.unary_unary(
+                '/kestrel.brain.BrainService/ListWorkflows',
+                request_serializer=brain__pb2.ListWorkflowsRequest.SerializeToString,
+                response_deserializer=brain__pb2.ListWorkflowsResponse.FromString,
+                _registered_method=True)
+        self.GetCapabilities = channel.unary_unary(
+                '/kestrel.brain.BrainService/GetCapabilities',
+                request_serializer=brain__pb2.GetCapabilitiesRequest.SerializeToString,
+                response_deserializer=brain__pb2.GetCapabilitiesResponse.FromString,
+                _registered_method=True)
+        self.GetMoltbookActivity = channel.unary_unary(
+                '/kestrel.brain.BrainService/GetMoltbookActivity',
+                request_serializer=brain__pb2.GetMoltbookActivityRequest.SerializeToString,
+                response_deserializer=brain__pb2.GetMoltbookActivityResponse.FromString,
+                _registered_method=True)
+        self.ParseCronJob = channel.unary_unary(
+                '/kestrel.brain.BrainService/ParseCronJob',
+                request_serializer=brain__pb2.ParseCronJobRequest.SerializeToString,
+                response_deserializer=brain__pb2.ParseCronJobResponse.FromString,
+                _registered_method=True)
 
 
 class BrainServiceServicer(object):
@@ -302,6 +327,40 @@ class BrainServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def LaunchWorkflow(self, request, context):
+        """── Workflows ──────────────────────────────────────────────
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListWorkflows(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetCapabilities(self, request, context):
+        """── Capabilities ───────────────────────────────────────────
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetMoltbookActivity(self, request, context):
+        """── Moltbook Activity ─────────────────────────────────────
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ParseCronJob(self, request, context):
+        """── Automation ──────────────────────────────────────────────
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_BrainServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -419,6 +478,31 @@ def add_BrainServiceServicer_to_server(servicer, server):
                     servicer.ListTasks,
                     request_deserializer=brain__pb2.ListTasksRequest.FromString,
                     response_serializer=brain__pb2.ListTasksResponse.SerializeToString,
+            ),
+            'LaunchWorkflow': grpc.unary_stream_rpc_method_handler(
+                    servicer.LaunchWorkflow,
+                    request_deserializer=brain__pb2.LaunchWorkflowRequest.FromString,
+                    response_serializer=brain__pb2.TaskEvent.SerializeToString,
+            ),
+            'ListWorkflows': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListWorkflows,
+                    request_deserializer=brain__pb2.ListWorkflowsRequest.FromString,
+                    response_serializer=brain__pb2.ListWorkflowsResponse.SerializeToString,
+            ),
+            'GetCapabilities': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetCapabilities,
+                    request_deserializer=brain__pb2.GetCapabilitiesRequest.FromString,
+                    response_serializer=brain__pb2.GetCapabilitiesResponse.SerializeToString,
+            ),
+            'GetMoltbookActivity': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetMoltbookActivity,
+                    request_deserializer=brain__pb2.GetMoltbookActivityRequest.FromString,
+                    response_serializer=brain__pb2.GetMoltbookActivityResponse.SerializeToString,
+            ),
+            'ParseCronJob': grpc.unary_unary_rpc_method_handler(
+                    servicer.ParseCronJob,
+                    request_deserializer=brain__pb2.ParseCronJobRequest.FromString,
+                    response_serializer=brain__pb2.ParseCronJobResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -1043,6 +1127,141 @@ class BrainService(object):
             '/kestrel.brain.BrainService/ListTasks',
             brain__pb2.ListTasksRequest.SerializeToString,
             brain__pb2.ListTasksResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def LaunchWorkflow(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/kestrel.brain.BrainService/LaunchWorkflow',
+            brain__pb2.LaunchWorkflowRequest.SerializeToString,
+            brain__pb2.TaskEvent.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListWorkflows(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/ListWorkflows',
+            brain__pb2.ListWorkflowsRequest.SerializeToString,
+            brain__pb2.ListWorkflowsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetCapabilities(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/GetCapabilities',
+            brain__pb2.GetCapabilitiesRequest.SerializeToString,
+            brain__pb2.GetCapabilitiesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetMoltbookActivity(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/GetMoltbookActivity',
+            brain__pb2.GetMoltbookActivityRequest.SerializeToString,
+            brain__pb2.GetMoltbookActivityResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ParseCronJob(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/ParseCronJob',
+            brain__pb2.ParseCronJobRequest.SerializeToString,
+            brain__pb2.ParseCronJobResponse.FromString,
             options,
             channel_credentials,
             insecure,

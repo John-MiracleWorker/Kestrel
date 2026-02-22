@@ -297,6 +297,9 @@ class EvidenceChain:
                 for d in self._decisions:
                     # asyncpg needs datetime objects, not ISO strings
                     created_dt = datetime.fromisoformat(d.created_at) if d.created_at else datetime.now(timezone.utc)
+                    # Cast string IDs to UUID objects for asyncpg
+                    record_id = uuid.UUID(d.id) if isinstance(d.id, str) else d.id
+                    task_uuid = uuid.UUID(d.task_id) if isinstance(d.task_id, str) else d.task_id
                     await conn.execute(
                         """
                         INSERT INTO evidence_chain
@@ -305,7 +308,7 @@ class EvidenceChain:
                         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10, $11)
                         ON CONFLICT (id) DO UPDATE SET outcome = $10
                         """,
-                        d.id, d.task_id, d.step_number, d.decision_type.value,
+                        record_id, task_uuid, d.step_number, d.decision_type.value,
                         d.description, d.reasoning,
                         json.dumps([e.to_dict() for e in d.evidence]),
                         json.dumps(d.alternatives_considered),

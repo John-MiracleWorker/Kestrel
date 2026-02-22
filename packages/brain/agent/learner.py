@@ -163,7 +163,8 @@ class TaskLearner:
                 max_tokens=2048,
             )
 
-            content = response.get("content", "")
+            # generate() returns a plain string; generate_with_tools() returns a dict
+            content = response if isinstance(response, str) else response.get("content", "")
             # Strip markdown code fences
             if "```json" in content:
                 content = content.split("```json")[1].split("```")[0]

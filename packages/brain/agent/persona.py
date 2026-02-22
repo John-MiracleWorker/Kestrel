@@ -344,7 +344,7 @@ class PersonaLearner:
                         preferences = $2::jsonb, updated_at = $3
                     """,
                     user_id, json.dumps(prefs.to_dict()),
-                    datetime.now(timezone.utc).isoformat(),
+                    datetime.now(timezone.utc),
                 )
         except Exception as e:
             logger.error(f"Failed to save persona: {e}")

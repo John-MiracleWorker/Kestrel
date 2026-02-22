@@ -11,6 +11,7 @@ The agent can:
 import asyncio
 import json
 import logging
+import os
 from typing import Optional
 
 import httpx
@@ -483,6 +484,32 @@ def register_mcp_tools(registry, pool=None) -> None:
                     if "=" in line:
                         k, v = line.split("=", 1)
                         env[k.strip()] = v.strip()
+
+        # Auto-resolve required env vars from os.environ and common aliases.
+        # This bridges naming mismatches, e.g. user has GITHUB_PAT in .env
+        # but the GitHub MCP server expects GITHUB_PERSONAL_ACCESS_TOKEN.
+        _ENV_ALIASES = {
+            "GITHUB_PERSONAL_ACCESS_TOKEN": ["GITHUB_PAT", "GITHUB_TOKEN"],
+        }
+        for catalog_server in BUILTIN_CATALOG:
+            if catalog_server["name"] == name:
+                for required_var in catalog_server.get("requires_env", []):
+                    if required_var not in env:
+                        # Try os.environ directly first
+                        val = os.environ.get(required_var)
+                        if not val:
+                            # Try common aliases
+                            for alias in _ENV_ALIASES.get(required_var, []):
+                                val = os.environ.get(alias)
+                                if val:
+                                    logger.info(
+                                        f"MCP '{name}': resolved {required_var} "
+                                        f"from alias {alias}"
+                                    )
+                                    break
+                        if val:
+                            env[required_var] = val
+                break
 
         result = await mcp_pool.connect(name, command, env)
         return result

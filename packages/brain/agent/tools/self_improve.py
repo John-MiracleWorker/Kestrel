@@ -377,11 +377,11 @@ async def _github_sync(package: str = "all") -> dict:
     Scan codebase, filter high-severity issues, and create GitHub Issues.
     Requires GITHUB_PERSONAL_ACCESS_TOKEN and GITHUB_REPO env vars.
     """
-    token = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+    token = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN") or os.getenv("GITHUB_PAT", "")
     repo = os.getenv("GITHUB_REPO", "John-MiracleWorker/LibreBird")
 
     if not token:
-        return {"error": "GITHUB_PERSONAL_ACCESS_TOKEN not set. Set it in your .env file."}
+        return {"error": "GITHUB_PERSONAL_ACCESS_TOKEN (or GITHUB_PAT) not set. Set it in your .env file."}
 
     # Run scan
     results = _deep_scan(package)
@@ -1177,10 +1177,10 @@ async def _scheduled_health_check():
             logger.info("🔄 Starting scheduled health check...")
 
             # Only sync to GitHub if token is configured
-            if os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN"):
+            if os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN") or os.getenv("GITHUB_PAT"):
                 await _github_sync()
             else:
-                logger.info("No GITHUB_PERSONAL_ACCESS_TOKEN — skipping GitHub sync")
+                logger.info("No GITHUB_PERSONAL_ACCESS_TOKEN / GITHUB_PAT — skipping GitHub sync")
 
             # Always send Telegram digest if bot token is set
             if os.getenv("TELEGRAM_BOT_TOKEN"):

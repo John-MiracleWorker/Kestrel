@@ -113,10 +113,14 @@ class MCPClient:
         # Step 2: Send initialized notification
         await self._send_notification("notifications/initialized", {})
 
-        # Step 3: Discover tools if the server supports them
-        if self._server_capabilities.get("tools"):
+        # Step 3: Discover tools — always attempt, many servers support tools
+        # but don't advertise them in capabilities (e.g., GitHub MCP server)
+        try:
             tools_result = await self._send_request("tools/list", {})
             self._tools = tools_result.get("result", {}).get("tools", [])
+        except Exception as e:
+            logger.debug(f"MCP '{self._name}': tools/list not supported: {e}")
+            self._tools = []
 
         return {
             "server_info": self._server_info,

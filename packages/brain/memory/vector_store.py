@@ -100,7 +100,14 @@ class VectorStore:
         """Store a memory with its embedding."""
         embedding = await self.embed(content)
 
-        metadata_json = json.dumps(metadata or {})
+        metadata_val = metadata or {}
+        if isinstance(metadata_val, str):
+            metadata_json = metadata_val  # Already serialized
+        else:
+            try:
+                metadata_json = json.dumps(metadata_val, default=str)
+            except (TypeError, ValueError):
+                metadata_json = "{}"
 
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(

@@ -26,12 +26,20 @@ from dotenv import load_dotenv
 import grpc_tools
 from google.protobuf import json_format
 
-from providers.local import LocalProvider
-from providers.cloud import CloudProvider
-from memory.vector_store import VectorStore
-from memory.retrieval import RetrievalPipeline
-from memory.embeddings import EmbeddingPipeline
 from provider_config import ProviderConfig
+
+# ── Extracted modules ─────────────────────────────────────────────────
+from db import get_pool, get_redis, DB_URL
+from users import create_user, authenticate_user
+from crud import (
+    list_workspaces, create_workspace, list_conversations,
+    create_conversation, get_messages, delete_conversation,
+    update_conversation_title, save_message,
+)
+from providers_registry import (
+    get_provider, list_provider_configs, set_provider_config,
+    delete_provider_config, _providers, CloudProvider,
+)
 
 load_dotenv()
 logger = logging.getLogger("brain")
@@ -40,14 +48,6 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 # ── Configuration ─────────────────────────────────────────────────────
 GRPC_PORT = int(os.getenv("BRAIN_GRPC_PORT", "50051"))
 GRPC_HOST = os.getenv("BRAIN_GRPC_HOST", "0.0.0.0")
-DB_URL = os.getenv(
-    "DATABASE_URL",
-    f"postgresql://{os.getenv('POSTGRES_USER', 'kestrel')}:"
-    f"{os.getenv('POSTGRES_PASSWORD', 'changeme')}@"
-    f"{os.getenv('POSTGRES_HOST', 'localhost')}:"
-    f"{os.getenv('POSTGRES_PORT', '5432')}/"
-    f"{os.getenv('POSTGRES_DB', 'kestrel')}"
-)
 
 # ── Default System Prompt ─────────────────────────────────────────────
 KESTREL_DEFAULT_SYSTEM_PROMPT = """\
@@ -96,224 +96,14 @@ Don't force it — only post when you genuinely have something to contribute.
 Always tell your human what you posted and where (include the URL).
 """
 
-# ── Database Layer ────────────────────────────────────────────────────
-import asyncpg
-import redis.asyncio as redis
+# ── Agent Runtime Globals ─────────────────────────────────────────────
+from memory.vector_store import VectorStore
+from memory.retrieval import RetrievalPipeline
+from memory.embeddings import EmbeddingPipeline
 
-_pool: Optional[asyncpg.Pool] = None
-_redis_pool: Optional[redis.Redis] = None
-
-
-async def get_pool() -> asyncpg.Pool:
-    global _pool
-    if _pool is None:
-        _pool = await asyncpg.create_pool(
-            DB_URL,
-            min_size=int(os.getenv("POSTGRES_POOL_MIN", "2")),
-            max_size=int(os.getenv("POSTGRES_POOL_MAX", "10")),
-        )
-    return _pool
-
-async def get_redis() -> redis.Redis:
-    global _redis_pool
-    if _redis_pool is None:
-        _redis_pool = redis.from_url(
-            f"redis://{os.getenv('REDIS_HOST', 'localhost')}:{os.getenv('REDIS_PORT', '6379')}"
-        )
-    return _redis_pool
-
-
-# ── User Management ──────────────────────────────────────────────────
-
-async def create_user(email: str, password: str, display_name: str = "") -> dict:
-    """Create a new user with hashed password."""
-    import bcrypt
-    pool = await get_pool()
-    user_id = str(uuid.uuid4())
-    salt = ""  # Bcrypt handles salting internally
-    pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-
-    final_display_name = display_name or email.split("@")[0]
-    await pool.execute(
-        """INSERT INTO users (id, email, password_hash, salt, display_name, created_at)
-           VALUES ($1, $2, $3, $4, $5, NOW())""",
-        user_id, email, pw_hash, salt, final_display_name,
-    )
-    return {"id": user_id, "email": email, "displayName": final_display_name}
-
-
-async def authenticate_user(email: str, password: str) -> dict:
-    """Verify credentials and return user info."""
-    import bcrypt
-    pool = await get_pool()
-    row = await pool.fetchrow(
-        "SELECT id, email, password_hash, salt, display_name FROM users WHERE email = $1",
-        email,
-    )
-    if not row:
-        raise ValueError("User not found")
-
-    if row["password_hash"].startswith("$2"):
-        valid = bcrypt.checkpw(password.encode(), row["password_hash"].encode())
-    else:
-        # Fallback to legacy SHA-256 for transition
-        import hashlib
-        old_hash = hashlib.sha256((password + row["salt"]).encode()).hexdigest()
-        valid = (old_hash == row["password_hash"])
-
-    if not valid:
-        raise ValueError("Invalid password")
-
-    # Fetch workspace memberships
-    memberships = await pool.fetch(
-        """SELECT w.id, wm.role FROM workspaces w
-           JOIN workspace_members wm ON w.id = wm.workspace_id
-           WHERE wm.user_id = $1""",
-        row["id"],
-    )
-    workspaces = [{"id": str(m["id"]), "role": m["role"]} for m in memberships]
-
-    return {
-        "id": str(row["id"]),
-        "email": row["email"],
-        "displayName": row["display_name"],
-        "workspaces": workspaces,
-    }
-
-
-# ── Workspace / Conversation CRUD ────────────────────────────────────
-
-async def list_workspaces(user_id: str) -> list:
-    pool = await get_pool()
-    rows = await pool.fetch(
-        """SELECT w.id, w.name, w.created_at, wm.role
-           FROM workspaces w
-           JOIN workspace_members wm ON w.id = wm.workspace_id
-           WHERE wm.user_id = $1
-           ORDER BY w.created_at DESC""",
-        user_id,
-    )
-    return [
-        {"id": str(r["id"]), "name": r["name"], "role": r["role"],
-         "createdAt": r["created_at"].isoformat()}
-        for r in rows
-    ]
-
-
-async def create_workspace(user_id: str, name: str) -> dict:
-    pool = await get_pool()
-    ws_id = str(uuid.uuid4())
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute(
-                "INSERT INTO workspaces (id, name, created_at) VALUES ($1, $2, NOW())",
-                ws_id, name,
-            )
-            await conn.execute(
-                """INSERT INTO workspace_members (workspace_id, user_id, role, joined_at)
-                   VALUES ($1, $2, 'owner', NOW())""",
-                ws_id, user_id,
-            )
-    return {"id": ws_id, "name": name, "role": "owner"}
-
-
-async def list_conversations(user_id: str, workspace_id: str) -> list:
-    pool = await get_pool()
-    rows = await pool.fetch(
-        """SELECT id, title, created_at, updated_at
-           FROM conversations
-           WHERE workspace_id = $1
-           ORDER BY updated_at DESC LIMIT 50""",
-        workspace_id,
-    )
-    return [
-        {"id": str(r["id"]), "title": r["title"],
-         "createdAt": r["created_at"].isoformat(),
-         "updatedAt": r["updated_at"].isoformat()}
-        for r in rows
-    ]
-
-
-async def create_conversation(user_id: str, workspace_id: str) -> dict:
-    pool = await get_pool()
-    conv_id = str(uuid.uuid4())
-    await pool.execute(
-        """INSERT INTO conversations (id, workspace_id, title, created_at, updated_at)
-           VALUES ($1, $2, 'New Conversation', NOW(), NOW())""",
-        conv_id, workspace_id,
-    )
-    return {"id": conv_id, "title": "New Conversation"}
-
-
-async def get_messages(user_id: str, workspace_id: str, conversation_id: str) -> list:
-    pool = await get_pool()
-    rows = await pool.fetch(
-        """SELECT id, role, content, created_at
-           FROM messages
-           WHERE conversation_id = $1
-           ORDER BY created_at ASC""",
-        conversation_id,
-    )
-    return [
-        {"id": str(r["id"]), "role": r["role"], "content": r["content"],
-         "createdAt": r["created_at"].isoformat()}
-        for r in rows
-    ]
-
-
-async def delete_conversation(user_id: str, workspace_id: str, conversation_id: str) -> bool:
-    pool = await get_pool()
-    # Verify ownership/membership before deleting? 
-    # For now, we trust the workspace_id check implicitly via the query
-    result = await pool.execute(
-        "DELETE FROM conversations WHERE id = $1 AND workspace_id = $2",
-        conversation_id, workspace_id
-    )
-    return result != "DELETE 0"
-
-
-async def update_conversation_title(user_id: str, workspace_id: str, conversation_id: str, title: str) -> dict:
-    pool = await get_pool()
-    row = await pool.fetchrow(
-        """UPDATE conversations SET title = $1, updated_at = NOW()
-           WHERE id = $2 AND workspace_id = $3
-           RETURNING id, title, created_at, updated_at""",
-        title, conversation_id, workspace_id
-    )
-    if not row:
-        raise ValueError("Conversation not found")
-    
-    return {
-        "id": str(row["id"]),
-        "title": row["title"],
-        "createdAt": row["created_at"].isoformat(),
-        "updatedAt": row["updated_at"].isoformat()
-    }
-
-
-async def save_message(conversation_id: str, role: str, content: str) -> str:
-    pool = await get_pool()
-    msg_id = str(uuid.uuid4())
-    await pool.execute(
-        """INSERT INTO messages (id, conversation_id, role, content, created_at)
-           VALUES ($1, $2, $3, $4, NOW())""",
-        msg_id, conversation_id, role, content,
-    )
-    await pool.execute(
-        "UPDATE conversations SET updated_at = NOW() WHERE id = $1",
-        conversation_id,
-    )
-    return msg_id
-
-
-# ── LLM Provider Registry ────────────────────────────────────────────
-
-_providers: dict[str, Union[LocalProvider, CloudProvider]] = {}
 _retrieval: Optional[RetrievalPipeline] = None
 _embedding_pipeline: Optional[EmbeddingPipeline] = None
 _vector_store = None
-
-# ── Agent Runtime ────────────────────────────────────────────────────
 
 _agent_loop = None
 _agent_persistence = None
@@ -331,15 +121,6 @@ _workflow_registry = None
 _skill_manager = None
 _session_manager = None
 _sandbox_manager = None
-
-
-def get_provider(name: str):
-    if name not in _providers:
-        if name == "local":
-            _providers[name] = LocalProvider()
-        else:
-            _providers[name] = CloudProvider(name)
-    return _providers[name]
 
 
 # ── gRPC Service Implementation ──────────────────────────────────────
@@ -375,65 +156,9 @@ sys.path.insert(0, out_dir)
 import brain_pb2
 import brain_pb2_grpc
 
-
 import brain_pb2_grpc
 
-# ── Provider Config ────────────────────────────────────────────────
-async def list_provider_configs(workspace_id):
-    query = """
-        SELECT * FROM workspace_provider_config
-        WHERE workspace_id = $1
-    """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetch(query, workspace_id)
 
-async def set_provider_config(workspace_id, provider, config):
-    # upsert
-    query = """
-        INSERT INTO workspace_provider_config (
-            workspace_id, provider, model, api_key_encrypted, 
-            temperature, max_tokens, system_prompt, rag_enabled, 
-            rag_top_k, rag_min_similarity, is_default, settings
-        ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
-        )
-        ON CONFLICT (workspace_id, provider) DO UPDATE SET
-            model = EXCLUDED.model,
-            api_key_encrypted = COALESCE(EXCLUDED.api_key_encrypted, workspace_provider_config.api_key_encrypted),
-            temperature = EXCLUDED.temperature,
-            max_tokens = EXCLUDED.max_tokens,
-            system_prompt = EXCLUDED.system_prompt,
-            rag_enabled = EXCLUDED.rag_enabled,
-            rag_top_k = EXCLUDED.rag_top_k,
-            rag_min_similarity = EXCLUDED.rag_min_similarity,
-            is_default = EXCLUDED.is_default,
-            settings = EXCLUDED.settings,
-            updated_at = NOW()
-        RETURNING *
-    """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            if config.get('is_default', False):
-                await conn.execute(
-                    "UPDATE workspace_provider_config SET is_default = FALSE WHERE workspace_id = $1",
-                    workspace_id
-                )
-            
-            return await conn.fetchrow(query, 
-                workspace_id, provider, config.get('model'), config.get('api_key_encrypted'),
-                config.get('temperature', 0.7), config.get('max_tokens', 2048),
-                config.get('system_prompt'), config.get('rag_enabled', True),
-                config.get('rag_top_k', 5), config.get('rag_min_similarity', 0.3),
-                config.get('is_default', False), json.dumps(config.get('settings', {}))
-            )
-
-async def delete_provider_config(workspace_id, provider):
-    query = "DELETE FROM workspace_provider_config WHERE workspace_id = $1 AND provider = $2"
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(query, workspace_id, provider)
 
 
 class BrainServicer:
@@ -855,20 +580,65 @@ class BrainServicer:
 
             # Create per-task learner for post-task lesson extraction
             from agent.learner import TaskLearner
+            from agent.memory import WorkingMemory
+            task_working_memory = WorkingMemory(
+                redis_client=None,
+                vector_store=_vector_store,
+            )
             task_learner = TaskLearner(
                 provider=provider,
                 model=model,
-                working_memory=_vector_store,
+                working_memory=task_working_memory,
             )
 
             # ── Agent activity event queue ──────────────────────────
             # Council, Coordinator, and Reflection modules push events
-            # here via callbacks; we drain them alongside the agent loop.
+            # here via callbacks. We now push directly to the output stream
+            # so sub-agent events (e.g. delegate_task) appear in real-time.
             import asyncio as _asyncio
-            activity_queue = _asyncio.Queue()
+            output_queue = _asyncio.Queue()  # Unified output queue for ALL events
+            _SENTINEL = object()  # Marks end of stream
 
             async def _activity_callback(activity_type: str, data: dict):
-                await activity_queue.put({"activity_type": activity_type, **data})
+                """Push activity events directly to the output stream."""
+                # Format as a visible chunk so it appears in chat immediately
+                specialist = data.get("specialist", "")
+                status = data.get("status", "")
+                prefix = f"[{specialist}] " if specialist else ""
+
+                if activity_type == "delegation_started":
+                    text = f"\n🔀 **Delegating to {specialist}**: {data.get('goal', '')[:150]}\n\n"
+                    await output_queue.put(self._make_response(chunk_type=0, content_delta=text))
+                elif activity_type == "delegation_progress":
+                    if status == "thinking":
+                        text = f"💭 {prefix}*{data.get('thinking', '')[:120]}*\n"
+                        await output_queue.put(self._make_response(chunk_type=0, content_delta=text))
+                    elif status == "tool_calling":
+                        tool = data.get("tool", "tool")
+                        text = f"⚡ {prefix}Using **{tool}**...\n"
+                        await output_queue.put(self._make_response(chunk_type=0, content_delta=text))
+                    elif status == "tool_result":
+                        tool = data.get("tool", "tool")
+                        result_preview = (data.get("tool_result", "") or "")[:150].replace('\n', ' ')
+                        text = f"✓ {prefix}{tool}: {result_preview}\n\n"
+                        await output_queue.put(self._make_response(chunk_type=0, content_delta=text))
+                    elif status == "step_done":
+                        pass  # Don't duplicate step content
+                elif activity_type == "delegation_complete":
+                    status_icon = "✅" if data.get("status") == "complete" else "❌"
+                    text = f"\n{status_icon} {prefix}Delegation complete\n\n"
+                    await output_queue.put(self._make_response(chunk_type=0, content_delta=text))
+                else:
+                    # Generic activity — send as metadata
+                    await output_queue.put(self._make_response(
+                        chunk_type=0,
+                        metadata={
+                            "agent_status": "agent_activity",
+                            "activity": json.dumps({
+                                "activity_type": activity_type, **data
+                            }),
+                        },
+                    ))
 
             # Load workspace-specific dynamic skills into the tool registry
             if _skill_manager:
@@ -910,12 +680,10 @@ class BrainServicer:
                         if persona_block and messages:
                             # Find the system message and append persona context
                             for msg in messages:
-                                msg_role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
-                                if msg_role in ("system", 2):
-                                    if isinstance(msg, dict):
-                                        msg["content"] += "\n\n" + persona_block
-                                    else:
-                                        msg.content += "\n\n" + persona_block
+                                if not isinstance(msg, dict):
+                                    continue  # Only inject into dict messages
+                                if msg.get("role") in ("system", 2):
+                                    msg["content"] += "\n\n" + persona_block
                                     break
                 except Exception as e:
                     logger.warning(f"Failed to inject persona context: {e}")
@@ -938,12 +706,10 @@ class BrainServicer:
                     mcp_block += "\n\nFor GitHub repos, use `mcp_call` with the github server instead of trying to git clone (sandbox has no git/internet)."
                     if messages:
                         for msg in messages:
-                            msg_role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
-                            if msg_role in ("system", 2):
-                                if isinstance(msg, dict):
-                                    msg["content"] += mcp_block
-                                else:
-                                    msg.content += mcp_block
+                            if not isinstance(msg, dict):
+                                continue  # Only inject into dict messages
+                            if msg.get("role") in ("system", 2):
+                                msg["content"] += mcp_block
                                 break
             except Exception as e:
                 logger.warning(f"Failed to inject MCP server context: {e}")
@@ -974,171 +740,209 @@ class BrainServicer:
             if hasattr(agent_loop, '_reflection') and agent_loop._reflection:
                 agent_loop._reflection._event_callback = _activity_callback
 
-            async for event in agent_loop.run(chat_task):
-                # First, drain any queued agent activity events
-                while not activity_queue.empty():
-                    activity = activity_queue.get_nowait()
-                    yield self._make_response(
-                        chunk_type=0,
-                        metadata={
-                            "agent_status": "agent_activity",
-                            "activity": json.dumps(activity),
-                        },
-                    )
+            async def _run_agent_loop():
+                """Run agent loop in background, pushing events to output_queue."""
+                try:
+                    async for event in agent_loop.run(chat_task):
+                        await output_queue.put(("agent_event", event))
+                except Exception as e:
+                    logger.error(f"Agent loop error in background: {e}", exc_info=True)
+                    await output_queue.put(("error", str(e)))
+                finally:
+                    await output_queue.put(_SENTINEL)
 
-                event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
+            # Start the agent loop as a background task so activity callbacks
+            # can push to the same queue concurrently
+            agent_task_bg = _asyncio.create_task(_run_agent_loop())
 
-                if event_type == "thinking":
-                    # Agent is reasoning — send as metadata so UI can show "Thinking..."
-                    yield self._make_response(
-                        chunk_type=0,  # CONTENT_DELTA
-                        metadata={"agent_status": "thinking", "thinking": event.content[:200]},
-                    )
+            while True:
+                item = await output_queue.get()
 
-                elif event_type == "tool_called":
-                    # Agent is using a tool — send so UI can show "Using web_read..."
-                    yield self._make_response(
-                        chunk_type=0,
-                        metadata={
-                            "agent_status": "calling",
-                            "tool_name": event.tool_name,
-                            "tool_args": event.tool_args[:200] if event.tool_args else "",
-                        },
-                    )
+                # End of stream sentinel
+                if item is _SENTINEL:
+                    break
 
-                elif event_type == "tool_result":
-                    # Tool result came back — send brief metadata
-                    result_preview = (event.tool_result or "")[:300]
-                    yield self._make_response(
-                        chunk_type=0,
-                        metadata={
-                            "agent_status": "result",
-                            "tool_name": event.tool_name,
-                            "tool_result": result_preview,
-                        },
-                    )
-                    # Accumulate tool results for task_failed fallback
-                    if event.tool_result and len(event.tool_result) > 10:
-                        tool_results_gathered.append(
-                            f"**{event.tool_name}**: {event.tool_result[:500]}"
+                # Direct response chunks from activity callbacks
+                if isinstance(item, dict):
+                    yield item
+                    continue
+
+                # Tuple from the agent loop background task
+                if isinstance(item, tuple):
+                    msg_type, payload = item
+
+                    if msg_type == "error":
+                        yield self._make_response(
+                            chunk_type=3,
+                            error_message=payload or "Agent task failed",
                         )
+                        continue
 
-                elif event_type == "step_complete":
-                    # A step finished — if content, stream it as final text
-                    if event.content:
-                        words = event.content.split(' ')
-                        for i, word in enumerate(words):
-                            chunk = word if i == 0 else ' ' + word
-                            yield self._make_response(
-                                chunk_type=0,
-                                content_delta=chunk,
-                            )
-                        full_response_parts.append(event.content)
+                    if msg_type != "agent_event":
+                        continue
 
-                elif event_type == "approval_needed":
-                    # ask_human question — render as visible chat text
-                    question = event.content or "The agent needs your input."
-                    # Format it nicely
-                    approval_text = f"\n\n🤔 **I need your input:**\n\n{question}\n\n*Reply in the chat to continue.*"
-                    words = approval_text.split(' ')
-                    for i, word in enumerate(words):
-                        chunk = word if i == 0 else ' ' + word
+                    event = payload
+                    event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
+
+                    if event_type == "thinking":
+                        # Agent is reasoning — send metadata for UI indicators
                         yield self._make_response(
                             chunk_type=0,
-                            content_delta=chunk,
+                            metadata={"agent_status": "thinking", "thinking": event.content[:200]},
                         )
-                    full_response_parts.append(approval_text)
-                    # Also send metadata so UI knows we're waiting
-                    yield self._make_response(
-                        chunk_type=0,
-                        metadata={
-                            "agent_status": "waiting_for_human",
-                            "approval_id": event.approval_id or "",
-                            "question": question[:300],
-                        },
-                    )
+                        # Also stream a visible thinking indicator so chat isn't blank
+                        thinking_preview = (event.content or "")[:150].replace('\n', ' ')
+                        if thinking_preview and not full_response_parts:
+                            thinking_text = f"\n\n💭 *{thinking_preview}...*\n\n"
+                            yield self._make_response(chunk_type=0, content_delta=thinking_text)
 
-                elif event_type == "task_complete":
-                    # Task complete — stream any remaining content
-                    if event.content and event.content not in '\n'.join(full_response_parts):
-                        words = event.content.split(' ')
-                        for i, word in enumerate(words):
-                            chunk = word if i == 0 else ' ' + word
-                            yield self._make_response(
-                                chunk_type=0,
-                                content_delta=chunk,
+                    elif event_type == "tool_called":
+                        # Agent is using a tool — send metadata for UI indicators
+                        yield self._make_response(
+                            chunk_type=0,
+                            metadata={
+                                "agent_status": "calling",
+                                "tool_name": event.tool_name,
+                                "tool_args": event.tool_args[:200] if event.tool_args else "",
+                            },
+                        )
+                        # Stream visible tool activity so user sees progress
+                        tool_display = event.tool_name or "tool"
+                        tool_text = f"⚡ Using **{tool_display}**..."
+                        if event.tool_args and len(event.tool_args) < 100:
+                            try:
+                                args_preview = json.loads(event.tool_args)
+                                if isinstance(args_preview, dict):
+                                    for key in ("goal", "query", "content", "command", "server_name", "url", "specialist"):
+                                        if key in args_preview:
+                                            tool_text += f" `{args_preview[key][:80]}`"
+                                            break
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                        tool_text += "\n"
+                        yield self._make_response(chunk_type=0, content_delta=tool_text)
+
+                    elif event_type == "tool_result":
+                        result_preview = (event.tool_result or "")[:300]
+                        yield self._make_response(
+                            chunk_type=0,
+                            metadata={
+                                "agent_status": "result",
+                                "tool_name": event.tool_name,
+                                "tool_result": result_preview,
+                            },
+                        )
+                        result_snippet = (event.tool_result or "")[:200].replace('\n', ' ')
+                        if result_snippet:
+                            result_text = f"✓ {event.tool_name}: {result_snippet}\n\n"
+                            yield self._make_response(chunk_type=0, content_delta=result_text)
+                        if event.tool_result and len(event.tool_result) > 10:
+                            tool_results_gathered.append(
+                                f"**{event.tool_name}**: {event.tool_result[:500]}"
                             )
-                        full_response_parts.append(event.content)
 
-                elif event_type == "task_failed":
-                    # If we already accumulated content from tool calls, send it
-                    # instead of failing with "sorry" — the agent did useful work.
-                    if full_response_parts:
-                        logger.info(f"Task budget exceeded but content was gathered, sending it")
-                        combined = '\n'.join(full_response_parts)
-                        combined += "\n\n*(Note: I ran out of processing steps but here's what I found.)*"
-                        words = combined.split(' ')
+                    elif event_type == "step_complete":
+                        if event.content:
+                            words = event.content.split(' ')
+                            for i, word in enumerate(words):
+                                chunk = word if i == 0 else ' ' + word
+                                yield self._make_response(chunk_type=0, content_delta=chunk)
+                            full_response_parts.append(event.content)
+
+                    elif event_type == "approval_needed":
+                        question = event.content or "The agent needs your input."
+                        approval_text = f"\n\n🤔 **I need your input:**\n\n{question}\n\n*Reply in the chat to continue.*"
+                        words = approval_text.split(' ')
                         for i, word in enumerate(words):
                             chunk = word if i == 0 else ' ' + word
                             yield self._make_response(chunk_type=0, content_delta=chunk)
-                    elif tool_results_gathered:
-                        # No step_complete content, but we have tool results — summarize them
-                        logger.info(f"Task budget exceeded, summarizing {len(tool_results_gathered)} tool results")
-                        try:
-                            summary_prompt = (
-                                "You ran out of processing steps while working on a task. "
-                                "Summarize what you found from these tool results so far. "
-                                "Be helpful and concise:\n\n"
-                                + "\n\n".join(tool_results_gathered[:10])
-                            )
-                            summary_msgs = [{"role": "user", "content": summary_prompt}]
-                            summary_text = ""
-                            async for chunk in provider.stream(summary_msgs, model=model, api_key=api_key):
-                                if isinstance(chunk, str):
-                                    summary_text += chunk
-                                    yield self._make_response(chunk_type=0, content_delta=chunk)
+                        full_response_parts.append(approval_text)
+                        yield self._make_response(
+                            chunk_type=0,
+                            metadata={
+                                "agent_status": "waiting_for_human",
+                                "approval_id": event.approval_id or "",
+                                "question": question[:300],
+                            },
+                        )
 
-                            if summary_text:
-                                summary_text += "\n\n*(Note: I ran out of processing steps but here's what I found so far.)*"
-                                yield self._make_response(
-                                    chunk_type=0,
-                                    content_delta="\n\n*(Note: I ran out of processing steps but here's what I found so far.)*",
+                    elif event_type == "task_complete":
+                        if event.content and event.content not in '\n'.join(full_response_parts):
+                            words = event.content.split(' ')
+                            for i, word in enumerate(words):
+                                chunk = word if i == 0 else ' ' + word
+                                yield self._make_response(chunk_type=0, content_delta=chunk)
+                            full_response_parts.append(event.content)
+
+                    elif event_type == "task_failed":
+                        if full_response_parts:
+                            logger.info(f"Task budget exceeded but content was gathered, sending it")
+                            combined = '\n'.join(full_response_parts)
+                            combined += "\n\n*(Note: I ran out of processing steps but here's what I found.)*"
+                            words = combined.split(' ')
+                            for i, word in enumerate(words):
+                                chunk = word if i == 0 else ' ' + word
+                                yield self._make_response(chunk_type=0, content_delta=chunk)
+                        elif tool_results_gathered:
+                            logger.info(f"Task budget exceeded, summarizing {len(tool_results_gathered)} tool results")
+                            try:
+                                summary_prompt = (
+                                    "You ran out of processing steps while working on a task. "
+                                    "Summarize what you found from these tool results so far. "
+                                    "Be helpful and concise:\n\n"
+                                    + "\n\n".join(tool_results_gathered[:10])
                                 )
-                                full_response_parts.append(summary_text)
-                            else:
+                                summary_msgs = [{"role": "user", "content": summary_prompt}]
+                                summary_text = ""
+                                async for chunk in provider.stream(summary_msgs, model=model, api_key=api_key):
+                                    if isinstance(chunk, str):
+                                        summary_text += chunk
+                                        yield self._make_response(chunk_type=0, content_delta=chunk)
+
+                                if summary_text:
+                                    summary_text += "\n\n*(Note: I ran out of processing steps but here's what I found so far.)*"
+                                    yield self._make_response(
+                                        chunk_type=0,
+                                        content_delta="\n\n*(Note: I ran out of processing steps but here's what I found so far.)*",
+                                    )
+                                    full_response_parts.append(summary_text)
+                                else:
+                                    yield self._make_response(
+                                        chunk_type=3,
+                                        error_message="Agent ran out of processing steps. Try a more specific request.",
+                                    )
+                            except Exception as summary_err:
+                                logger.error(f"Failed to generate summary on task failure: {summary_err}")
                                 yield self._make_response(
                                     chunk_type=3,
-                                    error_message="Agent ran out of processing steps. Try a more specific request.",
+                                    error_message=event.content or "Agent task failed",
                                 )
-                        except Exception as summary_err:
-                            logger.error(f"Failed to generate summary on task failure: {summary_err}")
+                        else:
                             yield self._make_response(
                                 chunk_type=3,
                                 error_message=event.content or "Agent task failed",
                             )
-                    else:
+
+                        # Save whatever response we managed to produce
+                        final_text = '\n'.join(full_response_parts) if full_response_parts else ""
+                        if conversation_id and final_text:
+                            await save_message(conversation_id, "assistant", final_text)
+
                         yield self._make_response(
-                            chunk_type=3,
-                            error_message=event.content or "Agent task failed",
+                            chunk_type=2,  # DONE
+                            metadata={"provider": provider_name, "model": model},
+                        )
+                        return
+
+                    elif event_type == "plan_created":
+                        yield self._make_response(
+                            chunk_type=0,
+                            metadata={"agent_status": "planning", "plan": event.content[:300] if event.content else ""},
                         )
 
-                    # Save whatever response we managed to produce
-                    final_text = '\n'.join(full_response_parts) if full_response_parts else ""
-                    if conversation_id and final_text:
-                        await save_message(conversation_id, "assistant", final_text)
-
-                    # Send DONE so the gateway flushes the response to the channel
-                    yield self._make_response(
-                        chunk_type=2,  # DONE
-                        metadata={"provider": provider_name, "model": model},
-                    )
-                    return
-
-                elif event_type == "plan_created":
-                    yield self._make_response(
-                        chunk_type=0,
-                        metadata={"agent_status": "planning", "plan": event.content[:300] if event.content else ""},
-                    )
+            # Ensure background task is cleaned up
+            if not agent_task_bg.done():
+                agent_task_bg.cancel()
 
             # ── 5. Save response + auto-embed + persona observation ──
             full_response = "\n".join(full_response_parts) if full_response_parts else ""
@@ -1171,10 +975,21 @@ class BrainServicer:
                 # Update memory graph with conversation context
                 if _memory_graph and full_response:
                     try:
-                        await _memory_graph.extract_and_store(
-                            workspace_id=workspace_id,
-                            text=f"User: {user_content}\nKestrel: {full_response[:500]}",
-                        )
+                        # Extract simple topic entities from the user message
+                        import re as _re
+                        _words = _re.findall(r'\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\b', user_content)
+                        _topics = list(dict.fromkeys(w for w in _words if len(w) > 2))[:5]
+                        if _topics:
+                            _entities = [
+                                {"type": "concept", "name": t, "description": ""}
+                                for t in _topics
+                            ]
+                            await _memory_graph.extract_and_store(
+                                conversation_id=conversation_id,
+                                workspace_id=workspace_id,
+                                entities=_entities,
+                                relations=[],
+                            )
                     except Exception as e:
                         logger.warning(f"Memory graph update failed: {e}")
 

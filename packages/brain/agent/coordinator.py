@@ -185,15 +185,37 @@ class Coordinator:
         result_parts = []
         try:
             async for event in child_loop.run(child_task):
-                # Forward tool activity from sub-agent
-                if event.type.name == "TOOL_CALLED":
+                event_name = event.type.name if hasattr(event.type, 'name') else str(event.type)
+
+                # Forward ALL child events so the parent stream can render them
+                if event_name == "THINKING":
+                    await self._emit("delegation_progress", {
+                        "specialist": spec.name,
+                        "status": "thinking",
+                        "thinking": (event.content or "")[:200],
+                    })
+                elif event_name == "TOOL_CALLED":
                     await self._emit("delegation_progress", {
                         "specialist": spec.name,
                         "tool": event.tool_name,
+                        "tool_args": (event.tool_args or "")[:200],
                         "status": "tool_calling",
                     })
-                if event.type.name in ("TASK_COMPLETE", "TASK_FAILED"):
-                    result_parts.append(event.content)
+                elif event_name == "TOOL_RESULT":
+                    await self._emit("delegation_progress", {
+                        "specialist": spec.name,
+                        "tool": event.tool_name,
+                        "tool_result": (event.tool_result or "")[:300],
+                        "status": "tool_result",
+                    })
+                elif event_name == "STEP_COMPLETE":
+                    await self._emit("delegation_progress", {
+                        "specialist": spec.name,
+                        "status": "step_done",
+                        "content": (event.content or "")[:300],
+                    })
+                elif event_name in ("TASK_COMPLETE", "TASK_FAILED"):
+                    result_parts.append(event.content or "")
         except Exception as e:
             logger.error(f"Sub-agent {child_task.id} failed: {e}")
             await self._emit("delegation_complete", {
