@@ -43,7 +43,7 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
             const body = request.body as {
                 conversationId: string; messageId: string; rating: number; comment: string;
             };
-            const userId = (request as unknown as { userId: string }).userId;
+            const userId = request.user!.id;
 
             try {
                 const result = await brainClient.call('SubmitFeedback', {
@@ -69,7 +69,7 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
             },
         },
         async (request, reply) => {
-            const userId = (request as unknown as { userId: string }).userId;
+            const userId = request.user!.id;
             const { limit } = request.query as { limit: number };
 
             try {
@@ -120,7 +120,7 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         '/api/notifications/read-all',
         { preHandler: [requireAuth] },
         async (request, reply) => {
-            const userId = (request as unknown as { userId: string }).userId;
+            const userId = request.user!.id;
             try {
                 const pool = getPool();
                 await pool.query(
@@ -268,7 +268,7 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         async (request, reply) => {
             const { workspaceId } = request.params as { workspaceId: string };
             const { email, role } = request.body as { email: string; role: string };
-            const userId = (request as unknown as { userId: string }).userId;
+            const userId = request.user!.id;
 
             try {
                 const result = await brainClient.call('InviteWorkspaceMember', {

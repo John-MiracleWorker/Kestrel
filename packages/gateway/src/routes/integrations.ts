@@ -35,13 +35,21 @@ export default async function integrationRoutes(
         },
         async () => {
             const telegramAdapter = channelRegistry.getAdapter('telegram') as TelegramAdapter | undefined;
+            const discordAdapter = channelRegistry.getAdapter('discord');
+            const whatsappAdapter = channelRegistry.getAdapter('whatsapp');
             return {
                 telegram: {
                     connected: telegramAdapter?.status === 'connected',
                     status: telegramAdapter?.status ?? 'disconnected',
                 },
-                discord: { connected: false, status: 'disconnected' },
-                whatsapp: { connected: false, status: 'disconnected' },
+                discord: {
+                    connected: discordAdapter?.status === 'connected',
+                    status: discordAdapter?.status ?? 'disconnected',
+                },
+                whatsapp: {
+                    connected: whatsappAdapter?.status === 'connected',
+                    status: whatsappAdapter?.status ?? 'disconnected',
+                },
             };
         }
     );

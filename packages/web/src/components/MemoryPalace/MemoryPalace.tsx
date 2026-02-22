@@ -274,38 +274,37 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
         selectedRef.current = selectedNode;
     }, [selectedNode]);
 
-    // Load data (mock for now, will connect to real memory graph API)
+    // Load memory graph data from the real API
     useEffect(() => {
         if (!isVisible) return;
-        try {
-            request(`/workspaces/${workspaceId}/memory/graph`)
-                .then((raw: unknown) => {
-                    const data = raw as { nodes?: MemoryNode[]; links?: MemoryLink[] };
-                    if (data?.nodes?.length) {
-                        nodesRef.current = data.nodes;
-                        linksRef.current = data.links || [];
-                    } else {
+        request(`/workspaces/${workspaceId}/memory/graph`)
+            .then((raw: unknown) => {
+                const data = raw as { nodes?: MemoryNode[]; links?: MemoryLink[] };
+                if (data?.nodes?.length) {
+                    nodesRef.current = data.nodes;
+                    linksRef.current = data.links || [];
+                } else {
+                    // Empty graph — only show mock data in development
+                    if (import.meta.env.DEV) {
                         const mock = generateMockData();
                         nodesRef.current = mock.nodes;
                         linksRef.current = mock.links;
+                    } else {
+                        nodesRef.current = [];
+                        linksRef.current = [];
                     }
-                    setNodeCount(nodesRef.current.length);
-                    setLinkCount(linksRef.current.length);
-                })
-                .catch(() => {
-                    const mock = generateMockData();
-                    nodesRef.current = mock.nodes;
-                    linksRef.current = mock.links;
-                    setNodeCount(nodesRef.current.length);
-                    setLinkCount(linksRef.current.length);
-                });
-        } catch (_e) {
-            const mock = generateMockData();
-            nodesRef.current = mock.nodes;
-            linksRef.current = mock.links;
-            setNodeCount(nodesRef.current.length);
-            setLinkCount(linksRef.current.length);
-        }
+                }
+                setNodeCount(nodesRef.current.length);
+                setLinkCount(linksRef.current.length);
+            })
+            .catch((err: unknown) => {
+                console.error('Memory graph fetch failed:', err);
+                // On network failure, show empty graph — don't silently show fake data
+                nodesRef.current = [];
+                linksRef.current = [];
+                setNodeCount(0);
+                setLinkCount(0);
+            });
     }, [isVisible, workspaceId]);
 
     // Physics step — mutates nodesRef directly, no setState

@@ -94,7 +94,9 @@ class DockerExecutor:
                 "execution_time_ms": elapsed_ms,
                 "memory_used_mb": result.get("memory_used_mb", 0),
                 "audit_log": {
-                    **audit_log,
+                    "network_requests": result.get("network_requests", []),
+                    "file_accesses": audit_log["file_accesses"],
+                    "system_calls": audit_log["system_calls"],
                     "sandbox_id": result.get("container_id", ""),
                 },
             }
@@ -168,10 +170,20 @@ class DockerExecutor:
             stats = container.stats(stream=False)
             memory_used = stats.get("memory_stats", {}).get("usage", 0)
 
+            # Extract network I/O from container stats
+            network_requests = []
+            net_stats = stats.get("networks", {})
+            for iface, iface_stats in net_stats.items():
+                rx = iface_stats.get("rx_bytes", 0)
+                tx = iface_stats.get("tx_bytes", 0)
+                if rx > 0 or tx > 0:
+                    network_requests.append(f"{iface}: rx={rx}B tx={tx}B")
+
             return {
                 "output": output,
                 "container_id": container.id[:12],
                 "memory_used_mb": memory_used // (1024 * 1024),
+                "network_requests": network_requests,
             }
 
         except Exception as e:

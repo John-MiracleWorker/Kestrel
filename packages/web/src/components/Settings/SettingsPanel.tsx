@@ -754,10 +754,24 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                                         onBlur={e => { e.target.style.borderColor = '#333'; }} />
                                 </div>
                                 <div style={{ display: 'flex', gap: '8px' }}>
-                                    <button style={S.btnPrimary} onClick={() => {
-                                        // TODO: Wire to create_skill via agent loop
-                                        setShowCreateTool(false);
-                                        setNewToolName(''); setNewToolDesc(''); setNewToolCode('');
+                                    <button style={S.btnPrimary} onClick={async () => {
+                                        if (!newToolName.trim()) return;
+                                        try {
+                                            const goalParts = [`Create a new Python skill/tool named "${newToolName}"`];
+                                            if (newToolDesc.trim()) goalParts.push(`that ${newToolDesc}`);
+                                            if (newToolCode.trim()) goalParts.push(`using this implementation:\n\n\`\`\`python\n${newToolCode}\n\`\`\``);
+                                            await request(`/workspaces/${workspaceId}/tasks`, {
+                                                method: 'POST',
+                                                body: { goal: goalParts.join(' ') },
+                                            });
+                                            setShowCreateTool(false);
+                                            setNewToolName(''); setNewToolDesc(''); setNewToolCode('');
+                                            setSaveStatus('Tool creation task dispatched — check Tasks panel');
+                                            setTimeout(() => setSaveStatus(null), 4000);
+                                        } catch (err: any) {
+                                            setError(err.message || 'Failed to dispatch tool creation');
+                                            setTimeout(() => setError(null), 3000);
+                                        }
                                     }}>Create Tool</button>
                                     <div style={{ fontSize: '0.65rem', color: '#666', display: 'flex', alignItems: 'center' }}>
                                         Requires approval before use
@@ -1418,11 +1432,34 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                                     </div>
                                 </div>
                                 <div style={{ marginTop: '16px', display: 'flex', justifyContent: 'flex-end' }}>
-                                    <button style={{ ...S.btnPrimary, padding: '6px 16px', fontSize: '0.75rem' }} onClick={() => {
-                                        // TODO: Actually save the cron job to a database schedule
-                                        setSaveStatus('Cron job configuration prepared (mock saved!)');
-                                        setTimeout(() => setSaveStatus(null), 3000);
-                                    }}>Save Job</button>
+                                    <button style={{ ...S.btnPrimary, padding: '6px 16px', fontSize: '0.75rem' }}
+                                        disabled={cronLoading}
+                                        onClick={async () => {
+                                            if (!parsedCron) return;
+                                            setCronLoading(true);
+                                            try {
+                                                await request(`/workspaces/${workspaceId}/automation/cron`, {
+                                                    method: 'POST',
+                                                    body: {
+                                                        name: parsedCron.task.slice(0, 60) || 'Scheduled Job',
+                                                        description: parsedCron.human_schedule,
+                                                        cronExpression: parsedCron.cron,
+                                                        goal: parsedCron.task,
+                                                    },
+                                                });
+                                                setParsedCron(null);
+                                                setCronInput('');
+                                                setSaveStatus('Cron job saved successfully');
+                                                setTimeout(() => setSaveStatus(null), 3000);
+                                            } catch (err: any) {
+                                                setError(err.message || 'Failed to save cron job');
+                                                setTimeout(() => setError(null), 3000);
+                                            } finally {
+                                                setCronLoading(false);
+                                            }
+                                        }}>
+                                        {cronLoading ? 'Saving...' : 'Save Job'}
+                                    </button>
                                 </div>
                             </div>
                         )}

@@ -285,9 +285,11 @@ async def serve():
     try:
         await server.wait_for_termination()
     except KeyboardInterrupt:
-        logger.info("Shutting down Hands service...")
-        await server.stop(5)
+        logger.info("Shutting down Hands service (keyboard interrupt)...")
+    finally:
+        logger.info("Cleaning up sandbox containers...")
         await executor.cleanup()
+        await server.stop(5)
 
 
 if __name__ == "__main__":

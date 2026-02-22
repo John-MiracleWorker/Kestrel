@@ -8,6 +8,7 @@ import { requireAuth } from './auth/middleware';
 import { SessionManager } from './session/manager';
 import { BrainClient } from './brain/client';
 import { ChannelRegistry } from './channels/registry';
+import { Deduplicator } from './sync/deduplicator';
 import { WebChannelAdapter } from './channels/web';
 import { TelegramAdapter } from './channels/telegram';
 import { WhatsAppAdapter } from './channels/whatsapp';
@@ -198,7 +199,8 @@ async function start() {
         setupMetrics(app);
 
         // 6. Create channel registry + register integration routes (BEFORE listen)
-        channelRegistry = new ChannelRegistry(brainClient);
+        const deduplicator = new Deduplicator(redis);
+        channelRegistry = new ChannelRegistry(brainClient, deduplicator);
 
         await integrationRoutes(app, {
             channelRegistry,

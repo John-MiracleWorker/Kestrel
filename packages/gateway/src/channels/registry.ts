@@ -1,5 +1,6 @@
 import { BaseChannelAdapter, ChannelType, IncomingMessage, OutgoingMessage } from './base';
 import { BrainClient } from '../brain/client';
+import { Deduplicator } from '../sync/deduplicator';
 import { logger } from '../utils/logger';
 
 /**
@@ -14,7 +15,7 @@ export class ChannelRegistry {
     private userChannels = new Map<string, Set<ChannelType>>(); // userId → active channels
     private knownConversations = new Map<string, string>(); // channelKey → conversationId
 
-    constructor(private brain: BrainClient) { }
+    constructor(private brain: BrainClient, private deduplicator?: Deduplicator) { }
 
     /**
      * Register and connect an adapter.
@@ -112,6 +113,15 @@ export class ChannelRegistry {
 
         // Track user on this channel
         this.trackUserChannel(msg.userId, channel);
+
+        // Deduplicate: skip if this message was already seen within the dedup window
+        if (this.deduplicator) {
+            const isDup = await this.deduplicator.isDuplicate(msg.userId, msg.content, channel);
+            if (isDup) {
+                logger.info('Duplicate message suppressed', { channel, userId: msg.userId });
+                return;
+            }
+        }
 
         // Process attachments through the adapter's handler
         if (msg.attachments?.length) {

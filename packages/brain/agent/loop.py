@@ -90,6 +90,7 @@ class AgentLoop:
         evidence_chain: Optional[EvidenceChain] = None,
         api_key: str = "",
         event_callback=None,
+        reflection_engine=None,
     ):
         self._provider = provider
         self._tools = tool_registry
@@ -103,6 +104,7 @@ class AgentLoop:
         self._memory_graph = memory_graph
         self._evidence_chain = evidence_chain
         self._event_callback = event_callback
+        self._reflection_engine = reflection_engine
 
         # Callback for approval resolution (set by the gRPC handler)
         self._approval_callback: Optional[Callable] = None
@@ -223,6 +225,37 @@ class AgentLoop:
                     content=json.dumps(task.plan.to_dict()),
                     progress=self._progress(task),
                 )
+
+                # ── Reflection: Red-team the plan before execution ──
+                if self._reflection_engine and len(task.plan.steps) > 2:
+                    try:
+                        plan_text = json.dumps(task.plan.to_dict())
+                        reflection = await self._reflection_engine.reflect(
+                            plan=plan_text,
+                            task_goal=task.goal,
+                        )
+                        logger.info(
+                            f"Reflection: confidence={reflection.confidence_score:.2f} "
+                            f"risk={reflection.estimated_risk_level} "
+                            f"proceed={reflection.should_proceed} "
+                            f"critiques={len(reflection.critique_points)}"
+                        )
+                        if self._evidence_chain:
+                            self._evidence_chain.record_plan_decision(
+                                plan_summary=f"Reflection: {reflection.estimated_risk_level} risk, confidence={reflection.confidence_score:.2f}",
+                                reasoning=reflection.confidence_justification[:200],
+                                confidence=reflection.confidence_score,
+                            )
+                        if not reflection.should_proceed:
+                            yield TaskEvent(
+                                type=TaskEventType.THINKING,
+                                task_id=task.id,
+                                content=f"⚠ Reflection flagged critical issues (confidence={reflection.confidence_score:.2f}). Proceeding with caution.\n" +
+                                        "\n".join(f"- [{c.severity}] {c.description}" for c in reflection.critique_points[:3]),
+                                progress=self._progress(task),
+                            )
+                    except Exception as e:
+                        logger.warning(f"Reflection engine failed: {e}")
 
             # ── Phase 2: Execution Loop ──────────────────────────
             # Guard: if plan is still None (shouldn't happen, but be safe), create fallback
@@ -414,7 +447,28 @@ class AgentLoop:
                 except Exception as e:
                     logger.warning(f"Evidence chain persistence failed: {e}")
 
-            # ── Phase 4: Learn from this task ────────────────────
+            # ── Phase 4: Update memory graph with task entities ───
+            if self._memory_graph and task.result:
+                try:
+                    import re as _re
+                    _words = _re.findall(r'\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\b', task.goal + " " + task.result)
+                    _topics = list(dict.fromkeys(w for w in _words if len(w) > 2))[:8]
+                    if _topics:
+                        _entities = [
+                            {"type": "concept", "name": t, "description": ""}
+                            for t in _topics
+                        ]
+                        await self._memory_graph.extract_and_store(
+                            conversation_id=task.id,
+                            workspace_id=task.workspace_id,
+                            entities=_entities,
+                            relations=[],
+                        )
+                        logger.info(f"Memory graph updated with {len(_entities)} entities from task {task.id}")
+                except Exception as e:
+                    logger.warning(f"Memory graph update failed: {e}")
+
+            # ── Phase 5: Learn from this task ────────────────────
             if self._learner:
                 try:
                     await self._learner.extract_lessons(task)

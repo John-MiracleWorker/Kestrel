@@ -414,6 +414,7 @@ export function DocsPanel({ workspaceId, isVisible, onClose }: DocsPanelProps) {
     const [regenerating, setRegenerating] = useState(false);
     const [driftCount] = useState(0);
     const [isLive, setIsLive] = useState(false);
+    const [usingMockDocs, setUsingMockDocs] = useState(false);
 
     const activeDoc = docs.find(d => d.id === selectedDoc) || docs[0];
     const timeSince = (date: string) => {
@@ -436,7 +437,7 @@ export function DocsPanel({ workspaceId, isVisible, onClose }: DocsPanelProps) {
                     setIsLive(true);
                 }
             })
-            .catch(() => { /* keep mock docs as fallback */ });
+            .catch(() => { setUsingMockDocs(true); /* keep mock docs as fallback */ });
     }, [isVisible, workspaceId]);
 
     const handleRegenerate = async () => {
@@ -500,6 +501,12 @@ export function DocsPanel({ workspaceId, isVisible, onClose }: DocsPanelProps) {
                         <button style={S.closeBtn} onClick={onClose}>✕</button>
                     </div>
                 </div>
+
+                {usingMockDocs && (
+                    <div style={{ background: '#1a0f00', color: '#f59e0b', fontSize: '0.65rem', padding: '4px 12px', borderBottom: '1px solid #2a1a00', letterSpacing: '0.04em' }}>
+                        ⚠ Unable to generate live docs — showing cached reference
+                    </div>
+                )}
 
                 {driftCount > 0 && (
                     <div style={S.driftBanner}>

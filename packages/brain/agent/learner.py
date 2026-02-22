@@ -243,6 +243,7 @@ class TaskLearner:
     ) -> None:
         """Persist lessons to the knowledge base."""
         if not self._memory:
+            logger.debug(f"Lesson persistence skipped for workspace {workspace_id}: no working memory configured")
             return
 
         for lesson in lessons:

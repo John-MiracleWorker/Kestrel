@@ -1316,16 +1316,57 @@ class BrainServicer:
         from agent.guardrails import Guardrails
         from agent.loop import AgentLoop
         from agent.evidence import EvidenceChain
-        from agent.memory_graph import MemoryGraph
+        from agent.learner import TaskLearner
+        from agent.memory import WorkingMemory
+        from agent.reflection import ReflectionEngine
+
+        task_model = ws_config.get("model", "") if ws_config else ""
+        task_api_key = ws_config.get("api_key", "") if ws_config else ""
 
         task_tool_registry = build_tool_registry(hands_client=_hands_client, pool=pool)
         evidence_chain = EvidenceChain(task_id=task.id, pool=pool)
+
+        task_working_memory = WorkingMemory(
+            redis_client=None,
+            vector_store=_vector_store,
+        )
+        task_learner = TaskLearner(
+            provider=task_provider,
+            model=task_model,
+            working_memory=task_working_memory,
+        )
+        task_reflection = ReflectionEngine(
+            llm_provider=task_provider,
+            model=task_model,
+        )
+
         task_loop = AgentLoop(
             provider=task_provider,
             tool_registry=task_tool_registry,
             guardrails=Guardrails(),
             persistence=_agent_persistence,
+            model=task_model,
+            api_key=task_api_key,
+            memory_graph=_memory_graph,
+            evidence_chain=evidence_chain,
+            learner=task_learner,
+            reflection_engine=task_reflection,
         )
+
+        # Register this task as an active session
+        if _session_manager:
+            try:
+                await _session_manager.register_session(
+                    session_id=task.id,
+                    task_id=task.id,
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    agent_type="task",
+                    model=task_model,
+                    goal=goal,
+                )
+            except Exception as e:
+                logger.warning(f"Session registration failed: {e}")
 
         event_type_map = {
             "plan_created": brain_pb2.TaskEvent.EventType.PLAN_CREATED,
@@ -1364,6 +1405,11 @@ class BrainServicer:
             )
         finally:
             _running_tasks.pop(task.id, None)
+            if _session_manager:
+                try:
+                    await _session_manager.deregister_session(task.id)
+                except Exception as e:
+                    logger.warning(f"Session deregistration failed: {e}")
 
     async def StreamTaskEvents(self, request, context):
         """Reconnect to an already-running task's event stream."""
