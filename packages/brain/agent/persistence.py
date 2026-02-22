@@ -36,6 +36,17 @@ class PostgresTaskPersistence(TaskPersistence):
         conv_id = task.conversation_id or None
         ws_id = task.workspace_id or None
 
+        # Ensure user row exists (gateway may authenticate users not yet
+        # in brain's local users table). ON CONFLICT DO NOTHING is safe.
+        if task.user_id:
+            placeholder_email = f"{task.user_id}@placeholder.local"
+            await self._pool.execute(
+                """INSERT INTO users (id, email, password_hash, salt, display_name, created_at)
+                   VALUES ($1, $2, '', '', 'User', NOW())
+                   ON CONFLICT (id) DO NOTHING""",
+                task.user_id, placeholder_email,
+            )
+
         await self._pool.execute(
             """
             INSERT INTO agent_tasks (id, user_id, workspace_id, conversation_id,
