@@ -59,6 +59,12 @@ Instructions:
 5. If you encounter an error, try an alternative approach before giving up.
 6. Think step-by-step. Explain your reasoning before acting.
 
+Host Filesystem Strategy:
+- Use project_recall(name) FIRST to check for cached project context.
+- Use host_tree(path) ONCE for full directory tree — never call host_list repeatedly.
+- Use host_find(pattern) to locate files by regex instead of manual directory traversal.
+- host_write requires human approval.
+
 Progress: Step {step_index}/{total_steps} | Iteration {iteration}/{max_iterations}
 
 Previous observations for this step:
