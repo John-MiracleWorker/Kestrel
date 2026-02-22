@@ -6,6 +6,7 @@ import { NotificationBell } from '../Layout/NotificationBell';
 
 interface ChatViewProps {
     workspaceId: string | null;
+    conversationId: string | null;
     messages: Message[];
     streamingMessage: {
         id: string;
@@ -29,6 +30,7 @@ interface ChatViewProps {
 
 export function ChatView({
     workspaceId,
+    conversationId,
     messages,
     streamingMessage,
     onSendMessage,
@@ -277,13 +279,20 @@ export function ChatView({
                     }}
                 >
                     {messages.map((msg) => (
-                        <MessageBubble key={msg.id} message={msg} />
+                        <MessageBubble
+                            key={msg.id}
+                            message={msg}
+                            workspaceId={workspaceId}
+                            conversationId={conversationId}
+                        />
                     ))}
 
                     {streamingMessage && (
                         <MessageBubble
                             message={streamingMessage}
                             isStreaming
+                            workspaceId={workspaceId}
+                            conversationId={conversationId}
                             toolActivity={streamingMessage.toolActivity}
                             agentActivities={streamingMessage.agentActivities}
                         />
@@ -967,67 +976,121 @@ function PhaseDetail({ item, phaseKey }: { item: Activity; phaseKey: string }) {
 
 /* ── Feedback Buttons ─────────────────────────────────────────────── */
 
-function FeedbackButtons({ messageId }: { messageId: string }) {
+function FeedbackButtons({
+    messageId,
+    workspaceId,
+    conversationId,
+}: {
+    messageId: string;
+    workspaceId: string | null;
+    conversationId: string | null;
+}) {
     const [selected, setSelected] = useState<'up' | 'down' | null>(null);
+    const [feedbackStatus, setFeedbackStatus] = useState<'idle' | 'success' | 'error'>('idle');
+    const [idWarning, setIdWarning] = useState('');
+
+    const statusTitle =
+        feedbackStatus === 'success'
+            ? 'Feedback submitted'
+            : feedbackStatus === 'error'
+                ? 'Feedback failed to submit'
+                : undefined;
 
     const submitFeedback = async (rating: 1 | -1) => {
         const next = rating === 1 ? 'up' : 'down';
         if (selected === next) return; // Already selected
+        if (!workspaceId || !conversationId) {
+            setIdWarning('Feedback unavailable: missing conversation context.');
+            setFeedbackStatus('error');
+            return;
+        }
+
+        setIdWarning('');
         setSelected(next);
+        setFeedbackStatus('idle');
         try {
             // Best effort — don't block UI
             const token = localStorage.getItem('kestrel_refresh');
             if (token) {
-                await fetch('/api/workspaces/default/feedback', {
+                const response = await fetch(`/api/workspaces/${workspaceId}/feedback`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        conversationId: '00000000-0000-0000-0000-000000000000',
+                        conversationId,
                         messageId,
                         rating,
                         comment: '',
                     }),
                 });
+
+                if (!response.ok) {
+                    setSelected((current) => (current === next ? null : current));
+                    setFeedbackStatus('error');
+                    return;
+                }
+
+                setFeedbackStatus('success');
+                return;
             }
-        } catch { /* silent */ }
+
+            setSelected((current) => (current === next ? null : current));
+            setFeedbackStatus('error');
+        } catch {
+            setSelected((current) => (current === next ? null : current));
+            setFeedbackStatus('error');
+        }
     };
 
     return (
-        <div style={{ display: 'flex', gap: '4px', marginTop: '4px', marginLeft: '3px' }}>
-            <button
-                onClick={() => submitFeedback(1)}
-                style={{
-                    background: selected === 'up' ? 'rgba(16,185,129,0.15)' : 'transparent',
-                    border: 'none',
-                    color: selected === 'up' ? '#10b981' : 'var(--text-dim)',
-                    cursor: 'pointer',
-                    padding: '2px 6px',
-                    borderRadius: '4px',
-                    fontSize: '0.8rem',
-                    transition: 'all 0.2s',
-                    opacity: selected && selected !== 'up' ? 0.3 : 0.6,
-                }}
-                title="Good response"
-            >
-                👍
-            </button>
-            <button
-                onClick={() => submitFeedback(-1)}
-                style={{
-                    background: selected === 'down' ? 'rgba(239,68,68,0.15)' : 'transparent',
-                    border: 'none',
-                    color: selected === 'down' ? '#ef4444' : 'var(--text-dim)',
-                    cursor: 'pointer',
-                    padding: '2px 6px',
-                    borderRadius: '4px',
-                    fontSize: '0.8rem',
-                    transition: 'all 0.2s',
-                    opacity: selected && selected !== 'down' ? 0.3 : 0.6,
-                }}
-                title="Bad response"
-            >
-                👎
-            </button>
+        <div style={{ marginTop: '4px', marginLeft: '3px' }}>
+            <div style={{ display: 'flex', gap: '4px' }}>
+                <button
+                    onClick={() => submitFeedback(1)}
+                    style={{
+                        background: selected === 'up' ? 'rgba(16,185,129,0.15)' : 'transparent',
+                        border: 'none',
+                        color: selected === 'up' ? '#10b981' : 'var(--text-dim)',
+                        cursor: 'pointer',
+                        padding: '2px 6px',
+                        borderRadius: '4px',
+                        fontSize: '0.8rem',
+                        transition: 'all 0.2s',
+                        opacity: selected && selected !== 'up' ? 0.3 : 0.6,
+                    }}
+                    title={statusTitle || 'Good response'}
+                >
+                    👍
+                </button>
+                <button
+                    onClick={() => submitFeedback(-1)}
+                    style={{
+                        background: selected === 'down' ? 'rgba(239,68,68,0.15)' : 'transparent',
+                        border: 'none',
+                        color: selected === 'down' ? '#ef4444' : 'var(--text-dim)',
+                        cursor: 'pointer',
+                        padding: '2px 6px',
+                        borderRadius: '4px',
+                        fontSize: '0.8rem',
+                        transition: 'all 0.2s',
+                        opacity: selected && selected !== 'down' ? 0.3 : 0.6,
+                    }}
+                    title={statusTitle || 'Bad response'}
+                >
+                    👎
+                </button>
+            </div>
+            {idWarning && (
+                <div
+                    style={{
+                        marginTop: '4px',
+                        fontSize: '0.68rem',
+                        color: 'var(--accent-error)',
+                        fontFamily: 'var(--font-mono)',
+                    }}
+                >
+                    {idWarning}
+                </div>
+            )}
         </div>
     );
 }
@@ -1036,11 +1099,15 @@ function FeedbackButtons({ messageId }: { messageId: string }) {
 
 function MessageBubble({
     message,
+    workspaceId,
+    conversationId,
     isStreaming = false,
     toolActivity,
     agentActivities = [],
 }: {
     message: { role: string; content: string };
+    workspaceId: string | null;
+    conversationId: string | null;
     isStreaming?: boolean;
     toolActivity?: {
         status: string;
@@ -1125,7 +1192,11 @@ function MessageBubble({
             </div>
             {/* Feedback buttons for assistant messages */}
             {!isUser && message.content && !isStreaming && (
-                <FeedbackButtons messageId={(message as { id?: string }).id || ''} />
+                <FeedbackButtons
+                    messageId={(message as { id?: string }).id || ''}
+                    workspaceId={workspaceId}
+                    conversationId={conversationId}
+                />
             )}
             <style>{`
                 @keyframes blink { 50% { opacity: 0; } }
