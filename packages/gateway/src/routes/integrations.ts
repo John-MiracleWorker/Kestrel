@@ -5,10 +5,14 @@ import { requireAuth, requireWorkspace, requireRole } from '../auth/middleware';
 import { ChannelRegistry } from '../channels/registry';
 import { TelegramAdapter } from '../channels/telegram';
 import { logger } from '../utils/logger';
+import Redis from 'ioredis';
+
+const TELEGRAM_CONFIG_KEY = 'telegram:bot:config';
 
 interface IntegrationDeps {
     channelRegistry: ChannelRegistry;
     defaultWorkspaceId?: string;
+    redis: Redis;
 }
 
 /**
@@ -17,7 +21,7 @@ interface IntegrationDeps {
  */
 export default async function integrationRoutes(
     app: FastifyInstance,
-    { channelRegistry, defaultWorkspaceId }: IntegrationDeps
+    { channelRegistry, defaultWorkspaceId, redis }: IntegrationDeps
 ) {
     const typedApp = app.withTypeProvider<ZodTypeProvider>();
 
@@ -37,10 +41,14 @@ export default async function integrationRoutes(
             const telegramAdapter = channelRegistry.getAdapter('telegram') as TelegramAdapter | undefined;
             const discordAdapter = channelRegistry.getAdapter('discord');
             const whatsappAdapter = channelRegistry.getAdapter('whatsapp');
+            const tokenConfigured = !!(await redis.exists(TELEGRAM_CONFIG_KEY));
             return {
                 telegram: {
                     connected: telegramAdapter?.status === 'connected',
                     status: telegramAdapter?.status ?? 'disconnected',
+                    botId: telegramAdapter?.botInfo?.id,
+                    botUsername: telegramAdapter?.botInfo?.username,
+                    tokenConfigured,
                 },
                 discord: {
                     connected: discordAdapter?.status === 'connected',
@@ -91,9 +99,21 @@ export default async function integrationRoutes(
                 });
 
                 await channelRegistry.register(adapter);
+
+                // Persist config so it survives container restarts
+                await redis.set(TELEGRAM_CONFIG_KEY, JSON.stringify({
+                    token,
+                    workspaceId: workspaceId || defaultWorkspaceId || 'default',
+                }));
+
                 logger.info('Telegram adapter connected via settings');
 
-                return { success: true, status: 'connected' };
+                return {
+                    success: true,
+                    status: 'connected',
+                    botId: adapter.botInfo?.id,
+                    botUsername: adapter.botInfo?.username,
+                };
             } catch (err: any) {
                 logger.error('Telegram integration error', { error: err.message });
                 return reply.status(400).send({
@@ -116,6 +136,8 @@ export default async function integrationRoutes(
                 await channelRegistry.unregister('telegram');
                 logger.info('Telegram adapter disconnected via settings');
             }
+            // Remove persisted config so it won't be restored on next startup
+            await redis.del(TELEGRAM_CONFIG_KEY);
             return { success: true, status: 'disconnected' };
         }
     );
