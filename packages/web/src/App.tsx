@@ -108,6 +108,7 @@ export default function App() {
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative' }}>
                 <ChatView
                     workspaceId={currentWorkspace?.id || null}
+                    conversationId={currentConversation?.id || null}
                     messages={messages}
                     streamingMessage={streamingMessage}
                     onSendMessage={sendMessage}

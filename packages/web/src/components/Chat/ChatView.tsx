@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, type FormEvent } from 'react';
+import { useState, useRef, useEffect, useMemo, type FormEvent } from 'react';
 import type { Message } from '../../api/client';
 import { providers, uploadFiles } from '../../api/client';
 import { RichContent } from './RichContent';
@@ -6,6 +6,7 @@ import { NotificationBell } from '../Layout/NotificationBell';
 
 interface ChatViewProps {
     workspaceId: string | null;
+    conversationId?: string | null;
     messages: Message[];
     streamingMessage: {
         id: string;
@@ -29,6 +30,7 @@ interface ChatViewProps {
 
 export function ChatView({
     workspaceId,
+    conversationId,
     messages,
     streamingMessage,
     onSendMessage,
@@ -47,6 +49,86 @@ export function ChatView({
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [pendingFiles, setPendingFiles] = useState<File[]>([]);
     const [isUploading, setIsUploading] = useState(false);
+    const [draftStatus, setDraftStatus] = useState<'idle' | 'restored'>('idle');
+
+    const restoredModelRef = useRef<string | null>(null);
+    const persistedDraftRef = useRef('');
+
+    const storageKey = useMemo(() => {
+        if (!workspaceId) return null;
+        const conversationKey = conversationId || conversationTitle || 'new-session';
+        return `kestrel.chat.draft.${workspaceId}.${conversationKey}`;
+    }, [workspaceId, conversationId, conversationTitle]);
+
+    const availableProviders = useMemo(
+        () => new Set(['google', 'openai', 'anthropic', 'local']),
+        [],
+    );
+
+    const persistState = (next: { input?: string; selectedProvider?: string; selectedModel?: string }) => {
+        if (!storageKey || typeof window === 'undefined') return;
+
+        const currentRaw = window.localStorage.getItem(storageKey);
+        const current = currentRaw
+            ? (JSON.parse(currentRaw) as { input?: string; selectedProvider?: string; selectedModel?: string })
+            : {};
+
+        const merged = {
+            ...current,
+            ...next,
+        };
+
+        window.localStorage.setItem(storageKey, JSON.stringify(merged));
+    };
+
+    const clearStoredDraftInput = () => {
+        if (!storageKey || typeof window === 'undefined') return;
+
+        const currentRaw = window.localStorage.getItem(storageKey);
+        if (!currentRaw) return;
+
+        const current = JSON.parse(currentRaw) as { input?: string; selectedProvider?: string; selectedModel?: string };
+        delete current.input;
+        persistedDraftRef.current = '';
+        setDraftStatus('idle');
+
+        if (!current.selectedProvider && !current.selectedModel) {
+            window.localStorage.removeItem(storageKey);
+            return;
+        }
+
+        window.localStorage.setItem(storageKey, JSON.stringify(current));
+    };
+
+    const restoreDraft = () => {
+        if (!persistedDraftRef.current) return;
+        setInput(persistedDraftRef.current);
+        setDraftStatus('restored');
+    };
+
+    useEffect(() => {
+        if (!storageKey || typeof window === 'undefined') return;
+
+        const raw = window.localStorage.getItem(storageKey);
+        if (!raw) return;
+
+        const persisted = JSON.parse(raw) as {
+            input?: string;
+            selectedProvider?: string;
+            selectedModel?: string;
+        };
+
+        if (persisted.input) {
+            setInput(persisted.input);
+            persistedDraftRef.current = persisted.input;
+            setDraftStatus('restored');
+        }
+
+        if (persisted.selectedProvider && availableProviders.has(persisted.selectedProvider)) {
+            setSelectedProvider(persisted.selectedProvider);
+            restoredModelRef.current = persisted.selectedModel || null;
+        }
+    }, [storageKey, availableProviders]);
 
     // Auto-scroll on new messages
     useEffect(() => {
@@ -74,11 +156,20 @@ export function ChatView({
             .then((models) => {
                 const modelIds = models.map((m) => m.id);
                 setAvailableModels(modelIds);
-                if (modelIds.length > 0) {
-                    setSelectedModel(modelIds[0]);
-                } else {
-                    setSelectedModel('');
-                }
+
+                const restoredModel = restoredModelRef.current;
+                setSelectedModel((currentModel) => {
+                    if (restoredModel && modelIds.includes(restoredModel)) {
+                        return restoredModel;
+                    }
+
+                    if (currentModel && modelIds.includes(currentModel)) {
+                        return currentModel;
+                    }
+
+                    return modelIds[0] || '';
+                });
+                restoredModelRef.current = null;
             })
             .catch((err) => {
                 console.error('Failed to fetch models:', err);
@@ -87,6 +178,32 @@ export function ChatView({
             })
             .finally(() => setLoadingModels(false));
     }, [selectedProvider, workspaceId]);
+
+    useEffect(() => {
+        if (!storageKey) return;
+        const timeout = setTimeout(() => {
+            persistState({ input });
+            persistedDraftRef.current = input;
+        }, 300);
+
+        return () => clearTimeout(timeout);
+    }, [input, storageKey]);
+
+    useEffect(() => {
+        if (!storageKey) return;
+
+        if (!selectedProvider) {
+            persistState({ selectedProvider: '', selectedModel: '' });
+            return;
+        }
+
+        persistState({ selectedProvider });
+    }, [selectedProvider, storageKey]);
+
+    useEffect(() => {
+        if (!storageKey || !selectedProvider) return;
+        persistState({ selectedModel });
+    }, [selectedModel, selectedProvider, storageKey]);
 
     function handleSubmit(e: FormEvent) {
         e.preventDefault();
@@ -107,12 +224,14 @@ export function ChatView({
                     onSendMessage(trimmed || 'Analyze these files', selectedProvider || undefined, selectedModel || undefined, attachments);
                     setInput('');
                     setPendingFiles([]);
+                    clearStoredDraftInput();
                 })
                 .catch((err) => console.error('Upload failed:', err))
                 .finally(() => setIsUploading(false));
         } else {
             onSendMessage(trimmed, selectedProvider || undefined, selectedModel || undefined);
             setInput('');
+            clearStoredDraftInput();
         }
     }
 
@@ -133,6 +252,21 @@ export function ChatView({
     function handleProviderChange(provider: string) {
         setSelectedProvider(provider);
         setSelectedModel('');
+
+        if (!provider && storageKey && typeof window !== 'undefined') {
+            const raw = window.localStorage.getItem(storageKey);
+            if (!raw) return;
+            const persisted = JSON.parse(raw) as { input?: string; selectedProvider?: string; selectedModel?: string };
+            delete persisted.selectedProvider;
+            delete persisted.selectedModel;
+
+            if (!persisted.input) {
+                window.localStorage.removeItem(storageKey);
+                return;
+            }
+
+            window.localStorage.setItem(storageKey, JSON.stringify(persisted));
+        }
     }
 
     function handleKeyDown(e: React.KeyboardEvent) {
@@ -388,6 +522,27 @@ export function ChatView({
                                 lineHeight: '1.5',
                             }}
                         />
+                        <div style={{ marginTop: '6px', fontSize: '0.7rem', color: 'var(--text-dim)' }}>
+                            {draftStatus === 'restored' ? (
+                                <span>Draft restored</span>
+                            ) : persistedDraftRef.current && !input ? (
+                                <button
+                                    type="button"
+                                    onClick={restoreDraft}
+                                    style={{
+                                        background: 'transparent',
+                                        border: 'none',
+                                        color: 'var(--accent-cyan)',
+                                        cursor: 'pointer',
+                                        padding: 0,
+                                        fontFamily: 'var(--font-mono)',
+                                        fontSize: '0.7rem',
+                                    }}
+                                >
+                                    Restore draft
+                                </button>
+                            ) : null}
+                        </div>
                     </div>
                     {/* Hidden file input */}
                     <input
