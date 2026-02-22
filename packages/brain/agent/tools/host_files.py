@@ -13,9 +13,14 @@ Security model:
 """
 
 import difflib
+import asyncio
+import json
 import logging
 import os
 import re
+import subprocess
+import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +33,13 @@ from agent.tools.project_context import (
 )
 
 logger = logging.getLogger("brain.agent.tools.host_files")
+
+
+READ_CACHE_MAX_ENTRIES = 128
+TREE_CACHE_TTL_SECONDS = 20
+
+_read_cache: OrderedDict[str, dict] = OrderedDict()
+_tree_cache: OrderedDict[tuple[str, int], dict] = OrderedDict()
 
 
 # ── Sensitive Path Blocklist ─────────────────────────────────────────
@@ -162,6 +174,128 @@ def _resolve_host_path(path: str, mounts: list[str]) -> Path:
     )
 
 
+def _read_text_cached(path: Path) -> tuple[str, os.stat_result, bool]:
+    """Read UTF-8 text with a small LRU cache keyed by path+mtime+size."""
+    stat = path.stat()
+    key = str(path)
+    cached = _read_cache.get(key)
+    if cached and cached["mtime_ns"] == stat.st_mtime_ns and cached["size"] == stat.st_size:
+        _read_cache.move_to_end(key)
+        return cached["content"], stat, True
+
+    content = path.read_text(encoding="utf-8", errors="replace")
+    _read_cache[key] = {
+        "mtime_ns": stat.st_mtime_ns,
+        "size": stat.st_size,
+        "content": content,
+    }
+    _read_cache.move_to_end(key)
+    while len(_read_cache) > READ_CACHE_MAX_ENTRIES:
+        _read_cache.popitem(last=False)
+    return content, stat, False
+
+
+def _build_host_tree_sync(resolved: Path, depth: int) -> dict:
+    """Build host tree using scandir for lower syscall overhead."""
+    cache_key = (str(resolved), depth)
+    now = time.time()
+    cached = _tree_cache.get(cache_key)
+    try:
+        root_mtime_ns = resolved.stat().st_mtime_ns
+    except OSError:
+        root_mtime_ns = 0
+
+    if cached and (now - cached["created_at"]) <= TREE_CACHE_TTL_SECONDS and cached["root_mtime_ns"] == root_mtime_ns:
+        return {**cached["result"], "cache_hit": True}
+
+    tree_lines: list[str] = []
+    file_count = 0
+    dir_count = 0
+    max_entries = 500
+
+    def _build_tree(directory: Path, prefix: str, current_depth: int):
+        nonlocal file_count, dir_count
+
+        if current_depth > depth or (file_count + dir_count) >= max_entries:
+            return
+
+        try:
+            with os.scandir(directory) as scanner:
+                entries = sorted(list(scanner), key=lambda x: (not x.is_dir(follow_symlinks=False), x.name.lower()))
+        except (PermissionError, OSError):
+            return
+
+        visible = []
+        for entry in entries:
+            name = entry.name
+            if name.startswith(".") and name not in (".env.example",):
+                continue
+            if name in TREE_SKIP_DIRS:
+                continue
+            entry_path = Path(entry.path)
+            if _is_blocked_path(entry_path) is not None:
+                continue
+            visible.append(entry)
+
+        for i, entry in enumerate(visible):
+            if (file_count + dir_count) >= max_entries:
+                tree_lines.append(f"{prefix}... (truncated)")
+                return
+
+            is_last = (i == len(visible) - 1)
+            connector = "└── " if is_last else "├── "
+            extension = "    " if is_last else "│   "
+
+            entry_path = Path(entry.path)
+            if entry.is_dir(follow_symlinks=False):
+                dir_count += 1
+                marker_hint = ""
+                if current_depth <= 1:
+                    sub_markers = []
+                    for marker, tech in PROJECT_MARKERS.items():
+                        if (entry_path / marker).exists():
+                            sub_markers.append(tech)
+                    marker_hint = f"  [{', '.join(sub_markers)}]" if sub_markers else ""
+                tree_lines.append(f"{prefix}{connector}{entry.name}/{marker_hint}")
+                _build_tree(entry_path, prefix + extension, current_depth + 1)
+            else:
+                file_count += 1
+                try:
+                    size = entry.stat(follow_symlinks=False).st_size
+                    if size > 1_000_000:
+                        size_str = f" ({size / 1_000_000:.1f}MB)"
+                    elif size > 1000:
+                        size_str = f" ({size / 1000:.0f}KB)"
+                    else:
+                        size_str = ""
+                except OSError:
+                    size_str = ""
+                tree_lines.append(f"{prefix}{connector}{entry.name}{size_str}")
+
+    _build_tree(resolved, "", 0)
+    summary = {
+        "files": file_count,
+        "directories": dir_count,
+        "truncated": (file_count + dir_count) >= max_entries,
+    }
+    tree = "\n".join(tree_lines)
+    _tree_cache[cache_key] = {
+        "created_at": now,
+        "root_mtime_ns": root_mtime_ns,
+        "result": {
+            "tree": tree,
+            "summary": summary,
+        },
+    }
+    while len(_tree_cache) > 64:
+        _tree_cache.popitem(last=False)
+    return {
+        "tree": tree,
+        "summary": summary,
+        "cache_hit": False,
+    }
+
+
 # ── Tool Handlers ────────────────────────────────────────────────────
 
 
@@ -183,14 +317,14 @@ async def host_read(
         if not resolved.is_file():
             return {"error": f"Not a file: {path}"}
 
-        size = resolved.stat().st_size
+        content, stat, cache_hit = await asyncio.to_thread(_read_text_cached, resolved)
+        size = stat.st_size
         if size > 2_000_000:  # 2MB
             return {
                 "error": f"File too large ({size:,} bytes). "
                          "Consider reading specific line ranges with start_line/end_line.",
             }
 
-        content = resolved.read_text(encoding="utf-8", errors="replace")
         lines = content.split("\n")
         total_lines = len(lines)
 
@@ -202,15 +336,16 @@ async def host_read(
             end_idx = min(start_idx + max_lines, total_lines)
 
         selected_lines = lines[start_idx:end_idx]
-        content = "\n".join(selected_lines)
+        content_slice = "\n".join(selected_lines)
 
         return {
             "path": _container_to_host_path(resolved),
-            "content": content,
+            "content": content_slice,
             "start_line": start_idx + 1,
             "end_line": end_idx,
             "total_lines": total_lines,
             "size_bytes": size,
+            "cache_hit": cache_hit,
         }
 
     except ValueError as e:
@@ -225,9 +360,9 @@ async def host_batch_read(
     workspace_id: str = "default",
 ) -> dict:
     """Read multiple files in a single call. Returns all contents together."""
-    MAX_FILES = 10
+    MAX_FILES = 20
     MAX_BYTES_PER_FILE = 50_000
-    MAX_TOTAL_BYTES = 200_000
+    MAX_TOTAL_BYTES = 500_000
 
     if not paths:
         return {"error": "No paths provided. Pass a list of file paths."}
@@ -236,53 +371,57 @@ async def host_batch_read(
         return {"error": f"Too many files ({len(paths)}). Maximum is {MAX_FILES}."}
 
     mounts = _get_host_mounts()
-    results = []
-    total_bytes = 0
 
-    for file_path in paths:
+    async def _read_one(file_path: str) -> dict:
         entry = {"path": file_path}
         try:
             resolved = _resolve_host_path(file_path, mounts)
 
             if not resolved.exists():
                 entry["error"] = "File not found"
-                results.append(entry)
-                continue
+                return entry
 
             if not resolved.is_file():
                 entry["error"] = "Not a file"
-                results.append(entry)
-                continue
+                return entry
 
-            size = resolved.stat().st_size
+            content, stat, cache_hit = await asyncio.to_thread(_read_text_cached, resolved)
+            size = stat.st_size
             if size > MAX_BYTES_PER_FILE:
                 entry["error"] = f"File too large ({size:,} bytes, max {MAX_BYTES_PER_FILE:,})"
                 entry["size_bytes"] = size
-                results.append(entry)
-                continue
+                return entry
 
-            if total_bytes + size > MAX_TOTAL_BYTES:
-                entry["error"] = f"Total batch size exceeded ({MAX_TOTAL_BYTES:,} bytes)"
-                results.append(entry)
-                continue
-
-            content = resolved.read_text(encoding="utf-8", errors="replace")
             lines = content.split("\n")
             if len(lines) > max_lines_per_file:
                 content = "\n".join(lines[:max_lines_per_file])
                 entry["truncated_at_line"] = max_lines_per_file
                 entry["total_lines"] = len(lines)
 
-            total_bytes += len(content)
             entry["content"] = content
             entry["lines"] = min(len(lines), max_lines_per_file)
             entry["path"] = _container_to_host_path(resolved)
-
+            entry["size_bytes"] = size
+            entry["cache_hit"] = cache_hit
         except ValueError as e:
             entry["error"] = str(e)
         except Exception as e:
             entry["error"] = f"Read failed: {e}"
+        return entry
 
+    pending = await asyncio.gather(*[_read_one(file_path) for file_path in paths])
+
+    results = []
+    total_bytes = 0
+    for entry in pending:
+        content = entry.get("content")
+        if content is not None:
+            content_bytes = len(content.encode("utf-8"))
+            if total_bytes + content_bytes > MAX_TOTAL_BYTES:
+                entry.pop("content", None)
+                entry["error"] = f"Total batch size exceeded ({MAX_TOTAL_BYTES:,} bytes)"
+            else:
+                total_bytes += content_bytes
         results.append(entry)
 
     return {
@@ -290,6 +429,11 @@ async def host_batch_read(
         "count": len(results),
         "successful": sum(1 for r in results if "content" in r),
         "total_bytes": total_bytes,
+        "limits": {
+            "max_files": MAX_FILES,
+            "max_bytes_per_file": MAX_BYTES_PER_FILE,
+            "max_total_bytes": MAX_TOTAL_BYTES,
+        },
     }
 
 
@@ -297,6 +441,7 @@ async def host_list(
     path: str = ".",
     recursive: bool = False,
     pattern: str = "",
+    depth_limit: int = 4,
     workspace_id: str = "default",
 ) -> dict:
     """List files and directories in a host path."""
@@ -315,35 +460,42 @@ async def host_list(
         if not resolved.exists():
             return {"error": f"Directory not found: {path}"}
 
-        if not resolved.is_file():
-            pass  # It's a directory, proceed
-        else:
+        if resolved.is_file():
             return {"error": f"Not a directory: {path}. Use host_read to read files."}
 
         entries = []
         max_entries = 200
 
         def _should_skip(item: Path) -> bool:
-            """Skip hidden dirs, node_modules, etc."""
             name = item.name
             if name.startswith(".") and name not in (".", ".."):
                 return True
-            if name in ("node_modules", "__pycache__", ".git", "venv", ".venv"):
+            if name in TREE_SKIP_DIRS:
                 return True
             return _is_blocked_path(item) is not None
 
         if recursive:
-            for item in sorted(resolved.rglob("*")):
-                if len(entries) >= max_entries:
-                    break
-                rel = item.relative_to(resolved)
-                if len(rel.parts) > 4:
+            queue = [(resolved, 0)]
+            while queue and len(entries) < max_entries:
+                current, level = queue.pop(0)
+                try:
+                    children = sorted(current.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+                except (PermissionError, OSError):
                     continue
-                if any(_should_skip(Path(p)) for p in rel.parts):
-                    continue
-                if pattern and not re.search(pattern, str(rel), re.IGNORECASE):
-                    continue
-                entries.append(_host_file_info(item, resolved))
+
+                for item in children:
+                    if len(entries) >= max_entries:
+                        break
+                    if _should_skip(item):
+                        continue
+
+                    rel = item.relative_to(resolved)
+                    if pattern and not re.search(pattern, str(rel), re.IGNORECASE):
+                        continue
+
+                    entries.append(_host_file_info(item, resolved))
+                    if item.is_dir() and level < depth_limit:
+                        queue.append((item, level + 1))
         else:
             for item in sorted(resolved.iterdir()):
                 if len(entries) >= max_entries:
@@ -359,6 +511,7 @@ async def host_list(
             "entries": entries,
             "count": len(entries),
             "truncated": len(entries) >= max_entries,
+            "depth_limit": depth_limit,
             "_hint": "TIP: Use host_tree(path) for a full recursive tree with project context detection. Use host_find(pattern) to search for files.",
         }
 
@@ -383,70 +536,143 @@ async def host_search(
         if not resolved.exists():
             return {"error": f"Path not found: {path}"}
 
-        results = []
-        files_searched = 0
-        search_re = re.compile(re.escape(query), re.IGNORECASE)
-
-        # Walk the directory
         search_root = resolved if resolved.is_dir() else resolved.parent
+        file_re = re.compile(file_pattern, re.IGNORECASE) if file_pattern else None
 
-        for root_dir, dirs, files in os.walk(search_root):
-            # Skip hidden/ignored directories
-            dirs[:] = [
-                d for d in dirs
-                if not d.startswith(".")
-                and d not in ("node_modules", "__pycache__", "venv", ".venv", ".git")
-                and _is_blocked_path(Path(root_dir) / d) is None
-            ]
+        cmd = [
+            "rg",
+            "--json",
+            "--line-number",
+            "--ignore-case",
+            "--fixed-strings",
+            "--max-columns", "220",
+            "--max-columns-preview",
+            "-g", "!**/.git/**",
+            "-g", "!**/node_modules/**",
+            "-g", "!**/__pycache__/**",
+            "-g", "!**/.venv/**",
+            "-g", "!**/venv/**",
+            query,
+            ".",
+        ]
 
-            for fname in files:
-                if len(results) >= max_results:
-                    break
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            cmd,
+            cwd=str(search_root),
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
 
-                fpath = Path(root_dir) / fname
+        if proc.returncode not in (0, 1):
+            raise RuntimeError(proc.stderr.strip() or f"ripgrep failed with exit code {proc.returncode}")
 
-                # Skip blocked
-                if _is_blocked_path(fpath) is not None:
-                    continue
+        results = []
+        files_seen = set()
+        for line in proc.stdout.splitlines():
+            if len(results) >= max_results:
+                break
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("type") != "match":
+                continue
 
-                # File pattern filter
-                if file_pattern and not re.search(file_pattern, fname, re.IGNORECASE):
-                    continue
+            data = payload.get("data", {})
+            rel_path = data.get("path", {}).get("text")
+            if not rel_path:
+                continue
 
-                # Skip binary/large files
-                try:
-                    size = fpath.stat().st_size
-                    if size > 500_000:
-                        continue
-                except OSError:
-                    continue
+            full_path = (search_root / rel_path).resolve()
+            if _is_blocked_path(full_path) is not None:
+                continue
 
-                try:
-                    content = fpath.read_text(encoding="utf-8", errors="strict")
-                except (UnicodeDecodeError, OSError):
-                    continue
+            if file_re and not file_re.search(full_path.name):
+                continue
 
-                files_searched += 1
-
-                for i, line in enumerate(content.split("\n"), 1):
-                    if search_re.search(line):
-                        results.append({
-                            "file": _container_to_host_path(fpath),
-                            "line": i,
-                            "content": line.strip()[:200],
-                        })
-                        if len(results) >= max_results:
-                            break
+            line_number = data.get("line_number")
+            content = (data.get("lines", {}).get("text") or "").strip()
+            results.append({
+                "file": _container_to_host_path(full_path),
+                "line": line_number,
+                "content": content[:200],
+            })
+            files_seen.add(str(full_path))
 
         return {
             "query": query,
             "path": _container_to_host_path(resolved),
             "results": results,
             "count": len(results),
-            "files_searched": files_searched,
+            "files_searched": len(files_seen),
             "truncated": len(results) >= max_results,
+            "backend": "ripgrep",
         }
 
+    except (FileNotFoundError, RuntimeError, subprocess.TimeoutExpired):
+        # Fallback: Python scanner if ripgrep is unavailable or timed out.
+        try:
+            results = []
+            files_searched = 0
+            search_re = re.compile(re.escape(query), re.IGNORECASE)
+            search_root = resolved if resolved.is_dir() else resolved.parent
+
+            for root_dir, dirs, files in os.walk(search_root):
+                dirs[:] = [
+                    d for d in dirs
+                    if not d.startswith(".")
+                    and d not in TREE_SKIP_DIRS
+                    and _is_blocked_path(Path(root_dir) / d) is None
+                ]
+
+                for fname in files:
+                    if len(results) >= max_results:
+                        break
+
+                    fpath = Path(root_dir) / fname
+                    if _is_blocked_path(fpath) is not None:
+                        continue
+                    if file_pattern and not re.search(file_pattern, fname, re.IGNORECASE):
+                        continue
+
+                    try:
+                        size = fpath.stat().st_size
+                        if size > 500_000:
+                            continue
+                    except OSError:
+                        continue
+
+                    try:
+                        content = fpath.read_text(encoding="utf-8", errors="strict")
+                    except (UnicodeDecodeError, OSError):
+                        continue
+
+                    files_searched += 1
+                    for i, text_line in enumerate(content.split("\n"), 1):
+                        if search_re.search(text_line):
+                            results.append({
+                                "file": _container_to_host_path(fpath),
+                                "line": i,
+                                "content": text_line.strip()[:200],
+                            })
+                            if len(results) >= max_results:
+                                break
+
+            return {
+                "query": query,
+                "path": _container_to_host_path(resolved),
+                "results": results,
+                "count": len(results),
+                "files_searched": files_searched,
+                "truncated": len(results) >= max_results,
+                "backend": "python-fallback",
+            }
+        except Exception as e:
+            return {"error": f"Failed to search: {e}"}
     except ValueError as e:
         return {"error": str(e)}
     except Exception as e:
@@ -574,6 +800,8 @@ TREE_SKIP_DIRS = {
 async def host_tree(
     path: str,
     depth: int = 4,
+    start_after: int = 0,
+    max_tree_lines: int = 500,
     workspace_id: str = "default",
 ) -> dict:
     """
@@ -600,8 +828,7 @@ async def host_tree(
         pkg_json = resolved / "package.json"
         if pkg_json.exists():
             try:
-                import json as _json
-                pkg = _json.loads(pkg_json.read_text(encoding="utf-8", errors="replace"))
+                pkg = json.loads(pkg_json.read_text(encoding="utf-8", errors="replace"))
                 project_context["name"] = pkg.get("name", "")
                 project_context["description"] = pkg.get("description", "")
                 deps = list(pkg.get("dependencies", {}).keys())[:15]
@@ -620,85 +847,30 @@ async def host_tree(
         if pyproject.exists() and not project_context:
             try:
                 content = pyproject.read_text(encoding="utf-8", errors="replace")
-                # Simple extraction without toml parser
                 for line in content.split("\n"):
                     if "name" in line and "=" in line and "name" not in project_context:
-                        project_context["name"] = line.split("=", 1)[1].strip().strip('"\'')
+                        project_context["name"] = line.split("=", 1)[1].strip().strip("\"'")
                         break
             except Exception:
                 pass
 
-        # Build tree
-        tree_lines = []
-        file_count = 0
-        dir_count = 0
-        max_entries = 500
+        tree_payload = await asyncio.to_thread(_build_host_tree_sync, resolved, depth)
+        tree_lines = tree_payload["tree"].split("\n") if tree_payload["tree"] else []
 
-        def _build_tree(directory: Path, prefix: str, current_depth: int):
-            nonlocal file_count, dir_count
-
-            if current_depth > depth or (file_count + dir_count) >= max_entries:
-                return
-
-            try:
-                entries = sorted(directory.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
-            except PermissionError:
-                return
-
-            # Filter entries
-            visible = []
-            for entry in entries:
-                name = entry.name
-                if name.startswith(".") and name not in (".env.example",):
-                    continue
-                if name in TREE_SKIP_DIRS:
-                    continue
-                if _is_blocked_path(entry) is not None:
-                    continue
-                visible.append(entry)
-
-            for i, entry in enumerate(visible):
-                if (file_count + dir_count) >= max_entries:
-                    tree_lines.append(f"{prefix}... (truncated)")
-                    return
-
-                is_last = (i == len(visible) - 1)
-                connector = "└── " if is_last else "├── "
-                extension = "    " if is_last else "│   "
-
-                if entry.is_dir():
-                    dir_count += 1
-                    # Check for project markers in subdirs
-                    sub_markers = []
-                    for marker, tech in PROJECT_MARKERS.items():
-                        if (entry / marker).exists():
-                            sub_markers.append(tech)
-                    marker_hint = f"  [{', '.join(sub_markers)}]" if sub_markers else ""
-                    tree_lines.append(f"{prefix}{connector}{entry.name}/{marker_hint}")
-                    _build_tree(entry, prefix + extension, current_depth + 1)
-                else:
-                    file_count += 1
-                    try:
-                        size = entry.stat().st_size
-                        if size > 1_000_000:
-                            size_str = f" ({size / 1_000_000:.1f}MB)"
-                        elif size > 1000:
-                            size_str = f" ({size / 1000:.0f}KB)"
-                        else:
-                            size_str = ""
-                    except OSError:
-                        size_str = ""
-                    tree_lines.append(f"{prefix}{connector}{entry.name}{size_str}")
-
-        _build_tree(resolved, "", 0)
+        start_idx = max(0, start_after)
+        end_idx = min(len(tree_lines), start_idx + max_tree_lines)
+        tree_page = "\n".join(tree_lines[start_idx:end_idx])
 
         result = {
             "path": _container_to_host_path(resolved),
-            "tree": "\n".join(tree_lines),
-            "summary": {
-                "files": file_count,
-                "directories": dir_count,
-                "truncated": (file_count + dir_count) >= max_entries,
+            "tree": tree_page,
+            "summary": tree_payload["summary"],
+            "cache_hit": tree_payload.get("cache_hit", False),
+            "paging": {
+                "start_after": start_idx,
+                "returned_lines": max(0, end_idx - start_idx),
+                "total_lines": len(tree_lines),
+                "next_cursor": end_idx if end_idx < len(tree_lines) else None,
             },
         }
 
@@ -709,7 +881,8 @@ async def host_tree(
 
         # Auto-save project context to memory (fire-and-forget)
         try:
-            memo_id = await save_project_context(result, workspace_id=workspace_id)
+            memo_result = {**result, "tree": "\n".join(tree_lines[:1200])}
+            memo_id = await save_project_context(memo_result, workspace_id=workspace_id)
             if memo_id:
                 result["_memo"] = f"Project context saved to memory (id={memo_id})"
         except Exception as e:
@@ -881,7 +1054,7 @@ def register_host_file_tools(registry, vector_store=None) -> None:
                 "Pass a list of paths and get all contents back at once. "
                 "USE THIS instead of calling host_read multiple times — "
                 "it's 10x faster for reading multiple files (e.g. during code audits). "
-                "Maximum 10 files per call, 50KB per file."
+                "Maximum 20 files per call, 50KB per file, 500KB total."
             ),
             parameters={
                 "type": "object",

@@ -62,7 +62,8 @@ Instructions:
 Host Filesystem Strategy:
 - Use project_recall(name) FIRST to check for cached project context.
 - Use host_tree(path) ONCE for full directory tree — never call host_list repeatedly.
-- Use host_find(pattern) to locate files by regex instead of manual directory traversal.
+- Use host_find(pattern) or host_search(query, path) before broad reads to narrow scope quickly.
+- Use host_batch_read(paths) for grouped file reads instead of repeated host_read calls.
 - host_write requires human approval.
 
 Progress: Step {step_index}/{total_steps} | Iteration {iteration}/{max_iterations}
