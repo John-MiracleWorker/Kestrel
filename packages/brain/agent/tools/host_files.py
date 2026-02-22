@@ -35,8 +35,9 @@ from agent.tools.project_context import (
 logger = logging.getLogger("brain.agent.tools.host_files")
 
 
-READ_CACHE_MAX_ENTRIES = 128
-TREE_CACHE_TTL_SECONDS = 20
+READ_CACHE_MAX_ENTRIES = 256
+TREE_CACHE_TTL_SECONDS = 60
+TREE_CACHE_MAX_ENTRIES = 128
 
 _read_cache: OrderedDict[str, dict] = OrderedDict()
 _tree_cache: OrderedDict[tuple[str, int], dict] = OrderedDict()
@@ -45,7 +46,7 @@ _tree_cache: OrderedDict[tuple[str, int], dict] = OrderedDict()
 # ── Sensitive Path Blocklist ─────────────────────────────────────────
 # These paths are NEVER accessible, even if a parent is mounted.
 
-BLOCKED_PATHS = [
+BLOCKED_PATHS = frozenset([
     ".ssh",
     ".gnupg",
     ".gpg",
@@ -62,7 +63,7 @@ BLOCKED_PATHS = [
     ".env.local",
     ".env.production",
     "node_modules",
-]
+])
 
 BLOCKED_EXTENSIONS = {
     ".pem", ".key", ".p12", ".pfx", ".jks",
@@ -113,12 +114,10 @@ def _container_to_host_path(container_path: Path) -> str:
 
 def _is_blocked_path(path: Path) -> Optional[str]:
     """Check if a path matches the sensitive blocklist."""
-    path_str = str(path)
-    path_parts = path.parts
-
-    for blocked in BLOCKED_PATHS:
-        if blocked in path_parts or f"/{blocked}" in path_str:
-            return f"Access denied: '{blocked}' is a sensitive directory"
+    # O(1) average-case set intersection instead of O(n) linear scan
+    hit = set(path.parts) & BLOCKED_PATHS
+    if hit:
+        return f"Access denied: '{next(iter(hit))}' is a sensitive directory"
 
     if path.suffix.lower() in BLOCKED_EXTENSIONS:
         return f"Access denied: '{path.suffix}' files contain sensitive data"
@@ -287,7 +286,7 @@ def _build_host_tree_sync(resolved: Path, depth: int) -> dict:
             "summary": summary,
         },
     }
-    while len(_tree_cache) > 64:
+    while len(_tree_cache) > TREE_CACHE_MAX_ENTRIES:
         _tree_cache.popitem(last=False)
     return {
         "tree": tree,
@@ -475,27 +474,40 @@ async def host_list(
             return _is_blocked_path(item) is not None
 
         if recursive:
-            queue = [(resolved, 0)]
-            while queue and len(entries) < max_entries:
-                current, level = queue.pop(0)
+            # DFS with a list-stack (O(1) pop) and os.scandir (fewer syscalls than iterdir)
+            stack = [(resolved, 0)]
+            while stack and len(entries) < max_entries:
+                current, level = stack.pop()
                 try:
-                    children = sorted(current.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+                    with os.scandir(current) as scanner:
+                        scan_entries = sorted(
+                            scanner,
+                            key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()),
+                        )
                 except (PermissionError, OSError):
                     continue
 
-                for item in children:
+                subdirs = []
+                for entry in scan_entries:
                     if len(entries) >= max_entries:
                         break
+                    item = Path(entry.path)
                     if _should_skip(item):
                         continue
 
                     rel = item.relative_to(resolved)
                     if pattern and not re.search(pattern, str(rel), re.IGNORECASE):
+                        # Still descend into directories even if name doesn't match pattern
+                        if entry.is_dir(follow_symlinks=False) and level < depth_limit:
+                            subdirs.append((item, level + 1))
                         continue
 
                     entries.append(_host_file_info(item, resolved))
-                    if item.is_dir() and level < depth_limit:
-                        queue.append((item, level + 1))
+                    if entry.is_dir(follow_symlinks=False) and level < depth_limit:
+                        subdirs.append((item, level + 1))
+
+                # Push in reverse so leftmost dirs are processed first
+                stack.extend(reversed(subdirs))
         else:
             for item in sorted(resolved.iterdir()):
                 if len(entries) >= max_entries:
@@ -911,6 +923,66 @@ async def host_find(
         if not resolved.exists():
             return {"error": f"Path not found: {path}"}
 
+        # ── Fast path: fd (fast-find) ─────────────────────────────────
+        # fd is 10-50x faster than os.walk for large repos.
+        try:
+            cmd = [
+                "fd",
+                "--absolute-path",
+                "--no-ignore",          # consistent behavior regardless of .gitignore
+                "--regex", pattern,
+                "--max-results", str(max_results),
+            ]
+            if file_type == "file":
+                cmd += ["--type", "f"]
+            elif file_type == "directory":
+                cmd += ["--type", "d"]
+            # Exclude the same dirs that os.walk skips
+            for skip in TREE_SKIP_DIRS:
+                cmd += ["--exclude", skip]
+            cmd += [".", str(resolved)]
+
+            proc = await asyncio.to_thread(
+                subprocess.run, cmd,
+                capture_output=True, text=True, timeout=10,
+            )
+
+            if proc.returncode in (0, 1):
+                results = []
+                for line in proc.stdout.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    fpath = Path(line)
+                    if fpath.name.startswith("."):
+                        continue
+                    if _is_blocked_path(fpath) is not None:
+                        continue
+                    is_dir = fpath.is_dir()
+                    entry = {
+                        "name": fpath.name,
+                        "path": _container_to_host_path(fpath),
+                        "type": "directory" if is_dir else "file",
+                    }
+                    if not is_dir:
+                        try:
+                            entry["size_bytes"] = fpath.stat().st_size
+                        except OSError:
+                            pass
+                    results.append(entry)
+
+                return {
+                    "pattern": pattern,
+                    "path": _container_to_host_path(resolved),
+                    "results": results,
+                    "count": len(results),
+                    "truncated": len(results) >= max_results,
+                    "backend": "fd",
+                }
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass  # fd not available — fall through to os.walk
+
+        # ── Fallback: os.walk ─────────────────────────────────────────
         results = []
         search_re = re.compile(pattern, re.IGNORECASE)
 
@@ -959,6 +1031,7 @@ async def host_find(
             "results": results,
             "count": len(results),
             "truncated": len(results) >= max_results,
+            "backend": "os.walk",
         }
 
     except ValueError as e:

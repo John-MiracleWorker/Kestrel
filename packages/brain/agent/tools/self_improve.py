@@ -24,6 +24,7 @@ import re
 import subprocess
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 from urllib.request import Request, urlopen
@@ -332,6 +333,148 @@ def _file_signature(path: str) -> str:
     return f"{stat.st_mtime_ns}:{stat.st_size}"
 
 
+# ── Per-file Analysis (top-level for ThreadPoolExecutor) ─────────────
+_SECRET_RE = re.compile(
+    r"(password|secret|api_key|token)\s*=\s*['\"][^'\"]{8,}['\"]",
+    re.IGNORECASE,
+)
+
+
+def _analyze_file_content(content: str, fname: str, rel_path: str, pkg_name: str, lang: str) -> list[dict]:
+    """Analyze a single file's content for issues. Pure function, safe to run in threads."""
+    file_issues: list[dict] = []
+    lines = content.split("\n")
+
+    # Common text checks (applies to all languages)
+    for i, line in enumerate(lines, 1):
+        stripped = line.strip()
+        for marker in ("TODO", "FIXME", "HACK", "XXX"):
+            if marker in stripped and (stripped.startswith("//") or stripped.startswith("#")):
+                file_issues.append({
+                    "type": "todo",
+                    "severity": "low",
+                    "package": pkg_name,
+                    "file": rel_path,
+                    "line": i,
+                    "description": stripped.lstrip("/#/ ").strip(),
+                    "suggestion": f"Implement or remove: {stripped.lstrip('/#/ ').strip()[:100]}",
+                })
+        if _SECRET_RE.search(stripped):
+            if "env" not in stripped.lower() and "example" not in stripped.lower():
+                file_issues.append({
+                    "type": "security",
+                    "severity": "high",
+                    "package": pkg_name,
+                    "file": rel_path,
+                    "line": i,
+                    "description": "Potential hardcoded secret detected",
+                    "suggestion": "Move secrets to environment variables and rotate exposed credentials.",
+                })
+        if "eval(" in stripped and not stripped.startswith("#") and not stripped.startswith("//"):
+            file_issues.append({
+                "type": "security",
+                "severity": "medium",
+                "package": pkg_name,
+                "file": rel_path,
+                "line": i,
+                "description": "Use of eval() detected",
+                "suggestion": "Avoid eval(); use safe parsing or explicit dispatch.",
+            })
+
+    # Python AST single-pass checks
+    if lang == "python" and fname.endswith(".py"):
+        try:
+            tree = ast.parse(content, filename=fname)
+        except SyntaxError as e:
+            file_issues.append({
+                "type": "syntax_error",
+                "severity": "critical",
+                "package": pkg_name,
+                "file": rel_path,
+                "line": e.lineno,
+                "description": f"Python syntax error: {e.msg}",
+                "suggestion": f"Fix syntax error at line {e.lineno}: {e.text.strip() if e.text else ''}",
+            })
+            tree = None
+
+        if tree is not None:
+            imported_names = []
+            used_names: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    func_lines = (node.end_lineno - node.lineno + 1) if getattr(node, "end_lineno", None) else 0
+                    if func_lines > 80:
+                        file_issues.append({
+                            "type": "complexity",
+                            "severity": "medium",
+                            "package": pkg_name,
+                            "file": rel_path,
+                            "line": node.lineno,
+                            "description": f"Function `{node.name}` is {func_lines} lines long — consider refactoring",
+                            "suggestion": f"Break `{node.name}` into smaller helper functions",
+                        })
+                elif isinstance(node, ast.ExceptHandler) and node.type is None:
+                    file_issues.append({
+                        "type": "error_handling",
+                        "severity": "medium",
+                        "package": pkg_name,
+                        "file": rel_path,
+                        "line": node.lineno,
+                        "description": "Bare `except:` clause — catches SystemExit, KeyboardInterrupt etc.",
+                        "suggestion": "Use `except Exception:` instead of bare `except:`",
+                    })
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        name = alias.asname or alias.name.split(".")[-1]
+                        imported_names.append((name, node.lineno))
+                elif isinstance(node, ast.ImportFrom):
+                    for alias in node.names:
+                        name = alias.asname or alias.name
+                        imported_names.append((name, node.lineno))
+                elif isinstance(node, ast.Name):
+                    used_names.add(node.id)
+
+            for name, lineno in imported_names:
+                if name != "*" and not name.startswith("_") and name not in used_names:
+                    file_issues.append({
+                        "type": "dead_import",
+                        "severity": "low",
+                        "package": pkg_name,
+                        "file": rel_path,
+                        "line": lineno,
+                        "description": f"Potentially unused import: `{name}`",
+                        "suggestion": f"Remove unused import `{name}` at line {lineno}",
+                    })
+
+    return file_issues
+
+
+def _process_file(args: tuple) -> tuple[str, str, list[dict]]:
+    """Read and analyze one file. Returns (rel_path, signature, issues). Safe for threads."""
+    filepath, fname, rel_path, pkg_name, lang, cached_files, mode = args
+    try:
+        signature = _file_signature(filepath)
+    except OSError:
+        return rel_path, "", []
+
+    cached = cached_files.get(rel_path)
+    if mode != "deep" and cached and cached.get("sig") == signature:
+        return rel_path, signature, cached.get("issues", [])
+
+    try:
+        with open(filepath, "r", errors="ignore") as f:
+            content = f.read()
+    except Exception:
+        return rel_path, signature, []
+
+    return rel_path, signature, _analyze_file_content(content, fname, rel_path, pkg_name, lang)
+
+
+# ── Codebase overview cache (reused by _llm_analyze to skip redundant walk) ──
+_codebase_overview_cache: dict = {}  # {"tree": str, "exports": str, "built_at": float}
+_CODEBASE_OVERVIEW_TTL = 300  # 5 minutes
+
+
 # ── Main Action Router ───────────────────────────────────────────────
 async def self_improve_action(
     action: str,
@@ -343,7 +486,7 @@ async def self_improve_action(
     global _last_scan_results
 
     if action == "scan":
-        results = _deep_scan(package, mode=scan_mode)
+        results = await asyncio.to_thread(_deep_scan, package, scan_mode)
         _last_scan_results = results
         return results
     elif action == "test":
@@ -413,8 +556,8 @@ async def _github_sync(package: str = "all") -> dict:
     if not token:
         return {"error": "GITHUB_PERSONAL_ACCESS_TOKEN (or GITHUB_PAT) not set. Set it in your .env file."}
 
-    # Run scan
-    results = _deep_scan(package)
+    # Run scan (offloaded to thread — _deep_scan does blocking I/O + CPU work)
+    results = await asyncio.to_thread(_deep_scan, package)
     all_issues = results.get("issues", [])
 
     # Filter to high-severity only (critical, high, security)
@@ -513,7 +656,7 @@ async def _telegram_digest(package: str = "all") -> dict:
     Scan codebase and send a compact Telegram digest of findings.
     Groups by severity and shows top issues.
     """
-    results = _deep_scan(package)
+    results = await asyncio.to_thread(_deep_scan, package)
     all_issues = results.get("issues", [])
 
     if not all_issues:
@@ -578,6 +721,8 @@ def _deep_scan(package: str = "all", mode: str = "standard") -> dict:
       - quick: scan only files touched in git diff when available
       - standard: incremental scan using file signature cache
       - deep: force full scan of all candidate files
+
+    Files are processed in parallel with a ThreadPoolExecutor for I/O speed.
     """
     mode = (mode or "standard").lower()
     if mode not in {"quick", "standard", "deep"}:
@@ -585,9 +730,9 @@ def _deep_scan(package: str = "all", mode: str = "standard") -> dict:
 
     scan_cache = _load_scan_cache()
     cached_files = scan_cache.get("files", {})
-    next_cache = {"files": {}}
+    next_cache: dict = {"files": {}}
 
-    quick_targets = set()
+    quick_targets: set[str] = set()
     if mode == "quick":
         try:
             diff = subprocess.run(
@@ -601,10 +746,10 @@ def _deep_scan(package: str = "all", mode: str = "standard") -> dict:
         except Exception:
             quick_targets = set()
 
-    issues = []
     packages_to_scan = PACKAGES if package == "all" else {package: PACKAGES.get(package, {})}
-    files_considered = 0
 
+    # ── Pass 1: collect candidate file tuples (fast directory walk) ───
+    candidates: list[tuple] = []
     for pkg_name, pkg_info in packages_to_scan.items():
         if not pkg_info:
             continue
@@ -617,140 +762,24 @@ def _deep_scan(package: str = "all", mode: str = "standard") -> dict:
 
         for root, dirs, files in os.walk(pkg_path):
             dirs[:] = [d for d in dirs if d not in ("node_modules", "__pycache__", ".git", "dist", "build", ".next")]
-
             for fname in files:
                 if not fname.endswith(ext) and not fname.endswith(".ts"):
                     continue
-
                 filepath = os.path.join(root, fname)
                 rel_path = os.path.relpath(filepath, PROJECT_ROOT)
-
                 if mode == "quick" and quick_targets and rel_path not in quick_targets:
                     continue
+                candidates.append((filepath, fname, rel_path, pkg_name, lang, cached_files, mode))
 
-                files_considered += 1
-                try:
-                    signature = _file_signature(filepath)
-                except OSError:
-                    continue
+    files_considered = len(candidates)
 
-                cached = cached_files.get(rel_path)
-                if mode != "deep" and cached and cached.get("sig") == signature:
-                    issues.extend(cached.get("issues", []))
-                    next_cache["files"][rel_path] = cached
-                    continue
-
-                try:
-                    with open(filepath, "r", errors="ignore") as f:
-                        content = f.read()
-                except Exception:
-                    continue
-
-                file_issues = []
-                lines = content.split("\n")
-
-                # Common text checks
-                for i, line in enumerate(lines, 1):
-                    stripped = line.strip()
-                    for marker in ("TODO", "FIXME", "HACK", "XXX"):
-                        if marker in stripped and (stripped.startswith("//") or stripped.startswith("#")):
-                            file_issues.append({
-                                "type": "todo",
-                                "severity": "low",
-                                "package": pkg_name,
-                                "file": rel_path,
-                                "line": i,
-                                "description": stripped.lstrip("/#/ ").strip(),
-                                "suggestion": f"Implement or remove: {stripped.lstrip('/#/ ').strip()[:100]}",
-                            })
-                    if re.search(r"(password|secret|api_key|token)\\s*=\\s*['\"][^'\"]{8,}['\"]", stripped, re.I):
-                        if "env" not in stripped.lower() and "example" not in stripped.lower():
-                            file_issues.append({
-                                "type": "security",
-                                "severity": "high",
-                                "package": pkg_name,
-                                "file": rel_path,
-                                "line": i,
-                                "description": "Potential hardcoded secret detected",
-                                "suggestion": "Move secrets to environment variables and rotate exposed credentials.",
-                            })
-                    if "eval(" in stripped and not stripped.startswith("#") and not stripped.startswith("//"):
-                        file_issues.append({
-                            "type": "security",
-                            "severity": "medium",
-                            "package": pkg_name,
-                            "file": rel_path,
-                            "line": i,
-                            "description": "Use of eval() detected",
-                            "suggestion": "Avoid eval(); use safe parsing or explicit dispatch.",
-                        })
-
-                # Python AST single-pass checks
-                if lang == "python" and fname.endswith(".py"):
-                    try:
-                        tree = ast.parse(content, filename=fname)
-                    except SyntaxError as e:
-                        file_issues.append({
-                            "type": "syntax_error",
-                            "severity": "critical",
-                            "package": pkg_name,
-                            "file": rel_path,
-                            "line": e.lineno,
-                            "description": f"Python syntax error: {e.msg}",
-                            "suggestion": f"Fix syntax error at line {e.lineno}: {e.text.strip() if e.text else ''}",
-                        })
-                        tree = None
-
-                    if tree is not None:
-                        imported_names = []
-                        used_names = set()
-                        for node in ast.walk(tree):
-                            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                                func_lines = (node.end_lineno - node.lineno + 1) if getattr(node, "end_lineno", None) else 0
-                                if func_lines > 80:
-                                    file_issues.append({
-                                        "type": "complexity",
-                                        "severity": "medium",
-                                        "package": pkg_name,
-                                        "file": rel_path,
-                                        "line": node.lineno,
-                                        "description": f"Function `{node.name}` is {func_lines} lines long — consider refactoring",
-                                        "suggestion": f"Break `{node.name}` into smaller helper functions",
-                                    })
-                            elif isinstance(node, ast.ExceptHandler) and node.type is None:
-                                file_issues.append({
-                                    "type": "error_handling",
-                                    "severity": "medium",
-                                    "package": pkg_name,
-                                    "file": rel_path,
-                                    "line": node.lineno,
-                                    "description": "Bare `except:` clause — catches SystemExit, KeyboardInterrupt etc.",
-                                    "suggestion": "Use `except Exception:` instead of bare `except:`",
-                                })
-                            elif isinstance(node, ast.Import):
-                                for alias in node.names:
-                                    name = alias.asname or alias.name.split(".")[-1]
-                                    imported_names.append((name, node.lineno))
-                            elif isinstance(node, ast.ImportFrom):
-                                for alias in node.names:
-                                    name = alias.asname or alias.name
-                                    imported_names.append((name, node.lineno))
-                            elif isinstance(node, ast.Name):
-                                used_names.add(node.id)
-
-                        for name, lineno in imported_names:
-                            if name != "*" and not name.startswith("_") and name not in used_names:
-                                file_issues.append({
-                                    "type": "dead_import",
-                                    "severity": "low",
-                                    "package": pkg_name,
-                                    "file": rel_path,
-                                    "line": lineno,
-                                    "description": f"Potentially unused import: `{name}`",
-                                    "suggestion": f"Remove unused import `{name}` at line {lineno}",
-                                })
-
-                issues.extend(file_issues)
+    # ── Pass 2: process files in parallel ────────────────────────────
+    issues: list[dict] = []
+    max_workers = min(8, files_considered) if files_considered else 1
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for rel_path, signature, file_issues in executor.map(_process_file, candidates):
+            issues.extend(file_issues)
+            if signature:
                 next_cache["files"][rel_path] = {"sig": signature, "issues": file_issues}
 
     _save_scan_cache(next_cache)
@@ -950,65 +979,75 @@ async def _llm_analyze(candidate_issues: list[dict]) -> list[dict]:
         logger.error(f"Failed to initialize CloudProvider: {e}")
         return []
 
-    # ── Phase 1: Build codebase overview ──────────────────────────────
-    tree_lines = []
-    file_summaries = []
-    
-    for pkg_name, pkg_info in PACKAGES.items():
-        pkg_path = os.path.join(PROJECT_ROOT, pkg_info["path"])
-        if not os.path.exists(pkg_path):
-            continue
-        
-        tree_lines.append(f"\n📦 {pkg_name} ({pkg_info['lang']})")
-        ext = pkg_info["ext"]
-        
-        for root, dirs, files in os.walk(pkg_path):
-            dirs[:] = [d for d in dirs if d not in (
-                "node_modules", "__pycache__", ".git", "dist", "build", ".next", 
-                "venv", ".venv", "coverage", "test", "tests"
-            )]
-            
-            depth = root.replace(pkg_path, "").count(os.sep)
-            indent = "  " * (depth + 1)
-            rel_dir = os.path.relpath(root, os.path.join(PROJECT_ROOT, pkg_info["path"]))
-            if rel_dir != ".":
-                tree_lines.append(f"{indent}📁 {rel_dir}/")
-            
-            for fname in sorted(files):
-                if not (fname.endswith(ext) or fname.endswith(".ts") or fname.endswith(".tsx")):
-                    continue
-                filepath = os.path.join(root, fname)
-                try:
-                    content = open(filepath, "r", errors="ignore").read()
-                    line_count = content.count("\n") + 1
-                    tree_lines.append(f"{indent}  {fname} ({line_count} lines)")
-                    
-                    # Extract key exports/classes/functions for summary
-                    if pkg_info["lang"] == "python" and fname.endswith(".py"):
-                        try:
-                            tree = ast.parse(content, filename=fname)
-                            names = []
-                            for node in ast.iter_child_nodes(tree):
-                                if isinstance(node, ast.ClassDef):
-                                    names.append(f"class {node.name}")
-                                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                                    names.append(f"def {node.name}")
-                            if names:
-                                rel = os.path.relpath(filepath, PROJECT_ROOT)
-                                file_summaries.append(f"  {rel}: {', '.join(names[:8])}")
-                        except SyntaxError:
-                            pass
-                    elif fname.endswith((".ts", ".tsx")):
-                        # Quick TS export scan
-                        exports = re.findall(r'export\s+(?:default\s+)?(?:function|class|const|interface|type)\s+(\w+)', content)
-                        if exports:
-                            rel = os.path.relpath(filepath, PROJECT_ROOT)
-                            file_summaries.append(f"  {rel}: {', '.join(exports[:8])}")
-                except Exception:
-                    continue
+    # ── Phase 1: Build codebase overview (cached for 5 min to skip redundant walk) ──
+    global _codebase_overview_cache
+    now = time.time()
+    if _codebase_overview_cache and (now - _codebase_overview_cache.get("built_at", 0)) < _CODEBASE_OVERVIEW_TTL:
+        codebase_tree = _codebase_overview_cache["tree"]
+        key_exports = _codebase_overview_cache["exports"]
+        logger.debug("LLM analysis: using cached codebase overview")
+    else:
+        tree_lines = []
+        file_summaries = []
 
-    codebase_tree = "\n".join(tree_lines)
-    key_exports = "\n".join(file_summaries[:40])
+        for pkg_name, pkg_info in PACKAGES.items():
+            pkg_path = os.path.join(PROJECT_ROOT, pkg_info["path"])
+            if not os.path.exists(pkg_path):
+                continue
+
+            tree_lines.append(f"\n📦 {pkg_name} ({pkg_info['lang']})")
+            ext = pkg_info["ext"]
+
+            for root, dirs, files in os.walk(pkg_path):
+                dirs[:] = [d for d in dirs if d not in (
+                    "node_modules", "__pycache__", ".git", "dist", "build", ".next",
+                    "venv", ".venv", "coverage", "test", "tests"
+                )]
+
+                depth = root.replace(pkg_path, "").count(os.sep)
+                indent = "  " * (depth + 1)
+                rel_dir = os.path.relpath(root, os.path.join(PROJECT_ROOT, pkg_info["path"]))
+                if rel_dir != ".":
+                    tree_lines.append(f"{indent}📁 {rel_dir}/")
+
+                for fname in sorted(files):
+                    if not (fname.endswith(ext) or fname.endswith(".ts") or fname.endswith(".tsx")):
+                        continue
+                    filepath = os.path.join(root, fname)
+                    try:
+                        content = open(filepath, "r", errors="ignore").read()
+                        line_count = content.count("\n") + 1
+                        tree_lines.append(f"{indent}  {fname} ({line_count} lines)")
+
+                        # Extract key exports/classes/functions for summary
+                        if pkg_info["lang"] == "python" and fname.endswith(".py"):
+                            try:
+                                tree = ast.parse(content, filename=fname)
+                                names = []
+                                for node in ast.iter_child_nodes(tree):
+                                    if isinstance(node, ast.ClassDef):
+                                        names.append(f"class {node.name}")
+                                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                        names.append(f"def {node.name}")
+                                if names:
+                                    rel = os.path.relpath(filepath, PROJECT_ROOT)
+                                    file_summaries.append(f"  {rel}: {', '.join(names[:8])}")
+                            except SyntaxError:
+                                pass
+                        elif fname.endswith((".ts", ".tsx")):
+                            exports = re.findall(
+                                r'export\s+(?:default\s+)?(?:function|class|const|interface|type)\s+(\w+)',
+                                content,
+                            )
+                            if exports:
+                                rel = os.path.relpath(filepath, PROJECT_ROOT)
+                                file_summaries.append(f"  {rel}: {', '.join(exports[:8])}")
+                    except Exception:
+                        continue
+
+        codebase_tree = "\n".join(tree_lines)
+        key_exports = "\n".join(file_summaries[:40])
+        _codebase_overview_cache = {"tree": codebase_tree, "exports": key_exports, "built_at": now}
 
     # ── Phase 2: Collect source files for deep review ─────────────────
     files_to_analyze: dict[str, str] = {}
