@@ -20,8 +20,10 @@ Council roles:
   - User Advocate: UX impact, simplicity, user experience
 """
 
+import asyncio
 import json
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -177,6 +179,8 @@ class CouncilSession:
     QUORUM = 3
     # Consensus requires this fraction of approvals
     CONSENSUS_THRESHOLD = 0.6
+    # Max parallel LLM calls to avoid overloading providers.
+    MAX_PARALLEL_EVALUATIONS = max(1, int(os.getenv("COUNCIL_MAX_PARALLEL", "3")))
 
     def __init__(
         self,
@@ -218,11 +222,12 @@ class CouncilSession:
             "member_count": len(self._roles),
         })
 
-        # ── Phase 1: Independent evaluation ──────────────────────
-        opinions = []
-        for role in self._roles:
-            opinion = await self._get_evaluation(role, proposal, context)
-            opinions.append(opinion)
+        # ── Phase 1: Independent evaluation (bounded concurrency) ───────────
+        semaphore = asyncio.Semaphore(self.MAX_PARALLEL_EVALUATIONS)
+
+        async def evaluate_role(role: CouncilRole) -> CouncilMemberOpinion:
+            async with semaphore:
+                opinion = await self._get_evaluation(role, proposal, context)
             await self._emit("council_opinion", {
                 "role": role.value,
                 "vote": opinion.vote.value,
@@ -230,6 +235,9 @@ class CouncilSession:
                 "analysis": opinion.analysis[:300],
                 "concerns": opinion.concerns[:3],
             })
+            return opinion
+
+        opinions = await asyncio.gather(*(evaluate_role(role) for role in self._roles))
 
         # ── Phase 2: Cross-critique (debate round) ───────────────
         if include_debate and len(opinions) >= 2:
@@ -312,12 +320,12 @@ Provide your analysis, then {VOTE_PROMPT}
             for o in opinions
         )
 
-        revised = []
-        for opinion in opinions:
-            if not self._llm:
-                revised.append(opinion)
-                continue
+        if not self._llm:
+            return opinions
 
+        semaphore = asyncio.Semaphore(self.MAX_PARALLEL_EVALUATIONS)
+
+        async def revise(opinion: CouncilMemberOpinion) -> CouncilMemberOpinion:
             debate_prompt = f"""You previously voted **{opinion.vote.value}** on this proposal.
 
 ## Other Council Members' Positions
@@ -333,18 +341,18 @@ If yes, provide updated analysis. If no, confirm your position.
 {VOTE_PROMPT}
 """
             try:
-                response = await self._llm.generate(
-                    messages=[{"role": "user", "content": debate_prompt}],
-                    model=self._model,
-                    temperature=0.3,
-                    max_tokens=1000,
-                )
-                revised_opinion = self._parse_opinion(opinion.role, response.get("content", ""))
-                revised.append(revised_opinion)
+                async with semaphore:
+                    response = await self._llm.generate(
+                        messages=[{"role": "user", "content": debate_prompt}],
+                        model=self._model,
+                        temperature=0.3,
+                        max_tokens=1000,
+                    )
+                return self._parse_opinion(opinion.role, response.get("content", ""))
             except Exception:
-                revised.append(opinion)  # Keep original if debate fails
+                return opinion
 
-        return revised
+        return await asyncio.gather(*(revise(opinion) for opinion in opinions))
 
     def _synthesize_verdict(self, verdict: CouncilVerdict) -> None:
         """Synthesize individual opinions into a collective verdict."""

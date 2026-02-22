@@ -122,6 +122,8 @@ _vector_store = None
 _agent_loop = None
 _agent_persistence = None
 _running_tasks: dict[str, object] = {}
+_TASK_EVENT_HISTORY_MAX = int(os.getenv("TASK_EVENT_HISTORY_MAX", "300"))
+_TASK_EVENT_TTL_SECONDS = int(os.getenv("TASK_EVENT_TTL_SECONDS", "3600"))
 _hands_client = None
 _cron_scheduler = None
 _webhook_handler = None
@@ -177,6 +179,60 @@ import brain_pb2_grpc
 
 class BrainServicer:
     """Implements kestrel.brain.BrainService gRPC interface."""
+
+    @staticmethod
+    def _event_type_to_proto(event_type_value: str):
+        return {
+            "plan_created": brain_pb2.TaskEvent.EventType.PLAN_CREATED,
+            "step_started": brain_pb2.TaskEvent.EventType.STEP_STARTED,
+            "tool_called": brain_pb2.TaskEvent.EventType.TOOL_CALLED,
+            "tool_result": brain_pb2.TaskEvent.EventType.TOOL_RESULT,
+            "step_complete": brain_pb2.TaskEvent.EventType.STEP_COMPLETE,
+            "approval_needed": brain_pb2.TaskEvent.EventType.APPROVAL_NEEDED,
+            "thinking": brain_pb2.TaskEvent.EventType.THINKING,
+            "task_complete": brain_pb2.TaskEvent.EventType.TASK_COMPLETE,
+            "task_failed": brain_pb2.TaskEvent.EventType.TASK_FAILED,
+            "task_paused": brain_pb2.TaskEvent.EventType.TASK_PAUSED,
+        }.get(event_type_value, brain_pb2.TaskEvent.EventType.THINKING)
+
+    async def _persist_task_event(self, task_event: "brain_pb2.TaskEvent") -> None:
+        """Persist and publish task events for reconnectable streams."""
+        try:
+            redis_client = await get_redis()
+            event_json = json.dumps({
+                "type": int(task_event.type),
+                "task_id": task_event.task_id,
+                "step_id": task_event.step_id,
+                "content": task_event.content,
+                "tool_name": task_event.tool_name,
+                "tool_args": task_event.tool_args,
+                "tool_result": task_event.tool_result,
+                "approval_id": task_event.approval_id,
+                "progress": dict(task_event.progress),
+            }, default=str)
+            key = f"kestrel:task_events:{task_event.task_id}"
+            channel = f"kestrel:task_events:{task_event.task_id}:channel"
+            await redis_client.rpush(key, event_json)
+            await redis_client.ltrim(key, -_TASK_EVENT_HISTORY_MAX, -1)
+            await redis_client.expire(key, _TASK_EVENT_TTL_SECONDS)
+            await redis_client.publish(channel, event_json)
+        except Exception as event_err:
+            logger.warning(f"Failed to persist task event: {event_err}")
+
+    @staticmethod
+    def _task_event_from_json(payload: dict) -> "brain_pb2.TaskEvent":
+        progress = payload.get("progress") or {}
+        return brain_pb2.TaskEvent(
+            type=int(payload.get("type", brain_pb2.TaskEvent.EventType.THINKING)),
+            task_id=str(payload.get("task_id", "")),
+            step_id=str(payload.get("step_id", "")),
+            content=str(payload.get("content", "")),
+            tool_name=str(payload.get("tool_name", "")),
+            tool_args=str(payload.get("tool_args", "")),
+            tool_result=str(payload.get("tool_result", "")),
+            approval_id=str(payload.get("approval_id", "")),
+            progress={str(k): str(v) for k, v in progress.items()},
+        )
 
     async def ListModels(self, request, context):
         """List available models for a provider."""
@@ -1390,25 +1446,12 @@ class BrainServicer:
             except Exception as e:
                 logger.warning(f"Session registration failed: {e}")
 
-        event_type_map = {
-            "plan_created": brain_pb2.TaskEvent.EventType.PLAN_CREATED,
-            "step_started": brain_pb2.TaskEvent.EventType.STEP_STARTED,
-            "tool_called": brain_pb2.TaskEvent.EventType.TOOL_CALLED,
-            "tool_result": brain_pb2.TaskEvent.EventType.TOOL_RESULT,
-            "step_complete": brain_pb2.TaskEvent.EventType.STEP_COMPLETE,
-            "approval_needed": brain_pb2.TaskEvent.EventType.APPROVAL_NEEDED,
-            "thinking": brain_pb2.TaskEvent.EventType.THINKING,
-            "task_complete": brain_pb2.TaskEvent.EventType.TASK_COMPLETE,
-            "task_failed": brain_pb2.TaskEvent.EventType.TASK_FAILED,
-            "task_paused": brain_pb2.TaskEvent.EventType.TASK_PAUSED,
-        }
-
         # Run the task-specific agent loop and stream events
         try:
             async for event in task_loop.run(task):
                 event_type_value = event.type.value if hasattr(event.type, "value") else str(event.type)
-                yield brain_pb2.TaskEvent(
-                    type=event_type_map.get(event_type_value, brain_pb2.TaskEvent.EventType.THINKING),
+                task_event = brain_pb2.TaskEvent(
+                    type=self._event_type_to_proto(event_type_value),
                     task_id=event.task_id,
                     step_id=event.step_id or "",
                     content=event.content,
@@ -1418,13 +1461,17 @@ class BrainServicer:
                     approval_id=event.approval_id or "",
                     progress={k: str(v) for k, v in (event.progress or {}).items()},
                 )
+                await self._persist_task_event(task_event)
+                yield task_event
         except Exception as e:
             logger.error(f"StartTask error for task {task.id}: {e}", exc_info=True)
-            yield brain_pb2.TaskEvent(
+            failed_event = brain_pb2.TaskEvent(
                 type=brain_pb2.TaskEvent.EventType.TASK_FAILED,
                 task_id=task.id,
                 content=str(e),
             )
+            await self._persist_task_event(failed_event)
+            yield failed_event
         finally:
             _running_tasks.pop(task.id, None)
             if _session_manager:
@@ -1436,16 +1483,44 @@ class BrainServicer:
     async def StreamTaskEvents(self, request, context):
         """Reconnect to an already-running task's event stream."""
         task_id = request.task_id
+        redis_client = await get_redis()
+        history_key = f"kestrel:task_events:{task_id}"
+        channel = f"kestrel:task_events:{task_id}:channel"
 
-        if task_id not in _running_tasks:
+        history = await redis_client.lrange(history_key, 0, -1)
+        for raw in history:
+            try:
+                payload = json.loads(raw)
+                yield self._task_event_from_json(payload)
+            except Exception as replay_err:
+                logger.warning(f"Failed to replay task event for {task_id}: {replay_err}")
+
+        if task_id not in _running_tasks and not history:
             context.abort(grpc.StatusCode.NOT_FOUND, f"Task {task_id} is not running")
             return
 
-        # TODO: Implement event replay/fan-out via Redis pubsub
-        context.abort(
-            grpc.StatusCode.UNIMPLEMENTED,
-            "Event stream reconnection coming in next iteration",
-        )
+        pubsub = redis_client.pubsub()
+        await pubsub.subscribe(channel)
+        try:
+            while True:
+                if context.cancelled():
+                    break
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if message and message.get("data"):
+                    try:
+                        payload = json.loads(message["data"])
+                        yield self._task_event_from_json(payload)
+                    except Exception as stream_err:
+                        logger.warning(f"Failed to parse streamed task event for {task_id}: {stream_err}")
+
+                if task_id not in _running_tasks and not message:
+                    break
+        finally:
+            try:
+                await pubsub.unsubscribe(channel)
+                await pubsub.close()
+            except Exception:
+                pass
 
     async def ApproveAction(self, request, context):
         """Approve or deny a pending agent action."""
