@@ -660,6 +660,12 @@ class AgentLoop:
                     step.status = StepStatus.COMPLETE
                     step.result = tool_args.get("summary", result.output)
                     step.completed_at = datetime.now(timezone.utc)
+                    # Mark all remaining steps as SKIPPED so the loop exits
+                    for remaining in task.plan.steps:
+                        if remaining.status in (StepStatus.PENDING, StepStatus.IN_PROGRESS) and remaining.id != step.id:
+                            remaining.status = StepStatus.SKIPPED
+                            remaining.result = "Skipped — task completed early"
+                            remaining.completed_at = datetime.now(timezone.utc)
 
                 elif tool_name == "ask_human":
                     # Emit an APPROVAL_NEEDED event so the frontend shows the question
