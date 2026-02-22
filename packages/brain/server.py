@@ -15,6 +15,7 @@ import json
 import uuid
 from concurrent import futures
 from datetime import datetime
+from pathlib import Path
 
 import grpc
 from grpc import aio as grpc_aio
@@ -137,6 +138,13 @@ _workflow_registry = None
 _skill_manager = None
 _session_manager = None
 _sandbox_manager = None
+
+_TOOL_CATALOG_PATH = Path(__file__).resolve().parents[1] / "shared" / "tool-catalog.json"
+
+
+def load_tool_catalog() -> list[dict]:
+    with _TOOL_CATALOG_PATH.open("r", encoding="utf-8") as catalog_file:
+        return json.load(catalog_file)
 
 
 # ── gRPC Service Implementation ──────────────────────────────────────
@@ -1889,6 +1897,27 @@ class BrainServicer:
                 updated_at=row['updated_at'].isoformat()
             )
         )
+
+    async def ListTools(self, request, context):
+        try:
+            tools = load_tool_catalog()
+            return brain_pb2.ListToolsResponse(
+                tools=[
+                    brain_pb2.ToolMetadata(
+                        name=tool.get("name", ""),
+                        description=tool.get("description", ""),
+                        category=tool.get("category", ""),
+                        risk_level=tool.get("riskLevel", "low"),
+                        enabled=bool(tool.get("enabled", True)),
+                    )
+                    for tool in tools
+                ]
+            )
+        except Exception as e:
+            logger.error(f"ListTools failed: {e}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return brain_pb2.ListToolsResponse()
 
     async def DeleteProviderConfig(self, request, context):
         await delete_provider_config(request.workspace_id, request.provider)
