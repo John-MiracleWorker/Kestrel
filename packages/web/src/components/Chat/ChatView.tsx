@@ -19,9 +19,14 @@ interface ChatViewProps {
             toolResult?: string;
             thinking?: string;
         } | null;
-        agentActivities?: Array<{ activity_type: string;[key: string]: unknown }>;
+        agentActivities?: Array<{ activity_type: string; [key: string]: unknown }>;
     } | null;
-    onSendMessage: (content: string, provider?: string, model?: string, attachments?: Array<{ url: string; filename: string; mimeType: string; size: number }>) => void;
+    onSendMessage: (
+        content: string,
+        provider?: string,
+        model?: string,
+        attachments?: Array<{ url: string; filename: string; mimeType: string; size: number }>,
+    ) => void;
     isConnected: boolean;
     conversationTitle?: string;
     onToggleCanvas?: () => void;
@@ -41,12 +46,40 @@ export function ChatView({
     const [selectedModel, setSelectedModel] = useState('');
     const [availableModels, setAvailableModels] = useState<string[]>([]);
     const [loadingModels, setLoadingModels] = useState(false);
+    const [modelError, setModelError] = useState('');
 
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLTextAreaElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [pendingFiles, setPendingFiles] = useState<File[]>([]);
     const [isUploading, setIsUploading] = useState(false);
+    const [uploadError, setUploadError] = useState('');
+
+    function loadModels(provider: string) {
+        if (!workspaceId || !provider) return;
+
+        setLoadingModels(true);
+        setModelError('');
+        providers
+            .listModels(workspaceId, provider)
+            .then((models) => {
+                const modelIds = models.map((m) => m.id);
+                setAvailableModels(modelIds);
+                if (modelIds.length > 0) {
+                    setSelectedModel(modelIds[0]);
+                } else {
+                    setSelectedModel('');
+                }
+                setModelError('');
+            })
+            .catch((err) => {
+                console.error('Failed to fetch models:', err);
+                setAvailableModels([]);
+                setSelectedModel('');
+                setModelError('Could not load models for this provider. Please try again.');
+            })
+            .finally(() => setLoadingModels(false));
+    }
 
     // Auto-scroll on new messages
     useEffect(() => {
@@ -65,28 +98,39 @@ export function ChatView({
     useEffect(() => {
         if (!selectedProvider || !workspaceId) {
             setAvailableModels([]);
+            setModelError('');
             return;
         }
 
-        setLoadingModels(true);
-        providers
-            .listModels(workspaceId, selectedProvider)
-            .then((models) => {
-                const modelIds = models.map((m) => m.id);
-                setAvailableModels(modelIds);
-                if (modelIds.length > 0) {
-                    setSelectedModel(modelIds[0]);
-                } else {
-                    setSelectedModel('');
-                }
+        loadModels(selectedProvider);
+    }, [selectedProvider, workspaceId]);
+
+    function submitWithPendingFiles(trimmed: string) {
+        setIsUploading(true);
+        uploadFiles(pendingFiles)
+            .then((uploaded) => {
+                const attachments = uploaded.map((f) => ({
+                    url: f.url,
+                    filename: f.filename,
+                    mimeType: f.mimeType,
+                    size: f.size,
+                }));
+                onSendMessage(
+                    trimmed || 'Analyze these files',
+                    selectedProvider || undefined,
+                    selectedModel || undefined,
+                    attachments,
+                );
+                setInput('');
+                setPendingFiles([]);
+                setUploadError('');
             })
             .catch((err) => {
-                console.error('Failed to fetch models:', err);
-                setAvailableModels([]);
-                setSelectedModel('');
+                console.error('Upload failed:', err);
+                setUploadError('Upload failed. Please check your files and try again.');
             })
-            .finally(() => setLoadingModels(false));
-    }, [selectedProvider, workspaceId]);
+            .finally(() => setIsUploading(false));
+    }
 
     function handleSubmit(e: FormEvent) {
         e.preventDefault();
@@ -95,21 +139,7 @@ export function ChatView({
         if (isUploading) return;
 
         if (pendingFiles.length > 0) {
-            setIsUploading(true);
-            uploadFiles(pendingFiles)
-                .then((uploaded) => {
-                    const attachments = uploaded.map((f) => ({
-                        url: f.url,
-                        filename: f.filename,
-                        mimeType: f.mimeType,
-                        size: f.size,
-                    }));
-                    onSendMessage(trimmed || 'Analyze these files', selectedProvider || undefined, selectedModel || undefined, attachments);
-                    setInput('');
-                    setPendingFiles([]);
-                })
-                .catch((err) => console.error('Upload failed:', err))
-                .finally(() => setIsUploading(false));
+            submitWithPendingFiles(trimmed);
         } else {
             onSendMessage(trimmed, selectedProvider || undefined, selectedModel || undefined);
             setInput('');
@@ -133,6 +163,18 @@ export function ChatView({
     function handleProviderChange(provider: string) {
         setSelectedProvider(provider);
         setSelectedModel('');
+        setModelError('');
+        setUploadError('');
+    }
+
+    function handleRetryUpload() {
+        if (isUploading || pendingFiles.length === 0) return;
+        submitWithPendingFiles(input.trim());
+    }
+
+    function handleRetryModels() {
+        if (!selectedProvider || !workspaceId) return;
+        loadModels(selectedProvider);
     }
 
     function handleKeyDown(e: React.KeyboardEvent) {
@@ -174,38 +216,84 @@ export function ChatView({
 
                 <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
                     {/* Model Selector */}
-                    <div style={{ display: 'flex', gap: '8px' }}>
-                        <select
-                            value={selectedProvider}
-                            onChange={(e) => handleProviderChange(e.target.value)}
-                            className="terminal-select"
-                        >
-                            <option value="">SYSTEM_DEFAULT</option>
-                            <option value="google">GOOGLE</option>
-                            <option value="openai">OPENAI</option>
-                            <option value="anthropic">ANTHROPIC</option>
-                            <option value="local">LOCAL_LLM</option>
-                        </select>
-                        {selectedProvider && (
-                            <select
-                                value={selectedModel}
-                                onChange={(e) => setSelectedModel(e.target.value)}
-                                className="terminal-select"
-                                disabled={loadingModels}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                        {modelError && (
+                            <div
+                                style={{
+                                    border: '1px solid var(--accent-error)',
+                                    background: 'rgba(239,68,68,0.12)',
+                                    color: 'var(--text-primary)',
+                                    padding: '6px 8px',
+                                    borderRadius: '4px',
+                                    fontSize: '0.7rem',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '8px',
+                                }}
                             >
-                                {loadingModels ? (
-                                    <option value="">LOADING...</option>
-                                ) : availableModels.length > 0 ? (
-                                    availableModels.map((m) => (
-                                        <option key={m} value={m}>
-                                            {m.toUpperCase()}
-                                        </option>
-                                    ))
-                                ) : (
-                                    <option value="">NO_MODELS</option>
-                                )}
-                            </select>
+                                <span style={{ flex: 1 }}>{modelError}</span>
+                                <button
+                                    type="button"
+                                    onClick={handleRetryModels}
+                                    style={{
+                                        background: 'transparent',
+                                        border: '1px solid var(--accent-error)',
+                                        color: 'var(--accent-error)',
+                                        fontSize: '0.65rem',
+                                        cursor: 'pointer',
+                                        padding: '2px 6px',
+                                    }}
+                                >
+                                    Retry models
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setModelError('')}
+                                    style={{
+                                        background: 'none',
+                                        border: 'none',
+                                        color: 'var(--text-dim)',
+                                        cursor: 'pointer',
+                                        fontSize: '0.85rem',
+                                    }}
+                                >
+                                    ✕
+                                </button>
+                            </div>
                         )}
+                        <div style={{ display: 'flex', gap: '8px' }}>
+                            <select
+                                value={selectedProvider}
+                                onChange={(e) => handleProviderChange(e.target.value)}
+                                className="terminal-select"
+                            >
+                                <option value="">SYSTEM_DEFAULT</option>
+                                <option value="google">GOOGLE</option>
+                                <option value="openai">OPENAI</option>
+                                <option value="anthropic">ANTHROPIC</option>
+                                <option value="local">LOCAL_LLM</option>
+                            </select>
+                            {selectedProvider && (
+                                <select
+                                    value={selectedModel}
+                                    onChange={(e) => setSelectedModel(e.target.value)}
+                                    className="terminal-select"
+                                    disabled={loadingModels}
+                                >
+                                    {loadingModels ? (
+                                        <option value="">LOADING...</option>
+                                    ) : availableModels.length > 0 ? (
+                                        availableModels.map((m) => (
+                                            <option key={m} value={m}>
+                                                {m.toUpperCase()}
+                                            </option>
+                                        ))
+                                    ) : (
+                                        <option value="">NO_MODELS</option>
+                                    )}
+                                </select>
+                            )}
+                        </div>
                     </div>
 
                     {/* Connection Status */}
@@ -308,132 +396,254 @@ export function ChatView({
                         margin: '0 auto',
                         position: 'relative',
                         display: 'flex',
-                        gap: '12px',
-                        alignItems: 'flex-end',
+                        flexDirection: 'column',
+                        alignItems: 'stretch',
+                        gap: '10px',
                     }}
                 >
-                    <span
-                        style={{
-                            color: 'var(--accent-cyan)',
-                            paddingBottom: '12px',
-                            fontWeight: 'bold',
-                        }}
-                    >
-                        $
-                    </span>
+                    {uploadError && (
+                        <div
+                            style={{
+                                border: '1px solid var(--accent-error)',
+                                background: 'rgba(239,68,68,0.12)',
+                                color: 'var(--text-primary)',
+                                padding: '8px 10px',
+                                borderRadius: '4px',
+                                fontSize: '0.75rem',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '8px',
+                            }}
+                        >
+                            <span style={{ flex: 1 }}>{uploadError}</span>
+                            <button
+                                type="button"
+                                onClick={handleRetryUpload}
+                                disabled={pendingFiles.length === 0 || isUploading}
+                                style={{
+                                    background: 'transparent',
+                                    border: '1px solid var(--accent-error)',
+                                    color: 'var(--accent-error)',
+                                    fontSize: '0.7rem',
+                                    cursor:
+                                        pendingFiles.length > 0 && !isUploading
+                                            ? 'pointer'
+                                            : 'not-allowed',
+                                    padding: '2px 8px',
+                                    opacity: pendingFiles.length > 0 && !isUploading ? 1 : 0.5,
+                                }}
+                            >
+                                Retry upload
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setUploadError('')}
+                                style={{
+                                    background: 'none',
+                                    border: 'none',
+                                    color: 'var(--text-dim)',
+                                    cursor: 'pointer',
+                                    fontSize: '0.85rem',
+                                }}
+                            >
+                                ✕
+                            </button>
+                        </div>
+                    )}
                     <div
                         style={{
-                            flex: 1,
-                            background: 'rgba(0,0,0,0.3)',
-                            border: '1px solid var(--text-dim)',
-                            borderRadius: '4px',
-                            padding: '12px',
-                            transition: 'border-color 0.2s',
-                        }}
-                        onFocus={(e) => (e.currentTarget.style.borderColor = 'var(--accent-cyan)')}
-                        onBlur={(e) => (e.currentTarget.style.borderColor = 'var(--text-dim)')}
-                        tabIndex={-1}
-                        onDragOver={(e) => { e.preventDefault(); e.currentTarget.style.borderColor = 'var(--accent-purple)'; }}
-                        onDragLeave={(e) => { e.currentTarget.style.borderColor = 'var(--text-dim)'; }}
-                        onDrop={(e) => {
-                            e.preventDefault();
-                            e.currentTarget.style.borderColor = 'var(--text-dim)';
-                            const files = Array.from(e.dataTransfer.files);
-                            if (files.length) setPendingFiles((prev) => [...prev, ...files].slice(0, 5));
+                            display: 'flex',
+                            gap: '12px',
+                            alignItems: 'flex-end',
                         }}
                     >
-                        {/* Pending file chips */}
-                        {pendingFiles.length > 0 && (
-                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '8px' }}>
-                                {pendingFiles.map((f, i) => (
-                                    <div key={i} style={{
-                                        display: 'flex', alignItems: 'center', gap: '4px',
-                                        background: 'rgba(0,243,255,0.1)', border: '1px solid var(--accent-cyan)',
-                                        borderRadius: '4px', padding: '4px 8px', fontSize: '0.75rem',
-                                        color: 'var(--accent-cyan)', fontFamily: 'var(--font-mono)',
-                                    }}>
-                                        <span>{f.type.startsWith('image/') ? '🖼️' : '📄'}</span>
-                                        <span style={{ maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
-                                        <span style={{ color: 'var(--text-dim)', fontSize: '0.65rem' }}>
-                                            {(f.size / 1024).toFixed(0)}KB
-                                        </span>
-                                        <button
-                                            type="button"
-                                            onClick={() => removeFile(i)}
-                                            style={{
-                                                background: 'none', border: 'none', color: 'var(--text-dim)',
-                                                cursor: 'pointer', padding: '0 2px', fontSize: '0.8rem',
-                                            }}
-                                        >✕</button>
-                                    </div>
-                                ))}
-                            </div>
-                        )}
-                        <textarea
-                            ref={inputRef}
-                            value={input}
-                            onChange={(e) => setInput(e.target.value)}
-                            onKeyDown={handleKeyDown}
-                            placeholder="Execute command or enter message..."
-                            rows={1}
+                        <span
                             style={{
-                                width: '100%',
-                                border: 'none',
-                                background: 'transparent',
-                                resize: 'none',
-                                maxHeight: '200px',
-                                outline: 'none',
-                                color: 'var(--text-primary)',
-                                fontFamily: 'var(--font-mono)',
-                                lineHeight: '1.5',
+                                color: 'var(--accent-cyan)',
+                                paddingBottom: '12px',
+                                fontWeight: 'bold',
                             }}
+                        >
+                            $
+                        </span>
+                        <div
+                            style={{
+                                flex: 1,
+                                background: 'rgba(0,0,0,0.3)',
+                                border: '1px solid var(--text-dim)',
+                                borderRadius: '4px',
+                                padding: '12px',
+                                transition: 'border-color 0.2s',
+                            }}
+                            onFocus={(e) =>
+                                (e.currentTarget.style.borderColor = 'var(--accent-cyan)')
+                            }
+                            onBlur={(e) => (e.currentTarget.style.borderColor = 'var(--text-dim)')}
+                            tabIndex={-1}
+                            onDragOver={(e) => {
+                                e.preventDefault();
+                                e.currentTarget.style.borderColor = 'var(--accent-purple)';
+                            }}
+                            onDragLeave={(e) => {
+                                e.currentTarget.style.borderColor = 'var(--text-dim)';
+                            }}
+                            onDrop={(e) => {
+                                e.preventDefault();
+                                e.currentTarget.style.borderColor = 'var(--text-dim)';
+                                const files = Array.from(e.dataTransfer.files);
+                                if (files.length)
+                                    setPendingFiles((prev) => [...prev, ...files].slice(0, 5));
+                            }}
+                        >
+                            {/* Pending file chips */}
+                            {pendingFiles.length > 0 && (
+                                <div
+                                    style={{
+                                        display: 'flex',
+                                        flexWrap: 'wrap',
+                                        gap: '6px',
+                                        marginBottom: '8px',
+                                    }}
+                                >
+                                    {pendingFiles.map((f, i) => (
+                                        <div
+                                            key={i}
+                                            style={{
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                gap: '4px',
+                                                background: 'rgba(0,243,255,0.1)',
+                                                border: '1px solid var(--accent-cyan)',
+                                                borderRadius: '4px',
+                                                padding: '4px 8px',
+                                                fontSize: '0.75rem',
+                                                color: 'var(--accent-cyan)',
+                                                fontFamily: 'var(--font-mono)',
+                                            }}
+                                        >
+                                            <span>{f.type.startsWith('image/') ? '🖼️' : '📄'}</span>
+                                            <span
+                                                style={{
+                                                    maxWidth: '120px',
+                                                    overflow: 'hidden',
+                                                    textOverflow: 'ellipsis',
+                                                    whiteSpace: 'nowrap',
+                                                }}
+                                            >
+                                                {f.name}
+                                            </span>
+                                            <span
+                                                style={{
+                                                    color: 'var(--text-dim)',
+                                                    fontSize: '0.65rem',
+                                                }}
+                                            >
+                                                {(f.size / 1024).toFixed(0)}KB
+                                            </span>
+                                            <button
+                                                type="button"
+                                                onClick={() => removeFile(i)}
+                                                style={{
+                                                    background: 'none',
+                                                    border: 'none',
+                                                    color: 'var(--text-dim)',
+                                                    cursor: 'pointer',
+                                                    padding: '0 2px',
+                                                    fontSize: '0.8rem',
+                                                }}
+                                            >
+                                                ✕
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                            <textarea
+                                ref={inputRef}
+                                value={input}
+                                onChange={(e) => setInput(e.target.value)}
+                                onKeyDown={handleKeyDown}
+                                placeholder="Execute command or enter message..."
+                                rows={1}
+                                style={{
+                                    width: '100%',
+                                    border: 'none',
+                                    background: 'transparent',
+                                    resize: 'none',
+                                    maxHeight: '200px',
+                                    outline: 'none',
+                                    color: 'var(--text-primary)',
+                                    fontFamily: 'var(--font-mono)',
+                                    lineHeight: '1.5',
+                                }}
+                            />
+                        </div>
+                        {/* Hidden file input */}
+                        <input
+                            ref={fileInputRef}
+                            type="file"
+                            multiple
+                            accept="image/*,.pdf,.txt,.md,.py,.js,.ts,.tsx,.jsx,.json,.csv,.xml,.yaml,.yml,.html,.css,.sh,.sql,.java,.cpp,.c,.h,.go,.rs,.rb,.swift,.kt"
+                            style={{ display: 'none' }}
+                            onChange={handleFilesSelected}
                         />
+                        {/* Attach button */}
+                        <button
+                            type="button"
+                            onClick={handleAttach}
+                            title="Attach files (images, code, PDFs)"
+                            style={{
+                                background:
+                                    pendingFiles.length > 0
+                                        ? 'rgba(168,85,247,0.2)'
+                                        : 'transparent',
+                                color:
+                                    pendingFiles.length > 0
+                                        ? 'var(--accent-purple)'
+                                        : 'var(--text-dim)',
+                                border:
+                                    '1px solid ' +
+                                    (pendingFiles.length > 0
+                                        ? 'var(--accent-purple)'
+                                        : 'var(--text-dim)'),
+                                padding: '10px 12px',
+                                borderRadius: '4px',
+                                cursor: 'pointer',
+                                fontFamily: 'var(--font-mono)',
+                                height: '46px',
+                                fontSize: '1.1rem',
+                                transition: 'all 0.2s',
+                            }}
+                        >
+                            📎
+                        </button>
+                        <button
+                            type="submit"
+                            disabled={isUploading}
+                            style={{
+                                background:
+                                    input.trim() || pendingFiles.length > 0
+                                        ? isUploading
+                                            ? 'var(--accent-purple)'
+                                            : 'var(--accent-cyan)'
+                                        : 'transparent',
+                                color:
+                                    input.trim() || pendingFiles.length > 0
+                                        ? '#000'
+                                        : 'var(--text-dim)',
+                                border: '1px solid var(--accent-cyan)',
+                                padding: '10px 20px',
+                                borderRadius: '4px',
+                                cursor: isUploading ? 'not-allowed' : 'pointer',
+                                fontWeight: 'bold',
+                                fontFamily: 'var(--font-mono)',
+                                height: '46px',
+                                opacity: isUploading ? 0.7 : 1,
+                            }}
+                        >
+                            {isUploading ? 'UPLOADING...' : 'SEND'}
+                        </button>
                     </div>
-                    {/* Hidden file input */}
-                    <input
-                        ref={fileInputRef}
-                        type="file"
-                        multiple
-                        accept="image/*,.pdf,.txt,.md,.py,.js,.ts,.tsx,.jsx,.json,.csv,.xml,.yaml,.yml,.html,.css,.sh,.sql,.java,.cpp,.c,.h,.go,.rs,.rb,.swift,.kt"
-                        style={{ display: 'none' }}
-                        onChange={handleFilesSelected}
-                    />
-                    {/* Attach button */}
-                    <button
-                        type="button"
-                        onClick={handleAttach}
-                        title="Attach files (images, code, PDFs)"
-                        style={{
-                            background: pendingFiles.length > 0 ? 'rgba(168,85,247,0.2)' : 'transparent',
-                            color: pendingFiles.length > 0 ? 'var(--accent-purple)' : 'var(--text-dim)',
-                            border: '1px solid ' + (pendingFiles.length > 0 ? 'var(--accent-purple)' : 'var(--text-dim)'),
-                            padding: '10px 12px',
-                            borderRadius: '4px',
-                            cursor: 'pointer',
-                            fontFamily: 'var(--font-mono)',
-                            height: '46px',
-                            fontSize: '1.1rem',
-                            transition: 'all 0.2s',
-                        }}
-                    >📎</button>
-                    <button
-                        type="submit"
-                        disabled={(!input.trim() && pendingFiles.length === 0) || !isConnected || isUploading}
-                        style={{
-                            background: (input.trim() || pendingFiles.length > 0) ? (isUploading ? 'var(--accent-purple)' : 'var(--accent-cyan)') : 'transparent',
-                            color: (input.trim() || pendingFiles.length > 0) ? '#000' : 'var(--text-dim)',
-                            border: '1px solid var(--accent-cyan)',
-                            padding: '10px 20px',
-                            borderRadius: '4px',
-                            cursor: (input.trim() || pendingFiles.length > 0) ? 'pointer' : 'not-allowed',
-                            fontWeight: 'bold',
-                            fontFamily: 'var(--font-mono)',
-                            height: '46px',
-                            opacity: isConnected ? 1 : 0.5,
-                        }}
-                    >
-                        {isUploading ? 'UPLOADING...' : 'SEND'}
-                    </button>
                 </form>
             </div>
 
@@ -456,13 +666,13 @@ export function ChatView({
                     color: var(--text-primary);
                 }
             `}</style>
-        </div >
+        </div>
     );
 }
 
 /* ── KestrelProcessBar ────────────────────────────────────────────── */
 
-type Activity = { activity_type: string;[key: string]: unknown };
+type Activity = { activity_type: string; [key: string]: unknown };
 
 interface PhaseData {
     key: string;
@@ -554,24 +764,31 @@ function buildPhases(
     // Tools (from toolActivity state)
     if (toolActivity) {
         const toolItems = activities.filter(
-            (a) => a.activity_type === 'tool_calling' || a.activity_type === 'tool_result' || a.activity_type === 'calling' || a.activity_type === 'result',
+            (a) =>
+                a.activity_type === 'tool_calling' ||
+                a.activity_type === 'tool_result' ||
+                a.activity_type === 'calling' ||
+                a.activity_type === 'result',
         );
         const toolLabel =
             toolActivity.status === 'thinking'
                 ? 'Reasoning'
                 : toolActivity.status === 'planning'
-                    ? 'Planning'
-                    : (toolActivity.status === 'calling' || toolActivity.status === 'tool_calling')
-                        ? toolActivity.toolName || 'Tool'
-                        : (toolActivity.status === 'result' || toolActivity.status === 'tool_result')
-                            ? `${toolActivity.toolName} ✓`
-                            : 'Working';
+                  ? 'Planning'
+                  : toolActivity.status === 'calling' || toolActivity.status === 'tool_calling'
+                    ? toolActivity.toolName || 'Tool'
+                    : toolActivity.status === 'result' || toolActivity.status === 'tool_result'
+                      ? `${toolActivity.toolName} ✓`
+                      : 'Working';
         phases.push({
             key: 'tools',
             icon: '⚡',
             label: toolLabel,
             color: '#8b5cf6',
-            summary: (toolActivity.status === 'result' || toolActivity.status === 'tool_result') ? 'done' : '…',
+            summary:
+                toolActivity.status === 'result' || toolActivity.status === 'tool_result'
+                    ? 'done'
+                    : '…',
             items: toolItems,
         });
     }
@@ -692,74 +909,89 @@ function KestrelProcessBar({
         ? toolActivity.status === 'thinking'
             ? '🧠 Reasoning…'
             : toolActivity.status === 'planning'
-                ? '📋 Planning…'
-                : (toolActivity.status === 'calling' || toolActivity.status === 'tool_calling')
-                    ? `⚡ Using ${toolActivity.toolName || 'tool'}…`
-                    : (toolActivity.status === 'result' || toolActivity.status === 'tool_result')
-                        ? `✅ ${toolActivity.toolName || 'Tool'} complete`
-                        : '🔄 Working…'
+              ? '📋 Planning…'
+              : toolActivity.status === 'calling' || toolActivity.status === 'tool_calling'
+                ? `⚡ Using ${toolActivity.toolName || 'tool'}…`
+                : toolActivity.status === 'result' || toolActivity.status === 'tool_result'
+                  ? `✅ ${toolActivity.toolName || 'Tool'} complete`
+                  : '🔄 Working…'
         : '🔄 Processing…';
 
-    const isActive = toolActivity?.status === 'calling' || toolActivity?.status === 'thinking' || toolActivity?.status === 'planning';
+    const isActive =
+        toolActivity?.status === 'calling' ||
+        toolActivity?.status === 'thinking' ||
+        toolActivity?.status === 'planning';
     const isDone = toolActivity?.status === 'result';
     const accentColor = isActive ? '#a855f7' : isDone ? '#10b981' : '#00f3ff';
 
     return (
-        <div style={{
-            marginBottom: '12px',
-            borderRadius: '8px',
-            overflow: 'hidden',
-            border: `1px solid ${accentColor}44`,
-            background: `linear-gradient(135deg, ${accentColor}08, ${accentColor}15)`,
-            animation: 'processbar-in 0.3s ease-out',
-        }}>
+        <div
+            style={{
+                marginBottom: '12px',
+                borderRadius: '8px',
+                overflow: 'hidden',
+                border: `1px solid ${accentColor}44`,
+                background: `linear-gradient(135deg, ${accentColor}08, ${accentColor}15)`,
+                animation: 'processbar-in 0.3s ease-out',
+            }}
+        >
             {/* Animated progress line */}
             {isActive && (
-                <div style={{
-                    height: '2px',
-                    background: `linear-gradient(90deg, transparent, ${accentColor}, transparent)`,
-                    animation: 'progress-slide 1.5s ease-in-out infinite',
-                }} />
+                <div
+                    style={{
+                        height: '2px',
+                        background: `linear-gradient(90deg, transparent, ${accentColor}, transparent)`,
+                        animation: 'progress-slide 1.5s ease-in-out infinite',
+                    }}
+                />
             )}
 
             {/* Main status */}
-            <div style={{
-                padding: '10px 14px',
-                display: 'flex',
-                alignItems: 'center',
-                gap: '10px',
-            }}>
+            <div
+                style={{
+                    padding: '10px 14px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '10px',
+                }}
+            >
                 {/* Pulsing dot */}
                 {isActive && (
-                    <div style={{
-                        width: '8px',
-                        height: '8px',
-                        borderRadius: '50%',
-                        background: accentColor,
-                        boxShadow: `0 0 8px ${accentColor}`,
-                        animation: 'pulse-dot 1.2s ease-in-out infinite',
-                        flexShrink: 0,
-                    }} />
+                    <div
+                        style={{
+                            width: '8px',
+                            height: '8px',
+                            borderRadius: '50%',
+                            background: accentColor,
+                            boxShadow: `0 0 8px ${accentColor}`,
+                            animation: 'pulse-dot 1.2s ease-in-out infinite',
+                            flexShrink: 0,
+                        }}
+                    />
                 )}
-                <span style={{
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: '0.82rem',
-                    fontWeight: 600,
-                    color: accentColor,
-                    letterSpacing: '0.02em',
-                }}>
+                <span
+                    style={{
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: '0.82rem',
+                        fontWeight: 600,
+                        color: accentColor,
+                        letterSpacing: '0.02em',
+                    }}
+                >
                     {currentLabel}
                 </span>
                 {toolActivity?.toolArgs && isActive && (
-                    <span style={{
-                        fontFamily: 'var(--font-mono)',
-                        fontSize: '0.7rem',
-                        color: 'var(--text-dim)',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                        maxWidth: '200px',
-                    }}>
+                    <span
+                        style={{
+                            fontFamily: 'var(--font-mono)',
+                            fontSize: '0.7rem',
+                            color: 'var(--text-dim)',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                            maxWidth: '200px',
+                        }}
+                    >
                         {toolActivity.toolArgs.slice(0, 60)}
                     </span>
                 )}
@@ -767,12 +999,14 @@ function KestrelProcessBar({
 
             {/* Phase pills (completed phases) */}
             {phases.length > 1 && (
-                <div style={{
-                    padding: '0 14px 10px',
-                    display: 'flex',
-                    flexWrap: 'wrap',
-                    gap: '6px',
-                }}>
+                <div
+                    style={{
+                        padding: '0 14px 10px',
+                        display: 'flex',
+                        flexWrap: 'wrap',
+                        gap: '6px',
+                    }}
+                >
                     {phases.map((phase) => (
                         <span
                             key={phase.key}
@@ -798,16 +1032,18 @@ function KestrelProcessBar({
 
             {/* Thinking preview */}
             {toolActivity?.thinking && (
-                <div style={{
-                    padding: '0 14px 10px',
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: '0.7rem',
-                    color: 'var(--text-dim)',
-                    lineHeight: 1.4,
-                    maxHeight: '40px',
-                    overflow: 'hidden',
-                    opacity: 0.7,
-                }}>
+                <div
+                    style={{
+                        padding: '0 14px 10px',
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: '0.7rem',
+                        color: 'var(--text-dim)',
+                        lineHeight: 1.4,
+                        maxHeight: '40px',
+                        overflow: 'hidden',
+                        opacity: 0.7,
+                    }}
+                >
                     💭 {toolActivity.thinking.slice(0, 150)}
                 </div>
             )}
@@ -828,7 +1064,6 @@ function KestrelProcessBar({
             `}</style>
         </div>
     );
-
 }
 
 function PhaseDetail({ item, phaseKey }: { item: Activity; phaseKey: string }) {
@@ -913,8 +1148,8 @@ function PhaseDetail({ item, phaseKey }: { item: Activity; phaseKey: string }) {
             item.severity === 'critical'
                 ? '#ef4444'
                 : item.severity === 'high'
-                    ? '#f59e0b'
-                    : '#6b7280';
+                  ? '#f59e0b'
+                  : '#6b7280';
         return (
             <div style={{ display: 'flex', gap: '8px', padding: '2px 0' }}>
                 <span
@@ -989,7 +1224,9 @@ function FeedbackButtons({ messageId }: { messageId: string }) {
                     }),
                 });
             }
-        } catch { /* silent */ }
+        } catch {
+            /* silent */
+        }
     };
 
     return (
@@ -1049,7 +1286,7 @@ function MessageBubble({
         toolResult?: string;
         thinking?: string;
     } | null;
-    agentActivities?: Array<{ activity_type: string;[key: string]: unknown }>;
+    agentActivities?: Array<{ activity_type: string; [key: string]: unknown }>;
 }) {
     const isUser = message.role === 'user';
 
