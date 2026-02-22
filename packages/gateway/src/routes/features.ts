@@ -388,17 +388,16 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         async (request, reply) => {
             const { workspaceId } = (request as any).params;
             try {
-                const result = await brainClient.call('ListProcesses', { workspaceId });
+                const result = await brainClient.call('ListProcesses', { workspace_id: workspaceId });
                 return reply.send({
                     processes: result?.processes || [],
                     running: result?.running || 0,
                 });
-            } catch {
-                // Fallback: return mock structure if Brain method not ready
-                return reply.send({
+            } catch (error) {
+                request.log.error({ error }, 'Failed to list workspace processes');
+                return reply.code(502).send({
                     processes: [],
                     running: 0,
-                    hint: 'Brain ListProcesses not implemented yet — showing empty',
                 });
             }
         },

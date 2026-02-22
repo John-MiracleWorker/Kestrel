@@ -54,6 +54,7 @@ service BrainService {
   rpc GetMoltbookActivity(GetMoltbookActivityRequest) returns (GetMoltbookActivityResponse);
 
   // ── Automation ──────────────────────────────────────────────
+  rpc ListProcesses(ListProcessesRequest) returns (ListProcessesResponse);
   rpc ParseCronJob(ParseCronJobRequest) returns (ParseCronJobResponse);
 }
 
@@ -543,4 +544,27 @@ message ParseCronJobResponse {
   string cron = 1;
   string human_schedule = 2;
   string task = 3;
+}
+
+message ListProcessesRequest {
+  string workspace_id = 1;
+}
+
+message ProcessSummary {
+  string id = 1;
+  string name = 2;
+  string type = 3;
+  string status = 4;
+  string cron = 5;
+  string last_run = 6;
+  string next_run = 7;
+  int32 run_count = 8;
+  string last_result = 9;
+  string branch = 10;
+  string error = 11;
+}
+
+message ListProcessesResponse {
+  repeated ProcessSummary processes = 1;
+  int32 running = 2;
 }
