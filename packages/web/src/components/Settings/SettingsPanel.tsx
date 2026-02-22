@@ -269,6 +269,7 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
     const [telegramToken, setTelegramToken] = useState('');
     const [telegramEnabled, setTelegramEnabled] = useState(false);
     const [telegramStatus, setTelegramStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
+    const [telegramBotUsername, setTelegramBotUsername] = useState<string | null>(null);
     const [webhookEnabled, setWebhookEnabled] = useState(false);
     const [webhookEndpointUrl, setWebhookEndpointUrl] = useState('');
     const [webhookSecret, setWebhookSecret] = useState('');
@@ -439,7 +440,9 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
             .then((data: any) => {
                 if (data?.telegram) {
                     setTelegramStatus(data.telegram.status as any);
-                    setTelegramEnabled(data.telegram.connected);
+                    // Enable the toggle if either connected or a token is saved (may still be reconnecting)
+                    setTelegramEnabled(data.telegram.connected || !!data.telegram.tokenConfigured);
+                    if (data.telegram.botUsername) setTelegramBotUsername(data.telegram.botUsername);
                 }
             })
             .catch(() => { });
@@ -499,6 +502,8 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                 try {
                     const result = await integrations.connectTelegram(workspaceId, telegramToken, true);
                     setTelegramStatus(result.status === 'connected' ? 'connected' : 'disconnected');
+                    if (result.botUsername) setTelegramBotUsername(result.botUsername);
+                    setTelegramToken(''); // Clear token input after saving
                 } catch (telegramErr: any) {
                     setTelegramStatus('disconnected');
                     setError(telegramErr.message || 'Failed to connect Telegram');
@@ -508,6 +513,7 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                 try {
                     await integrations.disconnectTelegram(workspaceId);
                     setTelegramStatus('disconnected');
+                    setTelegramBotUsername(null);
                 } catch { /* ignore */ }
             }
 
@@ -1324,7 +1330,11 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                                     <span style={{ fontSize: '1.2rem' }}>✈</span>
                                     <div>
                                         <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#e0e0e0' }}>Telegram</div>
-                                        <div style={{ fontSize: '0.65rem', color: '#444' }}>Bot API integration</div>
+                                        <div style={{ fontSize: '0.65rem', color: '#444' }}>
+                                            {telegramBotUsername
+                                                ? <span>@{telegramBotUsername}</span>
+                                                : 'Bot API integration'}
+                                        </div>
                                     </div>
                                 </div>
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
@@ -1345,11 +1355,13 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                                         <label style={S.label}>Bot Token</label>
                                         <input style={S.input} type="password" value={telegramToken}
                                             onChange={e => setTelegramToken(e.target.value)}
-                                            placeholder="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+                                            placeholder={telegramStatus === 'connected' ? 'Enter new token to replace' : '123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11'}
                                             onFocus={e => { e.target.style.borderColor = '#00f3ff'; }}
                                             onBlur={e => { e.target.style.borderColor = '#333'; }} />
                                         <div style={{ fontSize: '0.65rem', color: '#444', marginTop: '4px' }}>
-                                            Get a token from <span style={{ color: '#00f3ff' }}>@BotFather</span> on Telegram
+                                            {telegramStatus === 'connected'
+                                                ? 'Leave blank to keep existing token'
+                                                : <>Get a token from <span style={{ color: '#00f3ff' }}>@BotFather</span> on Telegram</>}
                                         </div>
                                     </div>
                                 </div>

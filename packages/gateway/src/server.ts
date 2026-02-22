@@ -207,6 +207,7 @@ async function start() {
         await integrationRoutes(app, {
             channelRegistry,
             defaultWorkspaceId: process.env.DEFAULT_WORKSPACE_ID || 'default',
+            redis,
         });
 
         // 7. Start Fastify HTTP server
@@ -245,6 +246,23 @@ async function start() {
         if (telegramAdapter) {
             await channelRegistry.register(telegramAdapter);
             logger.info('Telegram adapter enabled (env var)');
+        } else {
+            // No env-var token — try to restore token persisted via the settings UI
+            const savedConfig = await redis.get('telegram:bot:config');
+            if (savedConfig) {
+                try {
+                    const { token, workspaceId: savedWsId } = JSON.parse(savedConfig);
+                    const restoredAdapter = new TelegramAdapter({
+                        botToken: token,
+                        mode: 'polling',
+                        defaultWorkspaceId: savedWsId || process.env.DEFAULT_WORKSPACE_ID || 'default',
+                    });
+                    await channelRegistry.register(restoredAdapter);
+                    logger.info('Telegram adapter restored from persisted config');
+                } catch (err: any) {
+                    logger.warn('Failed to restore Telegram adapter from persisted config', { error: err.message });
+                }
+            }
         }
 
         // WhatsApp (Twilio)

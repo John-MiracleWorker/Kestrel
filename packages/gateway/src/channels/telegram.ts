@@ -95,6 +95,15 @@ export class TelegramAdapter extends BaseChannelAdapter {
     // Pending approval requests
     private pendingApprovals = new Map<string, { taskId: string; chatId: number; userId: string }>();
 
+    // Bot identity (populated after connect)
+    private _botId: number | undefined;
+    private _botUsername: string | undefined;
+
+    get botInfo(): { id: number; username: string } | undefined {
+        if (!this._botId || !this._botUsername) return undefined;
+        return { id: this._botId, username: this._botUsername };
+    }
+
     constructor(private config: TelegramConfig) {
         super();
         this.apiBase = `https://api.telegram.org/bot${config.botToken}`;
@@ -105,8 +114,10 @@ export class TelegramAdapter extends BaseChannelAdapter {
     async connect(): Promise<void> {
         this.setStatus('connecting');
 
-        // Validate token
+        // Validate token and capture bot identity
         const me = await this.api('getMe');
+        this._botId = me.id;
+        this._botUsername = me.username;
         logger.info(`Telegram bot connected: @${me.username} (${me.id})`);
 
         if (this.config.mode === 'webhook' && this.config.webhookUrl) {
