@@ -585,8 +585,9 @@ class AgentLoop:
                         reasoning=f"LLM selected {tool_name} for step: {step.description[:80]}",
                     )
 
-                # Execute the tool
-                result = await self._tools.execute(tool_call)
+                # Execute the tool (inject workspace context)
+                tool_context = {"workspace_id": task.workspace_id} if task.workspace_id else {}
+                result = await self._tools.execute(tool_call, context=tool_context)
                 task.tool_calls_count += 1
 
                 # Inline budget check — stop immediately if limits exceeded

@@ -65,10 +65,15 @@ class ToolRegistry:
                 filtered._handlers[name] = self._handlers[name]
         return filtered
 
-    async def execute(self, tool_call: ToolCall) -> ToolResult:
+    async def execute(self, tool_call: ToolCall, context: dict = None) -> ToolResult:
         """
         Execute a tool call and return the result.
         Handles timeout enforcement and error wrapping.
+        
+        Args:
+            tool_call: The tool call to execute.
+            context: Optional context dict (e.g. workspace_id) to inject
+                     into the handler kwargs if the handler accepts them.
         """
         handler = self._handlers.get(tool_call.name)
         if not handler:
@@ -81,10 +86,19 @@ class ToolRegistry:
         definition = self._definitions[tool_call.name]
         start = time.monotonic()
 
+        # Merge context into args if handler accepts those kwargs
+        merged_args = dict(tool_call.arguments)
+        if context:
+            import inspect
+            sig = inspect.signature(handler)
+            for key, value in context.items():
+                if key in sig.parameters and key not in merged_args:
+                    merged_args[key] = value
+
         try:
             import asyncio
             result = await asyncio.wait_for(
-                handler(**tool_call.arguments),
+                handler(**merged_args),
                 timeout=definition.timeout_seconds,
             )
 
