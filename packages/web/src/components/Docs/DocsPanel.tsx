@@ -180,6 +180,42 @@ Node.js API gateway built with Fastify.
 - Automatic reconnection
 - Request/response logging
 - Error translation to HTTP status codes
+
+## Webhooks
+
+Workspace webhooks are configured from Settings → Integrations and persisted in workspace settings.
+
+### Outbound delivery
+- Endpoint: \`POST {endpointUrl}\`
+- Headers:
+  - \`x-kestrel-signature\`: \`sha256=<hex hmac>\` over raw JSON body using shared secret
+  - \`x-kestrel-event\`: event type
+  - \`x-kestrel-attempt\`: retry attempt number
+- Event envelope:
+
+\`\`\`json
+{
+  "id": "uuid",
+  "type": "task.completed",
+  "timestamp": "2026-01-01T00:00:00.000Z",
+  "payload": {
+    "workspaceId": "...",
+    "taskId": "..."
+  }
+}
+\`\`\`
+
+Supported events: \`task.started\`, \`task.completed\`, \`task.failed\`, \`message.created\`.
+
+### Retry behavior
+- Retries on network failure or any non-2xx response.
+- Exponential backoff: 1s, 2s, 4s (default max 3 attempts).
+- Request timeout defaults to 5s per attempt.
+
+### Inbound verification strategy
+- Endpoint: \`POST /api/workspaces/:workspaceId/webhooks/inbound\`
+- Verify \`x-kestrel-signature\` with HMAC-SHA256 of raw JSON payload and workspace shared secret.
+- Reject invalid/missing signatures with HTTP 401.
 `,
     },
     {

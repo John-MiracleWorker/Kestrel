@@ -346,6 +346,30 @@ export const integrations = {
         ),
 };
 
+export interface WorkspaceWebhookConfig {
+    enabled: boolean;
+    endpointUrl: string;
+    secret: string;
+    selectedEvents: string[];
+    maxRetries: number;
+    timeoutMs: number;
+}
+
+export const webhooks = {
+    getConfig: (workspaceId: string) =>
+        request<{ webhook: WorkspaceWebhookConfig; supportedEvents: string[] }>(`/workspaces/${workspaceId}/webhooks/config`),
+    saveConfig: (workspaceId: string, webhook: WorkspaceWebhookConfig) =>
+        request<{ success: boolean; webhook: WorkspaceWebhookConfig }>(
+            `/workspaces/${workspaceId}/webhooks/config`,
+            { method: 'PUT', body: webhook },
+        ),
+    testConnection: (workspaceId: string) =>
+        request<{ success: boolean; delivery: { success: boolean; statusCode?: number; error?: string; attempt: number } }>(
+            `/workspaces/${workspaceId}/webhooks/test`,
+            { method: 'POST' },
+        ),
+};
+
 // ── WebSocket ───────────────────────────────────────────────────────
 export function createChatSocket(): WebSocket {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';

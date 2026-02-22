@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { providers, apiKeys, tools as toolsApi, workspaces, integrations, capabilities as capsApi, request, type ApiKey, type ToolInfo, type CapabilityItem } from '../../api/client';
+import { providers, apiKeys, tools as toolsApi, workspaces, integrations, webhooks as webhookApi, capabilities as capsApi, request, type ApiKey, type ToolInfo, type CapabilityItem } from '../../api/client';
 
 /* ── Types ─────────────────────────────────────────────────────────── */
 
@@ -62,6 +62,8 @@ const CATEGORY_ICONS: Record<string, string> = {
     skill: '✦',
     general: '○',
 };
+
+const WEBHOOK_EVENTS = ['task.started', 'task.completed', 'task.failed', 'message.created'];
 
 /* ── Styles ────────────────────────────────────────────────────────── */
 
@@ -267,6 +269,12 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
     const [telegramToken, setTelegramToken] = useState('');
     const [telegramEnabled, setTelegramEnabled] = useState(false);
     const [telegramStatus, setTelegramStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
+    const [webhookEnabled, setWebhookEnabled] = useState(false);
+    const [webhookEndpointUrl, setWebhookEndpointUrl] = useState('');
+    const [webhookSecret, setWebhookSecret] = useState('');
+    const [webhookEvents, setWebhookEvents] = useState<string[]>(['task.completed']);
+    const [webhookTestResult, setWebhookTestResult] = useState<string | null>(null);
+    const [webhookTesting, setWebhookTesting] = useState(false);
 
     // API Keys state
     const [keysList, setKeysList] = useState<ApiKey[]>([]);
@@ -406,6 +414,23 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                 if (settings.disabledTools) {
                     setDisabledTools(new Set(settings.disabledTools));
                 }
+                if (settings.webhooks) {
+                    setWebhookEnabled(!!settings.webhooks.enabled);
+                    setWebhookEndpointUrl(settings.webhooks.endpointUrl || '');
+                    setWebhookSecret(settings.webhooks.secret || '');
+                    setWebhookEvents(settings.webhooks.selectedEvents || ['task.completed']);
+                }
+            })
+            .catch(() => { });
+
+        webhookApi.getConfig(workspaceId)
+            .then((res: any) => {
+                const cfg = res?.webhook;
+                if (!cfg) return;
+                setWebhookEnabled(!!cfg.enabled);
+                setWebhookEndpointUrl(cfg.endpointUrl || '');
+                setWebhookSecret(cfg.secret || '');
+                setWebhookEvents(cfg.selectedEvents || ['task.completed']);
             })
             .catch(() => { });
 
@@ -455,6 +480,15 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                         maxToolCalls,
                         maxWallTime,
                         autoApproveRisk,
+                    },
+                    disabledTools: Array.from(disabledTools),
+                    webhooks: {
+                        enabled: webhookEnabled,
+                        endpointUrl: webhookEndpointUrl,
+                        secret: webhookSecret,
+                        selectedEvents: webhookEvents,
+                        maxRetries: 3,
+                        timeoutMs: 5000,
                     },
                 },
             });
@@ -1342,18 +1376,73 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                         {/* Webhook */}
                         <div style={{
                             padding: '16px', background: '#111', border: '1px solid #1a1a1a',
-                            borderRadius: '4px', marginBottom: '12px', opacity: 0.5,
+                            borderRadius: '4px', marginBottom: '12px',
                         }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                                <span style={{ fontSize: '1.2rem' }}>⟐</span>
-                                <div style={{ flex: 1 }}>
-                                    <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#e0e0e0' }}>Webhooks</div>
-                                    <div style={{ fontSize: '0.65rem', color: '#444' }}>Custom HTTP endpoints</div>
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                                    <span style={{ fontSize: '1.2rem' }}>⟐</span>
+                                    <div style={{ flex: 1 }}>
+                                        <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#e0e0e0' }}>Webhooks</div>
+                                        <div style={{ fontSize: '0.65rem', color: '#444' }}>Outbound + inbound signed HTTP events</div>
+                                    </div>
                                 </div>
-                                <span style={{ fontSize: '0.6rem', padding: '2px 8px', borderRadius: '3px', background: '#1a1a1a', color: '#444' }}>
-                                    COMING SOON
-                                </span>
+                                <Toggle value={webhookEnabled} onChange={setWebhookEnabled} />
                             </div>
+
+                            {webhookEnabled && (
+                                <>
+                                    <div style={S.field}>
+                                        <label style={S.label}>Endpoint URL</label>
+                                        <input style={S.input} value={webhookEndpointUrl}
+                                            onChange={e => setWebhookEndpointUrl(e.target.value)}
+                                            placeholder="https://example.com/webhooks/kestrel" />
+                                    </div>
+                                    <div style={S.field}>
+                                        <label style={S.label}>Shared Secret</label>
+                                        <input style={S.input} type="password" value={webhookSecret}
+                                            onChange={e => setWebhookSecret(e.target.value)}
+                                            placeholder="used for x-kestrel-signature (HMAC-SHA256)" />
+                                    </div>
+                                    <div style={S.field}>
+                                        <label style={S.label}>Event Subscriptions</label>
+                                        <div style={{ display: 'grid', gap: '6px' }}>
+                                            {WEBHOOK_EVENTS.map(eventName => (
+                                                <label key={eventName} style={{ fontSize: '0.75rem', color: '#bbb', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={webhookEvents.includes(eventName)}
+                                                        onChange={(e) => {
+                                                            if (e.target.checked) setWebhookEvents(prev => [...prev, eventName]);
+                                                            else setWebhookEvents(prev => prev.filter(v => v !== eventName));
+                                                        }}
+                                                    />
+                                                    {eventName}
+                                                </label>
+                                            ))}
+                                        </div>
+                                    </div>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                                        <button style={{ ...S.btnGhost, padding: '6px 12px', fontSize: '0.72rem' }}
+                                            disabled={webhookTesting}
+                                            onClick={async () => {
+                                                setWebhookTesting(true);
+                                                setWebhookTestResult(null);
+                                                try {
+                                                    const res = await webhookApi.testConnection(workspaceId);
+                                                    const statusMsg = res?.delivery?.statusCode ? `HTTP ${res.delivery.statusCode}` : (res?.delivery?.error || 'No response');
+                                                    setWebhookTestResult(res.success ? `Delivery succeeded (${statusMsg})` : `Delivery failed (${statusMsg})`);
+                                                } catch (err: any) {
+                                                    setWebhookTestResult(err.message || 'Connection test failed');
+                                                } finally {
+                                                    setWebhookTesting(false);
+                                                }
+                                            }}>
+                                            {webhookTesting ? 'Testing...' : 'Test Connection'}
+                                        </button>
+                                        {webhookTestResult && <span style={{ fontSize: '0.72rem', color: webhookTestResult.includes('succeeded') ? '#00ff9d' : '#ff9d00' }}>{webhookTestResult}</span>}
+                                    </div>
+                                </>
+                            )}
                         </div>
                     </div>
                 );
