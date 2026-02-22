@@ -177,40 +177,64 @@ class AgentLoop:
                 if memory_context:
                     context += f"\n\n{memory_context}"
 
-                plan = await self._planner.create_plan(
-                    goal=task.goal,
-                    available_tools=self._tools.list_tools(),
-                    context=context,
-                )
-                task.plan = plan
+                try:
+                    plan = await self._planner.create_plan(
+                        goal=task.goal,
+                        available_tools=self._tools.list_tools(),
+                        context=context,
+                    )
+                    task.plan = plan
+                except Exception as e:
+                    logger.warning(f"Planning failed, using single-step fallback: {e}")
+                    task.plan = TaskPlan(
+                        goal=task.goal,
+                        steps=[TaskStep(
+                            index=0,
+                            description=f"Execute the goal directly: {task.goal[:200]}",
+                            status=StepStatus.PENDING,
+                        )],
+                        reasoning=f"Planning failed ({e}) — executing as single step",
+                    )
+
                 await self._persistence.update_task(task)
 
                 # Emit plan for UI process bar
                 if self._event_callback:
                     await self._event_callback("plan_created", {
-                        "step_count": len(plan.steps),
+                        "step_count": len(task.plan.steps),
                         "steps": [
                             {"index": s.index, "description": s.description[:100]}
-                            for s in plan.steps[:6]
+                            for s in task.plan.steps[:6]
                         ],
                     })
 
                 # Record plan decision in evidence chain
                 if self._evidence_chain:
                     self._evidence_chain.record_plan_decision(
-                        plan_summary=f"Created {len(plan.steps)}-step plan for: {task.goal[:100]}",
-                        reasoning=f"Decomposed goal into {len(plan.steps)} steps based on available tools",
+                        plan_summary=f"Created {len(task.plan.steps)}-step plan for: {task.goal[:100]}",
+                        reasoning=f"Decomposed goal into {len(task.plan.steps)} steps based on available tools",
                         confidence=0.7,
                     )
 
                 yield TaskEvent(
                     type=TaskEventType.PLAN_CREATED,
                     task_id=task.id,
-                    content=json.dumps(plan.to_dict()),
+                    content=json.dumps(task.plan.to_dict()),
                     progress=self._progress(task),
                 )
 
             # ── Phase 2: Execution Loop ──────────────────────────
+            # Guard: if plan is still None (shouldn't happen, but be safe), create fallback
+            if task.plan is None:
+                task.plan = TaskPlan(
+                    goal=task.goal,
+                    steps=[TaskStep(
+                        index=0,
+                        description=f"Respond to: {task.goal[:200]}",
+                        status=StepStatus.PENDING,
+                    )],
+                )
+
             task.status = TaskStatus.EXECUTING
             await self._persistence.update_task(task)
 
