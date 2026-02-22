@@ -916,6 +916,30 @@ class BrainServicer:
                 except Exception as e:
                     logger.warning(f"Failed to inject persona context: {e}")
 
+            # Inject installed MCP servers into the system prompt so the
+            # planner knows about available external tools (GitHub, etc.)
+            try:
+                mcp_rows = await pool.fetch(
+                    """SELECT name, description, server_url
+                       FROM installed_tools
+                       WHERE workspace_id = $1 AND enabled = true""",
+                    workspace_id,
+                )
+                if mcp_rows:
+                    mcp_block = "\n\n## Connected MCP Servers\n"
+                    mcp_block += "You have access to these external tool servers via `mcp_call`. "
+                    mcp_block += "Use `mcp_call(server_name=..., tool_name=..., arguments=...)` to invoke them.\n"
+                    for r in mcp_rows:
+                        mcp_block += f"\n- **{r['name']}**: {r['description'] or 'No description'} (command: `{r['server_url']}`)"
+                    mcp_block += "\n\nFor GitHub repos, use `mcp_call` with the github server instead of trying to git clone (sandbox has no git/internet)."
+                    if messages:
+                        for msg in messages:
+                            if msg.role == 2:  # SYSTEM
+                                msg.content += mcp_block
+                                break
+            except Exception as e:
+                logger.warning(f"Failed to inject MCP server context: {e}")
+
             # Override the agent's system prompt with our chat system prompt
             # by injecting messages into the task
             chat_task.messages = messages
