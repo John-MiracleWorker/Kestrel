@@ -101,10 +101,12 @@ services:
       GITHUB_PAT: ${GITHUB_PAT:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      AGENT_HOST_MOUNTS: ${AGENT_HOST_MOUNTS:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes:
       - ${LOCAL_MODEL_DIR:-./models}:/models:ro
       - .:/project # Mount project root for self-improvement git operations
+      - ${HOST_MOUNT_ROOT:-/Users}:/host_fs # Host filesystem (tool-level security + human approval for writes)
     depends_on:
       postgres:
         condition: service_healthy
