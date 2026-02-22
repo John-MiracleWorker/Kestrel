@@ -219,8 +219,9 @@ async def moltbook_action(
 
         return result
     except Exception as e:
-        logger.error(f"Moltbook {action} error: {e}")
-        return {"error": str(e), "action": action}
+        logger.error(f"Moltbook {action} error: {e}", exc_info=True)
+        error_msg = str(e).strip() or repr(e) or f"Moltbook {action} failed"
+        return {"error": error_msg, "action": action}
 
 
 async def _register(name: str = "Kestrel", **kwargs) -> dict:

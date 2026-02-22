@@ -130,12 +130,18 @@ export class ChannelRegistry {
             );
         }
 
-        // For external channels (Telegram, Discord, etc.), the conversation
-        // may not exist in Brain's database yet. Pass empty conversationId
-        // to let Brain auto-create, then track the returned ID for continuity.
+        // Use the channel-provided conversation ID (e.g. deterministic UUID from
+        // Telegram chat ID) so Brain can load and save history across messages.
+        // Fall back to a cached ID from a previous Brain response if available.
         const conversationKey = `${channel}:${msg.userId}:${msg.conversationId}`;
         const knownConvId = this.knownConversations.get(conversationKey);
-        const useConversationId = knownConvId || '';
+        const useConversationId = knownConvId || msg.conversationId || '';
+
+        // Build parameters — forward attachments so Brain can process images/files
+        const parameters: Record<string, string> = {};
+        if (msg.attachments?.length) {
+            parameters.attachments = JSON.stringify(msg.attachments);
+        }
 
         // Stream response from Brain
         try {
@@ -146,7 +152,7 @@ export class ChannelRegistry {
                 messages: [{ role: 0, content: msg.content }], // USER = 0
                 provider: '',   // Use workspace default
                 model: '',      // Use workspace default
-                parameters: {},
+                parameters,
             });
 
             let fullContent = '';
@@ -158,10 +164,11 @@ export class ChannelRegistry {
                         break;
 
                     case 'DONE': {
-                        // Capture conversation ID from Brain for future messages
-                        const returnedConvId = chunk.conversation_id;
-                        if (returnedConvId && msg.conversationId) {
-                            this.knownConversations.set(conversationKey, returnedConvId);
+                        // Store the conversation ID so subsequent messages reuse it
+                        const returnedConvId = chunk.conversation_id || chunk.metadata?.conversation_id;
+                        const finalConvId = returnedConvId || useConversationId;
+                        if (finalConvId && msg.conversationId) {
+                            this.knownConversations.set(conversationKey, finalConvId);
                         }
 
                         // Send complete response back through the channel
