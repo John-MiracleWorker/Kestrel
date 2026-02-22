@@ -3,6 +3,8 @@ Vector memory store — pgvector-backed semantic search
 for long-term knowledge retrieval.
 """
 
+import json
+
 import os
 import asyncio
 import logging
@@ -98,8 +100,7 @@ class VectorStore:
         """Store a memory with its embedding."""
         embedding = await self.embed(content)
 
-        import json as _json
-        metadata_json = _json.dumps(metadata or {})
+        metadata_json = json.dumps(metadata or {})
 
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -140,7 +141,9 @@ class VectorStore:
                 "source_type": r["source_type"],
                 "source_id": r["source_id"],
                 "similarity": float(r["similarity"]),
-                "metadata": dict(r["metadata"]) if r["metadata"] else {},
+                "metadata": (r["metadata"] if isinstance(r["metadata"], dict)
+                             else json.loads(r["metadata"]) if isinstance(r["metadata"], str)
+                             else {}) if r["metadata"] else {},
             }
             for r in rows
         ]
