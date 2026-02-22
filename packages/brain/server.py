@@ -803,15 +803,37 @@ class BrainServicer:
                 ),
             )
 
-            # Create a single-step plan (the agent will use tools if needed)
-            chat_task.plan = TaskPlan(
-                goal=user_content,
-                steps=[TaskStep(
-                    index=0,
-                    description=f"Respond to the user: {user_content[:100]}",
-                    status=StepStatus.PENDING,
-                )],
+            # Classify request complexity — complex tasks get full planning,
+            # simple conversational messages get a single-step shortcut.
+            _COMPLEX_SIGNALS = [
+                "audit", "analyze", "review", "build", "create", "deploy",
+                "refactor", "debug", "investigate", "migrate", "implement",
+                "design", "architect", "scan", "test", "benchmark",
+                "compare", "evaluate", "research", "set up", "configure",
+                "security", "performance", "optimize", "fix", "diagnose",
+                "generate", "write", "plan", "multi", "step-by-step",
+                "deep", "comprehensive", "full", "thorough", "complete",
+            ]
+            user_lower = user_content.lower()
+            is_complex = (
+                len(user_content.split()) > 12
+                or any(sig in user_lower for sig in _COMPLEX_SIGNALS)
             )
+
+            if is_complex:
+                # Let the agent loop's TaskPlanner decompose this into
+                # a multi-step plan (plan=None triggers planning phase)
+                chat_task.plan = None
+            else:
+                # Simple conversational message — single step, fast response
+                chat_task.plan = TaskPlan(
+                    goal=user_content,
+                    steps=[TaskStep(
+                        index=0,
+                        description=f"Respond to the user: {user_content[:100]}",
+                        status=StepStatus.PENDING,
+                    )],
+                )
 
             # Build tool registry and agent loop
             tool_registry = build_tool_registry(hands_client=_hands_client, vector_store=_vector_store)
