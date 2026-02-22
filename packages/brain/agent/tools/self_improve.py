@@ -255,21 +255,25 @@ def register_self_improve_tools(registry) -> None:
             description=(
                 "Kestrel's self-improvement engine. Deeply analyzes the codebase "
                 "for issues and sends improvement proposals to Telegram for user "
-                "approval. Actions: scan, test, report, propose, approve, deny."
+                "approval. Actions: scan, test, report, propose, approve, deny, "
+                "github_sync (file issues to GitHub), telegram_digest (send health report)."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["scan", "test", "report", "propose", "approve", "deny", "list_pending"],
+                        "enum": ["scan", "test", "report", "propose", "approve", "deny",
+                                 "list_pending", "github_sync", "telegram_digest"],
                         "description": (
                             "scan = deep codebase analysis, "
                             "test = run test suite, "
                             "report = last scan summary, "
                             "propose = send proposals to Telegram, "
                             "approve/deny = act on a proposal, "
-                            "list_pending = show pending proposals"
+                            "list_pending = show pending proposals, "
+                            "github_sync = file high-severity issues to GitHub, "
+                            "telegram_digest = send code health summary to Telegram"
                         ),
                     },
                     "package": {
@@ -289,6 +293,9 @@ def register_self_improve_tools(registry) -> None:
         ),
         handler=self_improve_action,
     )
+
+    # Start the background scheduler for periodic health checks
+    start_scheduler()
 
 
 # ── Scan Results Cache ───────────────────────────────────────────────
@@ -321,8 +328,207 @@ async def self_improve_action(
     elif action == "list_pending":
         pending = _load_proposals()
         return {"pending": list(pending.values()), "count": len(pending)}
+    elif action == "github_sync":
+        return await _github_sync(package)
+    elif action == "telegram_digest":
+        return await _telegram_digest(package)
     else:
         return {"error": f"Unknown action: {action}"}
+
+
+# ── GitHub Issues Sync ───────────────────────────────────────────────
+_SYNCED_ISSUES_FILE = "/tmp/kestrel_synced_issues.json"
+
+def _load_synced_hashes() -> set:
+    """Load set of issue hashes already synced to GitHub."""
+    try:
+        with open(_SYNCED_ISSUES_FILE, "r") as f:
+            return set(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+def _save_synced_hashes(hashes: set) -> None:
+    """Save synced issue hashes."""
+    try:
+        with open(_SYNCED_ISSUES_FILE, "w") as f:
+            json.dump(list(hashes), f)
+    except IOError as e:
+        logger.error(f"Failed to save synced hashes: {e}")
+
+
+def _issue_hash(issue: dict) -> str:
+    """Generate a deterministic hash for an issue to deduplicate."""
+    import hashlib
+    key = f"{issue.get('type')}:{issue.get('file')}:{issue.get('line')}:{issue.get('description', '')[:80]}"
+    return hashlib.md5(key.encode()).hexdigest()[:12]
+
+
+_SEVERITY_LABELS = {
+    "critical": "bug",
+    "high": "bug",
+    "medium": "improvement",
+    "low": "enhancement",
+    "info": "enhancement",
+}
+
+
+async def _github_sync(package: str = "all") -> dict:
+    """
+    Scan codebase, filter high-severity issues, and create GitHub Issues.
+    Requires GITHUB_PERSONAL_ACCESS_TOKEN and GITHUB_REPO env vars.
+    """
+    token = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+    repo = os.getenv("GITHUB_REPO", "John-MiracleWorker/LibreBird")
+
+    if not token:
+        return {"error": "GITHUB_PERSONAL_ACCESS_TOKEN not set. Set it in your .env file."}
+
+    # Run scan
+    results = _deep_scan(package)
+    all_issues = results.get("issues", [])
+
+    # Filter to high-severity only (critical, high, security)
+    high_issues = [
+        i for i in all_issues
+        if i.get("severity") in ("critical", "high")
+        or i.get("type") in ("security", "syntax_error")
+    ]
+
+    if not high_issues:
+        return {
+            "message": "No high-severity issues found.",
+            "total_scanned": results.get("total_issues", 0),
+            "created": 0,
+        }
+
+    # Deduplicate
+    synced = _load_synced_hashes()
+    new_issues = [i for i in high_issues if _issue_hash(i) not in synced]
+
+    if not new_issues:
+        return {
+            "message": f"All {len(high_issues)} high-severity issues already synced to GitHub.",
+            "total_scanned": results.get("total_issues", 0),
+            "created": 0,
+        }
+
+    # Create GitHub Issues
+    created = []
+    for issue in new_issues[:10]:  # Cap at 10 per sync to avoid flooding
+        severity = issue.get("severity", "medium")
+        issue_type = issue.get("type", "unknown")
+        labels = ["kestrel-bot", _SEVERITY_LABELS.get(severity, "enhancement")]
+        if issue_type == "security":
+            labels.append("security")
+
+        title = f"[{severity.upper()}] {issue.get('description', 'Unknown issue')[:80]}"
+        body = (
+            f"## Auto-detected by Kestrel Self-Improvement Engine\n\n"
+            f"**Severity**: {severity}\n"
+            f"**Type**: {issue_type}\n"
+            f"**Package**: {issue.get('package', 'unknown')}\n"
+            f"**File**: `{issue.get('file', 'unknown')}`\n"
+            f"**Line**: {issue.get('line', 'N/A')}\n\n"
+            f"### Description\n{issue.get('description', 'No description')}\n\n"
+            f"### Suggested Fix\n{issue.get('suggestion', 'No suggestion available')}\n\n"
+            f"---\n_Created by Kestrel's automated code analysis_"
+        )
+
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"https://api.github.com/repos/{repo}/issues",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github+json",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                    json={"title": title, "body": body, "labels": labels},
+                )
+                if resp.status_code in (201, 200):
+                    resp_data = resp.json()
+                    created.append({
+                        "number": resp_data.get("number"),
+                        "title": title,
+                        "url": resp_data.get("html_url"),
+                    })
+                    synced.add(_issue_hash(issue))
+                    logger.info(f"Created GitHub issue #{resp_data.get('number')}: {title}")
+                else:
+                    logger.warning(f"GitHub issue creation failed ({resp.status_code}): {resp.text[:200]}")
+        except Exception as e:
+            logger.error(f"GitHub API error: {e}")
+
+    _save_synced_hashes(synced)
+
+    # Send Telegram notification about new issues
+    if created:
+        summary_lines = [f"🔔 **{len(created)} new issues filed to GitHub**\n"]
+        for c in created:
+            summary_lines.append(f"• #{c['number']}: {c['title'][:60]}")
+        _send_summary_to_telegram("\n".join(summary_lines))
+
+    return {
+        "message": f"Created {len(created)} GitHub issues from {len(new_issues)} new findings.",
+        "total_scanned": results.get("total_issues", 0),
+        "high_severity": len(high_issues),
+        "created": len(created),
+        "issues": created,
+    }
+
+
+async def _telegram_digest(package: str = "all") -> dict:
+    """
+    Scan codebase and send a compact Telegram digest of findings.
+    Groups by severity and shows top issues.
+    """
+    results = _deep_scan(package)
+    all_issues = results.get("issues", [])
+
+    if not all_issues:
+        msg = "✅ **Kestrel Code Health**: No issues found. Codebase is clean!"
+        _send_summary_to_telegram(msg)
+        return {"message": "No issues found. Telegram notified.", "sent": True}
+
+    # Group by severity
+    by_severity: dict[str, list] = {}
+    for issue in all_issues:
+        sev = issue.get("severity", "info")
+        by_severity.setdefault(sev, []).append(issue)
+
+    # Build digest
+    severity_icons = {
+        "critical": "🚨", "high": "🔴", "medium": "🟡",
+        "low": "🔵", "info": "ℹ️"
+    }
+
+    lines = [f"📊 **Kestrel Code Health Report**\n"]
+    lines.append(f"Total: {len(all_issues)} issues across {results.get('packages_scanned', 0)} packages\n")
+
+    for sev in ("critical", "high", "medium", "low", "info"):
+        issues = by_severity.get(sev, [])
+        if issues:
+            icon = severity_icons.get(sev, "•")
+            lines.append(f"{icon} **{sev.upper()}**: {len(issues)}")
+
+    # Top 5 most important issues
+    top = sorted(all_issues, key=lambda x: {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}.get(x.get("severity", "info"), 5))[:5]
+    if top:
+        lines.append("\n**Top Issues:**")
+        for i, issue in enumerate(top, 1):
+            lines.append(f"{i}. [{issue.get('severity', '?').upper()}] {issue.get('description', '?')[:70]}")
+            lines.append(f"   📁 `{issue.get('file', '?')}`")
+
+    msg = "\n".join(lines)
+    _send_summary_to_telegram(msg)
+
+    return {
+        "message": "Telegram digest sent.",
+        "sent": True,
+        "total_issues": len(all_issues),
+        "by_severity": {k: len(v) for k, v in by_severity.items()},
+    }
 
 
 # ── Deep Codebase Scanner ────────────────────────────────────────────
@@ -953,3 +1159,51 @@ def _handle_approval(proposal_id: str, approved: bool) -> dict:
             "status": "denied",
             "message": f"Proposal {proposal_id[:8]} denied and discarded.",
         }
+
+
+# ── Background Scheduler ─────────────────────────────────────────────
+_SCHEDULER_INTERVAL_HOURS = 6
+_scheduler_started = False
+
+
+async def _scheduled_health_check():
+    """Background loop: scan → GitHub sync → Telegram digest every N hours."""
+    interval = _SCHEDULER_INTERVAL_HOURS * 3600
+    # Wait 5 minutes before first run to let the server fully start
+    await asyncio.sleep(300)
+
+    while True:
+        try:
+            logger.info("🔄 Starting scheduled health check...")
+
+            # Only sync to GitHub if token is configured
+            if os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN"):
+                await _github_sync()
+            else:
+                logger.info("No GITHUB_PERSONAL_ACCESS_TOKEN — skipping GitHub sync")
+
+            # Always send Telegram digest if bot token is set
+            if os.getenv("TELEGRAM_BOT_TOKEN"):
+                await _telegram_digest()
+            else:
+                logger.info("No TELEGRAM_BOT_TOKEN — skipping Telegram digest")
+
+            logger.info(f"✅ Health check complete. Next run in {_SCHEDULER_INTERVAL_HOURS}h.")
+        except Exception as e:
+            logger.error(f"Scheduled health check failed: {e}")
+
+        await asyncio.sleep(interval)
+
+
+def start_scheduler():
+    """Start the background health check scheduler (called once from server startup)."""
+    global _scheduler_started
+    if _scheduler_started:
+        return
+    _scheduler_started = True
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_scheduled_health_check())
+        logger.info(f"📅 Self-improvement scheduler started (every {_SCHEDULER_INTERVAL_HOURS}h)")
+    except RuntimeError:
+        logger.warning("No running event loop — scheduler will start on first request")

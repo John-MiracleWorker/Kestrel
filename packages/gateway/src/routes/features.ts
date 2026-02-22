@@ -269,16 +269,16 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
     );
 
     // ── P2: Search MCP Servers (Smithery registry) ───────────────────
-    const BUILTIN_MCP_CATALOG = [
+    const BUILTIN_MCP_CATALOG: Array<{ name: string; description: string; transport: string; category: string; requires_env?: string[] }> = [
         { name: '@modelcontextprotocol/server-filesystem', description: 'Read/write local files and directories', transport: 'stdio', category: 'files' },
-        { name: '@modelcontextprotocol/server-github', description: 'GitHub repos, issues, PRs, and code search', transport: 'stdio', category: 'dev' },
-        { name: '@modelcontextprotocol/server-postgres', description: 'Query PostgreSQL databases', transport: 'stdio', category: 'data' },
+        { name: '@modelcontextprotocol/server-github', description: 'GitHub repos, issues, PRs, and code search', transport: 'stdio', category: 'dev', requires_env: ['GITHUB_PERSONAL_ACCESS_TOKEN'] },
+        { name: '@modelcontextprotocol/server-postgres', description: 'Query PostgreSQL databases', transport: 'stdio', category: 'data', requires_env: ['POSTGRES_URL'] },
         { name: '@modelcontextprotocol/server-sqlite', description: 'Query SQLite databases', transport: 'stdio', category: 'data' },
-        { name: '@modelcontextprotocol/server-slack', description: 'Read/send Slack messages and channels', transport: 'stdio', category: 'comms' },
+        { name: '@modelcontextprotocol/server-slack', description: 'Read/send Slack messages and channels', transport: 'stdio', category: 'comms', requires_env: ['SLACK_BOT_TOKEN'] },
         { name: '@modelcontextprotocol/server-puppeteer', description: 'Browser automation and web scraping', transport: 'stdio', category: 'web' },
-        { name: '@modelcontextprotocol/server-brave-search', description: 'Web search via Brave Search API', transport: 'stdio', category: 'web' },
+        { name: '@modelcontextprotocol/server-brave-search', description: 'Web search via Brave Search API', transport: 'stdio', category: 'web', requires_env: ['BRAVE_API_KEY'] },
         { name: '@modelcontextprotocol/server-memory', description: 'Persistent key-value memory storage', transport: 'stdio', category: 'memory' },
-        { name: '@modelcontextprotocol/server-google-maps', description: 'Google Maps geocoding, directions, places', transport: 'stdio', category: 'geo' },
+        { name: '@modelcontextprotocol/server-google-maps', description: 'Google Maps geocoding, directions, places', transport: 'stdio', category: 'geo', requires_env: ['GOOGLE_MAPS_API_KEY'] },
         { name: '@modelcontextprotocol/server-fetch', description: 'HTTP requests to external APIs', transport: 'stdio', category: 'web' },
         { name: '@modelcontextprotocol/server-sequential-thinking', description: 'Step-by-step reasoning and problem solving', transport: 'stdio', category: 'reasoning' },
         { name: '@modelcontextprotocol/server-everything', description: 'Kitchen-sink demo of all MCP features', transport: 'stdio', category: 'demo' },

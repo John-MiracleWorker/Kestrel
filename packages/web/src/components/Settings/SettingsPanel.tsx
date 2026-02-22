@@ -248,8 +248,10 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
     const [mcpTransport, setMcpTransport] = useState<'stdio' | 'http' | 'sse'>('stdio');
     const [mcpSaving, setMcpSaving] = useState(false);
     const [mcpSearchQuery, setMcpSearchQuery] = useState('');
-    const [mcpSearchResults, setMcpSearchResults] = useState<Array<{ name: string; description: string; transport: string; source: string }>>([]);
+    const [mcpSearchResults, setMcpSearchResults] = useState<Array<{ name: string; description: string; transport: string; source: string; requires_env?: string[] }>>([]);
     const [mcpSearching, setMcpSearching] = useState(false);
+    const [mcpConfiguring, setMcpConfiguring] = useState<string | null>(null); // server name being configured
+    const [mcpEnvValues, setMcpEnvValues] = useState<Record<string, string>>({});
 
     // Agent/guardrails state
     const [maxIterations, setMaxIterations] = useState(25);
@@ -846,57 +848,122 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                                     <div style={{ marginTop: '12px', maxHeight: '280px', overflowY: 'auto' }}>
                                         {mcpSearchResults.map(r => {
                                             const isInstalled = mcpServers.some(s => s.name === r.name);
+                                            const needsConfig = r.requires_env && r.requires_env.length > 0;
+                                            const isConfiguring = mcpConfiguring === r.name;
+
+                                            const doInstall = async (envVars?: Record<string, string>) => {
+                                                try {
+                                                    await request(`/workspaces/${workspaceId}/mcp-tools`, {
+                                                        method: 'POST',
+                                                        body: {
+                                                            name: r.name,
+                                                            description: r.description,
+                                                            serverUrl: `npx -y ${r.name}`,
+                                                            transport: r.transport || 'stdio',
+                                                            config: envVars ? { env: envVars } : {},
+                                                        },
+                                                    });
+                                                    setMcpServers(prev => [...prev, {
+                                                        name: r.name, description: r.description,
+                                                        server_url: `npx -y ${r.name}`,
+                                                        transport: r.transport || 'stdio', enabled: true,
+                                                    }]);
+                                                    setMcpConfiguring(null);
+                                                    setMcpEnvValues({});
+                                                    setSaveStatus(`Installed ${r.name}`);
+                                                    setTimeout(() => setSaveStatus(null), 2000);
+                                                } catch {
+                                                    setError('Failed to install');
+                                                    setTimeout(() => setError(null), 3000);
+                                                }
+                                            };
+
                                             return (
                                                 <div key={r.name} style={{
-                                                    display: 'flex', alignItems: 'center', gap: '10px',
                                                     padding: '10px 12px', background: '#0d0d0d',
-                                                    border: '1px solid #1a1a1a', borderRadius: '4px',
-                                                    marginBottom: '6px', opacity: isInstalled ? 0.5 : 1,
+                                                    border: isConfiguring ? '1px solid #a855f7' : '1px solid #1a1a1a',
+                                                    borderRadius: '4px', marginBottom: '6px',
+                                                    opacity: isInstalled ? 0.5 : 1,
+                                                    transition: 'border-color 0.2s',
                                                 }}>
-                                                    <span style={{ fontSize: '0.85rem', color: r.source === 'official' ? '#00f3ff' : '#a855f7', flexShrink: 0 }}>
-                                                        {r.source === 'official' ? '★' : '◆'}
-                                                    </span>
-                                                    <div style={{ flex: 1, minWidth: 0 }}>
-                                                        <div style={{ fontSize: '0.75rem', fontWeight: 500, color: '#e0e0e0', marginBottom: '2px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                                            {r.name}
+                                                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                                                        <span style={{ fontSize: '0.85rem', color: r.source === 'official' ? '#00f3ff' : '#a855f7', flexShrink: 0 }}>
+                                                            {r.source === 'official' ? '★' : '◆'}
+                                                        </span>
+                                                        <div style={{ flex: 1, minWidth: 0 }}>
+                                                            <div style={{ fontSize: '0.75rem', fontWeight: 500, color: '#e0e0e0', marginBottom: '2px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                                {r.name}
+                                                                {needsConfig && <span style={{ color: '#f59e0b', fontSize: '0.6rem', marginLeft: '6px' }}>🔑 requires config</span>}
+                                                            </div>
+                                                            <div style={{ fontSize: '0.65rem', color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                                {r.description}
+                                                            </div>
                                                         </div>
-                                                        <div style={{ fontSize: '0.65rem', color: '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                                            {r.description}
-                                                        </div>
+                                                        <button
+                                                            style={{
+                                                                ...S.btnGhost, padding: '4px 12px', fontSize: '0.65rem',
+                                                                color: isInstalled ? '#555' : isConfiguring ? '#f59e0b' : '#10b981',
+                                                                borderColor: isInstalled ? '#333' : isConfiguring ? '#f59e0b' : '#10b981',
+                                                            }}
+                                                            disabled={isInstalled}
+                                                            onClick={() => {
+                                                                if (needsConfig && !isConfiguring) {
+                                                                    setMcpConfiguring(r.name);
+                                                                    setMcpEnvValues({});
+                                                                } else if (!needsConfig) {
+                                                                    doInstall();
+                                                                }
+                                                            }}
+                                                        >
+                                                            {isInstalled ? 'Installed' : isConfiguring ? '▾ Configure' : needsConfig ? '🔑 Configure' : '+ Install'}
+                                                        </button>
                                                     </div>
-                                                    <button
-                                                        style={{
-                                                            ...S.btnGhost, padding: '4px 12px', fontSize: '0.65rem',
-                                                            color: isInstalled ? '#555' : '#10b981',
-                                                            borderColor: isInstalled ? '#333' : '#10b981',
-                                                        }}
-                                                        disabled={isInstalled}
-                                                        onClick={async () => {
-                                                            try {
-                                                                await request(`/workspaces/${workspaceId}/mcp-tools`, {
-                                                                    method: 'POST',
-                                                                    body: {
-                                                                        name: r.name,
-                                                                        description: r.description,
-                                                                        serverUrl: `npx -y ${r.name}`,
-                                                                        transport: r.transport || 'stdio',
-                                                                    },
-                                                                });
-                                                                setMcpServers(prev => [...prev, {
-                                                                    name: r.name, description: r.description,
-                                                                    server_url: `npx -y ${r.name}`,
-                                                                    transport: r.transport || 'stdio', enabled: true,
-                                                                }]);
-                                                                setSaveStatus(`Installed ${r.name}`);
-                                                                setTimeout(() => setSaveStatus(null), 2000);
-                                                            } catch {
-                                                                setError('Failed to install');
-                                                                setTimeout(() => setError(null), 3000);
-                                                            }
-                                                        }}
-                                                    >
-                                                        {isInstalled ? 'Installed' : '+ Install'}
-                                                    </button>
+
+                                                    {/* Env var configuration form */}
+                                                    {isConfiguring && r.requires_env && (
+                                                        <div style={{
+                                                            marginTop: '10px', padding: '10px 12px',
+                                                            background: '#111', borderRadius: '4px',
+                                                            border: '1px solid #a855f733',
+                                                        }}>
+                                                            <div style={{ fontSize: '0.7rem', color: '#a855f7', fontWeight: 600, marginBottom: '8px' }}>
+                                                                🔑 Required Configuration
+                                                            </div>
+                                                            {r.requires_env.map(envKey => (
+                                                                <div key={envKey} style={{ marginBottom: '8px' }}>
+                                                                    <label style={{ fontSize: '0.65rem', color: '#888', display: 'block', marginBottom: '3px' }}>
+                                                                        {envKey}
+                                                                    </label>
+                                                                    <input
+                                                                        style={{ ...S.input, fontSize: '0.75rem' }}
+                                                                        type={envKey.toLowerCase().includes('token') || envKey.toLowerCase().includes('key') || envKey.toLowerCase().includes('secret') ? 'password' : 'text'}
+                                                                        placeholder={`Enter ${envKey}...`}
+                                                                        value={mcpEnvValues[envKey] || ''}
+                                                                        onChange={e => setMcpEnvValues(prev => ({ ...prev, [envKey]: e.target.value }))}
+                                                                    />
+                                                                </div>
+                                                            ))}
+                                                            <div style={{ display: 'flex', gap: '8px', marginTop: '10px' }}>
+                                                                <button
+                                                                    style={{
+                                                                        ...S.btnPrimary, padding: '6px 16px', fontSize: '0.7rem',
+                                                                        background: '#a855f7',
+                                                                        opacity: r.requires_env.every(k => mcpEnvValues[k]?.trim()) ? 1 : 0.4,
+                                                                    }}
+                                                                    disabled={!r.requires_env.every(k => mcpEnvValues[k]?.trim())}
+                                                                    onClick={() => doInstall(mcpEnvValues)}
+                                                                >
+                                                                    ✓ Install with Config
+                                                                </button>
+                                                                <button
+                                                                    style={{ ...S.btnGhost, padding: '6px 12px', fontSize: '0.7rem' }}
+                                                                    onClick={() => { setMcpConfiguring(null); setMcpEnvValues({}); }}
+                                                                >
+                                                                    Cancel
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    )}
                                                 </div>
                                             );
                                         })}
