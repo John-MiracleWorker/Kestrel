@@ -280,14 +280,26 @@ class MCPConnectionPool:
         """Connect to (or reuse) an MCP server."""
         if name in self._connections and self._connections[name].connected:
             client = self._connections[name]
-            return {
-                "already_connected": True,
-                "server": client.server_info,
-                "tools": [
-                    {"name": t["name"], "description": t.get("description", "")}
-                    for t in client.tools
-                ],
-            }
+            # Force reconnect if: no tools discovered (likely missing auth)
+            # or env vars have changed (e.g., PAT was added)
+            env_changed = env and env != client.env
+            no_tools = len(client.tools) == 0
+            if no_tools or env_changed:
+                logger.info(
+                    f"MCP '{name}': reconnecting (no_tools={no_tools}, "
+                    f"env_changed={env_changed})"
+                )
+                await client.disconnect()
+                del self._connections[name]
+            else:
+                return {
+                    "already_connected": True,
+                    "server": client.server_info,
+                    "tools": [
+                        {"name": t["name"], "description": t.get("description", "")}
+                        for t in client.tools
+                    ],
+                }
 
         client = MCPClient(name, command, env)
         result = await client.connect()
