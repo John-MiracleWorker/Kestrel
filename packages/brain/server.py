@@ -1021,6 +1021,29 @@ class BrainServicer:
                             )
                         full_response_parts.append(event.content)
 
+                elif event_type == "approval_needed":
+                    # ask_human question — render as visible chat text
+                    question = event.content or "The agent needs your input."
+                    # Format it nicely
+                    approval_text = f"\n\n🤔 **I need your input:**\n\n{question}\n\n*Reply in the chat to continue.*"
+                    words = approval_text.split(' ')
+                    for i, word in enumerate(words):
+                        chunk = word if i == 0 else ' ' + word
+                        yield self._make_response(
+                            chunk_type=0,
+                            content_delta=chunk,
+                        )
+                    full_response_parts.append(approval_text)
+                    # Also send metadata so UI knows we're waiting
+                    yield self._make_response(
+                        chunk_type=0,
+                        metadata={
+                            "agent_status": "waiting_for_human",
+                            "approval_id": event.approval_id or "",
+                            "question": question[:300],
+                        },
+                    )
+
                 elif event_type == "task_complete":
                     # Task complete — stream any remaining content
                     if event.content and event.content not in '\n'.join(full_response_parts):
