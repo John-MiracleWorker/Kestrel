@@ -152,6 +152,27 @@ export function useChat(
                             createdAt: new Date().toISOString(),
                         };
                         setMessages((prev) => [...prev, finalMessage]);
+
+                        // Auto-generate title after first assistant reply
+                        if (
+                            workspaceId &&
+                            conversationId &&
+                            !titleGeneratedRef.current
+                        ) {
+                            titleGeneratedRef.current = true;
+                            conversations
+                                .generateTitle(workspaceId, conversationId)
+                                .then((newTitle) => {
+                                    window.dispatchEvent(
+                                        new CustomEvent('conversation-title-changed', {
+                                            detail: { conversationId, newTitle },
+                                        }),
+                                    );
+                                })
+                                .catch((err) =>
+                                    console.error('Auto-title failed:', err),
+                                );
+                        }
                     }
                     setStreamingMessage(null);
                     contentRef.current = '';
