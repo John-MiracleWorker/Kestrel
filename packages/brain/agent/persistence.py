@@ -31,6 +31,11 @@ class PostgresTaskPersistence(TaskPersistence):
 
     async def save_task(self, task: AgentTask) -> None:
         """Insert a new agent task."""
+        # Protobuf sends empty strings for unset fields; PostgreSQL UUID
+        # columns reject '' — convert to None for nullable UUID cols.
+        conv_id = task.conversation_id or None
+        ws_id = task.workspace_id or None
+
         await self._pool.execute(
             """
             INSERT INTO agent_tasks (id, user_id, workspace_id, conversation_id,
@@ -40,8 +45,8 @@ class PostgresTaskPersistence(TaskPersistence):
             """,
             task.id,
             task.user_id,
-            task.workspace_id,
-            task.conversation_id,
+            ws_id,
+            conv_id,
             task.goal,
             task.status.value if isinstance(task.status, TaskStatus) else task.status,
             json.dumps(task.plan.to_dict()) if task.plan else None,
