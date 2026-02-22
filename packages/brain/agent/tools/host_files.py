@@ -20,6 +20,12 @@ from pathlib import Path
 from typing import Optional
 
 from agent.types import RiskLevel, ToolDefinition
+from agent.tools.project_context import (
+    save_project_context,
+    recall_project_context,
+    list_known_projects,
+    set_vector_store as _set_project_vs,
+)
 
 logger = logging.getLogger("brain.agent.tools.host_files")
 
@@ -626,6 +632,14 @@ async def host_tree(
         if project_context:
             result["project"] = project_context
 
+        # Auto-save project context to memory (fire-and-forget)
+        try:
+            memo_id = await save_project_context(result, workspace_id=workspace_id)
+            if memo_id:
+                result["_memo"] = f"Project context saved to memory (id={memo_id})"
+        except Exception as e:
+            logger.debug(f"Failed to auto-memo project: {e}")
+
         return result
 
     except ValueError as e:
@@ -705,9 +719,44 @@ async def host_find(
         return {"error": f"Failed to find files: {e}"}
 
 
+async def project_recall(
+    project_name: str,
+    workspace_id: str = "default",
+) -> dict:
+    """Recall saved context for a project by name."""
+    try:
+        # Try exact recall first
+        context = await recall_project_context(project_name, workspace_id)
+        if context:
+            return {
+                "found": True,
+                **context,
+            }
 
-def register_host_file_tools(registry) -> None:
+        # List known projects as suggestions
+        known = await list_known_projects(workspace_id)
+        if known:
+            return {
+                "found": False,
+                "message": f"No saved context for '{project_name}'.",
+                "known_projects": known,
+                "hint": "Use host_tree to scan the project first, or try one of the known project names.",
+            }
+
+        return {
+            "found": False,
+            "message": "No projects have been scanned yet. Use host_tree to scan a project directory first.",
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def register_host_file_tools(registry, vector_store=None) -> None:
     """Register host filesystem tools."""
+    # Inject vector store for project context memoization
+    if vector_store:
+        _set_project_vs(vector_store)
 
     registry.register(
         definition=ToolDefinition(
@@ -929,4 +978,31 @@ def register_host_file_tools(registry) -> None:
             category="host_file",
         ),
         handler=host_find,
+    )
+
+    registry.register(
+        definition=ToolDefinition(
+            name="project_recall",
+            description=(
+                "Recall saved context for a previously scanned project. "
+                "Returns the project's directory structure, tech stack, dependencies, "
+                "and other metadata from a previous host_tree scan. "
+                "If no match is found, lists all known projects. "
+                "USE THIS BEFORE host_tree to check if the project was already scanned."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "project_name": {
+                        "type": "string",
+                        "description": "Project name or slug (e.g. 'kestrel', 'my-react-app', 'little bird alt')",
+                    },
+                },
+                "required": ["project_name"],
+            },
+            risk_level=RiskLevel.LOW,
+            timeout_seconds=10,
+            category="memory",
+        ),
+        handler=project_recall,
     )

@@ -173,7 +173,7 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
     register_code_tools(registry, hands_client=hands_client)
     register_web_tools(registry)
     register_file_tools(registry)
-    register_host_file_tools(registry)
+    register_host_file_tools(registry, vector_store=vector_store)
     register_data_tools(registry)
     register_memory_tools(registry, vector_store=vector_store)
     register_human_tools(registry)
