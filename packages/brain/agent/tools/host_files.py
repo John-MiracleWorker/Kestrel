@@ -458,7 +458,252 @@ def _host_file_info(item: Path, base: Path) -> dict:
     return info
 
 
-# ── Registration ─────────────────────────────────────────────────────
+# ── Project-Aware Tree ───────────────────────────────────────────────
+
+# Files that indicate project type / tech stack
+PROJECT_MARKERS = {
+    "package.json": "Node.js",
+    "tsconfig.json": "TypeScript",
+    "Cargo.toml": "Rust",
+    "pyproject.toml": "Python",
+    "setup.py": "Python",
+    "requirements.txt": "Python",
+    "go.mod": "Go",
+    "Gemfile": "Ruby",
+    "pom.xml": "Java/Maven",
+    "build.gradle": "Java/Gradle",
+    "CMakeLists.txt": "C/C++",
+    "Makefile": "Make",
+    "Dockerfile": "Docker",
+    "docker-compose.yml": "Docker Compose",
+    "docker-compose.yaml": "Docker Compose",
+    ".env": "Environment Config",
+    ".gitignore": "Git",
+}
+
+# Directories to always skip in tree
+TREE_SKIP_DIRS = {
+    "node_modules", "__pycache__", ".git", "venv", ".venv",
+    ".tox", ".mypy_cache", ".pytest_cache", "dist", "build",
+    ".next", ".nuxt", ".cache", "coverage", ".turbo",
+    "target",  # Rust/Java
+}
+
+
+async def host_tree(
+    path: str,
+    depth: int = 4,
+    workspace_id: str = "default",
+) -> dict:
+    """
+    Return a full directory tree with project context detection.
+    Replaces dozens of sequential host_list calls with one comprehensive view.
+    """
+    try:
+        mounts = _get_host_mounts()
+        resolved = _resolve_host_path(path, mounts)
+
+        if not resolved.exists():
+            return {"error": f"Path not found: {path}"}
+        if not resolved.is_dir():
+            return {"error": f"Not a directory: {path}. Use host_read for files."}
+
+        # Detect project markers at root
+        detected_tech = []
+        for marker, tech in PROJECT_MARKERS.items():
+            if (resolved / marker).exists():
+                detected_tech.append(tech)
+
+        # Read key project files for context
+        project_context = {}
+        pkg_json = resolved / "package.json"
+        if pkg_json.exists():
+            try:
+                import json as _json
+                pkg = _json.loads(pkg_json.read_text(encoding="utf-8", errors="replace"))
+                project_context["name"] = pkg.get("name", "")
+                project_context["description"] = pkg.get("description", "")
+                deps = list(pkg.get("dependencies", {}).keys())[:15]
+                dev_deps = list(pkg.get("devDependencies", {}).keys())[:10]
+                if deps:
+                    project_context["dependencies"] = deps
+                if dev_deps:
+                    project_context["devDependencies"] = dev_deps
+                scripts = list(pkg.get("scripts", {}).keys())
+                if scripts:
+                    project_context["scripts"] = scripts
+            except Exception:
+                pass
+
+        pyproject = resolved / "pyproject.toml"
+        if pyproject.exists() and not project_context:
+            try:
+                content = pyproject.read_text(encoding="utf-8", errors="replace")
+                # Simple extraction without toml parser
+                for line in content.split("\n"):
+                    if "name" in line and "=" in line and "name" not in project_context:
+                        project_context["name"] = line.split("=", 1)[1].strip().strip('"\'')
+                        break
+            except Exception:
+                pass
+
+        # Build tree
+        tree_lines = []
+        file_count = 0
+        dir_count = 0
+        max_entries = 500
+
+        def _build_tree(directory: Path, prefix: str, current_depth: int):
+            nonlocal file_count, dir_count
+
+            if current_depth > depth or (file_count + dir_count) >= max_entries:
+                return
+
+            try:
+                entries = sorted(directory.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+            except PermissionError:
+                return
+
+            # Filter entries
+            visible = []
+            for entry in entries:
+                name = entry.name
+                if name.startswith(".") and name not in (".env.example",):
+                    continue
+                if name in TREE_SKIP_DIRS:
+                    continue
+                if _is_blocked_path(entry) is not None:
+                    continue
+                visible.append(entry)
+
+            for i, entry in enumerate(visible):
+                if (file_count + dir_count) >= max_entries:
+                    tree_lines.append(f"{prefix}... (truncated)")
+                    return
+
+                is_last = (i == len(visible) - 1)
+                connector = "└── " if is_last else "├── "
+                extension = "    " if is_last else "│   "
+
+                if entry.is_dir():
+                    dir_count += 1
+                    # Check for project markers in subdirs
+                    sub_markers = []
+                    for marker, tech in PROJECT_MARKERS.items():
+                        if (entry / marker).exists():
+                            sub_markers.append(tech)
+                    marker_hint = f"  [{', '.join(sub_markers)}]" if sub_markers else ""
+                    tree_lines.append(f"{prefix}{connector}{entry.name}/{marker_hint}")
+                    _build_tree(entry, prefix + extension, current_depth + 1)
+                else:
+                    file_count += 1
+                    try:
+                        size = entry.stat().st_size
+                        if size > 1_000_000:
+                            size_str = f" ({size / 1_000_000:.1f}MB)"
+                        elif size > 1000:
+                            size_str = f" ({size / 1000:.0f}KB)"
+                        else:
+                            size_str = ""
+                    except OSError:
+                        size_str = ""
+                    tree_lines.append(f"{prefix}{connector}{entry.name}{size_str}")
+
+        _build_tree(resolved, "", 0)
+
+        result = {
+            "path": _container_to_host_path(resolved),
+            "tree": "\n".join(tree_lines),
+            "summary": {
+                "files": file_count,
+                "directories": dir_count,
+                "truncated": (file_count + dir_count) >= max_entries,
+            },
+        }
+
+        if detected_tech:
+            result["tech_stack"] = list(set(detected_tech))
+        if project_context:
+            result["project"] = project_context
+
+        return result
+
+    except ValueError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": f"Failed to build tree: {e}"}
+
+
+async def host_find(
+    pattern: str,
+    path: str = ".",
+    file_type: str = "any",
+    max_results: int = 50,
+    workspace_id: str = "default",
+) -> dict:
+    """Find files by name pattern across the directory tree."""
+    try:
+        mounts = _get_host_mounts()
+        resolved = _resolve_host_path(path, mounts)
+
+        if not resolved.exists():
+            return {"error": f"Path not found: {path}"}
+
+        results = []
+        search_re = re.compile(pattern, re.IGNORECASE)
+
+        for root_dir, dirs, files in os.walk(resolved):
+            # Skip ignored directories
+            dirs[:] = [
+                d for d in dirs
+                if d not in TREE_SKIP_DIRS
+                and not d.startswith(".")
+                and _is_blocked_path(Path(root_dir) / d) is None
+            ]
+
+            items = []
+            if file_type in ("any", "file"):
+                items.extend((f, "file") for f in files)
+            if file_type in ("any", "directory"):
+                items.extend((d, "directory") for d in dirs)
+
+            for name, item_type in items:
+                if len(results) >= max_results:
+                    break
+
+                if search_re.search(name):
+                    full_path = Path(root_dir) / name
+                    if _is_blocked_path(full_path) is not None:
+                        continue
+
+                    entry = {
+                        "name": name,
+                        "path": _container_to_host_path(full_path),
+                        "type": item_type,
+                    }
+                    if item_type == "file":
+                        try:
+                            entry["size_bytes"] = full_path.stat().st_size
+                        except OSError:
+                            pass
+                    results.append(entry)
+
+            if len(results) >= max_results:
+                break
+
+        return {
+            "pattern": pattern,
+            "path": _container_to_host_path(resolved),
+            "results": results,
+            "count": len(results),
+            "truncated": len(results) >= max_results,
+        }
+
+    except ValueError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": f"Failed to find files: {e}"}
+
 
 
 def register_host_file_tools(registry) -> None:
@@ -611,4 +856,77 @@ def register_host_file_tools(registry) -> None:
             category="host_file",
         ),
         handler=host_write,
+    )
+
+    registry.register(
+        definition=ToolDefinition(
+            name="host_tree",
+            description=(
+                "Get a full directory tree of a path on the user's host filesystem. "
+                "Returns a visual tree with file sizes and automatically detects project type "
+                "(Node.js, Python, Rust, etc.) by scanning for markers like package.json, "
+                "pyproject.toml, Cargo.toml. Also extracts project metadata (name, dependencies, scripts). "
+                "USE THIS FIRST when exploring a codebase — it replaces many sequential host_list calls."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path to tree (absolute or relative to first mount)",
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "description": "Maximum depth to traverse (default 4, max 8)",
+                        "default": 4,
+                    },
+                },
+                "required": ["path"],
+            },
+            risk_level=RiskLevel.LOW,
+            timeout_seconds=30,
+            category="host_file",
+        ),
+        handler=host_tree,
+    )
+
+    registry.register(
+        definition=ToolDefinition(
+            name="host_find",
+            description=(
+                "Find files by name pattern on the user's host filesystem. "
+                "Like the 'fd' or 'find' command — searches recursively for files/directories "
+                "matching a regex pattern. Useful for locating specific files across a project."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regex pattern to match against file/directory names (e.g. '\\.py$' or 'test')",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to search in (default: first mounted directory)",
+                        "default": ".",
+                    },
+                    "file_type": {
+                        "type": "string",
+                        "description": "Filter by type: 'file', 'directory', or 'any' (default)",
+                        "default": "any",
+                        "enum": ["file", "directory", "any"],
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum results to return (default 50)",
+                        "default": 50,
+                    },
+                },
+                "required": ["pattern"],
+            },
+            risk_level=RiskLevel.LOW,
+            timeout_seconds=30,
+            category="host_file",
+        ),
+        handler=host_find,
     )

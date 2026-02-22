@@ -99,6 +99,7 @@ class Guardrails:
         tool_name: str,
         tool_args: dict,
         config: GuardrailConfig,
+        tool_registry=None,
     ) -> Optional[str]:
         """
         Check if a tool call requires human approval.
@@ -109,14 +110,17 @@ class Guardrails:
         if block_reason:
             return f"BLOCKED: {block_reason}"
 
-        # 2. Check if tool is in the always-approve list
+        # 2. Check if tool definition has requires_approval=True
+        if tool_registry:
+            tool_def = tool_registry.get_tool(tool_name)
+            if tool_def and getattr(tool_def, 'requires_approval', False):
+                return f"Tool '{tool_name}' requires human approval before execution"
+
+        # 3. Check if tool is in the always-approve list
         if tool_name in config.require_approval_tools:
             return f"Tool '{tool_name}' is configured to always require approval"
 
-        # 3. Check risk level against auto-approve threshold
-        from agent.tools import ToolRegistry
-        # The registry is passed at a higher level; here we use the
-        # risk level from the tool definition
+        # 4. Check risk level against auto-approve threshold
         risk = self._get_tool_risk(tool_name)
 
         if risk == RiskLevel.CRITICAL:
@@ -125,7 +129,7 @@ class Guardrails:
         if risk == RiskLevel.HIGH and config.auto_approve_risk.value < "high":
             return f"Tool '{tool_name}' has HIGH risk — exceeds auto-approve threshold"
 
-        # 4. Rate limiting
+        # 5. Rate limiting
         rate_issue = self._check_rate_limit(tool_name)
         if rate_issue:
             return rate_issue

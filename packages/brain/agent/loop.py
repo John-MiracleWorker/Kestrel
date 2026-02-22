@@ -621,6 +621,7 @@ class AgentLoop:
                 # Check guardrails
                 approval_needed = self._guardrails.needs_approval(
                     tool_name, tool_args, task.config,
+                    tool_registry=self._tools,
                 )
 
                 if approval_needed:
