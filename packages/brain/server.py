@@ -920,8 +920,14 @@ class BrainServicer:
             # by injecting messages into the task
             chat_task.messages = messages
 
-            # Skip the planning phase — we already created a plan above
-            chat_task.status = TaskStatus.EXECUTING
+            # Only skip planning for simple messages (we already set a plan).
+            # Complex messages keep PLANNING status so the TaskPlanner runs.
+            if chat_task.plan is not None:
+                chat_task.status = TaskStatus.EXECUTING
+
+            # Persist the chat task to the DB so FK constraints
+            # (e.g. agent_approvals.task_id) are satisfied.
+            await _agent_persistence.save_task(chat_task)
 
             full_response_parts = []
 
