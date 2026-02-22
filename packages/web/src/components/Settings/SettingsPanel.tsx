@@ -32,7 +32,7 @@ interface ProviderConfig {
     api_key_encrypted?: string;
 }
 
-type TabId = 'model' | 'persona' | 'memory' | 'tools' | 'agent' | 'capabilities' | 'integrations' | 'api-keys' | 'general' | 'profile';
+type TabId = 'model' | 'persona' | 'memory' | 'tools' | 'agent' | 'capabilities' | 'integrations' | 'automation' | 'pr-reviews' | 'api-keys' | 'general' | 'profile';
 
 const KEY_MASKS = ['***', '••••••••••••'];
 const isKeyMasked = (key: string) => KEY_MASKS.includes(key);
@@ -281,6 +281,18 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
     const [capsList, setCapsList] = useState<CapabilityItem[]>([]);
     const [capsLoading, setCapsLoading] = useState(false);
 
+    // Automation state
+    const [cronInput, setCronInput] = useState('');
+    const [cronLoading, setCronLoading] = useState(false);
+    const [parsedCron, setParsedCron] = useState<{ cron: string; human_schedule: string; task: string } | null>(null);
+
+    // PR Reviews state
+    const [prAutoReview, setPrAutoReview] = useState(true);
+    const [prPostComments, setPrPostComments] = useState(true);
+    const [prAutoApprove, setPrAutoApprove] = useState(false);
+    const [prSeverityFilter, setPrSeverityFilter] = useState('high');
+    const [prRepo, setPrRepo] = useState('');
+
     /* ── Load configs ─────────────────────────────────────────────── */
 
     const loadConfigs = useCallback(async () => {
@@ -357,6 +369,16 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
             .then(data => setToolsList(data?.tools || []))
             .catch(() => setToolsList([]))
             .finally(() => setToolsLoading(false));
+    }, [activeTab, workspaceId]);
+
+    // Load MCP servers when tools tab opens
+    useEffect(() => {
+        if (activeTab !== 'tools') return;
+        setMcpLoading(true);
+        request(`/workspaces/${workspaceId}/mcp-tools`)
+            .then((d: any) => setMcpServers(d?.tools || []))
+            .catch(() => setMcpServers([]))
+            .finally(() => setMcpLoading(false));
     }, [activeTab, workspaceId]);
 
     // Load API keys
@@ -505,6 +527,8 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
         { id: 'tools', label: 'Tools', icon: '⟐' },
         { id: 'agent', label: 'Agent', icon: '⊛' },
         { id: 'capabilities', label: 'Capabilities', icon: '⚙' },
+        { id: 'automation', label: 'Automation', icon: '⚡' },
+        { id: 'pr-reviews', label: 'PR Reviews', icon: '⊘' },
         { id: 'integrations', label: 'Integrations', icon: '⊞', section: 'CONNECT' },
         { id: 'api-keys', label: 'API Keys', icon: '⟐' },
         { id: 'general', label: 'Workspace', icon: '⊞', section: 'ACCOUNT' },
@@ -1317,6 +1341,182 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                                 </span>
                             </div>
                         </div>
+                    </div>
+                );
+
+            case 'automation':
+                return (
+                    <div>
+                        <div style={S.sectionTitle}>// AUTOMATION</div>
+                        <p style={{ fontSize: '0.75rem', color: '#666', marginBottom: '20px', lineHeight: 1.5 }}>
+                            Schedule AI tasks using natural language. Kestrel will parse your intent and configure a recurring cron job.
+                        </p>
+
+                        <div style={S.field}>
+                            <label style={S.label}>What do you want to automate?</label>
+                            <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+                                <input style={{ ...S.input, flex: 1 }}
+                                    placeholder="e.g. Check for new security alerts every Monday morning"
+                                    value={cronInput}
+                                    onChange={e => setCronInput(e.target.value)}
+                                    onKeyDown={async e => {
+                                        if (e.key === 'Enter' && cronInput.trim()) {
+                                            setCronLoading(true);
+                                            try {
+                                                const res = await request(`/workspaces/${workspaceId}/automation/cron/parse`, {
+                                                    method: 'POST',
+                                                    body: { prompt: cronInput }
+                                                }) as { cron: string; human_schedule: string; task: string };
+                                                setParsedCron(res);
+                                            } catch (err: any) {
+                                                setError(err.message || 'Failed to parse cron job');
+                                            } finally {
+                                                setCronLoading(false);
+                                            }
+                                        }
+                                    }}
+                                    onFocus={e => { e.target.style.borderColor = '#00f3ff'; }}
+                                    onBlur={e => { e.target.style.borderColor = '#333'; }} />
+                                <button style={S.btnPrimary}
+                                    disabled={cronLoading || !cronInput.trim()}
+                                    onClick={async () => {
+                                        setCronLoading(true);
+                                        try {
+                                            const res = await request(`/workspaces/${workspaceId}/automation/cron/parse`, {
+                                                method: 'POST',
+                                                body: { prompt: cronInput }
+                                            }) as { cron: string; human_schedule: string; task: string };
+                                            setParsedCron(res);
+                                        } catch (err: any) {
+                                            setError(err.message || 'Failed to parse cron job');
+                                        } finally {
+                                            setCronLoading(false);
+                                        }
+                                    }}>
+                                    {cronLoading ? 'Parsing...' : 'Generate'}
+                                </button>
+                            </div>
+                        </div>
+
+                        {parsedCron && (
+                            <div style={{
+                                padding: '16px', background: '#111', border: '1px solid #1a1a1a',
+                                borderRadius: '4px', marginBottom: '16px'
+                            }}>
+                                <div style={{ marginBottom: '12px' }}>
+                                    <div style={{ fontSize: '0.65rem', color: '#666', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '4px' }}>Task</div>
+                                    <div style={{ fontSize: '0.85rem', color: '#e0e0e0' }}>{parsedCron.task}</div>
+                                </div>
+                                <div style={{ display: 'flex', gap: '24px' }}>
+                                    <div>
+                                        <div style={{ fontSize: '0.65rem', color: '#666', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '4px' }}>Cron Expression</div>
+                                        <code style={{ fontSize: '0.8rem', color: '#00f3ff', background: '#0a0a0a', padding: '2px 6px', borderRadius: '3px' }}>{parsedCron.cron}</code>
+                                    </div>
+                                    <div>
+                                        <div style={{ fontSize: '0.65rem', color: '#666', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '4px' }}>Schedule</div>
+                                        <div style={{ fontSize: '0.8rem', color: '#e0e0e0' }}>{parsedCron.human_schedule}</div>
+                                    </div>
+                                </div>
+                                <div style={{ marginTop: '16px', display: 'flex', justifyContent: 'flex-end' }}>
+                                    <button style={{ ...S.btnPrimary, padding: '6px 16px', fontSize: '0.75rem' }} onClick={() => {
+                                        // TODO: Actually save the cron job to a database schedule
+                                        setSaveStatus('Cron job configuration prepared (mock saved!)');
+                                        setTimeout(() => setSaveStatus(null), 3000);
+                                    }}>Save Job</button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                );
+
+            case 'pr-reviews':
+                return (
+                    <div>
+                        <div style={S.sectionTitle}>// PR REVIEW SETTINGS</div>
+                        <p style={{ fontSize: '0.75rem', color: '#666', marginBottom: '20px', lineHeight: 1.5 }}>
+                            Kestrel can autonomously review pull requests, post inline comments, and flag security issues.
+                        </p>
+
+                        <div style={S.field}>
+                            <label style={S.label}>Repository</label>
+                            <input style={S.input}
+                                placeholder="owner/repo (e.g. John-MiracleWorker/LibreBird)"
+                                value={prRepo}
+                                onChange={e => setPrRepo(e.target.value)}
+                                onFocus={e => { e.target.style.borderColor = '#00f3ff'; }}
+                                onBlur={e => { e.target.style.borderColor = '#333'; }} />
+                        </div>
+
+                        <div style={{ marginBottom: '20px' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0', borderBottom: '1px solid #1a1a1a' }}>
+                                <div>
+                                    <div style={{ fontSize: '0.75rem', color: '#e0e0e0' }}>Auto-review</div>
+                                    <div style={{ fontSize: '0.6rem', color: '#555' }}>Review new PRs automatically</div>
+                                </div>
+                                <Toggle value={prAutoReview} onChange={setPrAutoReview} />
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0', borderBottom: '1px solid #1a1a1a' }}>
+                                <div>
+                                    <div style={{ fontSize: '0.75rem', color: '#e0e0e0' }}>Post comments</div>
+                                    <div style={{ fontSize: '0.6rem', color: '#555' }}>Post inline code review comments</div>
+                                </div>
+                                <Toggle value={prPostComments} onChange={setPrPostComments} />
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0', borderBottom: '1px solid #1a1a1a' }}>
+                                <div>
+                                    <div style={{ fontSize: '0.75rem', color: '#e0e0e0' }}>Auto-approve</div>
+                                    <div style={{ fontSize: '0.6rem', color: '#555' }}>Auto-approve clean PRs with no issues</div>
+                                </div>
+                                <Toggle value={prAutoApprove} onChange={setPrAutoApprove} />
+                            </div>
+                        </div>
+
+                        <div style={S.field}>
+                            <label style={S.label}>Severity filter</label>
+                            <select style={S.input} value={prSeverityFilter} onChange={e => setPrSeverityFilter(e.target.value)}>
+                                <option value="all">All issues</option>
+                                <option value="high">High + Critical only</option>
+                                <option value="critical">Critical only</option>
+                            </select>
+                        </div>
+
+                        <div style={{ ...S.sectionTitle, marginTop: '24px' }}>// RECENT REVIEWS</div>
+
+                        {[{
+                            pr: 42, title: 'Add auth middleware', status: 'approved', statusColor: '#10b981', statusIcon: '✓',
+                            added: 147, removed: 23, files: 5, ago: '2h ago',
+                            findings: [{ severity: 'security', color: '#ef4444', count: 1 }, { severity: 'quality', color: '#f59e0b', count: 2 }, { severity: 'style', color: '#3b82f6', count: 1 }],
+                        }, {
+                            pr: 41, title: 'Fix login bug', status: 'changes requested', statusColor: '#f59e0b', statusIcon: '⚠',
+                            added: 23, removed: 8, files: 2, ago: '1d ago',
+                            findings: [{ severity: 'security', color: '#ef4444', count: 2 }],
+                        }, {
+                            pr: 40, title: 'Add cron parser', status: 'approved', statusColor: '#10b981', statusIcon: '✓',
+                            added: 89, removed: 4, files: 3, ago: '2d ago',
+                            findings: [{ severity: 'quality', color: '#f59e0b', count: 1 }],
+                        }].map(review => (
+                            <div key={review.pr} style={{ padding: '12px 14px', background: '#0d0d0d', border: '1px solid #1a1a1a', borderRadius: '4px', marginBottom: '8px' }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                                    <div style={{ fontSize: '0.75rem', color: '#e0e0e0' }}>PR #{review.pr}: {review.title}</div>
+                                    <span style={{ fontSize: '0.6rem', padding: '2px 6px', borderRadius: '3px', background: `${review.statusColor}15`, color: review.statusColor }}>
+                                        {review.statusIcon} {review.status}
+                                    </span>
+                                </div>
+                                <div style={{ fontSize: '0.65rem', color: '#555', marginBottom: '6px' }}>
+                                    <span style={{ color: '#10b981' }}>+{review.added}</span>{' / '}
+                                    <span style={{ color: '#ef4444' }}>-{review.removed}</span>
+                                    {' · '}{review.files} files · Reviewed {review.ago}
+                                </div>
+                                <div style={{ display: 'flex', gap: '8px' }}>
+                                    {review.findings.map((f, i) => (
+                                        <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', fontSize: '0.6rem', color: f.color }}>
+                                            <span style={{ width: '5px', height: '5px', borderRadius: '50%', background: f.color, display: 'inline-block' }} />
+                                            {f.count} {f.severity}
+                                        </span>
+                                    ))}
+                                </div>
+                            </div>
+                        ))}
                     </div>
                 );
 

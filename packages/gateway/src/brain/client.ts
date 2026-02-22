@@ -521,4 +521,8 @@ export class BrainClient {
     async getCapabilities(workspaceId: string): Promise<any> {
         return this.call('GetCapabilities', { workspace_id: workspaceId });
     }
+
+    async parseCronJob(workspaceId: string, prompt: string): Promise<any> {
+        return this.call('ParseCronJob', { workspace_id: workspaceId, prompt });
+    }
 }

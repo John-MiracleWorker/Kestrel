@@ -10,6 +10,9 @@ interface SidebarProps {
     onNewConversation: () => void;
     onOpenSettings: () => void;
     onOpenMoltbook: () => void;
+    onOpenMemoryPalace: () => void;
+    onOpenDocs: () => void;
+    onOpenScreenShare: () => void;
     onLogout: () => void;
 }
 
@@ -21,6 +24,9 @@ export function Sidebar({
     onNewConversation,
     onOpenSettings,
     onOpenMoltbook,
+    onOpenMemoryPalace,
+    onOpenDocs,
+    onOpenScreenShare,
     onLogout,
 }: SidebarProps) {
     const [workspaceList, setWorkspaceList] = useState<Workspace[]>([]);
@@ -421,6 +427,60 @@ export function Sidebar({
                                 e.currentTarget.style.boxShadow = 'none';
                             }}
                         >🦞</button>
+                        <button
+                            onClick={onOpenMemoryPalace}
+                            title="Memory Palace"
+                            style={{
+                                cursor: 'pointer', fontSize: '1rem',
+                                background: 'transparent', border: 'none',
+                                padding: '4px 8px', borderRadius: 'var(--radius-sm)',
+                                transition: 'all 0.2s',
+                            }}
+                            onMouseEnter={e => {
+                                e.currentTarget.style.background = 'rgba(168, 85, 247, 0.1)';
+                                e.currentTarget.style.boxShadow = '0 0 10px rgba(168, 85, 247, 0.1)';
+                            }}
+                            onMouseLeave={e => {
+                                e.currentTarget.style.background = 'transparent';
+                                e.currentTarget.style.boxShadow = 'none';
+                            }}
+                        >🧠</button>
+                        <button
+                            onClick={onOpenDocs}
+                            title="Auto-Documentation"
+                            style={{
+                                cursor: 'pointer', fontSize: '1rem',
+                                background: 'transparent', border: 'none',
+                                padding: '4px 8px', borderRadius: 'var(--radius-sm)',
+                                transition: 'all 0.2s',
+                            }}
+                            onMouseEnter={e => {
+                                e.currentTarget.style.background = 'rgba(16, 185, 129, 0.1)';
+                                e.currentTarget.style.boxShadow = '0 0 10px rgba(16, 185, 129, 0.1)';
+                            }}
+                            onMouseLeave={e => {
+                                e.currentTarget.style.background = 'transparent';
+                                e.currentTarget.style.boxShadow = 'none';
+                            }}
+                        >📖</button>
+                        <button
+                            onClick={onOpenScreenShare}
+                            title="Live Screen-Share Agent"
+                            style={{
+                                cursor: 'pointer', fontSize: '1rem',
+                                background: 'transparent', border: 'none',
+                                padding: '4px 8px', borderRadius: 'var(--radius-sm)',
+                                transition: 'all 0.2s',
+                            }}
+                            onMouseEnter={e => {
+                                e.currentTarget.style.background = 'rgba(245, 158, 11, 0.1)';
+                                e.currentTarget.style.boxShadow = '0 0 10px rgba(245, 158, 11, 0.1)';
+                            }}
+                            onMouseLeave={e => {
+                                e.currentTarget.style.background = 'transparent';
+                                e.currentTarget.style.boxShadow = 'none';
+                            }}
+                        >📺</button>
                     </div>
                     <button
                         onClick={onLogout}

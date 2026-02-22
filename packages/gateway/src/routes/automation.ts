@@ -41,6 +41,28 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
     // CRON JOBS
     // ══════════════════════════════════════════════════════════════════
 
+    const parseCronJobSchema = z.object({
+        prompt: z.string().min(1, 'prompt is required'),
+    });
+    type ParseCronJobBody = z.infer<typeof parseCronJobSchema>;
+
+    // Parse Natural Language to Cron Job
+    typedApp.post('/api/workspaces/:workspaceId/automation/cron/parse', {
+        preHandler: [requireAuth, requireWorkspace],
+        schema: { params: workspaceParamsSchema, body: parseCronJobSchema }
+    }, async (req, reply) => {
+        const { workspaceId } = req.params as WorkspaceParams;
+        const { prompt } = req.body as ParseCronJobBody;
+
+        try {
+            const result = await brainClient.parseCronJob(workspaceId, prompt);
+            return reply.status(200).send(result);
+        } catch (err: any) {
+            logger.error('Parse cron job failed', { error: err.message });
+            return reply.status(500).send({ error: err.message });
+        }
+    });
+
     const createCronJobSchema = z.object({
         name: z.string().min(1, 'name is required'),
         description: z.string().optional(),

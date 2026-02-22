@@ -295,6 +295,8 @@ class EvidenceChain:
         try:
             async with self._pool.acquire() as conn:
                 for d in self._decisions:
+                    # asyncpg needs datetime objects, not ISO strings
+                    created_dt = datetime.fromisoformat(d.created_at) if d.created_at else datetime.now(timezone.utc)
                     await conn.execute(
                         """
                         INSERT INTO evidence_chain
@@ -307,7 +309,7 @@ class EvidenceChain:
                         d.description, d.reasoning,
                         json.dumps([e.to_dict() for e in d.evidence]),
                         json.dumps(d.alternatives_considered),
-                        d.confidence, d.outcome, d.created_at,
+                        d.confidence, d.outcome, created_dt,
                     )
         except Exception as e:
             logger.error(f"Failed to persist evidence chain: {e}")

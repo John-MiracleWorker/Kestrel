@@ -51,6 +51,9 @@ service BrainService {
 
   // ── Moltbook Activity ─────────────────────────────────────
   rpc GetMoltbookActivity(GetMoltbookActivityRequest) returns (GetMoltbookActivityResponse);
+
+  // ── Automation ──────────────────────────────────────────────
+  rpc ParseCronJob(ParseCronJobRequest) returns (ParseCronJobResponse);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -510,4 +513,17 @@ message CapabilityItem {
 
 message GetCapabilitiesResponse {
   repeated CapabilityItem capabilities = 1;
+}
+
+// ── Automation ─────────────────────────────────────────────────────
+
+message ParseCronJobRequest {
+  string prompt = 1;
+  string workspace_id = 2;
+}
+
+message ParseCronJobResponse {
+  string cron = 1;
+  string human_schedule = 2;
+  string task = 3;
 }

@@ -207,7 +207,8 @@ class CronScheduler:
         """Trigger a cron job by launching an agent task."""
         logger.info(f"Triggering cron job: {job.name} ({job.id})")
 
-        job.last_run = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc)
+        job.last_run = now.isoformat()
         job.run_count += 1
 
         # Update DB
@@ -219,7 +220,7 @@ class CronScheduler:
                     SET last_run = $2, run_count = $3
                     WHERE id = $1
                     """,
-                    job.id, job.last_run, job.run_count,
+                    uuid.UUID(job.id), now, job.run_count,
                 )
         except Exception as e:
             logger.error(f"Failed to update cron job: {e}")
@@ -247,6 +248,7 @@ class CronScheduler:
         max_runs: int = None,
     ) -> CronJob:
         """Create a new cron job."""
+        now = datetime.now(timezone.utc)
         job = CronJob(
             id=str(uuid.uuid4()),
             workspace_id=workspace_id,
@@ -256,7 +258,7 @@ class CronScheduler:
             cron_expression=cron_expression,
             goal=goal,
             max_runs=max_runs,
-            created_at=datetime.now(timezone.utc).isoformat(),
+            created_at=now.isoformat(),
         )
 
         try:
@@ -268,9 +270,9 @@ class CronScheduler:
                          cron_expression, goal, status, max_runs, created_at)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                     """,
-                    job.id, workspace_id, user_id, name, description,
-                    cron_expression, goal, JobStatus.ACTIVE.value,
-                    max_runs, job.created_at,
+                    uuid.UUID(job.id), uuid.UUID(workspace_id), uuid.UUID(user_id),
+                    name, description, cron_expression, goal,
+                    JobStatus.ACTIVE.value, max_runs, now,
                 )
         except Exception as e:
             logger.error(f"Failed to persist cron job: {e}")
@@ -285,7 +287,7 @@ class CronScheduler:
         try:
             async with self._pool.acquire() as conn:
                 await conn.execute(
-                    "DELETE FROM automation_cron_jobs WHERE id = $1", job_id
+                    "DELETE FROM automation_cron_jobs WHERE id = $1", uuid.UUID(job_id)
                 )
             return True
         except Exception as e:

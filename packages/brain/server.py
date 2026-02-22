@@ -1749,6 +1749,44 @@ class BrainServicer:
             ))
         return brain_pb2.GetMoltbookActivityResponse(activity=activity)
 
+    # ── Automation ──────────────────────────────────────────────
+
+    async def ParseCronJob(self, request, context):
+        """Parse natural language into a cron expression."""
+        try:
+            from cron_parser import parse_nl_cron
+
+            # Resolve provider & API key
+            try:
+                pool = await get_pool()
+                ws_config = await ProviderConfig(pool).get_config(request.workspace_id)
+                provider_name = ws_config.get("provider", "local")
+                api_key = ws_config.get("api_key", "")
+                model = ws_config.get("model", "")
+                if api_key and api_key.startswith("provider_key:"):
+                    r = await get_redis()
+                    real_key = await r.get(api_key)
+                    api_key = real_key.decode("utf-8") if real_key else ""
+                provider = get_provider(provider_name)
+            except Exception as e:
+                logger.warning(f"Could not load provider config for cron parser: {e}")
+                provider_name = "local"
+                api_key = ""
+                model = ""
+                provider = get_provider("local")
+
+            result = await parse_nl_cron(request.prompt, provider, model, api_key)
+            return brain_pb2.ParseCronJobResponse(
+                cron=result.get("cron", ""),
+                human_schedule=result.get("human_schedule", ""),
+                task=result.get("task", "")
+            )
+        except Exception as e:
+            logger.error(f"ParseCronJob failed: {e}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return brain_pb2.ParseCronJobResponse()
+
     async def ListProviderConfigs(self, request, context):
         rows = await list_provider_configs(request.workspace_id)
         configs = []

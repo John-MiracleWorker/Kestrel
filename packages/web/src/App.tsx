@@ -6,6 +6,9 @@ import { ChatView } from './components/Chat/ChatView';
 import { SettingsPanel } from './components/Settings/SettingsPanel';
 import { LiveCanvas } from './components/Layout/LiveCanvas';
 import { MoltbookPanel } from './components/Moltbook/MoltbookPanel';
+import { MemoryPalace } from './components/MemoryPalace/MemoryPalace';
+import { DocsPanel } from './components/Docs/DocsPanel';
+import { ScreenShare } from './components/ScreenShare/ScreenShare';
 import { useChat } from './hooks/useChat';
 import { conversations, type Workspace, type Conversation, type Message } from './api/client';
 
@@ -16,6 +19,9 @@ export default function App() {
     const [initialMessages, setInitialMessages] = useState<Message[]>([]);
     const [showSettings, setShowSettings] = useState(false);
     const [showMoltbook, setShowMoltbook] = useState(false);
+    const [showMemoryPalace, setShowMemoryPalace] = useState(false);
+    const [showDocs, setShowDocs] = useState(false);
+    const [showScreenShare, setShowScreenShare] = useState(false);
     const autoCreateAttempted = useRef<string | null>(null);
     const [showCanvas, setShowCanvas] = useState(true); // Default to open for the look
 
@@ -90,6 +96,9 @@ export default function App() {
                 onNewConversation={handleNewConversation}
                 onOpenSettings={() => setShowSettings(true)}
                 onOpenMoltbook={() => setShowMoltbook(true)}
+                onOpenMemoryPalace={() => setShowMemoryPalace(true)}
+                onOpenDocs={() => setShowDocs(true)}
+                onOpenScreenShare={() => setShowScreenShare(true)}
                 onLogout={logout}
             />
 
@@ -127,6 +136,24 @@ export default function App() {
                 workspaceId={currentWorkspace?.id || ''}
                 isVisible={showMoltbook}
                 onClose={() => setShowMoltbook(false)}
+            />
+
+            <MemoryPalace
+                workspaceId={currentWorkspace?.id || ''}
+                isVisible={showMemoryPalace}
+                onClose={() => setShowMemoryPalace(false)}
+            />
+
+            <DocsPanel
+                workspaceId={currentWorkspace?.id || ''}
+                isVisible={showDocs}
+                onClose={() => setShowDocs(false)}
+            />
+
+            <ScreenShare
+                workspaceId={currentWorkspace?.id || ''}
+                isVisible={showScreenShare}
+                onClose={() => setShowScreenShare(false)}
             />
         </div>
     );
