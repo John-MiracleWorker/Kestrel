@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
+import { request } from '../../api/client';
 
 /* ── Types ─────────────────────────────────────────────────────── */
 interface Suggestion {
@@ -7,7 +8,7 @@ interface Suggestion {
     type: 'warning' | 'info' | 'suggestion';
     title: string;
     description: string;
-    lineRef?: string;
+    lineRef?: string | null;
     timestamp: number;
 }
 
@@ -70,6 +71,7 @@ const S = {
         padding: '10px 12px', marginBottom: '8px',
         background: '#111', borderRadius: '4px',
         borderLeft: `3px solid ${TYPE_COLORS[type] || '#555'}`,
+        animation: 'fadeIn 0.3s ease-out',
     }),
     suggTitle: {
         fontSize: '0.75rem', color: '#e0e0e0', marginBottom: '4px',
@@ -104,70 +106,129 @@ const S = {
         padding: '40px 20px', textAlign: 'center' as const,
         color: '#444', fontSize: '0.7rem',
     },
+    analyzing: {
+        padding: '12px 14px', borderBottom: '1px solid #222',
+        background: 'rgba(0,243,255,0.03)', fontSize: '0.65rem',
+        color: '#00f3ff', display: 'flex', alignItems: 'center', gap: '8px',
+    },
+    error: {
+        padding: '10px 12px', marginBottom: '8px',
+        background: '#111', borderRadius: '4px',
+        borderLeft: '3px solid #ef4444',
+        fontSize: '0.7rem', color: '#f87171',
+    },
 };
-
-/* ── Mock Suggestions ─────────────────────────────────────────── */
-const MOCK_SUGGESTIONS: Suggestion[] = [
-    {
-        id: '1', type: 'warning',
-        title: 'Potential security issue detected',
-        description: 'The JWT expiry on line 23 is set to 24h. Industry standard is 1h for session tokens.',
-        lineRef: 'auth.ts:23',
-        timestamp: Date.now() - 30000,
-    },
-    {
-        id: '2', type: 'suggestion',
-        title: 'Consider using bcrypt',
-        description: 'SHA256 is being used for password hashing on line 45. bcrypt is more resistant to brute-force attacks.',
-        lineRef: 'auth.ts:45',
-        timestamp: Date.now() - 15000,
-    },
-    {
-        id: '3', type: 'info',
-        title: 'Missing error handling',
-        description: 'The async function at line 78 doesn\'t have a try-catch block. Unhandled promise rejections could crash the process.',
-        lineRef: 'server.py:78',
-        timestamp: Date.now() - 5000,
-    },
-];
 
 /* ── Component ────────────────────────────────────────────────── */
 export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProps) {
     const [isWatching, setIsWatching] = useState(false);
     const [isPaused, setIsPaused] = useState(false);
+    const [isAnalyzing, setIsAnalyzing] = useState(false);
     const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
+    const [screenContext, setScreenContext] = useState('');
     const [frameCount, setFrameCount] = useState(0);
-    const [resolution, setResolution] = useState<'720p' | '1080p' | '4k'>('1080p');
-    const [captureInterval, setCaptureInterval] = useState(5000);
+    const [captureInterval, setCaptureInterval] = useState(10000);
     const [showSettings, setShowSettings] = useState(false);
+    const [error, setError] = useState<string | null>(null);
     const streamRef = useRef<MediaStream | null>(null);
-    const intervalRef = useRef<NodeJS.Timeout | null>(null);
+    const videoRef = useRef<HTMLVideoElement | null>(null);
+    const canvasRef = useRef<HTMLCanvasElement | null>(null);
+    const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const [position, setPosition] = useState({ x: 0, y: 0 });
     const dragRef = useRef({ isDragging: false, startX: 0, startY: 0 });
+
+    /** Capture a single frame from the video stream as base64 PNG */
+    const captureFrame = useCallback((): string | null => {
+        const video = videoRef.current;
+        const canvas = canvasRef.current;
+        if (!video || !canvas || video.readyState < 2) return null;
+
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return null;
+
+        ctx.drawImage(video, 0, 0);
+        // Get as JPEG for smaller payload (~60-70% smaller than PNG)
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+        // Strip the data:image/jpeg;base64, prefix
+        return dataUrl.split(',')[1] || null;
+    }, []);
+
+    /** Send a frame to the vision API */
+    const analyzeFrame = useCallback(async () => {
+        if (isPaused || isAnalyzing) return;
+
+        const imageBase64 = captureFrame();
+        if (!imageBase64) return;
+
+        setIsAnalyzing(true);
+        setError(null);
+        setFrameCount(prev => prev + 1);
+
+        try {
+            const result = await request<{
+                suggestions: Suggestion[];
+                context: string;
+            }>(`/workspaces/${workspaceId}/vision/analyze`, {
+                method: 'POST',
+                body: {
+                    image: imageBase64,
+                    mimeType: 'image/jpeg',
+                },
+            });
+
+            if (result.suggestions?.length > 0) {
+                setSuggestions(prev => {
+                    // Deduplicate by title
+                    const existingTitles = new Set(prev.map(s => s.title));
+                    const newSuggs = result.suggestions.filter(s => !existingTitles.has(s.title));
+                    // Keep max 10 suggestions
+                    return [...newSuggs, ...prev].slice(0, 10);
+                });
+            }
+            if (result.context) {
+                setScreenContext(result.context);
+            }
+        } catch (err: any) {
+            console.error('Vision analysis error:', err);
+            setError(err.message || 'Analysis failed');
+        } finally {
+            setIsAnalyzing(false);
+        }
+    }, [workspaceId, isPaused, isAnalyzing, captureFrame]);
 
     const startCapture = async () => {
         try {
             const stream = await navigator.mediaDevices.getDisplayMedia({
-                video: { width: { ideal: resolution === '4k' ? 3840 : resolution === '1080p' ? 1920 : 1280 } }
+                video: { width: { ideal: 1920 }, height: { ideal: 1080 } },
             });
+
             streamRef.current = stream;
+
+            // Create hidden video element to receive the stream
+            const video = document.createElement('video');
+            video.srcObject = stream;
+            video.muted = true;
+            video.playsInline = true;
+            await video.play();
+            videoRef.current = video;
+
+            // Create offscreen canvas for frame capture
+            const canvas = document.createElement('canvas');
+            canvasRef.current = canvas;
+
             setIsWatching(true);
             setFrameCount(0);
+            setSuggestions([]);
+            setError(null);
 
-            // Mock: add suggestions over time
-            intervalRef.current = setInterval(() => {
-                setFrameCount(prev => prev + 1);
-                // Simulate AI suggestions appearing
-                if (Math.random() > 0.7) {
-                    const mock = MOCK_SUGGESTIONS[Math.floor(Math.random() * MOCK_SUGGESTIONS.length)];
-                    setSuggestions(prev => {
-                        if (prev.length >= 5) return prev;
-                        return [{ ...mock, id: `${mock.id}-${Date.now()}`, timestamp: Date.now() }, ...prev];
-                    });
-                }
-            }, captureInterval);
+            // Start periodic analysis
+            // Small delay for the first frame to ensure video is ready
+            setTimeout(() => analyzeFrame(), 2000);
+            intervalRef.current = setInterval(() => analyzeFrame(), captureInterval);
 
-            // Listen for stream end
+            // Listen for stream end (user clicks "Stop sharing")
             stream.getVideoTracks()[0]?.addEventListener('ended', () => {
                 stopCapture();
             });
@@ -179,19 +240,26 @@ export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProp
     const stopCapture = () => {
         streamRef.current?.getTracks().forEach(t => t.stop());
         streamRef.current = null;
+        if (videoRef.current) {
+            videoRef.current.pause();
+            videoRef.current.srcObject = null;
+            videoRef.current = null;
+        }
+        canvasRef.current = null;
         if (intervalRef.current) clearInterval(intervalRef.current);
+        intervalRef.current = null;
         setIsWatching(false);
         setIsPaused(false);
+        setIsAnalyzing(false);
     };
 
     const togglePause = () => {
-        if (isPaused && intervalRef.current) {
-            // Resume
-            intervalRef.current = setInterval(() => {
-                setFrameCount(prev => prev + 1);
-            }, captureInterval);
-        } else if (intervalRef.current) {
-            clearInterval(intervalRef.current);
+        if (isPaused) {
+            // Resume — restart interval
+            intervalRef.current = setInterval(() => analyzeFrame(), captureInterval);
+        } else {
+            if (intervalRef.current) clearInterval(intervalRef.current);
+            intervalRef.current = null;
         }
         setIsPaused(!isPaused);
     };
@@ -200,13 +268,21 @@ export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProp
         setSuggestions(prev => prev.filter(s => s.id !== id));
     };
 
-    // Cleanup
+    // Cleanup on unmount
     useEffect(() => {
         return () => {
             streamRef.current?.getTracks().forEach(t => t.stop());
             if (intervalRef.current) clearInterval(intervalRef.current);
         };
     }, []);
+
+    // Reset interval when capture interval changes
+    useEffect(() => {
+        if (isWatching && !isPaused && intervalRef.current) {
+            clearInterval(intervalRef.current);
+            intervalRef.current = setInterval(() => analyzeFrame(), captureInterval);
+        }
+    }, [captureInterval, isWatching, isPaused, analyzeFrame]);
 
     // Drag handlers
     const handleDragStart = (e: React.MouseEvent) => {
@@ -246,7 +322,7 @@ export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProp
                 <div style={{ display: 'flex', alignItems: 'center' }}>
                     <span style={S.statusDot(isWatching && !isPaused)} />
                     <span style={S.title}>
-                        Kestrel Vision {isWatching ? (isPaused ? '· PAUSED' : '· WATCHING') : ''}
+                        Kestrel Vision {isWatching ? (isPaused ? '· PAUSED' : '· LIVE') : ''}
                     </span>
                 </div>
                 <div style={S.headerBtns}>
@@ -255,28 +331,25 @@ export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProp
                 </div>
             </div>
 
-            {/* Settings Popover */}
+            {/* Analyzing indicator */}
+            {isAnalyzing && (
+                <div style={S.analyzing}>
+                    <span style={{ animation: 'pulse 1s infinite' }}>◉</span>
+                    Analyzing frame...
+                </div>
+            )}
+
+            {/* Settings */}
             {showSettings && (
                 <div style={{ padding: '10px 14px', borderBottom: '1px solid #222', background: '#0d0d0d' }}>
                     <div style={{ fontSize: '0.65rem', color: '#555', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
                         Capture Interval
                     </div>
                     <div style={{ display: 'flex', gap: '4px', marginBottom: '10px' }}>
-                        {[3000, 5000, 10000, 30000].map(ms => (
+                        {[5000, 10000, 20000, 30000].map(ms => (
                             <button key={ms} style={S.resolutionPill(captureInterval === ms)}
                                 onClick={() => setCaptureInterval(ms)}>
                                 {ms / 1000}s
-                            </button>
-                        ))}
-                    </div>
-                    <div style={{ fontSize: '0.65rem', color: '#555', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-                        Resolution
-                    </div>
-                    <div style={{ display: 'flex', gap: '4px' }}>
-                        {(['720p', '1080p', '4k'] as const).map(r => (
-                            <button key={r} style={S.resolutionPill(resolution === r)}
-                                onClick={() => setResolution(r)}>
-                                {r}
                             </button>
                         ))}
                     </div>
@@ -289,7 +362,7 @@ export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProp
                     <div style={S.emptyState}>
                         <div style={{ fontSize: '1.5rem', marginBottom: '12px' }}>👁</div>
                         <div style={{ marginBottom: '12px' }}>
-                            Share your screen and Kestrel will analyze it in real-time, providing contextual suggestions.
+                            Share your screen and Kestrel will analyze it in real-time using AI vision, providing contextual code suggestions.
                         </div>
                         <button style={{
                             ...S.actionBtn, float: 'none' as any,
@@ -300,29 +373,50 @@ export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProp
                             Start Watching
                         </button>
                     </div>
-                ) : suggestions.length === 0 ? (
+                ) : suggestions.length === 0 && !error ? (
                     <div style={S.emptyState}>
-                        <div style={{ marginBottom: '8px' }}>Analyzing screen...</div>
-                        <div style={{ color: '#333' }}>Suggestions will appear here.</div>
-                    </div>
-                ) : suggestions.map(s => (
-                    <div key={s.id} style={S.suggestion(s.type)}>
-                        <div style={S.suggTitle}>
-                            <span>{TYPE_ICONS[s.type]}</span>
-                            <span>{s.title}</span>
+                        <div style={{ marginBottom: '8px' }}>
+                            {isAnalyzing ? 'Analyzing your screen...' : 'Watching for code issues...'}
                         </div>
-                        <div style={S.suggDesc}>{s.description}</div>
-                        {s.lineRef && (
-                            <div style={{ fontSize: '0.6rem', color: '#555', marginTop: '4px' }}>
-                                📍 {s.lineRef}
+                        <div style={{ color: '#333' }}>AI suggestions will appear here.</div>
+                        {screenContext && (
+                            <div style={{ color: '#444', marginTop: '8px', fontSize: '0.6rem', fontStyle: 'italic' }}>
+                                Sees: {screenContext}
                             </div>
                         )}
-                        <button style={S.actionBtn} onClick={() => dismissSuggestion(s.id)}>
-                            Dismiss
-                        </button>
-                        <div style={{ clear: 'both' }} />
                     </div>
-                ))}
+                ) : (
+                    <>
+                        {error && (
+                            <div style={S.error}>
+                                ✗ {error}
+                            </div>
+                        )}
+                        {screenContext && (
+                            <div style={{ fontSize: '0.6rem', color: '#444', marginBottom: '8px', fontStyle: 'italic' }}>
+                                Sees: {screenContext}
+                            </div>
+                        )}
+                        {suggestions.map(s => (
+                            <div key={s.id} style={S.suggestion(s.type)}>
+                                <div style={S.suggTitle}>
+                                    <span>{TYPE_ICONS[s.type]}</span>
+                                    <span>{s.title}</span>
+                                </div>
+                                <div style={S.suggDesc}>{s.description}</div>
+                                {s.lineRef && (
+                                    <div style={{ fontSize: '0.6rem', color: '#555', marginTop: '4px' }}>
+                                        📍 {s.lineRef}
+                                    </div>
+                                )}
+                                <button style={S.actionBtn} onClick={() => dismissSuggestion(s.id)}>
+                                    Dismiss
+                                </button>
+                                <div style={{ clear: 'both' }} />
+                            </div>
+                        ))}
+                    </>
+                )}
             </div>
 
             {/* Status Bar */}

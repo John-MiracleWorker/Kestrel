@@ -13,6 +13,7 @@ interface SidebarProps {
     onOpenMemoryPalace: () => void;
     onOpenDocs: () => void;
     onOpenScreenShare: () => void;
+    onOpenPRReview: () => void;
     onLogout: () => void;
 }
 
@@ -27,6 +28,7 @@ export function Sidebar({
     onOpenMemoryPalace,
     onOpenDocs,
     onOpenScreenShare,
+    onOpenPRReview,
     onLogout,
 }: SidebarProps) {
     const [workspaceList, setWorkspaceList] = useState<Workspace[]>([]);
@@ -481,6 +483,24 @@ export function Sidebar({
                                 e.currentTarget.style.boxShadow = 'none';
                             }}
                         >📺</button>
+                        <button
+                            onClick={onOpenPRReview}
+                            title="PR Reviews"
+                            style={{
+                                cursor: 'pointer', fontSize: '1rem',
+                                background: 'transparent', border: 'none',
+                                padding: '4px 8px', borderRadius: 'var(--radius-sm)',
+                                transition: 'all 0.2s',
+                            }}
+                            onMouseEnter={e => {
+                                e.currentTarget.style.background = 'rgba(59, 130, 246, 0.1)';
+                                e.currentTarget.style.boxShadow = '0 0 10px rgba(59, 130, 246, 0.1)';
+                            }}
+                            onMouseLeave={e => {
+                                e.currentTarget.style.background = 'transparent';
+                                e.currentTarget.style.boxShadow = 'none';
+                            }}
+                        >🔍</button>
                     </div>
                     <button
                         onClick={onLogout}

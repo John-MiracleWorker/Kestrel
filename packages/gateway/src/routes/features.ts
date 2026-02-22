@@ -404,3 +404,4 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         },
     );
 }
+

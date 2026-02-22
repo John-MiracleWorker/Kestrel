@@ -412,7 +412,8 @@ export function DocsPanel({ workspaceId, isVisible, onClose }: DocsPanelProps) {
     const [docs, setDocs] = useState<DocFile[]>(MOCK_DOCS);
     const [selectedDoc, setSelectedDoc] = useState<string>('overview');
     const [regenerating, setRegenerating] = useState(false);
-    const [driftCount] = useState(3);
+    const [driftCount] = useState(0);
+    const [isLive, setIsLive] = useState(false);
 
     const activeDoc = docs.find(d => d.id === selectedDoc) || docs[0];
     const timeSince = (date: string) => {
@@ -424,11 +425,37 @@ export function DocsPanel({ workspaceId, isVisible, onClose }: DocsPanelProps) {
     };
     const isStale = activeDoc ? (Date.now() - new Date(activeDoc.lastUpdated).getTime() > 3600000) : false;
 
+    // Fetch real docs on mount
+    useEffect(() => {
+        if (!isVisible || !workspaceId) return;
+        request<{ docs: DocFile[] }>(`/workspaces/${workspaceId}/docs/generate`, { method: 'POST', body: {} })
+            .then(result => {
+                if (result.docs?.length > 0) {
+                    setDocs(result.docs);
+                    setSelectedDoc(result.docs[0].id);
+                    setIsLive(true);
+                }
+            })
+            .catch(() => { /* keep mock docs as fallback */ });
+    }, [isVisible, workspaceId]);
+
     const handleRegenerate = async () => {
         setRegenerating(true);
-        setTimeout(() => {
+        try {
+            const result = await request<{ docs: DocFile[] }>(`/workspaces/${workspaceId}/docs/generate`, {
+                method: 'POST',
+                body: { category: activeDoc?.category },
+            });
+            if (result.docs?.length > 0) {
+                setDocs(result.docs);
+                setSelectedDoc(result.docs[0].id);
+                setIsLive(true);
+            }
+        } catch (err) {
+            console.error('Doc regeneration failed:', err);
+        } finally {
             setRegenerating(false);
-        }, 2000);
+        }
     };
 
     if (!isVisible) return null;
@@ -437,7 +464,7 @@ export function DocsPanel({ workspaceId, isVisible, onClose }: DocsPanelProps) {
         <div style={S.overlay}>
             {/* Left Nav */}
             <div style={S.nav}>
-                <div style={S.navHeader}>✦ Kestrel Docs</div>
+                <div style={S.navHeader}>✦ Kestrel Docs{isLive && <span style={{ color: '#10b981', fontSize: '0.5rem', marginLeft: '6px' }}>● LIVE</span>}</div>
                 {CATEGORIES.map(cat => (
                     <div key={cat}>
                         <div style={S.categoryTitle}>{cat}</div>
@@ -467,7 +494,7 @@ export function DocsPanel({ workspaceId, isVisible, onClose }: DocsPanelProps) {
                         </span>
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                        <button style={S.regenBtn} onClick={handleRegenerate} disabled={regenerating}>
+                        <button style={S.regenBtn} onClick={() => void handleRegenerate()} disabled={regenerating}>
                             {regenerating ? 'Regenerating...' : '✦ Regenerate'}
                         </button>
                         <button style={S.closeBtn} onClick={onClose}>✕</button>

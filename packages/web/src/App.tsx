@@ -9,6 +9,7 @@ import { MoltbookPanel } from './components/Moltbook/MoltbookPanel';
 import { MemoryPalace } from './components/MemoryPalace/MemoryPalace';
 import { DocsPanel } from './components/Docs/DocsPanel';
 import { ScreenShare } from './components/ScreenShare/ScreenShare';
+import { PRReview } from './components/PRReview/PRReview';
 import { useChat } from './hooks/useChat';
 import { conversations, type Workspace, type Conversation, type Message } from './api/client';
 
@@ -22,6 +23,7 @@ export default function App() {
     const [showMemoryPalace, setShowMemoryPalace] = useState(false);
     const [showDocs, setShowDocs] = useState(false);
     const [showScreenShare, setShowScreenShare] = useState(false);
+    const [showPRReview, setShowPRReview] = useState(false);
     const autoCreateAttempted = useRef<string | null>(null);
     const [showCanvas, setShowCanvas] = useState(true); // Default to open for the look
 
@@ -99,6 +101,7 @@ export default function App() {
                 onOpenMemoryPalace={() => setShowMemoryPalace(true)}
                 onOpenDocs={() => setShowDocs(true)}
                 onOpenScreenShare={() => setShowScreenShare(true)}
+                onOpenPRReview={() => setShowPRReview(true)}
                 onLogout={logout}
             />
 
@@ -154,6 +157,12 @@ export default function App() {
                 workspaceId={currentWorkspace?.id || ''}
                 isVisible={showScreenShare}
                 onClose={() => setShowScreenShare(false)}
+            />
+
+            <PRReview
+                workspaceId={currentWorkspace?.id || ''}
+                isVisible={showPRReview}
+                onClose={() => setShowPRReview(false)}
             />
         </div>
     );

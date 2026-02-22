@@ -26,6 +26,10 @@ import integrationRoutes from './routes/integrations';
 import automationRoutes from './routes/automation';
 import uploadRoutes from './routes/upload';
 import { featureRoutes } from './routes/features';
+import visionRoutes from './routes/vision';
+import { memoryRoutes } from './routes/memory';
+import { docsRoutes } from './routes/docs';
+import { prRoutes } from './routes/pr';
 
 dotenv.config();
 
@@ -177,6 +181,10 @@ async function start() {
         await automationRoutes(app, { brainClient });
         await uploadRoutes(app);
         await featureRoutes(app, { brainClient });
+        await visionRoutes(app, { brainClient });
+        await memoryRoutes(app);
+        await docsRoutes(app);
+        await prRoutes(app);
 
         if (telegramAdapter) {
             await telegramWebhookRoutes(app, { telegramAdapter });
