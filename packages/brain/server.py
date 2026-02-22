@@ -796,10 +796,10 @@ class BrainServicer:
                 conversation_id=conversation_id,
                 goal=user_content,
                 config=GCfg(
-                    max_iterations=ws_guardrails.get("maxIterations", 25),
-                    max_tool_calls=ws_guardrails.get("maxToolCalls", 20),
+                    max_iterations=ws_guardrails.get("maxIterations", 40),
+                    max_tool_calls=ws_guardrails.get("maxToolCalls", 50),
                     max_tokens=ws_guardrails.get("maxTokens", 100_000),
-                    max_wall_time_seconds=ws_guardrails.get("maxWallTime", 300),
+                    max_wall_time_seconds=ws_guardrails.get("maxWallTime", 600),
                 ),
             )
 
@@ -954,6 +954,7 @@ class BrainServicer:
             await _agent_persistence.save_task(chat_task)
 
             full_response_parts = []
+            tool_results_gathered = []  # Accumulate tool results for task_failed fallback
 
             # ── Attach activity callback to agent sub-modules ──────
 
@@ -1008,6 +1009,11 @@ class BrainServicer:
                             "tool_result": result_preview,
                         },
                     )
+                    # Accumulate tool results for task_failed fallback
+                    if event.tool_result and len(event.tool_result) > 10:
+                        tool_results_gathered.append(
+                            f"**{event.tool_name}**: {event.tool_result[:500]}"
+                        )
 
                 elif event_type == "step_complete":
                     # A step finished — if content, stream it as final text
@@ -1067,38 +1073,34 @@ class BrainServicer:
                         for i, word in enumerate(words):
                             chunk = word if i == 0 else ' ' + word
                             yield self._make_response(chunk_type=0, content_delta=chunk)
-                    else:
-                        # No content accumulated — try one final summary call to the LLM
-                        # with accumulated tool results from the task
+                    elif tool_results_gathered:
+                        # No step_complete content, but we have tool results — summarize them
+                        logger.info(f"Task budget exceeded, summarizing {len(tool_results_gathered)} tool results")
                         try:
-                            tool_results_summary = []
-                            if hasattr(chat_task, 'plan') and chat_task.plan:
-                                for step in chat_task.plan.steps:
-                                    for tc in step.tool_calls:
-                                        result_text = tc.get('result', '')
-                                        if result_text and tc.get('success', False):
-                                            tool_results_summary.append(
-                                                f"[{tc.get('tool', 'unknown')}]: {result_text[:300]}"
-                                            )
+                            summary_prompt = (
+                                "You ran out of processing steps while working on a task. "
+                                "Summarize what you found from these tool results so far. "
+                                "Be helpful and concise:\n\n"
+                                + "\n\n".join(tool_results_gathered[:10])
+                            )
+                            summary_msgs = [{"role": "user", "content": summary_prompt}]
+                            summary_text = ""
+                            async for chunk in provider.stream(summary_msgs, model=model, api_key=api_key):
+                                if isinstance(chunk, str):
+                                    summary_text += chunk
+                                    yield self._make_response(chunk_type=0, content_delta=chunk)
 
-                            if tool_results_summary:
-                                summary_prompt = (
-                                    "Based on these tool results, provide a helpful response:\n\n"
-                                    + "\n\n".join(tool_results_summary[:5])
+                            if summary_text:
+                                summary_text += "\n\n*(Note: I ran out of processing steps but here's what I found so far.)*"
+                                yield self._make_response(
+                                    chunk_type=0,
+                                    content_delta="\n\n*(Note: I ran out of processing steps but here's what I found so far.)*",
                                 )
-                                summary_msgs = [{"role": "user", "content": summary_prompt}]
-                                summary_text = ""
-                                async for chunk in provider.stream(summary_msgs, model=model, api_key=api_key):
-                                    if isinstance(chunk, str):
-                                        summary_text += chunk
-                                        yield self._make_response(chunk_type=0, content_delta=chunk)
-
-                                if summary_text:
-                                    full_response_parts.append(summary_text)
+                                full_response_parts.append(summary_text)
                             else:
                                 yield self._make_response(
                                     chunk_type=3,
-                                    error_message=event.content or "Agent task failed",
+                                    error_message="Agent ran out of processing steps. Try a more specific request.",
                                 )
                         except Exception as summary_err:
                             logger.error(f"Failed to generate summary on task failure: {summary_err}")
@@ -1106,6 +1108,11 @@ class BrainServicer:
                                 chunk_type=3,
                                 error_message=event.content or "Agent task failed",
                             )
+                    else:
+                        yield self._make_response(
+                            chunk_type=3,
+                            error_message=event.content or "Agent task failed",
+                        )
 
                     # Save whatever response we managed to produce
                     final_text = '\n'.join(full_response_parts) if full_response_parts else ""
