@@ -910,8 +910,12 @@ class BrainServicer:
                         if persona_block and messages:
                             # Find the system message and append persona context
                             for msg in messages:
-                                if msg.role == 2:  # SYSTEM
-                                    msg.content += "\n\n" + persona_block
+                                msg_role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
+                                if msg_role in ("system", 2):
+                                    if isinstance(msg, dict):
+                                        msg["content"] += "\n\n" + persona_block
+                                    else:
+                                        msg.content += "\n\n" + persona_block
                                     break
                 except Exception as e:
                     logger.warning(f"Failed to inject persona context: {e}")
@@ -934,8 +938,12 @@ class BrainServicer:
                     mcp_block += "\n\nFor GitHub repos, use `mcp_call` with the github server instead of trying to git clone (sandbox has no git/internet)."
                     if messages:
                         for msg in messages:
-                            if msg.role == 2:  # SYSTEM
-                                msg.content += mcp_block
+                            msg_role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
+                            if msg_role in ("system", 2):
+                                if isinstance(msg, dict):
+                                    msg["content"] += mcp_block
+                                else:
+                                    msg.content += mcp_block
                                 break
             except Exception as e:
                 logger.warning(f"Failed to inject MCP server context: {e}")
