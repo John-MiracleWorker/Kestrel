@@ -31,6 +31,7 @@ import visionRoutes from './routes/vision';
 import { memoryRoutes } from './routes/memory';
 import { docsRoutes } from './routes/docs';
 import { prRoutes } from './routes/pr';
+import workspaceWebhookRoutes from './routes/workspace-webhooks';
 
 dotenv.config();
 
@@ -186,6 +187,7 @@ async function start() {
         await memoryRoutes(app);
         await docsRoutes(app);
         await prRoutes(app);
+        await workspaceWebhookRoutes(app);
 
         if (telegramAdapter) {
             await telegramWebhookRoutes(app, { telegramAdapter });

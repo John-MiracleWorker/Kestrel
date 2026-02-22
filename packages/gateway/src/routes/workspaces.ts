@@ -5,6 +5,7 @@ import { requireAuth, requireWorkspace, requireRole, generateSecureToken } from 
 import { BrainClient } from '../brain/client';
 import { logger } from '../utils/logger';
 import Redis from 'ioredis';
+import { getPool } from '../db/pool';
 
 interface WorkspaceDeps {
     brainClient: BrainClient;
@@ -58,7 +59,22 @@ export default async function workspaceRoutes(app: FastifyInstance, deps: Worksp
     }, async (req) => {
         const { workspaceId } = req.params as WorkspaceParams;
         const workspace = req.workspace!;
-        return { workspace: { id: workspaceId, role: workspace.role } };
+        const pool = getPool();
+        const row = await pool.query(
+            'SELECT id, name, description, settings, created_at FROM workspaces WHERE id = $1',
+            [workspaceId],
+        );
+        const data = row.rows[0];
+        return {
+            workspace: {
+                id: workspaceId,
+                role: workspace.role,
+                name: data?.name || '',
+                description: data?.description || '',
+                settings: data?.settings || {},
+                createdAt: data?.created_at ? new Date(data.created_at).toISOString() : '',
+            },
+        };
     });
 
     const updateWorkspaceSchema = z.object({
@@ -77,7 +93,30 @@ export default async function workspaceRoutes(app: FastifyInstance, deps: Worksp
         const { name, description, settings } = req.body as UpdateWorkspaceBody;
 
         try {
-            const updated = await brainClient.updateWorkspace(workspaceId, { name, description, settings });
+            const pool = getPool();
+            const existing = await pool.query(
+                'SELECT settings FROM workspaces WHERE id = $1',
+                [workspaceId],
+            );
+            const previousSettings = (existing.rows[0]?.settings || {}) as Record<string, any>;
+            const mergedSettings = settings
+                ? {
+                    ...previousSettings,
+                    ...settings,
+                }
+                : previousSettings;
+
+            const updatedRow = await pool.query(
+                `UPDATE workspaces
+                 SET name = COALESCE($2, name),
+                     description = COALESCE($3, description),
+                     settings = $4,
+                     updated_at = NOW()
+                 WHERE id = $1
+                 RETURNING id, name, description, settings, created_at`,
+                [workspaceId, name || null, description || null, mergedSettings],
+            );
+            const updated = updatedRow.rows[0];
             return { workspace: updated };
         } catch (err: any) {
             logger.error('Update workspace failed', { error: err.message });
