@@ -125,6 +125,11 @@ class BrainServiceStub(object):
                 request_serializer=brain__pb2.ListModelsRequest.SerializeToString,
                 response_deserializer=brain__pb2.ListModelsResponse.FromString,
                 _registered_method=True)
+        self.ListTools = channel.unary_unary(
+                '/kestrel.brain.BrainService/ListTools',
+                request_serializer=brain__pb2.ListToolsRequest.SerializeToString,
+                response_deserializer=brain__pb2.ListToolsResponse.FromString,
+                _registered_method=True)
         self.StartTask = channel.unary_stream(
                 '/kestrel.brain.BrainService/StartTask',
                 request_serializer=brain__pb2.StartTaskRequest.SerializeToString,
@@ -169,6 +174,11 @@ class BrainServiceStub(object):
                 '/kestrel.brain.BrainService/GetMoltbookActivity',
                 request_serializer=brain__pb2.GetMoltbookActivityRequest.SerializeToString,
                 response_deserializer=brain__pb2.GetMoltbookActivityResponse.FromString,
+                _registered_method=True)
+        self.ListProcesses = channel.unary_unary(
+                '/kestrel.brain.BrainService/ListProcesses',
+                request_serializer=brain__pb2.ListProcessesRequest.SerializeToString,
+                response_deserializer=brain__pb2.ListProcessesResponse.FromString,
                 _registered_method=True)
         self.ParseCronJob = channel.unary_unary(
                 '/kestrel.brain.BrainService/ParseCronJob',
@@ -296,6 +306,12 @@ class BrainServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ListTools(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def StartTask(self, request, context):
         """── Autonomous Agent ────────────────────────────────────────
         """
@@ -354,9 +370,15 @@ class BrainServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def ParseCronJob(self, request, context):
+    def ListProcesses(self, request, context):
         """── Automation ──────────────────────────────────────────────
         """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ParseCronJob(self, request, context):
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -454,6 +476,11 @@ def add_BrainServiceServicer_to_server(servicer, server):
                     request_deserializer=brain__pb2.ListModelsRequest.FromString,
                     response_serializer=brain__pb2.ListModelsResponse.SerializeToString,
             ),
+            'ListTools': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListTools,
+                    request_deserializer=brain__pb2.ListToolsRequest.FromString,
+                    response_serializer=brain__pb2.ListToolsResponse.SerializeToString,
+            ),
             'StartTask': grpc.unary_stream_rpc_method_handler(
                     servicer.StartTask,
                     request_deserializer=brain__pb2.StartTaskRequest.FromString,
@@ -498,6 +525,11 @@ def add_BrainServiceServicer_to_server(servicer, server):
                     servicer.GetMoltbookActivity,
                     request_deserializer=brain__pb2.GetMoltbookActivityRequest.FromString,
                     response_serializer=brain__pb2.GetMoltbookActivityResponse.SerializeToString,
+            ),
+            'ListProcesses': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListProcesses,
+                    request_deserializer=brain__pb2.ListProcessesRequest.FromString,
+                    response_serializer=brain__pb2.ListProcessesResponse.SerializeToString,
             ),
             'ParseCronJob': grpc.unary_unary_rpc_method_handler(
                     servicer.ParseCronJob,
@@ -1003,6 +1035,33 @@ class BrainService(object):
             _registered_method=True)
 
     @staticmethod
+    def ListTools(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/ListTools',
+            brain__pb2.ListToolsRequest.SerializeToString,
+            brain__pb2.ListToolsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def StartTask(request,
             target,
             options=(),
@@ -1235,6 +1294,33 @@ class BrainService(object):
             '/kestrel.brain.BrainService/GetMoltbookActivity',
             brain__pb2.GetMoltbookActivityRequest.SerializeToString,
             brain__pb2.GetMoltbookActivityResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListProcesses(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/ListProcesses',
+            brain__pb2.ListProcessesRequest.SerializeToString,
+            brain__pb2.ListProcessesResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -1807,6 +1807,71 @@ class BrainServicer:
 
     # ── Automation ──────────────────────────────────────────────
 
+    async def ListProcesses(self, request, context):
+        """List scheduled jobs and recent agent tasks for a workspace."""
+        workspace_id = request.workspace_id
+        if not workspace_id:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id is required")
+
+        pool = await get_pool()
+        processes = []
+
+        if _cron_scheduler:
+            for job in await _cron_scheduler.list_jobs(workspace_id):
+                processes.append(brain_pb2.ProcessSummary(
+                    id=str(job.get("id", "")),
+                    name=str(job.get("name", "Scheduled task")),
+                    type="scheduled",
+                    status="running" if job.get("status") == "active" else str(job.get("status", "idle")),
+                    cron=str(job.get("cron_expression", "")),
+                    last_run=str(job.get("last_run") or ""),
+                    next_run=str(job.get("next_run") or ""),
+                    run_count=int(job.get("run_count") or 0),
+                ))
+
+        task_rows = await pool.fetch(
+            """
+            SELECT id, goal, status, result, error, created_at
+            FROM agent_tasks
+            WHERE workspace_id = $1
+            ORDER BY created_at DESC
+            LIMIT 25
+            """,
+            workspace_id,
+        )
+
+        for row in task_rows:
+            status = str(row["status"])
+            process_status = "completed" if status == "complete" else status
+            processes.append(brain_pb2.ProcessSummary(
+                id=str(row["id"]),
+                name=str(row["goal"]),
+                type="agent_task",
+                status=process_status,
+                last_run=row["created_at"].isoformat() if row["created_at"] else "",
+                last_result=str(row["result"] or ""),
+                error=str(row["error"] or ""),
+            ))
+
+        running = int(await pool.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM agent_tasks
+            WHERE workspace_id = $1
+              AND status IN ('planning', 'executing', 'observing', 'reflecting', 'waiting_approval')
+            """,
+            workspace_id,
+        ) or 0)
+
+        if _cron_scheduler:
+            running += sum(
+                1
+                for job in _cron_scheduler._jobs.values()
+                if job.workspace_id == workspace_id and job.status.value == "active"
+            )
+
+        return brain_pb2.ListProcessesResponse(processes=processes, running=running)
+
     async def ParseCronJob(self, request, context):
         """Parse natural language into a cron expression."""
         try:
