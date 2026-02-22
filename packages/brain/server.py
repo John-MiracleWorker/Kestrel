@@ -572,6 +572,37 @@ class BrainServicer:
                     "content": msg.content,
                 })
 
+            # ── 1a. Load conversation history from database ──────────
+            # The gateway only sends the latest user message. We need to
+            # load the full conversation history so the LLM has context.
+            conversation_id = request.conversation_id
+            if conversation_id:
+                try:
+                    history = await get_messages(
+                        request.user_id,
+                        workspace_id,
+                        conversation_id,
+                    )
+                    if history:
+                        # Convert stored messages to the format the brain expects
+                        history_messages = []
+                        for h in history:
+                            h_role = h["role"]
+                            # Normalize role strings from DB
+                            if h_role in ("user", "assistant", "system", "tool"):
+                                history_messages.append({
+                                    "role": h_role,
+                                    "content": h["content"],
+                                })
+                        # Prepend history before the current user message(s)
+                        # Limit to last 50 messages to avoid token overflow
+                        if history_messages:
+                            history_messages = history_messages[-50:]
+                            messages = history_messages + messages
+                            logger.info(f"Loaded {len(history_messages)} messages from conversation history")
+                except Exception as hist_err:
+                    logger.warning(f"Failed to load conversation history: {hist_err}")
+
             # Extract parameters (request overrides → workspace config → defaults)
             params = dict(request.parameters) if request.parameters else {}
             temperature = float(params.get("temperature", str(ws_config["temperature"])))
