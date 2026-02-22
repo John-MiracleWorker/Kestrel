@@ -1,52 +1,56 @@
 ---
-description: Documentation of data flow patterns between system components including agent communication, tool execution, and memory systems
+description: Describes data flow patterns and component interactions for autonomous agent systems and tool execution pipelines
 ---
 
 
 # data-flow
 
-Primary Data Flow Patterns:
+Primary Data Flow Paths:
 
-1. Inter-Agent Communication (Importance: 90)
-- Session-based message routing system with parent-child relationships
-- Message types: text, request, response, announce
-- Session discovery and tracking mechanisms
-- Workspace-scoped message history persistence
+1. Agent Task Execution Pipeline (Importance: 95)
+- Brain service initiates task via gRPC
+- Task routed through Channel Registry for workspace validation
+- Tool Registry performs risk assessment and access control
+- Hands service executes containerized skills with resource limits
+- Results flow back through Brain for evidence chain recording
+- Status updates streamed to Web UI via LiveCanvas
 
-2. Tool Execution Pipeline (Importance: 85) 
-- Orchestration layer manages tool lifecycle:
-  Tool Request -> Risk Assessment -> Access Control -> Execution -> Result Capture
-- Sandboxed code execution via external Hands service
-- Security boundary enforcement with workspace isolation
-- Language-specific execution environment mapping
+2. Memory Retrieval Flow (Importance: 90)
+- Conversation context triggers Memory Graph traversal
+- Entity relationships evaluated with temporal decay weights
+- pgvector performs similarity search on embeddings
+- Relevant memories merged into context window
+- Memory pruning based on workspace-specific rules
 
-3. Memory Retrieval Process (Importance: 80)
-- Vector-based similarity search with workspace scoping
-- Time-weighted relevance scoring with 10% weekly decay
-- Background embedding processing for conversation turns
-- Automatic context injection into prompts
+3. Multi-Channel Communication (Importance: 85)
+- Messages enter through channel-specific adapters
+- Router applies channel identity resolution
+- Deduplicator prevents duplicate processing using time windows
+- Message format normalized for cross-channel compatibility
+- Responses routed based on preference hierarchy:
+  * same_channel
+  * all_channels 
+  * prefer_web
 
-4. Provider Communication Flow (Importance: 75)
-- Unified streaming interface across multiple LLM providers
-- Provider-specific message format transformations
-- Tool/function calling protocol adaptations
-- Workspace-level configuration management
+4. Model Context Protocol Flow (Importance: 80)
+- Tools register capabilities with MCP server
+- Tool verification challenges issued
+- Session pooling manages concurrent tool access
+- Results normalized through MCP client interface
+- Cross-transport compatibility layer handles stdio/HTTP/SSE
 
-5. Channel Message Routing (Importance: 85)
-- Multi-channel message orchestration (Web, Telegram, Discord)
-- Three routing strategies:
-  * same_channel: Origin channel only
-  * all_channels: Broadcast mode
-  * prefer_web: Web interface priority
-- Cross-channel identity resolution
-- Message deduplication across platforms
+5. Social Network Integration (Importance: 75)
+- Agent activities logged to MoltBook feed
+- Auto-verification challenges processed
+- Rate limiting applied per workspace
+- Activity aggregation for UI display
+- Credential management with encryption
 
-Core Data Flow Paths:
-```
-User Input -> Channel Router -> Agent Session -> Tool Registry -> Execution Service
-Memory Retrieval -> Context Injection -> LLM Provider -> Response Generation
-Agent Response -> Channel Router -> User Output
-```
+Data Store Interactions:
+- PostgreSQL: User sessions, workspace data
+- Redis: Rate limiting, deduplication
+- pgvector: Semantic search indexes
+- File system: Skill execution artifacts
 
 $END$
 

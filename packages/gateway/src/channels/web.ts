@@ -166,6 +166,19 @@ export class WebChannelAdapter extends BaseChannelAdapter {
         }));
     }
 
+    async sendNotification(userId: string, notification: any): Promise<void> {
+        const socket = this.connections.get(userId);
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+            logger.debug('Cannot send notification — user not connected', { userId });
+            return;
+        }
+
+        socket.send(JSON.stringify({
+            type: 'notification',
+            notification,
+        }));
+    }
+
     /**
      * Route incoming WebSocket messages to appropriate handlers.
      */

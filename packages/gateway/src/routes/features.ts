@@ -14,6 +14,7 @@ import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { requireAuth, requireWorkspace } from '../auth/middleware';
 import { BrainClient } from '../brain/client';
 import { logger } from '../utils/logger';
+import { getPool } from '../db/pool';
 
 interface FeatureDeps {
     brainClient: BrainClient;
@@ -72,9 +73,18 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
             const { limit } = request.query as { limit: number };
 
             try {
-                const result = await brainClient.call('GetNotifications', { userId, limit });
-                return reply.send({ notifications: result?.notifications || [] });
+                const pool = getPool();
+                const result = await pool.query(
+                    `SELECT id, type, title, body, source, data, read, created_at
+                     FROM notifications
+                     WHERE user_id = $1 AND read = false
+                     ORDER BY created_at DESC
+                     LIMIT $2`,
+                    [userId, limit]
+                );
+                return reply.send({ notifications: result.rows });
             } catch (error) {
+                logger.error('Failed to fetch notifications', { error });
                 return reply.send({ notifications: [] });
             }
         },
@@ -92,9 +102,14 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         async (request, reply) => {
             const { notificationId } = request.params as { notificationId: string };
             try {
-                await brainClient.call('MarkNotificationRead', { notificationId });
+                const pool = getPool();
+                await pool.query(
+                    `UPDATE notifications SET read = true WHERE id = $1`,
+                    [notificationId]
+                );
                 return reply.send({ success: true });
-            } catch {
+            } catch (error) {
+                logger.error('Failed to mark read', { error });
                 return reply.status(500).send({ error: 'Failed to mark read' });
             }
         },
@@ -107,9 +122,14 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         async (request, reply) => {
             const userId = (request as unknown as { userId: string }).userId;
             try {
-                await brainClient.call('MarkAllNotificationsRead', { userId });
+                const pool = getPool();
+                await pool.query(
+                    `UPDATE notifications SET read = true WHERE user_id = $1 AND read = false`,
+                    [userId]
+                );
                 return reply.send({ success: true });
-            } catch {
+            } catch (error) {
+                logger.error('Failed to mark all read', { error });
                 return reply.status(500).send({ error: 'Failed to mark all read' });
             }
         },
@@ -125,9 +145,17 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         async (request, reply) => {
             const { workspaceId } = request.params as { workspaceId: string };
             try {
-                const result = await brainClient.call('ListInstalledTools', { workspaceId });
-                return reply.send({ tools: result?.tools || [] });
-            } catch {
+                const pool = getPool();
+                const result = await pool.query(
+                    `SELECT id, name, description, server_url, transport, config, enabled, installed_at, updated_at
+                     FROM installed_tools
+                     WHERE workspace_id = $1
+                     ORDER BY installed_at DESC`,
+                    [workspaceId]
+                );
+                return reply.send({ tools: result.rows });
+            } catch (err) {
+                logger.error('List installed tools error:', err);
                 return reply.send({ tools: [] });
             }
         },
@@ -157,7 +185,16 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
             };
 
             try {
-                await brainClient.call('InstallTool', { workspaceId, ...body });
+                const pool = getPool();
+                await pool.query(
+                    `INSERT INTO installed_tools (workspace_id, name, description, server_url, transport, config)
+                     VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                     ON CONFLICT (workspace_id, name)
+                     DO UPDATE SET server_url = $4, transport = $5, config = $6::jsonb,
+                                   description = $3, updated_at = NOW(), enabled = true`,
+                    [workspaceId, body.name, body.description, body.serverUrl, body.transport, JSON.stringify(body.config)]
+                );
+                logger.info(`MCP tool installed: ${body.name} in workspace ${workspaceId}`);
                 return reply.send({ success: true, name: body.name });
             } catch (error) {
                 logger.error('Tool install error:', error);
@@ -183,9 +220,15 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
                 workspaceId: string; toolName: string;
             };
             try {
-                await brainClient.call('UninstallTool', { workspaceId, name: toolName });
+                const pool = getPool();
+                await pool.query(
+                    'DELETE FROM installed_tools WHERE workspace_id = $1 AND name = $2',
+                    [workspaceId, toolName]
+                );
+                logger.info(`MCP tool uninstalled: ${toolName} from workspace ${workspaceId}`);
                 return reply.send({ success: true });
-            } catch {
+            } catch (err) {
+                logger.error('Tool uninstall error:', err);
                 return reply.status(500).send({ error: 'Failed to uninstall' });
             }
         },

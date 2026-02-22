@@ -209,6 +209,26 @@ async function start() {
         await channelRegistry.register(webAdapter);
         logger.info(`WebSocket server on ${config.wsPath}`);
 
+        // Set up Redis Pub/Sub for notifications
+        const redisSub = new Redis(config.redisUrl);
+        redisSub.subscribe('notifications', (err, count) => {
+            if (err) logger.error('Failed to subscribe to notifications channel', { error: err.message });
+            else logger.info(`Subscribed to notifications channel (${count})`);
+        });
+
+        redisSub.on('message', (channel, message) => {
+            if (channel === 'notifications') {
+                try {
+                    const data = JSON.parse(message);
+                    if (data.userId && data.notification) {
+                        webAdapter.sendNotification(data.userId, data.notification);
+                    }
+                } catch (e) {
+                    logger.error('Failed to parse incoming notification', { error: (e as Error).message });
+                }
+            }
+        });
+
         // Telegram (from env var — settings UI uses /integrations/telegram route instead)
         if (telegramAdapter) {
             await channelRegistry.register(telegramAdapter);

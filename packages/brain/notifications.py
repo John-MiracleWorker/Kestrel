@@ -57,8 +57,9 @@ class NotificationRouter:
     Rate-limited to 5 notifications per user per hour.
     """
 
-    def __init__(self, pool):
+    def __init__(self, pool, redis_pool=None):
         self._pool = pool
+        self._redis = redis_pool
         self._ws_callback: Optional[Callable] = None
         self._rate_counts: dict[str, list[float]] = {}  # user_id -> timestamps
         self._max_per_hour = 5
@@ -132,6 +133,17 @@ class NotificationRouter:
                 })
             except Exception as e:
                 logger.error(f"WS notification delivery failed: {e}")
+
+        # Publish to Redis so Gateway can push to WebSockets
+        if self._redis:
+            try:
+                payload = json.dumps({
+                    "userId": user_id,
+                    "notification": notification.to_dict(),
+                })
+                await self._redis.publish("notifications", payload)
+            except Exception as e:
+                logger.error(f"Redis notification publish failed: {e}")
 
         logger.info(f"Notification sent: {title} → {user_id} (via {source})")
         return notification

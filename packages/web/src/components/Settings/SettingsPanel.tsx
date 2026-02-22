@@ -69,24 +69,28 @@ const S = {
     backdrop: {
         position: 'fixed' as const, inset: 0, zIndex: 9999,
         display: 'flex', alignItems: 'center', justifyContent: 'center',
-        background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(6px)',
+        background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(12px)',
+        WebkitBackdropFilter: 'blur(12px)',
     },
     panel: {
-        display: 'flex', width: '100%', maxWidth: 860, height: '85vh',
-        background: '#0a0a0a', border: '1px solid #222',
-        borderRadius: '6px', overflow: 'hidden',
+        display: 'flex', width: '100%', maxWidth: 880, height: '85vh',
+        background: '#0a0a0a', border: '1px solid rgba(255,255,255,0.06)',
+        borderRadius: '12px', overflow: 'hidden',
         fontFamily: "'JetBrains Mono', monospace",
         animation: 'scaleIn 0.2s ease-out',
+        boxShadow: '0 20px 60px rgba(0,0,0,0.6), 0 0 30px rgba(0, 243, 255, 0.03)',
     },
     nav: {
-        width: 200, minWidth: 200, borderRight: '1px solid #222',
+        width: 200, minWidth: 200, borderRight: '1px solid rgba(255,255,255,0.04)',
         display: 'flex', flexDirection: 'column' as const,
         background: '#080808', padding: '16px 0',
+        backgroundImage: 'linear-gradient(180deg, rgba(0, 243, 255, 0.02) 0%, transparent 40%)',
     },
     navHeader: {
         padding: '0 16px 12px', fontSize: '0.7rem', fontWeight: 600,
         color: '#00f3ff', letterSpacing: '0.1em', textTransform: 'uppercase' as const,
-        borderBottom: '1px solid #1a1a1a', marginBottom: '4px',
+        borderBottom: '1px solid rgba(0, 243, 255, 0.1)', marginBottom: '4px',
+        textShadow: '0 0 10px rgba(0, 243, 255, 0.3)',
     },
     navSection: {
         padding: '8px 16px 4px', fontSize: '0.6rem', fontWeight: 600,
@@ -120,8 +124,8 @@ const S = {
     input: {
         width: '100%', padding: '10px 12px', fontSize: '0.8rem',
         fontFamily: "'JetBrains Mono', monospace",
-        background: '#111', border: '1px solid #333', borderRadius: '4px',
-        color: '#e0e0e0', outline: 'none', transition: 'border-color 0.2s',
+        background: '#111', border: '1px solid rgba(255,255,255,0.06)', borderRadius: '8px',
+        color: '#e0e0e0', outline: 'none', transition: 'border-color 0.3s, box-shadow 0.3s',
     },
     textarea: {
         width: '100%', padding: '12px', fontSize: '0.8rem', minHeight: 160,

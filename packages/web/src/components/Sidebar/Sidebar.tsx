@@ -130,12 +130,13 @@ export function Sidebar({
                 borderRight: '1px solid var(--border-color)',
                 height: '100%',
                 fontFamily: 'var(--font-mono)',
+                backgroundImage: 'linear-gradient(180deg, rgba(0, 243, 255, 0.02) 0%, transparent 30%)',
             }}>
-                {/* Workspace header as "Directory Path" */}
+                {/* Workspace header */}
                 <div style={{
                     padding: '16px',
                     borderBottom: '1px solid var(--border-color)',
-                    background: 'var(--bg-highlight)',
+                    background: 'linear-gradient(180deg, rgba(0, 243, 255, 0.04), var(--bg-panel))',
                 }}>
                     <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '4px' }}>CURRENT_WORKSPACE</div>
                     <button
@@ -145,18 +146,28 @@ export function Sidebar({
                             display: 'flex',
                             alignItems: 'center',
                             justifyContent: 'space-between',
-                            padding: '8px',
+                            padding: '10px 12px',
                             background: 'var(--bg-surface)',
                             color: 'var(--accent-cyan)',
                             cursor: 'pointer',
-                            borderRadius: 'var(--radius-sm)',
+                            borderRadius: 'var(--radius-md)',
+                            transition: 'all 0.3s',
+                            boxShadow: '0 0 0 0 rgba(0, 243, 255, 0)',
                         }}
                         onClick={() => setShowWorkspaceSwitcher(!showWorkspaceSwitcher)}
+                        onMouseEnter={(e) => {
+                            e.currentTarget.style.boxShadow = '0 0 15px rgba(0, 243, 255, 0.1)';
+                            e.currentTarget.style.borderColor = 'rgba(0, 243, 255, 0.4)';
+                        }}
+                        onMouseLeave={(e) => {
+                            e.currentTarget.style.boxShadow = '0 0 0 0 rgba(0, 243, 255, 0)';
+                            e.currentTarget.style.borderColor = '';
+                        }}
                     >
-                        <span style={{ fontWeight: 600 }}>
+                        <span style={{ fontWeight: 600, textShadow: '0 0 10px rgba(0, 243, 255, 0.3)' }}>
                             ~/{currentWorkspace?.name || 'Start'}
                         </span>
-                        <span style={{ fontSize: '0.8em' }}>▼</span>
+                        <span style={{ fontSize: '0.8em', transition: 'transform 0.2s', transform: showWorkspaceSwitcher ? 'rotate(180deg)' : 'none' }}>▼</span>
                     </button>
 
                     {/* Workspace dropdown */}
@@ -167,9 +178,12 @@ export function Sidebar({
                             width: '248px',
                             zIndex: 50,
                             marginTop: '4px',
-                            background: 'var(--bg-panel)',
-                            border: '1px solid var(--accent-cyan)',
-                            boxShadow: '0 4px 20px rgba(0,0,0,0.5)',
+                            background: 'rgba(10, 10, 10, 0.95)',
+                            backdropFilter: 'blur(16px)',
+                            border: '1px solid rgba(0, 243, 255, 0.3)',
+                            borderRadius: 'var(--radius-md)',
+                            boxShadow: '0 8px 32px rgba(0,0,0,0.6), 0 0 20px rgba(0, 243, 255, 0.08)',
+                            animation: 'fadeIn 0.2s ease-out',
                         }}>
                             {workspaceList.map((ws) => (
                                 <button
@@ -200,28 +214,33 @@ export function Sidebar({
                     <button
                         style={{
                             width: '100%',
-                            padding: '10px',
-                            background: 'transparent',
-                            border: '1px dashed var(--text-secondary)',
+                            padding: '10px 14px',
+                            background: 'rgba(0, 255, 157, 0.03)',
+                            border: '1px solid rgba(0, 255, 157, 0.15)',
                             color: 'var(--text-primary)',
                             display: 'flex',
                             alignItems: 'center',
                             justifyContent: 'center',
                             gap: '8px',
-                            transition: 'all 0.2s',
+                            transition: 'all 0.3s',
                             cursor: 'pointer',
+                            borderRadius: 'var(--radius-md)',
                         }}
                         onMouseEnter={(e) => {
-                            e.currentTarget.style.borderColor = 'var(--accent-green)';
+                            e.currentTarget.style.borderColor = 'rgba(0, 255, 157, 0.4)';
                             e.currentTarget.style.color = 'var(--accent-green)';
+                            e.currentTarget.style.background = 'rgba(0, 255, 157, 0.06)';
+                            e.currentTarget.style.boxShadow = '0 0 15px rgba(0, 255, 157, 0.08)';
                         }}
                         onMouseLeave={(e) => {
-                            e.currentTarget.style.borderColor = 'var(--text-secondary)';
+                            e.currentTarget.style.borderColor = 'rgba(0, 255, 157, 0.15)';
                             e.currentTarget.style.color = 'var(--text-primary)';
+                            e.currentTarget.style.background = 'rgba(0, 255, 157, 0.03)';
+                            e.currentTarget.style.boxShadow = 'none';
                         }}
                         onClick={onNewConversation}
                     >
-                        <span>[+]</span> NEW_SESSION_ID
+                        <span style={{ color: 'var(--accent-green)' }}>+</span> NEW SESSION
                     </button>
                 </div>
 
@@ -267,15 +286,30 @@ export function Sidebar({
                             style={{
                                 display: 'flex',
                                 alignItems: 'center',
-                                padding: '6px 8px',
+                                padding: '8px 10px',
                                 marginBottom: '2px',
                                 cursor: 'pointer',
-                                background: conv.id === currentConversation?.id ? 'rgba(0, 243, 255, 0.1)' : 'transparent',
+                                background: conv.id === currentConversation?.id ? 'rgba(0, 243, 255, 0.08)' : 'transparent',
                                 borderLeft: conv.id === currentConversation?.id ? '2px solid var(--accent-cyan)' : '2px solid transparent',
+                                borderRadius: '0 var(--radius-sm) var(--radius-sm) 0',
                                 color: conv.id === currentConversation?.id ? 'var(--accent-cyan)' : 'var(--text-secondary)',
-                                fontSize: '0.85rem',
+                                fontSize: '0.82rem',
+                                transition: 'all 0.2s',
+                                ...(conv.id === currentConversation?.id ? { boxShadow: 'inset 0 0 20px rgba(0, 243, 255, 0.03)' } : {}),
                             }}
                             onClick={() => onSelectConversation(conv)}
+                            onMouseEnter={(e) => {
+                                if (conv.id !== currentConversation?.id) {
+                                    e.currentTarget.style.background = 'rgba(255, 255, 255, 0.03)';
+                                    e.currentTarget.style.color = 'var(--text-primary)';
+                                }
+                            }}
+                            onMouseLeave={(e) => {
+                                if (conv.id !== currentConversation?.id) {
+                                    e.currentTarget.style.background = 'transparent';
+                                    e.currentTarget.style.color = 'var(--text-secondary)';
+                                }
+                            }}
                             className="group"
                         >
                             <span style={{ marginRight: '8px', opacity: 0.7 }}>
@@ -322,51 +356,88 @@ export function Sidebar({
 
                 {/* Footer status bar style */}
                 <div style={{
-                    padding: '12px',
+                    padding: '10px 12px',
                     borderTop: '1px solid var(--border-color)',
-                    background: 'var(--bg-highlight)',
-                    fontSize: '0.75rem',
+                    background: 'linear-gradient(180deg, var(--bg-panel), rgba(0, 243, 255, 0.02))',
+                    fontSize: '0.72rem',
                     display: 'flex',
                     justifyContent: 'space-between',
                     alignItems: 'center',
-                    color: 'var(--text-dim)'
+                    color: 'var(--text-dim)',
+                    gap: '4px',
                 }}>
-                    <button onClick={onOpenSettings} style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-                        <span style={{ color: 'var(--accent-green)' }}>●</span> SYSTEM_CONFIG
-                    </button>
                     <button
-                        onClick={() => setShowProcesses(true)}
-                        title="Background Processes"
+                        onClick={onOpenSettings}
                         style={{
-                            cursor: 'pointer',
-                            fontSize: '1.1rem',
-                            background: 'transparent',
-                            border: 'none',
-                            padding: '2px 6px',
-                            borderRadius: '4px',
-                            transition: 'background 0.2s',
+                            display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer',
+                            padding: '6px 10px', borderRadius: 'var(--radius-sm)',
+                            transition: 'all 0.2s', fontSize: '0.72rem',
                         }}
-                        onMouseEnter={e => (e.currentTarget.style.background = 'rgba(0, 243, 255, 0.15)')}
-                        onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
-                    >⚙</button>
-                    <button
-                        onClick={onOpenMoltbook}
-                        title="Moltbook Activity"
-                        style={{
-                            cursor: 'pointer',
-                            fontSize: '1.1rem',
-                            background: 'transparent',
-                            border: 'none',
-                            padding: '2px 6px',
-                            borderRadius: '4px',
-                            transition: 'background 0.2s',
+                        onMouseEnter={e => {
+                            e.currentTarget.style.background = 'rgba(0, 255, 157, 0.08)';
+                            e.currentTarget.style.color = 'var(--accent-green)';
                         }}
-                        onMouseEnter={e => (e.currentTarget.style.background = 'rgba(168, 85, 247, 0.15)')}
-                        onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
-                    >🦞</button>
-                    <button onClick={onLogout} style={{ cursor: 'pointer' }}>
-                        LOGOUT
+                        onMouseLeave={e => {
+                            e.currentTarget.style.background = 'transparent';
+                            e.currentTarget.style.color = '';
+                        }}
+                    >
+                        <span style={{ color: 'var(--accent-green)', fontSize: '0.5rem' }}>●</span> CONFIG
                     </button>
+                    <div style={{ display: 'flex', gap: '2px' }}>
+                        <button
+                            onClick={() => setShowProcesses(true)}
+                            title="Background Processes"
+                            style={{
+                                cursor: 'pointer', fontSize: '1rem',
+                                background: 'transparent', border: 'none',
+                                padding: '4px 8px', borderRadius: 'var(--radius-sm)',
+                                transition: 'all 0.2s',
+                            }}
+                            onMouseEnter={e => {
+                                e.currentTarget.style.background = 'rgba(0, 243, 255, 0.1)';
+                                e.currentTarget.style.boxShadow = '0 0 10px rgba(0, 243, 255, 0.1)';
+                            }}
+                            onMouseLeave={e => {
+                                e.currentTarget.style.background = 'transparent';
+                                e.currentTarget.style.boxShadow = 'none';
+                            }}
+                        >⚙</button>
+                        <button
+                            onClick={onOpenMoltbook}
+                            title="Moltbook Activity"
+                            style={{
+                                cursor: 'pointer', fontSize: '1rem',
+                                background: 'transparent', border: 'none',
+                                padding: '4px 8px', borderRadius: 'var(--radius-sm)',
+                                transition: 'all 0.2s',
+                            }}
+                            onMouseEnter={e => {
+                                e.currentTarget.style.background = 'rgba(189, 0, 255, 0.1)';
+                                e.currentTarget.style.boxShadow = '0 0 10px rgba(189, 0, 255, 0.1)';
+                            }}
+                            onMouseLeave={e => {
+                                e.currentTarget.style.background = 'transparent';
+                                e.currentTarget.style.boxShadow = 'none';
+                            }}
+                        >🦞</button>
+                    </div>
+                    <button
+                        onClick={onLogout}
+                        style={{
+                            cursor: 'pointer', fontSize: '0.65rem', padding: '4px 8px',
+                            borderRadius: 'var(--radius-sm)', transition: 'all 0.2s',
+                            color: 'var(--text-dim)', letterSpacing: '0.05em',
+                        }}
+                        onMouseEnter={e => {
+                            e.currentTarget.style.color = 'var(--accent-error)';
+                            e.currentTarget.style.background = 'rgba(255, 0, 85, 0.06)';
+                        }}
+                        onMouseLeave={e => {
+                            e.currentTarget.style.color = 'var(--text-dim)';
+                            e.currentTarget.style.background = 'transparent';
+                        }}
+                    >EXIT</button>
                 </div>
             </aside>
 
@@ -380,8 +451,8 @@ export function Sidebar({
                         display: 'flex',
                         alignItems: 'center',
                         justifyContent: 'center',
-                        background: 'rgba(0, 0, 0, 0.6)',
-                        backdropFilter: 'blur(4px)',
+                        background: 'rgba(0, 0, 0, 0.7)',
+                        backdropFilter: 'blur(12px)',
                     }}
                     onClick={() => setDeleteConfirmationId(null)}
                 >

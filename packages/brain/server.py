@@ -1944,6 +1944,22 @@ async def serve():
     _metrics_collector = MetricsCollector()
     logger.info("Metrics collector initialized")
 
+    # Initialize notification router
+    from notifications import NotificationRouter
+    _notification_router = NotificationRouter(pool, await get_redis())
+    logger.info("Notification router initialized")
+
+    # Initialize smart monitors
+    from smart_monitors import SmartMonitors
+    _smart_monitors = SmartMonitors(
+        pool=pool,
+        notification_router=_notification_router,
+        metrics=_metrics_collector,
+        agent_persistence=_agent_persistence
+    )
+    _smart_monitors.start()
+    logger.info("Smart monitors initialized")
+
     # Initialize workflow registry (pre-built task templates)
     _workflow_registry = WorkflowRegistry()
     logger.info(f"Workflow registry initialized: {len(_workflow_registry.list())} templates")

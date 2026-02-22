@@ -1,45 +1,49 @@
 ---
-description: Technical specification for memory and knowledge management systems, including vector storage, semantic search, and persistence mechanisms.
+description: Technical specification for two-tier memory architecture, semantic search, vector embeddings and knowledge persistence
 ---
 
 
 # memory-system
 
-## Core Memory Architecture (Importance Score: 90)
-Two-tier memory system implementation:
-1. Short-term conversation memory
-- Semantic vector storage for recent interactions
-- Time-weighted relevance scoring with 10% weekly decay
-- Automatic conversation embedding with background processing
+Two-tier memory architecture implementation:
 
-2. Long-term knowledge persistence
-- Workspace-scoped information storage
-- Vector-based similarity search for context retrieval
-- Metadata-enriched embedding storage using HNSW indices
+1. Primary Memory System (Importance: 95)
+- Asynchronous embedding pipeline for conversation history 
+- Time-weighted memory decay algorithm - 10% relevance decay per week
+- Combined similarity + recency scoring
+- Context formatting for RAG with 500 char limit per memory
+- Workspace-scoped memory isolation
+- Cross-channel memory synchronization
+- Location: packages/brain/memory/embeddings.py
 
-## Semantic Search Implementation (Importance Score: 85)
-- Time-weighted relevance scoring algorithm for memory retrieval
-- Custom decay function applied to older memories
-- Context formatting and automatic prompt augmentation
-- Background worker for asynchronous embedding processing
+2. Vector Store Implementation (Importance: 85)
+- pgvector semantic search with HNSW indexing
+- Workspace-partitioned storage model
+- Metadata-enriched embedding persistence
+- Automatic conversation turn embedding (2000 char limit)
+- Location: packages/brain/memory/vector_store.py
 
-## Memory Graph System (Importance Score: 80)
-- Semantic knowledge graph connecting conversation entities
-- Time-based decay system for node relevance
-- Entity relationship modeling specific to agent conversations 
-- Custom traversal algorithm for context retrieval
+3. Memory Graph Engine (Importance: 90) 
+- Semantic knowledge graph for temporal memory
+- Entity/relationship tracking with decay
+- Custom graph traversal for context retrieval
+- Weight-based pruning system
+- Location: packages/brain/agent/memory_graph.py
 
-## Memory Persistence (Importance Score: 75)
-- Workspace isolation for memory storage
-- Conversation turn processing (Q&A pairs)
-- Automatic conversation embedding
-- Metadata-enriched vector storage
+4. Memory Retrieval System (Importance: 85)
+- Context-aware memory retrieval
+- Combined vector + graph-based search
+- Workspace isolation enforcement
+- Minimum context requirements (20+ chars)
+- Location: packages/brain/memory/retrieval.py
 
-Key Interactions:
-- Memory Graph feeds contextual data to semantic search
-- Short-term memory automatically transitions to long-term storage
-- Time-based decay affects both tiers of memory
-- Workspace scoping enforced across all memory operations
+Key Memory Rules:
+- 10% weekly relevance decay
+- 500 char memory chunk limit
+- 2000 char conversation turn limit
+- 20+ char minimum for embedding
+- Strict workspace memory isolation
+- Cross-channel deduplication
 
 $END$
 

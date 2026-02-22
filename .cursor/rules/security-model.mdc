@@ -1,52 +1,51 @@
 ---
-description: Specification for analyzing and documenting security-related implementations including sandboxing, access control, and risk management.
+description: Defines security model for workspace isolation, code execution sandboxing, and permission management for AI agent operations
 ---
 
 
 # security-model
 
-Security Architecture Components:
+The security model implements a multi-layered protection system for AI agent operations:
 
-1. Tool Registry Access Control System
-Path: packages/brain/agent/tools/__init__.py
-- Risk-level based tool access filtering
-- Execution lifecycle management with timeouts
-- Tool capability restrictions by security requirements
-Importance Score: 85
+## Tool Registry Security (Importance: 90)
+Location: packages/brain/agent/tools/__init__.py
+- Risk level-based access control for tool execution
+- Dynamic tool filtering based on workspace permissions 
+- Strict timeout enforcement with automatic termination
+- Execution dispatch with comprehensive error wrapping
+- Tool verification challenge system for dynamic registration
 
-2. Sandboxed Code Execution
-Path: packages/brain/agent/tools/code.py
-- Isolated execution environments per language
-- Resource limits and timeout enforcement
-- External service boundary controls
-Importance Score: 90
+## Sandboxed Execution (Importance: 85)
+Location: packages/hands/executor.py
+- Docker-based skill isolation with resource quotas
+- Memory/CPU/network restrictions per container
+- Secure volume mounting with allowlist
+- Workspace-level isolation guarantees
+- Container lifecycle management with audit trails
 
-3. Workspace Security Model
-- Strict isolation between workspaces
-- Encrypted credential storage
-- Access control per workspace
-Importance Score: 80
+## Workspace Security (Importance: 80)
+Location: packages/hands/security/allowlist.py
+- Workspace-specific security policies
+- Global blocklist for dangerous operations
+- Policy modes: allowlist/blocklist/hybrid
+- Granular permission controls per workspace
+- Cross-workspace isolation enforcement
 
-4. Risk Assessment Framework
-Path: packages/brain/agent/reflection.py
-- Systematic "red teaming" for plan validation
-- Multi-stage critique with severity levels
-- Risk mitigation requirement enforcement
-Importance Score: 85
+## Security Audit System (Importance: 75)
+Location: packages/hands/security/audit.py
+- Detailed execution event tracking
+- Resource usage monitoring
+- Security violation detection
+- Persistent audit logs with context
+- Execution history for accountability
 
-5. Guardrail System
-Path: packages/brain/agent/guardrails.py
-- Pattern matching for dangerous operations
-- Rate limiting with adaptive thresholds
-- Operation approval workflows
-Importance Score: 80
-
-Key Security Patterns:
-- No direct SQL access allowed
-- Tool access controlled by risk level
-- Mandatory workspace isolation
-- Encrypted API key storage
-- Sandboxed code execution
+## Risk Management (Importance: 70)
+Location: packages/brain/agent/tools/self_improve.py
+- Multi-phase code analysis for security issues
+- Approval workflow for sensitive operations
+- Severity-based issue categorization
+- Inactivity guards for auto-deployment
+- Health check system with configurable thresholds
 
 $END$
 

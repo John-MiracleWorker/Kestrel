@@ -8,7 +8,7 @@
  *   - Type-based color coding
  */
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { request } from '../../api/client';
+import { request, createChatSocket } from '../../api/client';
 
 interface Notification {
     id: string;
@@ -26,6 +26,9 @@ const TYPE_COLORS: Record<string, string> = {
     warning: '#f59e0b',
     task_complete: '#a855f7',
     mention: '#ec4899',
+    dep_vuln: '#ef4444',
+    ci_fail: '#ef4444',
+    key_expiry: '#f59e0b',
 };
 
 const TYPE_ICONS: Record<string, string> = {
@@ -34,11 +37,15 @@ const TYPE_ICONS: Record<string, string> = {
     warning: '⚠',
     task_complete: '✦',
     mention: '@',
+    dep_vuln: '🛡',
+    ci_fail: '⚙',
+    key_expiry: '🔑',
 };
 
 export function NotificationBell() {
     const [notifications, setNotifications] = useState<Notification[]>([]);
     const [isOpen, setIsOpen] = useState(false);
+    const [isPulsing, setIsPulsing] = useState(false);
     const panelRef = useRef<HTMLDivElement>(null);
 
     const unreadCount = notifications.filter((n) => !n.read).length;
@@ -58,7 +65,30 @@ export function NotificationBell() {
     useEffect(() => {
         fetchNotifications();
         const interval = setInterval(fetchNotifications, 30000);
-        return () => clearInterval(interval);
+
+        let ws: WebSocket;
+        try {
+            ws = createChatSocket();
+            ws.addEventListener('message', (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'notification' && data.notification) {
+                        setNotifications((prev) => [data.notification, ...prev]);
+                        setIsPulsing(true);
+                        setTimeout(() => setIsPulsing(false), 2000);
+                    }
+                } catch (e) {
+                    // Ignore parsing errors
+                }
+            });
+        } catch (e) {
+            // Ignore socket creation errors
+        }
+
+        return () => {
+            clearInterval(interval);
+            if (ws) ws.close();
+        };
     }, [fetchNotifications]);
 
     // Close panel when clicking outside
@@ -98,20 +128,31 @@ export function NotificationBell() {
 
     return (
         <div ref={panelRef} style={{ position: 'relative' }}>
+            <style>
+                {`
+                    @keyframes notification-pulse {
+                        0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(168, 85, 247, 0.7); }
+                        70% { transform: scale(1.1); box-shadow: 0 0 0 10px rgba(168, 85, 247, 0); }
+                        100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(168, 85, 247, 0); }
+                    }
+                `}
+            </style>
             {/* Bell Button */}
             <button
                 onClick={() => setIsOpen(!isOpen)}
                 style={{
-                    background: isOpen ? 'rgba(168,85,247,0.15)' : 'transparent',
-                    border: '1px solid var(--border-subtle)',
+                    background: isOpen ? 'rgba(168,85,247,0.12)' : 'transparent',
+                    border: '1px solid rgba(255,255,255,0.06)',
                     color: unreadCount > 0 ? 'var(--accent-purple)' : 'var(--text-dim)',
                     padding: '8px 10px',
-                    borderRadius: '6px',
+                    borderRadius: '8px',
                     cursor: 'pointer',
                     fontFamily: 'var(--font-mono)',
                     fontSize: '1rem',
                     position: 'relative',
-                    transition: 'all 0.2s',
+                    transition: 'all 0.3s',
+                    animation: isPulsing ? 'notification-pulse 2s ease-out' : 'none',
+                    boxShadow: unreadCount > 0 ? '0 0 12px rgba(168,85,247,0.15)' : 'none',
                 }}
             >
                 🔔
@@ -147,12 +188,15 @@ export function NotificationBell() {
                         right: 0,
                         width: '360px',
                         maxHeight: '440px',
-                        background: 'var(--bg-primary)',
-                        border: '1px solid var(--border-subtle)',
-                        borderRadius: '8px',
-                        boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+                        background: 'rgba(10, 10, 10, 0.92)',
+                        backdropFilter: 'blur(16px)',
+                        WebkitBackdropFilter: 'blur(16px)',
+                        border: '1px solid rgba(255, 255, 255, 0.06)',
+                        borderRadius: '10px',
+                        boxShadow: '0 12px 40px rgba(0,0,0,0.6), 0 0 20px rgba(168,85,247,0.06)',
                         overflow: 'hidden',
                         zIndex: 1000,
+                        animation: 'fadeIn 0.2s ease-out',
                     }}
                 >
                     {/* Header */}
@@ -216,10 +260,17 @@ export function NotificationBell() {
                                         borderBottom: '1px solid rgba(255,255,255,0.03)',
                                         cursor: n.read ? 'default' : 'pointer',
                                         opacity: n.read ? 0.5 : 1,
-                                        transition: 'opacity 0.2s',
+                                        transition: 'all 0.2s',
                                         display: 'flex',
                                         gap: '10px',
                                         alignItems: 'flex-start',
+                                        background: 'transparent',
+                                    }}
+                                    onMouseEnter={(e) => {
+                                        if (!n.read) e.currentTarget.style.background = 'rgba(255,255,255,0.02)';
+                                    }}
+                                    onMouseLeave={(e) => {
+                                        e.currentTarget.style.background = 'transparent';
                                     }}
                                 >
                                     <span
