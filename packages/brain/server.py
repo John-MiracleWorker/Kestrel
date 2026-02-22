@@ -836,7 +836,7 @@ class BrainServicer:
                 )
 
             # Build tool registry and agent loop
-            tool_registry = build_tool_registry(hands_client=_hands_client, vector_store=_vector_store)
+            tool_registry = build_tool_registry(hands_client=_hands_client, vector_store=_vector_store, pool=pool)
 
             # Set workspace context for Moltbook activity logging
             from agent.tools.moltbook import _current_workspace_id as _mwid
@@ -1488,7 +1488,7 @@ class BrainServicer:
         from agent.evidence import EvidenceChain
         from agent.memory_graph import MemoryGraph
 
-        task_tool_registry = build_tool_registry(hands_client=_hands_client)
+        task_tool_registry = build_tool_registry(hands_client=_hands_client, pool=pool)
         evidence_chain = EvidenceChain(task_id=task.id, pool=pool)
         task_loop = AgentLoop(
             provider=task_provider,
@@ -2022,7 +2022,7 @@ async def serve():
     global _command_parser, _metrics_collector, _workflow_registry
     global _skill_manager, _session_manager, _sandbox_manager
     pool = await get_pool()
-    _tool_registry = build_tool_registry(hands_client=_hands_client)
+    _tool_registry = build_tool_registry(hands_client=_hands_client, pool=pool)
     guardrails = Guardrails()
     _agent_persistence = PostgresTaskPersistence(pool=pool)
     _agent_loop = AgentLoop(
@@ -2115,6 +2115,7 @@ async def serve():
                 tool_registry=build_tool_registry(
                     hands_client=_hands_client,
                     vector_store=_vector_store,
+                    pool=pool,
                 ),
                 guardrails=Guardrails(),
                 persistence=_agent_persistence,

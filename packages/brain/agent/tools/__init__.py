@@ -146,7 +146,7 @@ class ToolRegistry:
             )
 
 
-def build_tool_registry(hands_client=None, vector_store=None) -> ToolRegistry:
+def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> ToolRegistry:
     """
     Build the default tool registry with all built-in tools.
     Called during server startup.
@@ -180,7 +180,7 @@ def build_tool_registry(hands_client=None, vector_store=None) -> ToolRegistry:
 
     # MCP discovery + management tools
     from agent.tools.mcp import register_mcp_tools
-    register_mcp_tools(registry)
+    register_mcp_tools(registry, pool=pool)
 
     # Self-improvement + git tools
     from agent.tools.git import register_git_tools
