@@ -439,23 +439,45 @@ def register_mcp_tools(registry, pool=None) -> None:
         name: str,
         command: str = "",
         env_vars: str = "",
+        workspace_id: str = "",
     ) -> dict:
         """Connect to an MCP server and discover its tools."""
-        # If no command given, try to find from catalog or installed
+        # If no command given, try to find from catalog or installed DB
         if not command:
             for server in BUILTIN_CATALOG:
                 if server["name"] == name:
                     command = server["install"]
                     break
 
+        # Also check the installed_tools DB for this server
+        stored_env = {}
+        if pool and not command:
+            try:
+                async with pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        """SELECT server_url, config FROM installed_tools
+                           WHERE (name = $1 OR name ILIKE '%' || $1 || '%')
+                             AND enabled = true
+                           ORDER BY CASE WHEN name = $1 THEN 0 ELSE 1 END
+                           LIMIT 1""",
+                        name,
+                    )
+                    if row:
+                        command = row["server_url"]
+                        if row["config"]:
+                            cfg = row["config"] if isinstance(row["config"], dict) else json.loads(row["config"])
+                            stored_env = cfg.get("env", {})
+            except Exception as e:
+                logger.warning(f"Failed to look up installed MCP server '{name}': {e}")
+
         if not command:
             return {"error": f"No command specified for '{name}'. Use mcp_search to find it."}
 
-        # Parse env vars
-        env = {}
+        # Parse env vars (explicitly provided override stored ones)
+        env = dict(stored_env)  # Start with stored env
         if env_vars:
             try:
-                env = json.loads(env_vars)
+                env.update(json.loads(env_vars))
             except json.JSONDecodeError:
                 for line in env_vars.strip().split("\n"):
                     if "=" in line:
