@@ -115,6 +115,27 @@ async def update_conversation_title(user_id: str, workspace_id: str, conversatio
     }
 
 
+async def ensure_conversation(
+    conversation_id: str,
+    workspace_id: str,
+    channel: str = "web",
+    title: str = "New Conversation",
+) -> None:
+    """Create the conversation row if it doesn't already exist.
+
+    External channels (Telegram, Discord, etc.) generate deterministic
+    conversation IDs but never create rows in the conversations table.
+    This ensures the FK from messages → conversations is satisfied.
+    """
+    pool = await get_pool()
+    await pool.execute(
+        """INSERT INTO conversations (id, workspace_id, title, channel, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, NOW(), NOW())
+           ON CONFLICT (id) DO NOTHING""",
+        conversation_id, workspace_id, title, channel,
+    )
+
+
 async def save_message(conversation_id: str, role: str, content: str) -> str:
     pool = await get_pool()
     msg_id = str(uuid.uuid4())

@@ -34,7 +34,7 @@ from users import create_user, authenticate_user
 from crud import (
     list_workspaces, create_workspace, list_conversations,
     create_conversation, get_messages, delete_conversation,
-    update_conversation_title, save_message,
+    update_conversation_title, ensure_conversation, save_message,
 )
 from providers_registry import (
     get_provider, list_provider_configs, set_provider_config,
@@ -455,6 +455,14 @@ class BrainServicer:
 
             # ── 3. Save user message before streaming ───────────────
             if conversation_id:
+                # Ensure conversation row exists (external channels like
+                # Telegram generate deterministic IDs without creating rows).
+                channel_name = getattr(request, 'channel', '') or 'web'
+                await ensure_conversation(
+                    conversation_id, workspace_id,
+                    channel=channel_name,
+                )
+
                 user_content = next(
                     (m["content"] for m in reversed(messages) if m["role"] == "user"),
                     "",
