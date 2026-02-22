@@ -17,6 +17,7 @@ Safety:
 import asyncio
 import ast
 import json
+import hashlib
 import logging
 import os
 import re
@@ -280,6 +281,12 @@ def register_self_improve_tools(registry) -> None:
                         "type": "string",
                         "description": "Package to analyze: brain, gateway, web, hands, or 'all'",
                     },
+                    "scan_mode": {
+                        "type": "string",
+                        "enum": ["quick", "standard", "deep"],
+                        "description": "Scan breadth: quick (diff/mtime incremental), standard (default), deep (full exhaustive)",
+                        "default": "standard",
+                    },
                     "proposal_id": {
                         "type": "string",
                         "description": "Proposal ID for approve/deny actions",
@@ -300,6 +307,29 @@ def register_self_improve_tools(registry) -> None:
 
 # ── Scan Results Cache ───────────────────────────────────────────────
 _last_scan_results: dict = {}
+_SCAN_CACHE_FILE = os.path.join(PROJECT_ROOT, ".kestrel", "cache", "self_improve_scan.json")
+
+
+def _load_scan_cache() -> dict:
+    try:
+        with open(_SCAN_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"files": {}}
+
+
+def _save_scan_cache(cache: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(_SCAN_CACHE_FILE), exist_ok=True)
+        with open(_SCAN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except OSError as e:
+        logger.debug(f"Failed to persist scan cache: {e}")
+
+
+def _file_signature(path: str) -> str:
+    stat = os.stat(path)
+    return f"{stat.st_mtime_ns}:{stat.st_size}"
 
 
 # ── Main Action Router ───────────────────────────────────────────────
@@ -307,12 +337,13 @@ async def self_improve_action(
     action: str,
     package: str = "all",
     proposal_id: str = "",
+    scan_mode: str = "standard",
 ) -> dict:
     """Route to the appropriate self-improvement action."""
     global _last_scan_results
 
     if action == "scan":
-        results = _deep_scan(package)
+        results = _deep_scan(package, mode=scan_mode)
         _last_scan_results = results
         return results
     elif action == "test":
@@ -358,7 +389,6 @@ def _save_synced_hashes(hashes: set) -> None:
 
 def _issue_hash(issue: dict) -> str:
     """Generate a deterministic hash for an issue to deduplicate."""
-    import hashlib
     key = f"{issue.get('type')}:{issue.get('file')}:{issue.get('line')}:{issue.get('description', '')[:80]}"
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
@@ -540,22 +570,40 @@ PACKAGES = {
 }
 
 
-def _deep_scan(package: str = "all") -> dict:
+def _deep_scan(package: str = "all", mode: str = "standard") -> dict:
     """
-    Deep codebase analysis — goes beyond syntax to find real improvements.
-    
-    Checks:
-      1. Python syntax errors (ast.parse)
-      2. TypeScript strict checks (when available)
-      3. TODO/FIXME/HACK comments (actionable items)
-      4. Dead imports (unused imports in Python)
-      5. Large functions (complexity/readability)
-      6. Error handling gaps (bare excepts, missing error handling)
-      7. Security patterns (hardcoded secrets, eval usage)
-      8. Code duplication hints
+    Deep codebase analysis with incremental caching and single-pass AST checks.
+
+    Modes:
+      - quick: scan only files touched in git diff when available
+      - standard: incremental scan using file signature cache
+      - deep: force full scan of all candidate files
     """
+    mode = (mode or "standard").lower()
+    if mode not in {"quick", "standard", "deep"}:
+        mode = "standard"
+
+    scan_cache = _load_scan_cache()
+    cached_files = scan_cache.get("files", {})
+    next_cache = {"files": {}}
+
+    quick_targets = set()
+    if mode == "quick":
+        try:
+            diff = subprocess.run(
+                ["git", "-C", PROJECT_ROOT, "diff", "--name-only", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if diff.returncode == 0:
+                quick_targets = {line.strip() for line in diff.stdout.splitlines() if line.strip()}
+        except Exception:
+            quick_targets = set()
+
     issues = []
     packages_to_scan = PACKAGES if package == "all" else {package: PACKAGES.get(package, {})}
+    files_considered = 0
 
     for pkg_name, pkg_info in packages_to_scan.items():
         if not pkg_info:
@@ -568,7 +616,6 @@ def _deep_scan(package: str = "all") -> dict:
         lang = pkg_info["lang"]
 
         for root, dirs, files in os.walk(pkg_path):
-            # Skip node_modules, __pycache__, .git, dist
             dirs[:] = [d for d in dirs if d not in ("node_modules", "__pycache__", ".git", "dist", "build", ".next")]
 
             for fname in files:
@@ -578,33 +625,36 @@ def _deep_scan(package: str = "all") -> dict:
                 filepath = os.path.join(root, fname)
                 rel_path = os.path.relpath(filepath, PROJECT_ROOT)
 
+                if mode == "quick" and quick_targets and rel_path not in quick_targets:
+                    continue
+
+                files_considered += 1
                 try:
-                    content = open(filepath, "r", errors="ignore").read()
-                    lines = content.split("\n")
+                    signature = _file_signature(filepath)
+                except OSError:
+                    continue
+
+                cached = cached_files.get(rel_path)
+                if mode != "deep" and cached and cached.get("sig") == signature:
+                    issues.extend(cached.get("issues", []))
+                    next_cache["files"][rel_path] = cached
+                    continue
+
+                try:
+                    with open(filepath, "r", errors="ignore") as f:
+                        content = f.read()
                 except Exception:
                     continue
 
-                # 1. Python syntax check
-                if lang == "python" and fname.endswith(".py"):
-                    try:
-                        ast.parse(content, filename=fname)
-                    except SyntaxError as e:
-                        issues.append({
-                            "type": "syntax_error",
-                            "severity": "critical",
-                            "package": pkg_name,
-                            "file": rel_path,
-                            "line": e.lineno,
-                            "description": f"Python syntax error: {e.msg}",
-                            "suggestion": f"Fix syntax error at line {e.lineno}: {e.text.strip() if e.text else ''}",
-                        })
+                file_issues = []
+                lines = content.split("\n")
 
-                # 2. TODO/FIXME/HACK comments
+                # Common text checks
                 for i, line in enumerate(lines, 1):
                     stripped = line.strip()
                     for marker in ("TODO", "FIXME", "HACK", "XXX"):
                         if marker in stripped and (stripped.startswith("//") or stripped.startswith("#")):
-                            issues.append({
+                            file_issues.append({
                                 "type": "todo",
                                 "severity": "low",
                                 "package": pkg_name,
@@ -613,16 +663,52 @@ def _deep_scan(package: str = "all") -> dict:
                                 "description": stripped.lstrip("/#/ ").strip(),
                                 "suggestion": f"Implement or remove: {stripped.lstrip('/#/ ').strip()[:100]}",
                             })
+                    if re.search(r"(password|secret|api_key|token)\\s*=\\s*['\"][^'\"]{8,}['\"]", stripped, re.I):
+                        if "env" not in stripped.lower() and "example" not in stripped.lower():
+                            file_issues.append({
+                                "type": "security",
+                                "severity": "high",
+                                "package": pkg_name,
+                                "file": rel_path,
+                                "line": i,
+                                "description": "Potential hardcoded secret detected",
+                                "suggestion": "Move secrets to environment variables and rotate exposed credentials.",
+                            })
+                    if "eval(" in stripped and not stripped.startswith("#") and not stripped.startswith("//"):
+                        file_issues.append({
+                            "type": "security",
+                            "severity": "medium",
+                            "package": pkg_name,
+                            "file": rel_path,
+                            "line": i,
+                            "description": "Use of eval() detected",
+                            "suggestion": "Avoid eval(); use safe parsing or explicit dispatch.",
+                        })
 
-                # 3. Large functions (Python)
-                if lang == "python":
+                # Python AST single-pass checks
+                if lang == "python" and fname.endswith(".py"):
                     try:
                         tree = ast.parse(content, filename=fname)
+                    except SyntaxError as e:
+                        file_issues.append({
+                            "type": "syntax_error",
+                            "severity": "critical",
+                            "package": pkg_name,
+                            "file": rel_path,
+                            "line": e.lineno,
+                            "description": f"Python syntax error: {e.msg}",
+                            "suggestion": f"Fix syntax error at line {e.lineno}: {e.text.strip() if e.text else ''}",
+                        })
+                        tree = None
+
+                    if tree is not None:
+                        imported_names = []
+                        used_names = set()
                         for node in ast.walk(tree):
                             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                                func_lines = node.end_lineno - node.lineno + 1 if node.end_lineno else 0
+                                func_lines = (node.end_lineno - node.lineno + 1) if getattr(node, "end_lineno", None) else 0
                                 if func_lines > 80:
-                                    issues.append({
+                                    file_issues.append({
                                         "type": "complexity",
                                         "severity": "medium",
                                         "package": pkg_name,
@@ -631,83 +717,30 @@ def _deep_scan(package: str = "all") -> dict:
                                         "description": f"Function `{node.name}` is {func_lines} lines long — consider refactoring",
                                         "suggestion": f"Break `{node.name}` into smaller helper functions",
                                     })
-                    except SyntaxError:
-                        pass
-
-                # 4. Bare except clauses (Python)
-                if lang == "python":
-                    for i, line in enumerate(lines, 1):
-                        if re.match(r"\s*except\s*:", line):
-                            issues.append({
-                                "type": "error_handling",
-                                "severity": "medium",
-                                "package": pkg_name,
-                                "file": rel_path,
-                                "line": i,
-                                "description": "Bare `except:` clause — catches SystemExit, KeyboardInterrupt etc.",
-                                "suggestion": "Use `except Exception:` instead of bare `except:`",
-                            })
-
-                # 5. Security checks
-                for i, line in enumerate(lines, 1):
-                    stripped = line.strip()
-                    # Hardcoded secrets
-                    if re.search(r'(password|secret|api_key|token)\s*=\s*["\'][^"\']{8,}["\']', stripped, re.I):
-                        if "env" not in stripped.lower() and "example" not in stripped.lower():
-                            issues.append({
-                                "type": "security",
-                                "severity": "high",
-                                "package": pkg_name,
-                                "file": rel_path,
-                                "line": i,
-                                "description": "Potential hardcoded secret/credential",
-                                "suggestion": "Move to environment variable",
-                            })
-                    # eval() usage
-                    if "eval(" in stripped and not stripped.startswith("#"):
-                        issues.append({
-                            "type": "security",
-                            "severity": "high",
-                            "package": pkg_name,
-                            "file": rel_path,
-                            "line": i,
-                            "description": "Usage of `eval()` — potential code injection risk",
-                            "suggestion": "Replace eval() with ast.literal_eval() or proper parsing",
-                        })
-
-                # 6. Large files
-                if len(lines) > 500:
-                    issues.append({
-                        "type": "complexity",
-                        "severity": "low",
-                        "package": pkg_name,
-                        "file": rel_path,
-                        "line": 1,
-                        "description": f"File is {len(lines)} lines — consider splitting into modules",
-                        "suggestion": f"Break {fname} into smaller, focused modules",
-                    })
-
-                # 7. Unused imports (Python — simple check)
-                if lang == "python":
-                    try:
-                        tree = ast.parse(content, filename=fname)
-                        imports = []
-                        for node in ast.walk(tree):
-                            if isinstance(node, ast.Import):
+                            elif isinstance(node, ast.ExceptHandler) and node.type is None:
+                                file_issues.append({
+                                    "type": "error_handling",
+                                    "severity": "medium",
+                                    "package": pkg_name,
+                                    "file": rel_path,
+                                    "line": node.lineno,
+                                    "description": "Bare `except:` clause — catches SystemExit, KeyboardInterrupt etc.",
+                                    "suggestion": "Use `except Exception:` instead of bare `except:`",
+                                })
+                            elif isinstance(node, ast.Import):
                                 for alias in node.names:
                                     name = alias.asname or alias.name.split(".")[-1]
-                                    imports.append((name, node.lineno))
+                                    imported_names.append((name, node.lineno))
                             elif isinstance(node, ast.ImportFrom):
                                 for alias in node.names:
                                     name = alias.asname or alias.name
-                                    imports.append((name, node.lineno))
+                                    imported_names.append((name, node.lineno))
+                            elif isinstance(node, ast.Name):
+                                used_names.add(node.id)
 
-                        # Check if each import is used in the file body
-                        for name, lineno in imports:
-                            # Count occurrences (excluding the import line itself)
-                            uses = sum(1 for line in lines if name in line) - 1
-                            if uses <= 0 and name != "*" and not name.startswith("_"):
-                                issues.append({
+                        for name, lineno in imported_names:
+                            if name != "*" and not name.startswith("_") and name not in used_names:
+                                file_issues.append({
                                     "type": "dead_import",
                                     "severity": "low",
                                     "package": pkg_name,
@@ -716,14 +749,15 @@ def _deep_scan(package: str = "all") -> dict:
                                     "description": f"Potentially unused import: `{name}`",
                                     "suggestion": f"Remove unused import `{name}` at line {lineno}",
                                 })
-                    except SyntaxError:
-                        pass
 
-    # Sort by severity
+                issues.extend(file_issues)
+                next_cache["files"][rel_path] = {"sig": signature, "issues": file_issues}
+
+    _save_scan_cache(next_cache)
+
     severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
     issues.sort(key=lambda x: severity_order.get(x.get("severity", "info"), 4))
 
-    # Build summary
     by_severity = {}
     for issue in issues:
         s = issue.get("severity", "info")
@@ -741,11 +775,14 @@ def _deep_scan(package: str = "all") -> dict:
     if by_severity.get("low"): summary_parts.append(f"🔵 {by_severity['low']} low")
 
     return {
+        "mode": mode,
+        "files_considered": files_considered,
+        "cache_entries": len(next_cache.get("files", {})),
         "total_issues": len(issues),
         "summary": " | ".join(summary_parts) if summary_parts else "✅ Clean — no issues found",
         "by_type": by_type,
         "by_severity": by_severity,
-        "issues": issues[:30],  # Cap output
+        "issues": issues[:30],
     }
 
 
