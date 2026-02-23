@@ -196,8 +196,8 @@ async def moltbook_action(
         api_key = _load_api_key()
         if not api_key:
             return {
-                "error": "Not registered on Moltbook yet. Use action='register' first.",
-                "hint": "Call moltbook with action='register' to create your account.",
+                "error": "Moltbook API key not found. Set MOLTBOOK_API_KEY in your .env file.",
+                "hint": "Already registered? Add your API key to .env and restart the brain container.",
             }
 
     try:
@@ -230,9 +230,27 @@ async def _register(name: str = "Kestrel", **kwargs) -> dict:
     # Check if already registered locally
     existing_key = _load_api_key()
     if existing_key:
+        # Verify the key actually works
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"{BASE_URL}/agents/me",
+                    headers={"Authorization": f"Bearer {existing_key}", "Content-Type": "application/json"},
+                )
+                if resp.status_code == 200:
+                    profile = resp.json()
+                    return {
+                        "status": "already_registered",
+                        "message": f"Already registered on Moltbook as @{profile.get('username', name)}! Verified ✅",
+                        "api_key_present": True,
+                        "verified": True,
+                    }
+        except Exception:
+            pass
+        # Key exists but couldn't verify — still don't re-register
         return {
             "status": "already_registered",
-            "message": "Already registered on Moltbook! Use action='status' to check claim status.",
+            "message": "Already registered on Moltbook (API key present). Use action='status' to check.",
             "api_key_present": True,
         }
 

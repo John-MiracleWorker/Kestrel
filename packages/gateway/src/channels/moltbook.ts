@@ -132,11 +132,18 @@ export class MoltbookAdapter extends BaseChannelAdapter {
         try {
             this.agentProfile = await this.api('GET', '/agents/me');
             logger.info(`Moltbook agent connected: @${this.agentProfile!.username} (karma: ${this.agentProfile!.karma})`);
-        } catch (err) {
-            // Agent may not be registered yet — try to register
-            logger.info('Moltbook agent not found, attempting registration...');
-            this.agentProfile = await this.registerAgent();
-            logger.info(`Moltbook agent registered: @${this.agentProfile.username}`);
+        } catch (err: any) {
+            const status = err?.response?.status ?? err?.status;
+            if (status === 401 || status === 404) {
+                // Agent genuinely not registered — register now
+                logger.info('Moltbook agent not found (HTTP %d), attempting registration...', status);
+                this.agentProfile = await this.registerAgent();
+                logger.info(`Moltbook agent registered: @${this.agentProfile.username}`);
+            } else {
+                // Network/server error — do NOT re-register, just log and rethrow
+                logger.error('Moltbook connect failed (not a registration issue):', err?.message ?? err);
+                throw err;
+            }
         }
 
         // Start polling for new content and notifications

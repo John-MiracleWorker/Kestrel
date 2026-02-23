@@ -102,6 +102,7 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       AGENT_HOST_MOUNTS: ${AGENT_HOST_MOUNTS:-}
+      MOLTBOOK_API_KEY: ${MOLTBOOK_API_KEY:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes:
       - ${LOCAL_MODEL_DIR:-./models}:/models:ro
