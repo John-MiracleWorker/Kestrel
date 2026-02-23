@@ -3,13 +3,22 @@ Post-Task Learning — self-improvement through structured lesson extraction.
 
 After every task completes, the agent:
   1. Asks the LLM to extract lessons learned from the execution trace
-  2. Stores structured lessons in the workspace knowledge base
-  3. Before future tasks, retrieves relevant past lessons to improve planning
+  2. Deduplicates against existing lessons (same category + similar summary)
+  3. Stores unique lessons in the workspace knowledge base
+  4. Reinforces confidence of existing lessons when duplicates are found
+  5. Before future tasks, retrieves relevant past lessons to improve planning
+
+Enhancements:
+  - Lesson deduplication via summary fingerprinting and semantic matching
+    to prevent the knowledge base from accumulating redundant entries.
+  - Confidence reinforcement: when a near-duplicate is found, the existing
+    lesson's confidence is boosted (capped at 1.0) instead of storing a copy.
 
 This is what makes Kestrel genuinely improve over time — it learns from
 both successes and failures, building a growing library of reusable insights.
 """
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -17,6 +26,11 @@ from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger("brain.agent.learner")
+
+# Minimum Jaccard similarity for considering two lesson summaries as duplicates
+DEDUP_SIMILARITY_THRESHOLD = 0.6
+# Confidence boost when a duplicate lesson reinforces an existing one
+CONFIDENCE_REINFORCEMENT = 0.05
 
 
 @dataclass
@@ -100,18 +114,48 @@ Only output the JSON array, no other text.
 """
 
 
+def _lesson_fingerprint(category: str, summary: str) -> str:
+    """
+    Generate a deterministic fingerprint for a lesson based on its
+    category and normalized summary. Used for fast exact-match dedup.
+    """
+    normalized = " ".join(summary.lower().split())
+    key = f"{category}:{normalized}"
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def _summary_similarity(a: str, b: str) -> float:
+    """
+    Compute Jaccard similarity between two lesson summaries based on
+    word-level token sets. Fast and effective for short text comparison.
+    """
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    intersection = words_a & words_b
+    union = words_a | words_b
+    return len(intersection) / len(union)
+
+
 class TaskLearner:
     """
     Extracts and stores lessons from completed tasks.
 
     Integrates with the WorkingMemory knowledge tier for persistence
     and retrieval of past lessons during planning.
+
+    Includes deduplication: before storing a new lesson, checks existing
+    lessons for duplicates (same category + similar summary). Duplicates
+    reinforce the existing lesson's confidence instead of creating noise.
     """
 
     def __init__(self, provider, model: str, working_memory):
         self._provider = provider
         self._model = model
         self._memory = working_memory
+        # In-memory fingerprint cache to speed up dedup within a session
+        self._seen_fingerprints: dict[str, str] = {}  # fingerprint → lesson summary
 
     async def extract_lessons(self, task) -> list[Lesson]:
         """
@@ -236,17 +280,110 @@ class TaskLearner:
             logger.warning(f"Failed to retrieve lessons: {e}")
             return ""
 
+    async def _is_duplicate(
+        self,
+        workspace_id: str,
+        lesson: Lesson,
+    ) -> bool:
+        """
+        Check if a lesson is a duplicate of an existing one.
+
+        Uses two-tier dedup:
+          1. Fast fingerprint check (exact match on normalized summary)
+          2. Semantic similarity check against recent lessons from the knowledge base
+
+        If a duplicate is found, the existing lesson's confidence is reinforced.
+        """
+        # Tier 1: Fingerprint check (in-memory, O(1))
+        fp = _lesson_fingerprint(lesson.category, lesson.summary)
+        if fp in self._seen_fingerprints:
+            logger.debug(
+                f"Lesson dedup: exact fingerprint match for '{lesson.summary[:60]}'"
+            )
+            return True
+        self._seen_fingerprints[fp] = lesson.summary
+
+        # Tier 2: Semantic similarity check against stored lessons
+        if not self._memory:
+            return False
+
+        try:
+            existing = await self._memory.knowledge_search(
+                workspace_id=workspace_id,
+                query=lesson.summary,
+                top_k=5,
+            )
+
+            for r in existing:
+                content = r.get("content", "")
+                try:
+                    stored = json.loads(content)
+                except json.JSONDecodeError:
+                    continue
+
+                # Same category required for duplicate consideration
+                if stored.get("category") != lesson.category:
+                    continue
+
+                similarity = _summary_similarity(
+                    lesson.summary,
+                    stored.get("summary", ""),
+                )
+
+                if similarity >= DEDUP_SIMILARITY_THRESHOLD:
+                    # Reinforce existing lesson's confidence
+                    old_conf = stored.get("confidence", 0.8)
+                    new_conf = min(old_conf + CONFIDENCE_REINFORCEMENT, 1.0)
+                    if new_conf != old_conf:
+                        stored["confidence"] = new_conf
+                        stored["reinforcement_count"] = stored.get("reinforcement_count", 0) + 1
+                        # Re-store with updated confidence
+                        await self._memory.knowledge_store(
+                            workspace_id=workspace_id,
+                            content=json.dumps(stored),
+                            source="agent_lesson",
+                            metadata={
+                                "category": stored.get("category", "pattern"),
+                                "tags": stored.get("tags", []),
+                                "success": stored.get("success", True),
+                                "source_task_id": stored.get("source_task_id", ""),
+                            },
+                        )
+                        logger.info(
+                            f"Lesson dedup: reinforced existing lesson "
+                            f"(similarity={similarity:.2f}, new confidence={new_conf:.2f}): "
+                            f"'{stored.get('summary', '')[:60]}'"
+                        )
+                    return True
+
+        except Exception as e:
+            logger.debug(f"Lesson dedup check failed: {e}")
+
+        return False
+
     async def _store_lessons(
         self,
         workspace_id: str,
         lessons: list[Lesson],
     ) -> None:
-        """Persist lessons to the knowledge base."""
+        """
+        Persist lessons to the knowledge base with deduplication.
+
+        Each lesson is checked against existing knowledge before storage.
+        Duplicate lessons reinforce existing entries instead of creating new ones.
+        """
         if not self._memory:
             logger.debug(f"Lesson persistence skipped for workspace {workspace_id}: no working memory configured")
             return
 
+        stored_count = 0
+        dedup_count = 0
+
         for lesson in lessons:
+            if await self._is_duplicate(workspace_id, lesson):
+                dedup_count += 1
+                continue
+
             await self._memory.knowledge_store(
                 workspace_id=workspace_id,
                 content=json.dumps(lesson.to_dict()),
@@ -257,4 +394,11 @@ class TaskLearner:
                     "success": lesson.success,
                     "source_task_id": lesson.source_task_id,
                 },
+            )
+            stored_count += 1
+
+        if dedup_count > 0:
+            logger.info(
+                f"Lesson storage: {stored_count} new, {dedup_count} deduplicated "
+                f"(workspace {workspace_id})"
             )

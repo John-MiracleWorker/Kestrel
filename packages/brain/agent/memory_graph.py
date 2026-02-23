@@ -574,34 +574,182 @@ class MemoryGraph:
             ],
         }
 
+    async def query_by_vector_similarity(
+        self,
+        workspace_id: str,
+        query_text: str,
+        top_k: int = 10,
+        vector_store=None,
+    ) -> list[dict]:
+        """
+        Find memory graph nodes that are semantically similar to a query
+        using pgvector similarity search on node descriptions.
+
+        This complements the graph traversal by finding relevant nodes that
+        might not be directly connected to known entities. Together, they
+        form a hybrid retrieval system: graph structure + semantic similarity.
+        """
+        if not vector_store:
+            return []
+
+        try:
+            # Search the vector store for similar memory descriptions
+            results = await vector_store.search(
+                workspace_id=workspace_id,
+                query=query_text,
+                top_k=top_k,
+                source_filter="memory_graph",
+            )
+
+            if not results:
+                return []
+
+            # Resolve matching nodes from the graph
+            ws_uuid = self._to_uuid(workspace_id)
+            matched_nodes = []
+            async with self._pool.acquire() as conn:
+                for r in results:
+                    node_name = r.get("metadata", {}).get("entity_name", "")
+                    if not node_name:
+                        continue
+                    row = await conn.fetchrow(
+                        """
+                        SELECT id, entity_type, name, description, weight, mention_count
+                        FROM memory_graph_nodes
+                        WHERE workspace_id = $1 AND name = $2
+                        ORDER BY weight DESC
+                        LIMIT 1
+                        """,
+                        ws_uuid, node_name,
+                    )
+                    if row:
+                        matched_nodes.append({
+                            "id": row["id"],
+                            "type": row["entity_type"],
+                            "name": row["name"],
+                            "description": (row["description"] or "")[:200],
+                            "weight": float(row["weight"]),
+                            "mentions": row["mention_count"],
+                            "similarity": r.get("score", 0.0),
+                            "depth": -1,  # Indicates vector-matched, not graph-traversed
+                        })
+
+            return matched_nodes
+
+        except Exception as e:
+            logger.warning(f"Vector similarity search in memory graph failed: {e}")
+            return []
+
+    async def hybrid_query(
+        self,
+        workspace_id: str,
+        query_entities: list[str],
+        query_text: str = "",
+        max_depth: int = 2,
+        max_nodes: int = 30,
+        vector_store=None,
+    ) -> dict[str, Any]:
+        """
+        Hybrid retrieval combining graph traversal with vector similarity.
+
+        1. Graph traversal finds structurally connected context
+        2. Vector search finds semantically similar but disconnected context
+        3. Results are merged and ranked by a combined score
+
+        This produces higher-quality context than either approach alone.
+        """
+        # Run graph traversal and vector search concurrently
+        graph_task = self.query_context(workspace_id, query_entities, max_depth, max_nodes)
+
+        vector_results = []
+        if query_text and vector_store:
+            try:
+                vector_results = await self.query_by_vector_similarity(
+                    workspace_id=workspace_id,
+                    query_text=query_text,
+                    top_k=max_nodes // 2,
+                    vector_store=vector_store,
+                )
+            except Exception as e:
+                logger.warning(f"Vector leg of hybrid query failed: {e}")
+
+        graph_ctx = await graph_task
+
+        # Merge results, deduplicating by node ID
+        seen_ids = {n["id"] for n in graph_ctx["nodes"]}
+        merged_nodes = list(graph_ctx["nodes"])
+
+        for vn in vector_results:
+            if vn["id"] not in seen_ids:
+                seen_ids.add(vn["id"])
+                merged_nodes.append(vn)
+
+        # Combined ranking: graph weight * (1 / depth+1) + similarity bonus
+        for node in merged_nodes:
+            depth = node.get("depth", 0)
+            similarity = node.get("similarity", 0.0)
+            graph_score = node["weight"] * (1.0 / (1 + max(depth, 0)))
+            vector_bonus = similarity * 2.0 if similarity > 0 else 0.0
+            node["_combined_score"] = graph_score + vector_bonus
+
+        merged_nodes.sort(key=lambda n: n.get("_combined_score", 0), reverse=True)
+
+        return {
+            "nodes": merged_nodes[:max_nodes],
+            "edges": graph_ctx["edges"],
+            "seed_entities": query_entities,
+            "total_traversed": graph_ctx["total_traversed"],
+            "vector_matches": len(vector_results),
+            "hybrid": True,
+        }
+
     async def format_for_prompt(
         self,
         workspace_id: str,
         query_entities: list[str],
+        query_text: str = "",
+        vector_store=None,
     ) -> str:
         """
         Query the graph and format results as a prompt context block.
         Designed to be injected into the agent's system prompt.
+
+        Uses hybrid retrieval (graph + vector) when a vector_store is provided.
         """
-        ctx = await self.query_context(workspace_id, query_entities)
+        if query_text and vector_store:
+            ctx = await self.hybrid_query(
+                workspace_id, query_entities,
+                query_text=query_text,
+                vector_store=vector_store,
+            )
+        else:
+            ctx = await self.query_context(workspace_id, query_entities)
 
         if not ctx["nodes"]:
             return ""
 
-        lines = ["## 🧠 Memory Graph Context", ""]
+        lines = ["## Memory Graph Context", ""]
 
         for node in ctx["nodes"][:15]:
-            marker = "🔵" if node["depth"] == 0 else "⚪"
-            desc = f" — {node['description']}" if node["description"] else ""
+            depth = node.get("depth", 0)
+            if depth == -1:
+                marker = "~"   # Vector-matched node
+            elif depth == 0:
+                marker = "*"   # Seed node
+            else:
+                marker = "-"   # Graph-traversed node
+            desc = f" — {node['description']}" if node.get("description") else ""
             lines.append(f"{marker} **{node['name']}** ({node['type']}){desc}")
 
         if ctx["edges"]:
             lines.append("")
             lines.append("**Relationships:**")
             for edge in ctx["edges"][:10]:
-                # Find names
                 src_name = next((n["name"] for n in ctx["nodes"] if n["id"] == edge["source"]), "?")
                 tgt_name = next((n["name"] for n in ctx["nodes"] if n["id"] == edge["target"]), "?")
-                lines.append(f"  • {src_name} →[{edge['relation']}]→ {tgt_name}")
+                lines.append(f"  {src_name} -[{edge['relation']}]-> {tgt_name}")
+
+        if ctx.get("vector_matches"):
+            lines.append(f"\n_({ctx['vector_matches']} additional nodes found via semantic similarity)_")
 
         return "\n".join(lines)

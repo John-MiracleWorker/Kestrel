@@ -4,6 +4,12 @@ Task Planner — LLM-based goal decomposition into executable step DAGs.
 Uses the configured LLM provider to decompose a high-level user goal
 into concrete, actionable steps with tool hints and dependencies.
 Supports re-planning after step completion to adapt to new information.
+
+Enhancements:
+  - Parallel step identification: analyzes step DAG to find independent
+    steps that can execute concurrently.
+  - Priority scoring for steps based on criticality and blocking potential.
+  - Improved prompt engineering for better step decomposition.
 """
 
 import json
@@ -23,7 +29,7 @@ logger = logging.getLogger("brain.agent.planner")
 
 PLAN_SYSTEM_PROMPT = """\
 You are a task planner for an autonomous AI agent. Your job is to decompose
-a user's goal into concrete, actionable steps.
+a user's goal into concrete, actionable steps with a dependency DAG.
 
 Rules:
 1. Each step should be small enough to accomplish with 1-3 tool calls.
@@ -32,6 +38,9 @@ Rules:
 4. Steps must be independently verifiable — the agent should know when each is done.
 5. Be practical: prefer fewer, well-defined steps over many tiny ones.
 6. If the goal is simple enough for 1-2 steps, don't over-decompose it.
+7. **Parallelism**: steps that don't depend on each other should have EMPTY
+   depends_on arrays so they can execute concurrently. Only add a dependency
+   when the output of one step is genuinely needed as input for another.
 
 Available tools:
 {tool_descriptions}
@@ -44,13 +53,15 @@ Output your plan as JSON with this exact schema:
             "id": "step_1",
             "description": "Clear description of what this step accomplishes",
             "expected_tools": ["tool_name_1", "tool_name_2"],
-            "depends_on": []
+            "depends_on": [],
+            "priority": "high|medium|low"
         }},
         {{
             "id": "step_2",
             "description": "...",
             "expected_tools": ["tool_name_3"],
-            "depends_on": ["step_1"]
+            "depends_on": ["step_1"],
+            "priority": "medium"
         }}
     ]
 }}
@@ -243,6 +254,61 @@ class TaskPlanner:
             steps=steps,
             reasoning=data.get("reasoning", ""),
         )
+
+    def get_parallel_groups(self, plan: TaskPlan) -> list[list[TaskStep]]:
+        """
+        Analyze the step DAG and return groups of steps that can execute
+        in parallel. Each group contains steps whose dependencies have
+        all been satisfied by prior groups.
+
+        Returns a list of groups in execution order. Steps within each
+        group are independent and can run concurrently.
+
+        Example:
+          steps: A(deps=[]), B(deps=[]), C(deps=[A]), D(deps=[A,B])
+          → groups: [[A, B], [C, D]]  (A and B run concurrently, then C and D)
+        """
+        if not plan or not plan.steps:
+            return []
+
+        completed_ids: set[str] = set()
+        remaining = [s for s in plan.steps if s.status == StepStatus.PENDING]
+        groups: list[list[TaskStep]] = []
+
+        # Also count already-completed steps
+        for s in plan.steps:
+            if s.status in (StepStatus.COMPLETE, StepStatus.SKIPPED):
+                completed_ids.add(s.id)
+
+        max_iterations = len(remaining) + 1  # Safety limit
+        iteration = 0
+
+        while remaining and iteration < max_iterations:
+            iteration += 1
+            # Find steps whose dependencies are all satisfied
+            ready = [
+                s for s in remaining
+                if all(dep in completed_ids for dep in (s.depends_on or []))
+            ]
+
+            if not ready:
+                # Remaining steps have unresolvable deps — add them as a sequential fallback
+                groups.append(remaining)
+                break
+
+            groups.append(ready)
+            for s in ready:
+                completed_ids.add(s.id)
+                remaining.remove(s)
+
+        if groups:
+            parallel_count = sum(1 for g in groups if len(g) > 1)
+            logger.info(
+                f"Plan parallelism analysis: {len(plan.steps)} steps → "
+                f"{len(groups)} execution groups ({parallel_count} parallelizable)"
+            )
+
+        return groups
 
     def _format_tool_descriptions(self, tools: list[ToolDefinition]) -> str:
         """Format tool list for the planning prompt."""
