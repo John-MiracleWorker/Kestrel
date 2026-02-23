@@ -168,11 +168,17 @@ class CouncilSession:
     Orchestrates a multi-agent debate on a proposal.
 
     Flow:
-      1. Present proposal to all council members
-      2. Each member independently evaluates
-      3. Members critique each other's evaluations (optional debate round)
-      4. Final vote
-      5. Synthesize verdict
+      1. Classify proposal to determine role weights
+      2. Present proposal to all council members
+      3. Each member independently evaluates
+      4. Members critique each other's evaluations (optional debate round)
+      5. Final weighted vote using adaptive expertise
+      6. Synthesize verdict
+
+    Enhancement: Adaptive expertise weighting. When a proposal is security-
+    related, the Security Reviewer's vote carries more weight. For architecture
+    proposals, the Architect weighs more. This produces better decisions by
+    amplifying the most relevant expertise.
     """
 
     # Minimum members needed for quorum
@@ -181,6 +187,66 @@ class CouncilSession:
     CONSENSUS_THRESHOLD = 0.6
     # Max parallel LLM calls to avoid overloading providers.
     MAX_PARALLEL_EVALUATIONS = max(1, int(os.getenv("COUNCIL_MAX_PARALLEL", "3")))
+
+    # Expertise weight multipliers by proposal category
+    # Keys are categories detected from proposal content; values map roles to weight multipliers
+    EXPERTISE_WEIGHTS: dict[str, dict[CouncilRole, float]] = {
+        "security": {
+            CouncilRole.SECURITY: 2.0,
+            CouncilRole.ARCHITECT: 1.2,
+            CouncilRole.IMPLEMENTER: 1.0,
+            CouncilRole.DEVILS_ADVOCATE: 1.0,
+            CouncilRole.USER_ADVOCATE: 0.7,
+        },
+        "architecture": {
+            CouncilRole.ARCHITECT: 2.0,
+            CouncilRole.SECURITY: 1.2,
+            CouncilRole.IMPLEMENTER: 1.3,
+            CouncilRole.DEVILS_ADVOCATE: 1.0,
+            CouncilRole.USER_ADVOCATE: 0.8,
+        },
+        "performance": {
+            CouncilRole.IMPLEMENTER: 1.8,
+            CouncilRole.ARCHITECT: 1.5,
+            CouncilRole.SECURITY: 0.8,
+            CouncilRole.DEVILS_ADVOCATE: 1.0,
+            CouncilRole.USER_ADVOCATE: 0.7,
+        },
+        "ux": {
+            CouncilRole.USER_ADVOCATE: 2.0,
+            CouncilRole.IMPLEMENTER: 1.0,
+            CouncilRole.ARCHITECT: 0.8,
+            CouncilRole.SECURITY: 0.7,
+            CouncilRole.DEVILS_ADVOCATE: 1.0,
+        },
+        "general": {
+            CouncilRole.ARCHITECT: 1.0,
+            CouncilRole.IMPLEMENTER: 1.0,
+            CouncilRole.SECURITY: 1.0,
+            CouncilRole.DEVILS_ADVOCATE: 1.0,
+            CouncilRole.USER_ADVOCATE: 1.0,
+        },
+    }
+
+    # Keywords used to classify proposal category
+    _CATEGORY_KEYWORDS: dict[str, list[str]] = {
+        "security": [
+            "security", "auth", "password", "token", "encryption", "vulnerability",
+            "injection", "xss", "csrf", "secret", "credential", "permission", "access control",
+        ],
+        "architecture": [
+            "architecture", "refactor", "design pattern", "module", "dependency",
+            "abstraction", "coupling", "scalab", "migration", "schema",
+        ],
+        "performance": [
+            "performance", "latency", "throughput", "cache", "optimize", "slow",
+            "bottleneck", "memory leak", "n+1", "batch", "concurrent",
+        ],
+        "ux": [
+            "user experience", "ui", "ux", "interface", "usability", "accessibility",
+            "responsive", "design", "frontend", "onboarding",
+        ],
+    }
 
     def __init__(
         self,
@@ -200,6 +266,20 @@ class CouncilSession:
         ]
         self._event_callback = event_callback
 
+    def _classify_proposal(self, proposal: str) -> str:
+        """Classify a proposal into a category for expertise weighting."""
+        proposal_lower = proposal.lower()
+        scores: dict[str, int] = {}
+        for category, keywords in self._CATEGORY_KEYWORDS.items():
+            scores[category] = sum(1 for kw in keywords if kw in proposal_lower)
+        best = max(scores, key=scores.get) if scores else "general"
+        return best if scores.get(best, 0) > 0 else "general"
+
+    def _get_role_weight(self, role: CouncilRole, category: str) -> float:
+        """Get the expertise weight multiplier for a role given the proposal category."""
+        weights = self.EXPERTISE_WEIGHTS.get(category, self.EXPERTISE_WEIGHTS["general"])
+        return weights.get(role, 1.0)
+
     async def _emit(self, activity_type: str, data: dict):
         """Emit an agent activity event to the UI."""
         if self._event_callback:
@@ -212,14 +292,20 @@ class CouncilSession:
         include_debate: bool = True,
     ) -> CouncilVerdict:
         """
-        Run the full council deliberation process.
+        Run the full council deliberation process with adaptive expertise weighting.
         """
         verdict = CouncilVerdict(proposal=proposal)
+
+        # Classify proposal to determine expertise weights
+        category = self._classify_proposal(proposal)
+        logger.info(f"Council: proposal classified as '{category}'")
 
         await self._emit("council_started", {
             "topic": proposal[:200],
             "roles": [r.value for r in self._roles],
             "member_count": len(self._roles),
+            "category": category,
+            "weights": {r.value: self._get_role_weight(r, category) for r in self._roles},
         })
 
         # ── Phase 1: Independent evaluation (bounded concurrency) ───────────
@@ -249,8 +335,8 @@ class CouncilSession:
 
         verdict.opinions = opinions
 
-        # ── Phase 3: Synthesize verdict ──────────────────────────
-        self._synthesize_verdict(verdict)
+        # ── Phase 3: Synthesize verdict with expertise weighting ─
+        self._synthesize_verdict(verdict, category=category)
 
         await self._emit("council_verdict", {
             "consensus": verdict.consensus.value if verdict.consensus else "none",
@@ -354,8 +440,15 @@ If yes, provide updated analysis. If no, confirm your position.
 
         return await asyncio.gather(*(revise(opinion) for opinion in opinions))
 
-    def _synthesize_verdict(self, verdict: CouncilVerdict) -> None:
-        """Synthesize individual opinions into a collective verdict."""
+    def _synthesize_verdict(self, verdict: CouncilVerdict, category: str = "general") -> None:
+        """
+        Synthesize individual opinions into a collective verdict using
+        adaptive expertise weighting.
+
+        Each role's vote is weighted by their expertise relevance to the
+        proposal category. A Security Reviewer's rejection on a security
+        proposal carries 2x the weight of a User Advocate's approval.
+        """
         opinions = verdict.opinions
         if not opinions:
             verdict.has_consensus = False
@@ -363,29 +456,41 @@ If yes, provide updated analysis. If no, confirm your position.
             verdict.review_reason = "No council opinions available"
             return
 
-        # Count votes
-        vote_counts = {VoteType.APPROVE: 0, VoteType.REJECT: 0,
-                       VoteType.CONDITIONAL: 0, VoteType.ABSTAIN: 0}
-        for o in opinions:
-            vote_counts[o.vote] = vote_counts.get(o.vote, 0) + 1
+        # Weighted vote tallying
+        weighted_approve = 0.0
+        weighted_reject = 0.0
+        weighted_conditional = 0.0
+        total_weight = 0.0
 
-        total_voting = len(opinions) - vote_counts[VoteType.ABSTAIN]
-        if total_voting == 0:
+        for o in opinions:
+            if o.vote == VoteType.ABSTAIN:
+                continue
+            weight = self._get_role_weight(o.role, category)
+            total_weight += weight
+            if o.vote == VoteType.APPROVE:
+                weighted_approve += weight
+            elif o.vote == VoteType.REJECT:
+                weighted_reject += weight
+            elif o.vote == VoteType.CONDITIONAL:
+                weighted_conditional += weight
+
+        if total_weight == 0:
             verdict.has_consensus = False
             verdict.requires_user_review = True
             verdict.review_reason = "All members abstained"
             return
 
-        # Determine majority
-        approve_fraction = (vote_counts[VoteType.APPROVE] + vote_counts[VoteType.CONDITIONAL]) / total_voting
+        # Determine majority using weighted fractions
+        approve_fraction = (weighted_approve + weighted_conditional) / total_weight
+        reject_fraction = weighted_reject / total_weight
 
         if approve_fraction >= self.CONSENSUS_THRESHOLD:
-            if vote_counts[VoteType.CONDITIONAL] > vote_counts[VoteType.APPROVE]:
+            if weighted_conditional > weighted_approve:
                 verdict.consensus = VoteType.CONDITIONAL
             else:
                 verdict.consensus = VoteType.APPROVE
             verdict.has_consensus = True
-        elif (vote_counts[VoteType.REJECT] / total_voting) >= self.CONSENSUS_THRESHOLD:
+        elif reject_fraction >= self.CONSENSUS_THRESHOLD:
             verdict.consensus = VoteType.REJECT
             verdict.has_consensus = True
         else:
@@ -393,8 +498,13 @@ If yes, provide updated analysis. If no, confirm your position.
             verdict.requires_user_review = True
             verdict.review_reason = "Council is divided — no clear consensus"
 
-        # Average confidence
-        verdict.consensus_confidence = sum(o.confidence for o in opinions) / len(opinions)
+        # Weighted confidence average
+        weighted_conf_sum = sum(
+            o.confidence * self._get_role_weight(o.role, category)
+            for o in opinions
+        )
+        total_all_weight = sum(self._get_role_weight(o.role, category) for o in opinions)
+        verdict.consensus_confidence = weighted_conf_sum / total_all_weight if total_all_weight > 0 else 0.0
 
         # Find dissenters
         if verdict.consensus:

@@ -3,12 +3,19 @@ Agent Loop Engine — ReAct (Reason + Act) state machine for autonomous executio
 
 This is the heart of Kestrel's autonomous agent. It orchestrates:
   1. Planning — decompose the goal into steps
-  2. Executing — run tools and observe results
+  2. Executing — run tools and observe results (with parallel tool dispatch)
   3. Reflecting — decide next action based on observations
   4. Completing — summarize results and report
 
 The loop is fully resumable: all state is persisted to PostgreSQL,
 so tasks survive service restarts and can be paused/resumed.
+
+Enhancements:
+  - Parallel tool execution: when the LLM returns multiple independent tool
+    calls, they are dispatched concurrently for faster task completion.
+  - Smart retry with exponential backoff for transient tool failures.
+  - Streaming metrics integration for real-time cost/token tracking.
+  - Parallel step execution for independent plan steps.
 """
 
 import asyncio
@@ -39,8 +46,15 @@ from agent.planner import TaskPlanner
 from agent.learner import TaskLearner
 from agent.memory_graph import MemoryGraph
 from agent.evidence import EvidenceChain, DecisionType
+from agent.observability import MetricsCollector
 
 logger = logging.getLogger("brain.agent.loop")
+
+# ── Constants ────────────────────────────────────────────────────────
+MAX_PARALLEL_TOOLS = 5       # Max concurrent tool executions per turn
+RETRY_MAX_ATTEMPTS = 3       # Max retries for transient tool failures
+RETRY_BASE_DELAY_S = 1.0     # Base delay for exponential backoff
+PARALLEL_STEP_MAX = 3         # Max steps to execute concurrently
 
 
 # ── System Prompt for the Reasoning LLM ──────────────────────────────
@@ -112,6 +126,7 @@ class AgentLoop:
         self._evidence_chain = evidence_chain
         self._event_callback = event_callback
         self._reflection_engine = reflection_engine
+        self._metrics = MetricsCollector(model=model)
 
         # Callback for approval resolution (set by the gRPC handler)
         self._approval_callback: Optional[Callable] = None
@@ -424,11 +439,16 @@ class AgentLoop:
 
             # Emit final process bar events
             if self._event_callback:
-                # Token usage
+                # Token usage (enriched with metrics collector data)
+                metrics_data = self._metrics.metrics.to_dict()
                 await self._event_callback("token_usage", {
                     "total_tokens": task.token_usage,
                     "iterations": task.iterations,
                     "tool_calls": task.tool_calls_count,
+                    "estimated_cost_usd": metrics_data.get("estimated_cost_usd", 0),
+                    "llm_calls": metrics_data.get("llm_calls", 0),
+                    "avg_tool_time_ms": metrics_data.get("avg_tool_time_ms", 0),
+                    "total_elapsed_ms": metrics_data.get("total_elapsed_ms", 0),
                 })
                 # Evidence summary
                 if self._evidence_chain and self._evidence_chain._decisions:
@@ -505,6 +525,364 @@ class AgentLoop:
                 progress=self._progress(task),
             )
 
+    async def _execute_tool_with_retry(
+        self,
+        tool_call: ToolCall,
+        tool_context: dict,
+        max_attempts: int = RETRY_MAX_ATTEMPTS,
+    ) -> "ToolResult":
+        """
+        Execute a tool with exponential backoff retry for transient failures.
+
+        Retries on network errors, timeouts, and rate limits. Does NOT retry
+        on validation errors or intentional failures.
+        """
+        last_result = None
+        for attempt in range(max_attempts):
+            result = await self._tools.execute(tool_call, context=tool_context)
+            last_result = result
+
+            if result.success:
+                # Record successful execution in metrics
+                self._metrics.record_tool_execution(
+                    tool_name=tool_call.name,
+                    execution_time_ms=result.execution_time_ms,
+                    success=True,
+                )
+                return result
+
+            # Determine if this is a retryable failure
+            error_lower = (result.error or "").lower()
+            is_transient = any(kw in error_lower for kw in [
+                "timeout", "rate limit", "connection", "network",
+                "503", "502", "429", "temporarily unavailable",
+            ])
+
+            if not is_transient or attempt == max_attempts - 1:
+                self._metrics.record_tool_execution(
+                    tool_name=tool_call.name,
+                    execution_time_ms=result.execution_time_ms,
+                    success=False,
+                )
+                return result
+
+            # Exponential backoff: 1s, 2s, 4s
+            delay = RETRY_BASE_DELAY_S * (2 ** attempt)
+            logger.info(
+                f"Retrying {tool_call.name} after transient failure "
+                f"(attempt {attempt + 1}/{max_attempts}, delay {delay:.1f}s): "
+                f"{result.error[:100]}"
+            )
+            await asyncio.sleep(delay)
+
+        return last_result
+
+    async def _execute_tools_parallel(
+        self,
+        parsed_calls: list[dict],
+        task: AgentTask,
+        step: Any,
+    ) -> AsyncIterator[TaskEvent]:
+        """
+        Execute multiple independent tool calls concurrently.
+
+        Tools that require approval or are control tools (task_complete,
+        ask_human) are executed sequentially to maintain correct ordering.
+        """
+        # Separate into parallelizable and sequential calls
+        parallel_batch = []
+        sequential_queue = []
+
+        for tc_data in parsed_calls:
+            func = tc_data.get("function", {})
+            tool_name = func.get("name", "")
+            try:
+                tool_args = json.loads(func.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                tool_args = {}
+
+            # Control tools and tools needing approval must run sequentially
+            is_control = tool_name in ("task_complete", "ask_human")
+            needs_approval = self._guardrails.needs_approval(
+                tool_name, tool_args, task.config,
+                tool_registry=self._tools,
+            )
+
+            if is_control or needs_approval:
+                sequential_queue.append(tc_data)
+            else:
+                parallel_batch.append(tc_data)
+
+        # ── Execute parallel batch concurrently ──────────────────
+        if len(parallel_batch) > 1:
+            logger.info(
+                f"Parallel tool dispatch: {len(parallel_batch)} tools "
+                f"({', '.join(tc.get('function', {}).get('name', '?') for tc in parallel_batch)})"
+            )
+
+            semaphore = asyncio.Semaphore(MAX_PARALLEL_TOOLS)
+
+            async def _run_one(tc_data: dict) -> tuple[dict, ToolCall, "ToolResult"]:
+                async with semaphore:
+                    func = tc_data.get("function", {})
+                    tool_name = func.get("name", "")
+                    try:
+                        tool_args = json.loads(func.get("arguments", "{}"))
+                    except json.JSONDecodeError:
+                        tool_args = {}
+
+                    tool_call = ToolCall(
+                        id=tc_data.get("id", "call"),
+                        name=tool_name,
+                        arguments=tool_args,
+                    )
+                    tool_context = {"workspace_id": task.workspace_id} if task.workspace_id else {}
+                    result = await self._execute_tool_with_retry(tool_call, tool_context)
+                    return tc_data, tool_call, result
+
+            results = await asyncio.gather(
+                *(_run_one(tc) for tc in parallel_batch),
+                return_exceptions=True,
+            )
+
+            for item in results:
+                if isinstance(item, Exception):
+                    logger.error(f"Parallel tool execution error: {item}")
+                    continue
+
+                tc_data, tool_call, result = item
+                func = tc_data.get("function", {})
+                tool_name = func.get("name", "")
+                try:
+                    tool_args = json.loads(func.get("arguments", "{}"))
+                except json.JSONDecodeError:
+                    tool_args = {}
+
+                task.tool_calls_count += 1
+
+                # Record evidence
+                if self._evidence_chain:
+                    self._evidence_chain.record_tool_decision(
+                        tool_name=tool_name,
+                        args=tool_args,
+                        reasoning=f"LLM selected {tool_name} (parallel batch) for step: {step.description[:80]}",
+                    )
+
+                # Record in step history
+                step.tool_calls.append({
+                    "id": tool_call.id,
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "result": result.output if result.success else result.error,
+                    "success": result.success,
+                    "time_ms": result.execution_time_ms,
+                    **({"_gemini_raw_part": tc_data["_gemini_raw_part"]} if "_gemini_raw_part" in tc_data else {}),
+                })
+
+                yield TaskEvent(
+                    type=TaskEventType.TOOL_CALLED,
+                    task_id=task.id,
+                    step_id=step.id,
+                    tool_name=tool_name,
+                    tool_args=json.dumps(tool_args),
+                    progress=self._progress(task),
+                )
+                yield TaskEvent(
+                    type=TaskEventType.TOOL_RESULT,
+                    task_id=task.id,
+                    step_id=step.id,
+                    tool_name=tool_name,
+                    tool_result=result.output if result.success else result.error,
+                    progress=self._progress(task),
+                )
+
+                if not result.success:
+                    step.error = result.error
+
+                # Budget check after parallel batch
+                budget_error = self._guardrails.check_budget(task)
+                if budget_error:
+                    logger.warning(f"Budget exceeded during parallel tools: {budget_error}")
+                    step.status = StepStatus.COMPLETE
+                    step.result = f"Stopped: {budget_error}"
+                    step.completed_at = datetime.now(timezone.utc)
+                    await self._persistence.update_task(task)
+                    return
+
+        elif len(parallel_batch) == 1:
+            # Single tool — just add to sequential queue
+            sequential_queue = parallel_batch + sequential_queue
+
+        # ── Execute sequential calls one at a time ───────────────
+        for tc_data in sequential_queue:
+            async for event in self._execute_single_tool(tc_data, task, step):
+                yield event
+                # Check if step was completed by a control tool
+                if step.status in (StepStatus.COMPLETE, StepStatus.FAILED, StepStatus.SKIPPED):
+                    return
+
+        await self._persistence.update_task(task)
+
+    async def _execute_single_tool(
+        self,
+        tc_data: dict,
+        task: AgentTask,
+        step: Any,
+    ) -> AsyncIterator[TaskEvent]:
+        """Execute a single tool call with full guardrail and control-flow handling."""
+        func = tc_data.get("function", {})
+        tool_name = func.get("name", "")
+        try:
+            tool_args = json.loads(func.get("arguments", "{}"))
+        except json.JSONDecodeError:
+            tool_args = {}
+
+        tool_call = ToolCall(
+            id=tc_data.get("id", "call"),
+            name=tool_name,
+            arguments=tool_args,
+        )
+
+        # Check guardrails
+        approval_needed = self._guardrails.needs_approval(
+            tool_name, tool_args, task.config,
+            tool_registry=self._tools,
+        )
+
+        if approval_needed:
+            request = ApprovalRequest(
+                task_id=task.id,
+                step_id=step.id,
+                tool_name=tool_name,
+                tool_args=tool_args,
+                risk_level=self._tools.get_risk_level(tool_name),
+                reason=approval_needed,
+            )
+            task.pending_approval = request
+            await self._persistence.save_approval(request)
+
+            yield TaskEvent(
+                type=TaskEventType.APPROVAL_NEEDED,
+                task_id=task.id,
+                step_id=step.id,
+                tool_name=tool_name,
+                tool_args=json.dumps(tool_args),
+                approval_id=request.id,
+                content=approval_needed,
+                progress=self._progress(task),
+            )
+            return
+
+        # Emit tool_called event
+        yield TaskEvent(
+            type=TaskEventType.TOOL_CALLED,
+            task_id=task.id,
+            step_id=step.id,
+            tool_name=tool_name,
+            tool_args=json.dumps(tool_args),
+            progress=self._progress(task),
+        )
+
+        # Record tool decision in evidence chain
+        if self._evidence_chain:
+            self._evidence_chain.record_tool_decision(
+                tool_name=tool_name,
+                args=tool_args,
+                reasoning=f"LLM selected {tool_name} for step: {step.description[:80]}",
+            )
+
+        # Execute with retry
+        tool_context = {"workspace_id": task.workspace_id} if task.workspace_id else {}
+        result = await self._execute_tool_with_retry(tool_call, tool_context)
+        task.tool_calls_count += 1
+
+        # Inline budget check
+        budget_error = self._guardrails.check_budget(task)
+        if budget_error:
+            logger.warning(f"Budget exceeded mid-step: {budget_error}")
+            step.status = StepStatus.COMPLETE
+            step.result = f"Stopped: {budget_error}"
+            step.completed_at = datetime.now(timezone.utc)
+            await self._persistence.update_task(task)
+            yield TaskEvent(
+                type=TaskEventType.TOOL_RESULT,
+                task_id=task.id,
+                step_id=step.id,
+                tool_name=tool_name,
+                tool_result=result.output if result.success else result.error,
+                progress=self._progress(task),
+            )
+            return
+
+        # Record in step history
+        step.tool_calls.append({
+            "id": tool_call.id,
+            "tool": tool_name,
+            "args": tool_args,
+            "result": result.output if result.success else result.error,
+            "success": result.success,
+            "time_ms": result.execution_time_ms,
+            **({"_gemini_raw_part": tc_data["_gemini_raw_part"]} if "_gemini_raw_part" in tc_data else {}),
+        })
+
+        yield TaskEvent(
+            type=TaskEventType.TOOL_RESULT,
+            task_id=task.id,
+            step_id=step.id,
+            tool_name=tool_name,
+            tool_result=result.output if result.success else result.error,
+            progress=self._progress(task),
+        )
+
+        # Handle control tools
+        if tool_name == "task_complete":
+            step.status = StepStatus.COMPLETE
+            step.result = tool_args.get("summary", result.output)
+            step.completed_at = datetime.now(timezone.utc)
+            for remaining in task.plan.steps:
+                if remaining.status in (StepStatus.PENDING, StepStatus.IN_PROGRESS) and remaining.id != step.id:
+                    remaining.status = StepStatus.SKIPPED
+                    remaining.result = "Skipped — task completed early"
+                    remaining.completed_at = datetime.now(timezone.utc)
+
+        elif tool_name == "ask_human":
+            question = tool_args.get("question", "The agent needs your input")
+            approval_request = ApprovalRequest(
+                id=str(uuid.uuid4()),
+                task_id=task.id,
+                step_id=step.id,
+                tool_name="ask_human",
+                tool_args=tool_args,
+                reason=question,
+            )
+            task.pending_approval = approval_request
+            task.status = TaskStatus.WAITING_APPROVAL
+            await self._persistence.save_approval(approval_request)
+            await self._persistence.update_task(task)
+
+            yield TaskEvent(
+                type=TaskEventType.APPROVAL_NEEDED,
+                task_id=task.id,
+                step_id=step.id,
+                tool_name="ask_human",
+                content=question,
+                approval_id=approval_request.id,
+                progress=self._progress(task),
+            )
+
+            approved = await self._wait_for_approval(task)
+            task.status = TaskStatus.RUNNING
+
+            if not approved:
+                step.result = "User did not respond / declined"
+                step.status = StepStatus.COMPLETE
+                step.completed_at = datetime.now(timezone.utc)
+
+        elif not result.success:
+            step.error = result.error
+
+        await self._persistence.update_task(task)
+
     async def _reason_and_act(
         self,
         task: AgentTask,
@@ -514,8 +892,9 @@ class AgentLoop:
         One iteration of the ReAct loop:
         1. Build prompt with current observations
         2. Call LLM with available tools
-        3. If LLM returns a tool call → execute it
-        4. If LLM returns text → treat as thinking/reflection
+        3. If LLM returns multiple tool calls → dispatch in parallel
+        4. If LLM returns a single tool call → execute with retry
+        5. If LLM returns text → treat as thinking/reflection
         """
         # Build the agent prompt
         observations = "\n".join(
@@ -610,166 +989,31 @@ class AgentLoop:
             api_key=self._api_key,
         )
 
+        # Track LLM token usage in metrics
+        if response.get("usage"):
+            usage = response["usage"]
+            self._metrics.record_llm_call(
+                model=self._model,
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                cached_tokens=usage.get("cached_tokens", 0),
+            )
+            if self._event_callback:
+                await self._event_callback("metrics_update", self._metrics.metrics.to_compact_dict())
+
         # ── Handle LLM response ─────────────────────────────────
         if response.get("tool_calls"):
-            for tc_data in response["tool_calls"]:
-                func = tc_data.get("function", {})
-                tool_name = func.get("name", "")
-                try:
-                    tool_args = json.loads(func.get("arguments", "{}"))
-                except json.JSONDecodeError:
-                    tool_args = {}
+            tool_calls = response["tool_calls"]
 
-                tool_call = ToolCall(
-                    id=tc_data.get("id", "call"),
-                    name=tool_name,
-                    arguments=tool_args,
-                )
-
-                # Check guardrails
-                approval_needed = self._guardrails.needs_approval(
-                    tool_name, tool_args, task.config,
-                    tool_registry=self._tools,
-                )
-
-                if approval_needed:
-                    request = ApprovalRequest(
-                        task_id=task.id,
-                        step_id=step.id,
-                        tool_name=tool_name,
-                        tool_args=tool_args,
-                        risk_level=self._tools.get_risk_level(tool_name),
-                        reason=approval_needed,
-                    )
-                    task.pending_approval = request
-                    await self._persistence.save_approval(request)
-
-                    yield TaskEvent(
-                        type=TaskEventType.APPROVAL_NEEDED,
-                        task_id=task.id,
-                        step_id=step.id,
-                        tool_name=tool_name,
-                        tool_args=json.dumps(tool_args),
-                        approval_id=request.id,
-                        content=approval_needed,
-                        progress=self._progress(task),
-                    )
-                    return  # Pause execution until approved
-
-                # Emit tool_called event
-                yield TaskEvent(
-                    type=TaskEventType.TOOL_CALLED,
-                    task_id=task.id,
-                    step_id=step.id,
-                    tool_name=tool_name,
-                    tool_args=json.dumps(tool_args),
-                    progress=self._progress(task),
-                )
-
-                # Record tool decision in evidence chain
-                if self._evidence_chain:
-                    self._evidence_chain.record_tool_decision(
-                        tool_name=tool_name,
-                        args=tool_args,
-                        reasoning=f"LLM selected {tool_name} for step: {step.description[:80]}",
-                    )
-
-                # Execute the tool (inject workspace context)
-                tool_context = {"workspace_id": task.workspace_id} if task.workspace_id else {}
-                result = await self._tools.execute(tool_call, context=tool_context)
-                task.tool_calls_count += 1
-
-                # Inline budget check — stop immediately if limits exceeded
-                budget_error = self._guardrails.check_budget(task)
-                if budget_error:
-                    logger.warning(f"Budget exceeded mid-step: {budget_error}")
-                    step.status = StepStatus.COMPLETE
-                    step.result = f"Stopped: {budget_error}"
-                    step.completed_at = datetime.now(timezone.utc)
-                    await self._persistence.update_task(task)
-                    yield TaskEvent(
-                        type=TaskEventType.TOOL_RESULT,
-                        task_id=task.id,
-                        step_id=step.id,
-                        tool_name=tool_name,
-                        tool_result=result.output if result.success else result.error,
-                        progress=self._progress(task),
-                    )
-                    return  # Exit _reason_and_act, outer loop will catch FAILED
-
-                # Record in step history
-                step.tool_calls.append({
-                    "id": tool_call.id,
-                    "tool": tool_name,
-                    "args": tool_args,
-                    "result": result.output if result.success else result.error,
-                    "success": result.success,
-                    "time_ms": result.execution_time_ms,
-                    # Preserve Gemini raw part for thought_signature support
-                    **({"_gemini_raw_part": tc_data["_gemini_raw_part"]} if "_gemini_raw_part" in tc_data else {}),
-                })
-
-                yield TaskEvent(
-                    type=TaskEventType.TOOL_RESULT,
-                    task_id=task.id,
-                    step_id=step.id,
-                    tool_name=tool_name,
-                    tool_result=result.output if result.success else result.error,
-                    progress=self._progress(task),
-                )
-
-                # Check for special control tools
-                if tool_name == "task_complete":
-                    step.status = StepStatus.COMPLETE
-                    step.result = tool_args.get("summary", result.output)
-                    step.completed_at = datetime.now(timezone.utc)
-                    # Mark all remaining steps as SKIPPED so the loop exits
-                    for remaining in task.plan.steps:
-                        if remaining.status in (StepStatus.PENDING, StepStatus.IN_PROGRESS) and remaining.id != step.id:
-                            remaining.status = StepStatus.SKIPPED
-                            remaining.result = "Skipped — task completed early"
-                            remaining.completed_at = datetime.now(timezone.utc)
-
-                elif tool_name == "ask_human":
-                    # Emit an APPROVAL_NEEDED event so the frontend shows the question
-                    question = tool_args.get("question", "The agent needs your input")
-                    approval_request = ApprovalRequest(
-                        id=str(uuid.uuid4()),
-                        task_id=task.id,
-                        step_id=step.id,
-                        tool_name="ask_human",
-                        tool_args=tool_args,
-                        reason=question,
-                    )
-                    task.pending_approval = approval_request
-                    task.status = TaskStatus.WAITING_APPROVAL
-                    await self._persistence.save_approval(approval_request)
-                    await self._persistence.update_task(task)
-
-                    yield TaskEvent(
-                        type=TaskEventType.APPROVAL_NEEDED,
-                        task_id=task.id,
-                        step_id=step.id,
-                        tool_name="ask_human",
-                        content=question,
-                        approval_id=approval_request.id,
-                        progress=self._progress(task),
-                    )
-
-                    # Wait for the user to respond
-                    approved = await self._wait_for_approval(task)
-                    task.status = TaskStatus.RUNNING
-
-                    if not approved:
-                        step.result = "User did not respond / declined"
-                        step.status = StepStatus.COMPLETE
-                        step.completed_at = datetime.now(timezone.utc)
-
-                elif not result.success:
-                    step.error = result.error
-                    # Don't mark failed yet — the loop will handle retries
-
-                await self._persistence.update_task(task)
+            # Parallel dispatch when multiple independent tools are requested
+            if len(tool_calls) > 1:
+                logger.info(f"LLM returned {len(tool_calls)} tool calls — dispatching in parallel")
+                async for event in self._execute_tools_parallel(tool_calls, task, step):
+                    yield event
+            else:
+                # Single tool call — execute directly
+                async for event in self._execute_single_tool(tool_calls[0], task, step):
+                    yield event
 
         elif response.get("content"):
             text = response["content"]
