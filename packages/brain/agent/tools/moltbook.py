@@ -385,7 +385,7 @@ async def _create_post(submolt: str = "general", title: str = "", content: str =
     if not title:
         return {"error": "A title is required to create a post."}
 
-    payload = {"submolt": submolt, "title": title}
+    payload = {"submolt_name": submolt, "title": title}
     if content:
         payload["content"] = content
 
@@ -437,6 +437,15 @@ async def _add_comment(post_id: str = "", content: str = "", **kwargs) -> dict:
         return {"error": "post_id is required to comment."}
     if not content:
         return {"error": "content is required for a comment."}
+
+    # Guard against half-complete content from LLM truncation
+    stripped = content.rstrip()
+    truncation_signals = (" and", " or", " the", " a", " to", " in", " of", " for", " with", " that", " is", " are", " was", " but", " as", " by")
+    if len(stripped) < 20 or stripped.endswith(truncation_signals):
+        return {
+            "error": "Comment appears incomplete (likely truncated). Please compose the full comment and try again.",
+            "partial_content": stripped[:80],
+        }
 
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
