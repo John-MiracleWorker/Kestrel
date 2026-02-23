@@ -107,6 +107,124 @@ class RelationEdge:
         }
 
 
+# ── LLM Entity Extraction ───────────────────────────────────────────
+
+_EXTRACTION_PROMPT = """\
+Extract structured entities and relationships from this conversation turn.
+
+Entity types: file, person, project, tool, decision, error, concept
+Relationship types: depends_on, related_to, caused_by, resolved_by, uses, part_of, decided
+
+Return ONLY a JSON object with this exact structure (no markdown, no explanation):
+{{"entities": [{{"type": "...", "name": "...", "description": "..."}}], "relations": [{{"source": "name1", "target": "name2", "relation": "..."}}]}}
+
+Rules:
+- Extract 1-8 entities maximum, only genuinely important ones
+- Names should be concise (1-4 words)
+- Skip generic words like "The", "System", "Data"
+- File entities should be actual filenames (e.g. "server.py")
+- Person entities should be actual names or roles
+- Decision entities describe choices made (e.g. "Use gRPC over REST")
+- Error entities describe bugs or failures
+- Only create relations between entities you extracted
+
+USER: {user_message}
+
+ASSISTANT: {assistant_response}"""
+
+
+async def extract_entities_llm(
+    provider,
+    model: str,
+    api_key: str,
+    user_message: str,
+    assistant_response: str,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Use a lightweight LLM call to extract structured entities and relations
+    from a conversation turn.
+
+    Returns (entities, relations) suitable for MemoryGraph.extract_and_store().
+    """
+    # Truncate to keep the prompt cheap
+    user_msg = user_message[:800]
+    asst_msg = assistant_response[:1200]
+
+    prompt = _EXTRACTION_PROMPT.format(
+        user_message=user_msg,
+        assistant_response=asst_msg,
+    )
+
+    try:
+        chunks = []
+        async for token in provider.stream(
+            messages=[{"role": "user", "content": prompt}],
+            model=model,
+            temperature=0.1,
+            max_tokens=4096,
+            api_key=api_key,
+        ):
+            if isinstance(token, str):
+                chunks.append(token)
+
+        raw = "".join(chunks).strip()
+
+        # Debug log first 200 chars of raw response
+        logger.debug(f"LLM raw response ({len(raw)} chars): {raw[:200]}")
+
+        if not raw:
+            logger.warning("LLM entity extraction returned empty response")
+            return [], []
+
+        # Strip markdown fences if the LLM wrapped it
+        if "```" in raw:
+            # Handle ```json\n...\n``` pattern
+            import re as _re
+            fence_match = _re.search(r'```(?:json)?\s*\n?(.*?)```', raw, _re.DOTALL)
+            if fence_match:
+                raw = fence_match.group(1).strip()
+            elif raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1]
+                if raw.endswith("```"):
+                    raw = raw[:-3]
+                raw = raw.strip()
+
+        # Try to find JSON object in the response
+        if not raw.startswith("{"):
+            json_start = raw.find("{")
+            if json_start >= 0:
+                raw = raw[json_start:]
+
+        data = json.loads(raw)
+        entities = data.get("entities", [])
+        relations = data.get("relations", [])
+
+        # Validate entity types
+        valid_types = {"file", "person", "project", "tool", "decision", "error", "concept"}
+        entities = [
+            e for e in entities
+            if isinstance(e, dict) and e.get("type") in valid_types and e.get("name")
+        ]
+
+        # Validate relations
+        entity_names = {e["name"] for e in entities}
+        relations = [
+            r for r in relations
+            if isinstance(r, dict) and r.get("source") in entity_names and r.get("target") in entity_names
+        ]
+
+        logger.info(f"LLM extracted {len(entities)} entities, {len(relations)} relations")
+        return entities, relations
+
+    except json.JSONDecodeError as e:
+        logger.warning(f"LLM entity extraction JSON parse failed: {e}")
+        logger.debug(f"Raw response was: {raw[:300] if raw else '(empty)'}")
+        return [], []
+    except Exception as e:
+        logger.warning(f"LLM entity extraction failed: {e}")
+        return [], []
+
+
 # ── Memory Graph Engine ─────────────────────────────────────────────
 
 class MemoryGraph:
@@ -128,6 +246,13 @@ class MemoryGraph:
     def __init__(self, pool):
         self._pool = pool
 
+    @staticmethod
+    def _to_uuid(val) -> 'uuid.UUID':
+        """Convert a string to uuid.UUID if needed (asyncpg requires native UUIDs)."""
+        if isinstance(val, uuid.UUID):
+            return val
+        return uuid.UUID(str(val))
+
     async def extract_and_store(
         self,
         conversation_id: str,
@@ -144,10 +269,14 @@ class MemoryGraph:
 
         Returns count of nodes and edges created/updated.
         """
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc)
         nodes_upserted = 0
         edges_created = 0
         name_to_id: dict[str, str] = {}
+
+        # asyncpg requires native uuid.UUID objects for uuid columns
+        ws_uuid = uuid.UUID(workspace_id) if isinstance(workspace_id, str) else workspace_id
+        conv_uuid = uuid.UUID(conversation_id) if isinstance(conversation_id, str) else conversation_id
 
         async with self._pool.acquire() as conn:
             # ── Upsert entity nodes ──────────────────────────────
@@ -163,7 +292,7 @@ class MemoryGraph:
                     SELECT id, mention_count, weight FROM memory_graph_nodes
                     WHERE workspace_id = $1 AND name = $2 AND entity_type = $3
                     """,
-                    workspace_id, name, entity_type,
+                    ws_uuid, name, entity_type,
                 )
 
                 if existing:
@@ -185,7 +314,7 @@ class MemoryGraph:
                         json.dumps(entity.get("properties", {})),
                     )
                 else:
-                    node_id = str(uuid.uuid4())
+                    node_id = uuid.uuid4()
                     await conn.execute(
                         """
                         INSERT INTO memory_graph_nodes
@@ -194,13 +323,13 @@ class MemoryGraph:
                              source_conversation_id)
                         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 1, $8, $8, $9)
                         """,
-                        node_id, workspace_id, entity_type, name,
+                        node_id, ws_uuid, entity_type, name,
                         entity.get("description", ""),
                         json.dumps(entity.get("properties", {})),
-                        1.0, now, conversation_id,
+                        1.0, now, conv_uuid,
                     )
 
-                name_to_id[name] = node_id
+                name_to_id[name] = node_id if isinstance(node_id, uuid.UUID) else uuid.UUID(str(node_id))
                 nodes_upserted += 1
 
             # ── Create relation edges ────────────────────────────
@@ -217,13 +346,13 @@ class MemoryGraph:
                     if not source_id:
                         row = await conn.fetchrow(
                             "SELECT id FROM memory_graph_nodes WHERE workspace_id = $1 AND name = $2",
-                            workspace_id, source_name,
+                            ws_uuid, source_name,
                         )
                         source_id = row["id"] if row else None
                     if not target_id:
                         row = await conn.fetchrow(
                             "SELECT id FROM memory_graph_nodes WHERE workspace_id = $1 AND name = $2",
-                            workspace_id, target_name,
+                            ws_uuid, target_name,
                         )
                         target_id = row["id"] if row else None
 
@@ -246,7 +375,7 @@ class MemoryGraph:
                         dup["id"],
                     )
                 else:
-                    edge_id = str(uuid.uuid4())
+                    edge_id = uuid.uuid4()
                     await conn.execute(
                         """
                         INSERT INTO memory_graph_edges
@@ -257,7 +386,7 @@ class MemoryGraph:
                         edge_id, source_id, target_id, relation_type,
                         rel.get("strength", 1.0),
                         rel.get("context", ""),
-                        conversation_id, now,
+                        conv_uuid, now,
                     )
                     edges_created += 1
 
@@ -281,6 +410,8 @@ class MemoryGraph:
         result_nodes: list[dict] = []
         result_edges: list[dict] = []
 
+        ws_uuid = self._to_uuid(workspace_id)
+
         async with self._pool.acquire() as conn:
             # Find seed nodes by name
             seed_ids = []
@@ -293,7 +424,7 @@ class MemoryGraph:
                     ORDER BY weight DESC
                     LIMIT 3
                     """,
-                    workspace_id, f"%{name}%",
+                    ws_uuid, f"%{name}%",
                 )
                 for row in rows:
                     if row["id"] not in visited:
@@ -334,7 +465,7 @@ class MemoryGraph:
                         ORDER BY e.strength * n.weight DESC
                         LIMIT 10
                         """,
-                        node_id, workspace_id,
+                        node_id, ws_uuid,
                     )
 
                     for edge in edges:
@@ -385,10 +516,12 @@ class MemoryGraph:
         now = datetime.now(timezone.utc)
         updated = 0
 
+        ws_uuid = self._to_uuid(workspace_id)
+
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, weight, last_seen FROM memory_graph_nodes WHERE workspace_id = $1",
-                workspace_id,
+                ws_uuid,
             )
 
             for row in rows:
@@ -413,13 +546,14 @@ class MemoryGraph:
     async def get_stats(self, workspace_id: str) -> dict:
         """Get graph statistics for a workspace."""
         async with self._pool.acquire() as conn:
+            ws_uuid = self._to_uuid(workspace_id)
             node_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM memory_graph_nodes WHERE workspace_id = $1",
-                workspace_id,
+                ws_uuid,
             )
             edge_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM memory_graph_edges e JOIN memory_graph_nodes n ON e.source_id = n.id WHERE n.workspace_id = $1",
-                workspace_id,
+                ws_uuid,
             )
             top_nodes = await conn.fetch(
                 """
@@ -428,7 +562,7 @@ class MemoryGraph:
                 WHERE workspace_id = $1
                 ORDER BY weight DESC LIMIT 10
                 """,
-                workspace_id,
+                ws_uuid,
             )
 
         return {

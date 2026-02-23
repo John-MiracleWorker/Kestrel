@@ -6,9 +6,11 @@ import { request } from '../../api/client';
 interface MemoryNode {
     id: string;
     label: string;
-    entity_type: 'file' | 'person' | 'decision' | 'concept' | 'error';
+    entity_type: 'file' | 'person' | 'decision' | 'concept' | 'error' | 'project' | 'tool' | 'conversation';
+    description?: string;
     weight: number;
     mentions: number;
+    last_seen?: string;
     x: number;
     y: number;
     vx: number;
@@ -33,6 +35,9 @@ const ENTITY_COLORS: Record<string, string> = {
     decision: '#f59e0b',
     concept: '#a855f7',
     error: '#ef4444',
+    project: '#06b6d4',
+    tool: '#ec4899',
+    conversation: '#6366f1',
 };
 
 const ENTITY_ICONS: Record<string, string> = {
@@ -41,6 +46,9 @@ const ENTITY_ICONS: Record<string, string> = {
     decision: '⚡',
     concept: '💡',
     error: '🔴',
+    project: '📦',
+    tool: '🔧',
+    conversation: '💬',
 };
 
 /* ── Styles ────────────────────────────────────────────────────── */
@@ -103,7 +111,7 @@ const S = {
         background: '#0a0a0a',
     },
     detailPanel: {
-        width: '280px',
+        width: '300px',
         background: '#0a0a0a',
         borderLeft: '1px solid #222',
         padding: '16px',
@@ -127,6 +135,7 @@ const S = {
         fontSize: '0.6rem',
         color: '#555',
         fontFamily: 'inherit',
+        flexWrap: 'wrap' as const,
     },
     statPill: (_color: string) => ({
         display: 'inline-flex',
@@ -151,96 +160,29 @@ const S = {
         padding: '4px 0',
         borderBottom: '1px solid #1a1a1a',
     },
+    descriptionBox: {
+        fontSize: '0.7rem',
+        color: '#aaa',
+        lineHeight: '1.5',
+        padding: '8px 10px',
+        background: '#111',
+        borderRadius: '6px',
+        border: '1px solid #1a1a1a',
+        marginBottom: '12px',
+    },
+    metaBadge: (color: string) => ({
+        display: 'inline-block',
+        fontSize: '0.6rem',
+        color: color,
+        background: `${color}15`,
+        border: `1px solid ${color}30`,
+        borderRadius: '4px',
+        padding: '2px 8px',
+        fontWeight: 600,
+        textTransform: 'uppercase' as const,
+        letterSpacing: '0.06em',
+    }),
 };
-
-/* ── Mock Data Generator ──────────────────────────────────────── */
-function generateMockData(): { nodes: MemoryNode[]; links: MemoryLink[] } {
-    const nodeTemplates: Omit<MemoryNode, 'x' | 'y' | 'vx' | 'vy'>[] = [
-        { id: 'server.py', label: 'server.py', entity_type: 'file', weight: 5, mentions: 28 },
-        { id: 'client.ts', label: 'client.ts', entity_type: 'file', weight: 4, mentions: 15 },
-        { id: 'auth.ts', label: 'auth.ts', entity_type: 'file', weight: 3, mentions: 12 },
-        {
-            id: 'cron_parser.py',
-            label: 'cron_parser.py',
-            entity_type: 'file',
-            weight: 2,
-            mentions: 5,
-        },
-        {
-            id: 'SettingsPanel',
-            label: 'SettingsPanel.tsx',
-            entity_type: 'file',
-            weight: 4,
-            mentions: 18,
-        },
-        { id: 'ChatView', label: 'ChatView.tsx', entity_type: 'file', weight: 3, mentions: 10 },
-        { id: 'user', label: 'User', entity_type: 'person', weight: 4, mentions: 22 },
-        { id: 'kestrel', label: 'Kestrel', entity_type: 'person', weight: 3, mentions: 14 },
-        { id: 'jwt-auth', label: 'Use JWT Auth', entity_type: 'decision', weight: 3, mentions: 8 },
-        {
-            id: 'grpc-arch',
-            label: 'gRPC Architecture',
-            entity_type: 'decision',
-            weight: 4,
-            mentions: 11,
-        },
-        {
-            id: 'microservices',
-            label: 'Microservices',
-            entity_type: 'concept',
-            weight: 5,
-            mentions: 20,
-        },
-        { id: 'rag', label: 'RAG Pipeline', entity_type: 'concept', weight: 3, mentions: 9 },
-        {
-            id: 'memory-graph',
-            label: 'Memory Graph',
-            entity_type: 'concept',
-            weight: 3,
-            mentions: 7,
-        },
-        { id: 'agent-loop', label: 'Agent Loop', entity_type: 'concept', weight: 4, mentions: 13 },
-        { id: 'sandbox', label: 'Sandboxing', entity_type: 'concept', weight: 2, mentions: 6 },
-        { id: 'websocket', label: 'WebSocket', entity_type: 'concept', weight: 3, mentions: 10 },
-        { id: 'provider-err', label: 'Provider 401', entity_type: 'error', weight: 2, mentions: 4 },
-    ];
-
-    const cx = 400,
-        cy = 300;
-    const nodes: MemoryNode[] = nodeTemplates.map((n, i) => {
-        const angle = (2 * Math.PI * i) / nodeTemplates.length;
-        const radius = 120 + Math.random() * 100;
-        return {
-            ...n,
-            x: cx + Math.cos(angle) * radius,
-            y: cy + Math.sin(angle) * radius,
-            vx: 0,
-            vy: 0,
-        };
-    });
-
-    const links: MemoryLink[] = [
-        { source: 'server.py', target: 'client.ts', relation: 'communicates_with' },
-        { source: 'server.py', target: 'cron_parser.py', relation: 'imports' },
-        { source: 'server.py', target: 'grpc-arch', relation: 'implements' },
-        { source: 'client.ts', target: 'auth.ts', relation: 'depends_on' },
-        { source: 'client.ts', target: 'jwt-auth', relation: 'implements' },
-        { source: 'SettingsPanel', target: 'client.ts', relation: 'uses' },
-        { source: 'ChatView', target: 'client.ts', relation: 'uses' },
-        { source: 'user', target: 'server.py', relation: 'modified' },
-        { source: 'user', target: 'jwt-auth', relation: 'decided' },
-        { source: 'kestrel', target: 'agent-loop', relation: 'executes' },
-        { source: 'kestrel', target: 'rag', relation: 'uses' },
-        { source: 'microservices', target: 'grpc-arch', relation: 'related_to' },
-        { source: 'rag', target: 'memory-graph', relation: 'feeds' },
-        { source: 'agent-loop', target: 'sandbox', relation: 'uses' },
-        { source: 'websocket', target: 'ChatView', relation: 'powers' },
-        { source: 'provider-err', target: 'server.py', relation: 'occurred_in' },
-        { source: 'provider-err', target: 'auth.ts', relation: 'related_to' },
-    ];
-
-    return { nodes, links };
-}
 
 /* ── Component ────────────────────────────────────────────────── */
 export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalaceProps) {
@@ -284,22 +226,14 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
                     nodesRef.current = data.nodes;
                     linksRef.current = data.links || [];
                 } else {
-                    // Empty graph — only show mock data in development
-                    if (import.meta.env.DEV) {
-                        const mock = generateMockData();
-                        nodesRef.current = mock.nodes;
-                        linksRef.current = mock.links;
-                    } else {
-                        nodesRef.current = [];
-                        linksRef.current = [];
-                    }
+                    nodesRef.current = [];
+                    linksRef.current = [];
                 }
                 setNodeCount(nodesRef.current.length);
                 setLinkCount(linksRef.current.length);
             })
             .catch((err: unknown) => {
                 console.error('Memory graph fetch failed:', err);
-                // On network failure, show empty graph — don't silently show fake data
                 nodesRef.current = [];
                 linksRef.current = [];
                 setNodeCount(0);
@@ -312,6 +246,10 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
         const nodes = nodesRef.current;
         const links = linksRef.current;
         if (!nodes.length) return;
+
+        const canvas = canvasRef.current;
+        const w = canvas ? canvas.getBoundingClientRect().width : 800;
+        const h = canvas ? canvas.getBoundingClientRect().height : 600;
 
         // Repulsion
         for (let i = 0; i < nodes.length; i++) {
@@ -342,8 +280,7 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
             tgt.vy -= (dy / dist) * force;
         }
         // Centering + damping + integration
-        const cx = 400,
-            cy = 300;
+        const cx = w / 2, cy = h / 2;
         for (const n of nodes) {
             n.vx += (cx - n.x) * 0.001;
             n.vy += (cy - n.y) * 0.001;
@@ -353,8 +290,8 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
                 n.x += n.vx;
                 n.y += n.vy;
             }
-            n.x = Math.max(20, Math.min(780, n.x));
-            n.y = Math.max(20, Math.min(580, n.y));
+            n.x = Math.max(20, Math.min(w - 20, n.x));
+            n.y = Math.max(20, Math.min(h - 20, n.y));
         }
     }, []);
 
@@ -389,15 +326,18 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
             const tgt = nodes.find((n) => n.id === link.target);
             if (!src || !tgt) continue;
             const isHighlighted = filteredIds.has(src.id) && filteredIds.has(tgt.id);
+            const isConnected = selected && (link.source === selected.id || link.target === selected.id);
+
             ctx.beginPath();
             ctx.moveTo(src.x, src.y);
             ctx.lineTo(tgt.x, tgt.y);
-            ctx.strokeStyle = isHighlighted ? '#333' : '#1a1a1a';
-            ctx.lineWidth = isHighlighted ? 1 : 0.5;
+            ctx.strokeStyle = isConnected ? '#444' : isHighlighted ? '#2a2a2a' : '#151515';
+            ctx.lineWidth = isConnected ? 1.5 : isHighlighted ? 1 : 0.5;
             ctx.stroke();
 
-            // Label on hover
-            if (hovered && (link.source === hovered || link.target === hovered)) {
+            // Label on hover or when selected
+            if ((hovered && (link.source === hovered || link.target === hovered)) ||
+                (selected && (link.source === selected.id || link.target === selected.id))) {
                 const mx = (src.x + tgt.x) / 2;
                 const my = (src.y + tgt.y) / 2;
                 ctx.fillStyle = '#555';
@@ -412,8 +352,9 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
             const isFiltered = filteredIds.has(node.id);
             const isHovered = hovered === node.id;
             const isSelected = selected?.id === node.id;
+            const isConversation = node.entity_type === 'conversation';
             const color = ENTITY_COLORS[node.entity_type] || '#888';
-            const radius = 4 + node.weight * 1.5;
+            const radius = isConversation ? 6 : 4 + node.weight * 1.2;
 
             ctx.save();
             if (isHovered || isSelected) {
@@ -423,20 +364,39 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
                 ctx.globalAlpha = 0.15;
             }
 
-            ctx.beginPath();
-            ctx.arc(node.x, node.y, radius, 0, 2 * Math.PI);
+            // Conversations get a diamond shape, entities get circles
+            if (isConversation) {
+                ctx.beginPath();
+                ctx.moveTo(node.x, node.y - radius);
+                ctx.lineTo(node.x + radius, node.y);
+                ctx.lineTo(node.x, node.y + radius);
+                ctx.lineTo(node.x - radius, node.y);
+                ctx.closePath();
+            } else {
+                ctx.beginPath();
+                ctx.arc(node.x, node.y, radius, 0, 2 * Math.PI);
+            }
             ctx.fillStyle = color;
             ctx.fill();
             ctx.strokeStyle = isSelected ? '#fff' : `${color}66`;
             ctx.lineWidth = isSelected ? 2 : 1;
             ctx.stroke();
 
-            // Label
-            if (isHovered || isSelected || node.weight >= 4) {
-                ctx.fillStyle = isFiltered ? '#e0e0e0' : '#555';
+            // Always show labels (truncated for smaller nodes)
+            const showLabel = isHovered || isSelected || node.weight >= 3 || isConversation;
+            if (showLabel) {
+                const labelText = node.label.length > 20 ? node.label.slice(0, 18) + '…' : node.label;
+                ctx.fillStyle = isFiltered ? '#d0d0d0' : '#444';
                 ctx.font = `${isHovered ? 11 : 10}px JetBrains Mono`;
                 ctx.textAlign = 'center';
-                ctx.fillText(node.label, node.x, node.y + radius + 12);
+                ctx.fillText(labelText, node.x, node.y + radius + 12);
+            }
+
+            // Type icon on hover
+            if (isHovered) {
+                const icon = ENTITY_ICONS[node.entity_type] || '•';
+                ctx.font = '12px sans-serif';
+                ctx.fillText(icon, node.x, node.y - radius - 6);
             }
 
             ctx.restore();
@@ -519,12 +479,24 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
         decisions: nodes.filter((n) => n.entity_type === 'decision').length,
         concepts: nodes.filter((n) => n.entity_type === 'concept').length,
         errors: nodes.filter((n) => n.entity_type === 'error').length,
-        totalEdges: links.length,
+        projects: nodes.filter((n) => n.entity_type === 'project').length,
+        tools: nodes.filter((n) => n.entity_type === 'tool').length,
+        conversations: nodes.filter((n) => n.entity_type === 'conversation').length,
     };
 
     const selectedLinks = selectedNode
         ? links.filter((l) => l.source === selectedNode.id || l.target === selectedNode.id)
         : [];
+
+    const formatDate = (d?: string) => {
+        if (!d) return '—';
+        try {
+            return new Date(d).toLocaleDateString('en-US', {
+                month: 'short', day: 'numeric', year: '2-digit',
+                hour: '2-digit', minute: '2-digit',
+            });
+        } catch { return '—'; }
+    };
 
     return createPortal(
         <div style={S.overlay}>
@@ -561,27 +533,38 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
 
                 {selectedNode && (
                     <div style={S.detailPanel}>
+                        {/* Node header */}
                         <div
                             style={{
-                                fontSize: '0.9rem',
+                                fontSize: '1rem',
                                 color: ENTITY_COLORS[selectedNode.entity_type],
-                                marginBottom: '4px',
+                                marginBottom: '6px',
+                                fontWeight: 600,
                             }}
                         >
                             {ENTITY_ICONS[selectedNode.entity_type]} {selectedNode.label}
                         </div>
-                        <div
-                            style={{
-                                fontSize: '0.65rem',
-                                color: '#555',
-                                textTransform: 'uppercase',
-                                marginBottom: '12px',
-                            }}
-                        >
-                            {selectedNode.entity_type}
+
+                        {/* Type badge */}
+                        <div style={{ marginBottom: '12px' }}>
+                            <span style={S.metaBadge(ENTITY_COLORS[selectedNode.entity_type] || '#888')}>
+                                {selectedNode.entity_type}
+                            </span>
                         </div>
 
-                        <div style={{ display: 'flex', gap: '16px', marginBottom: '16px' }}>
+                        {/* Description */}
+                        {selectedNode.description && (
+                            <>
+                                <div style={S.sectionTitle}>// Description</div>
+                                <div style={S.descriptionBox}>
+                                    {selectedNode.description}
+                                </div>
+                            </>
+                        )}
+
+                        {/* Stats */}
+                        <div style={S.sectionTitle}>// Stats</div>
+                        <div style={{ display: 'flex', gap: '20px', marginBottom: '8px' }}>
                             <div>
                                 <div style={{ fontSize: '0.6rem', color: '#555' }}>Weight</div>
                                 <div style={{ fontSize: '0.85rem', color: '#e0e0e0' }}>
@@ -594,18 +577,42 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
                                     {selectedNode.mentions}
                                 </div>
                             </div>
+                            <div>
+                                <div style={{ fontSize: '0.6rem', color: '#555' }}>Last Seen</div>
+                                <div style={{ fontSize: '0.75rem', color: '#e0e0e0' }}>
+                                    {formatDate(selectedNode.last_seen)}
+                                </div>
+                            </div>
                         </div>
 
-                        <div style={S.sectionTitle}>// Connections</div>
-                        {selectedLinks.map((l, i) => (
-                            <div key={i} style={S.linkItem}>
-                                <span style={{ color: '#00f3ff' }}>{l.relation}</span>
-                                {' → '}
-                                <span style={{ color: '#e0e0e0' }}>
-                                    {l.source === selectedNode.id ? l.target : l.source}
-                                </span>
-                            </div>
-                        ))}
+                        {/* Connections */}
+                        <div style={S.sectionTitle}>// Connections ({selectedLinks.length})</div>
+                        {selectedLinks.map((l, i) => {
+                            const otherId = l.source === selectedNode.id ? l.target : l.source;
+                            const otherNode = nodes.find(n => n.id === otherId);
+                            const otherColor = otherNode ? ENTITY_COLORS[otherNode.entity_type] || '#888' : '#888';
+                            const otherIcon = otherNode ? ENTITY_ICONS[otherNode.entity_type] || '•' : '•';
+                            const otherLabel = otherNode?.label || otherId.slice(0, 12);
+                            return (
+                                <div
+                                    key={i}
+                                    style={{
+                                        ...S.linkItem,
+                                        cursor: 'pointer',
+                                        padding: '6px 4px',
+                                    }}
+                                    onClick={() => {
+                                        if (otherNode) setSelectedNode(otherNode);
+                                    }}
+                                >
+                                    <span style={{ color: '#00f3ff', fontSize: '0.65rem' }}>{l.relation}</span>
+                                    {' → '}
+                                    <span style={{ color: otherColor }}>
+                                        {otherIcon} {otherLabel}
+                                    </span>
+                                </div>
+                            );
+                        })}
                         {selectedLinks.length === 0 && (
                             <div style={{ fontSize: '0.7rem', color: '#444' }}>No connections</div>
                         )}
@@ -616,18 +623,24 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
             {/* Stats Bar */}
             <div style={S.statsBar}>
                 {Object.entries({
+                    conversations: 'conversation',
                     files: 'file',
                     people: 'person',
+                    projects: 'project',
+                    tools: 'tool',
                     decisions: 'decision',
                     concepts: 'concept',
                     errors: 'error',
-                }).map(([key, type]) => (
-                    <div key={key} style={S.statPill(ENTITY_COLORS[type])}>
-                        <span style={S.dot(ENTITY_COLORS[type])} />
-                        {key.charAt(0).toUpperCase() + key.slice(1)}:{' '}
-                        {stats[key as keyof typeof stats]}
-                    </div>
-                ))}
+                }).map(([key, type]) => {
+                    const count = stats[key as keyof typeof stats] || 0;
+                    if (count === 0) return null;
+                    return (
+                        <div key={key} style={S.statPill(ENTITY_COLORS[type])}>
+                            <span style={S.dot(ENTITY_COLORS[type])} />
+                            {key.charAt(0).toUpperCase() + key.slice(1)}: {count}
+                        </div>
+                    );
+                })}
                 <div style={{ marginLeft: 'auto' }}>
                     Total: {nodeCount} nodes · {linkCount} edges
                 </div>

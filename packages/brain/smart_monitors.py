@@ -67,7 +67,7 @@ class SmartMonitors:
                 logger.error(f"Key expiry monitor error: {e}")
 
     async def _monitor_stuck_tasks(self):
-        """Monitor for agent tasks stuck in 'running' state."""
+        """Monitor for agent tasks stuck in 'executing' state."""
         while self._running:
             try:
                 await asyncio.sleep(900)  # 15 minutes
@@ -75,8 +75,8 @@ class SmartMonitors:
                     rows = await conn.fetch(
                         """
                         SELECT id, user_id, workspace_id, goal 
-                        FROM tasks 
-                        WHERE status = 'running' 
+                        FROM agent_tasks 
+                        WHERE status = 'executing' 
                           AND updated_at < NOW() - INTERVAL '1 hour'
                         """
                     )

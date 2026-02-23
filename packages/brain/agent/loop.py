@@ -457,21 +457,22 @@ class AgentLoop:
             # ── Phase 4: Update memory graph with task entities ───
             if self._memory_graph and task.result:
                 try:
-                    import re as _re
-                    _words = _re.findall(r'\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\b', task.goal + " " + task.result)
-                    _topics = list(dict.fromkeys(w for w in _words if len(w) > 2))[:8]
-                    if _topics:
-                        _entities = [
-                            {"type": "concept", "name": t, "description": ""}
-                            for t in _topics
-                        ]
+                    from agent.memory_graph import extract_entities_llm
+                    _entities, _relations = await extract_entities_llm(
+                        provider=self._provider,
+                        model=self._model,
+                        api_key=self._api_key,
+                        user_message=task.goal,
+                        assistant_response=task.result,
+                    )
+                    if _entities:
                         await self._memory_graph.extract_and_store(
                             conversation_id=task.id,
                             workspace_id=task.workspace_id,
                             entities=_entities,
-                            relations=[],
+                            relations=_relations,
                         )
-                        logger.info(f"Memory graph updated with {len(_entities)} entities from task {task.id}")
+                        logger.info(f"Memory graph: stored {len(_entities)} entities, {len(_relations)} relations from task {task.id}")
                 except Exception as e:
                     logger.warning(f"Memory graph update failed: {e}")
 

@@ -1058,24 +1058,25 @@ class BrainServicer:
                     except Exception as e:
                         logger.warning(f"Persona observation failed: {e}")
 
-                # Update memory graph with conversation context
+                # Update memory graph with conversation context (LLM extraction)
                 if _memory_graph and full_response:
                     try:
-                        # Extract simple topic entities from the user message
-                        import re as _re
-                        _words = _re.findall(r'\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\b', user_content)
-                        _topics = list(dict.fromkeys(w for w in _words if len(w) > 2))[:5]
-                        if _topics:
-                            _entities = [
-                                {"type": "concept", "name": t, "description": ""}
-                                for t in _topics
-                            ]
+                        from agent.memory_graph import extract_entities_llm
+                        _entities, _relations = await extract_entities_llm(
+                            provider=provider,
+                            model=model,
+                            api_key=api_key,
+                            user_message=user_content,
+                            assistant_response=full_response,
+                        )
+                        if _entities:
                             await _memory_graph.extract_and_store(
                                 conversation_id=conversation_id,
                                 workspace_id=workspace_id,
                                 entities=_entities,
-                                relations=[],
+                                relations=_relations,
                             )
+                            logger.info(f"Memory graph: stored {len(_entities)} entities, {len(_relations)} relations")
                     except Exception as e:
                         logger.warning(f"Memory graph update failed: {e}")
 
