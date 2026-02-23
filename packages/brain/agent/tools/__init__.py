@@ -168,6 +168,7 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
     from agent.tools.memory import register_memory_tools
     from agent.tools.human import register_human_tools
     from agent.tools.moltbook import register_moltbook_tools
+    from agent.tools.moltbook_autonomous import register_moltbook_autonomous_tools
     from agent.tools.schedule import register_schedule_tools
 
     register_code_tools(registry, hands_client=hands_client)
@@ -178,6 +179,7 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
     register_memory_tools(registry, vector_store=vector_store)
     register_human_tools(registry)
     register_moltbook_tools(registry)
+    register_moltbook_autonomous_tools(registry)
     register_schedule_tools(registry)
 
     # MCP discovery + management tools
