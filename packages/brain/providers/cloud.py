@@ -91,6 +91,9 @@ MODEL_CATALOG = {
             {"id": "gemini-2.5-flash-preview-04-17", "ctx": "1M", "desc": "Stable workhorse — high-volume, audio output"},
             {"id": "gemini-2.5-flash-lite-preview-06-17", "ctx": "1M", "desc": "Ultra-cheap — high-throughput services"},
         ],
+        "computer_use": [
+            {"id": "gemini-2.5-computer-use-preview-10-2025", "ctx": "128k", "desc": "Desktop/browser control — autonomous UI interaction"},
+        ],
     },
 }
 

@@ -192,6 +192,10 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
     register_git_tools(registry)
     register_self_improve_tools(registry)
 
+    # Computer Use (Gemini desktop control)
+    from agent.tools.computer_use import register_computer_use_tools
+    register_computer_use_tools(registry)
+
     # Multi-agent delegation tools
     from agent.tools.delegate import DELEGATE_TOOL, DELEGATE_PARALLEL_TOOL
     from agent.coordinator import Coordinator
