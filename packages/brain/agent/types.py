@@ -211,9 +211,9 @@ class TaskPlan:
 @dataclass
 class GuardrailConfig:
     """Safety and resource limits for a task."""
-    max_iterations: int = 25
+    max_iterations: int = 40
     max_tokens: int = 100_000
-    max_tool_calls: int = 50
+    max_tool_calls: int = 80
     max_wall_time_seconds: int = 600
     auto_approve_risk: RiskLevel = RiskLevel.MEDIUM
     blocked_patterns: list[str] = field(default_factory=list)
