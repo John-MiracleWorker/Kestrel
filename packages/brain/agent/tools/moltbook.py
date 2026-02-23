@@ -17,8 +17,9 @@ from agent.types import RiskLevel, ToolDefinition
 
 logger = logging.getLogger("brain.agent.tools.moltbook")
 
-# Module-level workspace context — set before execution by the tool registry
+# Module-level context — set before execution by the tool registry / automation runner
 _current_workspace_id: Optional[str] = None
+_current_user_id: Optional[str] = None
 
 BASE_URL = "https://www.moltbook.com/api/v1"
 CREDS_PATH = os.path.expanduser("~/.config/moltbook/credentials.json")
@@ -379,25 +380,24 @@ async def _create_post(submolt: str = "general", title: str = "", content: str =
         resp.raise_for_status()
         data = resp.json()
 
-    # Handle verification challenge
-    verification = data.get("verification")
-    if verification:
-        challenge = verification.get("challenge", "")
-        verify_id = verification.get("id", "")
-        logger.info(f"Moltbook verification challenge: {challenge}")
+        # Handle verification challenge (keep client open)
+        verification = data.get("verification")
+        if verification:
+            challenge = verification.get("challenge", "")
+            verify_id = verification.get("id", "")
+            logger.info(f"Moltbook verification challenge: {challenge}")
 
-        # Auto-solve math challenge
-        answer = _solve_challenge(challenge)
-        if answer is not None:
-            verify_resp = await client.post(
-                f"{BASE_URL}/posts/verify",
-                json={"id": verify_id, "answer": answer},
-                headers=_headers(),
-            )
-            if verify_resp.status_code == 200:
-                data["verification_result"] = "✅ Challenge solved!"
-            else:
-                data["verification_result"] = f"❌ Challenge failed: {verify_resp.text}"
+            answer = _solve_challenge(challenge)
+            if answer is not None:
+                verify_resp = await client.post(
+                    f"{BASE_URL}/posts/verify",
+                    json={"id": verify_id, "answer": answer},
+                    headers=_headers(),
+                )
+                if verify_resp.status_code == 200:
+                    data["verification_result"] = "✅ Challenge solved!"
+                else:
+                    data["verification_result"] = f"❌ Challenge failed: {verify_resp.text}"
 
     post_data = data.get("data", data.get("post", data))
     post_id = post_data.get("id", post_data.get("_id", ""))
@@ -429,20 +429,20 @@ async def _add_comment(post_id: str = "", content: str = "", **kwargs) -> dict:
         resp.raise_for_status()
         data = resp.json()
 
-    # Handle verification challenge for comments too
-    verification = data.get("verification")
-    if verification:
-        challenge = verification.get("challenge", "")
-        verify_id = verification.get("id", "")
-        answer = _solve_challenge(challenge)
-        if answer is not None:
-            verify_resp = await client.post(
-                f"{BASE_URL}/comments/verify",
-                json={"id": verify_id, "answer": answer},
-                headers=_headers(),
-            )
-            if verify_resp.status_code == 200:
-                data["verification_result"] = "✅ Challenge solved!"
+        # Handle verification challenge for comments (keep client open)
+        verification = data.get("verification")
+        if verification:
+            challenge = verification.get("challenge", "")
+            verify_id = verification.get("id", "")
+            answer = _solve_challenge(challenge)
+            if answer is not None:
+                verify_resp = await client.post(
+                    f"{BASE_URL}/comments/verify",
+                    json={"id": verify_id, "answer": answer},
+                    headers=_headers(),
+                )
+                if verify_resp.status_code == 200:
+                    data["verification_result"] = "✅ Challenge solved!"
 
     return {
         "status": "commented",

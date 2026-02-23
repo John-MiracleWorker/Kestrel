@@ -2191,6 +2191,7 @@ async def serve():
             # Set context for tools used in automated tasks
             import agent.tools.moltbook as _moltbook_mod
             _moltbook_mod._current_workspace_id = task.workspace_id
+            _moltbook_mod._current_user_id = task.user_id
             import agent.tools.schedule as _schedule_mod
             _schedule_mod._cron_scheduler = _cron_scheduler
             _schedule_mod._current_workspace_id = task.workspace_id
@@ -2208,6 +2209,65 @@ async def serve():
         logger.info("Automation scheduler and webhook handler started")
     except Exception as e:
         logger.warning(f"Automation startup failed (non-fatal): {e}")
+
+    # Bootstrap autonomous Moltbook cron jobs for all workspaces
+    async def _bootstrap_moltbook_cron() -> None:
+        """
+        Ensure every workspace has an autonomous Moltbook session cron job.
+        Runs every 2 hours. Skips workspaces that already have the job.
+        The job is a no-op if no Moltbook credentials are present.
+        """
+        _MOLTBOOK_JOB_NAME = "moltbook_autonomous_session"
+        _MOLTBOOK_CRON = "0 */2 * * *"   # every 2 hours
+        _MOLTBOOK_GOAL = (
+            "Run your autonomous Moltbook session. "
+            "First call moltbook_session to scan your subscribed submolts and get your "
+            "engagement plan. Then use the moltbook tool to engage: upvote quality posts, "
+            "leave on-topic comments that add genuine value, and optionally create one "
+            "original post if you have something worth sharing. "
+            "Stay in character as Kestrel throughout."
+        )
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT wm.workspace_id, wm.user_id
+                    FROM workspace_members wm
+                    WHERE wm.role = 'owner'
+                    ORDER BY wm.workspace_id
+                    """
+                )
+
+            existing_names = {
+                (j.workspace_id, j.name)
+                for j in _cron_scheduler._jobs.values()
+            }
+
+            created = 0
+            for row in rows:
+                ws_id = str(row["workspace_id"])
+                u_id = str(row["user_id"])
+                if (ws_id, _MOLTBOOK_JOB_NAME) in existing_names:
+                    continue
+                await _cron_scheduler.create_job(
+                    workspace_id=ws_id,
+                    user_id=u_id,
+                    name=_MOLTBOOK_JOB_NAME,
+                    description="Autonomous Moltbook participation — browse, engage, post",
+                    cron_expression=_MOLTBOOK_CRON,
+                    goal=_MOLTBOOK_GOAL,
+                )
+                created += 1
+
+            if created:
+                logger.info(f"Bootstrapped Moltbook autonomous cron job for {created} workspace(s)")
+        except Exception as e:
+            logger.warning(f"Moltbook cron bootstrap failed (non-fatal): {e}")
+
+    try:
+        await _bootstrap_moltbook_cron()
+    except Exception as e:
+        logger.warning(f"Moltbook bootstrap error (non-fatal): {e}")
 
     await server.start()
     logger.info("Brain service ready")
