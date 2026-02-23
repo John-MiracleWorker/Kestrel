@@ -241,51 +241,86 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
             });
     }, [isVisible, workspaceId]);
 
+    // Cooling alpha — starts at 1.0, decays toward 0 so the sim settles
+    const alphaRef = useRef(1.0);
+
+    // Reheat when data changes
+    useEffect(() => {
+        alphaRef.current = 1.0;
+    }, [nodeCount]);
+
     // Physics step — mutates nodesRef directly, no setState
     const simulate = useCallback(() => {
         const nodes = nodesRef.current;
         const links = linksRef.current;
         if (!nodes.length) return;
 
+        // Cool down — once alpha is near zero the sim is frozen
+        const alpha = alphaRef.current;
+        if (alpha < 0.001) return; // fully settled
+        alphaRef.current *= 0.995; // slow exponential decay
+
         const canvas = canvasRef.current;
         const w = canvas ? canvas.getBoundingClientRect().width : 800;
         const h = canvas ? canvas.getBoundingClientRect().height : 600;
 
-        // Repulsion
+        // Build index for O(1) lookup instead of .find() in link loop
+        const idx = new Map<string, number>();
+        for (let i = 0; i < nodes.length; i++) idx.set(nodes[i].id, i);
+
+        // Repulsion (scaled by alpha so it weakens as sim cools)
+        const repStrength = 400 * alpha;
         for (let i = 0; i < nodes.length; i++) {
             for (let j = i + 1; j < nodes.length; j++) {
                 const dx = nodes[j].x - nodes[i].x;
                 const dy = nodes[j].y - nodes[i].y;
-                const dist = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
-                const force = 800 / (dist * dist);
-                nodes[i].vx -= (dx / dist) * force;
-                nodes[i].vy -= (dy / dist) * force;
-                nodes[j].vx += (dx / dist) * force;
-                nodes[j].vy += (dy / dist) * force;
+                const distSq = dx * dx + dy * dy;
+                const dist = Math.max(Math.sqrt(distSq), 1);
+                const force = repStrength / distSq;
+                const fx = (dx / dist) * force;
+                const fy = (dy / dist) * force;
+                nodes[i].vx -= fx;
+                nodes[i].vy -= fy;
+                nodes[j].vx += fx;
+                nodes[j].vy += fy;
             }
         }
         // Attraction (links)
+        const springStrength = 0.008 * alpha;
         for (const link of links) {
-            const src = nodes.find((n) => n.id === link.source);
-            const tgt = nodes.find((n) => n.id === link.target);
-            if (!src || !tgt) continue;
+            const si = idx.get(link.source);
+            const ti = idx.get(link.target);
+            if (si === undefined || ti === undefined) continue;
+            const src = nodes[si], tgt = nodes[ti];
             const dx = tgt.x - src.x;
             const dy = tgt.y - src.y;
             const dist = Math.sqrt(dx * dx + dy * dy);
             if (dist < 1) continue;
-            const force = (dist - 100) * 0.01;
-            src.vx += (dx / dist) * force;
-            src.vy += (dy / dist) * force;
-            tgt.vx -= (dx / dist) * force;
-            tgt.vy -= (dy / dist) * force;
+            const force = (dist - 120) * springStrength;
+            const fx = (dx / dist) * force;
+            const fy = (dy / dist) * force;
+            src.vx += fx;
+            src.vy += fy;
+            tgt.vx -= fx;
+            tgt.vy -= fy;
         }
-        // Centering + damping + integration
+        // Centering + damping + velocity clamping + integration
         const cx = w / 2, cy = h / 2;
+        const maxV = 8; // velocity cap to prevent explosions
         for (const n of nodes) {
-            n.vx += (cx - n.x) * 0.001;
-            n.vy += (cy - n.y) * 0.001;
-            n.vx *= 0.9;
-            n.vy *= 0.9;
+            // Centering gravity
+            n.vx += (cx - n.x) * 0.005 * alpha;
+            n.vy += (cy - n.y) * 0.005 * alpha;
+            // Damping (friction)
+            n.vx *= 0.85;
+            n.vy *= 0.85;
+            // Clamp velocity
+            const speed = Math.sqrt(n.vx * n.vx + n.vy * n.vy);
+            if (speed > maxV) {
+                n.vx = (n.vx / speed) * maxV;
+                n.vy = (n.vy / speed) * maxV;
+            }
+            // Integrate position
             if (!isDragging.current || dragNode.current?.id !== n.id) {
                 n.x += n.vx;
                 n.y += n.vy;
@@ -451,6 +486,8 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
             if (node) {
                 isDragging.current = true;
                 dragNode.current = node;
+                // Reheat simulation slightly so neighbors react
+                alphaRef.current = Math.max(alphaRef.current, 0.3);
             }
         }
     };
