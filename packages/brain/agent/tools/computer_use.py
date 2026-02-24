@@ -167,10 +167,44 @@ async def _call_gemini_computer_use(
         payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
 
     max_retries = 3
-    async with httpx.AsyncClient(timeout=120) as client:
+    # Use explicit timeouts — screenshot payloads are large and the model
+    # needs time to process the image, so the read timeout must be generous.
+    timeout = httpx.Timeout(connect=15.0, write=30.0, read=180.0, pool=15.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         for attempt in range(max_retries + 1):
-            resp = await client.post(url, json=payload)
-            if resp.status_code in (503, 429, 500) and attempt < max_retries:
+            try:
+                resp = await client.post(url, json=payload)
+            except httpx.ReadTimeout:
+                if attempt < max_retries:
+                    delay = 2 ** attempt + 2
+                    logger.warning(
+                        f"Gemini Computer Use API read timeout, "
+                        f"retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise RuntimeError(
+                    "Gemini Computer Use API timed out after all retries. "
+                    "The model may be overloaded or the screenshot is too large."
+                )
+
+            if resp.status_code == 429:
+                error_body = resp.text[:500]
+                if "quota" in error_body.lower() or "limit: 0" in error_body:
+                    raise RuntimeError(
+                        "Gemini API quota exhausted. Check your plan and billing "
+                        "at https://ai.google.dev/gemini-api/docs/rate-limits"
+                    )
+                if attempt < max_retries:
+                    delay = 2 ** attempt + 1
+                    logger.warning(
+                        f"Gemini Computer Use API 429, "
+                        f"retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+            if resp.status_code in (503, 500) and attempt < max_retries:
                 delay = 2 ** attempt
                 logger.warning(
                     f"Gemini Computer Use API {resp.status_code}, "
@@ -178,6 +212,7 @@ async def _call_gemini_computer_use(
                 )
                 await asyncio.sleep(delay)
                 continue
+
             if resp.status_code != 200:
                 error_text = resp.text[:1000]
                 # Scrub API key from error
