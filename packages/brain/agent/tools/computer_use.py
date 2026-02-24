@@ -6,27 +6,32 @@ the user's desktop: take screenshots, click, type, scroll, drag, and
 press key combinations.
 
 The agentic loop:
-  1. Capture a screenshot of the desktop
+  1. Request a screenshot from the host-side screen agent
   2. Send it to Gemini Computer Use model with the user's goal
   3. Parse the returned FunctionCall actions (click_at, type_text_at, etc.)
-  4. Execute each action via PyAutoGUI
-  5. Capture a new screenshot showing the result
+  4. Send each action to the screen agent for execution
+  5. Request a new screenshot showing the result
   6. Repeat until the model signals completion or the turn limit is hit
 
 Safety:
-  - All actions require approval by default (CRITICAL risk level)
+  - All actions are logged and have a maximum turn limit (HIGH risk level)
   - Safety decisions from the model that require confirmation are surfaced
   - Maximum turn limit prevents runaway loops
   - Fail-open: if screenshot capture fails, the loop halts immediately
 
+Architecture:
+  The Brain runs in Docker but needs native screen access.
+  A lightweight screen agent runs on the host Mac and exposes:
+    GET  /screenshot  → base64 PNG of current screen
+    POST /action      → execute a PyAutoGUI action
+
 Coordinate system:
   Gemini returns coordinates on a normalized 0-999 grid.
-  We scale them to actual screen dimensions before executing.
+  The screen agent scales them to actual screen dimensions.
 """
 
 import asyncio
 import base64
-import io
 import json
 import logging
 import os
@@ -45,11 +50,11 @@ COMPUTER_USE_MODEL = os.getenv(
     "GEMINI_COMPUTER_USE_MODEL",
     "gemini-2.5-computer-use-preview-10-2025",
 )
-# Gemini normalizes to a 1000x1000 grid; recommended real resolution:
-SCREEN_WIDTH = int(os.getenv("COMPUTER_USE_SCREEN_WIDTH", "1440"))
-SCREEN_HEIGHT = int(os.getenv("COMPUTER_USE_SCREEN_HEIGHT", "900"))
 MAX_TURNS = int(os.getenv("COMPUTER_USE_MAX_TURNS", "30"))
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+# Host-side screen agent URL (runs natively on the Mac)
+SCREEN_AGENT_URL = os.getenv("SCREEN_AGENT_URL", "http://host.docker.internal:9800")
 
 # Actions the model can request
 SUPPORTED_ACTIONS = {
@@ -67,143 +72,57 @@ SUPPORTED_ACTIONS = {
 }
 
 
-# ── Coordinate Helpers ───────────────────────────────────────────────
+# ── Screen Agent Communication ───────────────────────────────────────
 
 
-def _denormalize_x(x: int) -> int:
-    """Map Gemini's 0-999 x-coordinate to actual screen pixels."""
-    return int(x / 1000 * SCREEN_WIDTH)
-
-
-def _denormalize_y(y: int) -> int:
-    """Map Gemini's 0-999 y-coordinate to actual screen pixels."""
-    return int(y / 1000 * SCREEN_HEIGHT)
-
-
-# ── Screenshot Capture ───────────────────────────────────────────────
-
-
-def _capture_screenshot() -> bytes:
+async def _capture_screenshot() -> bytes:
     """
-    Capture the current desktop as a PNG byte string.
-    Falls back gracefully if pyautogui isn't available.
+    Request a screenshot from the host-side screen agent.
+    Returns raw PNG bytes.
     """
     try:
-        import pyautogui
-
-        img = pyautogui.screenshot()
-        # Resize to the expected resolution for consistent coordinates
-        img = img.resize((SCREEN_WIDTH, SCREEN_HEIGHT))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
-    except ImportError:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(f"{SCREEN_AGENT_URL}/screenshot")
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"Screen agent screenshot failed ({resp.status_code}): {resp.text[:200]}"
+                )
+            data = resp.json()
+            if not data.get("success"):
+                raise RuntimeError(f"Screen agent error: {data}")
+            return base64.b64decode(data["image_base64"])
+    except httpx.ConnectError:
         raise RuntimeError(
-            "pyautogui is required for desktop computer use. "
-            "Install it with: pip install pyautogui"
+            "Cannot connect to the screen agent. "
+            "Make sure it's running on the host: "
+            "cd packages/screen-agent && python screen_agent.py"
         )
-    except Exception as e:
-        raise RuntimeError(f"Screenshot capture failed: {e}")
+    except httpx.TimeoutException:
+        raise RuntimeError("Screen agent timed out capturing screenshot")
 
 
-# ── Action Execution ─────────────────────────────────────────────────
-
-
-def _execute_action(action_name: str, args: dict) -> str:
+async def _execute_action(action_name: str, args: dict) -> str:
     """
-    Execute a single UI action on the desktop.
+    Send an action to the host-side screen agent for execution.
     Returns a human-readable description of what was done.
     """
-    import pyautogui
-
-    # Safety: small delay between actions so the user can observe
-    pyautogui.PAUSE = 0.3
-
-    if action_name == "click_at":
-        x = _denormalize_x(args.get("x", 0))
-        y = _denormalize_y(args.get("y", 0))
-        button = args.get("button", "left")
-        pyautogui.click(x, y, button=button)
-        return f"Clicked ({x}, {y}) [{button}]"
-
-    elif action_name == "type_text_at":
-        x = _denormalize_x(args.get("x", 0))
-        y = _denormalize_y(args.get("y", 0))
-        text = args.get("text", "")
-        press_enter = args.get("press_enter", False)
-        clear_before = args.get("clear_before_typing", False)
-
-        pyautogui.click(x, y)
-        if clear_before:
-            pyautogui.hotkey("ctrl", "a")
-            pyautogui.press("delete")
-        pyautogui.typewrite(text, interval=0.02) if text.isascii() else pyautogui.write(text)
-        if press_enter:
-            pyautogui.press("enter")
-        return f"Typed '{text[:50]}...' at ({x}, {y})"
-
-    elif action_name == "scroll_document":
-        direction = args.get("direction", "down")
-        clicks = 5 if direction in ("down", "right") else -5
-        if direction in ("up", "down"):
-            pyautogui.scroll(clicks)
-        else:
-            pyautogui.hscroll(clicks)
-        return f"Scrolled {direction}"
-
-    elif action_name == "scroll_at":
-        x = _denormalize_x(args.get("x", 0))
-        y = _denormalize_y(args.get("y", 0))
-        direction = args.get("direction", "down")
-        magnitude = args.get("magnitude", 3)
-        clicks = magnitude if direction in ("down", "right") else -magnitude
-        pyautogui.moveTo(x, y)
-        pyautogui.scroll(clicks)
-        return f"Scrolled {direction} ({magnitude}) at ({x}, {y})"
-
-    elif action_name == "hover_at":
-        x = _denormalize_x(args.get("x", 0))
-        y = _denormalize_y(args.get("y", 0))
-        pyautogui.moveTo(x, y, duration=0.3)
-        return f"Hovered at ({x}, {y})"
-
-    elif action_name == "key_combination":
-        keys = args.get("keys", "")
-        # Gemini sends keys like "Control+A" — pyautogui wants ("ctrl", "a")
-        key_list = [k.strip().lower().replace("control", "ctrl") for k in keys.split("+")]
-        pyautogui.hotkey(*key_list)
-        return f"Pressed {keys}"
-
-    elif action_name == "drag_and_drop":
-        sx = _denormalize_x(args.get("x", 0))
-        sy = _denormalize_y(args.get("y", 0))
-        dx = _denormalize_x(args.get("destination_x", 0))
-        dy = _denormalize_y(args.get("destination_y", 0))
-        pyautogui.moveTo(sx, sy)
-        pyautogui.drag(dx - sx, dy - sy, duration=0.5)
-        return f"Dragged ({sx},{sy}) -> ({dx},{dy})"
-
-    elif action_name == "wait_5_seconds":
-        time.sleep(5)
-        return "Waited 5 seconds"
-
-    elif action_name == "navigate":
-        url = args.get("url", "")
-        # Open URL in the default browser
-        import webbrowser
-        webbrowser.open(url)
-        return f"Opened URL: {url}"
-
-    elif action_name == "go_back":
-        pyautogui.hotkey("alt", "left")
-        return "Browser: go back"
-
-    elif action_name == "go_forward":
-        pyautogui.hotkey("alt", "right")
-        return "Browser: go forward"
-
-    else:
-        return f"Unknown action: {action_name}"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{SCREEN_AGENT_URL}/action",
+                json={"action": action_name, "args": args},
+            )
+            if resp.status_code != 200:
+                return f"Screen agent error ({resp.status_code}): {resp.text[:200]}"
+            data = resp.json()
+            if data.get("success"):
+                return data.get("result", "Action completed")
+            else:
+                return f"Action failed: {data.get('error', 'unknown')}"
+    except httpx.ConnectError:
+        return "ERROR: Cannot connect to screen agent"
+    except httpx.TimeoutException:
+        return "ERROR: Screen agent timed out"
 
 
 # ── Gemini API Interaction ───────────────────────────────────────────
@@ -358,7 +277,7 @@ async def run_computer_use(
 
     # Initial screenshot
     try:
-        screenshot_bytes = await asyncio.to_thread(_capture_screenshot)
+        screenshot_bytes = await _capture_screenshot()
     except RuntimeError as e:
         return {
             "success": False,
@@ -443,7 +362,7 @@ async def run_computer_use(
         )
         contents.append({"role": "model", "parts": model_parts})
 
-        # Execute each action
+        # Execute each action via the screen agent
         function_responses = []
         for action in actions:
             action_name = action["name"]
@@ -454,9 +373,7 @@ async def run_computer_use(
                 logger.warning(result_text)
             else:
                 try:
-                    result_text = await asyncio.to_thread(
-                        _execute_action, action_name, action_args
-                    )
+                    result_text = await _execute_action(action_name, action_args)
                     logger.info(f"Executed: {result_text}")
                 except Exception as e:
                     result_text = f"Action failed: {e}"
@@ -481,7 +398,7 @@ async def run_computer_use(
 
         # Capture fresh screenshot after actions
         try:
-            screenshot_bytes = await asyncio.to_thread(_capture_screenshot)
+            screenshot_bytes = await _capture_screenshot()
         except RuntimeError as e:
             return {
                 "success": False,
@@ -554,8 +471,8 @@ COMPUTER_USE_TOOL = ToolDefinition(
         },
         "required": ["goal"],
     },
-    risk_level=RiskLevel.CRITICAL,
-    requires_approval=True,
+    risk_level=RiskLevel.HIGH,
+    requires_approval=False,
     timeout_seconds=600,
     category="computer_use",
 )

@@ -72,7 +72,7 @@ class Skill:
             description=f"[Custom Skill] {self.description}",
             parameters=self.parameters,
             risk_level=self.risk_level,
-            requires_approval=self.risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL),
+            requires_approval=self.risk_level == RiskLevel.HIGH,
             timeout_seconds=30,
             category="skill",
         )

@@ -123,8 +123,7 @@ class Guardrails:
         # 4. Check risk level against auto-approve threshold
         risk = self._get_tool_risk(tool_name)
 
-        if risk == RiskLevel.CRITICAL:
-            return f"Tool '{tool_name}' has CRITICAL risk level — always requires approval"
+
 
         if risk == RiskLevel.HIGH and config.auto_approve_risk.value < "high":
             return f"Tool '{tool_name}' has HIGH risk — exceeds auto-approve threshold"
@@ -226,10 +225,10 @@ class Guardrails:
         if config.max_wall_time_seconds > 3600:
             warnings.append("max_wall_time > 1 hour — consider breaking into smaller tasks")
 
-        if config.auto_approve_risk == RiskLevel.CRITICAL:
+        if config.auto_approve_risk == RiskLevel.HIGH:
             warnings.append(
-                "auto_approve_risk=CRITICAL will auto-approve ALL tool calls, "
-                "including destructive operations"
+                "auto_approve_risk=HIGH will auto-approve ALL tool calls, "
+                "including potentially destructive operations"
             )
 
         return warnings

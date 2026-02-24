@@ -103,6 +103,7 @@ services:
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       AGENT_HOST_MOUNTS: ${AGENT_HOST_MOUNTS:-}
       MOLTBOOK_API_KEY: ${MOLTBOOK_API_KEY:-}
+      SCREEN_AGENT_URL: ${SCREEN_AGENT_URL:-http://host.docker.internal:9800}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes:
       - ${LOCAL_MODEL_DIR:-./models}:/models:ro
