@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Pre-Flight Outcome Simulation — simulate plan execution before committing.
 

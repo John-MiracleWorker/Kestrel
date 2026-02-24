@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Time-Travel Plan Branching — fork from any past checkpoint, explore
 alternative strategies, compare outcomes.

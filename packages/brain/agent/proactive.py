@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Proactive Interrupt Engine — anomaly detection, hypothesis generation,
 and intelligent interruption routing.

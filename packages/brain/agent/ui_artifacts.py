@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Agent-Generated UI Artifacts — persistent interactive components
 created by the agent and stored as workspace-level artifacts.

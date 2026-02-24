@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Natural Language Automation Builder — describe workflows in plain English,
 Kestrel generates, validates, and saves as persistent cron jobs.

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Time-Travel tools — let the agent explore alternative execution paths
 during active tasks.

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 UI Builder tools — let the agent create and iterate on persistent
 interactive UI components during chat.

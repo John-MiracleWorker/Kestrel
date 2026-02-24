@@ -2176,7 +2176,7 @@ async def serve():
 
     # Feature 2: NL Automation Builder
     _automation_builder = AutomationBuilder(
-        llm_provider=get_provider("cloud"),
+        llm_provider=get_provider("google"),
     )
     logger.info("NL automation builder initialized")
 
@@ -2194,7 +2194,7 @@ async def serve():
 
     # Feature 5: Outcome Simulator (Pre-Flight)
     _outcome_simulator = OutcomeSimulator(
-        llm_provider=get_provider("cloud"),
+        llm_provider=get_provider("google"),
     )
     logger.info("Outcome simulator initialized")
 

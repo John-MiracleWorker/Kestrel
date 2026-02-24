@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Daemon control tools — let Kestrel create, list, pause, and stop
 background daemon agents from chat.

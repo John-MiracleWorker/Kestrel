@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Adaptive Model Router — per-step model selection for cost+quality optimisation.
 

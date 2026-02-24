@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Build Automation tool — lets Kestrel create persistent cron automations
 from natural language descriptions during chat.

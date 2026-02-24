@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Daemon Agents — always-on background agents that continuously monitor,
 reason about, and proactively act on data sources.
