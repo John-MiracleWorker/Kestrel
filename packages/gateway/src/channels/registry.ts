@@ -242,7 +242,26 @@ export class ChannelRegistry {
                                     toolArgs: chunk.metadata.tool_args || '',
                                     toolResult: chunk.metadata.tool_result || '',
                                     thinking: chunk.metadata.thinking || '',
+                                    approvalId: chunk.metadata.approval_id || '',
+                                    question: chunk.metadata.question || '',
                                 });
+
+                                if (chunk.metadata.agent_status === 'waiting_for_human' && chunk.metadata.approval_id) {
+                                    const approvalSender = (adapter as any).sendApprovalRequestForUser;
+                                    if (typeof approvalSender === 'function') {
+                                        try {
+                                            await approvalSender.call(
+                                                adapter,
+                                                msg.userId,
+                                                chunk.metadata.approval_id,
+                                                chunk.metadata.question || 'The agent needs your approval to continue.',
+                                                chunk.metadata.task_id || '',
+                                            );
+                                        } catch (err) {
+                                            logger.warn('Approval request send failed', { error: (err as Error).message });
+                                        }
+                                    }
+                                }
                             } catch (err) {
                                 logger.debug('Tool activity send failed', { error: (err as Error).message });
                             }

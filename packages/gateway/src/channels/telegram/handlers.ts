@@ -300,7 +300,8 @@ import { logger } from '../../utils/logger';
                     });
                     return;
                 }
-                await handleApproval(adapter, chatId, approvalId, true);
+                const actorUserId = msg.from ? adapter.resolveUserId(msg.from, chatId) : undefined;
+                await handleApproval(adapter, chatId, approvalId, true, actorUserId);
                 break;
             }
 
@@ -314,7 +315,8 @@ import { logger } from '../../utils/logger';
                     });
                     return;
                 }
-                await handleApproval(adapter, chatId, rejectId, false);
+                const actorUserId = msg.from ? adapter.resolveUserId(msg.from, chatId) : undefined;
+                await handleApproval(adapter, chatId, rejectId, false, actorUserId);
                 break;
             }
 
@@ -368,27 +370,32 @@ import { logger } from '../../utils/logger';
 
     // ── Approval Handling ──────────────────────────────────────────
 
-    export async function handleApproval(adapter: TelegramAdapter, chatId: number, approvalId: string, approved: boolean): Promise<void> {
-        const pending = adapter.pendingApprovals.get(approvalId);
-
+    export async function handleApproval(adapter: TelegramAdapter, chatId: number, approvalId: string, approved: boolean, actorUserId?: string): Promise<void> {
         const icon = approved ? '✅' : '❌';
         const action = approved ? 'Approved' : 'Rejected';
+
+        const result = await adapter.resolvePendingApproval(approvalId, approved, actorUserId);
+        if (!result.success) {
+            await adapter.api('sendMessage', {
+                chat_id: chatId,
+                text: `⚠️ Could not process approval \`${approvalId}\`: ${adapter.escapeMarkdown(result.error || 'unknown error')}`,
+                parse_mode: 'Markdown',
+            });
+            return;
+        }
 
         await adapter.api('sendMessage', {
             chat_id: chatId,
             text: `${icon} *${action}* approval \`${approvalId}\``,
             parse_mode: 'Markdown',
         });
-
-        // Clean up
-        adapter.pendingApprovals.delete(approvalId);
     }
 
     /**
      * Send an approval request to a Telegram chat with inline buttons.
      */
-    export async function sendApprovalRequest(adapter: TelegramAdapter, chatId: number, approvalId: string, description: string, taskId: string): Promise<void> {
-        adapter.pendingApprovals.set(approvalId, { taskId, chatId, userId: '' });
+    export async function sendApprovalRequest(adapter: TelegramAdapter, chatId: number, approvalId: string, description: string, taskId: string, userId: string): Promise<void> {
+        adapter.pendingApprovals.set(approvalId, { taskId, chatId, userId });
 
         await adapter.api('sendMessage', {
             chat_id: chatId,
@@ -487,12 +494,14 @@ print(json.dumps(result))
         // Handle approval callbacks
         if (query.data.startsWith('approve:')) {
             const approvalId = query.data.substring('approve:'.length);
-            await handleApproval(adapter, chatId, approvalId, true);
+            const actorUserId = adapter.resolveUserId(query.from, chatId);
+            await handleApproval(adapter, chatId, approvalId, true, actorUserId);
             return;
         }
         if (query.data.startsWith('reject:')) {
             const approvalId = query.data.substring('reject:'.length);
-            await handleApproval(adapter, chatId, approvalId, false);
+            const actorUserId = adapter.resolveUserId(query.from, chatId);
+            await handleApproval(adapter, chatId, approvalId, false, actorUserId);
             return;
         }
 

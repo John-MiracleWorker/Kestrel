@@ -153,6 +153,9 @@ async function start() {
                 webhookUrl: process.env.TELEGRAM_WEBHOOK_URL,
                 defaultWorkspaceId: process.env.DEFAULT_WORKSPACE_ID || 'default',
             });
+            telegramAdapter.setApprovalHandler(async (approvalId, userId, approved) =>
+                brainClient.approveAction(approvalId, userId, approved),
+            );
         }
 
         if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
@@ -208,6 +211,7 @@ async function start() {
             channelRegistry,
             defaultWorkspaceId: process.env.DEFAULT_WORKSPACE_ID || 'default',
             redis,
+            brainClient,
         });
 
         // 7. Start Fastify HTTP server
@@ -257,6 +261,9 @@ async function start() {
                         mode: 'polling',
                         defaultWorkspaceId: savedWsId || process.env.DEFAULT_WORKSPACE_ID || 'default',
                     });
+                    restoredAdapter.setApprovalHandler(async (approvalId, userId, approved) =>
+                        brainClient.approveAction(approvalId, userId, approved),
+                    );
                     await channelRegistry.register(restoredAdapter);
                     logger.info('Telegram adapter restored from persisted config');
                 } catch (err: any) {

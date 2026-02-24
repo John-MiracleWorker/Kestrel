@@ -6,6 +6,7 @@ import { ChannelRegistry } from '../channels/registry';
 import { TelegramAdapter } from '../channels/telegram';
 import { logger } from '../utils/logger';
 import Redis from 'ioredis';
+import { BrainClient } from '../brain/client';
 
 const TELEGRAM_CONFIG_KEY = 'telegram:bot:config';
 
@@ -13,6 +14,7 @@ interface IntegrationDeps {
     channelRegistry: ChannelRegistry;
     defaultWorkspaceId?: string;
     redis: Redis;
+    brainClient: BrainClient;
 }
 
 /**
@@ -21,7 +23,7 @@ interface IntegrationDeps {
  */
 export default async function integrationRoutes(
     app: FastifyInstance,
-    { channelRegistry, defaultWorkspaceId, redis }: IntegrationDeps
+    { channelRegistry, defaultWorkspaceId, redis, brainClient }: IntegrationDeps
 ) {
     const typedApp = app.withTypeProvider<ZodTypeProvider>();
 
@@ -97,6 +99,9 @@ export default async function integrationRoutes(
                     mode: 'polling',
                     defaultWorkspaceId: workspaceId || defaultWorkspaceId || 'default',
                 });
+                adapter.setApprovalHandler(async (approvalId, userId, approved) =>
+                    brainClient.approveAction(approvalId, userId, approved),
+                );
 
                 await channelRegistry.register(adapter);
 

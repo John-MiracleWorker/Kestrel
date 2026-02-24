@@ -612,6 +612,6 @@ class TaskPersistence:
         approval_id: str,
         status: ApprovalStatus,
         decided_by: str,
-    ) -> None:
-        """Resolve an approval request."""
+    ) -> bool:
+        """Resolve an approval request. Returns True when a pending approval was updated."""
         raise NotImplementedError

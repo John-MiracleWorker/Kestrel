@@ -46,6 +46,8 @@ export interface ToolActivity {
     toolArgs?: string;
     toolResult?: string;
     thinking?: string;
+    approvalId?: string;
+    question?: string;
 }
 
 /**

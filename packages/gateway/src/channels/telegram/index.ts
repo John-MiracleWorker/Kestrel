@@ -55,6 +55,62 @@ export class TelegramAdapter extends BaseChannelAdapter {
     private _botId: number | undefined;
     private _botUsername: string | undefined;
 
+
+    // Callback to resolve approvals in Brain
+    private approvalHandler?: (approvalId: string, userId: string, approved: boolean) => Promise<{ success: boolean; error?: string }>;
+
+    public setApprovalHandler(handler: (approvalId: string, userId: string, approved: boolean) => Promise<{ success: boolean; error?: string }>): void {
+        this.approvalHandler = handler;
+    }
+
+    public async resolvePendingApproval(
+        approvalId: string,
+        approved: boolean,
+        actorUserId?: string,
+    ): Promise<{ success: boolean; error?: string }> {
+        if (!this.approvalHandler) {
+            return { success: false, error: 'Approval handler is not configured on the gateway.' };
+        }
+
+        const pending = this.pendingApprovals.get(approvalId);
+
+        // Normal path: resolve against tracked pending request.
+        if (pending) {
+            if (actorUserId && pending.userId && pending.userId !== actorUserId) {
+                return { success: false, error: 'This approval request belongs to another user.' };
+            }
+
+            const result = await this.approvalHandler(approvalId, pending.userId, approved);
+            if (result.success) {
+                this.pendingApprovals.delete(approvalId);
+            }
+            return result;
+        }
+
+        // Fallback path: allow command-driven approval after adapter restart
+        // when in-memory pending map is empty, as long as we know actor user.
+        if (!actorUserId) {
+            return { success: false, error: 'Approval ID not found or already resolved.' };
+        }
+
+        return this.approvalHandler(approvalId, actorUserId, approved);
+    }
+
+    public async sendApprovalRequestForUser(userId: string, approvalId: string, description: string, taskId: string): Promise<void> {
+        const existing = this.pendingApprovals.get(approvalId);
+        if (existing) {
+            return;
+        }
+
+        const chatId = this.chatIdMap.get(userId);
+        if (!chatId) {
+            logger.warn('Cannot send Telegram approval request — no chat ID for user', { userId, approvalId });
+            return;
+        }
+
+        await sendApprovalRequest(this, chatId, approvalId, description, taskId, userId);
+    }
+
     get botInfo(): { id: number; username: string } | undefined {
         if (!this._botId || !this._botUsername) return undefined;
         return { id: this._botId, username: this._botUsername };
@@ -350,10 +406,9 @@ export class TelegramAdapter extends BaseChannelAdapter {
                     : 'Thinking...';
                 break;
             case 'waiting_approval':
+            case 'waiting_for_human':
                 emoji = '⏳';
-                text = `Needs approval: **${activity.toolName}**`;
-                // Approval requests might be handled separately via sendApprovalRequest
-                // but this ensures visibility even if that path isn't triggered
+                text = `Needs approval: **${activity.toolName || 'tool action'}**`;
                 break;
             default:
                 text = `${activity.status}: ${activity.toolName || 'processing'}`;

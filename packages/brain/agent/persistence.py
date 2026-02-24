@@ -166,15 +166,21 @@ class PostgresTaskPersistence(TaskPersistence):
         approval_id: str,
         status: ApprovalStatus,
         decided_by: str,
-    ) -> None:
-        """Resolve a pending approval request."""
-        await self._pool.execute(
+    ) -> bool:
+        """Resolve a pending approval request owned by the deciding user."""
+        row = await self._pool.fetchrow(
             """
-            UPDATE agent_approvals
+            UPDATE agent_approvals AS a
             SET status = $2, decided_by = $3, decided_at = now()
-            WHERE id = $1 AND status = 'pending'
+            FROM agent_tasks AS t
+            WHERE a.id = $1
+              AND a.status = 'pending'
+              AND a.task_id = t.id
+              AND t.user_id = $3
+            RETURNING a.id
             """,
             approval_id,
             status.value if isinstance(status, ApprovalStatus) else status,
             decided_by,
         )
+        return row is not None
