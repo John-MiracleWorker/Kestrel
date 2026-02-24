@@ -386,7 +386,8 @@ Provide your analysis, then {VOTE_PROMPT}
                 temperature=0.4,
                 max_tokens=1500,
             )
-            content = response.get("content", "")
+            # generate() may return str or dict depending on provider
+            content = response.get("content", "") if isinstance(response, dict) else str(response)
             return self._parse_opinion(role, content)
 
         except Exception as e:
@@ -434,7 +435,8 @@ If yes, provide updated analysis. If no, confirm your position.
                         temperature=0.3,
                         max_tokens=1000,
                     )
-                return self._parse_opinion(opinion.role, response.get("content", ""))
+                content = response.get("content", "") if isinstance(response, dict) else str(response)
+                return self._parse_opinion(opinion.role, content)
             except Exception:
                 return opinion
 

@@ -70,6 +70,8 @@ SUPPORTED_ACTIONS = {
     "key_combination",
     "drag_and_drop",
     "wait_5_seconds",
+    "open_web_browser",
+    "open_url",
 }
 
 
