@@ -50,52 +50,57 @@ PROVIDER_CONFIGS = {
 }
 
 # ── Model Catalog (current as of Feb 2026) ────────────────────────────
-# Use this for model discovery via CLI (`kestrel models`) or API.
 MODEL_CATALOG = {
     "openai": {
         "flagship": [
-            {"id": "gpt-5.2",          "ctx": "128k", "desc": "Most capable — enterprise knowledge work, complex reasoning"},
-            {"id": "gpt-5.1",          "ctx": "128k", "desc": "Core dev model — conversation stability, long-context reasoning"},
-            {"id": "gpt-5",            "ctx": "128k", "desc": "Developer-focused — coding + agentic tasks"},
+            {"id": "gpt-5.2",              "ctx": "128k", "desc": "Best for coding + agentic tasks across industries"},
+            {"id": "gpt-5.2-pro",           "ctx": "128k", "desc": "Smarter, more precise responses — enterprise-grade"},
+            {"id": "gpt-5.1",              "ctx": "128k", "desc": "Core dev model — conversation stability, long-context reasoning"},
+            {"id": "gpt-5",                "ctx": "128k", "desc": "Developer-focused — coding + agentic tasks"},
         ],
         "efficient": [
-            {"id": "gpt-5-mini",       "ctx": "128k", "desc": "Fast + cheap — well-defined tasks (default)"},
-            {"id": "gpt-5-nano",       "ctx": "128k", "desc": "Ultra-fast — rapid tasks, edge deployment"},
+            {"id": "gpt-5-mini",           "ctx": "128k", "desc": "Fast + cheap — well-defined tasks (default)"},
+            {"id": "gpt-5-nano",           "ctx": "128k", "desc": "Ultra-fast — rapid tasks, edge deployment"},
         ],
         "coding": [
-            {"id": "gpt-5.3-codex",       "ctx": "128k", "desc": "Most capable agentic coding model"},
-            {"id": "gpt-5.3-codex-spark", "ctx": "128k", "desc": "Low-latency coding — real-time editing, prototyping"},
+            {"id": "gpt-5.3-codex",        "ctx": "128k", "desc": "Most capable agentic coding model"},
+            {"id": "gpt-5.3-codex-spark",   "ctx": "128k", "desc": "Ultra-fast coding — real-time editing, prototyping"},
+        ],
+        "reasoning": [
+            {"id": "o3-deep-research",      "ctx": "128k", "desc": "Specialized deep research"},
+            {"id": "o4-mini-deep-research",  "ctx": "128k", "desc": "Lightweight deep research"},
         ],
         "legacy": [
-            {"id": "gpt-4.1",         "ctx": "128k", "desc": "Previous gen — still available via API"},
-            {"id": "gpt-4.1-mini",    "ctx": "128k", "desc": "Previous gen compact"},
+            {"id": "gpt-4.1",             "ctx": "128k", "desc": "Previous gen — still available via API"},
+            {"id": "gpt-4.1-mini",         "ctx": "128k", "desc": "Previous gen compact"},
         ],
     },
     "anthropic": {
         "flagship": [
-            {"id": "claude-opus-4-6",   "ctx": "200k", "desc": "Most intelligent — complex tasks, sustained agentic work"},
-            {"id": "claude-sonnet-4-5", "ctx": "200k", "desc": "Best all-around — coding, agents, cost-efficient (recommended)"},
+            {"id": "claude-opus-4-6",      "ctx": "1M",   "desc": "Most intelligent — coding, enterprise agents, sustained agentic work"},
+            {"id": "claude-sonnet-4-6",    "ctx": "1M",   "desc": "Best all-around — coding, agents, cost-efficient (recommended)"},
         ],
         "efficient": [
-            {"id": "claude-haiku-4-5",  "ctx": "200k", "desc": "Fastest + cheapest — quick responses (default)"},
+            {"id": "claude-haiku-4-5",     "ctx": "200k", "desc": "Fastest + cheapest — quick responses (default)"},
         ],
     },
     "google": {
         "flagship": [
-            {"id": "gemini-3.1-pro-preview",    "ctx": "2M",   "desc": "Multimodal flagship — deep reasoning, rich visuals (ARC-AGI-2 winner)"},
-            {"id": "gemini-3-deep-think-preview", "ctx": "1M", "desc": "Specialized reasoning — science, research, engineering"},
-            {"id": "gemini-3-pro-preview",      "ctx": "1M",   "desc": "Previous flagship — still highly capable"},
+            {"id": "gemini-3.1-pro-preview",           "ctx": "2M",   "desc": "Multimodal flagship — deep reasoning, agentic coding"},
+            {"id": "gemini-3-deep-think-preview",      "ctx": "1M",   "desc": "Specialized reasoning — science, research, engineering"},
+            {"id": "gemini-3-pro-preview",             "ctx": "1M",   "desc": "Previous flagship — highly capable"},
         ],
         "efficient": [
-            {"id": "gemini-3-flash-preview",    "ctx": "1M",   "desc": "Speed-optimized — price-performance leader"},
-            {"id": "gemini-2.5-flash-preview-04-17", "ctx": "1M", "desc": "Stable workhorse — high-volume, audio output"},
-            {"id": "gemini-2.5-flash-lite-preview-06-17", "ctx": "1M", "desc": "Ultra-cheap — high-throughput services"},
+            {"id": "gemini-3-flash-preview",           "ctx": "1M",   "desc": "Speed-optimized — frontier-class, cost-effective"},
+            {"id": "gemini-2.5-flash-preview-04-17",   "ctx": "1M",   "desc": "Stable workhorse — high-volume (deprecated June 2026)"},
+            {"id": "gemini-2.5-flash-lite-preview-06-17", "ctx": "1M","desc": "Ultra-cheap — high-throughput services"},
         ],
-        "computer_use": [
-            {"id": "gemini-2.5-computer-use-preview-10-2025", "ctx": "128k", "desc": "Desktop/browser control — autonomous UI interaction"},
+        "live": [
+            {"id": "gemini-2.5-flash-live-preview",    "ctx": "1M",   "desc": "Live API — low-latency bidirectional voice/video"},
         ],
     },
 }
+
 
 
 class CloudProvider:

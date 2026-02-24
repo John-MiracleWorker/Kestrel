@@ -80,8 +80,8 @@ class ModelRoute:
 # Environment-driven defaults
 _OLLAMA_MODEL = os.getenv("ROUTER_OLLAMA_MODEL", "qwen3:8b")
 _OLLAMA_LARGE_MODEL = os.getenv("ROUTER_OLLAMA_LARGE_MODEL", "qwen3:32b")
-_CLOUD_FAST_MODEL = os.getenv("ROUTER_CLOUD_FAST_MODEL", "gemini-2.0-flash")
-_CLOUD_POWER_MODEL = os.getenv("ROUTER_CLOUD_POWER_MODEL", "gemini-2.5-pro")
+_CLOUD_FAST_MODEL = os.getenv("ROUTER_CLOUD_FAST_MODEL", "gemini-3-flash-preview")
+_CLOUD_POWER_MODEL = os.getenv("ROUTER_CLOUD_POWER_MODEL", "gemini-3.1-pro-preview")
 _DEFAULT_STRATEGY = RoutingStrategy(
     os.getenv("ROUTER_STRATEGY", RoutingStrategy.LOCAL_FIRST.value)
 )
@@ -320,7 +320,7 @@ class ModelRouter:
             fallbacks = [
                 ("google", _CLOUD_FAST_MODEL),
                 ("openai", "gpt-5-mini"),
-                ("anthropic", "claude-haiku-4-5"),
+                ("anthropic", "claude-sonnet-4-6"),
             ]
         else:
             # Cloud provider unavailable → try Ollama first, then other clouds
@@ -328,7 +328,7 @@ class ModelRouter:
                 ("ollama", _OLLAMA_MODEL),
                 ("google", _CLOUD_FAST_MODEL),
                 ("openai", "gpt-5-mini"),
-                ("anthropic", "claude-haiku-4-5"),
+                ("anthropic", "claude-sonnet-4-6"),
             ]
 
         for fb_provider, fb_model in fallbacks:
