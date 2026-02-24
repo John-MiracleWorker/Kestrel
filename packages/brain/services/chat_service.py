@@ -176,11 +176,13 @@ class ChatServicerMixin(BaseServicerMixin):
                 cmd_result = runtime.command_parser.parse(user_content, cmd_context)
                 if cmd_result and cmd_result.handled:
                     # Send the command response directly (no agent needed)
-                    yield brain_pb2.ChatResponse(
-                        text=cmd_result.response,
-                        done=False,
+                    yield self._make_response(
+                        chunk_type=0,  # CONTENT_DELTA
+                        content_delta=cmd_result.response,
                     )
-                    yield brain_pb2.ChatResponse(text="", done=True)
+                    yield self._make_response(
+                        chunk_type=2,  # DONE
+                    )
                     if conversation_id and cmd_result.response:
                         await save_message(conversation_id, "user", user_content)
                         await save_message(conversation_id, "assistant", cmd_result.response)
