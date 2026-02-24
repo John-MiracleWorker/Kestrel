@@ -453,8 +453,8 @@ class ChatServicerMixin(BaseServicerMixin):
                 if item is _SENTINEL:
                     break
 
-                # Direct response chunks from activity callbacks
-                if isinstance(item, dict):
+                # Direct response chunks from activity callbacks (_make_response returns ChatResponse)
+                if isinstance(item, brain_pb2.ChatResponse):
                     yield item
                     continue
 
