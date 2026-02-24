@@ -1,3 +1,4 @@
+from typing import Optional
 """
 Backfill memory graph — scan existing conversations and extract entities.
 
@@ -19,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("backfill")
 
 
-async def main(workspace_id: str | None, limit: int, model_override: str | None = None):
+async def main(workspace_id: Optional[str], limit: int, model_override: Optional[str] = None):
     import asyncpg
     from agent.memory_graph import MemoryGraph, extract_entities_llm
     from providers_registry import get_provider

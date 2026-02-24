@@ -1,8 +1,12 @@
-import { useState, useRef, useEffect, type FormEvent } from 'react';
+import { useState, useRef, useEffect, useCallback, type FormEvent } from 'react';
 import type { Message } from '../../api/client';
 import { providers, uploadFiles } from '../../api/client';
 import { RichContent } from './RichContent';
 import { NotificationBell } from '../Layout/NotificationBell';
+import { StatusOrb } from '../Layout/StatusOrb';
+import { ActivityTimeline } from '../Agent/ActivityTimeline';
+import { InputComposer } from './InputComposer';
+import type { RoutingInfo } from '../../hooks/useChat';
 
 interface ChatViewProps {
     workspaceId: string | null;
@@ -19,7 +23,8 @@ interface ChatViewProps {
             toolResult?: string;
             thinking?: string;
         } | null;
-        agentActivities?: Array<{ activity_type: string; [key: string]: unknown }>;
+        agentActivities?: Array<{ activity_type: string;[key: string]: unknown }>;
+        routingInfo?: RoutingInfo | null;
     } | null;
     onSendMessage: (
         content: string,
@@ -148,6 +153,25 @@ export function ChatView({
 
     function handleAttach() {
         fileInputRef.current?.click();
+    }
+
+    function handleSlashCommand(command: string) {
+        switch (command) {
+            case '/canvas':
+                onToggleCanvas?.();
+                break;
+            case '/clear':
+                // Dispatch a new-conversation event for App.tsx to handle
+                window.dispatchEvent(new CustomEvent('new-conversation'));
+                break;
+            case '/settings':
+                window.dispatchEvent(new CustomEvent('open-settings'));
+                break;
+            default:
+                // For unhandled commands, send as a message with /command prefix
+                onSendMessage(command);
+                break;
+        }
     }
 
     function handleFilesSelected(e: React.ChangeEvent<HTMLInputElement>) {
@@ -297,15 +321,11 @@ export function ChatView({
                     </div>
 
                     {/* Connection Status */}
-                    <div
-                        style={{
-                            width: '10px',
-                            height: '10px',
-                            borderRadius: '50%',
-                            background: isConnected ? 'var(--accent-green)' : 'var(--accent-error)',
-                            boxShadow: `0 0 8px ${isConnected ? 'var(--accent-green)' : 'var(--accent-error)'}`,
-                        }}
-                        title={isConnected ? 'System Online' : 'System Offline'}
+                    <StatusOrb
+                        isConnected={isConnected}
+                        isStreaming={!!streamingMessage?.isStreaming}
+                        toolStatus={streamingMessage?.toolActivity?.status}
+                        wasEscalated={streamingMessage?.routingInfo?.wasEscalated}
                     />
 
                     {/* Toggle Canvas */}
@@ -365,7 +385,7 @@ export function ChatView({
                     }}
                 >
                     {messages.map((msg) => (
-                        <MessageBubble key={msg.id} message={msg} />
+                        <MessageBubble key={msg.id} message={msg} routingInfo={msg.routingInfo} />
                     ))}
 
                     {streamingMessage && (
@@ -374,6 +394,7 @@ export function ChatView({
                             isStreaming
                             toolActivity={streamingMessage.toolActivity}
                             agentActivities={streamingMessage.agentActivities}
+                            routingInfo={streamingMessage.routingInfo}
                         />
                     )}
 
@@ -389,18 +410,7 @@ export function ChatView({
                     background: 'var(--bg-panel)',
                 }}
             >
-                <form
-                    onSubmit={handleSubmit}
-                    style={{
-                        maxWidth: '900px',
-                        margin: '0 auto',
-                        position: 'relative',
-                        display: 'flex',
-                        flexDirection: 'column',
-                        alignItems: 'stretch',
-                        gap: '10px',
-                    }}
-                >
+                <div style={{ maxWidth: '900px', margin: '0 auto' }}>
                     {uploadError && (
                         <div
                             style={{
@@ -413,6 +423,7 @@ export function ChatView({
                                 display: 'flex',
                                 alignItems: 'center',
                                 gap: '8px',
+                                marginBottom: '10px',
                             }}
                         >
                             <span style={{ flex: 1 }}>{uploadError}</span>
@@ -450,201 +461,27 @@ export function ChatView({
                             </button>
                         </div>
                     )}
-                    <div
-                        style={{
-                            display: 'flex',
-                            gap: '12px',
-                            alignItems: 'flex-end',
-                        }}
-                    >
-                        <span
-                            style={{
-                                color: 'var(--accent-cyan)',
-                                paddingBottom: '12px',
-                                fontWeight: 'bold',
-                            }}
-                        >
-                            $
-                        </span>
-                        <div
-                            style={{
-                                flex: 1,
-                                background: 'rgba(0,0,0,0.3)',
-                                border: '1px solid var(--text-dim)',
-                                borderRadius: '4px',
-                                padding: '12px',
-                                transition: 'border-color 0.2s',
-                            }}
-                            onFocus={(e) =>
-                                (e.currentTarget.style.borderColor = 'var(--accent-cyan)')
-                            }
-                            onBlur={(e) => (e.currentTarget.style.borderColor = 'var(--text-dim)')}
-                            tabIndex={-1}
-                            onDragOver={(e) => {
-                                e.preventDefault();
-                                e.currentTarget.style.borderColor = 'var(--accent-purple)';
-                            }}
-                            onDragLeave={(e) => {
-                                e.currentTarget.style.borderColor = 'var(--text-dim)';
-                            }}
-                            onDrop={(e) => {
-                                e.preventDefault();
-                                e.currentTarget.style.borderColor = 'var(--text-dim)';
-                                const files = Array.from(e.dataTransfer.files);
-                                if (files.length)
-                                    setPendingFiles((prev) => [...prev, ...files].slice(0, 5));
-                            }}
-                        >
-                            {/* Pending file chips */}
-                            {pendingFiles.length > 0 && (
-                                <div
-                                    style={{
-                                        display: 'flex',
-                                        flexWrap: 'wrap',
-                                        gap: '6px',
-                                        marginBottom: '8px',
-                                    }}
-                                >
-                                    {pendingFiles.map((f, i) => (
-                                        <div
-                                            key={i}
-                                            style={{
-                                                display: 'flex',
-                                                alignItems: 'center',
-                                                gap: '4px',
-                                                background: 'rgba(0,243,255,0.1)',
-                                                border: '1px solid var(--accent-cyan)',
-                                                borderRadius: '4px',
-                                                padding: '4px 8px',
-                                                fontSize: '0.75rem',
-                                                color: 'var(--accent-cyan)',
-                                                fontFamily: 'var(--font-mono)',
-                                            }}
-                                        >
-                                            <span>{f.type.startsWith('image/') ? '🖼️' : '📄'}</span>
-                                            <span
-                                                style={{
-                                                    maxWidth: '120px',
-                                                    overflow: 'hidden',
-                                                    textOverflow: 'ellipsis',
-                                                    whiteSpace: 'nowrap',
-                                                }}
-                                            >
-                                                {f.name}
-                                            </span>
-                                            <span
-                                                style={{
-                                                    color: 'var(--text-dim)',
-                                                    fontSize: '0.65rem',
-                                                }}
-                                            >
-                                                {(f.size / 1024).toFixed(0)}KB
-                                            </span>
-                                            <button
-                                                type="button"
-                                                onClick={() => removeFile(i)}
-                                                style={{
-                                                    background: 'none',
-                                                    border: 'none',
-                                                    color: 'var(--text-dim)',
-                                                    cursor: 'pointer',
-                                                    padding: '0 2px',
-                                                    fontSize: '0.8rem',
-                                                }}
-                                            >
-                                                ✕
-                                            </button>
-                                        </div>
-                                    ))}
-                                </div>
-                            )}
-                            <textarea
-                                ref={inputRef}
-                                value={input}
-                                onChange={(e) => setInput(e.target.value)}
-                                onKeyDown={handleKeyDown}
-                                placeholder="Execute command or enter message..."
-                                rows={1}
-                                style={{
-                                    width: '100%',
-                                    border: 'none',
-                                    background: 'transparent',
-                                    resize: 'none',
-                                    maxHeight: '200px',
-                                    outline: 'none',
-                                    color: 'var(--text-primary)',
-                                    fontFamily: 'var(--font-mono)',
-                                    lineHeight: '1.5',
-                                }}
-                            />
-                        </div>
-                        {/* Hidden file input */}
-                        <input
-                            ref={fileInputRef}
-                            type="file"
-                            multiple
-                            accept="image/*,.pdf,.txt,.md,.py,.js,.ts,.tsx,.jsx,.json,.csv,.xml,.yaml,.yml,.html,.css,.sh,.sql,.java,.cpp,.c,.h,.go,.rs,.rb,.swift,.kt"
-                            style={{ display: 'none' }}
-                            onChange={handleFilesSelected}
-                        />
-                        {/* Attach button */}
-                        <button
-                            type="button"
-                            onClick={handleAttach}
-                            title="Attach files (images, code, PDFs)"
-                            style={{
-                                background:
-                                    pendingFiles.length > 0
-                                        ? 'rgba(168,85,247,0.2)'
-                                        : 'transparent',
-                                color:
-                                    pendingFiles.length > 0
-                                        ? 'var(--accent-purple)'
-                                        : 'var(--text-dim)',
-                                border:
-                                    '1px solid ' +
-                                    (pendingFiles.length > 0
-                                        ? 'var(--accent-purple)'
-                                        : 'var(--text-dim)'),
-                                padding: '10px 12px',
-                                borderRadius: '4px',
-                                cursor: 'pointer',
-                                fontFamily: 'var(--font-mono)',
-                                height: '46px',
-                                fontSize: '1.1rem',
-                                transition: 'all 0.2s',
-                            }}
-                        >
-                            📎
-                        </button>
-                        <button
-                            type="submit"
-                            disabled={isUploading}
-                            style={{
-                                background:
-                                    input.trim() || pendingFiles.length > 0
-                                        ? isUploading
-                                            ? 'var(--accent-purple)'
-                                            : 'var(--accent-cyan)'
-                                        : 'transparent',
-                                color:
-                                    input.trim() || pendingFiles.length > 0
-                                        ? '#000'
-                                        : 'var(--text-dim)',
-                                border: '1px solid var(--accent-cyan)',
-                                padding: '10px 20px',
-                                borderRadius: '4px',
-                                cursor: isUploading ? 'not-allowed' : 'pointer',
-                                fontWeight: 'bold',
-                                fontFamily: 'var(--font-mono)',
-                                height: '46px',
-                                opacity: isUploading ? 0.7 : 1,
-                            }}
-                        >
-                            {isUploading ? 'UPLOADING...' : 'SEND'}
-                        </button>
-                    </div>
-                </form>
+                    {/* Hidden file input */}
+                    <input
+                        ref={fileInputRef}
+                        type="file"
+                        multiple
+                        accept="image/*,.pdf,.txt,.md,.py,.js,.ts,.tsx,.jsx,.json,.csv,.xml,.yaml,.yml,.html,.css,.sh,.sql,.java,.cpp,.c,.h,.go,.rs,.rb,.swift,.kt"
+                        style={{ display: 'none' }}
+                        onChange={handleFilesSelected}
+                    />
+                    <InputComposer
+                        value={input}
+                        onChange={setInput}
+                        onSubmit={handleSubmit}
+                        onKeyDown={handleKeyDown}
+                        onAttach={handleAttach}
+                        onSlashCommand={handleSlashCommand}
+                        pendingFiles={pendingFiles}
+                        onRemoveFile={removeFile}
+                        isUploading={isUploading}
+                    />
+                </div>
             </div>
 
             <style>{`
@@ -672,7 +509,7 @@ export function ChatView({
 
 /* ── KestrelProcessBar ────────────────────────────────────────────── */
 
-type Activity = { activity_type: string; [key: string]: unknown };
+type Activity = { activity_type: string;[key: string]: unknown };
 
 interface PhaseData {
     key: string;
@@ -774,12 +611,12 @@ function buildPhases(
             toolActivity.status === 'thinking'
                 ? 'Reasoning'
                 : toolActivity.status === 'planning'
-                  ? 'Planning'
-                  : toolActivity.status === 'calling' || toolActivity.status === 'tool_calling'
-                    ? toolActivity.toolName || 'Tool'
-                    : toolActivity.status === 'result' || toolActivity.status === 'tool_result'
-                      ? `${toolActivity.toolName} ✓`
-                      : 'Working';
+                    ? 'Planning'
+                    : toolActivity.status === 'calling' || toolActivity.status === 'tool_calling'
+                        ? toolActivity.toolName || 'Tool'
+                        : toolActivity.status === 'result' || toolActivity.status === 'tool_result'
+                            ? `${toolActivity.toolName} ✓`
+                            : 'Working';
         phases.push({
             key: 'tools',
             icon: '⚡',
@@ -909,12 +746,12 @@ function KestrelProcessBar({
         ? toolActivity.status === 'thinking'
             ? '🧠 Reasoning…'
             : toolActivity.status === 'planning'
-              ? '📋 Planning…'
-              : toolActivity.status === 'calling' || toolActivity.status === 'tool_calling'
-                ? `⚡ Using ${toolActivity.toolName || 'tool'}…`
-                : toolActivity.status === 'result' || toolActivity.status === 'tool_result'
-                  ? `✅ ${toolActivity.toolName || 'Tool'} complete`
-                  : '🔄 Working…'
+                ? '📋 Planning…'
+                : toolActivity.status === 'calling' || toolActivity.status === 'tool_calling'
+                    ? `⚡ Using ${toolActivity.toolName || 'tool'}…`
+                    : toolActivity.status === 'result' || toolActivity.status === 'tool_result'
+                        ? `✅ ${toolActivity.toolName || 'Tool'} complete`
+                        : '🔄 Working…'
         : '🔄 Processing…';
 
     const isActive =
@@ -1148,8 +985,8 @@ function PhaseDetail({ item, phaseKey }: { item: Activity; phaseKey: string }) {
             item.severity === 'critical'
                 ? '#ef4444'
                 : item.severity === 'high'
-                  ? '#f59e0b'
-                  : '#6b7280';
+                    ? '#f59e0b'
+                    : '#6b7280';
         return (
             <div style={{ display: 'flex', gap: '8px', padding: '2px 0' }}>
                 <span
@@ -1276,6 +1113,7 @@ function MessageBubble({
     isStreaming = false,
     toolActivity,
     agentActivities = [],
+    routingInfo,
 }: {
     message: { role: string; content: string };
     isStreaming?: boolean;
@@ -1286,7 +1124,8 @@ function MessageBubble({
         toolResult?: string;
         thinking?: string;
     } | null;
-    agentActivities?: Array<{ activity_type: string; [key: string]: unknown }>;
+    agentActivities?: Array<{ activity_type: string;[key: string]: unknown }>;
+    routingInfo?: { provider: string; model: string; wasEscalated: boolean; complexity: number } | null;
 }) {
     const isUser = message.role === 'user';
 
@@ -1309,6 +1148,28 @@ function MessageBubble({
                 }}
             >
                 {isUser ? 'USER_INPUT' : 'SYSTEM_RESPONSE'}
+                {/* Routing badge for assistant messages */}
+                {!isUser && routingInfo && (
+                    <span
+                        style={{
+                            marginLeft: '10px',
+                            fontSize: '0.6rem',
+                            padding: '2px 6px',
+                            borderRadius: '3px',
+                            background: routingInfo.wasEscalated
+                                ? 'rgba(249, 115, 22, 0.15)'
+                                : 'rgba(0, 243, 255, 0.1)',
+                            border: `1px solid ${routingInfo.wasEscalated ? 'rgba(249, 115, 22, 0.4)' : 'rgba(0, 243, 255, 0.3)'}`,
+                            color: routingInfo.wasEscalated ? '#f97316' : 'var(--accent-cyan)',
+                            fontWeight: 400,
+                            letterSpacing: '0.05em',
+                        }}
+                        title={`Provider: ${routingInfo.provider} | Model: ${routingInfo.model} | Complexity: ${routingInfo.complexity.toFixed(1)}`}
+                    >
+                        {routingInfo.wasEscalated ? '☁️ ' : '⚡ '}
+                        {routingInfo.model.split('/').pop()}
+                    </span>
+                )}
             </div>
 
             <div
@@ -1342,9 +1203,12 @@ function MessageBubble({
                             <span className="thinking-dots">thinking</span>
                         </span>
                     )}
-                {/* KestrelProcessBar — unified tool + agent activity display */}
+                {/* Activity Timeline — unified tool + agent activity display */}
                 {isStreaming && (toolActivity || agentActivities.length > 0) && (
-                    <KestrelProcessBar activities={agentActivities} toolActivity={toolActivity} />
+                    <>
+                        <ActivityTimeline toolActivity={toolActivity} agentActivities={agentActivities} />
+                        <KestrelProcessBar activities={agentActivities} toolActivity={toolActivity} />
+                    </>
                 )}
                 {isUser ? message.content : <RichContent content={message.content} />}
                 {isStreaming && message.content && (

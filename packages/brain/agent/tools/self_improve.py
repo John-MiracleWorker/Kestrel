@@ -59,7 +59,7 @@ def get_inactivity_seconds() -> float:
 
 
 # ── JSON Extraction Helper ───────────────────────────────────────────
-def _extract_json_array(text: str) -> list | None:
+def _extract_json_array(text: str) -> Optional[list]:
     """
     Robustly extract a JSON array from LLM response text.
     Handles: raw JSON, markdown code fences, JSON embedded in prose.

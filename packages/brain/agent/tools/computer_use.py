@@ -1,3 +1,4 @@
+from typing import Optional
 """
 Gemini Computer Use — Desktop control via Gemini's Computer Use model.
 
@@ -133,7 +134,7 @@ async def _call_gemini_computer_use(
     api_key: str,
     model: str = "",
     system_instruction: str = "",
-    excluded_actions: list[str] | None = None,
+    excluded_actions: Optional[list[str]] = None,
 ) -> dict:
     """
     Call the Gemini Computer Use endpoint.
@@ -233,7 +234,7 @@ async def run_computer_use(
     model: str = "",
     max_turns: int = 0,
     system_prompt: str = "",
-    excluded_actions: list[str] | None = None,
+    excluded_actions: Optional[list[str]] = None,
     require_confirmation: bool = True,
 ) -> dict:
     """
@@ -484,7 +485,7 @@ def register_computer_use_tools(registry) -> None:
     async def computer_use_handler(
         goal: str,
         max_turns: int = 30,
-        excluded_actions: list[str] | None = None,
+        excluded_actions: Optional[list[str]] = None,
     ) -> dict:
         """Handle computer_use tool calls from the agent loop."""
         return await run_computer_use(

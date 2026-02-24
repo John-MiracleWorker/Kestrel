@@ -278,7 +278,7 @@ class CronScheduler:
             logger.error(f"Failed to persist cron job: {e}")
 
         self._jobs[job.id] = job
-        logger.info(f"Cron job created: {name} ({cron_expression})")
+        logger.info(f"Cron job created: {name} for workspace {workspace_id} ({cron_expression})")
         return job
 
     async def delete_job(self, job_id: str) -> bool:

@@ -15,6 +15,13 @@ interface ToolActivity {
     activity?: AgentActivity;
 }
 
+export interface RoutingInfo {
+    provider: string;
+    model: string;
+    wasEscalated: boolean;
+    complexity: number;
+}
+
 interface StreamingMessage {
     id: string;
     role: 'assistant';
@@ -22,6 +29,7 @@ interface StreamingMessage {
     isStreaming: boolean;
     toolActivity?: ToolActivity | null;
     agentActivities?: AgentActivity[];
+    routingInfo?: RoutingInfo | null;
 }
 
 interface UseChatReturn {
@@ -55,6 +63,7 @@ export function useChat(
     const wsRef = useRef<WebSocket | null>(null);
     const contentRef = useRef('');
     const activitiesRef = useRef<AgentActivity[]>([]);
+    const routingInfoRef = useRef<RoutingInfo | null>(null);
     const reconnectAttemptRef = useRef(0);
     const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const isMountedRef = useRef(true);
@@ -74,7 +83,7 @@ export function useChat(
         ws.onmessage = (event) => {
             if (!isMountedRef.current) return;
             const data = JSON.parse(event.data as string) as {
-                type: 'token' | 'done' | 'error' | 'thinking' | 'tool_activity';
+                type: 'token' | 'done' | 'error' | 'thinking' | 'tool_activity' | 'routing_info';
                 content?: string;
                 messageId?: string;
                 error?: string;
@@ -83,6 +92,10 @@ export function useChat(
                 toolArgs?: string;
                 toolResult?: string;
                 thinking?: string;
+                provider?: string;
+                model?: string;
+                wasEscalated?: boolean;
+                complexity?: number;
             };
 
             switch (data.type) {
@@ -96,6 +109,25 @@ export function useChat(
                             isStreaming: true,
                         });
                     }
+                    break;
+
+                case 'routing_info':
+                    // Store routing metadata for display on messages
+                    routingInfoRef.current = {
+                        provider: data.provider || '',
+                        model: data.model || '',
+                        wasEscalated: data.wasEscalated || false,
+                        complexity: data.complexity || 0,
+                    };
+                    setStreamingMessage((prev) => ({
+                        id: prev?.id || data.messageId || 'streaming',
+                        role: 'assistant',
+                        content: prev?.content || contentRef.current || '',
+                        isStreaming: true,
+                        toolActivity: prev?.toolActivity ?? null,
+                        agentActivities: prev?.agentActivities,
+                        routingInfo: routingInfoRef.current,
+                    }));
                     break;
 
                 case 'tool_activity': {
@@ -126,6 +158,7 @@ export function useChat(
                                 thinking: data.thinking,
                             },
                         agentActivities: [...activitiesRef.current],
+                        routingInfo: prev?.routingInfo ?? routingInfoRef.current,
                     }));
                     break;
                 }
@@ -140,6 +173,7 @@ export function useChat(
                         // Keep last toolActivity visible instead of clearing
                         toolActivity: prev?.toolActivity ?? null,
                         agentActivities: prev?.agentActivities,
+                        routingInfo: prev?.routingInfo ?? routingInfoRef.current,
                     }));
                     break;
 
@@ -150,6 +184,7 @@ export function useChat(
                             role: 'assistant',
                             content: contentRef.current,
                             createdAt: new Date().toISOString(),
+                            routingInfo: routingInfoRef.current || undefined,
                         };
                         setMessages((prev) => [...prev, finalMessage]);
 
@@ -177,6 +212,7 @@ export function useChat(
                     setStreamingMessage(null);
                     contentRef.current = '';
                     activitiesRef.current = [];
+                    routingInfoRef.current = null;
                     break;
 
                 case 'error': {

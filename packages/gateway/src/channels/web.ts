@@ -239,15 +239,27 @@ export class WebChannelAdapter extends BaseChannelAdapter {
                             case 0: // CONTENT_DELTA
                                 // Check for agent metadata (tool activity events)
                                 if (chunk.metadata?.agent_status && !chunk.content_delta) {
-                                    socket.send(JSON.stringify({
-                                        type: 'tool_activity',
-                                        status: chunk.metadata.agent_status,
-                                        toolName: chunk.metadata.tool_name || '',
-                                        toolArgs: chunk.metadata.tool_args || '',
-                                        toolResult: chunk.metadata.tool_result || '',
-                                        thinking: chunk.metadata.thinking || '',
-                                        messageId,
-                                    }));
+                                    // Forward routing info as a separate event type
+                                    if (chunk.metadata.agent_status === 'routing_info') {
+                                        socket.send(JSON.stringify({
+                                            type: 'routing_info',
+                                            provider: chunk.metadata.provider || '',
+                                            model: chunk.metadata.model || '',
+                                            wasEscalated: chunk.metadata.was_escalated === 'true',
+                                            complexity: parseFloat(chunk.metadata.complexity || '0'),
+                                            messageId,
+                                        }));
+                                    } else {
+                                        socket.send(JSON.stringify({
+                                            type: 'tool_activity',
+                                            status: chunk.metadata.agent_status,
+                                            toolName: chunk.metadata.tool_name || '',
+                                            toolArgs: chunk.metadata.tool_args || '',
+                                            toolResult: chunk.metadata.tool_result || '',
+                                            thinking: chunk.metadata.thinking || '',
+                                            messageId,
+                                        }));
+                                    }
                                 } else if (chunk.content_delta) {
                                     socket.send(JSON.stringify({
                                         type: 'token',

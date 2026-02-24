@@ -1,10 +1,11 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useAuth } from './hooks/useAuth';
 import { LoginPage } from './components/Auth/LoginPage';
 import { Sidebar } from './components/Sidebar/Sidebar';
 import { ChatView } from './components/Chat/ChatView';
 import { SettingsPanel } from './components/Settings/SettingsPanel';
 import { LiveCanvas } from './components/Layout/LiveCanvas';
+import { CommandPalette } from './components/Layout/CommandPalette';
 import { MoltbookPanel } from './components/Moltbook/MoltbookPanel';
 import { MemoryPalace } from './components/MemoryPalace/MemoryPalace';
 import { DocsPanel } from './components/Docs/DocsPanel';
@@ -24,8 +25,9 @@ export default function App() {
     const [showDocs, setShowDocs] = useState(false);
     const [showScreenShare, setShowScreenShare] = useState(false);
     const [showPRReview, setShowPRReview] = useState(false);
+    const [showCommandPalette, setShowCommandPalette] = useState(false);
     const autoCreateAttempted = useRef<string | null>(null);
-    const [showCanvas, setShowCanvas] = useState(true); // Default to open for the look
+    const [showCanvas, setShowCanvas] = useState(true);
 
     const { messages, streamingMessage, sendMessage, isConnected } = useChat(
         currentWorkspace?.id || null,
@@ -65,6 +67,38 @@ export default function App() {
             console.error('Failed to create conversation:', err);
         }
     }, [currentWorkspace]);
+
+    // Listen for global events from slash commands
+    useEffect(() => {
+        const onNewConv = () => handleNewConversation();
+        const onSettings = () => setShowSettings(true);
+        const onCmdK = (e: KeyboardEvent) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+                e.preventDefault();
+                setShowCommandPalette(prev => !prev);
+            }
+        };
+        window.addEventListener('new-conversation', onNewConv);
+        window.addEventListener('open-settings', onSettings);
+        window.addEventListener('keydown', onCmdK);
+        return () => {
+            window.removeEventListener('new-conversation', onNewConv);
+            window.removeEventListener('open-settings', onSettings);
+            window.removeEventListener('keydown', onCmdK);
+        };
+    }, [handleNewConversation]);
+
+    // Command palette actions
+    const paletteActions = useMemo(() => [
+        { id: 'new-chat', label: 'New Conversation', category: 'Navigation', icon: '✨', shortcut: '⌘N', action: handleNewConversation },
+        { id: 'toggle-canvas', label: 'Toggle Live HUD', category: 'Navigation', icon: '📺', shortcut: '⌘\\', action: () => setShowCanvas(c => !c) },
+        { id: 'settings', label: 'Open Settings', category: 'Navigation', icon: '⚙️', shortcut: '⌘,', action: () => setShowSettings(true) },
+        { id: 'memory', label: 'Memory Palace', category: 'Panels', icon: '🧠', action: () => setShowMemoryPalace(true) },
+        { id: 'moltbook', label: 'Moltbook', category: 'Panels', icon: '📘', action: () => setShowMoltbook(true) },
+        { id: 'docs', label: 'Documentation', category: 'Panels', icon: '📖', action: () => setShowDocs(true) },
+        { id: 'screen', label: 'Screen Share', category: 'Panels', icon: '🖥️', action: () => setShowScreenShare(true) },
+        { id: 'pr-review', label: 'PR Review', category: 'Panels', icon: '🔍', action: () => setShowPRReview(true) },
+    ], [handleNewConversation]);
 
     // Loading state
     if (isLoading) {
@@ -163,6 +197,12 @@ export default function App() {
                 workspaceId={currentWorkspace?.id || ''}
                 isVisible={showPRReview}
                 onClose={() => setShowPRReview(false)}
+            />
+
+            <CommandPalette
+                isOpen={showCommandPalette}
+                onClose={() => setShowCommandPalette(false)}
+                actions={paletteActions}
             />
         </div>
     );

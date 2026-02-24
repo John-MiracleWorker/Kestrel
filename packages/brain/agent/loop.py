@@ -1036,6 +1036,18 @@ class AgentLoop:
         except Exception as e:
             logger.warning(f"Context compaction failed (non-fatal): {e}")
 
+        # Emit routing metadata so frontend can show model/provider badge
+        if self._event_callback:
+            try:
+                await self._event_callback("routing_info", {
+                    "provider": route.provider,
+                    "model": routed_model or route.model,
+                    "was_escalated": getattr(route, '_escalated', False),
+                    "complexity": getattr(route, '_complexity', 0),
+                })
+            except Exception:
+                pass  # non-fatal
+
         logger.debug(
             f"Dispatching to {route.provider}:{routed_model} "
             f"(step={step.description[:50]}...)"

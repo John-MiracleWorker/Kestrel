@@ -416,6 +416,12 @@ export interface Message {
     role: 'user' | 'assistant' | 'system';
     content: string;
     createdAt: string;
+    routingInfo?: {
+        provider: string;
+        model: string;
+        wasEscalated: boolean;
+        complexity: number;
+    };
 }
 
 export interface ProviderInfo {
