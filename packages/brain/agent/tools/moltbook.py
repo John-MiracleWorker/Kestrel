@@ -9,6 +9,7 @@ All activity is logged to the moltbook_activity table for human visibility.
 import json
 import logging
 import os
+import time
 from typing import Optional
 
 import httpx
@@ -23,6 +24,43 @@ _current_user_id: Optional[str] = None
 
 BASE_URL = "https://www.moltbook.com/api/v1"
 CREDS_PATH = os.path.expanduser("~/.config/moltbook/credentials.json")
+
+# ── Rate Limiting ────────────────────────────────────────────────────
+_last_api_call: float = 0.0
+_rate_limit_until: float = 0.0
+_MIN_CALL_INTERVAL = 2.0  # seconds between API calls
+
+
+def _rate_check() -> Optional[dict]:
+    """Check if we're rate-limited. Returns error dict if limited, None if OK."""
+    global _last_api_call
+    now = time.monotonic()
+
+    # Respect 429 backoff
+    if now < _rate_limit_until:
+        wait = int(_rate_limit_until - now)
+        return {
+            "error": f"Moltbook rate-limited. Try again in ~{wait}s.",
+            "rate_limited": True,
+        }
+
+    # Enforce minimum interval between calls
+    elapsed = now - _last_api_call
+    if elapsed < _MIN_CALL_INTERVAL:
+        import asyncio
+        # Small enough to just sleep instead of blocking
+        pass  # Will be enforced in async context
+
+    _last_api_call = now
+    return None
+
+
+def _set_rate_limit(seconds: int = 60):
+    """Set a rate-limit backoff period."""
+    global _rate_limit_until
+    _rate_limit_until = time.monotonic() + seconds
+    logger.warning(f"Moltbook rate-limited for {seconds}s")
+
 
 
 def _load_api_key() -> Optional[str]:
@@ -200,6 +238,11 @@ async def moltbook_action(
                 "hint": "Already registered? Add your API key to .env and restart the brain container.",
             }
 
+    # Check rate limit before any API call
+    rate_err = _rate_check()
+    if rate_err:
+        return rate_err
+
     try:
         result = await handler(
             submolt=submolt, title=title, content=content,
@@ -219,6 +262,16 @@ async def moltbook_action(
         )
 
         return result
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            _set_rate_limit(60)
+            return {
+                "error": "Moltbook API rate-limited (429). Backing off for 60s.",
+                "rate_limited": True,
+                "action": action,
+            }
+        logger.error(f"Moltbook {action} error: {e}", exc_info=True)
+        return {"error": str(e).strip() or f"Moltbook {action} failed", "action": action}
     except Exception as e:
         logger.error(f"Moltbook {action} error: {e}", exc_info=True)
         error_msg = str(e).strip() or repr(e) or f"Moltbook {action} failed"

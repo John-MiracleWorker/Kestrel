@@ -257,12 +257,27 @@ class CloudProvider:
         if system_instruction:
             payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
 
-        # Retry loop for transient errors (503 high demand)
+        # Retry loop for transient errors (503 high demand, 429 rate limit)
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 async with httpx.AsyncClient(timeout=120) as client:
                     async with client.stream("POST", url, json=payload) as resp:
+                        # Handle 429 quota exhaustion — fail fast if quota is at 0
+                        if resp.status_code == 429:
+                            error_body = await resp.aread()
+                            error_text = error_body.decode('utf-8', errors='replace')
+                            if 'limit: 0' in error_text or 'quota' in error_text.lower():
+                                logger.error(f"Google API quota exhausted: {error_text[:300]}")
+                                raise Exception(
+                                    "Gemini API quota exhausted (daily limit reached). "
+                                    "Wait for quota reset or check billing at https://ai.google.dev/gemini-api/docs/rate-limits"
+                                )
+                            if attempt < max_retries - 1:
+                                logger.warning(f"Google API 429 (attempt {attempt+1}/{max_retries}), retrying...")
+                                await asyncio.sleep(2 ** attempt + 1)
+                                continue
+                            raise Exception(f"Google API rate limited after {max_retries} attempts")
                         if resp.status_code == 503 and attempt < max_retries - 1:
                             error_body = await resp.aread()
                             logger.warning(f"Google API 503 (attempt {attempt+1}/{max_retries}), retrying...")

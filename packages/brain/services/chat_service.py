@@ -254,6 +254,10 @@ class ChatServicerMixin(BaseServicerMixin):
             import agent.tools.moltbook as _moltbook_mod
             _moltbook_mod._current_workspace_id = workspace_id
 
+            # Set workspace context for MCP tools
+            import agent.tools.mcp as _mcp_mod
+            _mcp_mod._current_workspace_id = workspace_id
+
             # Set context for schedule tool (cron jobs)
             import agent.tools.schedule as _schedule_mod
             _schedule_mod._cron_scheduler = runtime.cron_scheduler

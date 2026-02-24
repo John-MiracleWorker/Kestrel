@@ -20,6 +20,9 @@ from agent.types import RiskLevel, ToolDefinition
 
 logger = logging.getLogger("brain.agent.tools.mcp")
 
+# Module-level workspace context — set by chat_service before each task
+_current_workspace_id: Optional[str] = None
+
 # ── Known MCP Server Registries ───────────────────────────────────────
 # These are public sources of MCP server metadata.
 MCP_REGISTRIES = [
@@ -202,8 +205,11 @@ def register_mcp_tools(registry, pool=None) -> None:
         env_vars: str = "",
     ) -> dict:
         """Install/register an MCP server for this workspace."""
+        workspace_id = workspace_id or _current_workspace_id or ""
         if not pool:
             return {"success": False, "error": "No database connection available"}
+        if not workspace_id:
+            return {"success": False, "error": "No workspace_id available. Cannot install MCP server."}
 
         config = {}
         if env_vars:
@@ -250,8 +256,11 @@ def register_mcp_tools(registry, pool=None) -> None:
 
     async def mcp_list(workspace_id: str = "") -> dict:
         """List all installed MCP servers for a workspace."""
+        workspace_id = workspace_id or _current_workspace_id or ""
         if not pool:
             return {"installed": [], "error": "No database connection"}
+        if not workspace_id:
+            return {"installed": [], "error": "No workspace_id available."}
 
         try:
             async with pool.acquire() as conn:
@@ -283,8 +292,11 @@ def register_mcp_tools(registry, pool=None) -> None:
 
     async def mcp_uninstall(name: str, workspace_id: str = "") -> dict:
         """Uninstall/remove an MCP server from the workspace."""
+        workspace_id = workspace_id or _current_workspace_id or ""
         if not pool:
             return {"success": False, "error": "No database connection"}
+        if not workspace_id:
+            return {"success": False, "error": "No workspace_id available."}
 
         try:
             async with pool.acquire() as conn:
