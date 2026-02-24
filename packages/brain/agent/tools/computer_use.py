@@ -147,7 +147,7 @@ async def _call_gemini_computer_use(
     # Build the computer use tool config
     computer_use_tool: dict[str, Any] = {
         "computerUse": {
-            "environment": "ENVIRONMENT_SCREEN",
+            "environment": "ENVIRONMENT_BROWSER",
         }
     }
     if excluded_actions:
