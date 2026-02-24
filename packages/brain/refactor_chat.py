@@ -13,8 +13,8 @@ import json
 import logging
 import base64
 import httpx as _httpx
-from core.prompts import KESTREL_DEFAULT_SYSTEM_PROMPT
-from db import get_messages
+from db import get_pool, get_redis
+from crud import get_messages
 
 logger = logging.getLogger("brain.services.context")
 

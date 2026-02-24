@@ -19,6 +19,26 @@ from agent.tools.project_context import (
 
 logger = logging.getLogger("brain.agent.tools.host_files")
 
+# Explicitly export underscore-prefixed names for `from .utils import *`
+# (Python's wildcard import skips _-prefixed names by default)
+__all__ = [
+    "BLOCKED_PATHS",
+    "BLOCKED_EXTENSIONS",
+    "PROJECT_MARKERS",
+    "TREE_SKIP_DIRS",
+    "_get_host_mounts",
+    "_HOST_MOUNT_ROOT",
+    "_CONTAINER_MOUNT_POINT",
+    "_host_to_container_path",
+    "_container_to_host_path",
+    "_is_blocked_path",
+    "_resolve_host_path",
+    "_host_file_info",
+    # OrderedDict caches used by submodules
+    "_tree_cache",
+    "_read_cache",
+]
+
 BLOCKED_PATHS = frozenset([
     ".ssh",
     ".gnupg",
@@ -53,6 +73,10 @@ def _get_host_mounts() -> list[str]:
 _HOST_MOUNT_ROOT = os.getenv("HOST_MOUNT_ROOT", "/Users")
 
 _CONTAINER_MOUNT_POINT = "/host_fs"
+
+# Shared caches (imported by explore.py and read.py via wildcard)
+_tree_cache: OrderedDict = OrderedDict()
+_read_cache: OrderedDict = OrderedDict()
 
 def _host_to_container_path(host_path: str) -> Path:
     """Translate a host-absolute path to the container-internal path.

@@ -4,6 +4,7 @@ import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { requireAuth, requireWorkspace } from '../auth/middleware';
 import { BrainClient } from '../brain/client';
 import { logger } from '../utils/logger';
+import { getPool } from '../db/pool';
 
 interface AutomationDeps {
     brainClient: BrainClient;
@@ -370,7 +371,14 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
     // CAPABILITIES
     // ══════════════════════════════════════════════════════════════════
 
-    // Get all agent capability statuses
+    /**
+     * Helper: slugify capability name into a stable id.
+     *   "Memory Graph" → "memory-graph"
+     */
+    const toCapId = (name: string): string =>
+        name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+    // Get all agent capability statuses (merged with workspace prefs)
     typedApp.get('/api/workspaces/:workspaceId/capabilities', {
         preHandler: [requireAuth, requireWorkspace],
         schema: { params: workspaceParamsSchema }
@@ -378,11 +386,96 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
         const { workspaceId } = req.params as WorkspaceParams;
 
         try {
+            // 1. Get capabilities from brain runtime
             const result = await brainClient.getCapabilities(workspaceId);
-            return { capabilities: result.capabilities || [] };
+            const brainCaps: any[] = result.capabilities || [];
+
+            // 2. Get workspace preferences from DB
+            const { rows: prefs } = await getPool().query(
+                'SELECT capability_id, installed, enabled FROM workspace_capabilities WHERE workspace_id = $1',
+                [workspaceId]
+            );
+            const prefMap = new Map<string, { installed: boolean; enabled: boolean }>();
+            for (const row of prefs) {
+                prefMap.set(row.capability_id, { installed: row.installed, enabled: row.enabled });
+            }
+
+            // 3. Merge
+            const capabilities = brainCaps.map((cap: any) => {
+                const id = toCapId(cap.name);
+                const pref = prefMap.get(id);
+                return {
+                    id,
+                    name: cap.name,
+                    description: cap.description || '',
+                    status: cap.status || 'disabled',
+                    category: cap.category || '',
+                    icon: cap.icon || '⚡',
+                    stats: cap.stats || {},
+                    installed: pref ? pref.installed : (cap.status === 'active'),
+                    enabled: pref ? pref.enabled : (cap.status === 'active'),
+                };
+            });
+
+            return { capabilities };
         } catch (err: any) {
             logger.error('Get capabilities failed', { error: err.message });
             return { capabilities: [] };
+        }
+    });
+
+    const capabilityParamsSchema = z.object({
+        workspaceId: z.string(),
+        capId: z.string(),
+    });
+    type CapabilityParams = z.infer<typeof capabilityParamsSchema>;
+
+    // Install a capability for this workspace
+    typedApp.post('/api/workspaces/:workspaceId/capabilities/:capId/install', {
+        preHandler: [requireAuth, requireWorkspace],
+        schema: { params: capabilityParamsSchema }
+    }, async (req, reply) => {
+        const { workspaceId, capId } = req.params as CapabilityParams;
+
+        try {
+            await getPool().query(
+                `INSERT INTO workspace_capabilities (workspace_id, capability_id, installed, enabled, installed_at, updated_at)
+                 VALUES ($1, $2, TRUE, TRUE, NOW(), NOW())
+                 ON CONFLICT (workspace_id, capability_id) DO UPDATE SET
+                     installed = TRUE, enabled = TRUE, installed_at = COALESCE(workspace_capabilities.installed_at, NOW()), updated_at = NOW()`,
+                [workspaceId, capId]
+            );
+            return { success: true, capId, installed: true, enabled: true };
+        } catch (err: any) {
+            logger.error('Install capability failed', { error: err.message, capId });
+            return reply.status(500).send({ error: err.message });
+        }
+    });
+
+    // Toggle (enable/disable) an installed capability
+    typedApp.patch('/api/workspaces/:workspaceId/capabilities/:capId', {
+        preHandler: [requireAuth, requireWorkspace],
+        schema: {
+            params: capabilityParamsSchema,
+            body: z.object({ enabled: z.boolean() }),
+        }
+    }, async (req, reply) => {
+        const { workspaceId, capId } = req.params as CapabilityParams;
+        const { enabled } = req.body as { enabled: boolean };
+
+        try {
+            const result = await getPool().query(
+                `UPDATE workspace_capabilities SET enabled = $3, updated_at = NOW()
+                 WHERE workspace_id = $1 AND capability_id = $2`,
+                [workspaceId, capId, enabled]
+            );
+            if (result.rowCount === 0) {
+                return reply.status(404).send({ error: 'Capability not installed' });
+            }
+            return { success: true, capId, enabled };
+        } catch (err: any) {
+            logger.error('Toggle capability failed', { error: err.message, capId });
+            return reply.status(500).send({ error: err.message });
         }
     });
 }

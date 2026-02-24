@@ -18,7 +18,8 @@ class ConversationServicerMixin(BaseServicerMixin):
                 id=c["id"],
                 title=c["title"],
                 created_at=c["createdAt"],
-                updated_at=c["updatedAt"]
+                updated_at=c["updatedAt"],
+                channel=c.get("channel", "web"),
             ) for c in raw_convos
         ]
         return brain_pb2.ListConversationsResponse(conversations=conversations)

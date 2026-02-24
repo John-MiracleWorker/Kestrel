@@ -69,10 +69,12 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
 
     // --- Loading config ---
     useEffect(() => {
-        request(`/workspaces/${workspaceId}/config`)
+        // 1. Provider configs (model, API key, temperature, etc.)
+        request(`/workspaces/${workspaceId}/providers`)
             .then((data: any) => {
-                if (data.providers) setProviderConfigs(data.providers);
-                const defaultProv = data.providers?.find((p: any) => p.isDefault || p.is_default);
+                const configs = data.configs || data.providers || [];
+                setProviderConfigs(configs);
+                const defaultProv = configs.find((p: any) => p.isDefault || p.is_default);
                 if (defaultProv) {
                     setSelectedProvider(defaultProv.provider);
                     setModel(defaultProv.model || '');
@@ -82,49 +84,67 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                     setRagEnabled(defaultProv.ragEnabled ?? defaultProv.rag_enabled ?? true);
                     setRagTopK(defaultProv.ragTopK || defaultProv.rag_top_k || 5);
                     setRagMinSimilarity(defaultProv.ragMinSimilarity || defaultProv.rag_min_similarity || 0.7);
-                }
-                if (data.agent) {
-                    setDisabledTools(new Set(data.agent.disabledTools || data.agent.disabled_tools || []));
-                    setMaxIterations(data.agent.maxIterations || data.agent.max_iterations || 30);
-                    setMaxToolCalls(data.agent.maxToolCalls || data.agent.max_tool_calls || 100);
-                    setMaxWallTime(data.agent.maxWallTime || data.agent.max_wall_time || 600);
-                    setAutoApproveRisk(data.agent.autoApproveRisk || data.agent.auto_approve_risk || 'high');
+                    // API key: gRPC keepCase returns api_key_encrypted
+                    const hasKey = !!(defaultProv.apiKeyEncrypted || defaultProv.api_key_encrypted);
+                    setApiKeyInput(hasKey ? DISPLAY_MASK : '');
                 }
             })
             .catch(err => setError(err.message));
 
+        // 2. Capabilities
         request(`/workspaces/${workspaceId}/capabilities`)
             .then((data: any) => setCapabilities(data.capabilities || []))
             .catch(err => console.error('Capabilities fail', err));
 
-        request(`/workspaces/${workspaceId}/integrations`)
+        // 3. Integration status (telegram, discord — runtime state)
+        request(`/workspaces/${workspaceId}/integrations/status`)
             .then((data: any) => {
                 const tg = data.telegram || {};
-                setTelegramEnabled(tg.enabled || false);
-                setTelegramToken(tg.token || '');
+                setTelegramEnabled(tg.connected || false);
+                setTelegramToken(tg.tokenConfigured ? DISPLAY_MASK : '');
                 const dc = data.discord || {};
-                setDiscordEnabled(dc.enabled || false);
-                setDiscordToken(dc.token || '');
-                const wh = data.webhooks || {};
-                setWebhookUrl(wh.url || '');
-                setWebhookSecret(wh.secret || '');
-                setWebhookEvents(wh.events || []);
-                const pr = data.pr_reviews || {};
-                setPrEnabled(pr.enabled || false);
-                setPrAutoApprove(pr.auto_approve || false);
-                setPrPostComments(pr.post_comments ?? true);
-                setPrSeverityFilter(pr.severity_filter || 'all');
-                const cron = data.cron || {};
-                setCronEnabled(cron.enabled || false);
-                setCronSchedule(cron.schedule || '0 * * * *');
-                setCronMaxRuns(cron.max_runs || 3);
-                setCronSystemPrompt(cron.system_prompt || '');
+                setDiscordEnabled(dc.connected || false);
+                setDiscordToken(dc.tokenConfigured ? DISPLAY_MASK : '');
             })
-            .catch(err => console.error('Integrations config parse fail', err));
+            .catch(err => console.error('Integrations status fail', err));
+
+        // 4. Workspace settings (agent guardrails, cron, webhooks, PR reviews)
+        request(`/workspaces/${workspaceId}/settings`)
+            .then((data: any) => {
+                // Agent guardrails
+                if (data.agent) {
+                    setDisabledTools(new Set(data.agent.disabledTools || []));
+                    setMaxIterations(data.agent.maxIterations ?? 30);
+                    setMaxToolCalls(data.agent.maxToolCalls ?? 100);
+                    setMaxWallTime(data.agent.maxWallTime ?? 600);
+                    setAutoApproveRisk(data.agent.autoApproveRisk || 'high');
+                }
+                // Cron / Automation
+                if (data.cron) {
+                    setCronEnabled(data.cron.enabled ?? false);
+                    setCronSchedule(data.cron.schedule || '0 * * * *');
+                    setCronMaxRuns(data.cron.maxRuns ?? 3);
+                    setCronSystemPrompt(data.cron.systemPrompt || '');
+                }
+                // Webhooks
+                if (data.webhooks) {
+                    setWebhookUrl(data.webhooks.url || '');
+                    setWebhookSecret(data.webhooks.secret || '');
+                    setWebhookEvents(data.webhooks.events || []);
+                }
+                // PR Reviews
+                if (data.prReviews) {
+                    setPrEnabled(data.prReviews.enabled ?? false);
+                    setPrAutoApprove(data.prReviews.autoApprove ?? false);
+                    setPrPostComments(data.prReviews.postComments ?? true);
+                    setPrSeverityFilter(data.prReviews.severityFilter || 'all');
+                }
+            })
+            .catch(err => console.error('Workspace settings fail', err));
     }, [workspaceId]);
 
     useEffect(() => {
-        request(`/models?provider=${selectedProvider}`)
+        request(`/workspaces/${workspaceId}/providers/${selectedProvider}/models`)
             .then((data: any) => setAvailableModels(data.models || []))
             .catch(() => setAvailableModels([]));
 
@@ -133,7 +153,8 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
             setModel(conf.model || '');
             setTemperature(conf.temperature ?? 0.7);
             setMaxTokens(conf.maxTokens || conf.max_tokens || 2048);
-            setApiKeyInput(conf.apiKeyEncrypted ? DISPLAY_MASK : '');
+            const hasKey = !!(conf.apiKeyEncrypted || conf.api_key_encrypted);
+            setApiKeyInput(hasKey ? DISPLAY_MASK : '');
         } else {
             setModel(''); setApiKeyInput('');
         }
@@ -148,31 +169,50 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
         setError(null);
         setSaveStatus(null);
         try {
+            // 1. Save provider config (model, API key, temperature, etc.)
             const apiReq = apiKeyInput && apiKeyInput !== DISPLAY_MASK ? { apiKey: apiKeyInput } : {};
-            await request(`/workspaces/${workspaceId}/config`, {
-                method: 'PATCH',
+            await request(`/workspaces/${workspaceId}/providers/${selectedProvider}`, {
+                method: 'PUT',
                 body: {
-                    provider: selectedProvider,
                     model, temperature, maxTokens, systemPrompt,
                     ragEnabled, ragTopK, ragMinSimilarity,
                     isDefault: true, ...apiReq,
-                    agent: {
-                        disabledTools: Array.from(disabledTools),
-                        maxIterations, maxToolCalls, maxWallTime, autoApproveRisk
-                    }
                 }
             });
 
-            await request(`/workspaces/${workspaceId}/integrations`, {
-                method: 'PATCH',
+            // 2. Save workspace settings (agent, cron, webhooks, PR reviews)
+            await request(`/workspaces/${workspaceId}/settings`, {
+                method: 'PUT',
                 body: {
-                    telegram: { enabled: telegramEnabled, token: telegramToken },
-                    discord: { enabled: discordEnabled, token: discordToken },
-                    webhooks: { enabled: !!webhookUrl, url: webhookUrl, secret: webhookSecret, events: webhookEvents },
-                    pr_reviews: { enabled: prEnabled, auto_approve: prAutoApprove, post_comments: prPostComments, severity_filter: prSeverityFilter },
-                    cron: { enabled: cronEnabled, schedule: cronSchedule, max_runs: cronMaxRuns, system_prompt: cronSystemPrompt },
+                    agent: {
+                        disabledTools: [...disabledTools],
+                        maxIterations, maxToolCalls, maxWallTime, autoApproveRisk,
+                    },
+                    cron: {
+                        enabled: cronEnabled, schedule: cronSchedule,
+                        maxRuns: cronMaxRuns, systemPrompt: cronSystemPrompt,
+                    },
+                    webhooks: {
+                        url: webhookUrl, secret: webhookSecret, events: webhookEvents,
+                    },
+                    prReviews: {
+                        enabled: prEnabled, autoApprove: prAutoApprove,
+                        postComments: prPostComments, severityFilter: prSeverityFilter,
+                    },
                 }
             });
+
+            // 3. Save Telegram if token was updated (not masked)
+            if (telegramToken && telegramToken !== DISPLAY_MASK) {
+                try {
+                    await request(`/workspaces/${workspaceId}/integrations/telegram`, {
+                        method: 'POST',
+                        body: { token: telegramToken, enabled: telegramEnabled },
+                    });
+                } catch (err: any) {
+                    console.error('Telegram save failed', err);
+                }
+            }
 
             setSaveStatus('Settings applied successfully');
             setTimeout(() => setSaveStatus(null), 3000);

@@ -12,8 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY packages/brain/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy shared proto files
+# Copy shared proto files and tool catalog
 COPY packages/shared/proto/ ../shared/proto/
+COPY packages/shared/tool-catalog.json ../shared/tool-catalog.json
 
 # Copy brain source
 COPY packages/brain/ .

@@ -197,6 +197,7 @@ message ConversationResponse {
   string title = 2;
   string created_at = 3;
   string updated_at = 4;
+  string channel = 5;   // "web", "telegram", "discord", etc.
 }
 
 message ListConversationsResponse {

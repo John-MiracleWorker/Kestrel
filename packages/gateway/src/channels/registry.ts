@@ -101,6 +101,10 @@ export class ChannelRegistry {
     /**
      * Route an incoming message to Brain for LLM processing,
      * then stream the response back through the originating adapter.
+     *
+     * If the adapter supports streaming (sendStreamStart/Update/End),
+     * tokens are forwarded progressively. Otherwise, the response
+     * is accumulated and sent as a single final message.
      */
     private async routeMessage(adapter: BaseChannelAdapter, msg: IncomingMessage): Promise<void> {
         const channel = adapter.channelType;
@@ -142,6 +146,8 @@ export class ChannelRegistry {
         if (msg.attachments?.length) {
             parameters.attachments = JSON.stringify(msg.attachments);
         }
+        // Pass channel type so Brain can tag conversations correctly
+        parameters.channel = channel;
 
         // Stream response from Brain
         try {
@@ -155,49 +161,12 @@ export class ChannelRegistry {
                 parameters,
             });
 
-            let fullContent = '';
-
-            for await (const chunk of stream) {
-                switch (chunk.type) {
-                    case 'CONTENT_DELTA':
-                        fullContent += chunk.content_delta || '';
-                        break;
-
-                    case 'DONE': {
-                        // Store the conversation ID so subsequent messages reuse it
-                        const returnedConvId = chunk.conversation_id || chunk.metadata?.conversation_id;
-                        const finalConvId = returnedConvId || useConversationId;
-                        if (finalConvId && msg.conversationId) {
-                            this.knownConversations.set(conversationKey, finalConvId);
-                        }
-
-                        // Send complete response back through the channel
-                        if (fullContent) {
-                            const outgoing: OutgoingMessage = {
-                                conversationId: returnedConvId || msg.conversationId || '',
-                                content: fullContent,
-                                options: { markdown: true },
-                            };
-
-                            // Let the adapter format the message for its platform
-                            const formatted = adapter.formatOutgoing(outgoing);
-                            await adapter.send(msg.userId, formatted);
-                        }
-                        break;
-                    }
-
-                    case 'ERROR':
-                        logger.error('Brain error during routing', {
-                            channel,
-                            userId: msg.userId,
-                            error: chunk.error_message,
-                        });
-                        await adapter.send(msg.userId, {
-                            conversationId: msg.conversationId || '',
-                            content: 'Sorry, something went wrong. Please try again.',
-                        });
-                        break;
-                }
+            // ── Streaming path (Telegram, Discord, etc.) ─────────────
+            if (adapter.supportsStreaming) {
+                await this.routeWithStreaming(adapter, msg, stream, conversationKey, useConversationId);
+            } else {
+                // ── Accumulate path (legacy adapters) ────────────────
+                await this.routeWithAccumulate(adapter, msg, stream, conversationKey, useConversationId);
             }
         } catch (err) {
             logger.error('Failed to route message through Brain', {
@@ -210,6 +179,185 @@ export class ChannelRegistry {
                 conversationId: msg.conversationId || '',
                 content: 'Sorry, I couldn\'t process your message. Please try again later.',
             });
+        }
+    }
+
+    /**
+     * Stream response progressively via adapter's streaming interface.
+     * Throttles updates to respect platform rate limits.
+     */
+    private async routeWithStreaming(
+        adapter: BaseChannelAdapter,
+        msg: IncomingMessage,
+        stream: AsyncIterable<any>,
+        conversationKey: string,
+        useConversationId: string,
+    ): Promise<void> {
+        const FLUSH_INTERVAL_MS = 1500; // Telegram: ~1 edit/sec max
+
+        // Start streaming — sends "Thinking..." placeholder
+        const handle = await adapter.sendStreamStart!(msg.userId, {
+            conversationId: msg.conversationId || '',
+        });
+
+        let fullContent = '';
+        let lastFlushLen = 0;
+        let flushTimer: NodeJS.Timeout | undefined;
+        let flushPromise: Promise<void> = Promise.resolve();
+
+        const scheduleFlush = () => {
+            if (flushTimer) return;
+            flushTimer = setTimeout(async () => {
+                flushTimer = undefined;
+                if (fullContent.length > lastFlushLen) {
+                    lastFlushLen = fullContent.length;
+                    try {
+                        flushPromise = adapter.sendStreamUpdate!(handle, fullContent);
+                        await flushPromise;
+                    } catch (err) {
+                        logger.warn('Stream update failed', { error: (err as Error).message });
+                    }
+                }
+            }, FLUSH_INTERVAL_MS);
+        };
+
+        // gRPC protobuf enum map
+        const enumMap: Record<string, number> = {
+            'CONTENT_DELTA': 0, 'TOOL_CALL': 1, 'DONE': 2, 'ERROR': 3,
+        };
+
+        for await (const chunk of stream) {
+            const chunkType = typeof chunk.type === 'number' ? chunk.type :
+                (enumMap[chunk.type as string] ?? -1);
+
+            switch (chunkType) {
+                case 0: // CONTENT_DELTA
+                    if (chunk.metadata?.agent_status && !chunk.content_delta) {
+                        // Forward tool activity as a separate notification
+                        if (adapter.sendToolActivity && chunk.metadata.agent_status !== 'routing_info') {
+                            try {
+                                await adapter.sendToolActivity(msg.userId, handle, {
+                                    status: chunk.metadata.agent_status,
+                                    toolName: chunk.metadata.tool_name || '',
+                                    toolArgs: chunk.metadata.tool_args || '',
+                                    toolResult: chunk.metadata.tool_result || '',
+                                    thinking: chunk.metadata.thinking || '',
+                                });
+                            } catch (err) {
+                                logger.debug('Tool activity send failed', { error: (err as Error).message });
+                            }
+                        }
+                    } else if (chunk.content_delta) {
+                        fullContent += chunk.content_delta;
+                        scheduleFlush();
+                    }
+                    break;
+
+                case 2: { // DONE
+                    // Cancel pending timer
+                    if (flushTimer) {
+                        clearTimeout(flushTimer);
+                        flushTimer = undefined;
+                    }
+                    // Wait for any in-flight update to finish
+                    await flushPromise;
+
+                    const returnedConvId = chunk.conversation_id || chunk.metadata?.conversation_id;
+                    const finalConvId = returnedConvId || useConversationId;
+                    if (finalConvId && msg.conversationId) {
+                        this.knownConversations.set(conversationKey, finalConvId);
+                    }
+
+                    // Send final content
+                    if (fullContent) {
+                        try {
+                            await adapter.sendStreamEnd!(handle, fullContent);
+                        } catch (err) {
+                            // Fallback: send as regular message if edit fails
+                            logger.warn('Stream end failed, sending regular message', { error: (err as Error).message });
+                            await adapter.send(msg.userId, {
+                                conversationId: msg.conversationId || '',
+                                content: fullContent,
+                                options: { markdown: true },
+                            });
+                        }
+                    }
+                    break;
+                }
+
+                case 3: // ERROR
+                    if (flushTimer) {
+                        clearTimeout(flushTimer);
+                        flushTimer = undefined;
+                    }
+                    logger.error('Brain error during streaming route', {
+                        channel: adapter.channelType,
+                        userId: msg.userId,
+                        error: chunk.error_message,
+                    });
+                    await adapter.send(msg.userId, {
+                        conversationId: msg.conversationId || '',
+                        content: 'Sorry, something went wrong. Please try again.',
+                    });
+                    break;
+            }
+        }
+
+        // Safety: clean up timer if stream ended without DONE
+        if (flushTimer) {
+            clearTimeout(flushTimer);
+        }
+    }
+
+    /**
+     * Accumulate full response and send once (legacy behavior).
+     */
+    private async routeWithAccumulate(
+        adapter: BaseChannelAdapter,
+        msg: IncomingMessage,
+        stream: AsyncIterable<any>,
+        conversationKey: string,
+        useConversationId: string,
+    ): Promise<void> {
+        let fullContent = '';
+
+        for await (const chunk of stream) {
+            switch (chunk.type) {
+                case 'CONTENT_DELTA':
+                    fullContent += chunk.content_delta || '';
+                    break;
+
+                case 'DONE': {
+                    const returnedConvId = chunk.conversation_id || chunk.metadata?.conversation_id;
+                    const finalConvId = returnedConvId || useConversationId;
+                    if (finalConvId && msg.conversationId) {
+                        this.knownConversations.set(conversationKey, finalConvId);
+                    }
+
+                    if (fullContent) {
+                        const outgoing: OutgoingMessage = {
+                            conversationId: returnedConvId || msg.conversationId || '',
+                            content: fullContent,
+                            options: { markdown: true },
+                        };
+                        const formatted = adapter.formatOutgoing(outgoing);
+                        await adapter.send(msg.userId, formatted);
+                    }
+                    break;
+                }
+
+                case 'ERROR':
+                    logger.error('Brain error during routing', {
+                        channel: adapter.channelType,
+                        userId: msg.userId,
+                        error: chunk.error_message,
+                    });
+                    await adapter.send(msg.userId, {
+                        conversationId: msg.conversationId || '',
+                        content: 'Sorry, something went wrong. Please try again.',
+                    });
+                    break;
+            }
         }
     }
 

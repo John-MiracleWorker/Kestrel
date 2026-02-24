@@ -5,6 +5,8 @@ import {
     IncomingMessage,
     OutgoingMessage,
     Attachment,
+    StreamHandle,
+    ToolActivity,
 } from '../base';
 import { logger } from '../../utils/logger';
 import { TelegramConfig, TelegramUpdate, TelegramMessage, TelegramUser, TelegramChat } from './types';
@@ -209,6 +211,163 @@ export class TelegramAdapter extends BaseChannelAdapter {
             case 'file':
                 await this.api('sendDocument', { chat_id: chatId, document: attachment.url });
                 break;
+        }
+    }
+
+    // ── Live Streaming Interface ────────────────────────────────────
+    // These methods are detected by registry.ts to enable progressive
+    // response updates instead of waiting for the full response.
+
+    /**
+     * Send a "Thinking..." placeholder and return a handle for
+     * subsequent edits. The handle's chatContext carries the
+     * Telegram chat ID so we can edit the right message.
+     */
+    async sendStreamStart(userId: string, meta: { conversationId: string }): Promise<StreamHandle> {
+        const chatId = this.chatIdMap.get(userId);
+        if (!chatId) throw new Error(`No chat ID mapped for user ${userId}`);
+
+        // Send placeholder
+        const result = await this.api('sendMessage', {
+            chat_id: chatId,
+            text: '🤔 Thinking...',
+        });
+
+        // Start typing indicator (continues while streaming)
+        this.startTyping(chatId);
+
+        return {
+            messageId: String(result.message_id),
+            chatContext: { chatId },
+        };
+    }
+
+    /**
+     * Edit the placeholder message with the latest accumulated content.
+     * Called on a throttled interval (~1.5s) by the registry.
+     */
+    async sendStreamUpdate(handle: StreamHandle, accumulatedContent: string): Promise<void> {
+        const chatId = handle.chatContext.chatId as number;
+        // Append a blinking cursor to show it's still generating
+        const display = accumulatedContent.length > 4000
+            ? accumulatedContent.slice(-4000) + '▌'
+            : accumulatedContent + ' ▌';
+        try {
+            await this.api('editMessageText', {
+                chat_id: chatId,
+                message_id: Number(handle.messageId),
+                text: display,
+                parse_mode: 'Markdown',
+                disable_web_page_preview: true,
+            });
+        } catch (err) {
+            // Telegram returns "message is not modified" if text is identical — ignore
+            const msg = (err as Error).message || '';
+            if (!msg.includes('message is not modified')) {
+                // Retry without Markdown (some partial content may break parsing)
+                try {
+                    await this.api('editMessageText', {
+                        chat_id: chatId,
+                        message_id: Number(handle.messageId),
+                        text: display.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, ''),
+                    });
+                } catch { /* best effort */ }
+            }
+        }
+    }
+
+    /**
+     * Finalize the streaming message with the complete content.
+     * Removes the cursor indicator and applies full Markdown.
+     */
+    async sendStreamEnd(handle: StreamHandle, finalContent: string): Promise<void> {
+        const chatId = handle.chatContext.chatId as number;
+
+        // Stop typing
+        this.stopTyping(chatId);
+
+        // If content is short enough, just edit the existing message
+        if (finalContent.length <= 4000) {
+            try {
+                await this.api('editMessageText', {
+                    chat_id: chatId,
+                    message_id: Number(handle.messageId),
+                    text: finalContent,
+                    parse_mode: 'Markdown',
+                    disable_web_page_preview: true,
+                });
+            } catch {
+                // Retry without markdown
+                try {
+                    await this.api('editMessageText', {
+                        chat_id: chatId,
+                        message_id: Number(handle.messageId),
+                        text: finalContent,
+                    });
+                } catch { /* best effort */ }
+            }
+            return;
+        }
+
+        // Content too long for a single message — delete the streaming
+        // message and send as chunked messages instead
+        try {
+            await this.api('deleteMessage', {
+                chat_id: chatId,
+                message_id: Number(handle.messageId),
+            });
+        } catch { /* ignore */ }
+
+        await this.sendToChat(chatId, {
+            conversationId: '',
+            content: finalContent,
+            options: { markdown: true },
+        });
+    }
+
+    /**
+     * Send tool activity as a separate short message.
+     * Uses emoji indicators for different activity types.
+     */
+    async sendToolActivity(userId: string, handle: StreamHandle, activity: ToolActivity): Promise<void> {
+        const chatId = handle.chatContext.chatId as number;
+
+        let emoji = '⚡';
+        let text = '';
+
+        switch (activity.status) {
+            case 'tool_start':
+                emoji = '🔧';
+                text = `Using **${activity.toolName}**...`;
+                break;
+            case 'tool_end':
+                // Skip end events to avoid spam
+                return;
+            case 'thinking':
+                emoji = '💭';
+                text = activity.thinking
+                    ? `${activity.thinking.slice(0, 120)}${activity.thinking.length > 120 ? '...' : ''}`
+                    : 'Thinking...';
+                break;
+            case 'waiting_approval':
+                emoji = '⏳';
+                text = `Needs approval: **${activity.toolName}**`;
+                // Approval requests might be handled separately via sendApprovalRequest
+                // but this ensures visibility even if that path isn't triggered
+                break;
+            default:
+                text = `${activity.status}: ${activity.toolName || 'processing'}`;
+        }
+
+        try {
+            await this.api('sendMessage', {
+                chat_id: chatId,
+                text: `${emoji} ${text}`,
+                parse_mode: 'Markdown',
+                disable_notification: true,
+            });
+        } catch {
+            // Best effort — don't break streaming for a status message
         }
     }
 

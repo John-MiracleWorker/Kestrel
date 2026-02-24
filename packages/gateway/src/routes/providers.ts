@@ -4,6 +4,7 @@ import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { requireAuth, requireWorkspace, requireRole } from '../auth/middleware';
 import { BrainClient } from '../brain/client';
 import { logger } from '../utils/logger';
+import { getPool } from '../db/pool';
 import Redis from 'ioredis';
 
 interface ProviderDeps {
@@ -275,6 +276,59 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
                     tools: [],
                     stale: true,
                 });
+            }
+        }
+    );
+
+    // ══════════════════════════════════════════════════════════════════
+    // WORKSPACE SETTINGS (catch-all JSONB for agent, automation, etc.)
+    // ══════════════════════════════════════════════════════════════════
+
+    // GET — load workspace settings
+    typedApp.get(
+        '/api/workspaces/:workspaceId/settings',
+        {
+            preHandler: [requireAuth, requireWorkspace],
+            schema: { params: workspaceParamsSchema },
+        },
+        async (req) => {
+            const { workspaceId } = req.params as WorkspaceParams;
+            try {
+                const { rows } = await getPool().query(
+                    'SELECT settings FROM workspace_settings WHERE workspace_id = $1',
+                    [workspaceId]
+                );
+                return rows.length > 0 ? rows[0].settings : {};
+            } catch (err: any) {
+                logger.error('Get workspace settings failed', { error: err.message });
+                return {};
+            }
+        }
+    );
+
+    // PUT — save workspace settings (deep-merges with existing)
+    typedApp.put(
+        '/api/workspaces/:workspaceId/settings',
+        {
+            preHandler: [requireAuth, requireWorkspace],
+            schema: { params: workspaceParamsSchema },
+        },
+        async (req) => {
+            const { workspaceId } = req.params as WorkspaceParams;
+            const body = req.body as Record<string, any>;
+            try {
+                await getPool().query(
+                    `INSERT INTO workspace_settings (workspace_id, settings, updated_at)
+                     VALUES ($1, $2, NOW())
+                     ON CONFLICT (workspace_id) DO UPDATE SET
+                         settings = workspace_settings.settings || $2,
+                         updated_at = NOW()`,
+                    [workspaceId, JSON.stringify(body)]
+                );
+                return { success: true };
+            } catch (err: any) {
+                logger.error('Save workspace settings failed', { error: err.message });
+                return { error: err.message };
             }
         }
     );

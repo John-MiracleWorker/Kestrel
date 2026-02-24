@@ -342,8 +342,27 @@ export function Sidebar({
                                     }}
                                 />
                             ) : (
-                                <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: '6px' }}>
                                     {conv.title || 'untitled_process'}
+                                    {conv.channel && conv.channel !== 'web' && (
+                                        <span style={{
+                                            fontSize: '0.65rem',
+                                            padding: '1px 5px',
+                                            borderRadius: '3px',
+                                            background: conv.channel === 'telegram'
+                                                ? 'rgba(0, 136, 204, 0.15)'
+                                                : 'rgba(88, 101, 242, 0.15)',
+                                            color: conv.channel === 'telegram'
+                                                ? '#0088cc'
+                                                : '#5865F2',
+                                            border: `1px solid ${conv.channel === 'telegram'
+                                                ? 'rgba(0, 136, 204, 0.25)'
+                                                : 'rgba(88, 101, 242, 0.25)'}`,
+                                            flexShrink: 0,
+                                        }}>
+                                            {conv.channel === 'telegram' ? '✈️' : conv.channel === 'discord' ? '💬' : conv.channel}
+                                        </span>
+                                    )}
                                 </span>
                             )}
 

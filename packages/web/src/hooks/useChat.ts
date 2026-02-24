@@ -299,10 +299,16 @@ export function useChat(
         titleGeneratedRef.current = false;
     }, [conversationId]);
 
-    // Update messages when initialMessages change
+    // Reset messages ONLY when the conversation actually changes —
+    // not when the initialMessages array gets a new reference mid-conversation.
+    const lastConversationRef = useRef<string | null>(null);
     useEffect(() => {
-        setMessages(initialMessages);
-    }, [initialMessages]);
+        const convId = conversationId ?? null;
+        if (convId !== lastConversationRef.current) {
+            lastConversationRef.current = convId;
+            setMessages(initialMessages);
+        }
+    }, [conversationId, initialMessages]);
 
     const sendMessage = useCallback(
         (content: string, provider?: string, model?: string, attachments?: Array<{ url: string; filename: string; mimeType: string; size: number }>) => {

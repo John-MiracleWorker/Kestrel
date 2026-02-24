@@ -413,6 +413,7 @@ export interface Conversation {
     title: string;
     createdAt: string;
     updatedAt: string;
+    channel?: string;  // "web", "telegram", "discord", etc.
 }
 
 export interface Message {

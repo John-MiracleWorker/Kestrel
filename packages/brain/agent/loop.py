@@ -48,6 +48,7 @@ from agent.core.memory_graph import MemoryGraph
 from agent.evidence import EvidenceChain, DecisionType
 from agent.observability import MetricsCollector
 from agent.model_router import ModelRouter, classify_step
+from agent.council import CouncilSession, CouncilRole
 from agent.core.executor import TaskExecutor
 
 logger = logging.getLogger("brain.agent.loop")
@@ -97,6 +98,11 @@ class AgentLoop:
         self._reflection_engine = reflection_engine
         self._model_router = model_router or ModelRouter()
         self._metrics = MetricsCollector(model=model)
+        self._council = CouncilSession(
+            llm_provider=provider,
+            model=model,
+            event_callback=event_callback,
+        )
 
         self._executor = TaskExecutor(
             provider=provider,
@@ -263,6 +269,49 @@ class AgentLoop:
                             )
                     except Exception as e:
                         logger.warning(f"Reflection engine failed: {e}")
+
+                # ── Council Deliberation: Multi-Agent Consensus ─────
+                if hasattr(self, "_council") and self._council and len(task.plan.steps) > 1:
+                    try:
+                        plan_text = json.dumps(task.plan.to_dict())
+                        verdict = await self._council.deliberate(
+                            proposal=plan_text,
+                            context=task.goal,
+                            include_debate=True
+                        )
+                        
+                        if verdict.requires_user_review:
+                            yield TaskEvent(
+                                type=TaskEventType.THINKING,
+                                task_id=task.id,
+                                content=f"⚖️ Council Review Required: {verdict.review_reason}\n\n" +
+                                        "\n".join(f"- {c}" for c in verdict.synthesized_concerns),
+                                progress=self._progress(task),
+                            )
+                            # Pause the loop and ask the user
+                            yield TaskEvent(
+                                type=TaskEventType.APPROVAL_NEEDED,
+                                task_id=task.id,
+                                content=f"The Council is divided or flagged a critical issue. Proceed?",
+                                progress=self._progress(task),
+                            )
+                            # The executor loop below handles the actual blocking/waiting for APPROVAL_NEEDED
+                            task.status = TaskStatus.WAITING_APPROVAL
+                            await self._persistence.update_task(task)
+                            
+                            # Wait for user approval
+                            approved = await self._executor._wait_for_approval(task)
+                            if not approved:
+                                task.status = TaskStatus.FAILED
+                                task.error = "User denied plan after Council review."
+                                await self._persistence.update_task(task)
+                                return
+                                
+                            task.status = TaskStatus.EXECUTING
+                            await self._persistence.update_task(task)
+
+                    except Exception as e:
+                        logger.warning(f"Council deliberation failed: {e}")
 
             # ── Phase 2: Execution Loop ──────────────────────────
             # Guard: if plan is still None (shouldn't happen, but be safe), create fallback

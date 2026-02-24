@@ -133,7 +133,9 @@ class ChatServicerMixin(BaseServicerMixin):
             if conversation_id:
                 # Ensure conversation row exists (external channels like
                 # Telegram generate deterministic IDs without creating rows).
-                channel_name = getattr(request, 'channel', '') or 'web'
+                # Channel is passed in gRPC parameters map by registry.ts
+                params = dict(request.parameters) if hasattr(request, 'parameters') else {}
+                channel_name = params.get('channel', '') or 'web'
                 await ensure_conversation(
                     conversation_id, workspace_id,
                     channel=channel_name,

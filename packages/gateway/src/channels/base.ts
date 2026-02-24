@@ -29,6 +29,26 @@ export interface Button {
 }
 
 /**
+ * Handle for an in-progress streaming message.
+ * Returned by sendStreamStart, passed to update/end.
+ */
+export interface StreamHandle {
+    messageId: string;
+    chatContext: any;
+}
+
+/**
+ * Tool activity event forwarded during streaming.
+ */
+export interface ToolActivity {
+    status: string;
+    toolName: string;
+    toolArgs?: string;
+    toolResult?: string;
+    thinking?: string;
+}
+
+/**
  * Incoming message from any channel — normalized format.
  */
 export interface IncomingMessage {
@@ -65,6 +85,11 @@ export interface OutgoingMessage {
  * Base class for all channel adapters.
  * Subclasses implement connect(), disconnect(), send(), and
  * optionally override handleAttachment() and formatOutgoing().
+ *
+ * For live streaming support, subclasses can implement
+ * sendStreamStart/Update/End/ToolActivity. The registry will
+ * detect these and forward chunks progressively instead of
+ * accumulating to a single final message.
  */
 export abstract class BaseChannelAdapter {
     abstract readonly channelType: ChannelType;
@@ -84,9 +109,39 @@ export abstract class BaseChannelAdapter {
         this.statusHandlers.forEach(h => h(status));
     }
 
+    /** Whether this adapter supports streaming responses. */
+    get supportsStreaming(): boolean {
+        return typeof (this as any).sendStreamStart === 'function';
+    }
+
     abstract connect(): Promise<void>;
     abstract disconnect(): Promise<void>;
     abstract send(userId: string, message: OutgoingMessage): Promise<void>;
+
+    // ── Optional streaming interface ─────────────────────────────
+    // Adapters that implement these methods receive live updates.
+
+    /**
+     * Start a streaming message (e.g. send "Thinking..." placeholder).
+     * Returns a handle used for subsequent updates.
+     */
+    sendStreamStart?(userId: string, meta: { conversationId: string }): Promise<StreamHandle>;
+
+    /**
+     * Update the streaming message with new accumulated content.
+     * Called periodically as tokens arrive (throttled by registry).
+     */
+    sendStreamUpdate?(handle: StreamHandle, accumulatedContent: string): Promise<void>;
+
+    /**
+     * Finalize the streaming message with complete content.
+     */
+    sendStreamEnd?(handle: StreamHandle, finalContent: string): Promise<void>;
+
+    /**
+     * Send a tool activity notification (separate from the main message).
+     */
+    sendToolActivity?(userId: string, handle: StreamHandle, activity: ToolActivity): Promise<void>;
 
     /**
      * Process an attachment for this channel (download, transcode, etc.).

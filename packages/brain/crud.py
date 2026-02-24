@@ -46,7 +46,7 @@ async def create_workspace(user_id: str, name: str) -> dict:
 async def list_conversations(user_id: str, workspace_id: str) -> list:
     pool = await get_pool()
     rows = await pool.fetch(
-        """SELECT id, title, created_at, updated_at
+        """SELECT id, title, channel, created_at, updated_at
            FROM conversations
            WHERE workspace_id = $1
            ORDER BY updated_at DESC LIMIT 50""",
@@ -54,6 +54,7 @@ async def list_conversations(user_id: str, workspace_id: str) -> list:
     )
     return [
         {"id": str(r["id"]), "title": r["title"],
+         "channel": r.get("channel", "web"),
          "createdAt": r["created_at"].isoformat(),
          "updatedAt": r["updated_at"].isoformat()}
         for r in rows
