@@ -7,20 +7,68 @@ from typing import Optional, Union
 
 from providers.local import LocalProvider
 from providers.cloud import CloudProvider
+from providers.ollama import OllamaProvider
 from db import get_pool
 
 logger = logging.getLogger("brain.providers")
 
-_providers: dict[str, Union[LocalProvider, CloudProvider]] = {}
+_providers: dict[str, Union[LocalProvider, CloudProvider, OllamaProvider]] = {}
 
 
 def get_provider(name: str):
     if name not in _providers:
         if name == "local":
             _providers[name] = LocalProvider()
+        elif name == "ollama":
+            _providers[name] = OllamaProvider()
         else:
             _providers[name] = CloudProvider(name)
     return _providers[name]
+
+
+def get_available_providers() -> list[str]:
+    """Return list of provider names that are currently ready."""
+    available = []
+    for name in ("ollama", "google", "openai", "anthropic", "local"):
+        try:
+            p = get_provider(name)
+            if p.is_ready():
+                available.append(name)
+        except Exception:
+            continue
+    return available
+
+
+def resolve_provider(provider_name: str):
+    """
+    Resolve a provider by name with fallback.
+
+    If the requested provider isn't ready, falls back through:
+    ollama → google → openai → anthropic → local
+    """
+    try:
+        p = get_provider(provider_name)
+        if p.is_ready():
+            return p
+    except Exception:
+        pass
+
+    # Fallback chain
+    for fallback in ("ollama", "google", "openai", "anthropic", "local"):
+        if fallback == provider_name:
+            continue
+        try:
+            p = get_provider(fallback)
+            if p.is_ready():
+                logger.info(f"Provider '{provider_name}' unavailable, falling back to '{fallback}'")
+                return p
+        except Exception:
+            continue
+
+    # Last resort — return whatever was requested (will error at call time)
+    logger.warning(f"No providers available, returning '{provider_name}' as-is")
+    return get_provider(provider_name)
+
 
 
 async def list_provider_configs(workspace_id):

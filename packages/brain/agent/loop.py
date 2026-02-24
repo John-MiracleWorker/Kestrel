@@ -114,8 +114,10 @@ class AgentLoop:
         event_callback=None,
         reflection_engine=None,
         model_router: Optional[ModelRouter] = None,
+        provider_resolver=None,
     ):
         self._provider = provider
+        self._provider_resolver = provider_resolver  # callable: (name) -> provider
         self._tools = tool_registry
         self._guardrails = guardrails
         self._persistence = persistence
@@ -982,7 +984,7 @@ class AgentLoop:
         # Get available tools as OpenAI function schemas
         tool_schemas = [t.to_openai_schema() for t in self._tools.list_tools()]
 
-        # Route to optimal model based on step type
+        # Route to optimal model + provider based on step type
         route = self._model_router.select(
             step_description=step.description,
             expected_tools=getattr(step, 'expected_tools', None),
@@ -991,8 +993,22 @@ class AgentLoop:
         routed_temp = route.temperature
         routed_max_tokens = route.max_tokens
 
-        # Call LLM with function calling (using routed model)
-        response = await self._provider.generate_with_tools(
+        # Resolve the provider for this route (multi-provider dispatch)
+        if self._provider_resolver and route.provider:
+            try:
+                active_provider = self._provider_resolver(route.provider)
+            except Exception:
+                active_provider = self._provider
+        else:
+            active_provider = self._provider
+
+        logger.debug(
+            f"Dispatching to {route.provider}:{routed_model} "
+            f"(step={step.description[:50]}...)"
+        )
+
+        # Call LLM with function calling (using routed provider + model)
+        response = await active_provider.generate_with_tools(
             messages=messages,
             model=routed_model,
             tools=tool_schemas,

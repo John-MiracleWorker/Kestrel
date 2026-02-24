@@ -40,7 +40,7 @@
         },
         "packages/brain/brain_pb2.py": { "sig": "1771801511024817532:27840", "issues": [] },
         "packages/brain/server.py": {
-            "sig": "1771887374446982388:104567",
+            "sig": "1771893694220080947:107736",
             "issues": [
                 {
                     "type": "todo",
@@ -57,7 +57,7 @@
                     "package": "brain",
                     "file": "packages/brain/server.py",
                     "line": 1996,
-                    "description": "Function `serve` is 290 lines long \u2014 consider refactoring",
+                    "description": "Function `serve` is 372 lines long \u2014 consider refactoring",
                     "suggestion": "Break `serve` into smaller helper functions"
                 },
                 {
@@ -373,23 +373,64 @@
                 }
             ]
         },
+        "packages/brain/agent/simulation.py": {
+            "sig": "1771893694219861128:10237",
+            "issues": [
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/simulation.py",
+                    "line": 1,
+                    "description": "Potentially unused import: `annotations`",
+                    "suggestion": "Remove unused import `annotations` at line 1"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/simulation.py",
+                    "line": 15,
+                    "description": "Potentially unused import: `Any`",
+                    "suggestion": "Remove unused import `Any` at line 15"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/simulation.py",
+                    "line": 15,
+                    "description": "Potentially unused import: `Optional`",
+                    "suggestion": "Remove unused import `Optional` at line 15"
+                }
+            ]
+        },
         "packages/brain/agent/planner.py": {
-            "sig": "1771279343764956296:8608",
+            "sig": "1771892510754592868:11199",
             "issues": [
                 {
                     "type": "dead_import",
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/agent/planner.py",
-                    "line": 11,
+                    "line": 17,
                     "description": "Potentially unused import: `Optional`",
-                    "suggestion": "Remove unused import `Optional` at line 11"
+                    "suggestion": "Remove unused import `Optional` at line 17"
                 }
             ]
         },
         "packages/brain/agent/council.py": {
-            "sig": "1771801511023640420:19440",
+            "sig": "1771892510753200111:24074",
             "issues": [
+                {
+                    "type": "complexity",
+                    "severity": "medium",
+                    "package": "brain",
+                    "file": "packages/brain/agent/council.py",
+                    "line": 443,
+                    "description": "Function `_synthesize_verdict` is 96 lines long \u2014 consider refactoring",
+                    "suggestion": "Break `_synthesize_verdict` into smaller helper functions"
+                },
                 {
                     "type": "dead_import",
                     "severity": "low",
@@ -539,7 +580,7 @@
             ]
         },
         "packages/brain/agent/skills.py": {
-            "sig": "1771888216670761784:11112",
+            "sig": "1771892515806189176:11112",
             "issues": [
                 {
                     "type": "dead_import",
@@ -576,7 +617,7 @@
             ]
         },
         "packages/brain/agent/memory_graph.py": {
-            "sig": "1771850124639587973:23171",
+            "sig": "1771892510754336826:28816",
             "issues": [
                 {
                     "type": "complexity",
@@ -613,6 +654,29 @@
                     "line": 24,
                     "description": "Potentially unused import: `Optional`",
                     "suggestion": "Remove unused import `Optional` at line 24"
+                }
+            ]
+        },
+        "packages/brain/agent/proactive.py": {
+            "sig": "1771893314323981502:10521",
+            "issues": [
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/proactive.py",
+                    "line": 1,
+                    "description": "Potentially unused import: `annotations`",
+                    "suggestion": "Remove unused import `annotations` at line 1"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/proactive.py",
+                    "line": 17,
+                    "description": "Potentially unused import: `Any`",
+                    "suggestion": "Remove unused import `Any` at line 17"
                 }
             ]
         },
@@ -658,6 +722,29 @@
             ]
         },
         "packages/brain/agent/automation.py": { "sig": "1771726081266613570:17563", "issues": [] },
+        "packages/brain/agent/ui_artifacts.py": {
+            "sig": "1771893316339527023:8641",
+            "issues": [
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/ui_artifacts.py",
+                    "line": 1,
+                    "description": "Potentially unused import: `annotations`",
+                    "suggestion": "Remove unused import `annotations` at line 1"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/ui_artifacts.py",
+                    "line": 15,
+                    "description": "Potentially unused import: `Any`",
+                    "suggestion": "Remove unused import `Any` at line 15"
+                }
+            ]
+        },
         "packages/brain/agent/__init__.py": { "sig": "1771279343760990686:109", "issues": [] },
         "packages/brain/agent/failover.py": {
             "sig": "1771696903925733408:7441",
@@ -705,8 +792,22 @@
                 }
             ]
         },
+        "packages/brain/agent/nl_automation.py": {
+            "sig": "1771893694219682974:8192",
+            "issues": [
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/nl_automation.py",
+                    "line": 1,
+                    "description": "Potentially unused import: `annotations`",
+                    "suggestion": "Remove unused import `annotations` at line 1"
+                }
+            ]
+        },
         "packages/brain/agent/types.py": {
-            "sig": "1771888210765202033:12010",
+            "sig": "1771893085359864611:12163",
             "issues": [
                 {
                     "type": "dead_import",
@@ -766,17 +867,17 @@
                 }
             ]
         },
-        "packages/brain/agent/guardrails.py": { "sig": "1771888213526552354:7938", "issues": [] },
+        "packages/brain/agent/guardrails.py": { "sig": "1771892515805947175:7938", "issues": [] },
         "packages/brain/agent/loop.py": {
-            "sig": "1771850124639460891:38281",
+            "sig": "1771892741484195857:48076",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/loop.py",
-                    "line": 119,
-                    "description": "Function `run` is 388 lines long \u2014 consider refactoring",
+                    "line": 137,
+                    "description": "Function `run` is 393 lines long \u2014 consider refactoring",
                     "suggestion": "Break `run` into smaller helper functions"
                 },
                 {
@@ -784,8 +885,26 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/loop.py",
-                    "line": 508,
-                    "description": "Function `_reason_and_act` is 298 lines long \u2014 consider refactoring",
+                    "line": 583,
+                    "description": "Function `_execute_tools_parallel` is 145 lines long \u2014 consider refactoring",
+                    "suggestion": "Break `_execute_tools_parallel` into smaller helper functions"
+                },
+                {
+                    "type": "complexity",
+                    "severity": "medium",
+                    "package": "brain",
+                    "file": "packages/brain/agent/loop.py",
+                    "line": 729,
+                    "description": "Function `_execute_single_tool` is 159 lines long \u2014 consider refactoring",
+                    "suggestion": "Break `_execute_single_tool` into smaller helper functions"
+                },
+                {
+                    "type": "complexity",
+                    "severity": "medium",
+                    "package": "brain",
+                    "file": "packages/brain/agent/loop.py",
+                    "line": 889,
+                    "description": "Function `_reason_and_act` is 173 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_reason_and_act` into smaller helper functions"
                 },
                 {
@@ -793,45 +912,54 @@
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/agent/loop.py",
-                    "line": 22,
+                    "line": 29,
                     "description": "Potentially unused import: `GuardrailConfig`",
-                    "suggestion": "Remove unused import `GuardrailConfig` at line 22"
+                    "suggestion": "Remove unused import `GuardrailConfig` at line 29"
                 },
                 {
                     "type": "dead_import",
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/agent/loop.py",
-                    "line": 22,
+                    "line": 29,
                     "description": "Potentially unused import: `RiskLevel`",
-                    "suggestion": "Remove unused import `RiskLevel` at line 22"
+                    "suggestion": "Remove unused import `RiskLevel` at line 29"
                 },
                 {
                     "type": "dead_import",
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/agent/loop.py",
-                    "line": 22,
+                    "line": 29,
                     "description": "Potentially unused import: `ToolDefinition`",
-                    "suggestion": "Remove unused import `ToolDefinition` at line 22"
+                    "suggestion": "Remove unused import `ToolDefinition` at line 29"
                 },
                 {
                     "type": "dead_import",
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/agent/loop.py",
-                    "line": 22,
+                    "line": 29,
                     "description": "Potentially unused import: `ToolResult`",
-                    "suggestion": "Remove unused import `ToolResult` at line 22"
+                    "suggestion": "Remove unused import `ToolResult` at line 29"
                 },
                 {
                     "type": "dead_import",
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/agent/loop.py",
-                    "line": 41,
+                    "line": 48,
                     "description": "Potentially unused import: `DecisionType`",
-                    "suggestion": "Remove unused import `DecisionType` at line 41"
+                    "suggestion": "Remove unused import `DecisionType` at line 48"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/loop.py",
+                    "line": 50,
+                    "description": "Potentially unused import: `classify_step`",
+                    "suggestion": "Remove unused import `classify_step` at line 50"
                 }
             ]
         },
@@ -855,6 +983,88 @@
                     "line": 12,
                     "description": "Potentially unused import: `Any`",
                     "suggestion": "Remove unused import `Any` at line 12"
+                }
+            ]
+        },
+        "packages/brain/agent/branching.py": {
+            "sig": "1771893310270414180:9331",
+            "issues": [
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/branching.py",
+                    "line": 1,
+                    "description": "Potentially unused import: `annotations`",
+                    "suggestion": "Remove unused import `annotations` at line 1"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/branching.py",
+                    "line": 12,
+                    "description": "Potentially unused import: `json`",
+                    "suggestion": "Remove unused import `json` at line 12"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/branching.py",
+                    "line": 17,
+                    "description": "Potentially unused import: `Any`",
+                    "suggestion": "Remove unused import `Any` at line 17"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/branching.py",
+                    "line": 17,
+                    "description": "Potentially unused import: `Optional`",
+                    "suggestion": "Remove unused import `Optional` at line 17"
+                }
+            ]
+        },
+        "packages/brain/agent/model_router.py": {
+            "sig": "1771893304224773162:10623",
+            "issues": [
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/model_router.py",
+                    "line": 1,
+                    "description": "Potentially unused import: `annotations`",
+                    "suggestion": "Remove unused import `annotations` at line 1"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/model_router.py",
+                    "line": 17,
+                    "description": "Potentially unused import: `field`",
+                    "suggestion": "Remove unused import `field` at line 17"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/model_router.py",
+                    "line": 19,
+                    "description": "Potentially unused import: `Any`",
+                    "suggestion": "Remove unused import `Any` at line 19"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/model_router.py",
+                    "line": 19,
+                    "description": "Potentially unused import: `Optional`",
+                    "suggestion": "Remove unused import `Optional` at line 19"
                 }
             ]
         },
@@ -904,17 +1114,49 @@
                 }
             ]
         },
+        "packages/brain/agent/daemon.py": {
+            "sig": "1771893308243342893:18977",
+            "issues": [
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/daemon.py",
+                    "line": 1,
+                    "description": "Potentially unused import: `annotations`",
+                    "suggestion": "Remove unused import `annotations` at line 1"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/daemon.py",
+                    "line": 16,
+                    "description": "Potentially unused import: `json`",
+                    "suggestion": "Remove unused import `json` at line 16"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/daemon.py",
+                    "line": 22,
+                    "description": "Potentially unused import: `Any`",
+                    "suggestion": "Remove unused import `Any` at line 22"
+                }
+            ]
+        },
         "packages/brain/agent/learner.py": {
-            "sig": "1771739823372992999:8899",
+            "sig": "1771892510753598072:14630",
             "issues": [
                 {
                     "type": "dead_import",
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/agent/learner.py",
-                    "line": 17,
+                    "line": 26,
                     "description": "Potentially unused import: `Optional`",
-                    "suggestion": "Remove unused import `Optional` at line 17"
+                    "suggestion": "Remove unused import `Optional` at line 26"
                 }
             ]
         },
@@ -988,6 +1230,20 @@
                     "line": 11,
                     "description": "Potentially unused import: `Optional`",
                     "suggestion": "Remove unused import `Optional` at line 11"
+                }
+            ]
+        },
+        "packages/brain/agent/tools/time_travel.py": {
+            "sig": "1771893322444058167:3780",
+            "issues": [
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/tools/time_travel.py",
+                    "line": 1,
+                    "description": "Potentially unused import: `annotations`",
+                    "suggestion": "Remove unused import `annotations` at line 1"
                 }
             ]
         },
@@ -1123,6 +1379,20 @@
                 }
             ]
         },
+        "packages/brain/agent/tools/ui_builder.py": {
+            "sig": "1771893324488574374:4450",
+            "issues": [
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/tools/ui_builder.py",
+                    "line": 1,
+                    "description": "Potentially unused import: `annotations`",
+                    "suggestion": "Remove unused import `annotations` at line 1"
+                }
+            ]
+        },
         "packages/brain/agent/tools/create_skill.py": {
             "sig": "1771279343767183378:2767",
             "issues": []
@@ -1165,7 +1435,7 @@
             ]
         },
         "packages/brain/agent/tools/computer_use.py": {
-            "sig": "1771888520342489465:17333",
+            "sig": "1771892515806400219:17333",
             "issues": [
                 {
                     "type": "complexity",
@@ -1210,6 +1480,20 @@
             "issues": []
         },
         "packages/brain/agent/tools/human.py": { "sig": "1771455928219639139:3511", "issues": [] },
+        "packages/brain/agent/tools/daemon_control.py": {
+            "sig": "1771893320389109117:4757",
+            "issues": [
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/tools/daemon_control.py",
+                    "line": 1,
+                    "description": "Potentially unused import: `annotations`",
+                    "suggestion": "Remove unused import `annotations` at line 1"
+                }
+            ]
+        },
         "packages/brain/agent/tools/host_files.py": {
             "sig": "1771801511024328663:48733",
             "issues": [
@@ -1313,6 +1597,20 @@
         "packages/brain/agent/tools/project_context.py": {
             "sig": "1771769050865964099:8533",
             "issues": []
+        },
+        "packages/brain/agent/tools/build_automation.py": {
+            "sig": "1771893318390717972:3790",
+            "issues": [
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/tools/build_automation.py",
+                    "line": 1,
+                    "description": "Potentially unused import: `annotations`",
+                    "suggestion": "Remove unused import `annotations` at line 1"
+                }
+            ]
         },
         "packages/brain/agent/tools/mcp_client.py": {
             "sig": "1771734484944108597:12965",
@@ -1547,6 +1845,10 @@
             "sig": "1771723058972061665:14591",
             "issues": []
         },
+        "packages/web/src/components/Agent/UIArtifactRenderer.tsx": {
+            "sig": "1771893723012620970:12375",
+            "issues": []
+        },
         "packages/web/src/components/Agent/PlanView.tsx": {
             "sig": "1771279343791530806:2637",
             "issues": []
@@ -1586,7 +1888,11 @@
         "packages/web/src/hooks/useAgent.ts": { "sig": "1771279343793431268:5688", "issues": [] },
         "packages/web/src/hooks/useChat.ts": { "sig": "1771718778057764869:12010", "issues": [] },
         "packages/web/src/hooks/useAuth.tsx": { "sig": "1771279343793660877:2589", "issues": [] },
-        "packages/web/src/api/client.ts": { "sig": "1771801511028507324:17650", "issues": [] },
+        "packages/web/src/hooks/useUIArtifacts.ts": {
+            "sig": "1771893723017995909:1915",
+            "issues": []
+        },
+        "packages/web/src/api/client.ts": { "sig": "1771893722987682918:18796", "issues": [] },
         "packages/hands/server.py": {
             "sig": "1771739628096145335:10684",
             "issues": [

@@ -40,6 +40,7 @@ from crud import (
 from providers_registry import (
     get_provider, list_provider_configs, set_provider_config,
     delete_provider_config, _providers, CloudProvider,
+    resolve_provider, get_available_providers,
 )
 
 load_dotenv()
@@ -756,6 +757,7 @@ class BrainServicer:
                 evidence_chain=evidence_chain,
                 checkpoint_manager=checkpoint_mgr,
                 event_callback=_activity_callback,
+                provider_resolver=resolve_provider,
             )
 
             # Inject persona context into the system prompt if available
@@ -1439,6 +1441,7 @@ class BrainServicer:
             evidence_chain=evidence_chain,
             learner=task_learner,
             reflection_engine=task_reflection,
+            provider_resolver=resolve_provider,
         )
 
         # Register this task as an active session
@@ -2085,7 +2088,7 @@ async def serve():
     from agent.sandbox import SandboxManager
     from agent.checkpoints import CheckpointManager
     # God-tier feature imports
-    from agent.model_router import ModelRouter
+    from agent.model_router import ModelRouter, RoutingStrategy
     from agent.nl_automation import AutomationBuilder
     from agent.daemon import DaemonManager
     from agent.branching import BranchManager
@@ -2103,16 +2106,21 @@ async def serve():
     guardrails = Guardrails()
     _agent_persistence = PostgresTaskPersistence(pool=pool)
 
-    # Feature 1: Adaptive Model Router
+    # Feature 1: Adaptive Model Router with provider-aware routing
+    available = get_available_providers()
+    logger.info(f"Available providers: {available}")
     _model_router = ModelRouter()
-    logger.info("Model router initialized")
+    logger.info(f"Model router initialized (strategy={_model_router._strategy.value})")
 
+    # Pick the best default provider as the baseline
+    _default_provider = resolve_provider("ollama")
     _agent_loop = AgentLoop(
-        provider=get_provider("local"),
+        provider=_default_provider,
         tool_registry=_tool_registry,
         guardrails=guardrails,
         persistence=_agent_persistence,
         model_router=_model_router,
+        provider_resolver=resolve_provider,
     )
     logger.info(f"Agent runtime initialized ({len(_tool_registry._definitions)} tools)")
 
@@ -2271,6 +2279,7 @@ async def serve():
                 guardrails=Guardrails(),
                 persistence=_agent_persistence,
                 memory_graph=_memory_graph,
+                provider_resolver=resolve_provider,
             )
             # Set context for tools used in automated tasks
             import agent.tools.moltbook as _moltbook_mod

@@ -1,19 +1,26 @@
 from __future__ import annotations
 """
-Adaptive Model Router — per-step model selection for cost+quality optimisation.
+Adaptive Model Router — per-step model selection with provider-aware routing.
 
-Routes different step types to different models:
-  - planning    → fast/cheap model (e.g. gemini-2.0-flash)
-  - coding      → powerful model  (e.g. gemini-2.5-pro)
-  - reflection  → fast model
-  - security    → powerful/cautious model
+Routes different step types to different model+provider combinations:
+  - planning    → fast/cheap (Ollama local or cloud flash)
+  - coding      → powerful   (cloud pro or large local model)
+  - reflection  → fast
+  - security    → powerful/cautious (cloud only)
   - general     → workspace default
 
-Supports per-workspace overrides stored in the DB.
+Supports routing strategies:
+  - LOCAL_FIRST  — prefer Ollama, fall back to cloud
+  - CLOUD_FIRST  — prefer cloud, fall back to Ollama
+  - COST_OPTIMIZED — use local for simple tasks, cloud for complex
+  - QUALITY_FIRST — always use most powerful available model
+
+Automatic fallback: if a provider is offline, routes to the next available.
 """
 
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
@@ -36,18 +43,26 @@ class StepType(str, Enum):
     GENERAL = "general"
 
 
+class RoutingStrategy(str, Enum):
+    """How to prioritize providers."""
+    LOCAL_FIRST = "local_first"        # Prefer Ollama → cloud fallback
+    CLOUD_FIRST = "cloud_first"        # Prefer cloud → Ollama fallback
+    COST_OPTIMIZED = "cost_optimized"  # Simple → local, complex → cloud
+    QUALITY_FIRST = "quality_first"    # Always strongest available model
+
+
 # ── Route Configuration ─────────────────────────────────────────────
 
 
 @dataclass
 class ModelRoute:
-    """A routing rule mapping step type to model."""
+    """A routing rule mapping step type to provider + model."""
     step_type: StepType
-    provider: str          # "cloud", "local"
-    model: str             # "gemini-2.0-flash", "gemini-2.5-pro", etc.
+    provider: str          # "ollama", "google", "openai", "anthropic", "local"
+    model: str             # model ID
     temperature: float = 0.7
     max_tokens: int = 4096
-    reason: str = ""       # Why this model was chosen
+    reason: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -62,83 +77,140 @@ class ModelRoute:
 
 # ── Default Routing Table ────────────────────────────────────────────
 
-
 # Environment-driven defaults
-_FAST_MODEL = os.getenv("ROUTER_FAST_MODEL", "gemini-2.0-flash")
-_POWER_MODEL = os.getenv("ROUTER_POWER_MODEL", "gemini-2.5-pro")
-_DEFAULT_PROVIDER = os.getenv("ROUTER_DEFAULT_PROVIDER", "cloud")
+_OLLAMA_MODEL = os.getenv("ROUTER_OLLAMA_MODEL", "qwen3:8b")
+_OLLAMA_LARGE_MODEL = os.getenv("ROUTER_OLLAMA_LARGE_MODEL", "qwen3:32b")
+_CLOUD_FAST_MODEL = os.getenv("ROUTER_CLOUD_FAST_MODEL", "gemini-2.0-flash")
+_CLOUD_POWER_MODEL = os.getenv("ROUTER_CLOUD_POWER_MODEL", "gemini-2.5-pro")
+_DEFAULT_STRATEGY = RoutingStrategy(
+    os.getenv("ROUTER_STRATEGY", RoutingStrategy.LOCAL_FIRST.value)
+)
 
-DEFAULT_ROUTES: dict[StepType, ModelRoute] = {
-    StepType.PLANNING: ModelRoute(
-        step_type=StepType.PLANNING,
-        provider=_DEFAULT_PROVIDER,
-        model=_FAST_MODEL,
-        temperature=0.3,
-        max_tokens=4096,
-        reason="Planning benefits from speed; doesn't need heavy reasoning",
-    ),
-    StepType.CODING: ModelRoute(
-        step_type=StepType.CODING,
-        provider=_DEFAULT_PROVIDER,
-        model=_POWER_MODEL,
-        temperature=0.2,
-        max_tokens=8192,
-        reason="Code generation requires strong reasoning and accuracy",
-    ),
-    StepType.RESEARCH: ModelRoute(
-        step_type=StepType.RESEARCH,
-        provider=_DEFAULT_PROVIDER,
-        model=_FAST_MODEL,
-        temperature=0.5,
-        max_tokens=4096,
-        reason="Research is exploratory; speed matters more than depth",
-    ),
-    StepType.REFLECTION: ModelRoute(
-        step_type=StepType.REFLECTION,
-        provider=_DEFAULT_PROVIDER,
-        model=_FAST_MODEL,
-        temperature=0.4,
-        max_tokens=2048,
-        reason="Reflection is meta-reasoning; fast model is sufficient",
-    ),
-    StepType.SECURITY: ModelRoute(
-        step_type=StepType.SECURITY,
-        provider=_DEFAULT_PROVIDER,
-        model=_POWER_MODEL,
-        temperature=0.1,
-        max_tokens=4096,
-        reason="Security review must be thorough and cautious",
-    ),
-    StepType.DATA_ANALYSIS: ModelRoute(
-        step_type=StepType.DATA_ANALYSIS,
-        provider=_DEFAULT_PROVIDER,
-        model=_POWER_MODEL,
-        temperature=0.3,
-        max_tokens=8192,
-        reason="Data analysis needs precise reasoning",
-    ),
-    StepType.WRITING: ModelRoute(
-        step_type=StepType.WRITING,
-        provider=_DEFAULT_PROVIDER,
-        model=_FAST_MODEL,
-        temperature=0.7,
-        max_tokens=4096,
-        reason="Writing tasks benefit from creativity",
-    ),
-    StepType.GENERAL: ModelRoute(
-        step_type=StepType.GENERAL,
-        provider=_DEFAULT_PROVIDER,
-        model=_FAST_MODEL,
-        temperature=0.7,
-        max_tokens=4096,
-        reason="Default route for uncategorised steps",
-    ),
-}
+# Step types considered "simple" (can run on local models)
+_SIMPLE_STEPS = {StepType.PLANNING, StepType.REFLECTION, StepType.WRITING, StepType.GENERAL}
+# Step types considered "complex" (benefit from powerful models)
+_COMPLEX_STEPS = {StepType.CODING, StepType.SECURITY, StepType.DATA_ANALYSIS, StepType.RESEARCH}
+
+
+def _build_routes(strategy: RoutingStrategy) -> dict[StepType, ModelRoute]:
+    """Build routing table based on strategy."""
+
+    if strategy == RoutingStrategy.LOCAL_FIRST:
+        return {
+            StepType.PLANNING: ModelRoute(
+                StepType.PLANNING, "ollama", _OLLAMA_MODEL,
+                temperature=0.3, max_tokens=4096,
+                reason="Planning is fast; local model is sufficient",
+            ),
+            StepType.CODING: ModelRoute(
+                StepType.CODING, "ollama", _OLLAMA_LARGE_MODEL,
+                temperature=0.2, max_tokens=8192,
+                reason="Code gen with largest local model for quality",
+            ),
+            StepType.RESEARCH: ModelRoute(
+                StepType.RESEARCH, "ollama", _OLLAMA_MODEL,
+                temperature=0.5, max_tokens=4096,
+                reason="Research is exploratory; local model handles it",
+            ),
+            StepType.REFLECTION: ModelRoute(
+                StepType.REFLECTION, "ollama", _OLLAMA_MODEL,
+                temperature=0.4, max_tokens=2048,
+                reason="Meta-reasoning; fast local model is fine",
+            ),
+            StepType.SECURITY: ModelRoute(
+                StepType.SECURITY, "google", _CLOUD_POWER_MODEL,
+                temperature=0.1, max_tokens=4096,
+                reason="Security review needs maximum accuracy → cloud",
+            ),
+            StepType.DATA_ANALYSIS: ModelRoute(
+                StepType.DATA_ANALYSIS, "ollama", _OLLAMA_LARGE_MODEL,
+                temperature=0.3, max_tokens=8192,
+                reason="Data analysis with large local model",
+            ),
+            StepType.WRITING: ModelRoute(
+                StepType.WRITING, "ollama", _OLLAMA_MODEL,
+                temperature=0.7, max_tokens=4096,
+                reason="Writing benefits from creativity; local is fine",
+            ),
+            StepType.GENERAL: ModelRoute(
+                StepType.GENERAL, "ollama", _OLLAMA_MODEL,
+                temperature=0.7, max_tokens=4096,
+                reason="Default: local model for uncategorized steps",
+            ),
+        }
+
+    elif strategy == RoutingStrategy.CLOUD_FIRST:
+        return {
+            StepType.PLANNING: ModelRoute(
+                StepType.PLANNING, "google", _CLOUD_FAST_MODEL,
+                temperature=0.3, max_tokens=4096,
+                reason="Cloud flash for fast planning",
+            ),
+            StepType.CODING: ModelRoute(
+                StepType.CODING, "google", _CLOUD_POWER_MODEL,
+                temperature=0.2, max_tokens=8192,
+                reason="Strongest cloud model for code generation",
+            ),
+            StepType.RESEARCH: ModelRoute(
+                StepType.RESEARCH, "google", _CLOUD_FAST_MODEL,
+                temperature=0.5, max_tokens=4096,
+                reason="Cloud flash for fast research",
+            ),
+            StepType.REFLECTION: ModelRoute(
+                StepType.REFLECTION, "google", _CLOUD_FAST_MODEL,
+                temperature=0.4, max_tokens=2048,
+                reason="Fast cloud model for reflection",
+            ),
+            StepType.SECURITY: ModelRoute(
+                StepType.SECURITY, "google", _CLOUD_POWER_MODEL,
+                temperature=0.1, max_tokens=4096,
+                reason="Maximum accuracy for security",
+            ),
+            StepType.DATA_ANALYSIS: ModelRoute(
+                StepType.DATA_ANALYSIS, "google", _CLOUD_POWER_MODEL,
+                temperature=0.3, max_tokens=8192,
+                reason="Strong reasoning for data analysis",
+            ),
+            StepType.WRITING: ModelRoute(
+                StepType.WRITING, "google", _CLOUD_FAST_MODEL,
+                temperature=0.7, max_tokens=4096,
+                reason="Cloud flash for writing tasks",
+            ),
+            StepType.GENERAL: ModelRoute(
+                StepType.GENERAL, "google", _CLOUD_FAST_MODEL,
+                temperature=0.7, max_tokens=4096,
+                reason="Default: cloud flash for general tasks",
+            ),
+        }
+
+    elif strategy == RoutingStrategy.COST_OPTIMIZED:
+        # Simple steps → local, complex steps → cloud
+        routes = {}
+        for st in StepType:
+            if st in _SIMPLE_STEPS:
+                routes[st] = ModelRoute(
+                    st, "ollama", _OLLAMA_MODEL,
+                    temperature=0.5, max_tokens=4096,
+                    reason=f"Cost-optimized: {st.value} runs locally",
+                )
+            else:
+                routes[st] = ModelRoute(
+                    st, "google", _CLOUD_POWER_MODEL,
+                    temperature=0.3, max_tokens=8192,
+                    reason=f"Cost-optimized: {st.value} needs cloud quality",
+                )
+        return routes
+
+    else:  # QUALITY_FIRST
+        return {st: ModelRoute(
+            st, "google", _CLOUD_POWER_MODEL,
+            temperature=0.3, max_tokens=8192,
+            reason="Quality-first: always use strongest model",
+        ) for st in StepType}
 
 
 # ── Step Type Classifier ─────────────────────────────────────────────
 
-# Keywords that signal a step type (checked against step description + tool hints)
 _STEP_TYPE_SIGNALS: dict[StepType, list[str]] = {
     StepType.CODING: [
         "code", "implement", "write function", "refactor", "debug", "fix bug",
@@ -173,7 +245,6 @@ _STEP_TYPE_SIGNALS: dict[StepType, list[str]] = {
 def classify_step(description: str, expected_tools: list[str] = None) -> StepType:
     """
     Classify a step by examining its description and tool hints.
-
     Uses keyword matching (fast, no LLM call). Falls back to GENERAL.
     """
     text = description.lower()
@@ -197,29 +268,90 @@ def classify_step(description: str, expected_tools: list[str] = None) -> StepTyp
 
 class ModelRouter:
     """
-    Routes agent loop steps to the optimal model+provider combination.
+    Routes agent steps to the optimal model+provider combination.
+
+    Unlike the previous version, this router is provider-aware:
+    - It selects which provider (ollama, google, openai, etc.) to use
+    - It checks provider availability before returning a route
+    - It falls back automatically if a provider is offline
 
     Usage:
-        router = ModelRouter()
+        router = ModelRouter(strategy=RoutingStrategy.LOCAL_FIRST)
         route = router.select(step_description, expected_tools)
-        # route.provider, route.model, route.temperature, route.max_tokens
+        provider = resolve_provider(route.provider)
+        response = await provider.generate_with_tools(model=route.model, ...)
     """
 
     def __init__(
         self,
+        strategy: RoutingStrategy = None,
         custom_routes: dict[StepType, ModelRoute] = None,
-        fallback_provider: str = "",
-        fallback_model: str = "",
+        provider_checker=None,  # callable: (name) -> bool
     ):
-        self._routes = dict(DEFAULT_ROUTES)
+        self._strategy = strategy or _DEFAULT_STRATEGY
+        self._routes = _build_routes(self._strategy)
         if custom_routes:
             self._routes.update(custom_routes)
 
-        self._fallback_provider = fallback_provider or _DEFAULT_PROVIDER
-        self._fallback_model = fallback_model or _FAST_MODEL
+        # Optional: inject a function that checks if a provider is available
+        # Defaults to checking via providers_registry at runtime
+        self._provider_checker = provider_checker
 
         # Stats for cost tracking
         self._route_counts: dict[StepType, int] = {}
+        self._fallback_counts: dict[str, int] = {}
+
+        logger.info(f"ModelRouter initialized with strategy={self._strategy.value}")
+
+    def _is_provider_available(self, name: str) -> bool:
+        """Check if a provider is currently available."""
+        if self._provider_checker:
+            return self._provider_checker(name)
+        try:
+            from providers_registry import get_provider
+            return get_provider(name).is_ready()
+        except Exception:
+            return False
+
+    def _find_fallback(self, original_provider: str, route: ModelRoute) -> ModelRoute:
+        """Find a working fallback provider for a route."""
+        # Define fallback chains depending on original provider
+        if original_provider == "ollama":
+            fallbacks = [
+                ("google", _CLOUD_FAST_MODEL),
+                ("openai", "gpt-5-mini"),
+                ("anthropic", "claude-haiku-4-5"),
+            ]
+        else:
+            # Cloud provider unavailable → try Ollama first, then other clouds
+            fallbacks = [
+                ("ollama", _OLLAMA_MODEL),
+                ("google", _CLOUD_FAST_MODEL),
+                ("openai", "gpt-5-mini"),
+                ("anthropic", "claude-haiku-4-5"),
+            ]
+
+        for fb_provider, fb_model in fallbacks:
+            if fb_provider == original_provider:
+                continue
+            if self._is_provider_available(fb_provider):
+                self._fallback_counts[fb_provider] = self._fallback_counts.get(fb_provider, 0) + 1
+                logger.info(
+                    f"Fallback: {original_provider} → {fb_provider} "
+                    f"for {route.step_type.value}"
+                )
+                return ModelRoute(
+                    step_type=route.step_type,
+                    provider=fb_provider,
+                    model=fb_model,
+                    temperature=route.temperature,
+                    max_tokens=route.max_tokens,
+                    reason=f"fallback from {original_provider}",
+                )
+
+        # No fallback available — return original and let it fail at call time
+        logger.warning(f"No fallback available for {original_provider}")
+        return route
 
     def select(
         self,
@@ -228,42 +360,49 @@ class ModelRouter:
         step_type: StepType = None,
     ) -> ModelRoute:
         """
-        Select the best model for a step.
+        Select the best model+provider for a step.
 
-        Args:
-            step_description: Natural language step description.
-            expected_tools: Tool names the step might use.
-            step_type: Override — skip classification if you already know.
-
-        Returns:
-            ModelRoute with provider, model, temperature, max_tokens.
+        Returns a ModelRoute with provider, model, temperature, max_tokens.
+        If the target provider is offline, automatically falls back.
         """
         if step_type is None:
             step_type = classify_step(step_description, expected_tools)
 
         route = self._routes.get(step_type, self._routes[StepType.GENERAL])
 
+        # Check availability and fall back if needed
+        if not self._is_provider_available(route.provider):
+            route = self._find_fallback(route.provider, route)
+
         # Track usage
         self._route_counts[step_type] = self._route_counts.get(step_type, 0) + 1
 
         logger.debug(
-            f"Routed step to {route.model} ({step_type.value}): "
-            f"{step_description[:80]}..."
+            f"Routed [{step_type.value}] → {route.provider}:{route.model} "
+            f"(temp={route.temperature}) | {step_description[:60]}..."
         )
         return route
 
     def override(self, step_type: StepType, route: ModelRoute) -> None:
         """Override a specific route (e.g. from workspace config)."""
         self._routes[step_type] = route
-        logger.info(f"Route override: {step_type.value} → {route.model}")
+        logger.info(f"Route override: {step_type.value} → {route.provider}:{route.model}")
+
+    def set_strategy(self, strategy: RoutingStrategy) -> None:
+        """Change routing strategy and rebuild routes."""
+        self._strategy = strategy
+        self._routes = _build_routes(strategy)
+        logger.info(f"Routing strategy changed to {strategy.value}")
 
     def get_stats(self) -> dict:
-        """Return routing statistics for observability."""
+        """Return routing + fallback statistics for observability."""
         return {
-            st.value: count
-            for st, count in sorted(
-                self._route_counts.items(), key=lambda x: -x[1]
-            )
+            "routes": {
+                st.value: count
+                for st, count in sorted(self._route_counts.items(), key=lambda x: -x[1])
+            },
+            "fallbacks": dict(self._fallback_counts),
+            "strategy": self._strategy.value,
         }
 
     def get_config(self) -> list[dict]:
@@ -300,8 +439,4 @@ class ModelRouter:
                     f"Loaded {len(rows)} workspace routing overrides for {workspace_id}"
                 )
         except Exception as e:
-            # Table might not exist yet — that's fine
             logger.debug(f"No routing overrides loaded: {e}")
-"""
-Adaptive Model Router — per-step model selection for cost+quality optimisation.
-"""
