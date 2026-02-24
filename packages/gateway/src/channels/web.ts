@@ -257,6 +257,10 @@ export class WebChannelAdapter extends BaseChannelAdapter {
                                             toolArgs: chunk.metadata.tool_args || '',
                                             toolResult: chunk.metadata.tool_result || '',
                                             thinking: chunk.metadata.thinking || '',
+                                            activity: chunk.metadata.activity || '',
+                                            // Delegation panel fields
+                                            delegationType: chunk.metadata.delegation_type || '',
+                                            delegation: chunk.metadata.delegation || '',
                                             messageId,
                                         }));
                                     }

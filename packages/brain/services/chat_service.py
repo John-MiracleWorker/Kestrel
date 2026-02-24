@@ -292,28 +292,20 @@ class ChatServicerMixin(BaseServicerMixin):
                 status = data.get("status", "")
                 prefix = f"[{specialist}] " if specialist else ""
 
-                if activity_type == "delegation_started":
-                    text = f"\n🔀 **Delegating to {specialist}**: {data.get('goal', '')[:150]}\n\n"
-                    await output_queue.put(self._make_response(chunk_type=0, content_delta=text))
-                elif activity_type == "delegation_progress":
-                    if status == "thinking":
-                        text = f"💭 {prefix}*{data.get('thinking', '')[:120]}*\n"
-                        await output_queue.put(self._make_response(chunk_type=0, content_delta=text))
-                    elif status == "tool_calling":
-                        tool = data.get("tool", "tool")
-                        text = f"⚡ {prefix}Using **{tool}**...\n"
-                        await output_queue.put(self._make_response(chunk_type=0, content_delta=text))
-                    elif status == "tool_result":
-                        tool = data.get("tool", "tool")
-                        result_preview = (data.get("tool_result", "") or "")[:150].replace('\n', ' ')
-                        text = f"✓ {prefix}{tool}: {result_preview}\n\n"
-                        await output_queue.put(self._make_response(chunk_type=0, content_delta=text))
-                    elif status == "step_done":
-                        pass  # Don't duplicate step content
-                elif activity_type == "delegation_complete":
-                    status_icon = "✅" if data.get("status") == "complete" else "❌"
-                    text = f"\n{status_icon} {prefix}Delegation complete\n\n"
-                    await output_queue.put(self._make_response(chunk_type=0, content_delta=text))
+                if activity_type in (
+                    "delegation_started", "delegation_progress",
+                    "delegation_complete", "parallel_delegation_started",
+                    "parallel_delegation_complete",
+                ):
+                    # Send as structured metadata for the AgentDebatePanel
+                    await output_queue.put(self._make_response(
+                        chunk_type=0,
+                        metadata={
+                            "agent_status": "delegation",
+                            "delegation_type": activity_type,
+                            "delegation": json.dumps(data),
+                        },
+                    ))
                 elif activity_type == "routing_info":
                     # Forward model routing info to the frontend
                     await output_queue.put(self._make_response(

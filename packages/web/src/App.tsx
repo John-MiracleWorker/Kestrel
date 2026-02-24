@@ -158,6 +158,7 @@ export default function App() {
                 content={streamingMessage?.content}
                 toolActivity={streamingMessage?.toolActivity}
                 agentActivities={streamingMessage?.agentActivities}
+                delegationEvents={streamingMessage?.delegationEvents}
             />
 
             {showSettings && (

@@ -3,6 +3,8 @@
  * Shows agent phase, tool activity, memory recalls, confidence, token stats.
  */
 import { useState, useMemo, useEffect, useRef } from 'react';
+import { AgentDebatePanel } from './AgentDebatePanel';
+import type { DelegationEvent } from '../../hooks/useChat';
 
 // ── Types ────────────────────────────────────────────────────────────
 interface ToolActivityData {
@@ -25,6 +27,7 @@ export interface LiveCanvasProps {
     content?: string;
     toolActivity?: ToolActivityData | null;
     agentActivities?: AgentActivity[];
+    delegationEvents?: DelegationEvent[];
 }
 
 // ── Phase Detection ──────────────────────────────────────────────────
@@ -75,6 +78,7 @@ export function LiveCanvas({
     content = '',
     toolActivity,
     agentActivities,
+    delegationEvents,
 }: LiveCanvasProps) {
     const [toolHistory, setToolHistory] = useState<ToolHistoryEntry[]>([]);
     const [startTime, setStartTime] = useState<number | null>(null);
@@ -229,6 +233,11 @@ export function LiveCanvas({
                         <Stat label="WORDS" value={String(wordCount)} />
                     </div>
                 </HudPanel>
+
+                {/* ── Agent Debate Panel ───────────────────────────────── */}
+                {delegationEvents && delegationEvents.length > 0 && (
+                    <AgentDebatePanel events={delegationEvents} />
+                )}
 
                 {/* ── Tool Activity Panel ──────────────────────────────── */}
                 <HudPanel title="TOOL ACTIVITY" accent="#f59e0b" count={toolHistory.length}>
@@ -407,6 +416,16 @@ export function LiveCanvas({
                 @keyframes pulse {
                     0%, 100% { opacity: 1; }
                     50% { opacity: 0.4; }
+                }
+                @keyframes slideIn {
+                    from {
+                        opacity: 0;
+                        transform: translateX(-10px);
+                    }
+                    to {
+                        opacity: 1;
+                        transform: translateX(0);
+                    }
                 }
             `}</style>
         </div>

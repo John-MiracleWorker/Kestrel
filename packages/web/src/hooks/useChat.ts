@@ -15,6 +15,23 @@ interface ToolActivity {
     activity?: AgentActivity;
 }
 
+export interface DelegationEvent {
+    type: string;  // delegation_started, delegation_progress, etc.
+    specialist: string;
+    status?: string;  // thinking, tool_calling, tool_result, step_done, complete, failed
+    goal?: string;
+    tools?: string[];
+    tool?: string;
+    toolArgs?: string;
+    toolResult?: string;
+    thinking?: string;
+    content?: string;
+    result?: string;
+    count?: number;
+    subtasks?: Array<{ goal: string; specialist: string }>;
+    timestamp: number;
+}
+
 export interface RoutingInfo {
     provider: string;
     model: string;
@@ -29,6 +46,7 @@ interface StreamingMessage {
     isStreaming: boolean;
     toolActivity?: ToolActivity | null;
     agentActivities?: AgentActivity[];
+    delegationEvents?: DelegationEvent[];
     routingInfo?: RoutingInfo | null;
 }
 
@@ -63,6 +81,7 @@ export function useChat(
     const wsRef = useRef<WebSocket | null>(null);
     const contentRef = useRef('');
     const activitiesRef = useRef<AgentActivity[]>([]);
+    const delegationEventsRef = useRef<DelegationEvent[]>([]);
     const routingInfoRef = useRef<RoutingInfo | null>(null);
     const reconnectAttemptRef = useRef(0);
     const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -96,6 +115,9 @@ export function useChat(
                 model?: string;
                 wasEscalated?: boolean;
                 complexity?: number;
+                delegationType?: string;
+                delegation?: string;
+                activity?: string;
             };
 
             switch (data.type) {
@@ -131,12 +153,50 @@ export function useChat(
                     break;
 
                 case 'tool_activity': {
+                    // Check if this is a delegation event (for AgentDebatePanel)
+                    const isDelegation = data.status === 'delegation' && data.delegationType;
+                    if (isDelegation) {
+                        try {
+                            const delegationData = JSON.parse(data.delegation || '{}');
+                            const evt: DelegationEvent = {
+                                type: data.delegationType!,
+                                specialist: delegationData.specialist || '',
+                                status: delegationData.status,
+                                goal: delegationData.goal,
+                                tools: delegationData.tools,
+                                tool: delegationData.tool,
+                                toolArgs: delegationData.tool_args,
+                                toolResult: delegationData.tool_result,
+                                thinking: delegationData.thinking,
+                                content: delegationData.content,
+                                result: delegationData.result,
+                                count: delegationData.count,
+                                subtasks: delegationData.subtasks,
+                                timestamp: Date.now(),
+                            };
+                            delegationEventsRef.current = [...delegationEventsRef.current, evt];
+                        } catch {
+                            /* ignore parse errors */
+                        }
+                        setStreamingMessage((prev) => ({
+                            id: prev?.id || data.messageId || 'streaming',
+                            role: 'assistant',
+                            content: prev?.content || contentRef.current || '',
+                            isStreaming: true,
+                            toolActivity: prev?.toolActivity ?? null,
+                            agentActivities: [...activitiesRef.current],
+                            delegationEvents: [...delegationEventsRef.current],
+                            routingInfo: prev?.routingInfo ?? routingInfoRef.current,
+                        }));
+                        break;
+                    }
+
                     // Check if this is an agent_activity event (council/coordinator/reflection)
                     const isAgentActivity = data.status === 'agent_activity';
                     if (isAgentActivity) {
                         try {
                             const activityData = JSON.parse(
-                                String((data as Record<string, unknown>).activity || '{}'),
+                                String(data.activity || '{}'),
                             ) as AgentActivity;
                             activitiesRef.current = [...activitiesRef.current, activityData];
                         } catch {
@@ -158,6 +218,7 @@ export function useChat(
                                 thinking: data.thinking,
                             },
                         agentActivities: [...activitiesRef.current],
+                        delegationEvents: [...delegationEventsRef.current],
                         routingInfo: prev?.routingInfo ?? routingInfoRef.current,
                     }));
                     break;
@@ -212,6 +273,7 @@ export function useChat(
                     setStreamingMessage(null);
                     contentRef.current = '';
                     activitiesRef.current = [];
+                    delegationEventsRef.current = [];
                     routingInfoRef.current = null;
                     break;
 
