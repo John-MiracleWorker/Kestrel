@@ -24,15 +24,25 @@ interface AgentState {
 
 // ── Specialist Colors & Emojis ───────────────────────────────────────
 const SPECIALIST_THEME: Record<string, { emoji: string; color: string; label: string }> = {
+    // Coordinator specialists
     'Researcher': { emoji: '🔬', color: '#f59e0b', label: 'RESEARCHER' },
     'Coder': { emoji: '💻', color: '#3b82f6', label: 'CODER' },
     'Data Analyst': { emoji: '📊', color: '#8b5cf6', label: 'ANALYST' },
     'Reviewer': { emoji: '🔍', color: '#ec4899', label: 'REVIEWER' },
     'Code Explorer': { emoji: '🗺️', color: '#10b981', label: 'EXPLORER' },
+    // Council roles
+    'safety': { emoji: '🛡️', color: '#ef4444', label: 'SAFETY' },
+    'ethics': { emoji: '⚖️', color: '#f59e0b', label: 'ETHICS' },
+    'pragmatism': { emoji: '🔧', color: '#10b981', label: 'PRAGMATISM' },
+    'innovation': { emoji: '💡', color: '#8b5cf6', label: 'INNOVATION' },
+    'engineering': { emoji: '⚙️', color: '#3b82f6', label: 'ENGINEERING' },
+    'science': { emoji: '🧪', color: '#06b6d4', label: 'SCIENCE' },
+    'mysticism': { emoji: '✨', color: '#c084fc', label: 'MYSTICISM' },
+    'existentialism': { emoji: '🌌', color: '#6366f1', label: 'EXISTENTIALISM' },
 };
 
 function getTheme(specialist: string) {
-    return SPECIALIST_THEME[specialist] || { emoji: '🤖', color: '#00f3ff', label: specialist.toUpperCase() };
+    return SPECIALIST_THEME[specialist] || SPECIALIST_THEME[specialist.toLowerCase()] || { emoji: '🤖', color: '#00f3ff', label: specialist.toUpperCase() };
 }
 
 // ── Status Badge Colors ──────────────────────────────────────────────
@@ -82,8 +92,14 @@ export function AgentDebatePanel({ events }: AgentDebatePanelProps) {
 
         for (const evt of events.slice(Object.keys(agents).length > 0 ? -5 : 0)) {
             const name = evt.specialist;
-            if (!name && evt.type !== 'parallel_delegation_started' && evt.type !== 'parallel_delegation_complete') continue;
+            if (!name
+                && evt.type !== 'parallel_delegation_started'
+                && evt.type !== 'parallel_delegation_complete'
+                && evt.type !== 'council_started'
+                && evt.type !== 'council_verdict'
+            ) continue;
 
+            // ── Coordinator events ──────────────────────────────
             if (evt.type === 'parallel_delegation_started') {
                 setTotalAgents(evt.count || 0);
                 // Pre-create agents from subtasks
@@ -103,8 +119,66 @@ export function AgentDebatePanel({ events }: AgentDebatePanelProps) {
                 continue;
             }
 
+            // ── Council events ──────────────────────────────────
+            if (evt.type === 'council_started') {
+                // Pre-create agents from roles
+                const councilRoles = evt.roles || [];
+                setTotalAgents(evt.count || councilRoles.length);
+                councilRoles.forEach((role: string) => {
+                    if (!agentMap[role]) {
+                        agentMap[role] = {
+                            specialist: role,
+                            status: 'thinking',
+                            goal: evt.goal,
+                            toolHistory: [],
+                            spawnTime: Date.now(),
+                        };
+                    }
+                });
+                continue;
+            }
+
+            if (evt.type === 'council_opinion') {
+                if (!name) continue;
+                if (!agentMap[name]) {
+                    agentMap[name] = {
+                        specialist: name,
+                        status: 'thinking',
+                        toolHistory: [],
+                        spawnTime: Date.now(),
+                    };
+                }
+                // Council opinion = agent completed their evaluation
+                agentMap[name].status = 'complete';
+                agentMap[name].lastThinking = evt.thinking; // analysis mapped to thinking
+                agentMap[name].result = `${evt.status?.toUpperCase() || 'VOTE'}: ${evt.thinking || ''}`;
+                continue;
+            }
+
+            if (evt.type === 'council_debate') {
+                // Mark all council agents as in-debate
+                Object.values(agentMap).forEach((a) => {
+                    if (a.status !== 'complete' && a.status !== 'failed') {
+                        a.status = 'thinking';
+                        a.lastThinking = evt.thinking || 'Cross-critiquing other positions...';
+                    }
+                });
+                continue;
+            }
+
+            if (evt.type === 'council_verdict') {
+                // Mark all as complete
+                Object.values(agentMap).forEach((a) => {
+                    if (a.status !== 'failed') {
+                        a.status = 'complete';
+                    }
+                });
+                continue;
+            }
+
             if (!name) continue;
 
+            // ── Standard delegation events ──────────────────────
             if (evt.type === 'delegation_started') {
                 agentMap[name] = {
                     specialist: name,

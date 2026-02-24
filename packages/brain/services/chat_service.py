@@ -296,6 +296,8 @@ class ChatServicerMixin(BaseServicerMixin):
                     "delegation_started", "delegation_progress",
                     "delegation_complete", "parallel_delegation_started",
                     "parallel_delegation_complete",
+                    "council_started", "council_opinion",
+                    "council_debate", "council_verdict",
                 ):
                     # Send as structured metadata for the AgentDebatePanel
                     await output_queue.put(self._make_response(

@@ -16,9 +16,9 @@ interface ToolActivity {
 }
 
 export interface DelegationEvent {
-    type: string;  // delegation_started, delegation_progress, etc.
+    type: string;  // delegation_started, delegation_progress, council_started, council_opinion, etc.
     specialist: string;
-    status?: string;  // thinking, tool_calling, tool_result, step_done, complete, failed
+    status?: string;  // thinking, tool_calling, tool_result, step_done, complete, failed, approve, reject
     goal?: string;
     tools?: string[];
     tool?: string;
@@ -29,6 +29,11 @@ export interface DelegationEvent {
     result?: string;
     count?: number;
     subtasks?: Array<{ goal: string; specialist: string }>;
+    // Council-specific fields
+    roles?: string[];
+    confidence?: number;
+    concerns?: string[];
+    suggestions?: string[];
     timestamp: number;
 }
 
@@ -158,20 +163,39 @@ export function useChat(
                     if (isDelegation) {
                         try {
                             const delegationData = JSON.parse(data.delegation || '{}');
+                            // Map council event fields to delegation format
+                            // Council uses: role, vote, analysis, concerns
+                            // Coordinator uses: specialist, status, thinking, tool
+                            const specialist = delegationData.specialist
+                                || delegationData.role
+                                || '';
+                            const thinking = delegationData.thinking
+                                || delegationData.analysis
+                                || delegationData.message
+                                || '';
+                            const status = delegationData.status
+                                || delegationData.vote
+                                || delegationData.consensus
+                                || '';
                             const evt: DelegationEvent = {
                                 type: data.delegationType!,
-                                specialist: delegationData.specialist || '',
-                                status: delegationData.status,
-                                goal: delegationData.goal,
+                                specialist,
+                                status,
+                                goal: delegationData.goal || delegationData.topic || '',
                                 tools: delegationData.tools,
                                 tool: delegationData.tool,
                                 toolArgs: delegationData.tool_args,
                                 toolResult: delegationData.tool_result,
-                                thinking: delegationData.thinking,
+                                thinking,
                                 content: delegationData.content,
                                 result: delegationData.result,
-                                count: delegationData.count,
+                                count: delegationData.count || delegationData.member_count,
                                 subtasks: delegationData.subtasks,
+                                // Council-specific fields
+                                roles: delegationData.roles,
+                                confidence: delegationData.confidence,
+                                concerns: delegationData.concerns,
+                                suggestions: delegationData.suggestions,
                                 timestamp: Date.now(),
                             };
                             delegationEventsRef.current = [...delegationEventsRef.current, evt];
