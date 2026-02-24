@@ -5,16 +5,22 @@ import sys
 import grpc_reflection.v1alpha.reflection as reflection
 from grpc_tools.protoc import main as protoc_main
 
+# Resolve paths relative to this file (packages/brain/core/grpc_setup.py)
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_BRAIN_DIR = os.path.dirname(_THIS_DIR)  # packages/brain/
+
 # Load proto definition at runtime
-PROTO_PATH = os.path.join(os.path.dirname(__file__), "../../../shared/proto")
+# In Docker: /app/core/../ = /app/, then ../shared/proto = /shared/proto
+# Locally: packages/brain/core/../ = packages/brain/, then ../shared/proto = packages/shared/proto
+PROTO_PATH = os.path.join(_BRAIN_DIR, "../shared/proto")
 BRAIN_PROTO = os.path.join(PROTO_PATH, "brain.proto")
 
 # Dynamic proto loading
 from grpc_tools import protoc
 import importlib
 
-# Generate Python stubs in a temp dir
-out_dir = os.path.join(os.path.dirname(__file__), "../../_generated")
+# Generate Python stubs in the _generated dir at the brain package root
+out_dir = os.path.join(_BRAIN_DIR, "_generated")
 os.makedirs(out_dir, exist_ok=True)
 
 protoc.main([
