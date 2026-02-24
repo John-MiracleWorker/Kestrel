@@ -74,8 +74,8 @@ class AgentServicerMixin(BaseServicerMixin):
         from agent.loop import AgentLoop
         from agent.evidence import EvidenceChain
         from agent.learner import TaskLearner
-        from agent.memory import WorkingMemory
-        from agent.reflection import ReflectionEngine
+        from agent.core.memory import WorkingMemory
+        from agent.core.reflection import ReflectionEngine
 
         task_model = ws_config.get("model", "") if ws_config else ""
         task_api_key = ws_config.get("api_key", "") if ws_config else ""

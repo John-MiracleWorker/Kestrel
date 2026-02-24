@@ -22,7 +22,7 @@ logger = logging.getLogger("backfill")
 
 async def main(workspace_id: Optional[str], limit: int, model_override: Optional[str] = None):
     import asyncpg
-    from agent.memory_graph import MemoryGraph, extract_entities_llm
+    from agent.core.memory_graph import MemoryGraph, extract_entities_llm
     from providers_registry import get_provider
     from encryption import decrypt
 

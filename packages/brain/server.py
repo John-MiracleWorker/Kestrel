@@ -269,7 +269,7 @@ async def serve():
     from agent.guardrails import Guardrails
     from agent.loop import AgentLoop
     from agent.persistence import PostgresTaskPersistence
-    from agent.memory_graph import MemoryGraph
+    from agent.core.memory_graph import MemoryGraph
     from agent.persona import PersonaLearner
     from agent.predictions import TaskPredictor
     from agent.automation import CronScheduler, WebhookHandler

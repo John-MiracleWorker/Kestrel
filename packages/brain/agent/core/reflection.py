@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
-logger = logging.getLogger("brain.agent.reflection")
+logger = logging.getLogger("brain.agent.core.reflection")
 
 
 class CritiqueCategory(str, Enum):

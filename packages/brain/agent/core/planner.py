@@ -23,7 +23,7 @@ from agent.types import (
     ToolDefinition,
 )
 
-logger = logging.getLogger("brain.agent.planner")
+logger = logging.getLogger("brain.agent.core.planner")
 
 # ── Planning Prompts ─────────────────────────────────────────────────
 

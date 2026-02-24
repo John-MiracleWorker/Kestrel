@@ -6,6 +6,7 @@ import { logger } from '../../utils/logger';
 interface WebhookDeps {
     telegramAdapter: import('../../channels/telegram').TelegramAdapter;
 }
+import { processUpdate } from '../../channels/telegram/handlers';
 
 /**
  * Telegram webhook route.
@@ -53,10 +54,10 @@ export default async function telegramWebhookRoutes(
             // Process asynchronously — respond 200 immediately
             // so Telegram doesn't retry
             setImmediate(() => {
-                telegramAdapter.processUpdate(update).catch((err) => {
+                processUpdate(telegramAdapter, update).catch((err: Error) => {
                     logger.error('Failed to process Telegram update', {
                         updateId: update.update_id,
-                        error: (err as Error).message,
+                        error: err.message,
                     });
                 });
             });

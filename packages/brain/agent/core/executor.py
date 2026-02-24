@@ -1,0 +1,639 @@
+import asyncio
+import json
+import logging
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Any, AsyncIterator, Callable, Optional
+
+from agent.types import (
+    AgentTask,
+    ApprovalRequest,
+    StepStatus,
+    TaskEvent,
+    TaskEventType,
+    TaskStatus,
+    ToolCall,
+    ToolResult,
+)
+from agent.guardrails import Guardrails
+from agent.observability import MetricsCollector
+from agent.evidence import EvidenceChain
+from agent.model_router import ModelRouter
+
+logger = logging.getLogger("brain.agent.core.executor")
+
+# ── Constants ────────────────────────────────────────────────────────
+MAX_PARALLEL_TOOLS = 5       # Max concurrent tool executions per turn
+RETRY_MAX_ATTEMPTS = 3       # Max retries for transient tool failures
+RETRY_BASE_DELAY_S = 1.0     # Base delay for exponential backoff
+
+# ── System Prompt for the Reasoning LLM ──────────────────────────────
+AGENT_SYSTEM_PROMPT = """\
+You are Kestrel, an autonomous AI agent. You are executing a multi-step task.
+
+Current goal: {goal}
+Current step: {step_description}
+
+Instructions:
+1. Analyze the current situation and decide which tool to call next.
+2. Call exactly ONE tool per turn. Wait for its result before proceeding.
+3. If the step is complete, call `task_complete` with a summary of what you accomplished.
+4. If you need clarification from the user, call `ask_human` with your question.
+5. If you encounter an error, try an alternative approach before giving up.
+6. Think step-by-step. Explain your reasoning before acting.
+
+Host Filesystem Strategy:
+- Use project_recall(name) FIRST to check for cached project context.
+- Use host_tree(path) ONCE for full directory tree — never call host_list repeatedly.
+- Use host_find(pattern) or host_search(query, path) before broad reads to narrow scope quickly.
+- Use host_batch_read(paths) for grouped file reads instead of repeated host_read calls.
+- host_write requires human approval.
+
+Progress: Step {step_index}/{total_steps} | Iteration {iteration}/{max_iterations}
+
+Previous observations for this step:
+{observations}
+"""
+
+
+class TaskExecutor:
+    """
+    Handles the execution phase of the AgentLoop (ReAct loop).
+    Executes tools, routes models, checks guardrails, and retries failures.
+    """
+
+    def __init__(
+        self,
+        provider,
+        tool_registry,
+        guardrails: Guardrails,
+        persistence,
+        metrics: MetricsCollector,
+        model: str,
+        api_key: str,
+        model_router: ModelRouter,
+        provider_resolver=None,
+        event_callback: Optional[Callable] = None,
+        evidence_chain: Optional[EvidenceChain] = None,
+        progress_callback: Optional[Callable] = None,
+    ):
+        self._provider = provider
+        self._tools = tool_registry
+        self._guardrails = guardrails
+        self._persistence = persistence
+        self._metrics = metrics
+        self._model = model
+        self._api_key = api_key
+        self._model_router = model_router
+        self._provider_resolver = provider_resolver
+        self._event_callback = event_callback
+        self._evidence_chain = evidence_chain
+        self._progress_callback = progress_callback or (lambda t: 0.0)
+
+    async def _wait_for_approval(self, task: AgentTask) -> bool:
+        """
+        Block until the pending approval is resolved.
+        Returns True if approved, False if denied/expired.
+        """
+        if not task.pending_approval:
+            return True
+
+        timeout_s = 300
+        start = time.time()
+        while time.time() - start < timeout_s:
+            approval = await self._persistence.get_approval(task.pending_approval.id)
+            if approval and approval.status != "PENDING":
+                return approval.status == "APPROVED"
+            await asyncio.sleep(2.0)
+        return False
+
+    async def run_step(self, task: AgentTask, step: Any) -> AsyncIterator[TaskEvent]:
+        """Runs a single iteration of the ReAct loop for a given step."""
+        async for event in self._reason_and_act(task, step):
+            yield event
+
+    async def _execute_tool_with_retry(
+        self,
+        tool_call: ToolCall,
+        tool_context: dict,
+        max_attempts: int = RETRY_MAX_ATTEMPTS,
+    ) -> ToolResult:
+        last_result = None
+        for attempt in range(max_attempts):
+            result = await self._tools.execute(tool_call, context=tool_context)
+            last_result = result
+
+            if result.success:
+                self._metrics.record_tool_execution(
+                    tool_name=tool_call.name,
+                    execution_time_ms=result.execution_time_ms,
+                    success=True,
+                )
+                return result
+
+            error_lower = (result.error or "").lower()
+            is_transient = any(kw in error_lower for kw in [
+                "timeout", "rate limit", "connection", "network",
+                "503", "502", "429", "temporarily unavailable",
+            ])
+
+            if not is_transient or attempt == max_attempts - 1:
+                self._metrics.record_tool_execution(
+                    tool_name=tool_call.name,
+                    execution_time_ms=result.execution_time_ms,
+                    success=False,
+                )
+                return result
+
+            delay = RETRY_BASE_DELAY_S * (2 ** attempt)
+            logger.info(
+                f"Retrying {tool_call.name} after transient failure "
+                f"(attempt {attempt + 1}/{max_attempts}, delay {delay:.1f}s): "
+                f"{result.error[:100]}"
+            )
+            await asyncio.sleep(delay)
+
+        return last_result
+
+    async def _execute_tools_parallel(
+        self,
+        parsed_calls: list[dict],
+        task: AgentTask,
+        step: Any,
+    ) -> AsyncIterator[TaskEvent]:
+        parallel_batch = []
+        sequential_queue = []
+
+        for tc_data in parsed_calls:
+            func = tc_data.get("function", {})
+            tool_name = func.get("name", "")
+            try:
+                tool_args = json.loads(func.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                tool_args = {}
+
+            is_control = tool_name in ("task_complete", "ask_human")
+            needs_approval = self._guardrails.needs_approval(
+                tool_name, tool_args, task.config,
+                tool_registry=self._tools,
+            )
+
+            if is_control or needs_approval:
+                sequential_queue.append(tc_data)
+            else:
+                parallel_batch.append(tc_data)
+
+        if len(parallel_batch) > 1:
+            logger.info(
+                f"Parallel tool dispatch: {len(parallel_batch)} tools "
+                f"({', '.join(tc.get('function', {}).get('name', '?') for tc in parallel_batch)})"
+            )
+
+            semaphore = asyncio.Semaphore(MAX_PARALLEL_TOOLS)
+
+            async def _run_one(tc_data: dict) -> tuple[dict, ToolCall, ToolResult]:
+                async with semaphore:
+                    func = tc_data.get("function", {})
+                    tool_name = func.get("name", "")
+                    try:
+                        tool_args = json.loads(func.get("arguments", "{}"))
+                    except json.JSONDecodeError:
+                        tool_args = {}
+
+                    tool_call = ToolCall(
+                        id=tc_data.get("id", "call"),
+                        name=tool_name,
+                        arguments=tool_args,
+                    )
+                    tool_context = {"workspace_id": task.workspace_id} if task.workspace_id else {}
+                    result = await self._execute_tool_with_retry(tool_call, tool_context)
+                    return tc_data, tool_call, result
+
+            results = await asyncio.gather(
+                *(_run_one(tc) for tc in parallel_batch),
+                return_exceptions=True,
+            )
+
+            for item in results:
+                if isinstance(item, Exception):
+                    logger.error(f"Parallel tool execution error: {item}")
+                    continue
+
+                tc_data, tool_call, result = item
+                func = tc_data.get("function", {})
+                tool_name = func.get("name", "")
+                try:
+                    tool_args = json.loads(func.get("arguments", "{}"))
+                except json.JSONDecodeError:
+                    tool_args = {}
+
+                task.tool_calls_count += 1
+
+                if self._evidence_chain:
+                    self._evidence_chain.record_tool_decision(
+                        tool_name=tool_name,
+                        args=tool_args,
+                        reasoning=f"LLM selected {tool_name} (parallel batch) for step: {step.description[:80]}",
+                    )
+
+                step.tool_calls.append({
+                    "id": tool_call.id,
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "result": result.output if result.success else result.error,
+                    "success": result.success,
+                    "time_ms": result.execution_time_ms,
+                    **({"_gemini_raw_part": tc_data["_gemini_raw_part"]} if "_gemini_raw_part" in tc_data else {}),
+                })
+
+                yield TaskEvent(
+                    type=TaskEventType.TOOL_CALLED,
+                    task_id=task.id,
+                    step_id=step.id,
+                    tool_name=tool_name,
+                    tool_args=json.dumps(tool_args),
+                    progress=self._progress_callback(task),
+                )
+                yield TaskEvent(
+                    type=TaskEventType.TOOL_RESULT,
+                    task_id=task.id,
+                    step_id=step.id,
+                    tool_name=tool_name,
+                    tool_result=result.output if result.success else result.error,
+                    progress=self._progress_callback(task),
+                )
+
+                if not result.success:
+                    step.error = result.error
+
+                budget_error = self._guardrails.check_budget(task)
+                if budget_error:
+                    logger.warning(f"Budget exceeded during parallel tools: {budget_error}")
+                    step.status = StepStatus.COMPLETE
+                    step.result = f"Stopped: {budget_error}"
+                    step.completed_at = datetime.now(timezone.utc)
+                    await self._persistence.update_task(task)
+                    return
+
+        elif len(parallel_batch) == 1:
+            sequential_queue = parallel_batch + sequential_queue
+
+        for tc_data in sequential_queue:
+            async for event in self._execute_single_tool(tc_data, task, step):
+                yield event
+                if step.status in (StepStatus.COMPLETE, StepStatus.FAILED, StepStatus.SKIPPED):
+                    return
+
+        await self._persistence.update_task(task)
+
+    async def _execute_single_tool(
+        self,
+        tc_data: dict,
+        task: AgentTask,
+        step: Any,
+    ) -> AsyncIterator[TaskEvent]:
+        func = tc_data.get("function", {})
+        tool_name = func.get("name", "")
+        try:
+            tool_args = json.loads(func.get("arguments", "{}"))
+        except json.JSONDecodeError:
+            tool_args = {}
+
+        tool_call = ToolCall(
+            id=tc_data.get("id", "call"),
+            name=tool_name,
+            arguments=tool_args,
+        )
+
+        approval_needed = self._guardrails.needs_approval(
+            tool_name, tool_args, task.config,
+            tool_registry=self._tools,
+        )
+
+        if approval_needed:
+            request = ApprovalRequest(
+                id=str(uuid.uuid4()),
+                task_id=task.id,
+                step_id=step.id,
+                tool_name=tool_name,
+                tool_args=tool_args,
+                risk_level=self._tools.get_risk_level(tool_name),
+                reason=approval_needed,
+            )
+            task.pending_approval = request
+            await self._persistence.save_approval(request)
+
+            yield TaskEvent(
+                type=TaskEventType.APPROVAL_NEEDED,
+                task_id=task.id,
+                step_id=step.id,
+                tool_name=tool_name,
+                tool_args=json.dumps(tool_args),
+                approval_id=request.id,
+                content=approval_needed,
+                progress=self._progress_callback(task),
+            )
+            return
+
+        yield TaskEvent(
+            type=TaskEventType.TOOL_CALLED,
+            task_id=task.id,
+            step_id=step.id,
+            tool_name=tool_name,
+            tool_args=json.dumps(tool_args),
+            progress=self._progress_callback(task),
+        )
+
+        if self._evidence_chain:
+            self._evidence_chain.record_tool_decision(
+                tool_name=tool_name,
+                args=tool_args,
+                reasoning=f"LLM selected {tool_name} for step: {step.description[:80]}",
+            )
+
+        tool_context = {"workspace_id": task.workspace_id} if task.workspace_id else {}
+        result = await self._execute_tool_with_retry(tool_call, tool_context)
+        task.tool_calls_count += 1
+
+        budget_error = self._guardrails.check_budget(task)
+        if budget_error:
+            logger.warning(f"Budget exceeded mid-step: {budget_error}")
+            step.status = StepStatus.COMPLETE
+            step.result = f"Stopped: {budget_error}"
+            step.completed_at = datetime.now(timezone.utc)
+            await self._persistence.update_task(task)
+            yield TaskEvent(
+                type=TaskEventType.TOOL_RESULT,
+                task_id=task.id,
+                step_id=step.id,
+                tool_name=tool_name,
+                tool_result=result.output if result.success else result.error,
+                progress=self._progress_callback(task),
+            )
+            return
+
+        step.tool_calls.append({
+            "id": tool_call.id,
+            "tool": tool_name,
+            "args": tool_args,
+            "result": result.output if result.success else result.error,
+            "success": result.success,
+            "time_ms": result.execution_time_ms,
+            **({"_gemini_raw_part": tc_data["_gemini_raw_part"]} if "_gemini_raw_part" in tc_data else {}),
+        })
+
+        yield TaskEvent(
+            type=TaskEventType.TOOL_RESULT,
+            task_id=task.id,
+            step_id=step.id,
+            tool_name=tool_name,
+            tool_result=result.output if result.success else result.error,
+            progress=self._progress_callback(task),
+        )
+
+        if tool_name == "task_complete":
+            step.status = StepStatus.COMPLETE
+            step.result = tool_args.get("summary", result.output)
+            step.completed_at = datetime.now(timezone.utc)
+            for remaining in task.plan.steps:
+                if remaining.status in (StepStatus.PENDING, StepStatus.IN_PROGRESS) and remaining.id != step.id:
+                    remaining.status = StepStatus.SKIPPED
+                    remaining.result = "Skipped — task completed early"
+                    remaining.completed_at = datetime.now(timezone.utc)
+
+        elif tool_name == "ask_human":
+            question = tool_args.get("question", "The agent needs your input")
+            approval_request = ApprovalRequest(
+                id=str(uuid.uuid4()),
+                task_id=task.id,
+                step_id=step.id,
+                tool_name="ask_human",
+                tool_args=tool_args,
+                reason=question,
+            )
+            task.pending_approval = approval_request
+            task.status = TaskStatus.WAITING_APPROVAL
+            await self._persistence.save_approval(approval_request)
+            await self._persistence.update_task(task)
+
+            yield TaskEvent(
+                type=TaskEventType.APPROVAL_NEEDED,
+                task_id=task.id,
+                step_id=step.id,
+                tool_name="ask_human",
+                content=question,
+                approval_id=approval_request.id,
+                progress=self._progress_callback(task),
+            )
+
+            approved = await self._wait_for_approval(task)
+            task.status = TaskStatus.RUNNING
+
+            if not approved:
+                step.result = "User did not respond / declined"
+                step.status = StepStatus.COMPLETE
+                step.completed_at = datetime.now(timezone.utc)
+
+        elif not result.success:
+            step.error = result.error
+
+        await self._persistence.update_task(task)
+
+    async def _reason_and_act(
+        self,
+        task: AgentTask,
+        step: Any,
+    ) -> AsyncIterator[TaskEvent]:
+        observations = "\n".join(
+            f"[{tc.get('tool', '?')}] → {tc.get('result', '?')}"
+            for tc in step.tool_calls
+        ) or "(none yet)"
+
+        done, total = task.plan.progress
+
+        if task.messages:
+            messages = list(task.messages)
+            for tc in step.tool_calls[-6:]:
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": tc.get("id", "call_1"),
+                        "type": "function",
+                        "function": {
+                            "name": tc.get("tool", ""),
+                            "arguments": json.dumps(tc.get("args", {})),
+                        },
+                        **({"_gemini_raw_part": tc["_gemini_raw_part"]} if "_gemini_raw_part" in tc else {}),
+                    }],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", "call_1"),
+                    "content": tc.get("result", ""),
+                })
+        else:
+            system_prompt = AGENT_SYSTEM_PROMPT.format(
+                goal=task.goal,
+                step_description=step.description,
+                step_index=step.index + 1,
+                total_steps=total,
+                iteration=task.iterations,
+                max_iterations=task.config.max_iterations,
+                observations=observations,
+            )
+
+            messages = [{"role": "system", "content": system_prompt}]
+
+            if not step.tool_calls:
+                messages.append({
+                    "role": "user",
+                    "content": f"Execute this step: {step.description}",
+                })
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": f"Continue executing: {step.description}",
+                })
+                for tc in step.tool_calls[-6:]:
+                    messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": tc.get("id", "call_1"),
+                            "type": "function",
+                            "function": {
+                                "name": tc.get("tool", ""),
+                                "arguments": json.dumps(tc.get("args", {})),
+                            },
+                            **({"_gemini_raw_part": tc["_gemini_raw_part"]} if "_gemini_raw_part" in tc else {}),
+                        }],
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.get("id", "call_1"),
+                        "content": tc.get("result", ""),
+                    })
+
+        tool_schemas = [t.to_openai_schema() for t in self._tools.list_tools()]
+
+        route = self._model_router.select(
+            step_description=step.description,
+            expected_tools=getattr(step, 'expected_tools', None),
+        )
+        routed_model = route.model if route.model else self._model
+        routed_temp = route.temperature
+        routed_max_tokens = route.max_tokens
+
+        if self._provider_resolver and route.provider:
+            try:
+                active_provider = self._provider_resolver(route.provider)
+            except Exception:
+                active_provider = self._provider
+        else:
+            active_provider = self._provider
+
+        try:
+            from agent.context_compactor import compact_context, needs_escalation
+
+            messages, was_compacted = await compact_context(
+                messages=messages,
+                provider_name=route.provider,
+                provider=active_provider,
+                model=routed_model,
+            )
+
+            if was_compacted and needs_escalation(messages, route.provider):
+                if self._provider_resolver:
+                    for cloud_name in ("google", "openai", "anthropic"):
+                        try:
+                            cloud_p = self._provider_resolver(cloud_name)
+                            if cloud_p.is_ready():
+                                logger.info(
+                                    f"Context overflow: escalating {route.provider} → {cloud_name}"
+                                )
+                                active_provider = cloud_p
+                                routed_model = ""
+                                break
+                        except Exception:
+                            continue
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"Context compaction failed (non-fatal): {e}")
+
+        if self._event_callback:
+            try:
+                await self._event_callback("routing_info", {
+                    "provider": route.provider,
+                    "model": routed_model or route.model,
+                    "was_escalated": getattr(route, '_escalated', False),
+                    "complexity": getattr(route, '_complexity', 0),
+                })
+            except Exception:
+                pass
+
+        logger.debug(
+            f"Dispatching to {route.provider}:{routed_model} "
+            f"(step={step.description[:50]}...)"
+        )
+
+        response = await active_provider.generate_with_tools(
+            messages=messages,
+            model=routed_model,
+            tools=tool_schemas,
+            temperature=routed_temp,
+            max_tokens=routed_max_tokens,
+            api_key=self._api_key,
+        )
+
+        if response.get("usage"):
+            usage = response["usage"]
+            self._metrics.record_llm_call(
+                model=self._model,
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                cached_tokens=usage.get("cached_tokens", 0),
+            )
+            if self._event_callback:
+                await self._event_callback("metrics_update", self._metrics.metrics.to_compact_dict())
+
+        if response.get("tool_calls"):
+            tool_calls = response["tool_calls"]
+
+            if len(tool_calls) > 1:
+                logger.info(f"LLM returned {len(tool_calls)} tool calls — dispatching in parallel")
+                async for event in self._execute_tools_parallel(tool_calls, task, step):
+                    yield event
+            else:
+                async for event in self._execute_single_tool(tool_calls[0], task, step):
+                    yield event
+
+        elif response.get("content"):
+            text = response["content"]
+
+            if task.messages:
+                step.status = StepStatus.COMPLETE
+                step.result = text
+                step.completed_at = datetime.now(timezone.utc)
+                await self._persistence.update_task(task)
+            else:
+                yield TaskEvent(
+                    type=TaskEventType.THINKING,
+                    task_id=task.id,
+                    step_id=step.id,
+                    content=text,
+                    progress=self._progress_callback(task),
+                )
+
+                if any(phrase in text.lower() for phrase in [
+                    "step is complete",
+                    "this step is done",
+                    "completed this step",
+                    "no tools needed",
+                ]):
+                    step.status = StepStatus.COMPLETE
+                    step.result = text
+                    step.completed_at = datetime.now(timezone.utc)
+                    await self._persistence.update_task(task)

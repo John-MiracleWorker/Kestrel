@@ -219,12 +219,16 @@ export const moltbook = {
 // ── Capabilities ────────────────────────────────────────────────────
 
 export interface CapabilityItem {
+    id: string;
     name: string;
     description: string;
     status: 'active' | 'available' | 'disabled';
     category: string;
     icon: string;
     stats?: Record<string, string>;
+    installed?: boolean;
+    enabled?: boolean;
+    requires_mcp?: string[];
 }
 
 export const capabilities = {

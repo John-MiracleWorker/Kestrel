@@ -1,0 +1,517 @@
+import { randomUUID } from 'crypto';
+import { IncomingMessage, Attachment } from '../base';
+import { TelegramAdapter } from './index';
+import { TelegramUpdate, TelegramMessage, TelegramUser } from './types';
+import { logger } from '../../utils/logger';
+
+// ── Webhook Handler ────────────────────────────────────────────
+
+    /**
+     * Process an incoming Telegram update (called by the webhook route).
+     */
+    export async function processUpdate(adapter: TelegramAdapter, update: TelegramUpdate): Promise<void> {
+        if (update.callback_query) {
+            await handleCallbackQuery(adapter, update.callback_query);
+            return;
+        }
+
+        if (!update.message) return;
+
+        const msg = update.message;
+        const from = msg.from;
+        if (!from) return;
+
+        // Access control check
+        if (!adapter.isAllowed(from.id)) {
+            await adapter.api('sendMessage', {
+                chat_id: msg.chat.id,
+                text: '🔒 Access denied. You are not authorized to use this bot.',
+            });
+            return;
+        }
+
+        const text = msg.text || msg.caption || '';
+
+        // Handle Telegram-specific commands
+        if (text.startsWith('/')) {
+            await handleCommand(adapter, msg, text);
+            return;
+        }
+
+        // Handle task mode (!goal prefix)
+        if (text.startsWith('!')) {
+            const goal = text.substring(1).trim();
+            if (goal) {
+                await handleTaskRequest(adapter, msg, from, goal);
+                return;
+            }
+        }
+
+        // Start typing indicator
+        adapter.startTyping(msg.chat.id);
+
+        // Map Telegram user → Kestrel user
+        const userId = adapter.resolveUserId(from, msg.chat.id);
+
+        // Build attachments
+        const attachments: Attachment[] = [];
+        if (msg.photo?.length) {
+            const largest = msg.photo[msg.photo.length - 1];
+            attachments.push({
+                type: 'image',
+                url: `tg://${largest.file_id}`,
+                mimeType: 'image/jpeg',
+                size: largest.file_size,
+            });
+        }
+        if (msg.document) {
+            attachments.push({
+                type: 'file',
+                url: `tg://${msg.document.file_id}`,
+                filename: msg.document.file_name,
+                mimeType: msg.document.mime_type,
+                size: msg.document.file_size,
+            });
+        }
+        if (msg.voice) {
+            attachments.push({
+                type: 'audio',
+                url: `tg://${msg.voice.file_id}`,
+                mimeType: msg.voice.mime_type,
+                size: msg.voice.file_size,
+            });
+        }
+        if (msg.audio) {
+            attachments.push({
+                type: 'audio',
+                url: `tg://${msg.audio.file_id}`,
+                filename: msg.audio.file_name,
+                mimeType: msg.audio.mime_type,
+                size: msg.audio.file_size,
+            });
+        }
+        if (msg.video) {
+            attachments.push({
+                type: 'video',
+                url: `tg://${msg.video.file_id}`,
+                mimeType: msg.video.mime_type,
+                size: msg.video.file_size,
+            });
+        }
+
+        // Emit normalized message
+        const incoming: IncomingMessage = {
+            id: randomUUID(),
+            channel: 'telegram',
+            userId,
+            workspaceId: adapter.config.defaultWorkspaceId,
+            conversationId: adapter.resolveConversationId(msg.chat.id),
+            content: text,
+            attachments: attachments.length ? attachments : undefined,
+            metadata: {
+                channelUserId: String(from.id),
+                channelMessageId: String(msg.message_id),
+                timestamp: new Date(msg.date * 1000),
+                telegramChatId: msg.chat.id,
+                telegramUsername: from.username,
+            },
+        };
+
+        (adapter as any).emit('message', incoming);
+    }
+
+    // ── Task Mode ─────────────────────────────────────────────────
+
+    /**
+     * Handle a task request (message starting with !).
+     * Sends the goal to the agent as an autonomous task and streams
+     * progress updates back to the Telegram chat.
+     */
+    export async function handleTaskRequest(adapter: TelegramAdapter, msg: TelegramMessage, from: TelegramUser, goal: string): Promise<void> {
+        const chatId = msg.chat.id;
+        const userId = adapter.resolveUserId(from, chatId);
+
+        await adapter.api('sendMessage', {
+            chat_id: chatId,
+            text:
+                '🦅 *Starting autonomous task...*\n\n' +
+                `📋 *Goal:* ${adapter.escapeMarkdown(goal)}\n\n` +
+                '_I\'ll work on this and send you updates._',
+            parse_mode: 'Markdown',
+        });
+
+        adapter.startTyping(chatId);
+
+        // Emit as a task-type message
+        const incoming: IncomingMessage = {
+            id: randomUUID(),
+            channel: 'telegram',
+            userId,
+            workspaceId: adapter.config.defaultWorkspaceId,
+            conversationId: adapter.resolveConversationId(msg.chat.id, `task-${Date.now()}`),
+            content: goal,
+            metadata: {
+                channelUserId: String(from.id),
+                channelMessageId: String(msg.message_id),
+                timestamp: new Date(msg.date * 1000),
+                telegramChatId: chatId,
+                telegramUsername: from.username,
+                isTaskRequest: true,
+            },
+        };
+
+        (adapter as any).emit('message', incoming);
+    }
+
+    // ── Commands ───────────────────────────────────────────────────
+
+    export async function handleCommand(adapter: TelegramAdapter, msg: TelegramMessage, text: string): Promise<void> {
+        const chatId = msg.chat.id;
+        const parts = text.split(/\s+/);
+        const command = parts[0].replace(/@\w+$/, ''); // Strip @botname
+        const args = parts.slice(1);
+
+        switch (command) {
+            case '/start':
+                await adapter.api('sendMessage', {
+                    chat_id: chatId,
+                    text:
+                        '🦅 *Welcome to Kestrel\\!*\n\n' +
+                        'I\'m your autonomous AI agent\\. Here\'s what I can do:\n\n' +
+                        '*💬 Chat Mode*\n' +
+                        'Just send me a message to chat\\.\n\n' +
+                        '*🤖 Task Mode*\n' +
+                        'Start a message with `\\!` to launch an autonomous task:\n' +
+                        '`\\!review the auth module for security issues`\n\n' +
+                        '*Commands:*\n' +
+                        '/help — Show all commands\n' +
+                        '/task \\<goal\\> — Start an autonomous task\n' +
+                        '/tasks — List active tasks\n' +
+                        '/status — System status\n' +
+                        '/cancel \\<id\\> — Cancel a task\n' +
+                        '/model \\<name\\> — Switch AI model\n' +
+                        '/new — Start a new conversation',
+                    parse_mode: 'MarkdownV2',
+                });
+                break;
+
+            case '/help':
+                await adapter.api('sendMessage', {
+                    chat_id: chatId,
+                    text:
+                        '*🦅 Kestrel Commands*\n\n' +
+                        '*Communication:*\n' +
+                        '  Just type — Chat with the AI\n' +
+                        '  `!goal` — Launch autonomous task\n\n' +
+                        '*Commands:*\n' +
+                        '  /task `<goal>` — Start an autonomous task\n' +
+                        '  /tasks — List your active tasks\n' +
+                        '  /status — Show system status\n' +
+                        '  /cancel `<id>` — Cancel a running task\n' +
+                        '  /approve `<id>` — Approve a pending action\n' +
+                        '  /reject `<id>` — Reject a pending action\n' +
+                        '  /model `<name>` — Switch AI model\n' +
+                        '  /workspace — Show current workspace\n' +
+                        '  /new — Start a new conversation\n' +
+                        '  /stop — Stop all typing indicators\n',
+                    parse_mode: 'Markdown',
+                });
+                break;
+
+            case '/task': {
+                const goal = args.join(' ').trim();
+                if (!goal) {
+                    await adapter.api('sendMessage', {
+                        chat_id: chatId,
+                        text: '❓ Usage: `/task <your goal>`\n\nExample: `/task review the database schema for performance issues`',
+                        parse_mode: 'Markdown',
+                    });
+                    return;
+                }
+                if (msg.from) {
+                    await handleTaskRequest(adapter, msg, msg.from, goal);
+                }
+                break;
+            }
+
+            case '/tasks':
+                await adapter.api('sendMessage', {
+                    chat_id: chatId,
+                    text:
+                        '📋 *Your Tasks*\n\n' +
+                        '_Task listing requires the web dashboard or CLI._\n' +
+                        '_Use_ `kestrel tasks` _in the CLI to view all tasks._',
+                    parse_mode: 'Markdown',
+                });
+                break;
+
+            case '/status':
+                await adapter.api('sendMessage', {
+                    chat_id: chatId,
+                    text:
+                        '🦅 *Kestrel Status*\n\n' +
+                        `✅ Bot: Online\n` +
+                        `📡 Mode: ${adapter.config.mode}\n` +
+                        `🏢 Workspace: \`${adapter.config.defaultWorkspaceId}\`\n` +
+                        `👤 Your ID: \`${msg.from?.id || 'unknown'}\`\n` +
+                        `💬 Chat: \`${chatId}\``,
+                    parse_mode: 'Markdown',
+                });
+                break;
+
+            case '/cancel': {
+                const taskId = args[0];
+                if (!taskId) {
+                    await adapter.api('sendMessage', {
+                        chat_id: chatId,
+                        text: '❓ Usage: `/cancel <task_id>`',
+                        parse_mode: 'Markdown',
+                    });
+                    return;
+                }
+                // Emit as a cancel command
+                if (msg.from) {
+                    const userId = adapter.resolveUserId(msg.from, chatId);
+                    (adapter as any).emit('message', {
+                        id: randomUUID(),
+                        channel: 'telegram',
+                        userId,
+                        workspaceId: adapter.config.defaultWorkspaceId,
+                        conversationId: adapter.resolveConversationId(chatId),
+                        content: `/cancel ${taskId}`,
+                        metadata: {
+                            channelUserId: String(msg.from.id),
+                            channelMessageId: String(msg.message_id),
+                            timestamp: new Date(msg.date * 1000),
+                            isCommand: true,
+                        },
+                    });
+                }
+                break;
+            }
+
+            case '/approve': {
+                const approvalId = args[0];
+                if (!approvalId) {
+                    await adapter.api('sendMessage', {
+                        chat_id: chatId,
+                        text: '❓ Usage: `/approve <approval_id>`',
+                        parse_mode: 'Markdown',
+                    });
+                    return;
+                }
+                await handleApproval(adapter, chatId, approvalId, true);
+                break;
+            }
+
+            case '/reject': {
+                const rejectId = args[0];
+                if (!rejectId) {
+                    await adapter.api('sendMessage', {
+                        chat_id: chatId,
+                        text: '❓ Usage: `/reject <approval_id>`',
+                        parse_mode: 'Markdown',
+                    });
+                    return;
+                }
+                await handleApproval(adapter, chatId, rejectId, false);
+                break;
+            }
+
+            case '/model':
+                if (args[0]) {
+                    await adapter.api('sendMessage', {
+                        chat_id: chatId,
+                        text: `🔄 Model switched to \`${args[0]}\``,
+                        parse_mode: 'Markdown',
+                    });
+                } else {
+                    await adapter.api('sendMessage', {
+                        chat_id: chatId,
+                        text: '❓ Usage: `/model <model_name>`\n\nExamples:\n`/model gpt-4o`\n`/model claude-sonnet-4-20250514`\n`/model gemini-2.5-pro`',
+                        parse_mode: 'Markdown',
+                    });
+                }
+                break;
+
+            case '/workspace':
+                await adapter.api('sendMessage', {
+                    chat_id: chatId,
+                    text: `🏢 Current workspace: \`${adapter.config.defaultWorkspaceId}\``,
+                    parse_mode: 'Markdown',
+                });
+                break;
+
+            case '/new':
+                await adapter.api('sendMessage', {
+                    chat_id: chatId,
+                    text: '✨ New conversation started! Send your first message.',
+                    parse_mode: 'Markdown',
+                });
+                break;
+
+            case '/stop':
+                adapter.stopTyping(chatId);
+                await adapter.api('sendMessage', {
+                    chat_id: chatId,
+                    text: '⏹ Stopped.',
+                });
+                break;
+
+            default:
+                await adapter.api('sendMessage', {
+                    chat_id: chatId,
+                    text: `Unknown command: ${command}. Use /help for available commands.`,
+                });
+        }
+    }
+
+    // ── Approval Handling ──────────────────────────────────────────
+
+    export async function handleApproval(adapter: TelegramAdapter, chatId: number, approvalId: string, approved: boolean): Promise<void> {
+        const pending = adapter.pendingApprovals.get(approvalId);
+
+        const icon = approved ? '✅' : '❌';
+        const action = approved ? 'Approved' : 'Rejected';
+
+        await adapter.api('sendMessage', {
+            chat_id: chatId,
+            text: `${icon} *${action}* approval \`${approvalId}\``,
+            parse_mode: 'Markdown',
+        });
+
+        // Clean up
+        adapter.pendingApprovals.delete(approvalId);
+    }
+
+    /**
+     * Send an approval request to a Telegram chat with inline buttons.
+     */
+    export async function sendApprovalRequest(adapter: TelegramAdapter, chatId: number, approvalId: string, description: string, taskId: string): Promise<void> {
+        adapter.pendingApprovals.set(approvalId, { taskId, chatId, userId: '' });
+
+        await adapter.api('sendMessage', {
+            chat_id: chatId,
+            text:
+                '⚠️ *Approval Required*\n\n' +
+                `${description}\n\n` +
+                `ID: \`${approvalId}\``,
+            parse_mode: 'Markdown',
+            reply_markup: JSON.stringify({
+                inline_keyboard: [[
+                    { text: '✅ Approve', callback_data: `approve:${approvalId}` },
+                    { text: '❌ Reject', callback_data: `reject:${approvalId}` },
+                ]],
+            }),
+        });
+    }
+
+    /**
+     * Send a progress update for an active task.
+     */
+    export async function sendTaskProgress(adapter: TelegramAdapter, chatId: number, step: string, detail: string = ''): Promise<void> {
+        const text = detail
+            ? `🔧 *${adapter.escapeMarkdown(step)}*\n${adapter.escapeMarkdown(detail)}`
+            : `🔧 ${adapter.escapeMarkdown(step)}`;
+
+        await adapter.api('sendMessage', {
+            chat_id: chatId,
+            text,
+            parse_mode: 'Markdown',
+            disable_notification: true,  // Silent for progress updates
+        });
+    }
+
+    // ── Callback Queries ───────────────────────────────────────────
+
+    export async function handleCallbackQuery(adapter: TelegramAdapter, query: {
+        id: string;
+        from: TelegramUser;
+        message?: TelegramMessage;
+        data?: string;
+    }): Promise<void> {
+        // Acknowledge the callback
+        await adapter.api('answerCallbackQuery', { callback_query_id: query.id });
+
+        if (!query.data || !query.message) return;
+        const chatId = query.message.chat.id;
+
+        // Handle self-improvement callbacks (si_approve / si_deny)
+        if (query.data.startsWith('si_approve:') || query.data.startsWith('si_deny:')) {
+            const isApprove = query.data.startsWith('si_approve:');
+            const proposalId = query.data.substring(query.data.indexOf(':') + 1);
+            const action = isApprove ? 'approve' : 'deny';
+            const icon = isApprove ? '✅' : '❌';
+
+            await adapter.api('sendMessage', {
+                chat_id: chatId,
+                text: `${icon} Processing ${action} for proposal \`${proposalId.substring(0, 8)}...\``,
+                parse_mode: 'Markdown',
+            });
+
+            try {
+                // Call brain's self_improve handler via docker exec
+                const { execSync } = await import('child_process');
+                const cmd = `docker exec littlebirdalt-brain-1 python3 -c "
+import sys, json
+sys.path.insert(0, '/app')
+from agent.tools.self_improve import _handle_approval
+result = _handle_approval('${proposalId}', approved=${isApprove ? 'True' : 'False'})
+print(json.dumps(result))
+"`;
+                const output = execSync(cmd, { timeout: 15000, encoding: 'utf-8' }).trim();
+                const result = JSON.parse(output);
+
+                if (result.error) {
+                    await adapter.api('sendMessage', {
+                        chat_id: chatId,
+                        text: `⚠️ ${result.error}`,
+                    });
+                } else {
+                    await adapter.api('sendMessage', {
+                        chat_id: chatId,
+                        text: `${icon} *${result.status === 'approved' ? 'Approved' : 'Denied'}*\n${result.message || ''}`,
+                        parse_mode: 'Markdown',
+                    });
+                }
+            } catch (err) {
+                logger.error('Self-improve callback failed', { error: (err as Error).message });
+                await adapter.api('sendMessage', {
+                    chat_id: chatId,
+                    text: `⚠️ Failed to process: ${(err as Error).message?.substring(0, 200)}`,
+                });
+            }
+            return;
+        }
+
+        // Handle approval callbacks
+        if (query.data.startsWith('approve:')) {
+            const approvalId = query.data.substring('approve:'.length);
+            await handleApproval(adapter, chatId, approvalId, true);
+            return;
+        }
+        if (query.data.startsWith('reject:')) {
+            const approvalId = query.data.substring('reject:'.length);
+            await handleApproval(adapter, chatId, approvalId, false);
+            return;
+        }
+
+        // Treat other callback data as a message
+        const userId = adapter.resolveUserId(query.from, chatId);
+        const incoming: IncomingMessage = {
+            id: randomUUID(),
+            channel: 'telegram',
+            userId,
+            workspaceId: adapter.config.defaultWorkspaceId,
+            conversationId: adapter.resolveConversationId(chatId),
+            content: query.data,
+            metadata: {
+                channelUserId: String(query.from.id),
+                channelMessageId: String(query.message.message_id),
+                timestamp: new Date(),
+                isCallbackQuery: true,
+            },
+        };
+
+        (adapter as any).emit('message', incoming);
+    }

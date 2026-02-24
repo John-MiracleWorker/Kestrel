@@ -161,7 +161,7 @@ export default async function workspaceWebhookRoutes(app: FastifyInstance) {
         preHandler: [requireAuth, requireWorkspace],
         schema: { params: inboundParams },
     }, async (req, reply) => {
-        const { workspaceId } = req.params as z.infer<typeof inboundParams>;
+        const { workspaceId, event } = req.params as z.infer<typeof inboundParams>;
         const pool = getPool();
         const result = await pool.query('SELECT settings FROM workspaces WHERE id = $1', [workspaceId]);
         const settings = (result.rows[0]?.settings || {}) as Record<string, any>;
@@ -180,6 +180,6 @@ export default async function workspaceWebhookRoutes(app: FastifyInstance) {
             return reply.status(401).send({ error: 'Invalid signature' });
         }
 
-        return { success: true, message: 'Inbound webhook accepted', event: req.params['event'] || 'unknown' };
+        return { success: true, message: 'Inbound webhook accepted', event: event || 'unknown' };
     });
 }

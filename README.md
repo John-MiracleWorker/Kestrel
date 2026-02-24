@@ -1,361 +1,134 @@
 <p align="center">
-  <h1 align="center">Kestrel</h1>
-  <p align="center"><strong>Autonomous AI agent platform that thinks, plans, and acts — on your own infrastructure.</strong></p>
+  <img src="https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/logo.png" alt="Kestrel Logo" width="120" style="border-radius: 20px" onerror="this.style.display='none'">
+  <h1 align="center">🦅 Kestrel (formerly Libre Bird)</h1>
+  <p align="center"><strong>The dangerously autonomous, entirely self-hostable, slightly-too-smart AI agent platform.</strong></p>
   <p align="center">
-    <a href="#quick-start">Quick Start</a> •
-    <a href="#the-kestrel-agent">Agent Engine</a> •
-    <a href="#features">Features</a> •
-    <a href="#architecture">Architecture</a> •
-    <a href="#tools--skills">Tools</a> •
-    <a href="#development">Development</a>
+    <a href="#-why-kestrel">Why Kestrel?</a> •
+    <a href="#-the-brain">The Brain</a> •
+    <a href="#-architecture">Architecture</a> •
+    <a href="#-skills-and-tools">Skills</a> •
+    <a href="#-quick-start">Quick Start</a>
   </p>
 </p>
 
 ---
 
-Kestrel is a privacy-first, self-hostable AI platform that goes far beyond simple chat. At its core is an **autonomous agent engine** that plans, reasons, self-reflects, coordinates multi-agent debates, and executes real-world actions through 30+ sandboxed tools — all while showing you exactly how it thinks.
+## 👋 Welcome to Kestrel!
 
-> **Private by default** — runs entirely on your infrastructure. Your data never leaves your machines. Supports local models via MLX (Apple Silicon) or any cloud LLM (Gemini, OpenAI, Anthropic).
+Ever wanted an AI assistant that doesn't just reply to your messages, but actually thinks, argues with itself, spins up Docker containers, and executes real-world actions while you sip your coffee? Welcome to **Kestrel**.
 
----
-
-## ✨ Features
-
-| Category                     | Highlights                                                                                     |
-| ---------------------------- | ---------------------------------------------------------------------------------------------- |
-| 🧠 **Autonomous Agent**      | Plan → Execute → Reflect loop with multi-step reasoning and self-correction                    |
-| 🤔 **Multi-Agent Debates**   | Council of specialists (Architect, Security, Implementer, Devil's Advocate) vote on decisions  |
-| 👁️ **Transparent Thinking**  | KestrelProcessBar shows every step: memory recall → planning → tool use → council → confidence |
-| 🔧 **30+ Built-in Skills**   | Web search, code execution, file management, GitHub, email, home automation, and more          |
-| 🧩 **Custom Skills**         | Create workspace-specific tools that Kestrel loads dynamically                                 |
-| 💾 **Persistent Memory**     | Knowledge graph + vector memory that persists across restarts and conversations                |
-| 🔒 **Sandboxed Execution**   | All tool execution runs in isolated Docker containers with resource limits                     |
-| 📱 **Multi-Channel**         | Web, Telegram, Discord, WhatsApp — same agent, different interfaces                            |
-| 🗣️ **Voice Input**           | Wake word detection ("Hey Libre") with real-time audio streaming                               |
-| 🖥️ **Native macOS App**      | Run as a native `.app` bundle via pywebview                                                    |
-| 📊 **Guardrails & Auditing** | Token budgets, wall-time limits, evidence chains, and full audit trails                        |
+We firmly believe your data should stay yours. Kestrel is a privacy-first, heavily-armed (with tools) AI engine that runs *entirely* on your own infrastructure. You can hook it up to lightweight local MLX models on Apple Silicon, or plug in heavy hitters like Gemini, Claude, or GPT-4.
 
 ---
 
-## The Kestrel Agent
+## ✨ Why Kestrel?
 
-Kestrel isn't a chatbot wrapper — it's a full autonomous agent engine.
+Because typical chatbots are boring. Kestrel has agency.
 
-### How It Thinks
-
-```
-User Message
-    │
-    ▼
-┌──────────────────────────────────────────────────────┐
-│  Phase 0: Context Gathering                          │
-│  • Query Memory Graph for relevant past knowledge    │
-│  • Load lessons from previous tasks                  │
-│  • Activate workspace-specific skills                │
-│  • Inject persona & conversation history             │
-└──────────────────────┬───────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────┐
-│  Phase 1: Planning                                   │
-│  • Analyze goal and available tools                  │
-│  • Generate multi-step execution plan                │
-│  • Record plan decision in evidence chain            │
-└──────────────────────┬───────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────┐
-│  Phase 2: Execution Loop                             │
-│  • Execute plan steps with tool calls                │
-│  • Request human approval for risky actions           │
-│  • Checkpoint progress for recovery                  │
-│  • Coordinate sub-agents via Coordinator             │
-└──────────────────────┬───────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────┐
-│  Phase 3: Reflection & Learning                      │
-│  • Self-critique via ReflectionEngine                │
-│  • Council debate for complex decisions              │
-│  • Extract lessons for future tasks                  │
-│  • Persist evidence chain for auditability           │
-└──────────────────────────────────────────────────────┘
-```
-
-### Real-Time Visibility
-
-Every step of Kestrel's thinking process is streamed to the UI as a compact **KestrelProcessBar**:
-
-```
-🧠 3 recalled → 📖 2 lessons → 📋 4 steps → ⚡ web_search → 🤔 consensus → 🎯 92% → 💰 1.2k
-```
-
-Each phase is a clickable pill that expands to show full details — council votes, plan steps, evidence decisions, token costs, and more. No black boxes.
-
-### Multi-Agent Council
-
-For complex or risky decisions, Kestrel convenes a **Council** of specialists:
-
-| Role                | Perspective                                  |
-| ------------------- | -------------------------------------------- |
-| 🏗️ Architect        | System design, scalability, maintainability  |
-| ⚙️ Implementer      | Practical feasibility, effort, edge cases    |
-| 🔒 Security         | Vulnerabilities, data safety, access control |
-| 😈 Devil's Advocate | Challenges assumptions, finds weaknesses     |
-| 👤 User Advocate    | User experience, clarity, communication      |
-
-Members vote independently, debate each other's positions, and reach a consensus (or flag disagreement). If unsure, Kestrel escalates to the user rather than guessing.
+- � **Multi-Phase Cognitive Loop:** It doesn't just guess an answer. It accesses persistent memory, generates a multi-step plan, uses sandboxed tools, and reflects on whether it messed up.
+- 🏛️ **The Council:** Got a highly complex prompt? Kestrel convenes a literal *Multi-Agent Debate*. The Architect, the Security Expert, the Implementer, and the Devil's Advocate will argue in real-time until they reach a consensus.
+- �️ **See Everything:** The *KestrelProcessBar* in the UI streams the agent's internal monologue, memory recalls, and council votes. Zero black boxes.
+- 📦 **Sandboxed Toolkit:** 30+ built-in skills (web scraping, shell execution, GitHub manipulating, smart-home toggling) that run securely in isolated Docker containers via the `Hands` service.
+- 📱 **Omnipresent:** Chat via the gorgeous Web UI, native macOS app, Telegram, Discord, or WhatsApp. It's the exact same persistent brain everywhere.
 
 ---
 
-## Architecture
+## 🏗️ Architecture (We actually refactored this recently!)
 
+Kestrel is built like a tank, split into clean, modular microservices (because monolithic "God objects" give us nightmares).
+
+```mermaid
+graph TD
+    User([You, in your pajamas]) <-->|Web/Discord/Telegram/Voice| Gateway
+    
+    subgraph Kestrel Stack
+        Gateway[Gateway Node.js<br>WebSocket/REST Router]
+        Brain[The Brain Python<br>Cognitive Engine & Planning]
+        Hands[The Hands Python<br>Sandboxed Execution]
+        DB[(PostgreSQL 16<br>+ pgvector)]
+        Cache[(Redis 7)]
+        Frontend[React / Vite<br>Aurora UI]
+    end
+
+    Gateway <-->|gRPC| Brain
+    Brain <-->|gRPC| Hands
+    Brain <--> DB
+    Gateway <--> Cache
+    Frontend <--> Gateway
 ```
-┌─────────────────┐     WebSocket / REST
-│    Clients      │◄────────────────────────►┌──────────────────┐
-│  (Web, iOS,     │                          │     Gateway      │
-│   Telegram,     │                          │   (Node.js)      │
-│   Discord)      │                          └────────┬─────────┘
-└─────────────────┘                                   │ gRPC
-                                         ┌────────────┼────────────┐
-                                         ▼                         ▼
-                                  ┌──────────────┐         ┌──────────────┐
-                                  │    Brain     │         │    Hands     │
-                                  │  (Python)    │         │  (Python)    │
-                                  └──────┬───────┘         └──────┬───────┘
-                                         │                        │
-                               ┌─────────┼─────────┐      ┌──────┴───────┐
-                               ▼         ▼         ▼      ▼              ▼
-                         ┌──────┐  ┌──────────┐ ┌─────┐ ┌────────┐ ┌────────┐
-                         │Postgr│  │   LLM    │ │Redis│ │ Docker │ │ Skills │
-                         │ SQL  │  │Providers │ │     │ │Sandbox │ │        │
-                         └──────┘  └──────────┘ └─────┘ └────────┘ └────────┘
-```
 
-### Services
-
-| Service      | Language             | Port         | Responsibility                                                                    |
-| ------------ | -------------------- | ------------ | --------------------------------------------------------------------------------- |
-| **Gateway**  | Node.js / TypeScript | 8741         | Authentication (JWT), WebSocket sessions, multi-channel adapters, request routing |
-| **Brain**    | Python               | 50051 (gRPC) | Agent loop, LLM orchestration, memory graph, task planning, reflection, council   |
-| **Hands**    | Python               | 50052 (gRPC) | Sandboxed tool/skill execution in Docker containers                               |
-| **Frontend** | React / Vite         | 5173         | Aurora design system, real-time chat UI, KestrelProcessBar                        |
-
-### Infrastructure
-
-| Component                    | Purpose                                               |
-| ---------------------------- | ----------------------------------------------------- |
-| **PostgreSQL 16** (pgvector) | Persistent storage, vector search, Row-Level Security |
-| **Redis 7**                  | Session management, caching, pub/sub                  |
-| **Docker**                   | Sandboxed execution environment for skills            |
-
-### Brain Subsystems
-
-The Brain service initializes a deep stack of subsystems at startup:
-
-| Module            | File               | Purpose                                                     |
-| ----------------- | ------------------ | ----------------------------------------------------------- |
-| Agent Loop        | `loop.py`          | Plan → Execute → Reflect cycle with budgets and checkpoints |
-| Task Planner      | `planner.py`       | LLM-powered multi-step plan generation                      |
-| Council           | `council.py`       | Multi-agent debate with role-based voting                   |
-| Coordinator       | `coordinator.py`   | Sub-agent delegation and progress tracking                  |
-| Reflection Engine | `reflection.py`    | Self-critique with severity-graded feedback                 |
-| Memory Graph      | `memory_graph.py`  | Persistent knowledge graph for entities and relationships   |
-| Evidence Chain    | `evidence.py`      | Auditable decision trail with citations                     |
-| Persona Learner   | `persona.py`       | Learns user preferences over time                           |
-| Task Learner      | `learner.py`       | Extracts lessons from completed tasks                       |
-| Guardrails        | `guardrails.py`    | Token budgets, iteration limits, wall-time caps             |
-| Checkpoints       | `checkpoints.py`   | Task state snapshots for crash recovery                     |
-| Command Parser    | `commands.py`      | Slash commands (`/status`, `/model`) without LLM calls      |
-| Skill Manager     | `skills.py`        | Dynamic workspace-specific tool loading                     |
-| Workflow Registry | `workflows.py`     | Built-in task templates                                     |
-| Automation        | `automation.py`    | Cron scheduling and webhook handlers                        |
-| Predictions       | `predictions.py`   | Proactive intent prediction                                 |
-| Observability     | `observability.py` | Metrics, tracing, and performance monitoring                |
+### The Core Microservices:
+1. **The Brain (Python / gRPC):** The absolute core. Orchestrates the Plan → Execute → Reflect loop, coordinates the Council, accesses persistent Vector Memory (Chroma / pgvector), and manages 30+ tools. Recently heavily modularized into clean `core`, `memory`, and `services` namespaces!
+2. **The Hands (Python / gRPC):** The executing muscles. Spawns secure, transient Docker containers to run risky code, fetch URLs, and manipulate files without nuking your host machine.
+3. **The Gateway (Node.js / TS):** The fast, lightweight router that handles JWT auth, WebSockets, rate limiting, and normalizes inputs from Telegram, Discord, and Web clients.
+4. **The Frontend (React / Vite):** A beautiful, glassmorphism-heavy UI with real-time streaming updates of what the Brain is currently plotting.
 
 ---
 
-## Tools & Skills
+## 🧰 Skills and Tools
 
-### 30 Built-in Skills
+Kestrel comes equipped with enough tools to build an empire (or at least automate your inbox).
 
-Kestrel ships with an extensive toolkit, each running in a sandboxed Docker container:
-
-| Category              | Skills                                                                       | Description                                                  |
-| --------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| 🌐 **Web**            | `web`, `browser_automation`                                                  | Search (DuckDuckGo), page fetching, headless browser control |
-| 💻 **Code Execution** | `python_executor`, `node_executor`, `shell_executor`                         | Run Python, Node.js, and bash in sandboxes                   |
-| 📁 **Files**          | `documents`, `notes`                                                         | Read, write, search filesystem; note management              |
-| 🔍 **Knowledge**      | `knowledge`, `wikipedia`                                                     | RAG via ChromaDB, Wikipedia/Wolfram Alpha                    |
-| 🐙 **Dev Tools**      | `github`                                                                     | Repos, issues, PRs, code review                              |
-| 📧 **Communication**  | `email`, `contacts`                                                          | Email send/receive, contact management                       |
-| 📅 **Productivity**   | `calendar`, `scheduler`, `focus_timer`, `meeting_summarizer`, `productivity` | Calendar events, cron jobs, pomodoro timer, meeting notes    |
-| 🎨 **Media**          | `media`                                                                      | Image generation via MLX Stable Diffusion                    |
-| 🌍 **Translation**    | `translate`, `text_transform`                                                | Multi-language translation, text manipulation                |
-| 📡 **Integration**    | `api_caller`, `serial_usb`, `ssh_ftp`, `home_automation`, `digest`           | REST APIs, serial/USB, SSH/FTP, smart home, RSS feeds        |
-| 🖥️ **System**         | `system_monitor`, `screen`, `computer_use`, `core`                           | CPU/memory stats, screenshots, full computer control         |
-
-### Built-in Agent Tools
-
-Beyond sandboxed skills, Kestrel has direct-access agent tools:
-
-| Tool                         | Purpose                           |
-| ---------------------------- | --------------------------------- |
-| `read_web`                   | Parse web content via trafilatura |
-| `execute_python`             | Run Python code directly          |
-| `execute_bash`               | Run shell commands                |
-| `read_file` / `search_files` | Filesystem access                 |
-| `search_knowledge`           | Semantic search via ChromaDB      |
-| `generate_image`             | Local image gen via mflux         |
-| `text_to_speech`             | TTS output                        |
-| `remember` / `recall`        | Memory graph read/write           |
-| `ask_human`                  | Request user input when stuck     |
-| `create_schedule`            | Set up cron-based automated tasks |
-| `moltbook`                   | Log structured activity entries   |
+- **System & Code:** `python_executor`, `node_executor`, `shell_executor`, `github`, `system_monitor`, `computer_use`
+- **Knowledge & Web:** `web`, `browser_automation`, `knowledge` (RAG), `wikipedia`
+- **Productivity & Comm:** `email`, `calendar`, `meeting_summarizer`, `contacts`, `digest`
+- **God-Tier Auto:** `self_improve` (Yes, it rewrites its own code), `moltbook_autonomous` (Background scheduling and automation).
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
+
+Want to unleash Kestrel on your local network?
 
 ### Prerequisites
-
 - Docker & Docker Compose
-- At least one LLM API key (Google, OpenAI, or Anthropic) — or a local model
+- LLM API Keys (OpenAI, Anthropic, or Google) **OR** a local GGUF model if you're feeling entirely off-grid.
 
-### One-Command Deploy
-
+### 1-2-3 Deploy
 ```bash
-# Clone
+# 1. Grab the code
 git clone https://github.com/John-MiracleWorker/Kestrel.git
 cd Kestrel
 
-# Configure
+# 2. Set up your secrets (Don't skip this or Kestrel gets cranky)
 cp .env.example .env
-# Edit .env — set your API keys and passwords
+code .env # Add your API keys and secure passwords
 
-# Launch everything
-docker compose up -d
+# 3. Fire it all up
+docker compose up -d --build
 ```
-
-Then open **http://localhost:5173** — that's it.
-
-### Environment Variables
-
-Key variables in `.env`:
-
-| Variable               | Default                | Description                                 |
-| ---------------------- | ---------------------- | ------------------------------------------- |
-| `GOOGLE_API_KEY`       | —                      | Gemini API key                              |
-| `OPENAI_API_KEY`       | —                      | OpenAI API key                              |
-| `ANTHROPIC_API_KEY`    | —                      | Anthropic API key                           |
-| `DEFAULT_LLM_PROVIDER` | `local`                | `google`, `openai`, `anthropic`, or `local` |
-| `JWT_SECRET`           | `dev-secret-change-me` | Auth secret (change in production!)         |
-| `POSTGRES_PASSWORD`    | `changeme`             | Database password                           |
+*Boom.* Head over to **http://localhost:5173**. Your new hyper-capable assistant awaits.
 
 ---
 
-## Development
+## 🛠️ Development & Contributing
 
-### Run Services Individually
+The codebase is meticulously typed and documented. We love PRs!
 
+If you want to spin up services natively instead of in Docker:
 ```bash
-# Gateway (Node.js)
-cd packages/gateway && npm run dev
+# Terminal 1: Gateway
+cd packages/gateway && npm install && npm run dev
 
-# Brain (Python gRPC)
-cd packages/brain && python server.py
+# Terminal 2: Brain
+cd packages/brain && pip install -r requirements.txt && python server.py
 
-# Hands (Python gRPC)
-cd packages/hands && python server.py
-
-# Frontend (Vite dev server)
-cd packages/web && npm run dev
+# Terminal 3: Frontend
+cd packages/web && npm install && npm run dev
 ```
 
-### Run Tests
-
+Run tests natively:
 ```bash
-npm test                      # Gateway tests
-cd packages/brain && pytest   # Brain tests
-cd packages/hands && pytest   # Hands tests
-```
-
-### Project Structure
-
-```
-kestrel/
-├── packages/
-│   ├── brain/               # Python AI service (agent engine)
-│   │   ├── server.py              # gRPC server, 11+ RPCs
-│   │   ├── agent/                 # Full agent stack (24 modules)
-│   │   │   ├── loop.py            # Core plan-execute-reflect loop
-│   │   │   ├── council.py         # Multi-agent debate system
-│   │   │   ├── coordinator.py     # Sub-agent delegation
-│   │   │   ├── reflection.py      # Self-critique engine
-│   │   │   ├── memory_graph.py    # Persistent knowledge graph
-│   │   │   ├── evidence.py        # Auditable decision chain
-│   │   │   ├── planner.py         # LLM-powered task planning
-│   │   │   ├── guardrails.py      # Budget & safety limits
-│   │   │   └── ...                # 16 more modules
-│   │   ├── providers/             # LLM adapters (local, cloud)
-│   │   └── migrations/            # PostgreSQL schema + RLS
-│   ├── gateway/             # Node.js API gateway
-│   │   ├── src/server.ts          # Fastify + WebSocket
-│   │   ├── src/channels/          # Web, Telegram, Discord, WhatsApp
-│   │   └── src/brain/             # gRPC client
-│   ├── hands/               # Python tool execution service
-│   │   ├── executor.py            # Docker sandbox runner
-│   │   └── security/              # Allowlist & audit
-│   ├── web/                 # React frontend (Vite)
-│   │   └── src/components/Chat/   # ChatView + KestrelProcessBar
-│   └── shared/proto/        # Protobuf service contracts
-├── skills/                  # 30 built-in sandboxed skills
-├── docker-compose.yml       # Full stack orchestration
-└── .env.example             # Configuration template
+npm run test --prefix packages/gateway
+pytest packages/brain/tests/
 ```
 
 ---
 
-## Security
+## 🛡️ Security Note
 
-| Layer                   | Implementation                                               |
-| ----------------------- | ------------------------------------------------------------ |
-| **Authentication**      | JWT tokens with configurable expiry                          |
-| **Data Isolation**      | Row-Level Security (RLS) on PostgreSQL per workspace         |
-| **Sandboxed Execution** | All skills run in Docker containers with CPU/memory limits   |
-| **Module Allowlisting** | Only approved Python modules available in sandboxes          |
-| **Audit Logging**       | Every tool execution logged with full context                |
-| **Risk-Based Approval** | High-risk actions require explicit user confirmation         |
-| **Guardrails**          | Token budgets, iteration caps, and wall-time limits per task |
-| **Evidence Chain**      | Cryptographically auditable decision trail                   |
+Kestrel is *powerful*. It can run code and access your filesystem. We use Row-Level Security in Postgres, Docker sandboxing, and strict JWT auth to keep you safe, but **please do not expose the Gateway port (8741) to the public internet** without putting it behind a reverse proxy (like Nginx or Caddy) with proper TLS enabled. 
 
 ---
 
-## Channels
-
-Kestrel is accessible from multiple interfaces, all routing through the same agent:
-
-| Channel         | Status    | Protocol                    |
-| --------------- | --------- | --------------------------- |
-| 🌐 Web UI       | ✅ Active | WebSocket                   |
-| 📱 Telegram     | ✅ Active | Bot API                     |
-| 💬 Discord      | ✅ Active | Bot API                     |
-| 📲 WhatsApp     | ✅ Active | Cloud API                   |
-| 🖥️ macOS Native | ✅ Active | pywebview                   |
-| 🗣️ Voice        | ✅ Active | Wake word + audio streaming |
-
----
-
-## LLM Providers
-
-| Provider    | Models                                         | Status |
-| ----------- | ---------------------------------------------- | ------ |
-| Google      | Gemini 3 Flash, Gemini 3 Pro, Gemini 2.5 Flash | ✅     |
-| OpenAI      | GPT-5 series                                   | ✅     |
-| Anthropic   | Claude Sonnet 4.5, Haiku 4.5                   | ✅     |
-| Local (MLX) | Any GGUF model via llama.cpp                   | ✅     |
-
-Switch providers on the fly with `/model google` or via the UI settings.
-
----
-
-## License
-
-Private — all rights reserved.
+*Built with ❤️ (and entirely too much caffeine) by the Kestrel Team.*

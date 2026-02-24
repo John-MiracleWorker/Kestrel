@@ -214,7 +214,7 @@ async def record_session_in_memory_graph(
         return
     try:
         import server as _server
-        from agent.memory_graph import MemoryGraph
+        from agent.core.memory_graph import MemoryGraph
 
         pool = await _server.get_pool()
         graph = MemoryGraph(pool)
@@ -302,7 +302,7 @@ async def get_memory_context(workspace_id: str) -> str:
     """
     try:
         import server as _server
-        from agent.memory_graph import MemoryGraph
+        from agent.core.memory_graph import MemoryGraph
 
         pool = await _server.get_pool()
         graph = MemoryGraph(pool)
