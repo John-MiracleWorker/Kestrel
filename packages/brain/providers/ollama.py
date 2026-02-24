@@ -22,6 +22,9 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
 # Default model to use when none specified
 OLLAMA_DEFAULT_MODEL = os.getenv("OLLAMA_DEFAULT_MODEL", "qwen3:8b")
 
+# Default context window — set higher for agent workflows
+OLLAMA_CONTEXT_LENGTH = int(os.getenv("OLLAMA_CONTEXT_LENGTH", "16384"))
+
 # Health check cache (avoid hammering Ollama every call)
 _health_cache: dict[str, float] = {"ready": False, "checked_at": 0}
 _HEALTH_TTL = 30  # seconds
@@ -120,6 +123,7 @@ class OllamaProvider:
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,
+                "num_ctx": OLLAMA_CONTEXT_LENGTH,
             },
         }
 
@@ -190,6 +194,7 @@ class OllamaProvider:
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,
+                "num_ctx": OLLAMA_CONTEXT_LENGTH,
             },
         }
 

@@ -1002,6 +1002,40 @@ class AgentLoop:
         else:
             active_provider = self._provider
 
+        # ── Context compaction ────────────────────────────────────
+        # If messages are approaching the provider's context limit,
+        # compact older messages into a summary to save tokens.
+        # If still too large, escalate to a cloud provider.
+        try:
+            from agent.context_compactor import compact_context, needs_escalation
+
+            messages, was_compacted = await compact_context(
+                messages=messages,
+                provider_name=route.provider,
+                provider=active_provider,
+                model=routed_model,
+            )
+
+            if was_compacted and needs_escalation(messages, route.provider):
+                # Context is still too large for this provider — escalate
+                if self._provider_resolver:
+                    for cloud_name in ("google", "openai", "anthropic"):
+                        try:
+                            cloud_p = self._provider_resolver(cloud_name)
+                            if cloud_p.is_ready():
+                                logger.info(
+                                    f"Context overflow: escalating {route.provider} → {cloud_name}"
+                                )
+                                active_provider = cloud_p
+                                routed_model = ""  # Use provider's default
+                                break
+                        except Exception:
+                            continue
+        except ImportError:
+            pass  # context_compactor not available
+        except Exception as e:
+            logger.warning(f"Context compaction failed (non-fatal): {e}")
+
         logger.debug(
             f"Dispatching to {route.provider}:{routed_model} "
             f"(step={step.description[:50]}...)"

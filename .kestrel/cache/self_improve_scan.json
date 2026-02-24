@@ -40,14 +40,14 @@
         },
         "packages/brain/brain_pb2.py": { "sig": "1771801511024817532:27840", "issues": [] },
         "packages/brain/server.py": {
-            "sig": "1771893694220080947:107736",
+            "sig": "1771894177872140533:108263",
             "issues": [
                 {
                     "type": "todo",
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/server.py",
-                    "line": 251,
+                    "line": 252,
                     "description": "TODO: query local models",
                     "suggestion": "Implement or remove: TODO: query local models"
                 },
@@ -56,8 +56,8 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/server.py",
-                    "line": 1996,
-                    "description": "Function `serve` is 372 lines long \u2014 consider refactoring",
+                    "line": 1999,
+                    "description": "Function `serve` is 378 lines long \u2014 consider refactoring",
                     "suggestion": "Break `serve` into smaller helper functions"
                 },
                 {
@@ -65,8 +65,8 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/server.py",
-                    "line": 327,
-                    "description": "Function `StreamChat` is 769 lines long \u2014 consider refactoring",
+                    "line": 328,
+                    "description": "Function `StreamChat` is 770 lines long \u2014 consider refactoring",
                     "suggestion": "Break `StreamChat` into smaller helper functions"
                 },
                 {
@@ -74,8 +74,8 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/server.py",
-                    "line": 1343,
-                    "description": "Function `StartTask` is 149 lines long \u2014 consider refactoring",
+                    "line": 1345,
+                    "description": "Function `StartTask` is 150 lines long \u2014 consider refactoring",
                     "suggestion": "Break `StartTask` into smaller helper functions"
                 },
                 {
@@ -83,7 +83,7 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/server.py",
-                    "line": 1672,
+                    "line": 1675,
                     "description": "Function `GetCapabilities` is 99 lines long \u2014 consider refactoring",
                     "suggestion": "Break `GetCapabilities` into smaller helper functions"
                 },
@@ -137,45 +137,54 @@
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/server.py",
-                    "line": 154,
-                    "description": "Potentially unused import: `reflection`",
-                    "suggestion": "Remove unused import `reflection` at line 154"
-                },
-                {
-                    "type": "dead_import",
-                    "severity": "low",
-                    "package": "brain",
-                    "file": "packages/brain/server.py",
                     "line": 155,
+                    "description": "Potentially unused import: `reflection`",
+                    "suggestion": "Remove unused import `reflection` at line 155"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/server.py",
+                    "line": 156,
                     "description": "Potentially unused import: `protoc_main`",
-                    "suggestion": "Remove unused import `protoc_main` at line 155"
+                    "suggestion": "Remove unused import `protoc_main` at line 156"
                 },
                 {
                     "type": "dead_import",
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/server.py",
-                    "line": 163,
+                    "line": 164,
                     "description": "Potentially unused import: `importlib`",
-                    "suggestion": "Remove unused import `importlib` at line 163"
+                    "suggestion": "Remove unused import `importlib` at line 164"
                 },
                 {
                     "type": "dead_import",
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/server.py",
-                    "line": 165,
+                    "line": 166,
                     "description": "Potentially unused import: `tempfile`",
-                    "suggestion": "Remove unused import `tempfile` at line 165"
+                    "suggestion": "Remove unused import `tempfile` at line 166"
                 },
                 {
                     "type": "dead_import",
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/server.py",
-                    "line": 558,
+                    "line": 2091,
+                    "description": "Potentially unused import: `RoutingStrategy`",
+                    "suggestion": "Remove unused import `RoutingStrategy` at line 2091"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/server.py",
+                    "line": 559,
                     "description": "Potentially unused import: `TaskEventType`",
-                    "suggestion": "Remove unused import `TaskEventType` at line 558"
+                    "suggestion": "Remove unused import `TaskEventType` at line 559"
                 }
             ]
         },
@@ -214,7 +223,7 @@
         },
         "packages/brain/users.py": { "sig": "1771736233418838589:2100", "issues": [] },
         "packages/brain/providers_registry.py": {
-            "sig": "1771736245551757614:3035",
+            "sig": "1771894028496358431:4525",
             "issues": [
                 {
                     "type": "dead_import",
@@ -311,14 +320,14 @@
             ]
         },
         "packages/brain/providers/cloud.py": {
-            "sig": "1771887102676845106:28943",
+            "sig": "1771894437970214934:29276",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/providers/cloud.py",
-                    "line": 538,
+                    "line": 543,
                     "description": "Function `_generate_with_tools_google` is 110 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_generate_with_tools_google` into smaller helper functions"
                 }
@@ -326,6 +335,38 @@
         },
         "packages/brain/providers/local.py": { "sig": "1771539820070330240:4400", "issues": [] },
         "packages/brain/providers/__init__.py": { "sig": "1771204357051503083:3287", "issues": [] },
+        "packages/brain/providers/ollama.py": {
+            "sig": "1771895013217604516:9769",
+            "issues": [
+                {
+                    "type": "complexity",
+                    "severity": "medium",
+                    "package": "brain",
+                    "file": "packages/brain/providers/ollama.py",
+                    "line": 172,
+                    "description": "Function `generate_with_tools` is 91 lines long \u2014 consider refactoring",
+                    "suggestion": "Break `generate_with_tools` into smaller helper functions"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/providers/ollama.py",
+                    "line": 1,
+                    "description": "Potentially unused import: `annotations`",
+                    "suggestion": "Remove unused import `annotations` at line 1"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/providers/ollama.py",
+                    "line": 13,
+                    "description": "Potentially unused import: `Optional`",
+                    "suggestion": "Remove unused import `Optional` at line 13"
+                }
+            ]
+        },
         "packages/brain/tests/conftest.py": { "sig": "1771454411477992063:166", "issues": [] },
         "packages/brain/tests/test_providers.py": {
             "sig": "1771279343776996432:2810",
@@ -869,14 +910,14 @@
         },
         "packages/brain/agent/guardrails.py": { "sig": "1771892515805947175:7938", "issues": [] },
         "packages/brain/agent/loop.py": {
-            "sig": "1771892741484195857:48076",
+            "sig": "1771894133300803572:48717",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/loop.py",
-                    "line": 137,
+                    "line": 139,
                     "description": "Function `run` is 393 lines long \u2014 consider refactoring",
                     "suggestion": "Break `run` into smaller helper functions"
                 },
@@ -885,7 +926,7 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/loop.py",
-                    "line": 583,
+                    "line": 585,
                     "description": "Function `_execute_tools_parallel` is 145 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_execute_tools_parallel` into smaller helper functions"
                 },
@@ -894,7 +935,7 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/loop.py",
-                    "line": 729,
+                    "line": 731,
                     "description": "Function `_execute_single_tool` is 159 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_execute_single_tool` into smaller helper functions"
                 },
@@ -903,8 +944,8 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/loop.py",
-                    "line": 889,
-                    "description": "Function `_reason_and_act` is 173 lines long \u2014 consider refactoring",
+                    "line": 891,
+                    "description": "Function `_reason_and_act` is 187 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_reason_and_act` into smaller helper functions"
                 },
                 {
@@ -1028,8 +1069,17 @@
             ]
         },
         "packages/brain/agent/model_router.py": {
-            "sig": "1771893304224773162:10623",
+            "sig": "1771894723118759832:23837",
             "issues": [
+                {
+                    "type": "complexity",
+                    "severity": "medium",
+                    "package": "brain",
+                    "file": "packages/brain/agent/model_router.py",
+                    "line": 95,
+                    "description": "Function `_build_routes` is 115 lines long \u2014 consider refactoring",
+                    "suggestion": "Break `_build_routes` into smaller helper functions"
+                },
                 {
                     "type": "dead_import",
                     "severity": "low",
@@ -1044,27 +1094,36 @@
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/agent/model_router.py",
-                    "line": 17,
+                    "line": 23,
+                    "description": "Potentially unused import: `time`",
+                    "suggestion": "Remove unused import `time` at line 23"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/model_router.py",
+                    "line": 24,
                     "description": "Potentially unused import: `field`",
-                    "suggestion": "Remove unused import `field` at line 17"
+                    "suggestion": "Remove unused import `field` at line 24"
                 },
                 {
                     "type": "dead_import",
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/agent/model_router.py",
-                    "line": 19,
+                    "line": 26,
                     "description": "Potentially unused import: `Any`",
-                    "suggestion": "Remove unused import `Any` at line 19"
+                    "suggestion": "Remove unused import `Any` at line 26"
                 },
                 {
                     "type": "dead_import",
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/agent/model_router.py",
-                    "line": 19,
+                    "line": 26,
                     "description": "Potentially unused import: `Optional`",
-                    "suggestion": "Remove unused import `Optional` at line 19"
+                    "suggestion": "Remove unused import `Optional` at line 26"
                 }
             ]
         },
