@@ -1,0 +1,343 @@
+/* ── UI Artifact Renderer ─────────────────────────────────────────── */
+/* Renders persistent interactive components created by the agent.     */
+
+.ui-artifact-panel {
+    display: flex;
+    flex-direction: column;
+    background: var(--agent-bg, #0f172a);
+    border: 1px solid var(--agent-border, #334155);
+    border-radius: var(--agent-radius, 12px);
+    overflow: hidden;
+    font-family:
+        'Inter',
+        -apple-system,
+        sans-serif;
+    color: var(--agent-text, #e2e8f0);
+    animation: artifact-enter 0.3s ease;
+}
+
+@keyframes artifact-enter {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* ── Header ──────────────────────────────────────────────────────── */
+
+.ui-artifact-panel__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    background: var(--agent-surface, #1e293b);
+    border-bottom: 1px solid var(--agent-border, #334155);
+}
+
+.ui-artifact-panel__title-group {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+}
+
+.ui-artifact-panel__icon {
+    font-size: 18px;
+    flex-shrink: 0;
+}
+
+.ui-artifact-panel__title {
+    font-weight: 600;
+    font-size: 14px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.ui-artifact-panel__type-badge {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    background: rgba(59, 130, 246, 0.15);
+    color: #93c5fd;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+    flex-shrink: 0;
+}
+
+.ui-artifact-panel__type-badge--react {
+    background: rgba(6, 182, 212, 0.15);
+    color: #67e8f9;
+    border-color: rgba(6, 182, 212, 0.3);
+}
+
+.ui-artifact-panel__type-badge--html {
+    background: rgba(249, 115, 22, 0.15);
+    color: #fdba74;
+    border-color: rgba(249, 115, 22, 0.3);
+}
+
+.ui-artifact-panel__type-badge--markdown {
+    background: rgba(168, 85, 247, 0.15);
+    color: #c4b5fd;
+    border-color: rgba(168, 85, 247, 0.3);
+}
+
+.ui-artifact-panel__actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.ui-artifact-panel__action-btn {
+    background: transparent;
+    border: 1px solid var(--agent-border, #334155);
+    color: var(--agent-muted, #64748b);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.ui-artifact-panel__action-btn:hover {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--agent-text, #e2e8f0);
+    border-color: var(--agent-active, #3b82f6);
+}
+
+.ui-artifact-panel__action-btn--active {
+    background: rgba(59, 130, 246, 0.15);
+    color: #93c5fd;
+    border-color: rgba(59, 130, 246, 0.4);
+}
+
+/* ── Content ─────────────────────────────────────────────────────── */
+
+.ui-artifact-panel__content {
+    flex: 1;
+    overflow: auto;
+    position: relative;
+}
+
+/* Preview mode — sandboxed iframe */
+.ui-artifact-panel__preview {
+    width: 100%;
+    min-height: 200px;
+    border: none;
+    background: #fff;
+}
+
+/* Code mode — syntax display */
+.ui-artifact-panel__code {
+    padding: 16px;
+    background: rgba(0, 0, 0, 0.3);
+    overflow: auto;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 13px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: #93c5fd;
+    tab-size: 2;
+}
+
+.ui-artifact-panel__code .line-number {
+    display: inline-block;
+    width: 40px;
+    text-align: right;
+    margin-right: 16px;
+    color: var(--agent-muted, #64748b);
+    user-select: none;
+    opacity: 0.5;
+}
+
+/* ── Description / Metadata ──────────────────────────────────────── */
+
+.ui-artifact-panel__meta {
+    padding: 10px 16px;
+    border-top: 1px solid var(--agent-border, #334155);
+    background: var(--agent-surface, #1e293b);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 12px;
+    color: var(--agent-muted, #64748b);
+}
+
+.ui-artifact-panel__description {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.ui-artifact-panel__version {
+    flex-shrink: 0;
+    font-size: 11px;
+    padding: 2px 8px;
+    background: rgba(100, 116, 139, 0.15);
+    border-radius: 4px;
+}
+
+/* ── List View (Multiple Artifacts) ──────────────────────────────── */
+
+.ui-artifacts-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.ui-artifacts-list__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 4px;
+}
+
+.ui-artifacts-list__title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--agent-text, #e2e8f0);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.ui-artifacts-list__count {
+    font-size: 11px;
+    font-weight: 500;
+    padding: 2px 8px;
+    background: rgba(59, 130, 246, 0.15);
+    color: #93c5fd;
+    border-radius: 10px;
+}
+
+/* ── Copy Toast ──────────────────────────────────────────────────── */
+
+.ui-artifact-panel__toast {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    background: var(--agent-success, #10b981);
+    color: white;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 6px 14px;
+    border-radius: 6px;
+    animation:
+        toast-in 0.2s ease,
+        toast-out 0.2s ease 1.8s forwards;
+    pointer-events: none;
+    z-index: 10;
+}
+
+@keyframes toast-in {
+    from {
+        opacity: 0;
+        transform: translateY(-8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes toast-out {
+    from {
+        opacity: 1;
+    }
+    to {
+        opacity: 0;
+    }
+}
+
+/* ── Scrollbar ───────────────────────────────────────────────────── */
+
+.ui-artifact-panel__content::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+.ui-artifact-panel__content::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.ui-artifact-panel__content::-webkit-scrollbar-thumb {
+    background: var(--agent-border, #334155);
+    border-radius: 3px;
+}
+
+/* ── Empty State ─────────────────────────────────────────────────── */
+
+.ui-artifact-panel__empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 48px 24px;
+    color: var(--agent-muted, #64748b);
+    text-align: center;
+    gap: 12px;
+}
+
+.ui-artifact-panel__empty-icon {
+    font-size: 36px;
+    opacity: 0.4;
+}
+
+.ui-artifact-panel__empty-text {
+    font-size: 13px;
+    max-width: 280px;
+    line-height: 1.5;
+}
+
+/* ── Version History ─────────────────────────────────────────────── */
+
+.ui-artifact-panel__versions {
+    padding: 12px 16px;
+    border-top: 1px solid var(--agent-border);
+    background: rgba(0, 0, 0, 0.2);
+    max-height: 160px;
+    overflow-y: auto;
+}
+
+.ui-artifact-panel__version-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 8px;
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+.ui-artifact-panel__version-item:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.ui-artifact-panel__version-item--active {
+    background: rgba(59, 130, 246, 0.12);
+    color: #93c5fd;
+}
+
+.ui-artifact-panel__version-label {
+    font-weight: 500;
+}
+
+.ui-artifact-panel__version-date {
+    color: var(--agent-muted);
+    font-size: 11px;
+}

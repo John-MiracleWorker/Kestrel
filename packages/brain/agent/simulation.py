@@ -146,10 +146,17 @@ class OutcomeSimulator:
             # Surface to user for approval
     """
 
-    def __init__(self, llm_provider=None, model: str = "", event_callback=None):
+    def __init__(self, llm_provider=None, model: str = "", event_callback=None, provider_resolver=None):
         self._provider = llm_provider
         self._model = model
         self._event_callback = event_callback
+        self._resolver = provider_resolver  # callable() -> provider
+
+    def _get_provider(self):
+        """Resolve provider dynamically."""
+        if self._resolver:
+            return self._resolver()
+        return self._provider
 
     async def simulate(
         self,
@@ -179,7 +186,8 @@ class OutcomeSimulator:
         tools_text = ", ".join(tool_names or ["(unknown)"])
 
         # If no LLM provider, fall back to rule-based simulation
-        if not self._provider:
+        provider = self._get_provider()
+        if not provider:
             result = self._rule_based_simulation(plan)
             result.simulation_time_ms = int((time.time() - start) * 1000)
             return result
@@ -192,7 +200,7 @@ class OutcomeSimulator:
         )
 
         try:
-            response = await self._provider.generate(
+            response = await provider.generate(
                 messages=[{"role": "user", "content": prompt}],
                 model=self._model,
                 temperature=0.3,

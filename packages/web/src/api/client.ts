@@ -151,7 +151,9 @@ export async function uploadFiles(files: File[]): Promise<UploadedFile[]> {
     }
 
     if (!res.ok) {
-        const err = (await res.json().catch(() => ({ error: res.statusText }))) as { error?: string };
+        const err = (await res.json().catch(() => ({ error: res.statusText }))) as {
+            error?: string;
+        };
         throw new Error(err.error || 'Upload failed');
     }
 
@@ -211,7 +213,7 @@ export const moltbook = {
     getActivity: (workspaceId: string, limit = 20) =>
         request<{ activity: MoltbookActivityItem[] }>(
             `/workspaces/${workspaceId}/moltbook/activity?limit=${limit}`,
-        ).then(res => res.activity),
+        ).then((res) => res.activity),
 };
 
 // ── Capabilities ────────────────────────────────────────────────────
@@ -227,9 +229,9 @@ export interface CapabilityItem {
 
 export const capabilities = {
     get: (workspaceId: string) =>
-        request<{ capabilities: CapabilityItem[] }>(
-            `/workspaces/${workspaceId}/capabilities`,
-        ).then(res => res.capabilities),
+        request<{ capabilities: CapabilityItem[] }>(`/workspaces/${workspaceId}/capabilities`).then(
+            (res) => res.capabilities,
+        ),
 };
 
 // ── Workflows ───────────────────────────────────────────────────────
@@ -248,7 +250,7 @@ export const workflows = {
     list: (category?: string) =>
         request<{ workflows: WorkflowItem[] }>(
             `/workflows${category ? `?category=${category}` : ''}`,
-        ).then(res => res.workflows),
+        ).then((res) => res.workflows),
 };
 
 // ── Conversations ───────────────────────────────────────────────────
@@ -347,12 +349,12 @@ export const integrations = {
     connectTelegram: (workspaceId: string, token: string, enabled: boolean) =>
         request<{ success: boolean; status: string; botId?: number; botUsername?: string }>(
             `/workspaces/${workspaceId}/integrations/telegram`,
-            { method: 'POST', body: { token, enabled } }
+            { method: 'POST', body: { token, enabled } },
         ),
     disconnectTelegram: (workspaceId: string) =>
         request<{ success: boolean; status: string }>(
             `/workspaces/${workspaceId}/integrations/telegram`,
-            { method: 'DELETE' }
+            { method: 'DELETE' },
         ),
 };
 
@@ -367,17 +369,19 @@ export interface WorkspaceWebhookConfig {
 
 export const webhooks = {
     getConfig: (workspaceId: string) =>
-        request<{ webhook: WorkspaceWebhookConfig; supportedEvents: string[] }>(`/workspaces/${workspaceId}/webhooks/config`),
+        request<{ webhook: WorkspaceWebhookConfig; supportedEvents: string[] }>(
+            `/workspaces/${workspaceId}/webhooks/config`,
+        ),
     saveConfig: (workspaceId: string, webhook: WorkspaceWebhookConfig) =>
         request<{ success: boolean; webhook: WorkspaceWebhookConfig }>(
             `/workspaces/${workspaceId}/webhooks/config`,
             { method: 'PUT', body: webhook },
         ),
     testConnection: (workspaceId: string) =>
-        request<{ success: boolean; delivery: { success: boolean; statusCode?: number; error?: string; attempt: number } }>(
-            `/workspaces/${workspaceId}/webhooks/test`,
-            { method: 'POST' },
-        ),
+        request<{
+            success: boolean;
+            delivery: { success: boolean; statusCode?: number; error?: string; attempt: number };
+        }>(`/workspaces/${workspaceId}/webhooks/test`, { method: 'POST' }),
 };
 
 // ── WebSocket ───────────────────────────────────────────────────────
@@ -492,5 +496,36 @@ export const tasks = {
     cancel: (taskId: string) =>
         request<{ success: boolean }>(`/tasks/${taskId}/cancel`, {
             method: 'POST',
+        }),
+};
+
+// ── UI Artifacts ────────────────────────────────────────────────────
+
+export interface UIArtifactItem {
+    id: string;
+    title: string;
+    description: string;
+    component_type: 'react' | 'html' | 'markdown';
+    component_code: string;
+    props_schema: Record<string, unknown>;
+    data_source: string;
+    version: number;
+    created_at: string;
+    updated_at: string;
+}
+
+export const uiArtifacts = {
+    list: (workspaceId: string) =>
+        request<{ artifacts: UIArtifactItem[] }>(`/workspaces/${workspaceId}/ui-artifacts`).then(
+            (res) => res.artifacts,
+        ),
+
+    get: (workspaceId: string, artifactId: string) =>
+        request<UIArtifactItem>(`/workspaces/${workspaceId}/ui-artifacts/${artifactId}`),
+
+    update: (workspaceId: string, artifactId: string, instruction: string) =>
+        request<UIArtifactItem>(`/workspaces/${workspaceId}/ui-artifacts/${artifactId}`, {
+            method: 'PUT',
+            body: { instruction },
         }),
 };

@@ -139,9 +139,16 @@ class AutomationBuilder:
       2. LLM fallback for complex descriptions
     """
 
-    def __init__(self, llm_provider=None, model: str = ""):
+    def __init__(self, llm_provider=None, model: str = "", provider_resolver=None):
         self._provider = llm_provider
         self._model = model
+        self._resolver = provider_resolver  # callable() -> provider
+
+    def _get_provider(self):
+        """Resolve provider dynamically (workspace config may change)."""
+        if self._resolver:
+            return self._resolver()
+        return self._provider
 
     async def build(self, request: str) -> AutomationSpec:
         """
@@ -167,7 +174,8 @@ class AutomationBuilder:
             )
 
         # Tier 2: LLM extraction
-        if not self._provider:
+        provider = self._get_provider()
+        if not provider:
             raise ValueError(
                 "Cannot parse complex automation request without LLM provider. "
                 "Try using common patterns like 'every weekday at 8am...' "
@@ -175,7 +183,7 @@ class AutomationBuilder:
             )
 
         prompt = BUILD_PROMPT.format(request=request)
-        response = await self._provider.generate(
+        response = await provider.generate(
             messages=[{"role": "user", "content": prompt}],
             model=self._model,
             temperature=0.2,

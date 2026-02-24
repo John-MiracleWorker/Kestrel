@@ -2174,9 +2174,23 @@ async def serve():
 
     # ── God-Tier Features ────────────────────────────────────────────
 
+    # Dynamic provider resolver — checks workspace config at call time
+    def _resolve_default_provider():
+        """Return the workspace's default cloud provider (sync-safe)."""
+        # Try to find the default configured cloud provider
+        for name in ("google", "openai", "anthropic"):
+            try:
+                p = get_provider(name)
+                if p.is_ready():
+                    return p
+            except Exception:
+                continue
+        # Last resort: return Google even if key missing (will error at call time)
+        return get_provider("google")
+
     # Feature 2: NL Automation Builder
     _automation_builder = AutomationBuilder(
-        llm_provider=get_provider("google"),
+        provider_resolver=_resolve_default_provider,
     )
     logger.info("NL automation builder initialized")
 
@@ -2194,7 +2208,7 @@ async def serve():
 
     # Feature 5: Outcome Simulator (Pre-Flight)
     _outcome_simulator = OutcomeSimulator(
-        llm_provider=get_provider("google"),
+        provider_resolver=_resolve_default_provider,
     )
     logger.info("Outcome simulator initialized")
 
