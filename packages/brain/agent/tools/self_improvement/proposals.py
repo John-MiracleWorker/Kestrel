@@ -433,8 +433,8 @@ Return ONLY the JSON array, no markdown code fences. Limit to 5 most impactful p
         logger.error(f"LLM analysis failed: {e}")
         return []
 
-def _handle_approval(proposal_id: str, approved: bool) -> dict:
-    """Handle approval or denial of a proposal."""
+async def _handle_approval(proposal_id: str, approved: bool) -> dict:
+    """Handle approval or denial of a proposal — now actually applies the change."""
     if not proposal_id:
         return {"error": "proposal_id is required"}
 
@@ -456,15 +456,28 @@ def _handle_approval(proposal_id: str, approved: bool) -> dict:
         del pending[proposal_id]
         _save_proposals(pending)
 
-        # Notify user
-        _send_summary_to_telegram(
-            f"✅ <b>Approved:</b> {matching.get('description', '')[:200]}\n\n"
-            f"Kestrel will apply this fix on the next improvement cycle."
-        )
+        # Actually apply the improvement
+        from .patcher import apply_proposal
+        result = await apply_proposal(matching)
+
+        if result.get("success"):
+            _send_summary_to_telegram(
+                f"✅ <b>Applied:</b> {matching.get('description', '')[:200]}\n\n"
+                f"File: <code>{result.get('file', '?')}</code>\n"
+                f"Hot-reloaded ✅ | Watchdog active (5min)"
+            )
+        else:
+            _send_summary_to_telegram(
+                f"⚠️ <b>Approved but failed to apply:</b>\n"
+                f"{matching.get('description', '')[:200]}\n\n"
+                f"Error: {result.get('error', 'unknown')}"
+            )
 
         return {
             "status": "approved",
-            "message": f"Proposal {proposal_id[:8]} approved. Will be applied next cycle.",
+            "applied": result.get("success", False),
+            "message": result.get("message", result.get("error", "")),
+            "stages": result.get("stages", {}),
             "proposal": matching,
         }
     else:

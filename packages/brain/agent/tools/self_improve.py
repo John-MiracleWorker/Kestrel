@@ -19,6 +19,7 @@ from .self_improvement.utils import *
 from .self_improvement.ast_analyzer import _deep_scan
 from .self_improvement.github_sync import _github_sync
 from .self_improvement.proposals import _run_tests, _propose_improvements, _telegram_digest, _handle_approval
+from .self_improvement.patcher import apply_proposal, rollback, get_history
 
 def register_self_improve_tools(registry) -> None:
     """Register the self-improvement engine tool."""
@@ -38,6 +39,7 @@ def register_self_improve_tools(registry) -> None:
                     "action": {
                         "type": "string",
                         "enum": ["scan", "test", "report", "propose", "approve", "deny",
+                                 "apply", "rollback", "history",
                                  "list_pending", "github_sync", "telegram_digest"],
                         "description": (
                             "scan = deep codebase analysis, "
@@ -45,6 +47,9 @@ def register_self_improve_tools(registry) -> None:
                             "report = last scan summary, "
                             "propose = send proposals to Telegram, "
                             "approve/deny = act on a proposal, "
+                            "apply = generate patch + test + hot-reload for a proposal, "
+                            "rollback = revert last applied change for a file, "
+                            "history = show all applied self-improvements, "
                             "list_pending = show pending proposals, "
                             "github_sync = file high-severity issues to GitHub, "
                             "telegram_digest = send code health summary to Telegram"
@@ -62,7 +67,11 @@ def register_self_improve_tools(registry) -> None:
                     },
                     "proposal_id": {
                         "type": "string",
-                        "description": "Proposal ID for approve/deny actions",
+                        "description": "Proposal ID for approve/deny/apply actions",
+                    },
+                    "file": {
+                        "type": "string",
+                        "description": "File path for rollback action (relative to project root)",
                     },
                 },
                 "required": ["action"],
@@ -81,6 +90,7 @@ async def self_improve_action(
     package: str = "all",
     proposal_id: str = "",
     scan_mode: str = "standard",
+    file: str = "",
 ) -> dict:
     """Route to the appropriate self-improvement action."""
     global _last_scan_results
@@ -96,9 +106,29 @@ async def self_improve_action(
     elif action == "propose":
         return await _propose_improvements()
     elif action == "approve":
-        return _handle_approval(proposal_id, approved=True)
+        return await _handle_approval(proposal_id, approved=True)
     elif action == "deny":
-        return _handle_approval(proposal_id, approved=False)
+        return await _handle_approval(proposal_id, approved=False)
+    elif action == "apply":
+        # Apply a specific proposal by ID (generates patch, tests, hot-reloads)
+        if not proposal_id:
+            return {"error": "proposal_id is required for apply action"}
+        pending = _load_proposals()
+        matching = None
+        for pid, proposal in pending.items():
+            if pid == proposal_id or pid.startswith(proposal_id):
+                matching = proposal
+                break
+        if not matching:
+            return {"error": f"Proposal not found: {proposal_id}", "pending": list(pending.keys())}
+        return await apply_proposal(matching)
+    elif action == "rollback":
+        if not file:
+            return {"error": "'file' parameter required for rollback (relative path, e.g. 'agent/tools/moltbook.py')"}
+        return rollback(file)
+    elif action == "history":
+        history = get_history()
+        return {"improvements": history, "count": len(history)}
     elif action == "list_pending":
         pending = _load_proposals()
         return {"pending": list(pending.values()), "count": len(pending)}
