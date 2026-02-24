@@ -49,7 +49,7 @@ logger = logging.getLogger("brain.agent.tools.computer_use")
 
 COMPUTER_USE_MODEL = os.getenv(
     "GEMINI_COMPUTER_USE_MODEL",
-    "gemini-2.5-computer-use-preview-10-2025",
+    "gemini-3-flash-preview",
 )
 MAX_TURNS = int(os.getenv("COMPUTER_USE_MAX_TURNS", "30"))
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
