@@ -2084,6 +2084,14 @@ async def serve():
     from agent.sessions import SessionManager
     from agent.sandbox import SandboxManager
     from agent.checkpoints import CheckpointManager
+    # God-tier feature imports
+    from agent.model_router import ModelRouter
+    from agent.nl_automation import AutomationBuilder
+    from agent.daemon import DaemonManager
+    from agent.branching import BranchManager
+    from agent.simulation import OutcomeSimulator
+    from agent.proactive import ProactiveEngine
+    from agent.ui_artifacts import UIArtifactManager
 
     global _agent_loop, _agent_persistence, _tool_registry, _memory_graph
     global _cron_scheduler, _webhook_handler
@@ -2094,11 +2102,17 @@ async def serve():
     _tool_registry = build_tool_registry(hands_client=_hands_client, pool=pool)
     guardrails = Guardrails()
     _agent_persistence = PostgresTaskPersistence(pool=pool)
+
+    # Feature 1: Adaptive Model Router
+    _model_router = ModelRouter()
+    logger.info("Model router initialized")
+
     _agent_loop = AgentLoop(
         provider=get_provider("local"),
         tool_registry=_tool_registry,
         guardrails=guardrails,
         persistence=_agent_persistence,
+        model_router=_model_router,
     )
     logger.info(f"Agent runtime initialized ({len(_tool_registry._definitions)} tools)")
 
@@ -2157,6 +2171,60 @@ async def serve():
     # Initialize sandbox manager (Docker container isolation)
     _sandbox_manager = SandboxManager()
     logger.info("Sandbox manager initialized")
+
+    # ── God-Tier Features ────────────────────────────────────────────
+
+    # Feature 2: NL Automation Builder
+    _automation_builder = AutomationBuilder(
+        llm_provider=get_provider("cloud"),
+    )
+    logger.info("NL automation builder initialized")
+
+    # Feature 3: Daemon Manager
+    _daemon_manager = DaemonManager(
+        pool=pool,
+        notification_router=_notification_router,
+        task_launcher=None,  # Set after cron scheduler init
+    )
+    logger.info("Daemon manager initialized")
+
+    # Feature 4: Branch Manager (Time-Travel)
+    _branch_manager = BranchManager(pool=pool)
+    logger.info("Branch manager initialized")
+
+    # Feature 5: Outcome Simulator (Pre-Flight)
+    _outcome_simulator = OutcomeSimulator(
+        llm_provider=get_provider("cloud"),
+    )
+    logger.info("Outcome simulator initialized")
+
+    # Feature 6: Proactive Interrupt Engine
+    _proactive_engine = ProactiveEngine(
+        notification_router=_notification_router,
+        task_launcher=None,  # Set after cron scheduler init
+    )
+    try:
+        await _proactive_engine.start()
+        logger.info("Proactive interrupt engine started")
+    except Exception as e:
+        logger.warning(f"Proactive engine start failed (non-fatal): {e}")
+
+    # Feature 7: UI Artifact Manager
+    _ui_artifact_manager = UIArtifactManager(pool=pool)
+    logger.info("UI artifact manager initialized")
+
+    # Register god-tier tools
+    from agent.tools.build_automation import register_build_automation_tools
+    from agent.tools.daemon_control import register_daemon_tools
+    from agent.tools.time_travel import register_time_travel_tools
+    from agent.tools.ui_builder import register_ui_builder_tools
+
+    register_build_automation_tools(_tool_registry)
+    register_daemon_tools(_tool_registry)
+    register_time_travel_tools(_tool_registry)
+    register_ui_builder_tools(_tool_registry)
+    logger.info("God-tier tools registered")
+
 
     # Initialize and start automation (cron scheduler + webhook handler)
     async def launch_task_from_automation(workspace_id, user_id, goal, source="automation"):

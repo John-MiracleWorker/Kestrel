@@ -290,6 +290,9 @@ class AgentTask:
     parent_task_id: Optional[str] = None
     child_task_ids: list[str] = field(default_factory=list)
 
+    # Time-travel branching
+    branch_id: str = "main"
+
 
 # ── Task Events (streamed to clients) ────────────────────────────────
 
@@ -311,6 +314,8 @@ class TaskEventType(str, Enum):
     DELEGATION_COMPLETE = "delegation_complete"
     CHECKPOINT_SAVED = "checkpoint_saved"
     AGENT_ACTIVITY = "agent_activity"
+    SIMULATION_COMPLETE = "simulation_complete"
+    PROACTIVE_INTERRUPT = "proactive_interrupt"
 
 
 @dataclass

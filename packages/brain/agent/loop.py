@@ -47,6 +47,7 @@ from agent.learner import TaskLearner
 from agent.memory_graph import MemoryGraph
 from agent.evidence import EvidenceChain, DecisionType
 from agent.observability import MetricsCollector
+from agent.model_router import ModelRouter, classify_step
 
 logger = logging.getLogger("brain.agent.loop")
 
@@ -112,6 +113,7 @@ class AgentLoop:
         api_key: str = "",
         event_callback=None,
         reflection_engine=None,
+        model_router: Optional[ModelRouter] = None,
     ):
         self._provider = provider
         self._tools = tool_registry
@@ -126,6 +128,7 @@ class AgentLoop:
         self._evidence_chain = evidence_chain
         self._event_callback = event_callback
         self._reflection_engine = reflection_engine
+        self._model_router = model_router or ModelRouter()
         self._metrics = MetricsCollector(model=model)
 
         # Callback for approval resolution (set by the gRPC handler)
@@ -979,13 +982,22 @@ class AgentLoop:
         # Get available tools as OpenAI function schemas
         tool_schemas = [t.to_openai_schema() for t in self._tools.list_tools()]
 
-        # Call LLM with function calling
+        # Route to optimal model based on step type
+        route = self._model_router.select(
+            step_description=step.description,
+            expected_tools=getattr(step, 'expected_tools', None),
+        )
+        routed_model = route.model if route.model else self._model
+        routed_temp = route.temperature
+        routed_max_tokens = route.max_tokens
+
+        # Call LLM with function calling (using routed model)
         response = await self._provider.generate_with_tools(
             messages=messages,
-            model=self._model,
+            model=routed_model,
             tools=tool_schemas,
-            temperature=0.2,
-            max_tokens=4096,
+            temperature=routed_temp,
+            max_tokens=routed_max_tokens,
             api_key=self._api_key,
         )
 
