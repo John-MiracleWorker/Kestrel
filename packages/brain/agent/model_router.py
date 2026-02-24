@@ -263,6 +263,105 @@ def classify_step(description: str, expected_tools: list[str] = None) -> StepTyp
     return max(scores, key=scores.get)
 
 
+# ── Complexity Estimation ────────────────────────────────────────────
+
+# Signals that indicate a task is too complex for small local models
+_COMPLEXITY_SIGNALS_HIGH: list[str] = [
+    "architect", "design system", "refactor entire", "migration",
+    "security audit", "vulnerability", "CVE", "penetration",
+    "multi-step", "multi-file", "cross-module", "distributed",
+    "concurrent", "race condition", "deadlock", "transaction",
+    "optimize", "performance bottleneck", "memory leak",
+    "machine learning", "training", "neural", "fine-tune",
+    "cryptograph", "encryption", "certificate",
+    "kubernetes", "terraform", "infrastructure",
+    "complex", "advanced", "sophisticated", "comprehensive",
+    "production", "enterprise", "scale", "high-availability",
+    "generate a full", "build a complete", "create an entire",
+]
+
+_COMPLEXITY_SIGNALS_LOW: list[str] = [
+    "simple", "quick", "basic", "trivial", "minor",
+    "rename", "typo", "fix typo", "update comment",
+    "list", "show", "display", "print", "log",
+    "add a field", "change the", "set the",
+]
+
+# Threshold: complexity >= this → escalate to cloud
+_ESCALATION_THRESHOLD = float(os.getenv("ROUTER_ESCALATION_THRESHOLD", "5.0"))
+
+
+def estimate_complexity(
+    description: str,
+    step_type: StepType,
+    expected_tools: list[str] = None,
+    context_messages: int = 0,
+) -> float:
+    """
+    Estimate task complexity on a 0-10 scale.
+
+    Factors:
+      - Keyword signals (high/low complexity indicators)
+      - Description length (longer = usually more complex)
+      - Step type (security, coding inherently score higher)
+      - Number of expected tools (more tools = more orchestration)
+      - Conversation depth (more messages = evolving complexity)
+
+    Returns a float 0.0 (trivial) to 10.0 (extremely complex).
+    """
+    score = 0.0
+    text = description.lower()
+
+    # 1. Keyword signals (+0.6 per high signal, -0.4 per low signal)
+    for signal in _COMPLEXITY_SIGNALS_HIGH:
+        if signal in text:
+            score += 0.6
+    for signal in _COMPLEXITY_SIGNALS_LOW:
+        if signal in text:
+            score -= 0.4
+
+    # 2. Description length (long descriptions usually = complex tasks)
+    char_count = len(description)
+    if char_count > 500:
+        score += 2.0
+    elif char_count > 200:
+        score += 1.0
+    elif char_count > 100:
+        score += 0.5
+
+    # 3. Step type baseline
+    type_baselines = {
+        StepType.SECURITY: 3.0,      # Security always leans complex
+        StepType.CODING: 2.0,        # Code gen benefits from reasoning
+        StepType.DATA_ANALYSIS: 2.0, # Data tasks need precision
+        StepType.RESEARCH: 1.5,      # Research can be deep
+        StepType.PLANNING: 1.0,      # Planning is usually manageable
+        StepType.REFLECTION: 0.5,    # Meta-reasoning, light
+        StepType.WRITING: 0.5,       # Writing is straightforward
+        StepType.GENERAL: 0.5,       # Default
+    }
+    score += type_baselines.get(step_type, 0.5)
+
+    # 4. Tool count (more tools = more orchestration complexity)
+    if expected_tools:
+        tool_count = len(expected_tools)
+        if tool_count >= 5:
+            score += 2.0
+        elif tool_count >= 3:
+            score += 1.0
+        elif tool_count >= 1:
+            score += 0.5
+
+    # 5. Conversation depth (longer conversations = evolved complexity)
+    if context_messages > 20:
+        score += 1.0
+    elif context_messages > 10:
+        score += 0.5
+
+    # Clamp to 0-10
+    return max(0.0, min(10.0, score))
+
+
 # ── Model Router ─────────────────────────────────────────────────────
 
 
@@ -300,6 +399,7 @@ class ModelRouter:
         # Stats for cost tracking
         self._route_counts: dict[StepType, int] = {}
         self._fallback_counts: dict[str, int] = {}
+        self._escalation_counts: dict[StepType, int] = {}
 
         logger.info(f"ModelRouter initialized with strategy={self._strategy.value}")
 
@@ -353,22 +453,76 @@ class ModelRouter:
         logger.warning(f"No fallback available for {original_provider}")
         return route
 
+    def _maybe_escalate(self, route: ModelRoute, complexity: float) -> ModelRoute:
+        """
+        If complexity exceeds threshold and we're on a local model,
+        escalate to the best available cloud provider.
+        """
+        if complexity < _ESCALATION_THRESHOLD:
+            return route
+
+        # Only escalate from local providers
+        if route.provider not in ("ollama", "local"):
+            return route
+
+        # Find the best available cloud provider
+        cloud_priority = [
+            ("google", _CLOUD_POWER_MODEL),
+            ("openai", "gpt-5.2"),
+            ("anthropic", "claude-sonnet-4-6"),
+        ]
+
+        for cloud_provider, cloud_model in cloud_priority:
+            if self._is_provider_available(cloud_provider):
+                self._escalation_counts[route.step_type] = (
+                    self._escalation_counts.get(route.step_type, 0) + 1
+                )
+                logger.info(
+                    f"Escalating [{route.step_type.value}] "
+                    f"{route.provider}:{route.model} → {cloud_provider}:{cloud_model} "
+                    f"(complexity={complexity:.1f}, threshold={_ESCALATION_THRESHOLD})"
+                )
+                return ModelRoute(
+                    step_type=route.step_type,
+                    provider=cloud_provider,
+                    model=cloud_model,
+                    temperature=route.temperature,
+                    max_tokens=max(route.max_tokens, 8192),  # cloud can handle more
+                    reason=f"escalated from {route.provider} (complexity={complexity:.1f})",
+                )
+
+        # No cloud available — stay local
+        return route
+
     def select(
         self,
         step_description: str = "",
         expected_tools: list[str] = None,
         step_type: StepType = None,
+        context_messages: int = 0,
     ) -> ModelRoute:
         """
         Select the best model+provider for a step.
 
+        Performs three checks:
+        1. Classify step type and look up the base route
+        2. Estimate complexity — escalate local → cloud if too complex
+        3. Check provider availability — fall back if offline
+
         Returns a ModelRoute with provider, model, temperature, max_tokens.
-        If the target provider is offline, automatically falls back.
         """
         if step_type is None:
             step_type = classify_step(step_description, expected_tools)
 
         route = self._routes.get(step_type, self._routes[StepType.GENERAL])
+
+        # Estimate complexity and escalate if needed
+        complexity = estimate_complexity(
+            step_description, step_type, expected_tools, context_messages
+        )
+
+        if self._strategy in (RoutingStrategy.LOCAL_FIRST, RoutingStrategy.COST_OPTIMIZED):
+            route = self._maybe_escalate(route, complexity)
 
         # Check availability and fall back if needed
         if not self._is_provider_available(route.provider):
@@ -379,7 +533,8 @@ class ModelRouter:
 
         logger.debug(
             f"Routed [{step_type.value}] → {route.provider}:{route.model} "
-            f"(temp={route.temperature}) | {step_description[:60]}..."
+            f"(complexity={complexity:.1f}, temp={route.temperature}) "
+            f"| {step_description[:60]}..."
         )
         return route
 
@@ -395,14 +550,19 @@ class ModelRouter:
         logger.info(f"Routing strategy changed to {strategy.value}")
 
     def get_stats(self) -> dict:
-        """Return routing + fallback statistics for observability."""
+        """Return routing + fallback + escalation statistics."""
         return {
             "routes": {
                 st.value: count
                 for st, count in sorted(self._route_counts.items(), key=lambda x: -x[1])
             },
             "fallbacks": dict(self._fallback_counts),
+            "escalations": {
+                st.value: count
+                for st, count in self._escalation_counts.items()
+            },
             "strategy": self._strategy.value,
+            "escalation_threshold": _ESCALATION_THRESHOLD,
         }
 
     def get_config(self) -> list[dict]:
