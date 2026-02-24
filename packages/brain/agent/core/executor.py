@@ -9,6 +9,7 @@ from typing import Any, AsyncIterator, Callable, Optional
 from agent.types import (
     AgentTask,
     ApprovalRequest,
+    ApprovalStatus,
     StepStatus,
     TaskEvent,
     TaskEventType,
@@ -103,8 +104,11 @@ class TaskExecutor:
         start = time.time()
         while time.time() - start < timeout_s:
             approval = await self._persistence.get_approval(task.pending_approval.id)
-            if approval and approval.status != "PENDING":
-                return approval.status == "APPROVED"
+            if approval:
+                status = approval.status.value if isinstance(approval.status, ApprovalStatus) else str(approval.status)
+                status = status.lower()
+                if status != ApprovalStatus.PENDING.value:
+                    return status == ApprovalStatus.APPROVED.value
             await asyncio.sleep(2.0)
         return False
 

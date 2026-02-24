@@ -207,11 +207,16 @@ class AgentServicerMixin(BaseServicerMixin):
         from agent.types import ApprovalStatus
 
         try:
-            await runtime.agent_persistence.resolve_approval(
+            updated = await runtime.agent_persistence.resolve_approval(
                 approval_id=request.approval_id,
                 status=ApprovalStatus.APPROVED if request.approved else ApprovalStatus.DENIED,
                 decided_by=request.user_id,
             )
+            if not updated:
+                return brain_pb2.ApproveActionResponse(
+                    success=False,
+                    error="Approval not found, already resolved, or not owned by this user.",
+                )
             return brain_pb2.ApproveActionResponse(success=True, error="")
         except Exception as e:
             return brain_pb2.ApproveActionResponse(success=False, error=str(e))

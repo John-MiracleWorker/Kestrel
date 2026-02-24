@@ -91,6 +91,7 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
                 "agent_status": "waiting_for_human",
                 "approval_id": event.approval_id or "",
                 "question": question[:300],
+                "task_id": event.task_id or "",
             },
         )
 
