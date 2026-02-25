@@ -111,6 +111,7 @@ services:
       - ${LOCAL_MODEL_DIR:-./models}:/models:ro
       - .:/project # Mount project root for self-improvement git operations
       - ${HOST_MOUNT_ROOT:-/Users}:/host_fs # Host filesystem (tool-level security + human approval for writes)
+      - /var/run/docker.sock:/var/run/docker.sock # Docker socket for container_control tool
     depends_on:
       postgres:
         condition: service_healthy
