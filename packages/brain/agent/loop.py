@@ -21,6 +21,7 @@ Enhancements:
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -52,6 +53,11 @@ from agent.council import CouncilSession, CouncilRole
 from agent.core.executor import TaskExecutor
 
 logger = logging.getLogger("brain.agent.loop")
+
+
+def _council_debate_enabled() -> bool:
+    """Whether to run the council cross-critique debate round."""
+    return os.getenv("COUNCIL_INCLUDE_DEBATE", "false").lower() == "true"
 
 
 class AgentLoop:
@@ -277,7 +283,7 @@ class AgentLoop:
                         verdict = await self._council.deliberate(
                             proposal=plan_text,
                             context=task.goal,
-                            include_debate=True
+                            include_debate=_council_debate_enabled()
                         )
                         
                         if verdict.requires_user_review:

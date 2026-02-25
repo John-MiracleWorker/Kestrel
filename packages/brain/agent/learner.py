@@ -21,6 +21,7 @@ both successes and failures, building a growing library of reusable insights.
 import hashlib
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -31,6 +32,16 @@ logger = logging.getLogger("brain.agent.learner")
 DEDUP_SIMILARITY_THRESHOLD = 0.6
 # Confidence boost when a duplicate lesson reinforces an existing one
 CONFIDENCE_REINFORCEMENT = 0.05
+
+
+def _lesson_extract_max_tokens() -> int:
+    """Token cap for structured post-task lesson extraction."""
+    raw = os.getenv("TASK_LEARNER_MAX_TOKENS", "1024")
+    try:
+        val = int(raw)
+    except ValueError:
+        val = 1024
+    return max(256, min(val, 4096))
 
 
 @dataclass
@@ -204,7 +215,7 @@ class TaskLearner:
                 ],
                 model=self._model,
                 temperature=0.3,
-                max_tokens=2048,
+                max_tokens=_lesson_extract_max_tokens(),
             )
 
             # generate() returns a plain string; generate_with_tools() returns a dict

@@ -17,6 +17,7 @@ This is Kestrel's "second brain" — it grows smarter with every conversation.
 import json
 import logging
 import math
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -24,6 +25,16 @@ from enum import Enum
 from typing import Any, Optional
 
 logger = logging.getLogger("brain.agent.memory_graph")
+
+
+def _extract_max_tokens() -> int:
+    """Token cap for LLM entity extraction (small structured JSON output)."""
+    raw = os.getenv("MEMORY_GRAPH_EXTRACT_MAX_TOKENS", "768")
+    try:
+        val = int(raw)
+    except ValueError:
+        val = 768
+    return max(128, min(val, 4096))
 
 
 # ── Node & Edge Types ────────────────────────────────────────────────
@@ -161,7 +172,7 @@ async def extract_entities_llm(
             messages=[{"role": "user", "content": prompt}],
             model=model,
             temperature=0.1,
-            max_tokens=4096,
+            max_tokens=_extract_max_tokens(),
             api_key=api_key,
         ):
             if isinstance(token, str):

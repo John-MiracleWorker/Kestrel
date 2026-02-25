@@ -16,12 +16,23 @@ No other agent systematically stress-tests its own reasoning.
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
 logger = logging.getLogger("brain.agent.core.reflection")
+
+
+def _reflection_max_tokens(env_name: str, default: int) -> int:
+    """Read reflection token caps from env with sane bounds."""
+    raw = os.getenv(env_name, str(default))
+    try:
+        val = int(raw)
+    except ValueError:
+        val = default
+    return max(256, min(val, 4096))
 
 
 class CritiqueCategory(str, Enum):
@@ -280,7 +291,7 @@ class ReflectionEngine:
                 messages=[{"role": "user", "content": prompt}],
                 model=self._model,
                 temperature=0.3,
-                max_tokens=2000,
+                max_tokens=_reflection_max_tokens("REFLECTION_REVIEW_MAX_TOKENS", 1200),
             )
             return response.get("content", "")
         except Exception as e:
@@ -303,7 +314,7 @@ class ReflectionEngine:
                 messages=[{"role": "user", "content": prompt}],
                 model=self._model,
                 temperature=0.3,
-                max_tokens=2000,
+                max_tokens=_reflection_max_tokens("REFLECTION_STRENGTHEN_MAX_TOKENS", 1200),
             )
             return response.get("content", plan)
         except Exception as e:
