@@ -102,6 +102,9 @@ export default async function integrationRoutes(
                 adapter.setApprovalHandler(async (approvalId, userId, approved) =>
                     brainClient.approveAction(approvalId, userId, approved),
                 );
+                adapter.setPendingApprovalsLookupHandler((userId, lookupWorkspaceId) =>
+                    brainClient.listPendingApprovals(userId, lookupWorkspaceId),
+                );
 
                 await channelRegistry.register(adapter);
 

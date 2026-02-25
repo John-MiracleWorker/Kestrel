@@ -40,6 +40,7 @@ service BrainService {
   rpc StartTask(StartTaskRequest) returns (stream TaskEvent);
   rpc StreamTaskEvents(StreamTaskEventsRequest) returns (stream TaskEvent);
   rpc ApproveAction(ApproveActionRequest) returns (ApproveActionResponse);
+  rpc ListPendingApprovals(ListPendingApprovalsRequest) returns (ListPendingApprovalsResponse);
   rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
   rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
 
@@ -425,6 +426,23 @@ message ApproveActionRequest {
 message ApproveActionResponse {
   bool success = 1;
   string error = 2;
+}
+
+message ListPendingApprovalsRequest {
+  string user_id = 1;
+  string workspace_id = 2;
+}
+
+message PendingApprovalSummary {
+  string approval_id = 1;
+  string task_id = 2;
+  string tool_name = 3;
+  string reason = 4;
+  string created_at = 5;
+}
+
+message ListPendingApprovalsResponse {
+  repeated PendingApprovalSummary approvals = 1;
 }
 
 message CancelTaskRequest {

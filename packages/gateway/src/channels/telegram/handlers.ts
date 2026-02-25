@@ -56,20 +56,48 @@ import { logger } from '../../utils/logger';
             const DENY_KEYWORDS = ['deny', 'denied', 'reject', 'no', 'cancel', 'stop', 'abort'];
             const textLower = text.toLowerCase().trim();
             const resolvedUser = adapter.resolveUserId(from, msg.chat.id);
+            const isApproval = APPROVE_KEYWORDS.some(kw => textLower.includes(kw));
+            const isDenial = DENY_KEYWORDS.some(kw => textLower.includes(kw));
 
-            const pendingForChat = [...adapter.pendingApprovals.entries()]
-                .filter(([, v]) => v.chatId === msg.chat.id);
+            if (isApproval || isDenial) {
+                const pendingForChat = [...adapter.pendingApprovals.entries()]
+                    .filter(([, v]) => v.chatId === msg.chat.id);
+                const threadId = msg.message_thread_id;
 
-            if (pendingForChat.length > 0) {
-                const isApproval = APPROVE_KEYWORDS.some(kw => textLower.includes(kw));
-                const isDenial = DENY_KEYWORDS.some(kw => textLower.includes(kw));
-
-                if (isApproval || isDenial) {
+                if (pendingForChat.length > 0) {
                     const [approvalId] = pendingForChat[pendingForChat.length - 1];
-                    const threadId = msg.message_thread_id;
                     await handleApproval(adapter, msg.chat.id, approvalId, isApproval, resolvedUser, threadId);
                     return;
                 }
+
+                const unresolvedApprovals = await adapter.listPendingApprovalsForUser(resolvedUser);
+
+                if (unresolvedApprovals.length === 1) {
+                    await handleApproval(adapter, msg.chat.id, unresolvedApprovals[0].approval_id, isApproval, resolvedUser, threadId);
+                    return;
+                }
+
+                const params: Record<string, any> = {
+                    chat_id: msg.chat.id,
+                    parse_mode: 'Markdown',
+                };
+                if (threadId !== undefined) params.message_thread_id = threadId;
+
+                if (unresolvedApprovals.length > 1) {
+                    const listedApprovals = unresolvedApprovals
+                        .map((approval) => `• \`${adapter.escapeMarkdown(approval.approval_id)}\``)
+                        .join('\n');
+                    params.text =
+                        '⚠️ I found multiple pending approvals. Please specify one:\n\n' +
+                        `${listedApprovals}\n\n` +
+                        'Use `/approve <approval_id>` or `/reject <approval_id>`.';
+                    await adapter.api('sendMessage', params);
+                    return;
+                }
+
+                params.text = 'No pending approvals were found for you right now.';
+                await adapter.api('sendMessage', params);
+                return;
             }
         }
 

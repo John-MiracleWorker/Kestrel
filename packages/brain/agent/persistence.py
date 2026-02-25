@@ -184,3 +184,32 @@ class PostgresTaskPersistence(TaskPersistence):
             decided_by,
         )
         return row is not None
+
+    async def list_pending_approvals(self, user_id: str, workspace_id: Optional[str] = None) -> list[dict[str, Any]]:
+        """List unresolved approval requests owned by a user."""
+        query = """
+            SELECT a.id, a.task_id, a.tool_name, a.reason, a.created_at
+            FROM agent_approvals AS a
+            JOIN agent_tasks AS t ON t.id = a.task_id
+            WHERE a.status = 'pending'
+              AND t.user_id = $1
+        """
+        params: list[Any] = [user_id]
+
+        if workspace_id:
+            query += " AND t.workspace_id = $2"
+            params.append(workspace_id)
+
+        query += " ORDER BY a.created_at DESC"
+
+        rows = await self._pool.fetch(query, *params)
+        return [
+            {
+                "approval_id": str(row["id"]),
+                "task_id": str(row["task_id"]),
+                "tool_name": row["tool_name"] or "",
+                "reason": row["reason"] or "",
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]

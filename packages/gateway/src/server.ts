@@ -156,6 +156,9 @@ async function start() {
             telegramAdapter.setApprovalHandler(async (approvalId, userId, approved) =>
                 brainClient.approveAction(approvalId, userId, approved),
             );
+            telegramAdapter.setPendingApprovalsLookupHandler((userId, workspaceId) =>
+                brainClient.listPendingApprovals(userId, workspaceId),
+            );
         }
 
         if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
@@ -263,6 +266,9 @@ async function start() {
                     });
                     restoredAdapter.setApprovalHandler(async (approvalId, userId, approved) =>
                         brainClient.approveAction(approvalId, userId, approved),
+                    );
+                    restoredAdapter.setPendingApprovalsLookupHandler((userId, workspaceId) =>
+                        brainClient.listPendingApprovals(userId, workspaceId),
                     );
                     await channelRegistry.register(restoredAdapter);
                     logger.info('Telegram adapter restored from persisted config');

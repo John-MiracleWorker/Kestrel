@@ -221,6 +221,28 @@ class AgentServicerMixin(BaseServicerMixin):
         except Exception as e:
             return brain_pb2.ApproveActionResponse(success=False, error=str(e))
 
+    async def ListPendingApprovals(self, request, context):
+        """List unresolved approvals for a user/workspace."""
+        try:
+            approvals = await runtime.agent_persistence.list_pending_approvals(
+                user_id=request.user_id,
+                workspace_id=request.workspace_id or None,
+            )
+            items = [
+                brain_pb2.PendingApprovalSummary(
+                    approval_id=item["approval_id"],
+                    task_id=item["task_id"],
+                    tool_name=item["tool_name"],
+                    reason=item["reason"],
+                    created_at=item["created_at"].isoformat() if item["created_at"] else "",
+                )
+                for item in approvals
+            ]
+            return brain_pb2.ListPendingApprovalsResponse(approvals=items)
+        except Exception as e:
+            logger.exception("ListPendingApprovals failed")
+            context.abort(grpc.StatusCode.INTERNAL, str(e))
+
     async def CancelTask(self, request, context):
         """Cancel a running agent task."""
         task_id = request.task_id
