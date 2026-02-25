@@ -115,7 +115,7 @@ class NotificationRouter:
                     """,
                     notification.id, user_id, workspace_id, type,
                     title, body, source, json.dumps(data or {}),
-                    notification.created_at,
+                    datetime.fromisoformat(notification.created_at),
                 )
         except Exception as e:
             logger.error(f"Failed to persist notification: {e}")
@@ -140,7 +140,7 @@ class NotificationRouter:
                 payload = json.dumps({
                     "userId": user_id,
                     "notification": notification.to_dict(),
-                })
+                }, default=str)
                 await self._redis.publish("notifications", payload)
             except Exception as e:
                 logger.error(f"Redis notification publish failed: {e}")

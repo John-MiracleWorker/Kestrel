@@ -66,7 +66,7 @@ async def bootstrap_moltbook_cron(pool: Any) -> None:
     The job is a no-op if no Moltbook credentials are present.
     """
     _MOLTBOOK_JOB_NAME = "moltbook_autonomous_session"
-    _MOLTBOOK_CRON = "0 */2 * * *"   # every 2 hours
+    _MOLTBOOK_CRON = "0 */6 * * *"   # every 6 hours
     _MOLTBOOK_GOAL = (
         "Run your autonomous Moltbook session. "
         "First call moltbook_session to scan your subscribed submolts and get your "

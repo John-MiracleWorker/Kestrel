@@ -310,9 +310,9 @@ class CronScheduler:
                 )
             for row in rows:
                 job = CronJob(
-                    id=row["id"],
-                    workspace_id=row["workspace_id"],
-                    user_id=row["user_id"],
+                    id=str(row["id"]),
+                    workspace_id=str(row["workspace_id"]),
+                    user_id=str(row["user_id"]),
                     name=row["name"],
                     description=row["description"],
                     cron_expression=row["cron_expression"],
