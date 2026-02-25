@@ -10,6 +10,16 @@ from crud import get_messages
 
 logger = logging.getLogger("brain.services.context")
 
+
+def _history_limit() -> int:
+    """Return capped chat history message limit for context assembly."""
+    raw = os.getenv("CHAT_HISTORY_LIMIT", "20")
+    try:
+        val = int(raw)
+    except ValueError:
+        val = 20
+    return max(1, min(val, 100))
+
 async def build_chat_context(request, workspace_id, pool, r, runtime, provider_name, model, ws_config, api_key):
     # Convert proto messages to dict format
     messages = []
@@ -39,7 +49,7 @@ async def build_chat_context(request, workspace_id, pool, r, runtime, provider_n
                             "content": h["content"],
                         })
                 if history_messages:
-                    history_messages = history_messages[-50:]
+                    history_messages = history_messages[-_history_limit():]
                     messages = history_messages + messages
                     logger.info(f"Loaded {len(history_messages)} messages from history")
         except Exception as hist_err:

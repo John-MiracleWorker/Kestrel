@@ -33,6 +33,16 @@ from typing import Any, Optional
 logger = logging.getLogger("brain.agent.council")
 
 
+def _council_max_tokens(env_name: str, default: int) -> int:
+    """Read council token caps from env with sane bounds."""
+    raw = os.getenv(env_name, str(default))
+    try:
+        val = int(raw)
+    except ValueError:
+        val = default
+    return max(256, min(val, 4096))
+
+
 class CouncilRole(str, Enum):
     """Roles that council members can take."""
     ARCHITECT = "architect"
@@ -384,7 +394,7 @@ Provide your analysis, then {VOTE_PROMPT}
                 messages=[{"role": "user", "content": full_prompt}],
                 model=self._model,
                 temperature=0.4,
-                max_tokens=1500,
+                max_tokens=_council_max_tokens("COUNCIL_EVAL_MAX_TOKENS", 800),
             )
             # generate() may return str or dict depending on provider
             content = response.get("content", "") if isinstance(response, dict) else str(response)
@@ -433,7 +443,7 @@ If yes, provide updated analysis. If no, confirm your position.
                         messages=[{"role": "user", "content": debate_prompt}],
                         model=self._model,
                         temperature=0.3,
-                        max_tokens=1000,
+                        max_tokens=_council_max_tokens("COUNCIL_DEBATE_MAX_TOKENS", 500),
                     )
                 content = response.get("content", "") if isinstance(response, dict) else str(response)
                 return self._parse_opinion(opinion.role, content)
