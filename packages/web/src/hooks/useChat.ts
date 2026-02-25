@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createChatSocket, conversations, forceRefresh, type Message } from '../api/client';
+import { useAuth } from './useAuth';
 
 interface AgentActivity {
     activity_type: string;
@@ -91,6 +92,7 @@ export function useChat(
     const reconnectAttemptRef = useRef(0);
     const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const isMountedRef = useRef(true);
+    const { isAuthenticated } = useAuth();
 
     const connectSocket = useCallback(() => {
         if (!workspaceId || !conversationId || !isMountedRef.current) return;
@@ -339,7 +341,7 @@ export function useChat(
     }, [workspaceId, conversationId]);
 
     useEffect(() => {
-        if (!workspaceId || !conversationId) return;
+        if (!workspaceId || !conversationId || !isAuthenticated) return;
 
         isMountedRef.current = true;
         reconnectAttemptRef.current = 0;
@@ -354,7 +356,7 @@ export function useChat(
             wsRef.current?.close();
             wsRef.current = null;
         };
-    }, [workspaceId, conversationId, connectSocket]);
+    }, [workspaceId, conversationId, connectSocket, isAuthenticated]);
 
     // Automatic title generation trigger — fires after first assistant reply
     const titleGeneratedRef = useRef(false);

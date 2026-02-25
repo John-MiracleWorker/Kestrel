@@ -9,6 +9,7 @@
  */
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { request, createChatSocket } from '../../api/client';
+import { useAuth } from '../../hooks/useAuth';
 
 interface Notification {
     id: string;
@@ -47,6 +48,7 @@ export function NotificationBell() {
     const [isOpen, setIsOpen] = useState(false);
     const [isPulsing, setIsPulsing] = useState(false);
     const panelRef = useRef<HTMLDivElement>(null);
+    const { isAuthenticated } = useAuth();
 
     const unreadCount = notifications.filter((n) => !n.read).length;
 
@@ -63,6 +65,8 @@ export function NotificationBell() {
     }, []);
 
     useEffect(() => {
+        if (!isAuthenticated) return;
+
         fetchNotifications();
         const interval = setInterval(fetchNotifications, 30000);
 
@@ -89,7 +93,7 @@ export function NotificationBell() {
             clearInterval(interval);
             if (ws) ws.close();
         };
-    }, [fetchNotifications]);
+    }, [fetchNotifications, isAuthenticated]);
 
     // Close panel when clicking outside
     useEffect(() => {
