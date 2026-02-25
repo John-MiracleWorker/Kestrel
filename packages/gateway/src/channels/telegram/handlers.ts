@@ -508,22 +508,58 @@ import { logger } from '../../utils/logger';
     export async function sendApprovalRequest(adapter: TelegramAdapter, chatId: number, approvalId: string, description: string, taskId: string, userId: string, threadId?: number): Promise<void> {
         adapter.pendingApprovals.set(approvalId, { taskId, chatId, userId, threadId });
 
+        const escapedDescription = adapter.escapeMarkdown(description);
+        const escapedApprovalId = adapter.escapeMarkdown(approvalId);
+        const replyMarkup = JSON.stringify({
+            inline_keyboard: [[
+                { text: '✅ Approve', callback_data: `approve:${approvalId}` },
+                { text: '❌ Reject', callback_data: `reject:${approvalId}` },
+            ]],
+        });
+
         const params: Record<string, any> = {
             chat_id: chatId,
             text:
                 '⚠️ *Approval Required*\n\n' +
-                `${description}\n\n` +
-                `ID: \`${approvalId}\``,
+                `${escapedDescription}\n\n` +
+                `ID: ${escapedApprovalId}`,
             parse_mode: 'Markdown',
-            reply_markup: JSON.stringify({
-                inline_keyboard: [[
-                    { text: '✅ Approve', callback_data: `approve:${approvalId}` },
-                    { text: '❌ Reject', callback_data: `reject:${approvalId}` },
-                ]],
-            }),
+            reply_markup: replyMarkup,
         };
         if (threadId !== undefined) params.message_thread_id = threadId;
-        await adapter.api('sendMessage', params);
+
+        try {
+            await adapter.api('sendMessage', params);
+        } catch (err) {
+            logger.error('Telegram sendMessage failed for approval request', {
+                method: 'sendMessage',
+                approvalId,
+                chatId,
+                error: err,
+            });
+
+            const fallbackParams: Record<string, any> = {
+                chat_id: chatId,
+                text:
+                    '⚠️ Approval Required\n\n' +
+                    `${description}\n\n` +
+                    `ID: ${approvalId}`,
+                reply_markup: replyMarkup,
+            };
+            if (threadId !== undefined) fallbackParams.message_thread_id = threadId;
+
+            try {
+                await adapter.api('sendMessage', fallbackParams);
+            } catch (fallbackErr) {
+                logger.error('Telegram fallback sendMessage failed for approval request', {
+                    method: 'sendMessage',
+                    approvalId,
+                    chatId,
+                    error: fallbackErr,
+                });
+                throw fallbackErr;
+            }
+        }
     }
 
     /**
