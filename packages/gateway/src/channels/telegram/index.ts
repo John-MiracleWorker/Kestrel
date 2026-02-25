@@ -49,7 +49,10 @@ export class TelegramAdapter extends BaseChannelAdapter {
     public chatModes = new Map<number, 'chat' | 'task'>();
 
     // Pending approval requests
-    public pendingApprovals = new Map<string, { taskId: string; chatId: number; userId: string }>();
+    public pendingApprovals = new Map<string, { taskId: string; chatId: number; userId: string; threadId?: number }>();
+
+    // Maps kestrelUserId → current message_thread_id (undefined for non-forum chats)
+    public userThreadMap = new Map<string, number | undefined>();
 
     // Bot identity (populated after connect)
     private _botId: number | undefined;
@@ -108,7 +111,8 @@ export class TelegramAdapter extends BaseChannelAdapter {
             return;
         }
 
-        await sendApprovalRequest(this, chatId, approvalId, description, taskId, userId);
+        const threadId = this.userThreadMap.get(userId);
+        await sendApprovalRequest(this, chatId, approvalId, description, taskId, userId, threadId);
     }
 
     get botInfo(): { id: number; username: string } | undefined {
@@ -175,14 +179,15 @@ export class TelegramAdapter extends BaseChannelAdapter {
             return;
         }
 
-        await this.sendToChat(chatId, message);
+        const threadId = this.userThreadMap.get(userId);
+        await this.sendToChat(chatId, message, threadId);
     }
 
     /**
      * Send a message to a specific Telegram chat.
      * Handles chunking for long messages (4096 char Telegram limit).
      */
-    private async sendToChat(chatId: number, message: OutgoingMessage): Promise<void> {
+    private async sendToChat(chatId: number, message: OutgoingMessage, threadId?: number): Promise<void> {
         // Stop typing indicator when sending
         this.stopTyping(chatId);
 
@@ -197,6 +202,11 @@ export class TelegramAdapter extends BaseChannelAdapter {
                 parse_mode: 'Markdown',
                 disable_web_page_preview: true,
             };
+
+            // Route to the correct forum topic if applicable
+            if (threadId !== undefined) {
+                params.message_thread_id = threadId;
+            }
 
             // Only add buttons to the last chunk
             if (i === chunks.length - 1 && message.options?.buttons?.length) {
@@ -223,7 +233,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
         // Send attachments as separate messages
         if (message.attachments?.length) {
             for (const att of message.attachments) {
-                await this.sendAttachment(chatId, att);
+                await this.sendAttachment(chatId, att, threadId);
             }
         }
     }
@@ -253,19 +263,20 @@ export class TelegramAdapter extends BaseChannelAdapter {
         return chunks;
     }
 
-    private async sendAttachment(chatId: number, attachment: Attachment): Promise<void> {
+    private async sendAttachment(chatId: number, attachment: Attachment, threadId?: number): Promise<void> {
+        const thread = threadId !== undefined ? { message_thread_id: threadId } : {};
         switch (attachment.type) {
             case 'image':
-                await this.api('sendPhoto', { chat_id: chatId, photo: attachment.url });
+                await this.api('sendPhoto', { chat_id: chatId, photo: attachment.url, ...thread });
                 break;
             case 'audio':
-                await this.api('sendAudio', { chat_id: chatId, audio: attachment.url });
+                await this.api('sendAudio', { chat_id: chatId, audio: attachment.url, ...thread });
                 break;
             case 'video':
-                await this.api('sendVideo', { chat_id: chatId, video: attachment.url });
+                await this.api('sendVideo', { chat_id: chatId, video: attachment.url, ...thread });
                 break;
             case 'file':
-                await this.api('sendDocument', { chat_id: chatId, document: attachment.url });
+                await this.api('sendDocument', { chat_id: chatId, document: attachment.url, ...thread });
                 break;
         }
     }
@@ -283,18 +294,19 @@ export class TelegramAdapter extends BaseChannelAdapter {
         const chatId = this.chatIdMap.get(userId);
         if (!chatId) throw new Error(`No chat ID mapped for user ${userId}`);
 
+        const threadId = this.userThreadMap.get(userId);
+
         // Send placeholder
-        const result = await this.api('sendMessage', {
-            chat_id: chatId,
-            text: '🤔 Thinking...',
-        });
+        const params: Record<string, any> = { chat_id: chatId, text: '🤔 Thinking...' };
+        if (threadId !== undefined) params.message_thread_id = threadId;
+        const result = await this.api('sendMessage', params);
 
         // Start typing indicator (continues while streaming)
-        this.startTyping(chatId);
+        this.startTyping(chatId, threadId);
 
         return {
             messageId: String(result.message_id),
-            chatContext: { chatId },
+            chatContext: { chatId, threadId },
         };
     }
 
@@ -338,11 +350,13 @@ export class TelegramAdapter extends BaseChannelAdapter {
      */
     async sendStreamEnd(handle: StreamHandle, finalContent: string): Promise<void> {
         const chatId = handle.chatContext.chatId as number;
+        const threadId = handle.chatContext.threadId as number | undefined;
 
         // Stop typing
         this.stopTyping(chatId);
 
         // If content is short enough, just edit the existing message
+        // (editMessageText doesn't need message_thread_id — it targets by message_id)
         if (finalContent.length <= 4000) {
             try {
                 await this.api('editMessageText', {
@@ -378,7 +392,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
             conversationId: '',
             content: finalContent,
             options: { markdown: true },
-        });
+        }, threadId);
     }
 
     /**
@@ -387,6 +401,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
      */
     async sendToolActivity(userId: string, handle: StreamHandle, activity: ToolActivity): Promise<void> {
         const chatId = handle.chatContext.chatId as number;
+        const threadId = handle.chatContext.threadId as number | undefined;
 
         let emoji = '⚡';
         let text = '';
@@ -415,12 +430,14 @@ export class TelegramAdapter extends BaseChannelAdapter {
         }
 
         try {
-            await this.api('sendMessage', {
+            const params: Record<string, any> = {
                 chat_id: chatId,
                 text: `${emoji} ${text}`,
                 parse_mode: 'Markdown',
                 disable_notification: true,
-            });
+            };
+            if (threadId !== undefined) params.message_thread_id = threadId;
+            await this.api('sendMessage', params);
         } catch {
             // Best effort — don't break streaming for a status message
         }
@@ -450,14 +467,17 @@ export class TelegramAdapter extends BaseChannelAdapter {
      * Show "typing..." indicator in a chat.
      * Automatically refreshes every 4 seconds (Telegram's indicator lasts 5s).
      */
-    public startTyping(chatId: number): void {
+    public startTyping(chatId: number, threadId?: number): void {
+        const params: Record<string, any> = { chat_id: chatId, action: 'typing' };
+        if (threadId !== undefined) params.message_thread_id = threadId;
+
         // Send immediately
-        this.api('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => { });
+        this.api('sendChatAction', params).catch(() => { });
 
         // Refresh every 4 seconds
         if (!this.typingIntervals.has(chatId)) {
             const interval = setInterval(() => {
-                this.api('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => { });
+                this.api('sendChatAction', params).catch(() => { });
             }, 4000);
             this.typingIntervals.set(chatId, interval);
         }
@@ -539,11 +559,12 @@ export class TelegramAdapter extends BaseChannelAdapter {
 
     /**
      * Generate a deterministic conversation UUID from a chat ID.
+     * Includes threadId so different forum topics get distinct conversation IDs.
      */
-    public resolveConversationId(chatId: number, suffix?: string): string {
-        const seed = suffix
-            ? `telegram-conv:${chatId}:${suffix}`
-            : `telegram-conv:${chatId}`;
+    public resolveConversationId(chatId: number, suffix?: string, threadId?: number): string {
+        const threadPart = threadId !== undefined ? `:t${threadId}` : '';
+        const base = `telegram-conv:${chatId}${threadPart}`;
+        const seed = suffix ? `${base}:${suffix}` : base;
         return this.deterministicUUID(seed);
     }
 

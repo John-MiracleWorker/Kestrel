@@ -47,11 +47,16 @@ import { logger } from '../../utils/logger';
             }
         }
 
+        const threadId = msg.message_thread_id;
+
         // Start typing indicator
-        adapter.startTyping(msg.chat.id);
+        adapter.startTyping(msg.chat.id, threadId);
 
         // Map Telegram user → Kestrel user
         const userId = adapter.resolveUserId(from, msg.chat.id);
+
+        // Record the thread this user is currently active in
+        adapter.userThreadMap.set(userId, threadId);
 
         // Build attachments
         const attachments: Attachment[] = [];
@@ -105,7 +110,7 @@ import { logger } from '../../utils/logger';
             channel: 'telegram',
             userId,
             workspaceId: adapter.config.defaultWorkspaceId,
-            conversationId: adapter.resolveConversationId(msg.chat.id),
+            conversationId: adapter.resolveConversationId(msg.chat.id, undefined, threadId),
             content: text,
             attachments: attachments.length ? attachments : undefined,
             metadata: {
@@ -113,6 +118,7 @@ import { logger } from '../../utils/logger';
                 channelMessageId: String(msg.message_id),
                 timestamp: new Date(msg.date * 1000),
                 telegramChatId: msg.chat.id,
+                telegramThreadId: threadId,
                 telegramUsername: from.username,
             },
         };
@@ -129,18 +135,24 @@ import { logger } from '../../utils/logger';
      */
     export async function handleTaskRequest(adapter: TelegramAdapter, msg: TelegramMessage, from: TelegramUser, goal: string): Promise<void> {
         const chatId = msg.chat.id;
+        const threadId = msg.message_thread_id;
         const userId = adapter.resolveUserId(from, chatId);
 
-        await adapter.api('sendMessage', {
+        // Record the thread this user is currently active in
+        adapter.userThreadMap.set(userId, threadId);
+
+        const confirmParams: Record<string, any> = {
             chat_id: chatId,
             text:
                 '🦅 *Starting autonomous task...*\n\n' +
                 `📋 *Goal:* ${adapter.escapeMarkdown(goal)}\n\n` +
                 '_I\'ll work on this and send you updates._',
             parse_mode: 'Markdown',
-        });
+        };
+        if (threadId !== undefined) confirmParams.message_thread_id = threadId;
+        await adapter.api('sendMessage', confirmParams);
 
-        adapter.startTyping(chatId);
+        adapter.startTyping(chatId, threadId);
 
         // Emit as a task-type message
         const incoming: IncomingMessage = {
@@ -148,13 +160,14 @@ import { logger } from '../../utils/logger';
             channel: 'telegram',
             userId,
             workspaceId: adapter.config.defaultWorkspaceId,
-            conversationId: adapter.resolveConversationId(msg.chat.id, `task-${Date.now()}`),
+            conversationId: adapter.resolveConversationId(msg.chat.id, `task-${Date.now()}`, threadId),
             content: goal,
             metadata: {
                 channelUserId: String(from.id),
                 channelMessageId: String(msg.message_id),
                 timestamp: new Date(msg.date * 1000),
                 telegramChatId: chatId,
+                telegramThreadId: threadId,
                 telegramUsername: from.username,
                 isTaskRequest: true,
             },
@@ -167,13 +180,20 @@ import { logger } from '../../utils/logger';
 
     export async function handleCommand(adapter: TelegramAdapter, msg: TelegramMessage, text: string): Promise<void> {
         const chatId = msg.chat.id;
+        const threadId = msg.message_thread_id;
         const parts = text.split(/\s+/);
         const command = parts[0].replace(/@\w+$/, ''); // Strip @botname
         const args = parts.slice(1);
 
+        // Helper to inject message_thread_id into sendMessage params for forum topics
+        const withThread = (params: Record<string, any>): Record<string, any> => {
+            if (threadId !== undefined) params.message_thread_id = threadId;
+            return params;
+        };
+
         switch (command) {
             case '/start':
-                await adapter.api('sendMessage', {
+                await adapter.api('sendMessage', withThread({
                     chat_id: chatId,
                     text:
                         '🦅 *Welcome to Kestrel\\!*\n\n' +
@@ -190,13 +210,14 @@ import { logger } from '../../utils/logger';
                         '/status — System status\n' +
                         '/cancel \\<id\\> — Cancel a task\n' +
                         '/model \\<name\\> — Switch AI model\n' +
-                        '/new — Start a new conversation',
+                        '/new — Start a new conversation\n' +
+                        '/newthread \\[name\\] — Start a new topic thread',
                     parse_mode: 'MarkdownV2',
-                });
+                }));
                 break;
 
             case '/help':
-                await adapter.api('sendMessage', {
+                await adapter.api('sendMessage', withThread({
                     chat_id: chatId,
                     text:
                         '*🦅 Kestrel Commands*\n\n' +
@@ -213,19 +234,20 @@ import { logger } from '../../utils/logger';
                         '  /model `<name>` — Switch AI model\n' +
                         '  /workspace — Show current workspace\n' +
                         '  /new — Start a new conversation\n' +
+                        '  /newthread `[name]` — Start a new topic thread\n' +
                         '  /stop — Stop all typing indicators\n',
                     parse_mode: 'Markdown',
-                });
+                }));
                 break;
 
             case '/task': {
                 const goal = args.join(' ').trim();
                 if (!goal) {
-                    await adapter.api('sendMessage', {
+                    await adapter.api('sendMessage', withThread({
                         chat_id: chatId,
                         text: '❓ Usage: `/task <your goal>`\n\nExample: `/task review the database schema for performance issues`',
                         parse_mode: 'Markdown',
-                    });
+                    }));
                     return;
                 }
                 if (msg.from) {
@@ -235,18 +257,18 @@ import { logger } from '../../utils/logger';
             }
 
             case '/tasks':
-                await adapter.api('sendMessage', {
+                await adapter.api('sendMessage', withThread({
                     chat_id: chatId,
                     text:
                         '📋 *Your Tasks*\n\n' +
                         '_Task listing requires the web dashboard or CLI._\n' +
                         '_Use_ `kestrel tasks` _in the CLI to view all tasks._',
                     parse_mode: 'Markdown',
-                });
+                }));
                 break;
 
             case '/status':
-                await adapter.api('sendMessage', {
+                await adapter.api('sendMessage', withThread({
                     chat_id: chatId,
                     text:
                         '🦅 *Kestrel Status*\n\n' +
@@ -256,17 +278,17 @@ import { logger } from '../../utils/logger';
                         `👤 Your ID: \`${msg.from?.id || 'unknown'}\`\n` +
                         `💬 Chat: \`${chatId}\``,
                     parse_mode: 'Markdown',
-                });
+                }));
                 break;
 
             case '/cancel': {
                 const taskId = args[0];
                 if (!taskId) {
-                    await adapter.api('sendMessage', {
+                    await adapter.api('sendMessage', withThread({
                         chat_id: chatId,
                         text: '❓ Usage: `/cancel <task_id>`',
                         parse_mode: 'Markdown',
-                    });
+                    }));
                     return;
                 }
                 // Emit as a cancel command
@@ -277,12 +299,13 @@ import { logger } from '../../utils/logger';
                         channel: 'telegram',
                         userId,
                         workspaceId: adapter.config.defaultWorkspaceId,
-                        conversationId: adapter.resolveConversationId(chatId),
+                        conversationId: adapter.resolveConversationId(chatId, undefined, threadId),
                         content: `/cancel ${taskId}`,
                         metadata: {
                             channelUserId: String(msg.from.id),
                             channelMessageId: String(msg.message_id),
                             timestamp: new Date(msg.date * 1000),
+                            telegramThreadId: threadId,
                             isCommand: true,
                         },
                     });
@@ -293,111 +316,173 @@ import { logger } from '../../utils/logger';
             case '/approve': {
                 const approvalId = args[0];
                 if (!approvalId) {
-                    await adapter.api('sendMessage', {
+                    await adapter.api('sendMessage', withThread({
                         chat_id: chatId,
                         text: '❓ Usage: `/approve <approval_id>`',
                         parse_mode: 'Markdown',
-                    });
+                    }));
                     return;
                 }
                 const actorUserId = msg.from ? adapter.resolveUserId(msg.from, chatId) : undefined;
-                await handleApproval(adapter, chatId, approvalId, true, actorUserId);
+                await handleApproval(adapter, chatId, approvalId, true, actorUserId, threadId);
                 break;
             }
 
             case '/reject': {
                 const rejectId = args[0];
                 if (!rejectId) {
-                    await adapter.api('sendMessage', {
+                    await adapter.api('sendMessage', withThread({
                         chat_id: chatId,
                         text: '❓ Usage: `/reject <approval_id>`',
                         parse_mode: 'Markdown',
-                    });
+                    }));
                     return;
                 }
                 const actorUserId = msg.from ? adapter.resolveUserId(msg.from, chatId) : undefined;
-                await handleApproval(adapter, chatId, rejectId, false, actorUserId);
+                await handleApproval(adapter, chatId, rejectId, false, actorUserId, threadId);
                 break;
             }
 
             case '/model':
                 if (args[0]) {
-                    await adapter.api('sendMessage', {
+                    await adapter.api('sendMessage', withThread({
                         chat_id: chatId,
                         text: `🔄 Model switched to \`${args[0]}\``,
                         parse_mode: 'Markdown',
-                    });
+                    }));
                 } else {
-                    await adapter.api('sendMessage', {
+                    await adapter.api('sendMessage', withThread({
                         chat_id: chatId,
                         text: '❓ Usage: `/model <model_name>`\n\nExamples:\n`/model gpt-4o`\n`/model claude-sonnet-4-20250514`\n`/model gemini-2.5-pro`',
                         parse_mode: 'Markdown',
-                    });
+                    }));
                 }
                 break;
 
             case '/workspace':
-                await adapter.api('sendMessage', {
+                await adapter.api('sendMessage', withThread({
                     chat_id: chatId,
                     text: `🏢 Current workspace: \`${adapter.config.defaultWorkspaceId}\``,
                     parse_mode: 'Markdown',
-                });
+                }));
                 break;
 
-            case '/new':
-                await adapter.api('sendMessage', {
-                    chat_id: chatId,
-                    text: '✨ New conversation started! Send your first message.',
-                    parse_mode: 'Markdown',
-                });
+            case '/new': {
+                // In forum supergroups, create a new topic; otherwise just acknowledge
+                if (msg.chat.type === 'supergroup' && threadId !== undefined) {
+                    try {
+                        const topic = await adapter.api('createForumTopic', {
+                            chat_id: chatId,
+                            name: 'New Conversation',
+                        });
+                        if (msg.from) {
+                            const userId = adapter.resolveUserId(msg.from, chatId);
+                            adapter.userThreadMap.set(userId, topic.message_thread_id);
+                        }
+                        await adapter.api('sendMessage', {
+                            chat_id: chatId,
+                            message_thread_id: topic.message_thread_id,
+                            text: '✨ New thread started! Send your first message here.',
+                        });
+                    } catch {
+                        await adapter.api('sendMessage', withThread({
+                            chat_id: chatId,
+                            text: '✨ New conversation started! Send your first message.',
+                        }));
+                    }
+                } else {
+                    await adapter.api('sendMessage', withThread({
+                        chat_id: chatId,
+                        text: '✨ New conversation started! Send your first message.',
+                        parse_mode: 'Markdown',
+                    }));
+                }
                 break;
+            }
+
+            case '/newthread': {
+                const topicName = (args.join(' ').trim() || 'New Conversation').substring(0, 128);
+                if (msg.chat.type === 'supergroup') {
+                    try {
+                        const topic = await adapter.api('createForumTopic', {
+                            chat_id: chatId,
+                            name: topicName,
+                        });
+                        if (msg.from) {
+                            const userId = adapter.resolveUserId(msg.from, chatId);
+                            adapter.userThreadMap.set(userId, topic.message_thread_id);
+                        }
+                        await adapter.api('sendMessage', {
+                            chat_id: chatId,
+                            message_thread_id: topic.message_thread_id,
+                            text: `✨ *New thread started:* ${adapter.escapeMarkdown(topicName)}\n\nSend your first message here.`,
+                            parse_mode: 'Markdown',
+                        });
+                    } catch {
+                        await adapter.api('sendMessage', withThread({
+                            chat_id: chatId,
+                            text: '✨ New conversation started! Send your first message.',
+                        }));
+                    }
+                } else {
+                    await adapter.api('sendMessage', {
+                        chat_id: chatId,
+                        text: '✨ New conversation started! Send your first message.',
+                    });
+                }
+                break;
+            }
 
             case '/stop':
                 adapter.stopTyping(chatId);
-                await adapter.api('sendMessage', {
+                await adapter.api('sendMessage', withThread({
                     chat_id: chatId,
                     text: '⏹ Stopped.',
-                });
+                }));
                 break;
 
             default:
-                await adapter.api('sendMessage', {
+                await adapter.api('sendMessage', withThread({
                     chat_id: chatId,
                     text: `Unknown command: ${command}. Use /help for available commands.`,
-                });
+                }));
         }
     }
 
     // ── Approval Handling ──────────────────────────────────────────
 
-    export async function handleApproval(adapter: TelegramAdapter, chatId: number, approvalId: string, approved: boolean, actorUserId?: string): Promise<void> {
+    export async function handleApproval(adapter: TelegramAdapter, chatId: number, approvalId: string, approved: boolean, actorUserId?: string, threadId?: number): Promise<void> {
         const icon = approved ? '✅' : '❌';
         const action = approved ? 'Approved' : 'Rejected';
 
         const result = await adapter.resolvePendingApproval(approvalId, approved, actorUserId);
         if (!result.success) {
-            await adapter.api('sendMessage', {
+            const errParams: Record<string, any> = {
                 chat_id: chatId,
                 text: `⚠️ Could not process approval \`${approvalId}\`: ${adapter.escapeMarkdown(result.error || 'unknown error')}`,
                 parse_mode: 'Markdown',
-            });
+            };
+            if (threadId !== undefined) errParams.message_thread_id = threadId;
+            await adapter.api('sendMessage', errParams);
             return;
         }
 
-        await adapter.api('sendMessage', {
+        const params: Record<string, any> = {
             chat_id: chatId,
             text: `${icon} *${action}* approval \`${approvalId}\``,
             parse_mode: 'Markdown',
-        });
+        };
+        if (threadId !== undefined) params.message_thread_id = threadId;
+        await adapter.api('sendMessage', params);
     }
 
     /**
      * Send an approval request to a Telegram chat with inline buttons.
      */
-    export async function sendApprovalRequest(adapter: TelegramAdapter, chatId: number, approvalId: string, description: string, taskId: string, userId: string): Promise<void> {
-        adapter.pendingApprovals.set(approvalId, { taskId, chatId, userId });
+    export async function sendApprovalRequest(adapter: TelegramAdapter, chatId: number, approvalId: string, description: string, taskId: string, userId: string, threadId?: number): Promise<void> {
+        adapter.pendingApprovals.set(approvalId, { taskId, chatId, userId, threadId });
 
-        await adapter.api('sendMessage', {
+        const params: Record<string, any> = {
             chat_id: chatId,
             text:
                 '⚠️ *Approval Required*\n\n' +
@@ -410,23 +495,27 @@ import { logger } from '../../utils/logger';
                     { text: '❌ Reject', callback_data: `reject:${approvalId}` },
                 ]],
             }),
-        });
+        };
+        if (threadId !== undefined) params.message_thread_id = threadId;
+        await adapter.api('sendMessage', params);
     }
 
     /**
      * Send a progress update for an active task.
      */
-    export async function sendTaskProgress(adapter: TelegramAdapter, chatId: number, step: string, detail: string = ''): Promise<void> {
+    export async function sendTaskProgress(adapter: TelegramAdapter, chatId: number, step: string, detail: string = '', threadId?: number): Promise<void> {
         const text = detail
             ? `🔧 *${adapter.escapeMarkdown(step)}*\n${adapter.escapeMarkdown(detail)}`
             : `🔧 ${adapter.escapeMarkdown(step)}`;
 
-        await adapter.api('sendMessage', {
+        const params: Record<string, any> = {
             chat_id: chatId,
             text,
             parse_mode: 'Markdown',
             disable_notification: true,  // Silent for progress updates
-        });
+        };
+        if (threadId !== undefined) params.message_thread_id = threadId;
+        await adapter.api('sendMessage', params);
     }
 
     // ── Callback Queries ───────────────────────────────────────────
@@ -442,6 +531,8 @@ import { logger } from '../../utils/logger';
 
         if (!query.data || !query.message) return;
         const chatId = query.message.chat.id;
+        // Extract thread context from the button's parent message
+        const threadId = query.message.message_thread_id;
 
         // Handle self-improvement callbacks (si_approve / si_deny)
         if (query.data.startsWith('si_approve:') || query.data.startsWith('si_deny:')) {
@@ -450,11 +541,13 @@ import { logger } from '../../utils/logger';
             const action = isApprove ? 'approve' : 'deny';
             const icon = isApprove ? '✅' : '❌';
 
-            await adapter.api('sendMessage', {
+            const processingParams: Record<string, any> = {
                 chat_id: chatId,
                 text: `${icon} Processing ${action} for proposal \`${proposalId.substring(0, 8)}...\``,
                 parse_mode: 'Markdown',
-            });
+            };
+            if (threadId !== undefined) processingParams.message_thread_id = threadId;
+            await adapter.api('sendMessage', processingParams);
 
             try {
                 // Call brain's self_improve handler via docker exec
@@ -470,23 +563,26 @@ print(json.dumps(result))
                 const result = JSON.parse(output);
 
                 if (result.error) {
-                    await adapter.api('sendMessage', {
-                        chat_id: chatId,
-                        text: `⚠️ ${result.error}`,
-                    });
+                    const errParams: Record<string, any> = { chat_id: chatId, text: `⚠️ ${result.error}` };
+                    if (threadId !== undefined) errParams.message_thread_id = threadId;
+                    await adapter.api('sendMessage', errParams);
                 } else {
-                    await adapter.api('sendMessage', {
+                    const resultParams: Record<string, any> = {
                         chat_id: chatId,
                         text: `${icon} *${result.status === 'approved' ? 'Approved' : 'Denied'}*\n${result.message || ''}`,
                         parse_mode: 'Markdown',
-                    });
+                    };
+                    if (threadId !== undefined) resultParams.message_thread_id = threadId;
+                    await adapter.api('sendMessage', resultParams);
                 }
             } catch (err) {
                 logger.error('Self-improve callback failed', { error: (err as Error).message });
-                await adapter.api('sendMessage', {
+                const failParams: Record<string, any> = {
                     chat_id: chatId,
                     text: `⚠️ Failed to process: ${(err as Error).message?.substring(0, 200)}`,
-                });
+                };
+                if (threadId !== undefined) failParams.message_thread_id = threadId;
+                await adapter.api('sendMessage', failParams);
             }
             return;
         }
@@ -495,13 +591,13 @@ print(json.dumps(result))
         if (query.data.startsWith('approve:')) {
             const approvalId = query.data.substring('approve:'.length);
             const actorUserId = adapter.resolveUserId(query.from, chatId);
-            await handleApproval(adapter, chatId, approvalId, true, actorUserId);
+            await handleApproval(adapter, chatId, approvalId, true, actorUserId, threadId);
             return;
         }
         if (query.data.startsWith('reject:')) {
             const approvalId = query.data.substring('reject:'.length);
             const actorUserId = adapter.resolveUserId(query.from, chatId);
-            await handleApproval(adapter, chatId, approvalId, false, actorUserId);
+            await handleApproval(adapter, chatId, approvalId, false, actorUserId, threadId);
             return;
         }
 
@@ -512,12 +608,13 @@ print(json.dumps(result))
             channel: 'telegram',
             userId,
             workspaceId: adapter.config.defaultWorkspaceId,
-            conversationId: adapter.resolveConversationId(chatId),
+            conversationId: adapter.resolveConversationId(chatId, undefined, threadId),
             content: query.data,
             metadata: {
                 channelUserId: String(query.from.id),
                 channelMessageId: String(query.message.message_id),
                 timestamp: new Date(),
+                telegramThreadId: threadId,
                 isCallbackQuery: true,
             },
         };
