@@ -79,6 +79,8 @@ services:
     environment:
       BRAIN_GRPC_HOST: 0.0.0.0
       BRAIN_GRPC_PORT: 50051
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-kestrel}
