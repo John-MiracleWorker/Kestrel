@@ -12,6 +12,7 @@ Safety rails:
 
 import logging
 import os
+import shutil
 import subprocess
 
 from agent.types import RiskLevel, ToolDefinition
@@ -28,42 +29,102 @@ KNOWN_SERVICES = {"postgres", "redis", "gateway", "brain", "hands", "frontend"}
 PROTECTED_SERVICES = {"postgres", "redis"}
 
 
+def _resolve_compose_command() -> tuple[list[str] | None, str | None]:
+    """Resolve an available compose command for this environment."""
+    if shutil.which("docker"):
+        return ["docker", "compose"], None
+    if shutil.which("docker-compose"):
+        return ["docker-compose"], "docker-compose"
+    if shutil.which("podman"):
+        return ["podman", "compose"], "podman"
+    return None, None
+
 def _is_admin(user_id: str = "") -> bool:
     if not ADMIN_USER_ID:
         return True  # Single-user mode: allow all
     return user_id == ADMIN_USER_ID
 
 
+def _resolve_project_root() -> str | None:
+    """Resolve a compose project directory that exists in this runtime."""
+    candidates = [
+        PROJECT_ROOT,
+        os.getenv("KESTREL_PROJECT_ROOT", ""),
+        "/workspace/Kestrel",
+        os.getcwd(),
+    ]
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
 def _run_compose(args: list[str], timeout: int = 60) -> dict:
-    """Run a docker compose command and return structured output."""
+    """Run an available compose command and return structured output."""
+    compose_cmd, runtime = _resolve_compose_command()
+    if not compose_cmd:
+        return {
+            "success": False,
+            "error": (
+                "Container runtime not available in this environment. "
+                "Tried Docker Compose and Podman Compose but neither CLI was found."
+            ),
+            "hint": (
+                "Install Docker/Podman on the host and expose the socket to this container, "
+                "or run this tool from an environment with compose access."
+            ),
+        }
+
+    project_root = _resolve_project_root()
+    if not project_root:
+        return {
+            "success": False,
+            "error": (
+                "Compose project directory was not found in this runtime. "
+                "Expected `/project` or `KESTREL_PROJECT_ROOT` to exist."
+            ),
+            "hint": "Set KESTREL_PROJECT_ROOT to the repository path in the running container.",
+        }
+
     try:
         result = subprocess.run(
-            ["docker", "compose"] + args,
-            cwd=PROJECT_ROOT,
+            compose_cmd + args,
+            cwd=project_root,
             capture_output=True,
             text=True,
             timeout=timeout,
         )
         if result.returncode != 0:
+            command_label = " ".join(compose_cmd)
             return {
                 "success": False,
-                "error": result.stderr.strip() or f"docker compose {' '.join(args)} failed",
+                "error": result.stderr.strip() or f"{command_label} {' '.join(args)} failed",
                 "returncode": result.returncode,
+                "runtime": runtime or "docker",
+                "project_root": project_root,
             }
         return {
             "success": True,
             "output": result.stdout.strip(),
             "stderr": result.stderr.strip() if result.stderr.strip() else None,
+            "runtime": runtime or "docker",
+            "project_root": project_root,
         }
     except subprocess.TimeoutExpired:
         return {"success": False, "error": f"Command timed out ({timeout}s)"}
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
+        command_label = " ".join(compose_cmd)
         return {
             "success": False,
             "error": (
-                "docker CLI not found. "
-                "Ensure Docker is installed and the socket is accessible from this container."
+                f"{command_label} failed to launch in this runtime: {exc}. "
+                "Verify both the runtime binary and compose project path are accessible."
             ),
+            "runtime": runtime or "docker",
+            "project_root": project_root,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}

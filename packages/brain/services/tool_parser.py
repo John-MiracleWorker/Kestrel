@@ -5,6 +5,56 @@ from core.grpc_setup import brain_pb2
 
 logger = logging.getLogger("brain.services.tool_parser")
 
+
+def _format_tool_result_preview(tool_result: str) -> str:
+    """Create a compact, human-readable preview for tool results."""
+    raw = (tool_result or "").strip()
+    if not raw:
+        return ""
+
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw[:200].replace("\n", " ")
+
+    if isinstance(parsed, dict):
+        if "success" in parsed:
+            success_label = "success" if parsed.get("success") else "failed"
+            error = parsed.get("error")
+            if error:
+                return f"{success_label}: {str(error)[:140]}"
+            details = []
+            for key in ("branch", "changed_files", "clean", "message"):
+                if key in parsed:
+                    details.append(f"{key}={parsed[key]}")
+            if details:
+                return f"{success_label} ({', '.join(details[:3])})"
+            return success_label
+
+        items = []
+        for key in list(parsed.keys())[:4]:
+            value = str(parsed[key]).replace("\n", " ")
+            items.append(f"{key}={value[:60]}")
+        return ", ".join(items)[:200]
+
+    if isinstance(parsed, list):
+        return f"{len(parsed)} item(s)"
+
+    return str(parsed)[:200]
+
+
+def _build_failure_note(reason: str) -> str:
+    """Build an accurate trailing note for incomplete tasks."""
+    normalized = (reason or "").strip()
+    if not normalized:
+        return "*(Note: The task stopped before completion.)*"
+
+    lowered = normalized.lower()
+    if "iteration limit reached" in lowered or "running too long" in lowered:
+        return "*(Note: The task hit its step limit before completion.)*"
+
+    return f"*(Note: Task stopped before completion: {normalized[:160]})*"
+
 async def parse_agent_event(item, full_response_parts, tool_results_gathered, provider, model, api_key, make_response_fn):
     msg_type, payload = item
 
@@ -62,7 +112,7 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
                 "tool_result": result_preview,
             },
         )
-        result_snippet = (event.tool_result or "")[:200].replace('\n', ' ')
+        result_snippet = _format_tool_result_preview(event.tool_result or "")
         if result_snippet:
             result_text = f"✓ {event.tool_name}: {result_snippet}\n\n"
             yield make_response_fn(chunk_type=0, content_delta=result_text)
@@ -104,9 +154,10 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
             full_response_parts.append(event.content)
 
     elif event_type == "task_failed":
+        failure_note = _build_failure_note(event.content or "")
         if full_response_parts:
             combined = '\n'.join(full_response_parts)
-            combined += "\n\n*(Note: I ran out of processing steps but here's what I found.)*"
+            combined += f"\n\n{failure_note}"
             words = combined.split(' ')
             for i, word in enumerate(words):
                 chunk = word if i == 0 else ' ' + word
@@ -114,8 +165,9 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
         elif tool_results_gathered:
             try:
                 summary_prompt = (
-                    "You ran out of processing steps while working on a task. "
-                    "Summarize what you found from these tool results so far. "
+                    "A task stopped before completion. "
+                    f"Failure reason: {event.content or 'unknown'}. "
+                    "Summarize what was learned from these tool results so far. "
                     "Be helpful and concise:\n\n"
                     + "\n\n".join(tool_results_gathered[:10])
                 )
@@ -127,11 +179,11 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
                         yield make_response_fn(chunk_type=0, content_delta=chunk)
 
                 if summary_text:
-                    summary_text += "\n\n*(Note: I ran out of processing steps but here's what I found so far.)*"
-                    yield make_response_fn(chunk_type=0, content_delta="\n\n*(Note: I ran out of processing steps but here's what I found so far.)*")
+                    summary_text += f"\n\n{failure_note}"
+                    yield make_response_fn(chunk_type=0, content_delta=f"\n\n{failure_note}")
                     full_response_parts.append(summary_text)
                 else:
-                    yield make_response_fn(chunk_type=3, error_message="Agent ran out of processing steps.")
+                    yield make_response_fn(chunk_type=3, error_message=event.content or "Agent task failed")
             except Exception as summary_err:
                 yield make_response_fn(chunk_type=3, error_message=event.content or "Agent task failed")
         else:
