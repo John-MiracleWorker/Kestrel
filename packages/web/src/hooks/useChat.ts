@@ -101,13 +101,13 @@ export function useChat(
         wsRef.current = ws;
 
         ws.onopen = () => {
-            if (!isMountedRef.current) return;
+            if (!isMountedRef.current || wsRef.current !== ws) return;
             setIsConnected(true);
             reconnectAttemptRef.current = 0;
         };
 
         ws.onmessage = (event) => {
-            if (!isMountedRef.current) return;
+            if (!isMountedRef.current || wsRef.current !== ws) return;
             const data = JSON.parse(event.data as string) as {
                 type: 'token' | 'done' | 'error' | 'thinking' | 'tool_activity' | 'routing_info';
                 content?: string;
@@ -320,7 +320,7 @@ export function useChat(
         };
 
         const handleDisconnect = async (event: CloseEvent) => {
-            if (!isMountedRef.current) return;
+            if (!isMountedRef.current || wsRef.current !== ws) return;
             setIsConnected(false);
 
             // If disconnected due to an invalid/expired token, force a refresh
@@ -387,16 +387,30 @@ export function useChat(
         titleGeneratedRef.current = false;
     }, [conversationId]);
 
-    // Reset messages ONLY when the conversation actually changes —
-    // not when the initialMessages array gets a new reference mid-conversation.
-    const lastConversationRef = useRef<string | null>(null);
+    // Clear ALL state immediately when conversation changes so nothing bleeds between threads
+    const prevConversationIdRef = useRef<string | null>(conversationId);
     useEffect(() => {
-        const convId = conversationId ?? null;
-        if (convId !== lastConversationRef.current) {
-            lastConversationRef.current = convId;
+        if (conversationId !== prevConversationIdRef.current) {
+            prevConversationIdRef.current = conversationId;
+            setMessages([]);
+            setStreamingMessage(null);
+            contentRef.current = '';
+            activitiesRef.current = [];
+            delegationEventsRef.current = [];
+            routingInfoRef.current = null;
+        }
+    }, [conversationId]);
+
+    // Hydrate messages when the async fetch in App.tsx completes
+    // (initialMessages gets a new array identity each time setInitialMessages is called)
+    const prevInitialMessagesRef = useRef<Message[]>(initialMessages);
+    useEffect(() => {
+        if (initialMessages !== prevInitialMessagesRef.current) {
+            prevInitialMessagesRef.current = initialMessages;
             setMessages(initialMessages);
         }
-    }, [conversationId, initialMessages]);
+    }, [initialMessages]);
+
 
     const sendMessage = useCallback(
         (content: string, provider?: string, model?: string, attachments?: Array<{ url: string; filename: string; mimeType: string; size: number }>) => {

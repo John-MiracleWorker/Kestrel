@@ -217,6 +217,7 @@ export function LiveCanvas({
             <div
                 style={{
                     flex: 1,
+                    minHeight: 0,
                     overflowY: 'auto',
                     padding: '12px',
                     display: 'flex',
