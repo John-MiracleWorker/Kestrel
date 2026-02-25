@@ -245,25 +245,37 @@ export class ChannelRegistry {
                                     approvalId: chunk.metadata.approval_id || '',
                                     question: chunk.metadata.question || '',
                                 });
-
-                                if (chunk.metadata.agent_status === 'waiting_for_human' && chunk.metadata.approval_id) {
-                                    const approvalSender = (adapter as any).sendApprovalRequestForUser;
-                                    if (typeof approvalSender === 'function') {
-                                        try {
-                                            await approvalSender.call(
-                                                adapter,
-                                                msg.userId,
-                                                chunk.metadata.approval_id,
-                                                chunk.metadata.question || 'The agent needs your approval to continue.',
-                                                chunk.metadata.task_id || '',
-                                            );
-                                        } catch (err) {
-                                            logger.warn('Approval request send failed', { error: (err as Error).message });
-                                        }
-                                    }
-                                }
                             } catch (err) {
                                 logger.debug('Tool activity send failed', { error: (err as Error).message });
+                            }
+                        }
+
+                        if (chunk.metadata.agent_status === 'waiting_for_human' && chunk.metadata.approval_id) {
+                            const approvalId = chunk.metadata.approval_id;
+                            try {
+                                logger.info('Dispatching approval request for user', {
+                                    approval_id: approvalId,
+                                    userId: msg.userId,
+                                    channel: adapter.channelType,
+                                });
+
+                                const approvalSender = (adapter as any).sendApprovalRequestForUser;
+                                if (typeof approvalSender === 'function') {
+                                    await approvalSender.call(
+                                        adapter,
+                                        msg.userId,
+                                        approvalId,
+                                        chunk.metadata.question || 'The agent needs your approval to continue.',
+                                        chunk.metadata.task_id || '',
+                                    );
+                                }
+                            } catch (err) {
+                                logger.warn('Approval request send failed', {
+                                    approval_id: approvalId,
+                                    userId: msg.userId,
+                                    channel: adapter.channelType,
+                                    error: (err as Error).message,
+                                });
                             }
                         }
                     } else if (chunk.content_delta) {
