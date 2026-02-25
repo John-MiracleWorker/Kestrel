@@ -10,10 +10,18 @@ export interface TelegramUser {
 export interface TelegramChat {
     id: number;
     type: 'private' | 'group' | 'supergroup' | 'channel';
+    is_forum?: boolean;
+}
+
+export interface TelegramForumTopic {
+    message_thread_id: number;
+    name: string;
+    icon_color: number;
 }
 
 export interface TelegramMessage {
     message_id: number;
+    message_thread_id?: number;
     from?: TelegramUser;
     chat: TelegramChat;
     date: number;
