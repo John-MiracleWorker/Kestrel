@@ -47,6 +47,32 @@ import { logger } from '../../utils/logger';
             }
         }
 
+        // ── Check for pending approval text response ────────────────
+        // When a user types "I approve" / "yes" / "reject" etc. while
+        // there is a pending approval for their chat, resolve it instead
+        // of creating a brand-new agent task.
+        {
+            const APPROVE_KEYWORDS = ['approve', 'approved', 'yes', 'go ahead', 'do it', 'proceed', 'confirm', 'i approve'];
+            const DENY_KEYWORDS = ['deny', 'denied', 'reject', 'no', 'cancel', 'stop', 'abort'];
+            const textLower = text.toLowerCase().trim();
+            const resolvedUser = adapter.resolveUserId(from, msg.chat.id);
+
+            const pendingForChat = [...adapter.pendingApprovals.entries()]
+                .filter(([, v]) => v.chatId === msg.chat.id);
+
+            if (pendingForChat.length > 0) {
+                const isApproval = APPROVE_KEYWORDS.some(kw => textLower.includes(kw));
+                const isDenial = DENY_KEYWORDS.some(kw => textLower.includes(kw));
+
+                if (isApproval || isDenial) {
+                    const [approvalId] = pendingForChat[pendingForChat.length - 1];
+                    const threadId = msg.message_thread_id;
+                    await handleApproval(adapter, msg.chat.id, approvalId, isApproval, resolvedUser, threadId);
+                    return;
+                }
+            }
+        }
+
         const threadId = msg.message_thread_id;
 
         // Start typing indicator

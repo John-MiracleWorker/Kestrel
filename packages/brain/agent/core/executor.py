@@ -346,7 +346,12 @@ class TaskExecutor:
                 content=approval_needed,
                 progress=self._progress_callback(task),
             )
-            return
+            # Generator suspends here. The loop in loop.py waits for
+            # human approval (polling the DB).  When the consumer resumes
+            # iteration, execution falls through to the tool-execution
+            # code below — so the approved tool actually runs.
+            # If the approval is denied the loop breaks and this
+            # generator is cleaned up without reaching the code below.
 
         yield TaskEvent(
             type=TaskEventType.TOOL_CALLED,
