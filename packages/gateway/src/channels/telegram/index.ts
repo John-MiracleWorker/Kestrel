@@ -61,9 +61,14 @@ export class TelegramAdapter extends BaseChannelAdapter {
 
     // Callback to resolve approvals in Brain
     private approvalHandler?: (approvalId: string, userId: string, approved: boolean) => Promise<{ success: boolean; error?: string }>;
+    private pendingApprovalsLookupHandler?: (userId: string, workspaceId: string) => Promise<Array<{ approval_id: string }>>;
 
     public setApprovalHandler(handler: (approvalId: string, userId: string, approved: boolean) => Promise<{ success: boolean; error?: string }>): void {
         this.approvalHandler = handler;
+    }
+
+    public setPendingApprovalsLookupHandler(handler: (userId: string, workspaceId: string) => Promise<Array<{ approval_id: string }>>): void {
+        this.pendingApprovalsLookupHandler = handler;
     }
 
     public async resolvePendingApproval(
@@ -97,6 +102,14 @@ export class TelegramAdapter extends BaseChannelAdapter {
         }
 
         return this.approvalHandler(approvalId, actorUserId, approved);
+    }
+
+    public async listPendingApprovalsForUser(userId: string): Promise<Array<{ approval_id: string }>> {
+        if (!this.pendingApprovalsLookupHandler) {
+            return [];
+        }
+
+        return this.pendingApprovalsLookupHandler(userId, this.config.defaultWorkspaceId);
     }
 
     public async sendApprovalRequestForUser(userId: string, approvalId: string, description: string, taskId: string): Promise<void> {

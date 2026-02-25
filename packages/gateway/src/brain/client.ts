@@ -407,6 +407,27 @@ export class BrainClient {
         });
     }
 
+    async listPendingApprovals(userId: string, workspaceId?: string): Promise<any[]> {
+        return new Promise((resolve) => {
+            if (!this.connected || typeof this.client?.ListPendingApprovals !== 'function') {
+                resolve([]);
+                return;
+            }
+
+            this.client.ListPendingApprovals(
+                { user_id: userId, workspace_id: workspaceId || '' },
+                (err: any, response: any) => {
+                    if (err) {
+                        logger.warn('ListPendingApprovals failed', { error: err.message, userId, workspaceId });
+                        resolve([]);
+                    } else {
+                        resolve(response?.approvals || []);
+                    }
+                }
+            );
+        });
+    }
+
     /**
      * Cancel a running agent task.
      */
