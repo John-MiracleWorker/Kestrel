@@ -190,10 +190,16 @@ async def _call_gemini_computer_use(
 
             if resp.status_code == 429:
                 error_body = resp.text[:500]
+                # Extract retry-after header if present
+                retry_after = resp.headers.get("retry-after", "")
+                retry_hint = f" Retry after {retry_after}s." if retry_after else ""
                 if "quota" in error_body.lower() or "limit: 0" in error_body:
                     raise RuntimeError(
-                        "Gemini API quota exhausted. Check your plan and billing "
-                        "at https://ai.google.dev/gemini-api/docs/rate-limits"
+                        f"Gemini API quota exhausted.{retry_hint} "
+                        "Check your plan and billing "
+                        "at https://ai.google.dev/gemini-api/docs/rate-limits — "
+                        "free-tier keys have very low computer-use limits. "
+                        "Upgrade to a paid plan or use a different GOOGLE_API_KEY."
                     )
                 if attempt < max_retries:
                     delay = 2 ** attempt + 1
