@@ -75,6 +75,8 @@ class TaskMetrics:
     total_elapsed_ms: int = 0
     context_compactions: int = 0
     model_failovers: int = 0
+    verifier_runs: int = 0
+    verifier_failures: int = 0
 
     # Detailed breakdowns
     tool_metrics: list[ToolMetric] = field(default_factory=list)
@@ -92,6 +94,8 @@ class TaskMetrics:
             "total_elapsed_ms": self.total_elapsed_ms,
             "context_compactions": self.context_compactions,
             "model_failovers": self.model_failovers,
+            "verifier_runs": self.verifier_runs,
+            "verifier_failures": self.verifier_failures,
         }
 
     def to_compact_dict(self) -> dict:
@@ -192,6 +196,15 @@ class MetricsCollector:
         """Record a model failover event."""
         self._metrics.model_failovers += 1
         logger.warning(f"Model failover: {from_model} → {to_model}")
+
+    def record_verifier_result(self, passed: bool, critique: str) -> None:
+        """Record a verifier gate evaluation result."""
+        self._metrics.verifier_runs += 1
+        if not passed:
+            self._metrics.verifier_failures += 1
+            logger.warning(f"Verifier failed: {critique[:100]}...")
+        else:
+            logger.info("Verifier passed")
 
     def _estimate_cost(
         self,

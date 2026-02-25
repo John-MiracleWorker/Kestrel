@@ -97,6 +97,36 @@ class ToolRegistry:
 
         try:
             import asyncio
+            
+            # --- CACHE CHECK ---
+            cache_key = None
+            if definition.cache_ttl_seconds > 0:
+                try:
+                    from db import get_redis
+                    import hashlib
+                    import json
+                    redis_client = await get_redis()
+                    
+                    # Create deterministic cache key
+                    args_json = json.dumps(merged_args, sort_keys=True)
+                    key_base = f"{tool_call.name}:{args_json}"
+                    cache_key = f"tool_cache:{hashlib.sha256(key_base.encode()).hexdigest()}"
+                    
+                    cached_data = await redis_client.get(cache_key)
+                    if cached_data:
+                        logger.debug(f"Cache hit for tool {tool_call.name}")
+                        parsed = json.loads(cached_data)
+                        return ToolResult(
+                            tool_call_id=tool_call.id,
+                            success=parsed.get("success", True),
+                            output=parsed.get("output", ""),
+                            error=parsed.get("error", ""),
+                            execution_time_ms=0,
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to check tool cache for {tool_call.name}: {e}")
+            # -------------------
+
             result = await asyncio.wait_for(
                 handler(**merged_args),
                 timeout=definition.timeout_seconds,
@@ -118,12 +148,32 @@ class ToolRegistry:
             if len(output) > 10_000:
                 output = output[:9_900] + f"\n\n... (truncated, {len(output)} total chars)"
 
-            return ToolResult(
+            tool_result = ToolResult(
                 tool_call_id=tool_call.id,
                 success=True,
                 output=output,
                 execution_time_ms=elapsed_ms,
             )
+            
+            # --- CACHE STORE ---
+            if cache_key and definition.cache_ttl_seconds > 0:
+                try:
+                    import json
+                    cache_payload = {
+                        "success": True,
+                        "output": output,
+                        "error": "",
+                    }
+                    await redis_client.setex(
+                        cache_key,
+                        definition.cache_ttl_seconds,
+                        json.dumps(cache_payload)
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to set tool cache for {tool_call.name}: {e}")
+            # -------------------
+            
+            return tool_result
 
         except asyncio.TimeoutError:
             elapsed_ms = int((time.monotonic() - start) * 1000)

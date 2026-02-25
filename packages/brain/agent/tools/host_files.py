@@ -170,6 +170,7 @@ def register_host_file_tools(registry, vector_store=None) -> None:
             risk_level=RiskLevel.LOW,
             timeout_seconds=30,
             category="host_file",
+            cache_ttl_seconds=300,
         ),
         handler=host_search,
     )
@@ -238,6 +239,7 @@ def register_host_file_tools(registry, vector_store=None) -> None:
             risk_level=RiskLevel.LOW,
             timeout_seconds=30,
             category="host_file",
+            cache_ttl_seconds=300,
         ),
         handler=host_tree,
     )
@@ -279,6 +281,7 @@ def register_host_file_tools(registry, vector_store=None) -> None:
             risk_level=RiskLevel.LOW,
             timeout_seconds=30,
             category="host_file",
+            cache_ttl_seconds=300,
         ),
         handler=host_find,
     )
@@ -306,6 +309,7 @@ def register_host_file_tools(registry, vector_store=None) -> None:
             risk_level=RiskLevel.LOW,
             timeout_seconds=10,
             category="memory",
+            cache_ttl_seconds=300,
         ),
         handler=project_recall,
     )

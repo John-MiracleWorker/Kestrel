@@ -67,6 +67,7 @@ class ToolDefinition:
     requires_approval: bool = False  # Override: always require human approval
     timeout_seconds: int = 30
     category: str = "general"        # code, web, file, data, memory, control
+    cache_ttl_seconds: int = 0       # 0 = no cache, > 0 = seconds to cache result
 
     def to_openai_schema(self) -> dict:
         """Convert to OpenAI function-calling format."""
@@ -306,6 +307,9 @@ class TaskEventType(str, Enum):
     STEP_COMPLETE = "step_complete"
     APPROVAL_NEEDED = "approval_needed"
     THINKING = "thinking"
+    VERIFIER_STARTED = "verifier_started"
+    VERIFIER_PASSED = "verifier_passed"
+    VERIFIER_FAILED = "verifier_failed"
     TASK_COMPLETE = "task_complete"
     TASK_FAILED = "task_failed"
     TASK_PAUSED = "task_paused"

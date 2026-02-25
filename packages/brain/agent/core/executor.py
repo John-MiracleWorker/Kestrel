@@ -21,6 +21,7 @@ from agent.guardrails import Guardrails
 from agent.observability import MetricsCollector
 from agent.evidence import EvidenceChain
 from agent.model_router import ModelRouter
+from agent.core.verifier import VerifierEngine
 
 logger = logging.getLogger("brain.agent.core.executor")
 
@@ -38,11 +39,16 @@ Current step: {step_description}
 
 Instructions:
 1. Analyze the current situation and decide which tool to call next.
-2. Call exactly ONE tool per turn. Wait for its result before proceeding.
+2. You may call up to 5 tools per turn if they are independent, read-only/low-risk, and do not require approval. Prefer batching and parallel-safe tools. Wait for all results before proceeding.
 3. If the step is complete, call `task_complete` with a summary of what you accomplished.
 4. If you need clarification from the user, call `ask_human` with your question.
 5. If you encounter an error, try an alternative approach before giving up.
 6. Think step-by-step. Explain your reasoning before acting.
+
+Verification & Evidence Rules:
+- Before calling `task_complete`, you MUST explicitly cite the tool outputs that prove your work in your summary.
+- Your final summary will be strictly evaluated by an independent Verifier Engine against your tool execution history. 
+- If you make unsupported claims or hallucinate actions you didn't take, your completion will be REJECTED.
 
 Host Filesystem Strategy:
 - Use project_recall(name) FIRST to check for cached project context.
@@ -78,6 +84,7 @@ class TaskExecutor:
         event_callback: Optional[Callable] = None,
         evidence_chain: Optional[EvidenceChain] = None,
         progress_callback: Optional[Callable] = None,
+        verifier: Optional[VerifierEngine] = None,
     ):
         self._provider = provider
         self._tools = tool_registry
@@ -91,6 +98,7 @@ class TaskExecutor:
         self._event_callback = event_callback
         self._evidence_chain = evidence_chain
         self._progress_callback = progress_callback or (lambda t: 0.0)
+        self._verifier = verifier
 
     async def _wait_for_approval(self, task: AgentTask) -> bool:
         """
@@ -397,6 +405,50 @@ class TaskExecutor:
         )
 
         if tool_name == "task_complete":
+            if self._verifier:
+                summary = tool_args.get("summary", result.output)
+                
+                yield TaskEvent(
+                    type=TaskEventType.VERIFIER_STARTED,
+                    task_id=task.id,
+                    step_id=step.id,
+                    content="Verifying task complete claims against accumulated evidence...",
+                    progress=self._progress_callback(task),
+                )
+                
+                passed, critique = await self._verifier.verify(task.goal, summary, self._evidence_chain)
+                
+                if not passed:
+                    error_msg = f"Verification Failed. You must fix these unsupported claims before completing the task:\n{critique}"
+                    
+                    yield TaskEvent(
+                        type=TaskEventType.VERIFIER_FAILED,
+                        task_id=task.id,
+                        step_id=step.id,
+                        content=error_msg,
+                        progress=self._progress_callback(task),
+                    )
+                    
+                    if self._metrics:
+                        self._metrics.record_verifier_result(False, critique)
+
+                    # Overwrite the success/output so the agent sees the failure
+                    step.tool_calls[-1]["result"] = error_msg
+                    step.tool_calls[-1]["success"] = False
+                    
+                    return # Abort completion, let agent retry
+
+                if self._metrics:
+                    self._metrics.record_verifier_result(True, critique)
+                
+                yield TaskEvent(
+                    type=TaskEventType.VERIFIER_PASSED,
+                    task_id=task.id,
+                    step_id=step.id,
+                    content=f"Verification passed. {critique}",
+                    progress=self._progress_callback(task),
+                )
+
             step.status = StepStatus.COMPLETE
             step.result = tool_args.get("summary", result.output)
             step.completed_at = datetime.now(timezone.utc)
