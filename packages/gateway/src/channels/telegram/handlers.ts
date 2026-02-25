@@ -52,52 +52,30 @@ import { logger } from '../../utils/logger';
         // there is a pending approval for their chat, resolve it instead
         // of creating a brand-new agent task.
         {
-            const APPROVE_KEYWORDS = ['approve', 'approved', 'yes', 'go ahead', 'do it', 'proceed', 'confirm', 'i approve'];
-            const DENY_KEYWORDS = ['deny', 'denied', 'reject', 'no', 'cancel', 'stop', 'abort'];
-            const textLower = text.toLowerCase().trim();
-            const resolvedUser = adapter.resolveUserId(from, msg.chat.id);
-            const isApproval = APPROVE_KEYWORDS.some(kw => textLower.includes(kw));
-            const isDenial = DENY_KEYWORDS.some(kw => textLower.includes(kw));
+            const pendingForChat = [...adapter.pendingApprovals.entries()]
+                .filter(([, v]) => v.chatId === msg.chat.id);
 
-            if (isApproval || isDenial) {
-                const pendingForChat = [...adapter.pendingApprovals.entries()]
-                    .filter(([, v]) => v.chatId === msg.chat.id);
-                const threadId = msg.message_thread_id;
+            // Only intercept text-based approvals when there are actually
+            // pending approvals for this chat. Otherwise let the message
+            // flow through as a normal chat message.
+            if (pendingForChat.length > 0) {
+                const APPROVE_KEYWORDS = ['approve', 'approved', 'yes', 'go ahead', 'do it', 'proceed', 'confirm', 'i approve'];
+                const DENY_KEYWORDS = ['deny', 'denied', 'reject', 'no', 'cancel', 'stop', 'abort'];
+                const textLower = text.toLowerCase().trim();
 
-                if (pendingForChat.length > 0) {
+                // Use word-boundary matching to avoid false positives
+                // (e.g. "yesterday" should not match "yes")
+                const matchesKeyword = (kw: string) => new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(textLower);
+                const isApproval = APPROVE_KEYWORDS.some(matchesKeyword);
+                const isDenial = DENY_KEYWORDS.some(matchesKeyword);
+
+                if (isApproval || isDenial) {
+                    const resolvedUser = adapter.resolveUserId(from, msg.chat.id);
+                    const threadId = msg.message_thread_id;
                     const [approvalId] = pendingForChat[pendingForChat.length - 1];
                     await handleApproval(adapter, msg.chat.id, approvalId, isApproval, resolvedUser, threadId);
                     return;
                 }
-
-                const unresolvedApprovals = await adapter.listPendingApprovalsForUser(resolvedUser);
-
-                if (unresolvedApprovals.length === 1) {
-                    await handleApproval(adapter, msg.chat.id, unresolvedApprovals[0].approval_id, isApproval, resolvedUser, threadId);
-                    return;
-                }
-
-                const params: Record<string, any> = {
-                    chat_id: msg.chat.id,
-                    parse_mode: 'Markdown',
-                };
-                if (threadId !== undefined) params.message_thread_id = threadId;
-
-                if (unresolvedApprovals.length > 1) {
-                    const listedApprovals = unresolvedApprovals
-                        .map((approval) => `• \`${adapter.escapeMarkdown(approval.approval_id)}\``)
-                        .join('\n');
-                    params.text =
-                        '⚠️ I found multiple pending approvals. Please specify one:\n\n' +
-                        `${listedApprovals}\n\n` +
-                        'Use `/approve <approval_id>` or `/reject <approval_id>`.';
-                    await adapter.api('sendMessage', params);
-                    return;
-                }
-
-                params.text = 'No pending approvals were found for you right now.';
-                await adapter.api('sendMessage', params);
-                return;
             }
         }
 
