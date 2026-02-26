@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import uuid
 from typing import Any, Optional
 
@@ -56,8 +57,11 @@ class MCPClient:
         # Build environment
         env = {**os.environ, **self.env}
 
-        # Parse command into args
-        parts = self.command.split()
+        # Parse command into args (shlex handles quoted paths with spaces)
+        try:
+            parts = shlex.split(self.command)
+        except ValueError:
+            parts = self.command.split()
 
         try:
             self._process = await asyncio.create_subprocess_exec(

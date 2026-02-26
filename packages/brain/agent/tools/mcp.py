@@ -129,6 +129,13 @@ BUILTIN_CATALOG = [
         "transport": "stdio",
         "category": "demo",
     },
+    {
+        "name": "ollama",
+        "description": "Generate text and chat with local Ollama models. Supports model listing and multi-turn conversations.",
+        "install": "python3 mcp-servers/ollama/server.py",
+        "transport": "stdio",
+        "category": "ai",
+    },
 ]
 
 
