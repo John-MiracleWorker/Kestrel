@@ -89,10 +89,13 @@ async def bootstrap_moltbook_cron(pool: Any) -> None:
                 """
             )
 
-        existing_names = {
-            (j.workspace_id, j.name)
-            for j in runtime.cron_scheduler._jobs.values()
-        }
+        # Check the DATABASE for existing jobs (not in-memory cache which may be stale)
+        async with pool.acquire() as conn:
+            existing = await conn.fetch(
+                "SELECT workspace_id, name FROM automation_cron_jobs WHERE name = $1",
+                _MOLTBOOK_JOB_NAME,
+            )
+        existing_names = {(str(r["workspace_id"]), r["name"]) for r in existing}
 
         created = 0
         for row in rows:

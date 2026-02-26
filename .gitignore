@@ -74,3 +74,6 @@ Thumbs.db
 coverage/
 .coverage
 htmlcov/
+mcp-servers/gmail/credentials.json
+mcp-servers/gmail/credenials.json
+mcp-servers/gmail/token.json
