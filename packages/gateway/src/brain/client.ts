@@ -15,7 +15,7 @@ export class BrainClient {
 
     constructor(private address: string) { }
 
-    async connect(): Promise<void> {
+    async connect(maxRetries = 10): Promise<void> {
         const packageDef = protoLoader.loadSync(PROTO_PATH, {
             keepCase: true,
             longs: String,
@@ -31,20 +31,32 @@ export class BrainClient {
             grpc.credentials.createInsecure()
         );
 
-        // Wait for connection (with 5s deadline)
-        return new Promise((resolve, reject) => {
-            const deadline = new Date(Date.now() + 5000);
-            this.client.waitForReady(deadline, (err: Error | null) => {
-                if (err) {
-                    logger.error('Brain gRPC connection failed', { error: err.message, address: this.address });
+        // Retry connection with exponential backoff
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                await new Promise<void>((resolve, reject) => {
+                    const deadline = new Date(Date.now() + 5000);
+                    this.client.waitForReady(deadline, (err: Error | null) => {
+                        if (err) reject(err);
+                        else resolve();
+                    });
+                });
+                this.connected = true;
+                logger.info('Brain gRPC connected', { address: this.address, attempt });
+                return;
+            } catch (err: any) {
+                const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+                logger.warn(`Brain gRPC not ready (attempt ${attempt}/${maxRetries}), retrying in ${delay}ms...`, {
+                    address: this.address,
+                    error: err.message,
+                });
+                if (attempt === maxRetries) {
                     this.connected = false;
-                    reject(new Error(`Failed to connect to Brain gRPC at ${this.address}: ${err.message}`));
-                } else {
-                    this.connected = true;
-                    resolve();
+                    throw new Error(`Failed to connect to Brain gRPC at ${this.address} after ${maxRetries} attempts`);
                 }
-            });
-        });
+                await new Promise(r => setTimeout(r, delay));
+            }
+        }
     }
 
     isConnected(): boolean {
