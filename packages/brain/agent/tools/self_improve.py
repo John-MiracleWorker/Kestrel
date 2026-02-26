@@ -98,6 +98,7 @@ async def self_improve_action(
     if action == "scan":
         results = await asyncio.to_thread(_deep_scan, package, scan_mode)
         _last_scan_results = results
+        _persist_scan_results(results)
         return results
     elif action == "test":
         return _run_tests(package)

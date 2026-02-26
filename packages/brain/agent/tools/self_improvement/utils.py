@@ -99,7 +99,7 @@ def _extract_json_array(text: str) -> Optional[list]:
 
     return None
 
-_PROPOSALS_FILE = "/tmp/kestrel_proposals.json"
+_PROPOSALS_FILE = os.path.join(PROJECT_ROOT, ".kestrel", "cache", "kestrel_proposals.json")
 
 def _load_proposals() -> dict[str, dict]:
     """Load pending proposals from disk."""
@@ -216,7 +216,9 @@ def _send_summary_to_telegram(summary: str) -> dict:
 
 _last_scan_results: dict = {}
 
-_SCAN_CACHE_FILE = os.path.join(PROJECT_ROOT, ".kestrel", "cache", "self_improve_scan.json")
+_PERSISTENT_DIR = os.path.join(PROJECT_ROOT, ".kestrel", "cache")
+_SCAN_CACHE_FILE = os.path.join(_PERSISTENT_DIR, "self_improve_scan.json")
+_SCAN_RESULTS_FILE = os.path.join(_PERSISTENT_DIR, "self_improve_last_results.json")
 
 def _load_scan_cache() -> dict:
     try:
@@ -236,6 +238,28 @@ def _save_scan_cache(cache: dict) -> None:
 def _file_signature(path: str) -> str:
     stat = os.stat(path)
     return f"{stat.st_mtime_ns}:{stat.st_size}"
+
+def _persist_scan_results(results: dict) -> None:
+    """Write scan results to disk so they survive service restarts."""
+    try:
+        os.makedirs(os.path.dirname(_SCAN_RESULTS_FILE), exist_ok=True)
+        with open(_SCAN_RESULTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(results, f)
+    except OSError as e:
+        logger.debug(f"Failed to persist scan results: {e}")
+
+
+def _restore_scan_results() -> dict:
+    """Load the most recent scan results from disk (cold-start recovery)."""
+    try:
+        with open(_SCAN_RESULTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+# Restore last scan results on import so 'report' works after restart
+_last_scan_results = _restore_scan_results()
 
 _codebase_overview_cache: dict = {}
 

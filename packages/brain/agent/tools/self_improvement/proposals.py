@@ -128,8 +128,84 @@ def _run_tests(package: str = "all") -> dict:
         "results": results,
     }
 
+def _build_history_feedback() -> dict:
+    """Build a feedback summary from past self-improvement outcomes.
+
+    Returns a dict with:
+      - ``file_success_rate``: {filepath: float} — success rate per file
+      - ``type_success_rate``: {issue_type: float} — success rate per issue type
+      - ``recently_failed_files``: set of files that failed in the last 5 attempts
+
+    This lets the proposal ranker up-weight files/types that historically
+    succeed and down-weight those that repeatedly fail or get rolled back.
+    """
+    from .patcher import get_history
+
+    history = get_history()
+    if not history:
+        return {"file_success_rate": {}, "type_success_rate": {}, "recently_failed_files": set()}
+
+    file_outcomes: dict[str, list[bool]] = {}
+    type_outcomes: dict[str, list[bool]] = {}
+
+    for entry in history:
+        filepath = entry.get("file", "")
+        action = entry.get("action", "")
+        details = entry.get("details", {})
+        issue_type = details.get("proposal", {}).get("type", "unknown")
+
+        success = action in ("applied", "watchdog_passed")
+        failure = action in ("auto_rollback",)
+
+        if success or failure:
+            file_outcomes.setdefault(filepath, []).append(success)
+            type_outcomes.setdefault(issue_type, []).append(success)
+
+    def _rate(outcomes: list[bool]) -> float:
+        return sum(outcomes) / len(outcomes) if outcomes else 0.5
+
+    recently_failed = set()
+    for entry in history[-20:]:
+        if entry.get("action") in ("auto_rollback",):
+            recently_failed.add(entry.get("file", ""))
+
+    return {
+        "file_success_rate": {f: _rate(o) for f, o in file_outcomes.items()},
+        "type_success_rate": {t: _rate(o) for t, o in type_outcomes.items()},
+        "recently_failed_files": recently_failed,
+    }
+
+
+def _score_proposal(proposal: dict, feedback: dict) -> float:
+    """Score a proposal 0-1 using historical feedback.
+
+    Higher = more likely to succeed and worth proposing.
+    """
+    severity_weight = {"critical": 1.0, "high": 0.8, "medium": 0.5, "low": 0.2}.get(
+        proposal.get("severity", "medium"), 0.5
+    )
+
+    filepath = proposal.get("file", "")
+    file_rate = feedback["file_success_rate"].get(filepath, 0.5)
+
+    issue_type = proposal.get("type", "unknown")
+    type_rate = feedback["type_success_rate"].get(issue_type, 0.5)
+
+    # Penalize files that recently failed hard
+    recency_penalty = 0.3 if filepath in feedback["recently_failed_files"] else 0.0
+
+    # LLM-sourced proposals get a small bonus
+    source_bonus = 0.1 if proposal.get("source") == "llm" else 0.0
+
+    score = (severity_weight * 0.4) + (file_rate * 0.25) + (type_rate * 0.25) + source_bonus - recency_penalty
+    return max(0.0, min(1.0, score))
+
+
 async def _propose_improvements() -> dict:
-    """Create proposals from scan results, enrich with LLM analysis, send to Telegram."""
+    """Create proposals from scan results, enrich with LLM analysis, send to Telegram.
+
+    Now uses historical feedback to rank proposals by likelihood of success.
+    """
 
     if not _last_scan_results or not _last_scan_results.get("issues"):
         return {"error": "No scan results. Run 'scan' first."}
@@ -148,6 +224,12 @@ async def _propose_improvements() -> dict:
 
     # Combine static + LLM proposals (LLM proposals go first — they're smarter)
     all_proposals = llm_proposals + actionable
+
+    # Step 2: Rank proposals using historical feedback loop
+    feedback = _build_history_feedback()
+    for p in all_proposals:
+        p["_feedback_score"] = _score_proposal(p, feedback)
+    all_proposals.sort(key=lambda p: p.get("_feedback_score", 0), reverse=True)
 
     if not all_proposals:
         _send_summary_to_telegram(
@@ -195,6 +277,68 @@ async def _propose_improvements() -> dict:
         "total_actionable": len(actionable),
         "message": f"Sent {proposals_sent} proposals to Telegram ({len(llm_proposals)} AI-enhanced)",
     }
+
+def _gather_learner_insights() -> dict:
+    """Extract actionable insights from past task-learner lessons and improvement history.
+
+    Scans the patcher history for patterns the learner has flagged:
+      - Files that repeatedly appear in failed tasks
+      - Issue types that the agent keeps re-encountering
+      - Specific pitfalls that lessons warn about
+
+    Returns a dict suitable for enriching the LLM analysis prompt so the
+    AI reviewer focuses on historically problematic areas.
+    """
+    from .patcher import get_history
+
+    history = get_history()
+    if not history:
+        return {"focus_files": [], "recurring_types": [], "pitfall_summary": ""}
+
+    # Count how often each file appears in improvement history
+    file_counts: dict[str, int] = {}
+    type_counts: dict[str, int] = {}
+    rollback_files: list[str] = []
+
+    for entry in history:
+        fpath = entry.get("file", "")
+        action = entry.get("action", "")
+        details = entry.get("details", {})
+        issue_type = details.get("proposal", {}).get("type", "")
+
+        if fpath:
+            file_counts[fpath] = file_counts.get(fpath, 0) + 1
+        if issue_type:
+            type_counts[issue_type] = type_counts.get(issue_type, 0) + 1
+        if action == "auto_rollback":
+            rollback_files.append(fpath)
+
+    # Top files that keep needing fixes
+    focus_files = sorted(file_counts, key=file_counts.get, reverse=True)[:5]
+
+    # Most common issue types
+    recurring_types = sorted(type_counts, key=type_counts.get, reverse=True)[:5]
+
+    # Build a short summary the LLM can use
+    pitfall_lines = []
+    if rollback_files:
+        unique = list(dict.fromkeys(rollback_files))[:3]
+        pitfall_lines.append(
+            f"Files that previously failed after patching: {', '.join(unique)}. "
+            "Be extra careful with changes to these files."
+        )
+    if recurring_types:
+        pitfall_lines.append(
+            f"Recurring issue types: {', '.join(recurring_types)}. "
+            "Prioritize finding and fixing these patterns."
+        )
+
+    return {
+        "focus_files": focus_files,
+        "recurring_types": recurring_types,
+        "pitfall_summary": " ".join(pitfall_lines),
+    }
+
 
 async def _llm_analyze(candidate_issues: list[dict]) -> list[dict]:
     """
@@ -298,9 +442,28 @@ async def _llm_analyze(candidate_issues: list[dict]) -> list[dict]:
         key_exports = "\n".join(file_summaries[:40])
         _codebase_overview_cache = {"tree": codebase_tree, "exports": key_exports, "built_at": now}
 
+    # ── Phase 1b: Gather learner insights from improvement history ────
+    learner_insights = _gather_learner_insights()
+
     # ── Phase 2: Collect source files for deep review ─────────────────
     files_to_analyze: dict[str, str] = {}
-    
+
+    # Prioritize files the learner identified as historically problematic
+    for focus_file in learner_insights.get("focus_files", []):
+        if len(files_to_analyze) >= 2:
+            break
+        filepath = os.path.join(PROJECT_ROOT, focus_file)
+        if not os.path.exists(filepath) or focus_file in files_to_analyze:
+            continue
+        try:
+            content = open(filepath, "r", errors="ignore").read()
+            lines = content.split("\n")
+            if len(lines) > 300:
+                content = "\n".join(lines[:300]) + f"\n\n... ({len(lines)} total lines, truncated)"
+            files_to_analyze[focus_file] = content
+        except Exception:
+            continue
+
     # Include flagged files from static analysis
     for issue in (candidate_issues or []):
         filepath = os.path.join(PROJECT_ROOT, issue.get("file", ""))
@@ -353,6 +516,13 @@ async def _llm_analyze(candidate_issues: list[dict]) -> list[dict]:
             for i in candidate_issues[:10]
         )
 
+    learner_section = ""
+    if learner_insights.get("pitfall_summary"):
+        learner_section = (
+            "## Lessons from Past Self-Improvements\n"
+            f"{learner_insights['pitfall_summary']}"
+        )
+
     # ── Phase 3: LLM prompt ──────────────────────────────────────────
     prompt = f"""You are Kestrel's self-improvement engine. You are analyzing the FULL Kestrel AI platform codebase to find the most impactful improvements.
 
@@ -363,6 +533,8 @@ async def _llm_analyze(candidate_issues: list[dict]) -> list[dict]:
 {key_exports}
 
 {issues_section}
+
+{learner_section}
 
 ## Source Files (for deep review)
 {files_section}
