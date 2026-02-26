@@ -11,7 +11,7 @@ Safety rails:
 import logging
 import os
 import subprocess
-from typing import Optional
+from typing import Optional  # noqa: F401 — kept for future type hints
 
 from agent.types import RiskLevel, ToolDefinition
 
@@ -20,6 +20,19 @@ logger = logging.getLogger("brain.agent.tools.git")
 # Project root inside Docker
 PROJECT_ROOT = "/project"
 MAX_DIFF_LINES = 1000  # Increased for larger syncs
+
+# Files that should never be staged — pattern fragments matched against paths
+BLOCKED_FILE_PATTERNS = [
+    "credentials.json",
+    "client_secret",
+    "token.json",
+    "service-account",
+    ".env",
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+]
 
 # Admin guard: only the admin user can push/deploy to GitHub.
 # Other users can only make local changes.
@@ -224,28 +237,88 @@ def _git_checkout(name: str) -> dict:
 
 
 def _git_pull() -> dict:
-    """Pull changes from remote."""
+    """Pull changes from remote, using rebase to avoid merge commits."""
     branch = _get_current_branch()
-    result = _run_git(["pull", "origin", branch])
+    result = _run_git(["pull", "--rebase", "origin", branch])
     if result.get("success"):
         return {"message": f"✅ Pulled changes for '{branch}'", "output": result.get("output")}
+
+    error_msg = result.get("error", "")
+    if "divergent" in error_msg:
+        return {
+            "error": f"🚫 Branches diverged. Try: git pull --rebase origin {branch}. "
+            "If conflicts occur, resolve them manually."
+        }
     return result
 
 
 def _git_add(files: str) -> dict:
-    """Stage files for commit."""
+    """Stage files for commit, blocking secrets/credentials."""
     if not files:
         files = "."
+
+    # When staging specific files, check against blocked patterns
+    file_list = files.split() if files != "." else []
+    blocked = []
+    for f in file_list:
+        for pattern in BLOCKED_FILE_PATTERNS:
+            if pattern in f.lower():
+                blocked.append(f)
+                break
+
+    if blocked:
+        return {
+            "error": f"🚫 Blocked staging secret/credential files: {blocked}. "
+            "These should never be committed. Add them to .gitignore instead."
+        }
+
+    # For 'git add .' — stage then immediately unstage any blocked files
     result = _run_git(["add", files])
-    if result.get("success"):
-        return {"message": f"✅ Staged: {files}"}
-    return result
+    if not result.get("success"):
+        return result
+
+    if files == ".":
+        # Check what got staged and unstage anything sensitive
+        staged = _run_git(["diff", "--cached", "--name-only"], check=False)
+        staged_files = [l for l in staged.get("output", "").split("\n") if l]
+        unstaged = []
+        for f in staged_files:
+            for pattern in BLOCKED_FILE_PATTERNS:
+                if pattern in f.lower():
+                    _run_git(["reset", "HEAD", f], check=False)
+                    unstaged.append(f)
+                    break
+        if unstaged:
+            return {
+                "message": f"✅ Staged files (auto-excluded secrets: {unstaged})",
+                "warning": "Secret files were detected and excluded from staging.",
+            }
+
+    return {"message": f"✅ Staged: {files}"}
 
 
 def _git_commit(message: str) -> dict:
-    """Commit staged changes."""
+    """Commit staged changes, with secret-file and diff-size checks."""
     if not message:
         return {"error": "Commit message is required."}
+
+    # Check for secret files in staging area
+    staged = _run_git(["diff", "--cached", "--name-only"], check=False)
+    staged_files = [l for l in staged.get("output", "").split("\n") if l]
+    secrets_found = []
+    for f in staged_files:
+        for pattern in BLOCKED_FILE_PATTERNS:
+            if pattern in f.lower():
+                secrets_found.append(f)
+                break
+    if secrets_found:
+        # Auto-unstage the secrets
+        for f in secrets_found:
+            _run_git(["reset", "HEAD", f], check=False)
+        return {
+            "error": f"🚫 Blocked commit — secret files were staged: {secrets_found}. "
+            "They have been unstaged. Remove them or add to .gitignore."
+        }
 
     # Check diff size
     stat = _run_git(["diff", "--cached", "--stat"], check=False)
@@ -267,14 +340,40 @@ def _git_commit(message: str) -> dict:
 
 
 def _git_push() -> dict:
-    """Push current branch to origin."""
+    """Push current branch to origin, handling common failure modes."""
     branch = _get_current_branch()
     if branch in ("main", "master"):
         return {"error": "🚫 Pushing directly to main/master is disabled for safety."}
-    
-    result = _run_git(["push", "origin", branch])
+
+    # First attempt
+    result = _run_git(["push", "-u", "origin", branch])
     if result.get("success"):
         return {"message": f"✅ Pushed '{branch}' to origin"}
+
+    error_msg = result.get("error", "")
+
+    # Handle divergent branches — pull with rebase then retry
+    if "divergent" in error_msg or "rejected" in error_msg or "non-fast-forward" in error_msg:
+        logger.warning("Push rejected (divergent), attempting pull --rebase")
+        pull = _run_git(["pull", "--rebase", "origin", branch], check=False)
+        if pull.get("success"):
+            retry = _run_git(["push", "-u", "origin", branch])
+            if retry.get("success"):
+                return {"message": f"✅ Rebased and pushed '{branch}' to origin"}
+            return {"error": f"Push failed after rebase: {retry.get('error', 'unknown')}"}
+        return {
+            "error": f"🚫 Could not rebase — manual conflict resolution needed. "
+            f"Pull error: {pull.get('error', 'unknown')}"
+        }
+
+    # Handle GH013 (secret scanning / repo rule violations)
+    if "GH013" in error_msg or "Repository rule violations" in error_msg:
+        return {
+            "error": "🚫 GitHub blocked push due to repository rules (likely secret detection). "
+            "Check for credentials.json, tokens, or keys in staged files. "
+            "Remove them with: git rm --cached <file> && git commit --amend"
+        }
+
     return result
 
 
