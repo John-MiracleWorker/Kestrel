@@ -46,6 +46,16 @@ yarn-error.log*
 .env.local
 .env.*.local
 
+# Secrets & credentials (prevent accidental commits)
+**/credentials.json
+**/client_secret*.json
+**/token.json
+**/service-account*.json
+*.key
+*.pem
+*.p12
+*.pfx
+
 # IDE
 .vscode/
 .idea/
