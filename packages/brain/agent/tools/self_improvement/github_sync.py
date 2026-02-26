@@ -17,7 +17,7 @@ from agent.types import RiskLevel, ToolDefinition
 from .utils import *
 from .ast_analyzer import _deep_scan
 
-_SYNCED_ISSUES_FILE = "/tmp/kestrel_synced_issues.json"
+_SYNCED_ISSUES_FILE = os.path.join(PROJECT_ROOT, ".kestrel", "cache", "kestrel_synced_issues.json")
 
 def _load_synced_hashes() -> set:
     """Load set of issue hashes already synced to GitHub."""

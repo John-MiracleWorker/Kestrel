@@ -364,16 +364,32 @@ async def start_watchdog(filepath: str, backup_path: str, seconds: int = 300):
     _active_watchdogs[rel] = task
 
 
+class _ErrorCountHandler(logging.Handler):
+    """Lightweight logging handler that counts ERROR+ log records.
+
+    Attached once to the 'brain' logger so the watchdog can detect
+    error-rate spikes after a patch is applied.
+    """
+
+    def __init__(self):
+        super().__init__(level=logging.ERROR)
+        self.count = 0
+
+    def emit(self, record):
+        self.count += 1
+
+
+# Singleton — attached lazily on first call to _count_recent_errors()
+_error_handler: _ErrorCountHandler | None = None
+
+
 def _count_recent_errors() -> int:
-    """Count recent ERROR-level log entries (proxy for error rate)."""
-    try:
-        # Check if error counter is available from the logging system
-        root_logger = logging.getLogger("brain")
-        # Simple approach: count handlers with error counters
-        # In practice, this could read from a log file or metrics endpoint
-        return getattr(root_logger, "_error_count", 0)
-    except Exception:
-        return 0
+    """Count ERROR-level log entries seen since the handler was attached."""
+    global _error_handler
+    if _error_handler is None:
+        _error_handler = _ErrorCountHandler()
+        logging.getLogger("brain").addHandler(_error_handler)
+    return _error_handler.count
 
 
 # ── History ──────────────────────────────────────────────────────────
@@ -417,10 +433,68 @@ def get_history() -> list[dict]:
 # ── Full Pipeline ────────────────────────────────────────────────────
 
 
+async def _council_review(proposal: dict, patch_summary: str) -> dict:
+    """Run the proposal through a Council deliberation for multi-perspective review.
+
+    Returns ``{"approved": True/False, "verdict": <CouncilVerdict dict>}``.
+    If the Council system is unavailable (no LLM, import error, etc.), the
+    proposal is approved by default so the pipeline isn't blocked.
+    """
+    try:
+        from agent.council import CouncilSession
+
+        # Use the same cloud provider the patcher uses
+        provider_name = os.getenv("DEFAULT_LLM_PROVIDER", "google")
+        if provider_name == "local":
+            provider_name = "google"
+
+        from providers.cloud import CloudProvider
+        provider = CloudProvider(provider_name)
+        if not provider.is_ready():
+            logger.info("Council review skipped: cloud provider not ready")
+            return {"approved": True, "verdict": None, "skipped": True}
+
+        council = CouncilSession(llm_provider=provider)
+
+        proposal_text = (
+            f"Self-improvement proposal for {proposal.get('file', '?')}:\n"
+            f"Type: {proposal.get('type', '?')}\n"
+            f"Severity: {proposal.get('severity', '?')}\n"
+            f"Description: {proposal.get('description', '')}\n"
+            f"Suggestion: {proposal.get('suggestion', '')}\n\n"
+            f"Patch summary: {patch_summary}"
+        )
+
+        verdict = await council.deliberate(
+            proposal=proposal_text,
+            context="Automated self-improvement patch — evaluate safety and correctness.",
+            include_debate=False,  # Keep it fast; single-round evaluation
+        )
+
+        approved = verdict.has_consensus and verdict.consensus is not None and verdict.consensus.value != "reject"
+
+        logger.info(
+            f"Council review: {'approved' if approved else 'rejected'} "
+            f"(consensus={verdict.has_consensus}, "
+            f"votes={[o.vote.value for o in verdict.opinions]})"
+        )
+
+        return {
+            "approved": approved,
+            "verdict": verdict.to_dict(),
+            "requires_user_review": verdict.requires_user_review,
+        }
+
+    except Exception as e:
+        logger.warning(f"Council review failed ({e}), defaulting to approved")
+        return {"approved": True, "verdict": None, "skipped": True, "error": str(e)}
+
+
 async def apply_proposal(proposal: dict) -> dict:
     """
     Full self-improvement pipeline:
     1. Generate code patch via LLM
+    1b. Council multi-agent review of the proposed change
     2. Syntax check
     3. Backup original
     4. Run tests
@@ -460,6 +534,25 @@ async def apply_proposal(proposal: dict) -> dict:
     if not patch_result["success"]:
         results["success"] = False
         results["error"] = f"Patch generation failed: {patch_result['error']}"
+        return results
+
+    # Stage 1b: Council review — multi-agent safety check
+    council_result = await _council_review(
+        proposal,
+        patch_summary=patch_result.get("explanation", proposal.get("description", ""))[:300],
+    )
+    results["stages"]["council_review"] = council_result
+    if not council_result.get("approved", True):
+        results["success"] = False
+        results["error"] = "Council rejected the proposal — not safe to apply"
+        _record_history(rel_path, "council_rejected", {
+            "proposal": {
+                "type": proposal.get("type"),
+                "severity": proposal.get("severity"),
+                "description": proposal.get("description", "")[:200],
+            },
+            "verdict": council_result.get("verdict"),
+        })
         return results
 
     new_content = patch_result["patched_content"]
