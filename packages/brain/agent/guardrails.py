@@ -65,7 +65,8 @@ class Guardrails:
     """
 
     def __init__(self):
-        self._tool_call_timestamps: dict[str, list[float]] = {}  # task_id → timestamps
+        self._tool_call_timestamps: dict[str, list[float]] = {}  # tool_name → timestamps
+        self._recent_calls: list[tuple[str, str]] = []  # (tool_name, args_hash) for repetition detection
 
     def check_budget(self, task: AgentTask) -> Optional[str]:
         """
@@ -181,6 +182,34 @@ class Guardrails:
             return (
                 f"Rate limit: '{tool_name}' called {len(timestamps)} times in 60s. "
                 "Possible infinite loop detected."
+            )
+
+        return None
+
+    def check_repetition(self, tool_name: str, tool_args: dict) -> Optional[str]:
+        """
+        Check if an identical tool+args combination has been called recently.
+        Returns a warning string (not a block) to inject into context.
+        """
+        import hashlib
+        import json as _json
+        args_hash = hashlib.md5(
+            _json.dumps(tool_args, sort_keys=True).encode()
+        ).hexdigest()[:12]
+        call_sig = (tool_name, args_hash)
+
+        count = sum(1 for c in self._recent_calls if c == call_sig)
+
+        # Track it
+        self._recent_calls.append(call_sig)
+        # Keep only last 50 calls
+        if len(self._recent_calls) > 50:
+            self._recent_calls = self._recent_calls[-50:]
+
+        if count >= 2:
+            return (
+                f"Repetition detected: '{tool_name}' called {count + 1} times with "
+                f"identical arguments. This is likely unproductive."
             )
 
         return None

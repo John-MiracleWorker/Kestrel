@@ -22,6 +22,7 @@ from agent.observability import MetricsCollector
 from agent.evidence import EvidenceChain
 from agent.model_router import ModelRouter
 from agent.core.verifier import VerifierEngine
+from agent.diagnostics import DiagnosticTracker
 
 logger = logging.getLogger("brain.agent.core.executor")
 
@@ -42,12 +43,20 @@ Instructions:
 2. You may call up to 5 tools per turn if they are independent, read-only/low-risk, and do not require approval. Prefer batching and parallel-safe tools. Wait for all results before proceeding.
 3. If the step is complete, call `task_complete` with a summary of what you accomplished.
 4. If you need clarification from the user, call `ask_human` with your question.
-5. If you encounter an error, try an alternative approach before giving up.
-6. Think step-by-step. Explain your reasoning before acting.
+5. Think step-by-step. Explain your reasoning before acting.
+
+Error Recovery Protocol:
+- When a tool fails, DIAGNOSE before retrying. Read the error message carefully.
+- NEVER retry the exact same tool call with identical arguments — it will fail again.
+- If an error is about a missing file/command, verify the path exists first.
+- If an error is about dependencies, install them before retrying the operation.
+- If an error is about auth/permissions, check credentials before retrying.
+- If a server/process crashed, check stderr output and requirements before reconnecting.
+- After 3 failures on the same step, STOP and use diagnostic tools (system_health, host_read, host_list) to gather information, or call `ask_human` to ask the user for help.
 
 Verification & Evidence Rules:
 - Before calling `task_complete`, you MUST explicitly cite the tool outputs that prove your work in your summary.
-- Your final summary will be strictly evaluated by an independent Verifier Engine against your tool execution history. 
+- Your final summary will be strictly evaluated by an independent Verifier Engine against your tool execution history.
 - If you make unsupported claims or hallucinate actions you didn't take, your completion will be REJECTED.
 
 Host Filesystem Strategy:
@@ -58,7 +67,7 @@ Host Filesystem Strategy:
 - host_write requires human approval.
 
 Progress: Step {step_index}/{total_steps} | Iteration {iteration}/{max_iterations}
-
+{diagnostic_context}
 Previous observations for this step:
 {observations}
 """
@@ -99,6 +108,13 @@ class TaskExecutor:
         self._evidence_chain = evidence_chain
         self._progress_callback = progress_callback or (lambda t: 0.0)
         self._verifier = verifier
+        self._step_diagnostics: dict[str, DiagnosticTracker] = {}  # step_id → tracker
+
+    def _get_tracker(self, step_id: str) -> DiagnosticTracker:
+        """Get or create a DiagnosticTracker for a step."""
+        if step_id not in self._step_diagnostics:
+            self._step_diagnostics[step_id] = DiagnosticTracker()
+        return self._step_diagnostics[step_id]
 
     async def _wait_for_approval(self, task: AgentTask) -> bool:
         """
@@ -259,6 +275,16 @@ class TaskExecutor:
                     **({"_gemini_raw_part": tc_data["_gemini_raw_part"]} if "_gemini_raw_part" in tc_data else {}),
                 })
 
+                # Record in diagnostic tracker
+                tracker = self._get_tracker(step.id)
+                tracker.record(
+                    tool_name=tool_name,
+                    args=tool_args,
+                    result_output=result.output if result.success else "",
+                    success=result.success,
+                    error=result.error if not result.success else None,
+                )
+
                 yield TaskEvent(
                     type=TaskEventType.TOOL_CALLED,
                     task_id=task.id,
@@ -400,6 +426,16 @@ class TaskExecutor:
             **({"_gemini_raw_part": tc_data["_gemini_raw_part"]} if "_gemini_raw_part" in tc_data else {}),
         })
 
+        # Record in diagnostic tracker
+        tracker = self._get_tracker(step.id)
+        tracker.record(
+            tool_name=tool_name,
+            args=tool_args,
+            result_output=result.output if result.success else "",
+            success=result.success,
+            error=result.error if not result.success else None,
+        )
+
         yield TaskEvent(
             type=TaskEventType.TOOL_RESULT,
             task_id=task.id,
@@ -513,9 +549,19 @@ class TaskExecutor:
 
         done, total = task.plan.progress
 
+        # Build diagnostic context from tracked attempts
+        tracker = self._get_tracker(step.id)
+        diagnostic_context = tracker.build_diagnostic_prompt()
+
         if task.messages:
             messages = list(task.messages)
-            for tc in step.tool_calls[-6:]:
+            # Inject diagnostic context into chat-mode as a system message
+            if diagnostic_context:
+                messages.append({
+                    "role": "system",
+                    "content": diagnostic_context,
+                })
+            for tc in step.tool_calls[-10:]:
                 messages.append({
                     "role": "assistant",
                     "content": None,
@@ -543,6 +589,7 @@ class TaskExecutor:
                 iteration=task.iterations,
                 max_iterations=task.config.max_iterations,
                 observations=observations,
+                diagnostic_context=("\n" + diagnostic_context + "\n") if diagnostic_context else "",
             )
 
             messages = [{"role": "system", "content": system_prompt}]
@@ -553,11 +600,31 @@ class TaskExecutor:
                     "content": f"Execute this step: {step.description}",
                 })
             else:
+                # Show up to 10 recent tool calls; if older calls were
+                # trimmed, prepend a compact summary so the LLM knows
+                # what it already tried (prevents redundant retries).
+                recent_window = 10
+                skipped = step.tool_calls[:-recent_window] if len(step.tool_calls) > recent_window else []
+                recent = step.tool_calls[-recent_window:]
+
+                continue_msg = f"Continue executing: {step.description}"
+                if skipped:
+                    summary_lines = []
+                    for tc in skipped:
+                        status = "✓" if tc.get("success") else "✗"
+                        summary_lines.append(
+                            f"  {status} {tc.get('tool', '?')}({json.dumps(tc.get('args', {}))[:60]})"
+                        )
+                    continue_msg += (
+                        f"\n\nEarlier attempts ({len(skipped)} calls, summarized):\n"
+                        + "\n".join(summary_lines)
+                    )
+
                 messages.append({
                     "role": "user",
-                    "content": f"Continue executing: {step.description}",
+                    "content": continue_msg,
                 })
-                for tc in step.tool_calls[-6:]:
+                for tc in recent:
                     messages.append({
                         "role": "assistant",
                         "content": None,
