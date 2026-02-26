@@ -47,12 +47,24 @@ logger = logging.getLogger("brain.agent.tools.computer_use")
 
 # ── Configuration ────────────────────────────────────────────────────
 
-COMPUTER_USE_MODEL = os.getenv(
-    "GEMINI_COMPUTER_USE_MODEL",
-    "gemini-3-flash-preview",
-)
+# Model is resolved dynamically from the registry at first use.
+# Set GEMINI_COMPUTER_USE_MODEL env var to override.
+COMPUTER_USE_MODEL = os.getenv("GEMINI_COMPUTER_USE_MODEL", "")
 MAX_TURNS = int(os.getenv("COMPUTER_USE_MAX_TURNS", "30"))
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+async def _resolve_computer_use_model() -> str:
+    """Resolve the computer use model dynamically from the registry."""
+    global COMPUTER_USE_MODEL
+    if COMPUTER_USE_MODEL:
+        return COMPUTER_USE_MODEL
+    try:
+        from core.model_registry import model_registry
+        COMPUTER_USE_MODEL = await model_registry.get_fast_model("google")
+        logger.info(f"Computer use model resolved dynamically: {COMPUTER_USE_MODEL}")
+    except Exception:
+        COMPUTER_USE_MODEL = "gemini-2.5-flash"
+    return COMPUTER_USE_MODEL
 
 # Host-side screen agent URL (runs natively on the Mac)
 SCREEN_AGENT_URL = os.getenv("SCREEN_AGENT_URL", "http://host.docker.internal:9800")

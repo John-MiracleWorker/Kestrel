@@ -25,23 +25,44 @@ logger = logging.getLogger("brain.agent.observability")
 # ── Model Pricing Table (cost per 1M tokens) ────────────────────────
 
 MODEL_PRICES: dict[str, dict[str, float]] = {
-    # OpenAI
-    "gpt-4o": {"prompt": 2.50, "completion": 10.00},
-    "gpt-4o-mini": {"prompt": 0.15, "completion": 0.60},
-    "gpt-4-turbo": {"prompt": 10.00, "completion": 30.00},
+    # OpenAI (current)
+    "gpt-5.2": {"prompt": 2.50, "completion": 10.00},
+    "gpt-5.2-pro": {"prompt": 5.00, "completion": 15.00},
+    "gpt-5.1": {"prompt": 2.00, "completion": 8.00},
+    "gpt-5": {"prompt": 2.00, "completion": 8.00},
+    "gpt-5-mini": {"prompt": 0.15, "completion": 0.60},
+    "gpt-5-nano": {"prompt": 0.05, "completion": 0.20},
+    "gpt-5.3-codex": {"prompt": 3.00, "completion": 12.00},
     "gpt-4.1": {"prompt": 2.00, "completion": 8.00},
-    "o3-mini": {"prompt": 1.10, "completion": 4.40},
-    # Anthropic
-    "claude-sonnet-4-20250514": {"prompt": 3.00, "completion": 15.00},
-    "claude-3-5-sonnet-20241022": {"prompt": 3.00, "completion": 15.00},
-    "claude-3-haiku-20240307": {"prompt": 0.25, "completion": 1.25},
-    "claude-opus-4-20250514": {"prompt": 15.00, "completion": 75.00},
-    # Google
-    "gemini-2.5-pro": {"prompt": 1.25, "completion": 10.00},
-    "gemini-2.5-flash": {"prompt": 0.15, "completion": 0.60},
+    "gpt-4.1-mini": {"prompt": 0.40, "completion": 1.60},
+    # Anthropic (current)
+    "claude-opus-4-6": {"prompt": 15.00, "completion": 75.00},
+    "claude-sonnet-4-6": {"prompt": 3.00, "completion": 15.00},
+    "claude-haiku-4-5": {"prompt": 0.25, "completion": 1.25},
+    # Google  (current — match dynamically discovered model names)
+    "gemini-3.1-pro-preview": {"prompt": 1.25, "completion": 5.00},
+    "gemini-3-pro-preview": {"prompt": 1.25, "completion": 5.00},
+    "gemini-3-deep-think-preview": {"prompt": 2.00, "completion": 10.00},
+    "gemini-3-flash-preview": {"prompt": 0.15, "completion": 0.60},
+    "gemini-2.5-flash-preview-04-17": {"prompt": 0.15, "completion": 0.60},
+    "gemini-2.5-flash-lite-preview-06-17": {"prompt": 0.04, "completion": 0.15},
     # Local (free)
     "local": {"prompt": 0.0, "completion": 0.0},
 }
+
+
+def _estimate_model_price(model: str) -> dict[str, float]:
+    """Estimate pricing for a model not in the static table via name patterns."""
+    if model in MODEL_PRICES:
+        return MODEL_PRICES[model]
+    ml = model.lower()
+    if "pro" in ml or "opus" in ml or "deep" in ml:
+        return {"prompt": 2.00, "completion": 10.00}
+    if "flash" in ml or "mini" in ml or "haiku" in ml or "nano" in ml:
+        return {"prompt": 0.15, "completion": 0.60}
+    if "lite" in ml:
+        return {"prompt": 0.04, "completion": 0.15}
+    return {"prompt": 1.00, "completion": 5.00}  # mid-range default
 
 
 @dataclass
@@ -213,18 +234,8 @@ class MetricsCollector:
         completion_tokens: int,
     ) -> float:
         """Estimate cost based on model pricing table."""
-        # Try exact match first, then prefix match
-        prices = MODEL_PRICES.get(model)
-        if not prices:
-            # Try matching by prefix (e.g., "gpt-4o-2024..." → "gpt-4o")
-            for key, val in MODEL_PRICES.items():
-                if model.startswith(key) or key in model:
-                    prices = val
-                    break
-
-        if not prices:
-            # Unknown model — assume local/free
-            return 0.0
+        # Use fallback pattern-matcher for dynamically discovered models
+        prices = _estimate_model_price(model)
 
         prompt_cost = (prompt_tokens / 1_000_000) * prices["prompt"]
         completion_cost = (completion_tokens / 1_000_000) * prices["completion"]

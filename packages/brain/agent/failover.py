@@ -74,28 +74,27 @@ class ModelHealth:
 
 
 # ── Default Fallback Chains ──────────────────────────────────────────
+# These are populated dynamically on startup via build_dynamic_chains().
+# Static defaults are kept as a safety net if the API is unreachable.
+DEFAULT_CHAINS: dict[str, list[str]] = {}
 
-DEFAULT_CHAINS: dict[str, list[str]] = {
-    # OpenAI chain
-    "gpt-4o": ["gpt-4o", "gpt-4o-mini", "gpt-4.1"],
-    "gpt-4o-mini": ["gpt-4o-mini", "gpt-4o"],
-    "o3-mini": ["o3-mini", "gpt-4o"],
-
-    # Anthropic chain
-    "claude-sonnet-4-20250514": [
-        "claude-sonnet-4-20250514",
-        "claude-3-5-sonnet-20241022",
-        "claude-3-haiku-20240307",
-    ],
-    "claude-opus-4-20250514": [
-        "claude-opus-4-20250514",
-        "claude-sonnet-4-20250514",
-    ],
-
-    # Google chain
-    "gemini-2.5-pro": ["gemini-2.5-pro", "gemini-2.5-flash"],
-    "gemini-2.5-flash": ["gemini-2.5-flash", "gemini-2.5-pro"],
-}
+async def build_dynamic_chains() -> None:
+    """Populate DEFAULT_CHAINS from the model registry's discovered models."""
+    global DEFAULT_CHAINS
+    try:
+        from core.model_registry import model_registry
+        for provider in ("google", "openai", "anthropic"):
+            models = await model_registry.list_models(provider)
+            if not models:
+                continue
+            for m in models:
+                mid = m["id"]
+                chain = await model_registry.build_failover_chain(provider, mid)
+                if chain:
+                    DEFAULT_CHAINS[mid] = chain
+        logger.info(f"Failover: built dynamic chains for {len(DEFAULT_CHAINS)} models")
+    except Exception as e:
+        logger.warning(f"Failover: dynamic chain build failed, chains remain empty: {e}")
 
 
 class ModelFailover:

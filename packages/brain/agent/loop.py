@@ -277,7 +277,17 @@ class AgentLoop:
                         logger.warning(f"Reflection engine failed: {e}")
 
                 # ── Council Deliberation: Multi-Agent Consensus ─────
-                if hasattr(self, "_council") and self._council and len(task.plan.steps) > 1:
+                # Only invoke council for complex plans (complexity > 5.0)
+                # to avoid wasting 5+ LLM calls on simple tasks
+                plan_complexity = float(len(task.plan.steps))  # rough default
+                try:
+                    from agent.model_router import estimate_complexity, classify_step
+                    _st = classify_step(task.goal)
+                    plan_complexity = estimate_complexity(task.goal, _st)
+                except Exception:
+                    pass
+
+                if hasattr(self, "_council") and self._council and plan_complexity > 5.0:
                     try:
                         plan_text = json.dumps(task.plan.to_dict())
                         verdict = await self._council.deliberate(
@@ -418,13 +428,16 @@ class AgentLoop:
                         break
 
                     if step.status == StepStatus.FAILED:
-                        # Try retry (max 3 attempts per step)
+                        # Try retry with exponential backoff (max 3 attempts per step)
                         if step.attempts < 3:
                             step.status = StepStatus.IN_PROGRESS
                             step.attempts += 1
+                            backoff_delay = 2 ** (step.attempts - 1)  # 1s, 2s, 4s
                             logger.info(
-                                f"Retrying step {step.id} (attempt {step.attempts})"
+                                f"Retrying step {step.id} (attempt {step.attempts}/3, "
+                                f"backoff {backoff_delay}s): {step.error or 'unknown error'}"
                             )
+                            await asyncio.sleep(backoff_delay)
                         else:
                             yield TaskEvent(
                                 type=TaskEventType.TASK_FAILED,
@@ -434,7 +447,7 @@ class AgentLoop:
                                 progress=self._progress(task),
                             )
                             task.status = TaskStatus.FAILED
-                            task.error = f"Step '{step.description}' failed: {step.error}"
+                            task.error = f"Step '{step.description[:80]}' failed after 3 retries: {step.error}"
                             await self._persistence.update_task(task)
                             return
 

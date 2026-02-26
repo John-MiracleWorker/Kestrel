@@ -270,6 +270,7 @@ class MemoryGraph:
         workspace_id: str,
         entities: list[dict],
         relations: list[dict],
+        vector_store=None,
     ) -> dict[str, int]:
         """
         Store extracted entities and relations from a conversation turn.
@@ -277,6 +278,9 @@ class MemoryGraph:
         Input format:
           entities: [{"type": "file", "name": "auth.py", "description": "...", "properties": {...}}]
           relations: [{"source": "auth.py", "target": "User", "relation": "depends_on", "context": "..."}]
+
+        When vector_store is provided, also indexes entity descriptions for
+        semantic similarity search via hybrid_query().
 
         Returns count of nodes and edges created/updated.
         """
@@ -400,6 +404,35 @@ class MemoryGraph:
                         conv_uuid, now,
                     )
                     edges_created += 1
+
+        # ── Index entity descriptions into vector store ──────────
+        # This enables hybrid_query() to find nodes via semantic similarity,
+        # not just graph traversal.
+        if vector_store and entities:
+            try:
+                docs = []
+                for entity in entities:
+                    name = entity.get("name", "").strip()
+                    desc = entity.get("description", "").strip()
+                    if name and desc:
+                        docs.append({
+                            "content": f"{name}: {desc}",
+                            "metadata": {
+                                "entity_name": name,
+                                "entity_type": entity.get("type", "concept"),
+                                "source": "memory_graph",
+                                "conversation_id": conversation_id,
+                            },
+                        })
+                if docs:
+                    await vector_store.upsert(
+                        workspace_id=workspace_id,
+                        documents=docs,
+                        source_filter="memory_graph",
+                    )
+                    logger.debug(f"Indexed {len(docs)} memory graph entities into vector store")
+            except Exception as e:
+                logger.warning(f"Vector indexing of memory graph entities failed (non-fatal): {e}")
 
         logger.info(f"Memory graph updated: {nodes_upserted} nodes, {edges_created} edges")
         return {"nodes_upserted": nodes_upserted, "edges_created": edges_created}

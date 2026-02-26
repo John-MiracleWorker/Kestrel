@@ -354,64 +354,37 @@ async def serve():
     except Exception as e:
         logger.warning(f"Automation startup failed (non-fatal): {e}")
 
-    # Bootstrap autonomous Moltbook cron jobs for all workspaces
-    async def _bootstrap_moltbook_cron() -> None:
-        """
-        Ensure every workspace has an autonomous Moltbook session cron job.
-        Runs every 2 hours. Skips workspaces that already have the job.
-        The job is a no-op if no Moltbook credentials are present.
-        """
-        _MOLTBOOK_JOB_NAME = "moltbook_autonomous_session"
-        _MOLTBOOK_CRON = "0 */2 * * *"   # every 2 hours
-        _MOLTBOOK_GOAL = (
-            "Run your autonomous Moltbook session. "
-            "First call moltbook_session to scan your subscribed submolts and get your "
-            "engagement plan. Then use the moltbook tool to engage: upvote quality posts, "
-            "leave on-topic comments that add genuine value, and optionally create one "
-            "original post if you have something worth sharing. "
-            "Stay in character as Kestrel throughout."
-        )
-        try:
-            async with pool.acquire() as conn:
-                rows = await conn.fetch(
-                    """
-                    SELECT wm.workspace_id, wm.user_id
-                    FROM workspace_members wm
-                    WHERE wm.role = 'owner'
-                    ORDER BY wm.workspace_id
-                    """
-                )
-
-            existing_names = {
-                (j.workspace_id, j.name)
-                for j in runtime.cron_scheduler._jobs.values()
-            }
-
-            created = 0
-            for row in rows:
-                ws_id = str(row["workspace_id"])
-                u_id = str(row["user_id"])
-                if (ws_id, _MOLTBOOK_JOB_NAME) in existing_names:
-                    continue
-                await runtime.cron_scheduler.create_job(
-                    workspace_id=ws_id,
-                    user_id=u_id,
-                    name=_MOLTBOOK_JOB_NAME,
-                    description="Autonomous Moltbook participation — browse, engage, post",
-                    cron_expression=_MOLTBOOK_CRON,
-                    goal=_MOLTBOOK_GOAL,
-                )
-                created += 1
-
-            if created:
-                logger.info(f"Bootstrapped Moltbook autonomous cron job for {created} workspace(s)")
-        except Exception as e:
-            logger.warning(f"Moltbook cron bootstrap failed (non-fatal): {e}")
-
+    # ── Initialize dynamic model registry ──────────────────────────────
+    # Discovers current models from Google/OpenAI/Anthropic APIs at startup
+    # so the rest of the codebase never hardcodes model names.
     try:
-        await _bootstrap_moltbook_cron()
+        from core.model_registry import model_registry
+        from agent.model_router import init_models as init_router_models
+        from agent.failover import build_dynamic_chains
+
+        # Pre-warm the registry for Google (primary provider)
+        await model_registry.list_models("google")
+        await init_router_models()
+        await build_dynamic_chains()
+        logger.info("Dynamic model registry initialized")
     except Exception as e:
-        logger.warning(f"Moltbook bootstrap error (non-fatal): {e}")
+        logger.warning(f"Model registry init failed (non-fatal, will use env defaults): {e}")
+
+    # Bootstrap autonomous Moltbook cron jobs (canonical version from cron.py)
+    try:
+        from core.cron import bootstrap_moltbook_cron
+        await bootstrap_moltbook_cron(pool)
+    except Exception as e:
+        logger.warning(f"Moltbook cron bootstrap failed (non-fatal): {e}")
+
+    # ── Wire daemon manager and load persisted daemons ─────────────────
+    try:
+        from core.cron import launch_task_from_automation
+        _daemon_manager._task_launcher = launch_task_from_automation
+        await _daemon_manager.load_daemons()
+        logger.info("Daemon manager wired and persisted daemons loaded")
+    except Exception as e:
+        logger.warning(f"Daemon manager wiring failed (non-fatal): {e}")
 
     await server.start()
     logger.info("Brain service ready")
@@ -422,6 +395,12 @@ async def serve():
         logger.info("Shutting down Brain service...")
         if runtime.cron_scheduler:
             await runtime.cron_scheduler.stop()
+        # Stop all daemons gracefully
+        try:
+            for daemon in _daemon_manager._daemons.values():
+                await daemon.stop()
+        except Exception:
+            pass
         await server.stop(5)
         pool = await get_pool()
         if pool:

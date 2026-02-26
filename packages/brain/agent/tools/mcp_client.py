@@ -146,45 +146,82 @@ class MCPClient:
         return self._tools
 
     async def call_tool(self, tool_name: str, arguments: dict = None) -> dict:
-        """Call a tool on the connected MCP server."""
-        if not self._connected:
-            return {"error": "Not connected to MCP server"}
+        """Call a tool on the connected MCP server.
 
-        # Validate tool exists
-        valid_tools = [t["name"] for t in self._tools]
-        if tool_name not in valid_tools:
+        If the call fails due to a broken connection (process crash, pipe
+        error), automatically attempts one reconnect before returning an error.
+        """
+        for attempt in range(2):  # 1 normal + 1 reconnect
+            if not self._connected:
+                if attempt == 0:
+                    return {"error": "Not connected to MCP server"}
+                # Second attempt after reconnect failed
+                return {"error": "Reconnect failed — MCP server unreachable"}
+
+            # Validate tool exists
+            valid_tools = [t["name"] for t in self._tools]
+            if tool_name not in valid_tools:
+                return {
+                    "error": f"Tool '{tool_name}' not found on '{self.name}'",
+                    "available_tools": valid_tools,
+                }
+
+            try:
+                result = await self._send_request("tools/call", {
+                    "name": tool_name,
+                    "arguments": arguments or {},
+                })
+            except (BrokenPipeError, ConnectionError, OSError) as e:
+                logger.warning(
+                    f"MCP '{self.name}' connection lost during call_tool: {e}. "
+                    f"Attempting reconnect…"
+                )
+                await self._try_reconnect()
+                continue
+
+            if "error" in result:
+                err = str(result["error"])
+                # Detect transport-level failures that warrant a reconnect
+                if any(kw in err.lower() for kw in ("broken pipe", "eof", "connection", "transport")):
+                    if attempt == 0:
+                        logger.warning(f"MCP '{self.name}' transport error: {err}. Reconnecting…")
+                        await self._try_reconnect()
+                        continue
+                return {"error": result["error"]}
+
+            # Parse MCP tool result
+            tool_result = result.get("result", {})
+            content = tool_result.get("content", [])
+
+            # Extract text content
+            output_parts = []
+            for item in content:
+                if item.get("type") == "text":
+                    output_parts.append(item.get("text", ""))
+                elif item.get("type") == "image":
+                    output_parts.append(f"[Image: {item.get('mimeType', 'image')}]")
+                elif item.get("type") == "resource":
+                    output_parts.append(f"[Resource: {item.get('uri', '')}]")
+
             return {
-                "error": f"Tool '{tool_name}' not found on '{self.name}'",
-                "available_tools": valid_tools,
+                "success": not tool_result.get("isError", False),
+                "output": "\n".join(output_parts) if output_parts else str(tool_result),
+                "raw": tool_result,
             }
 
-        result = await self._send_request("tools/call", {
-            "name": tool_name,
-            "arguments": arguments or {},
-        })
+        return {"error": "MCP call_tool failed after reconnect attempt"}
 
-        if "error" in result:
-            return {"error": result["error"]}
-
-        # Parse MCP tool result
-        tool_result = result.get("result", {})
-        content = tool_result.get("content", [])
-
-        # Extract text content
-        output_parts = []
-        for item in content:
-            if item.get("type") == "text":
-                output_parts.append(item.get("text", ""))
-            elif item.get("type") == "image":
-                output_parts.append(f"[Image: {item.get('mimeType', 'image')}]")
-            elif item.get("type") == "resource":
-                output_parts.append(f"[Resource: {item.get('uri', '')}]")
-
-        return {
-            "success": not tool_result.get("isError", False),
-            "output": "\n".join(output_parts) if output_parts else str(tool_result),
-            "raw": tool_result,
-        }
+    async def _try_reconnect(self) -> None:
+        """Attempt to reconnect to the MCP server after a connection failure."""
+        try:
+            await self.disconnect()
+        except Exception:
+            pass
+        try:
+            await self.connect(timeout=15)
+            logger.info(f"MCP '{self.name}' reconnected successfully")
+        except Exception as e:
+            logger.error(f"MCP '{self.name}' reconnect failed: {e}")
 
     async def disconnect(self):
         """Gracefully shut down the MCP server."""
@@ -364,6 +401,28 @@ class MCPConnectionPool:
                     })
         return all_tools
 
+    async def health_check(self) -> dict[str, str]:
+        """Check health of all MCP connections, reconnect dead ones.
+
+        Returns a dict of {server_name: 'healthy' | 'reconnected' | 'dead'}.
+        """
+        results: dict[str, str] = {}
+        for name, client in list(self._connections.items()):
+            if client.connected:
+                results[name] = "healthy"
+            else:
+                logger.warning(f"MCP '{name}' is disconnected, attempting reconnect…")
+                try:
+                    await client._try_reconnect()
+                    if client.connected:
+                        results[name] = "reconnected"
+                    else:
+                        results[name] = "dead"
+                except Exception:
+                    results[name] = "dead"
+                    logger.error(f"MCP '{name}' health check: reconnect failed")
+        return results
+
 
 # Global connection pool
 _pool = MCPConnectionPool()
@@ -372,3 +431,4 @@ _pool = MCPConnectionPool()
 def get_mcp_pool() -> MCPConnectionPool:
     """Get the global MCP connection pool."""
     return _pool
+

@@ -203,14 +203,33 @@ def _escape_md(text: str) -> str:
     return re.sub(f"([{re.escape(special)}])", r"\\\1", text)
 
 def _send_summary_to_telegram(summary: str) -> dict:
-    """Send a plain summary message to Telegram."""
+    """Send a summary message to Telegram with proper HTML formatting.
+
+    Converts common markdown patterns to Telegram HTML:
+      **bold** → <b>bold</b>
+      `code`   → <code>code</code>
+      • / - list items → bullet character
+    """
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
     if not chat_id:
         return {"ok": False, "error": "No chat ID"}
 
+    # Convert markdown to Telegram HTML
+    html = summary
+    # Bold: **text** → <b>text</b>
+    html = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', html)
+    # Inline code: `text` → <code>text</code>
+    html = re.sub(r'`([^`]+)`', r'<code>\1</code>', html)
+    # Markdown bullet lists: lines starting with  - or  * → •
+    html = re.sub(r'^[\s]*[-*]\s+', '• ', html, flags=re.MULTILINE)
+    # Escape remaining HTML-sensitive characters (but not our tags)
+    # Only escape < and > that are NOT part of our HTML tags
+    html = re.sub(r'<(?!/?(b|code|pre|i|a|s|u)[ >])', '&lt;', html)
+    html = re.sub(r'(?<!</?(b|code|pre|i|a|s|u))>', '&gt;', html)
+
     return _telegram_api("sendMessage", {
         "chat_id": int(chat_id),
-        "text": summary,
+        "text": html,
         "parse_mode": "HTML",
     })
 

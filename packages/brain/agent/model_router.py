@@ -77,14 +77,32 @@ class ModelRoute:
 
 # ── Default Routing Table ────────────────────────────────────────────
 
-# Environment-driven defaults
+# Environment-driven defaults for local models (these don't need API discovery)
 _OLLAMA_MODEL = os.getenv("ROUTER_OLLAMA_MODEL", "qwen3:8b")
 _OLLAMA_LARGE_MODEL = os.getenv("ROUTER_OLLAMA_LARGE_MODEL", "qwen3:32b")
-_CLOUD_FAST_MODEL = os.getenv("ROUTER_CLOUD_FAST_MODEL", "gemini-3-flash-preview")
-_CLOUD_POWER_MODEL = os.getenv("ROUTER_CLOUD_POWER_MODEL", "gemini-3.1-pro-preview")
 _DEFAULT_STRATEGY = RoutingStrategy(
     os.getenv("ROUTER_STRATEGY", RoutingStrategy.LOCAL_FIRST.value)
 )
+
+# Cloud model names — populated dynamically by init_models() from the
+# centralized model_registry.  Env-var overrides still work as a safety net.
+_CLOUD_FAST_MODEL = os.getenv("ROUTER_CLOUD_FAST_MODEL", "")   # filled at startup
+_CLOUD_POWER_MODEL = os.getenv("ROUTER_CLOUD_POWER_MODEL", "") # filled at startup
+
+async def init_models() -> None:
+    """Discover cloud models from the API and populate the module globals."""
+    global _CLOUD_FAST_MODEL, _CLOUD_POWER_MODEL
+    try:
+        from core.model_registry import model_registry
+        if not _CLOUD_FAST_MODEL:
+            _CLOUD_FAST_MODEL = await model_registry.get_fast_model("google") or "gemini-2.5-flash"
+        if not _CLOUD_POWER_MODEL:
+            _CLOUD_POWER_MODEL = await model_registry.get_power_model("google") or "gemini-2.5-pro"
+        logger.info(f"Model router: fast={_CLOUD_FAST_MODEL}, power={_CLOUD_POWER_MODEL}")
+    except Exception as e:
+        logger.warning(f"Dynamic model discovery failed, using env defaults: {e}")
+        _CLOUD_FAST_MODEL = _CLOUD_FAST_MODEL or "gemini-2.5-flash"
+        _CLOUD_POWER_MODEL = _CLOUD_POWER_MODEL or "gemini-2.5-pro"
 
 # Step types considered "simple" (can run on local models)
 _SIMPLE_STEPS = {StepType.PLANNING, StepType.REFLECTION, StepType.WRITING, StepType.GENERAL}
