@@ -3,6 +3,7 @@ asyncio
 aiohttp
 grpcio
 grpcio-tools
+grpcio-reflection
 protobuf
 redis
 asyncpg
