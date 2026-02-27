@@ -864,7 +864,10 @@ class TaskExecutor:
                 )
                 for cloud_name in ("google", "openai", "anthropic"):
                     try:
-                        cloud_p = self._provider_resolver(cloud_name)
+                        # Use get_provider directly — NOT self._provider_resolver
+                        # which is resolve_provider() and would fall back to ollama.
+                        from providers_registry import get_provider
+                        cloud_p = get_provider(cloud_name)
                         if not cloud_p.is_ready():
                             continue
 
