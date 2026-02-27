@@ -9,9 +9,22 @@ import {
     ToolActivity,
 } from '../base';
 import { logger } from '../../utils/logger';
-import { TelegramConfig, TelegramUpdate, TelegramMessage, TelegramUser, TelegramChat } from './types';
-import { processUpdate, handleTaskRequest, handleCommand, handleApproval, sendApprovalRequest, sendTaskProgress, handleCallbackQuery } from './handlers';
-
+import {
+    TelegramConfig,
+    TelegramUpdate,
+    TelegramMessage,
+    TelegramUser,
+    TelegramChat,
+} from './types';
+import {
+    processUpdate,
+    handleTaskRequest,
+    handleCommand,
+    handleApproval,
+    sendApprovalRequest,
+    sendTaskProgress,
+    handleCallbackQuery,
+} from './handlers';
 
 // ── Telegram Adapter ───────────────────────────────────────────────
 
@@ -39,8 +52,8 @@ export class TelegramAdapter extends BaseChannelAdapter {
     public pollingTimer?: NodeJS.Timeout;
 
     // Telegram chat ID → userId mapping
-    public chatIdMap = new Map<string, number>();   // kestrelUserId → telegramChatId
-    public userIdMap = new Map<number, string>();    // telegramChatId → kestrelUserId
+    public chatIdMap = new Map<string, number>(); // kestrelUserId → telegramChatId
+    public userIdMap = new Map<number, string>(); // telegramChatId → kestrelUserId
 
     // Active typing indicators per chat
     public typingIntervals = new Map<number, NodeJS.Timeout>();
@@ -49,7 +62,10 @@ export class TelegramAdapter extends BaseChannelAdapter {
     public chatModes = new Map<number, 'chat' | 'task'>();
 
     // Pending approval requests
-    public pendingApprovals = new Map<string, { taskId: string; chatId: number; userId: string; threadId?: number }>();
+    public pendingApprovals = new Map<
+        string,
+        { taskId: string; chatId: number; userId: string; threadId?: number }
+    >();
 
     // Maps kestrelUserId → current message_thread_id (undefined for non-forum chats)
     public userThreadMap = new Map<string, number | undefined>();
@@ -58,16 +74,30 @@ export class TelegramAdapter extends BaseChannelAdapter {
     private _botId: number | undefined;
     private _botUsername: string | undefined;
 
-
     // Callback to resolve approvals in Brain
-    private approvalHandler?: (approvalId: string, userId: string, approved: boolean) => Promise<{ success: boolean; error?: string }>;
-    private pendingApprovalsLookupHandler?: (userId: string, workspaceId: string) => Promise<Array<{ approval_id: string }>>;
+    private approvalHandler?: (
+        approvalId: string,
+        userId: string,
+        approved: boolean,
+    ) => Promise<{ success: boolean; error?: string }>;
+    private pendingApprovalsLookupHandler?: (
+        userId: string,
+        workspaceId: string,
+    ) => Promise<Array<{ approval_id: string }>>;
 
-    public setApprovalHandler(handler: (approvalId: string, userId: string, approved: boolean) => Promise<{ success: boolean; error?: string }>): void {
+    public setApprovalHandler(
+        handler: (
+            approvalId: string,
+            userId: string,
+            approved: boolean,
+        ) => Promise<{ success: boolean; error?: string }>,
+    ): void {
         this.approvalHandler = handler;
     }
 
-    public setPendingApprovalsLookupHandler(handler: (userId: string, workspaceId: string) => Promise<Array<{ approval_id: string }>>): void {
+    public setPendingApprovalsLookupHandler(
+        handler: (userId: string, workspaceId: string) => Promise<Array<{ approval_id: string }>>,
+    ): void {
         this.pendingApprovalsLookupHandler = handler;
     }
 
@@ -104,7 +134,9 @@ export class TelegramAdapter extends BaseChannelAdapter {
         return this.approvalHandler(approvalId, actorUserId, approved);
     }
 
-    public async listPendingApprovalsForUser(userId: string): Promise<Array<{ approval_id: string }>> {
+    public async listPendingApprovalsForUser(
+        userId: string,
+    ): Promise<Array<{ approval_id: string }>> {
         if (!this.pendingApprovalsLookupHandler) {
             return [];
         }
@@ -112,7 +144,12 @@ export class TelegramAdapter extends BaseChannelAdapter {
         return this.pendingApprovalsLookupHandler(userId, this.config.defaultWorkspaceId);
     }
 
-    public async sendApprovalRequestForUser(userId: string, approvalId: string, description: string, taskId: string): Promise<void> {
+    public async sendApprovalRequestForUser(
+        userId: string,
+        approvalId: string,
+        description: string,
+        taskId: string,
+    ): Promise<void> {
         const existing = this.pendingApprovals.get(approvalId);
         if (existing) {
             return;
@@ -120,7 +157,10 @@ export class TelegramAdapter extends BaseChannelAdapter {
 
         const chatId = this.chatIdMap.get(userId);
         if (!chatId) {
-            logger.warn('Cannot send Telegram approval request — no chat ID for user', { userId, approvalId });
+            logger.warn('Cannot send Telegram approval request — no chat ID for user', {
+                userId,
+                approvalId,
+            });
             return;
         }
 
@@ -176,7 +216,9 @@ export class TelegramAdapter extends BaseChannelAdapter {
         this.typingIntervals.clear();
 
         if (this.config.mode === 'webhook') {
-            await this.api('deleteWebhook').catch(() => { /* best-effort */ });
+            await this.api('deleteWebhook').catch(() => {
+                /* best-effort */
+            });
         }
 
         this.setStatus('disconnected');
@@ -200,11 +242,15 @@ export class TelegramAdapter extends BaseChannelAdapter {
      * Send a message to a specific Telegram chat.
      * Handles chunking for long messages (4096 char Telegram limit).
      */
-    private async sendToChat(chatId: number, message: OutgoingMessage, threadId?: number): Promise<void> {
+    private async sendToChat(
+        chatId: number,
+        message: OutgoingMessage,
+        threadId?: number,
+    ): Promise<void> {
         // Stop typing indicator when sending
         this.stopTyping(chatId);
 
-        const content = message.content;
+        const content = this.sanitizeForTelegram(message.content);
 
         // Chunk long messages
         const chunks = this.chunkMessage(content, 4000);
@@ -276,7 +322,11 @@ export class TelegramAdapter extends BaseChannelAdapter {
         return chunks;
     }
 
-    private async sendAttachment(chatId: number, attachment: Attachment, threadId?: number): Promise<void> {
+    private async sendAttachment(
+        chatId: number,
+        attachment: Attachment,
+        threadId?: number,
+    ): Promise<void> {
         const thread = threadId !== undefined ? { message_thread_id: threadId } : {};
         switch (attachment.type) {
             case 'image':
@@ -289,7 +339,11 @@ export class TelegramAdapter extends BaseChannelAdapter {
                 await this.api('sendVideo', { chat_id: chatId, video: attachment.url, ...thread });
                 break;
             case 'file':
-                await this.api('sendDocument', { chat_id: chatId, document: attachment.url, ...thread });
+                await this.api('sendDocument', {
+                    chat_id: chatId,
+                    document: attachment.url,
+                    ...thread,
+                });
                 break;
         }
     }
@@ -330,9 +384,8 @@ export class TelegramAdapter extends BaseChannelAdapter {
     async sendStreamUpdate(handle: StreamHandle, accumulatedContent: string): Promise<void> {
         const chatId = handle.chatContext.chatId as number;
         // Append a blinking cursor to show it's still generating
-        const display = accumulatedContent.length > 4000
-            ? accumulatedContent.slice(-4000) + '▌'
-            : accumulatedContent + ' ▌';
+        const sanitized = this.sanitizeForTelegram(accumulatedContent);
+        const display = sanitized.length > 4000 ? sanitized.slice(-4000) + '▌' : sanitized + ' ▌';
         try {
             await this.api('editMessageText', {
                 chat_id: chatId,
@@ -352,7 +405,9 @@ export class TelegramAdapter extends BaseChannelAdapter {
                         message_id: Number(handle.messageId),
                         text: display.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, ''),
                     });
-                } catch { /* best effort */ }
+                } catch {
+                    /* best effort */
+                }
             }
         }
     }
@@ -370,12 +425,13 @@ export class TelegramAdapter extends BaseChannelAdapter {
 
         // If content is short enough, just edit the existing message
         // (editMessageText doesn't need message_thread_id — it targets by message_id)
-        if (finalContent.length <= 4000) {
+        const sanitizedFinal = this.sanitizeForTelegram(finalContent);
+        if (sanitizedFinal.length <= 4000) {
             try {
                 await this.api('editMessageText', {
                     chat_id: chatId,
                     message_id: Number(handle.messageId),
-                    text: finalContent,
+                    text: sanitizedFinal,
                     parse_mode: 'Markdown',
                     disable_web_page_preview: true,
                 });
@@ -387,7 +443,9 @@ export class TelegramAdapter extends BaseChannelAdapter {
                         message_id: Number(handle.messageId),
                         text: finalContent,
                     });
-                } catch { /* best effort */ }
+                } catch {
+                    /* best effort */
+                }
             }
             return;
         }
@@ -399,20 +457,30 @@ export class TelegramAdapter extends BaseChannelAdapter {
                 chat_id: chatId,
                 message_id: Number(handle.messageId),
             });
-        } catch { /* ignore */ }
+        } catch {
+            /* ignore */
+        }
 
-        await this.sendToChat(chatId, {
-            conversationId: '',
-            content: finalContent,
-            options: { markdown: true },
-        }, threadId);
+        await this.sendToChat(
+            chatId,
+            {
+                conversationId: '',
+                content: finalContent,
+                options: { markdown: true },
+            },
+            threadId,
+        );
     }
 
     /**
      * Send tool activity as a separate short message.
      * Uses emoji indicators for different activity types.
      */
-    async sendToolActivity(userId: string, handle: StreamHandle, activity: ToolActivity): Promise<void> {
+    async sendToolActivity(
+        userId: string,
+        handle: StreamHandle,
+        activity: ToolActivity,
+    ): Promise<void> {
         const chatId = handle.chatContext.chatId as number;
         const threadId = handle.chatContext.threadId as number | undefined;
 
@@ -463,6 +531,38 @@ export class TelegramAdapter extends BaseChannelAdapter {
         return message;
     }
 
+    /**
+     * Convert standard LLM markdown to Telegram-compatible Markdown.
+     * Telegram's legacy Markdown mode has quirks:
+     *   - **bold** must be *bold*
+     *   - ## headers aren't supported — convert to bold lines
+     *   - Unmatched * or _ break parsing
+     *   - Nested formatting isn't supported
+     */
+    public sanitizeForTelegram(text: string): string {
+        let result = text;
+
+        // 1. Convert **bold** to *bold* (Telegram uses single asterisk for bold)
+        result = result.replace(/\*\*(.+?)\*\*/g, '*$1*');
+
+        // 2. Convert ## headers to bold lines
+        result = result.replace(/^#{1,6}\s+(.+)$/gm, '*$1*');
+
+        // 3. Convert > blockquotes (not supported in legacy mode)
+        result = result.replace(/^>\s+(.+)$/gm, '│ $1');
+
+        // 4. Convert --- / *** horizontal rules
+        result = result.replace(/^[-*_]{3,}$/gm, '————————');
+
+        // 5. Ensure code blocks use ``` which Telegram supports
+        // (already compatible — no change needed)
+
+        // 6. Strip HTML tags that might be in the response
+        result = result.replace(/<[^>]+>/g, '');
+
+        return result;
+    }
+
     // ── Attachment Processing ──────────────────────────────────────
 
     async handleAttachment(attachment: Attachment): Promise<Attachment> {
@@ -485,12 +585,12 @@ export class TelegramAdapter extends BaseChannelAdapter {
         if (threadId !== undefined) params.message_thread_id = threadId;
 
         // Send immediately
-        this.api('sendChatAction', params).catch(() => { });
+        this.api('sendChatAction', params).catch(() => {});
 
         // Refresh every 4 seconds
         if (!this.typingIntervals.has(chatId)) {
             const interval = setInterval(() => {
-                this.api('sendChatAction', params).catch(() => { });
+                this.api('sendChatAction', params).catch(() => {});
             }, 4000);
             this.typingIntervals.set(chatId, interval);
         }
@@ -599,10 +699,12 @@ export class TelegramAdapter extends BaseChannelAdapter {
             body: params ? JSON.stringify(params) : undefined,
         });
 
-        const data = await res.json() as { ok: boolean; result: any; description?: string };
+        const data = (await res.json()) as { ok: boolean; result: any; description?: string };
 
         if (!data.ok) {
-            throw new Error(`Telegram API error: ${data.description || 'Unknown error'} (${method})`);
+            throw new Error(
+                `Telegram API error: ${data.description || 'Unknown error'} (${method})`,
+            );
         }
 
         return data.result;

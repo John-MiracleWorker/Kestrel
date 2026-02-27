@@ -18,16 +18,25 @@ class ChatServicerMixin(BaseServicerMixin):
         try:
             # 1. Get provider instance
             if request.provider == "local":
-                # TODO: query local models
-                models = [
-                    {"id": "llama-3-8b-instruct", "name": "Llama 3 8B (Local)", "context_window": "8k"},
-                    {"id": "mistral-7b-instruct", "name": "Mistral 7B (Local)", "context_window": "32k"},
-                ]
-                pb_models = [
-                    brain_pb2.Model(id=m["id"], name=m["name"], context_window=m["context_window"])
-                    for m in models
-                ]
-                return brain_pb2.ListModelsResponse(models=pb_models)
+                # Dynamically query installed Ollama models
+                try:
+                    from providers.ollama import OllamaProvider
+                    ollama = OllamaProvider()
+                    if ollama.is_ready():
+                        ollama_models = await ollama.list_models()
+                        pb_models = [
+                            brain_pb2.Model(
+                                id=m["id"],
+                                name=m.get("name", m["id"]),
+                                context_window=m.get("context_window", ""),
+                            )
+                            for m in ollama_models
+                        ]
+                        return brain_pb2.ListModelsResponse(models=pb_models)
+                except Exception as e:
+                    logger.warning(f"Failed to query Ollama models: {e}")
+                # Fallback if Ollama unavailable
+                return brain_pb2.ListModelsResponse(models=[])
             
             provider = get_provider(request.provider)
             if not isinstance(provider, CloudProvider):
