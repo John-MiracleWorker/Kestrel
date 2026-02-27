@@ -542,6 +542,23 @@ class ModelRouter:
         if self._strategy in (RoutingStrategy.LOCAL_FIRST, RoutingStrategy.COST_OPTIMIZED):
             route = self._maybe_escalate(route, complexity)
 
+        # Escalate to cloud for heavy tool-calling steps on local models.
+        # 1-2 tools are fine on ollama, but 3+ tools are too slow/unreliable
+        # (qwen3 returns 400 Bad Request with large tool schemas).
+        if (
+            expected_tools
+            and len(expected_tools) > 2
+            and route.provider in ("ollama", "local")
+        ):
+            logger.info(
+                f"Tool-calling step on {route.provider} → escalating to cloud "
+                f"({len(expected_tools)} tools expected)"
+            )
+            route = self._maybe_escalate(
+                route,
+                max(complexity, _ESCALATION_THRESHOLD + 1),  # Force escalation
+            )
+
         # Check availability and fall back if needed
         if not self._is_provider_available(route.provider):
             route = self._find_fallback(route.provider, route)
