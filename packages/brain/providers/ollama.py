@@ -215,7 +215,10 @@ class OllamaProvider:
                 payload["tools"] = ollama_tools
 
         try:
-            async with httpx.AsyncClient(timeout=300) as client:
+            # Short timeout for tool calls (quick failover to cloud),
+            # longer for plain chat (ollama can be slow but still cheaper).
+            timeout = 30 if ollama_tools else 120
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(
                     f"{self._base_url}/api/chat",
                     json=payload,
