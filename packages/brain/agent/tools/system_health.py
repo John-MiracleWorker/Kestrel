@@ -30,14 +30,21 @@ def check_service_port(host, port):
             return False
 
 def get_system_health():
+    gateway_host = os.environ.get("GATEWAY_HOST", "gateway")
+    gateway_port = int(os.environ.get("GATEWAY_PORT", 8741))
+    brain_host = os.environ.get("BRAIN_GRPC_HOST", "localhost")
+    brain_port = int(os.environ.get("BRAIN_GRPC_PORT", 50051))
+    hands_host = os.environ.get("HANDS_GRPC_HOST", "hands")
+    hands_port = int(os.environ.get("HANDS_GRPC_PORT", 50052))
+
     health = {
         "timestamp": time.time(),
         "disk": check_disk_usage(),
         "resources": check_cpu_memory(),
         "services": {
-            "gateway": check_service_port("localhost", 4000),
-            "brain": check_service_port("localhost", 50051),
-            "hands": check_service_port("localhost", 50052)
+            "gateway": check_service_port(gateway_host, gateway_port),
+            "brain": check_service_port(brain_host, brain_port),
+            "hands": check_service_port(hands_host, hands_port)
         }
     }
     return health

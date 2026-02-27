@@ -98,6 +98,8 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       GOOGLE_DEFAULT_MODEL: ${GOOGLE_DEFAULT_MODEL:-gemini-3.1-pro-preview}
+      GATEWAY_HOST: gateway
+      GATEWAY_PORT: 8741
       HANDS_GRPC_HOST: hands
       HANDS_GRPC_PORT: 50052
       EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
