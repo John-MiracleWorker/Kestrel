@@ -246,6 +246,19 @@ class CloudProvider:
                     "parts": [{"text": msg["content"]}],
                 })
 
+        # Sanitize: first entry must be "user", no consecutive same-role
+        if not contents:
+            contents = [{"role": "user", "parts": [{"text": "(empty message)"}]}]
+        if contents[0]["role"] != "user":
+            contents.insert(0, {"role": "user", "parts": [{"text": "(context)"}]})
+        merged = [contents[0]]
+        for entry in contents[1:]:
+            if entry["role"] == merged[-1]["role"]:
+                merged[-1]["parts"].extend(entry["parts"])
+            else:
+                merged.append(entry)
+        contents = merged
+
         url = f"{self._config['base_url']}/{model}:streamGenerateContent?key={api_key}&alt=sse"
         payload = {
             "contents": contents,
@@ -594,6 +607,24 @@ class CloudProvider:
                         })
                 contents.append({"role": role, "parts": parts})
 
+        # ── Sanitize contents for Gemini API requirements ─────────
+        # 1. Must not be empty
+        # 2. First content must have role "user"
+        # 3. Consecutive entries must not share the same role (merge them)
+        if not contents:
+            contents = [{"role": "user", "parts": [{"text": "(empty message)"}]}]
+
+        if contents[0]["role"] != "user":
+            contents.insert(0, {"role": "user", "parts": [{"text": "(context)"}]})
+
+        merged = [contents[0]]
+        for entry in contents[1:]:
+            if entry["role"] == merged[-1]["role"]:
+                merged[-1]["parts"].extend(entry["parts"])
+            else:
+                merged.append(entry)
+        contents = merged
+
         url = f"{self._config['base_url']}/{model}:generateContent?key={api_key}"
         payload: dict = {
             "contents": contents,
@@ -627,6 +658,7 @@ class CloudProvider:
             _log.getLogger('brain.providers').info(f"Gemini tool payload contents: {json.dumps(contents, indent=2, default=str)[:3000]}")
 
         # Retry with exponential backoff for transient errors (503, 429, 500)
+        # Also log 400 errors with payload details for debugging
         max_retries = 3
         base_delay = 1.0
         last_error = None
@@ -634,6 +666,20 @@ class CloudProvider:
         async with httpx.AsyncClient(timeout=120) as client:
             for attempt in range(max_retries + 1):
                 resp = await client.post(url, json=payload)
+                if resp.status_code == 400:
+                    # Log diagnostic info — 400s from Gemini are usually
+                    # payload issues (bad roles, empty parts, invalid model)
+                    try:
+                        err_body = resp.json()
+                        err_msg = err_body.get("error", {}).get("message", resp.text[:500])
+                    except Exception:
+                        err_msg = resp.text[:500]
+                    logger.error(
+                        f"Gemini 400 Bad Request (model={model}): {err_msg}\n"
+                        f"  contents roles: {[c.get('role') for c in contents]}\n"
+                        f"  contents count: {len(contents)}, tools count: {len(tools or [])}"
+                    )
+                    _safe_raise(resp)
                 if resp.status_code in (503, 429, 500) and attempt < max_retries:
                     delay = base_delay * (2 ** attempt)
                     logging.getLogger('brain.providers').warning(
