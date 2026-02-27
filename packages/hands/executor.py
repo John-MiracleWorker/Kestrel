@@ -1,6 +1,9 @@
 """
 Docker-based sandbox executor for running skills securely.
 Manages container lifecycle, resource limits, and output collection.
+
+Uses an asyncio.Semaphore for request queuing so that callers beyond
+MAX_CONCURRENT wait in a FIFO queue instead of getting an immediate error.
 """
 
 import asyncio
@@ -14,6 +17,8 @@ logger = logging.getLogger("hands.executor")
 
 SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "kestrel/sandbox:latest")
 MAX_CONCURRENT = int(os.getenv("SANDBOX_MAX_CONCURRENT", "10"))
+# Maximum number of requests waiting in the queue before rejecting
+MAX_QUEUE_SIZE = int(os.getenv("SANDBOX_MAX_QUEUE_SIZE", "50"))
 
 # When running inside Docker, the skill_path is a container-internal path
 # (e.g., /skills/web). The host Docker daemon cannot resolve this path.
@@ -23,16 +28,26 @@ CONTAINER_SKILLS_DIR = os.getenv("SKILLS_DIR", "/skills")
 
 
 class DockerExecutor:
-    """Manages sandboxed skill execution in Docker containers."""
+    """Manages sandboxed skill execution in Docker containers.
+
+    Instead of rejecting requests immediately when at capacity, requests
+    are queued (up to MAX_QUEUE_SIZE) using an asyncio.Semaphore.
+    """
 
     def __init__(self):
         self._docker = None
+        self._semaphore = asyncio.Semaphore(MAX_CONCURRENT)
         self._active = 0
+        self._queued = 0
         self._max_concurrent = MAX_CONCURRENT
 
     @property
     def active_sandboxes(self) -> int:
         return self._active
+
+    @property
+    def queued_requests(self) -> int:
+        return self._queued
 
     @property
     def max_concurrent(self) -> int:
@@ -59,50 +74,64 @@ class DockerExecutor:
         allowed_domains: list[str] = None,
         allowed_paths: list[str] = None,
     ) -> dict:
-        """Run a skill function in a sandboxed Docker container."""
-        if self._active >= self._max_concurrent:
-            raise RuntimeError("Maximum concurrent sandboxes reached")
+        """Run a skill function in a sandboxed Docker container.
 
-        self._active += 1
-        start_time = time.time()
-        audit_log = {
-            "network_requests": [],
-            "file_accesses": [],
-            "system_calls": [],
-        }
+        If all slots are busy, the request is queued (FIFO) up to
+        MAX_QUEUE_SIZE. If the queue is also full, RuntimeError is raised.
+        """
+        # Check queue capacity before waiting
+        if self._queued >= MAX_QUEUE_SIZE:
+            raise RuntimeError(
+                f"Sandbox queue full ({self._queued} waiting, "
+                f"{self._active} active). Try again later."
+            )
 
+        self._queued += 1
         try:
-            client = self._get_client()
-            loop = asyncio.get_event_loop()
+            # Wait for a slot — this is the FIFO queue
+            async with self._semaphore:
+                self._queued -= 1
+                self._active += 1
+                start_time = time.time()
 
-            # Build container configuration
-            container_config = self._build_config(
-                skill_path, function_name, arguments,
-                limits, allowed_domains, allowed_paths,
-            )
+                try:
+                    client = self._get_client()
+                    loop = asyncio.get_event_loop()
 
-            # Run container in executor (docker-py is sync)
-            result = await loop.run_in_executor(
-                None,
-                lambda: self._run_container(client, container_config, limits["timeout"])
-            )
+                    # Build container configuration
+                    container_config = self._build_config(
+                        skill_path, function_name, arguments,
+                        limits, allowed_domains, allowed_paths,
+                    )
 
-            elapsed_ms = int((time.time() - start_time) * 1000)
+                    # Run container in executor (docker-py is sync)
+                    result = await loop.run_in_executor(
+                        None,
+                        lambda: self._run_container(client, container_config, limits["timeout"])
+                    )
 
-            return {
-                "output": result.get("output", ""),
-                "execution_time_ms": elapsed_ms,
-                "memory_used_mb": result.get("memory_used_mb", 0),
-                "audit_log": {
-                    "network_requests": result.get("network_requests", []),
-                    "file_accesses": audit_log["file_accesses"],
-                    "system_calls": audit_log["system_calls"],
-                    "sandbox_id": result.get("container_id", ""),
-                },
-            }
+                    elapsed_ms = int((time.time() - start_time) * 1000)
 
-        finally:
-            self._active -= 1
+                    return {
+                        "output": result.get("output", ""),
+                        "execution_time_ms": elapsed_ms,
+                        "memory_used_mb": result.get("memory_used_mb", 0),
+                        "audit_log": {
+                            "network_requests": result.get("network_requests", []),
+                            "file_accesses": [],
+                            "system_calls": [],
+                            "sandbox_id": result.get("container_id", ""),
+                        },
+                    }
+
+                finally:
+                    self._active -= 1
+        except BaseException:
+            # If we were still in the "queued" state when the exception hit
+            # (e.g., cancellation while waiting for the semaphore), adjust.
+            if self._queued > 0:
+                self._queued -= 1
+            raise
 
     def _build_config(self, skill_path, function_name, arguments,
                       limits, allowed_domains, allowed_paths):
@@ -116,8 +145,6 @@ class DockerExecutor:
             env["ALLOWED_DOMAINS"] = ",".join(allowed_domains)
 
         # Translate container-internal skill path to host path for Docker volume mounts.
-        # When running in Docker-in-Docker (DinD), the host Docker daemon needs
-        # the host-side absolute path, not the path inside the Hands container.
         mount_path = skill_path
         if HOST_SKILLS_DIR and CONTAINER_SKILLS_DIR and skill_path.startswith(CONTAINER_SKILLS_DIR):
             relative = skill_path[len(CONTAINER_SKILLS_DIR):]

@@ -2,7 +2,7 @@ import Fastify, { FastifyInstance } from 'fastify';
 import { WebSocketServer } from 'ws';
 import Redis from 'ioredis';
 import dotenv from 'dotenv';
-import { logger } from './utils/logger';
+import { logger, generateCorrelationId, correlatedLogger } from './utils/logger';
 import { setupMetrics } from './utils/metrics';
 import { requireAuth } from './auth/middleware';
 import { SessionManager } from './session/manager';
@@ -53,6 +53,16 @@ const app: FastifyInstance = Fastify({
 // Setup Zod Validation Compilers
 app.setValidatorCompiler(validatorCompiler);
 app.setSerializerCompiler(serializerCompiler);
+
+// ── Correlation ID Middleware ────────────────────────────────────────
+// Generates or propagates a correlation ID for every request so that
+// logs across Gateway and Brain can be joined for a single user action.
+app.addHook('onRequest', async (req, reply) => {
+    const correlationId = (req.headers['x-correlation-id'] as string) || generateCorrelationId();
+    req.correlationId = correlationId;
+    reply.header('x-correlation-id', correlationId);
+});
+
 
 // Security Headers
 app.register(import('@fastify/helmet'), {

@@ -39,14 +39,14 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install pytest
+        cd ../hands
+        pip install -r requirements.txt
 
     - name: Run code formatting check
-      run: npm run format:check || echo "Prettier not configured yet, skipping format check"
+      run: npx prettier --check "packages/gateway/src/**/*.ts" "packages/web/src/**/*.{ts,tsx}"
 
-    - name: Run linting (Gateway & Web)
-      run: |
-        npm run lint -w @kestrel/gateway || exit 0
-        npm run lint -w @kestrel/web || exit 0
+    - name: Run linting (Gateway)
+      run: npm run lint -w @kestrel/gateway
 
     - name: Run type checking (Gateway & Web)
       run: |
@@ -54,12 +54,14 @@ jobs:
         npm run typecheck -w @kestrel/web
 
     - name: Run tests (Gateway)
-      run: npm test -w @kestrel/gateway || exit 0
-
-    - name: Run tests (Web)
-      run: npm test -w @kestrel/web || exit 0
+      run: npm test -w @kestrel/gateway
 
     - name: Run tests (Brain)
       run: |
         cd packages/brain
-        pytest tests/ || exit 0
+        pytest tests/ -v
+
+    - name: Run tests (Hands)
+      run: |
+        cd packages/hands
+        pytest tests/ -v

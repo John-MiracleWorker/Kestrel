@@ -8,6 +8,7 @@ a fallback chain: workspace config → env var → defaults.
 import os
 import logging
 from typing import Optional
+from cryptography.fernet import InvalidToken
 from encryption import encrypt, decrypt
 
 import json
@@ -38,10 +39,23 @@ class ProviderConfig:
         )
 
         if row:
+            # Attempt to decrypt — if the key changed, log the error and
+            # return an empty api_key so the user is prompted to re-enter.
+            api_key = ""
+            if row["api_key_encrypted"]:
+                try:
+                    api_key = decrypt(row["api_key_encrypted"])
+                except InvalidToken:
+                    logger.error(
+                        "Cannot decrypt API key for workspace %s provider %s — "
+                        "ENCRYPTION_KEY may have changed. "
+                        "Please re-enter the API key in settings.",
+                        workspace_id, row["provider"],
+                    )
             return {
                 "provider": row["provider"],
                 "model": row["model"] or "",
-                "api_key": decrypt(row["api_key_encrypted"]) if row["api_key_encrypted"] else "",
+                "api_key": api_key,
                 "temperature": float(row["temperature"]),
                 "max_tokens": int(row["max_tokens"]),
                 "system_prompt": row["system_prompt"] or "",
