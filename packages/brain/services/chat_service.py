@@ -227,26 +227,30 @@ class ChatServicerMixin(BaseServicerMixin):
 
             # Classify request complexity — complex tasks get full planning,
             # simple conversational messages get a single-step shortcut.
-            _COMPLEX_SIGNALS = [
-                "audit", "analyze", "review", "build", "create", "deploy",
-                "refactor", "debug", "investigate", "migrate", "implement",
-                "design", "architect", "scan", "test", "benchmark",
-                "compare", "evaluate", "research", "set up", "configure",
-                "security", "performance", "optimize", "fix", "diagnose",
-                "generate", "write", "plan", "multi", "step-by-step",
-                "deep", "comprehensive", "full", "thorough", "complete",
+            #
+            # INVERTED LOGIC: detect simple messages (greetings, short Qs),
+            # default everything else to the full agent loop with tools.
+            # This prevents Kestrel from giving text walkthroughs instead
+            # of actually using tools for action requests.
+            _SIMPLE_PATTERNS = [
+                "hello", "hey", "hi", "yo", "sup", "howdy",
+                "good morning", "good afternoon", "good evening",
+                "thanks", "thank you", "thx", "ty",
+                "ok", "okay", "cool", "nice", "great", "awesome",
+                "yes", "no", "yeah", "nah", "yep", "nope",
+                "bye", "goodbye", "see you", "later",
+                "what's up", "how are you", "what are you",
+                "who are you", "what can you do",
             ]
-            user_lower = user_content.lower()
-            is_complex = (
-                len(user_content.split()) > 12
-                or any(sig in user_lower for sig in _COMPLEX_SIGNALS)
+            user_lower = user_content.lower().strip()
+            word_count = len(user_content.split())
+
+            is_simple = (
+                word_count <= 6
+                and any(user_lower.startswith(p) or user_lower == p for p in _SIMPLE_PATTERNS)
             )
 
-            if is_complex:
-                # Let the agent loop's TaskPlanner decompose this into
-                # a multi-step plan (plan=None triggers planning phase)
-                chat_task.plan = None
-            else:
+            if is_simple:
                 # Simple conversational message — single step, fast response
                 chat_task.plan = TaskPlan(
                     goal=user_content,
@@ -256,6 +260,10 @@ class ChatServicerMixin(BaseServicerMixin):
                         status=StepStatus.PENDING,
                     )],
                 )
+            else:
+                # Let the agent loop's TaskPlanner decompose this into
+                # a multi-step plan (plan=None triggers planning phase)
+                chat_task.plan = None
 
             # Build tool registry and agent loop
             tool_registry = build_tool_registry(hands_client=runtime.hands_client, vector_store=runtime.vector_store, pool=pool)
