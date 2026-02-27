@@ -183,13 +183,20 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
                     yield make_response_fn(chunk_type=0, content_delta=f"\n\n{failure_note}")
                     full_response_parts.append(summary_text)
                 else:
-                    yield make_response_fn(chunk_type=3, error_message=event.content or "Agent task failed")
+                    # Send failure as content so user sees an explanation
+                    # instead of a generic "something went wrong" error
+                    yield make_response_fn(chunk_type=0, content_delta=failure_note)
+                    full_response_parts.append(failure_note)
             except Exception as summary_err:
-                yield make_response_fn(chunk_type=3, error_message=event.content or "Agent task failed")
+                logger.warning(f"Failed to generate task failure summary: {summary_err}")
+                yield make_response_fn(chunk_type=0, content_delta=failure_note)
+                full_response_parts.append(failure_note)
         else:
-            yield make_response_fn(chunk_type=3, error_message=event.content or "Agent task failed")
-        
-        yield make_response_fn(chunk_type=2, metadata={"provider": provider.name if hasattr(provider, 'name') else 'unknown', "model": model})
+            # No prior content and no tool results — send the failure
+            # reason as visible content instead of an ERROR chunk so the
+            # user gets a meaningful message in Telegram / web chat.
+            yield make_response_fn(chunk_type=0, content_delta=failure_note)
+            full_response_parts.append(failure_note)
 
     elif event_type == "plan_created":
         yield make_response_fn(
