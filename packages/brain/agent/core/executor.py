@@ -862,7 +862,14 @@ class TaskExecutor:
                     f"Provider {route.provider} failed: {llm_err}. "
                     f"Attempting cloud failover..."
                 )
-                for cloud_name in ("google", "openai", "anthropic"):
+                # Build failover list: workspace's configured provider first
+                configured = getattr(self._provider, 'provider', '')
+                cloud_order = [configured] if configured in ("google", "openai", "anthropic") else []
+                for c in ("google", "openai", "anthropic"):
+                    if c not in cloud_order:
+                        cloud_order.append(c)
+
+                for cloud_name in cloud_order:
                     try:
                         # Use get_provider directly — NOT self._provider_resolver
                         # which is resolve_provider() and would fall back to ollama.
