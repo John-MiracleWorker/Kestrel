@@ -760,12 +760,27 @@ class TaskExecutor:
 
         # ── Full tool-calling path (complex messages / agentic tasks) ──
 
-        tool_schemas = [t.to_openai_schema() for t in self._tools.list_tools()]
+        # Select relevant tools instead of sending all 38 schemas.
+        # This keeps the context small for local models and improves accuracy.
+        step_expected = getattr(step, 'expected_tools', None)
 
         route = self._model_router.select(
             step_description=step.description,
-            expected_tools=getattr(step, 'expected_tools', None),
+            expected_tools=step_expected,
         )
+
+        try:
+            from agent.tool_selector import ToolSelector
+            selector = ToolSelector(self._tools.list_tools())
+            selected_tools = selector.select(
+                step_description=step.description,
+                expected_tools=step_expected,
+                provider=route.provider,
+            )
+            tool_schemas = [t.to_openai_schema() for t in selected_tools]
+        except Exception as e:
+            logger.warning(f"ToolSelector failed, using all tools: {e}")
+            tool_schemas = [t.to_openai_schema() for t in self._tools.list_tools()]
         routed_model = route.model if route.model else self._model
         routed_temp = route.temperature
         routed_max_tokens = route.max_tokens
