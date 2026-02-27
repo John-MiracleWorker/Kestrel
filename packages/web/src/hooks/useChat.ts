@@ -17,9 +17,9 @@ interface ToolActivity {
 }
 
 export interface DelegationEvent {
-    type: string;  // delegation_started, delegation_progress, council_started, council_opinion, etc.
+    type: string; // delegation_started, delegation_progress, council_started, council_opinion, etc.
     specialist: string;
-    status?: string;  // thinking, tool_calling, tool_result, step_done, complete, failed, approve, reject
+    status?: string; // thinking, tool_calling, tool_result, step_done, complete, failed, approve, reject
     goal?: string;
     tools?: string[];
     tool?: string;
@@ -59,7 +59,12 @@ interface StreamingMessage {
 interface UseChatReturn {
     messages: Message[];
     streamingMessage: StreamingMessage | null;
-    sendMessage: (content: string, provider?: string, model?: string, attachments?: Array<{ url: string; filename: string; mimeType: string; size: number }>) => void;
+    sendMessage: (
+        content: string,
+        provider?: string,
+        model?: string,
+        attachments?: Array<{ url: string; filename: string; mimeType: string; size: number }>,
+    ) => void;
     isConnected: boolean;
 }
 
@@ -168,17 +173,18 @@ export function useChat(
                             // Map council event fields to delegation format
                             // Council uses: role, vote, analysis, concerns
                             // Coordinator uses: specialist, status, thinking, tool
-                            const specialist = delegationData.specialist
-                                || delegationData.role
-                                || '';
-                            const thinking = delegationData.thinking
-                                || delegationData.analysis
-                                || delegationData.message
-                                || '';
-                            const status = delegationData.status
-                                || delegationData.vote
-                                || delegationData.consensus
-                                || '';
+                            const specialist =
+                                delegationData.specialist || delegationData.role || '';
+                            const thinking =
+                                delegationData.thinking ||
+                                delegationData.analysis ||
+                                delegationData.message ||
+                                '';
+                            const status =
+                                delegationData.status ||
+                                delegationData.vote ||
+                                delegationData.consensus ||
+                                '';
                             const evt: DelegationEvent = {
                                 type: data.delegationType!,
                                 specialist,
@@ -237,12 +243,12 @@ export function useChat(
                         toolActivity: isAgentActivity
                             ? (prev?.toolActivity ?? null)
                             : {
-                                status: data.status || 'thinking',
-                                toolName: data.toolName,
-                                toolArgs: data.toolArgs,
-                                toolResult: data.toolResult,
-                                thinking: data.thinking,
-                            },
+                                  status: data.status || 'thinking',
+                                  toolName: data.toolName,
+                                  toolArgs: data.toolArgs,
+                                  toolResult: data.toolResult,
+                                  thinking: data.thinking,
+                              },
                         agentActivities: [...activitiesRef.current],
                         delegationEvents: [...delegationEventsRef.current],
                         routingInfo: prev?.routingInfo ?? routingInfoRef.current,
@@ -264,23 +270,24 @@ export function useChat(
                     }));
                     break;
 
-                case 'done':
-                    if (contentRef.current) {
+                case 'done': {
+                    // Use contentRef if available; fall back to the last
+                    // streamingMessage content to prevent silent message loss
+                    // when done arrives after contentRef was cleared.
+                    const finalContent = contentRef.current || (streamingMessage?.content ?? '');
+
+                    if (finalContent) {
                         const finalMessage: Message = {
                             id: data.messageId || generateId(),
                             role: 'assistant',
-                            content: contentRef.current,
+                            content: finalContent,
                             createdAt: new Date().toISOString(),
                             routingInfo: routingInfoRef.current || undefined,
                         };
                         setMessages((prev) => [...prev, finalMessage]);
 
                         // Auto-generate title after first assistant reply
-                        if (
-                            workspaceId &&
-                            conversationId &&
-                            !titleGeneratedRef.current
-                        ) {
+                        if (workspaceId && conversationId && !titleGeneratedRef.current) {
                             titleGeneratedRef.current = true;
                             conversations
                                 .generateTitle(workspaceId, conversationId)
@@ -291,9 +298,7 @@ export function useChat(
                                         }),
                                     );
                                 })
-                                .catch((err) =>
-                                    console.error('Auto-title failed:', err),
-                                );
+                                .catch((err) => console.error('Auto-title failed:', err));
                         }
                     }
                     setStreamingMessage(null);
@@ -302,6 +307,7 @@ export function useChat(
                     delegationEventsRef.current = [];
                     routingInfoRef.current = null;
                     break;
+                }
 
                 case 'error': {
                     console.error('Chat error:', JSON.stringify(data));
@@ -411,9 +417,13 @@ export function useChat(
         }
     }, [initialMessages]);
 
-
     const sendMessage = useCallback(
-        (content: string, provider?: string, model?: string, attachments?: Array<{ url: string; filename: string; mimeType: string; size: number }>) => {
+        (
+            content: string,
+            provider?: string,
+            model?: string,
+            attachments?: Array<{ url: string; filename: string; mimeType: string; size: number }>,
+        ) => {
             if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
                 console.warn('WebSocket not ready, message dropped');
                 return;
@@ -427,7 +437,11 @@ export function useChat(
             };
 
             setMessages((prev) => [...prev, userMessage]);
-            contentRef.current = '';
+            // Only reset content if we're not mid-stream; otherwise the
+            // done handler would find an empty buffer and drop the response.
+            if (!streamingMessage) {
+                contentRef.current = '';
+            }
 
             wsRef.current.send(
                 JSON.stringify({

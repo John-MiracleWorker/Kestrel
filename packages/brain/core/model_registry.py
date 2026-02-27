@@ -28,8 +28,22 @@ _CACHE_TTL = int(os.getenv("MODEL_REGISTRY_TTL", "3600"))  # re-fetch every hour
 # ── Tier classification heuristics (provider-specific) ───────────────
 
 def _classify_google(model_id: str) -> str:
-    """Classify a Google model into 'power', 'fast', or 'other'."""
+    """Classify a Google model into 'power', 'fast', or 'other'.
+
+    Excludes specialty models (image generation, live streaming,
+    deep-research, custom-tools, tuning, embedding) so they never
+    get auto-selected as the default fast/power model.
+    """
     mid = model_id.lower()
+
+    # Specialty models should never be auto-selected as defaults
+    _SPECIALTY_MARKERS = (
+        "image", "live", "deep-research", "customtools",
+        "tuning", "embedding", "vision",
+    )
+    if any(marker in mid for marker in _SPECIALTY_MARKERS):
+        return "other"
+
     # Deep-think / pro variants → power
     if "pro" in mid or "deep-think" in mid or "ultra" in mid:
         return "power"

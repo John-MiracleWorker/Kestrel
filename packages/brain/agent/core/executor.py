@@ -644,6 +644,69 @@ class TaskExecutor:
                         "content": tc.get("result", ""),
                     })
 
+        # ── Conversational shortcut ────────────────────────────────
+        # For simple chat messages (greetings, small talk, basic Q&A),
+        # skip tool-calling entirely and stream a direct text response.
+        # This prevents the LLM from proactively calling tools like
+        # moltbook when the user just says "hey kestrel!".
+        #
+        # Criteria for the shortcut:
+        #   1. Chat mode (task.messages is set — came from StreamChat)
+        #   2. No prior tool calls on this step (first iteration)
+        #   3. Step was pre-classified as simple ("Respond to the user")
+        _is_simple_chat = (
+            task.messages
+            and not step.tool_calls
+            and step.description.startswith("Respond to the user")
+        )
+
+        if _is_simple_chat:
+            # Stream directly — no tools offered to the LLM
+            logger.info("Simple chat shortcut: streaming without tools")
+
+            route = self._model_router.select(
+                step_description=step.description,
+                expected_tools=[],
+            )
+            routed_model = route.model if route.model else self._model
+            if self._provider_resolver and route.provider:
+                try:
+                    active_provider = self._provider_resolver(route.provider)
+                except Exception:
+                    active_provider = self._provider
+            else:
+                active_provider = self._provider
+
+            if self._event_callback:
+                try:
+                    await self._event_callback("routing_info", {
+                        "provider": route.provider,
+                        "model": routed_model,
+                        "was_escalated": False,
+                        "complexity": 0,
+                    })
+                except Exception:
+                    pass
+
+            text_parts = []
+            async for token in active_provider.stream(
+                messages=messages,
+                model=routed_model,
+                temperature=route.temperature,
+                max_tokens=route.max_tokens,
+                api_key=self._api_key,
+            ):
+                text_parts.append(token)
+
+            text = "".join(text_parts)
+            step.status = StepStatus.COMPLETE
+            step.result = text
+            step.completed_at = datetime.now(timezone.utc)
+            await self._persistence.update_task(task)
+            return
+
+        # ── Full tool-calling path (complex messages / agentic tasks) ──
+
         tool_schemas = [t.to_openai_schema() for t in self._tools.list_tools()]
 
         route = self._model_router.select(
