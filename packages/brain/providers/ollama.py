@@ -250,13 +250,7 @@ class OllamaProvider:
 
         except httpx.ConnectError:
             logger.error(f"Cannot connect to Ollama at {self._base_url}")
-            return {
-                "content": f"[Error: Cannot connect to Ollama at {self._base_url}]",
-                "tool_calls": [],
-            }
+            raise
         except Exception as e:
             logger.error(f"Ollama generate_with_tools failed: {e}")
-            return {
-                "content": f"[Error: {e}]",
-                "tool_calls": [],
-            }
+            raise
