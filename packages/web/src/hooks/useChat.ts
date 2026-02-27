@@ -91,6 +91,10 @@ export function useChat(
     const [isConnected, setIsConnected] = useState(false);
     const wsRef = useRef<WebSocket | null>(null);
     const contentRef = useRef('');
+    // Backup ref: never cleared except inside the done handler.
+    // Prevents message loss when contentRef is cleared by conversation
+    // changes or sendMessage during active streaming.
+    const lastDoneContentRef = useRef('');
     const activitiesRef = useRef<AgentActivity[]>([]);
     const delegationEventsRef = useRef<DelegationEvent[]>([]);
     const routingInfoRef = useRef<RoutingInfo | null>(null);
@@ -258,6 +262,7 @@ export function useChat(
 
                 case 'token':
                     contentRef.current += data.content;
+                    lastDoneContentRef.current += data.content;
                     setStreamingMessage((prev) => ({
                         id: prev?.id || data.messageId || 'streaming',
                         role: 'assistant',
@@ -271,10 +276,10 @@ export function useChat(
                     break;
 
                 case 'done': {
-                    // Use contentRef if available; fall back to the last
-                    // streamingMessage content to prevent silent message loss
-                    // when done arrives after contentRef was cleared.
-                    const finalContent = contentRef.current || (streamingMessage?.content ?? '');
+                    // Use lastDoneContentRef as the authoritative source —
+                    // it's never cleared except here, so it survives
+                    // contentRef resets from conversation changes or sendMessage.
+                    const finalContent = lastDoneContentRef.current || contentRef.current;
 
                     if (finalContent) {
                         const finalMessage: Message = {
@@ -303,6 +308,7 @@ export function useChat(
                     }
                     setStreamingMessage(null);
                     contentRef.current = '';
+                    lastDoneContentRef.current = '';
                     activitiesRef.current = [];
                     delegationEventsRef.current = [];
                     routingInfoRef.current = null;
