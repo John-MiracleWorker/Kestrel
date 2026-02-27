@@ -669,6 +669,8 @@ class TaskExecutor:
                 expected_tools=[],
             )
             routed_model = route.model if route.model else self._model
+            routed_temp = route.temperature
+            routed_max_tokens = route.max_tokens
             if self._provider_resolver and route.provider:
                 try:
                     active_provider = self._provider_resolver(route.provider)
@@ -676,6 +678,52 @@ class TaskExecutor:
                     active_provider = self._provider
             else:
                 active_provider = self._provider
+
+            # If the selected provider isn't ready (e.g. ollama from Docker),
+            # fall back to a cloud provider
+            if hasattr(active_provider, 'is_ready') and not active_provider.is_ready():
+                logger.info(f"Provider {route.provider} not ready, trying cloud fallback")
+                if self._provider_resolver:
+                    for cloud_name in ("google", "openai", "anthropic"):
+                        try:
+                            cloud_p = self._provider_resolver(cloud_name)
+                            if cloud_p.is_ready():
+                                active_provider = cloud_p
+                                routed_model = ""  # Use provider's default
+                                logger.info(f"Fell back to {cloud_name}")
+                                break
+                        except Exception:
+                            continue
+
+            # Apply context compaction + cloud escalation (same as full path)
+            try:
+                from agent.context_compactor import compact_context, needs_escalation
+
+                messages, was_compacted = await compact_context(
+                    messages=messages,
+                    provider_name=route.provider,
+                    provider=active_provider,
+                    model=routed_model,
+                )
+
+                if was_compacted and needs_escalation(messages, route.provider):
+                    if self._provider_resolver:
+                        for cloud_name in ("google", "openai", "anthropic"):
+                            try:
+                                cloud_p = self._provider_resolver(cloud_name)
+                                if cloud_p.is_ready():
+                                    logger.info(
+                                        f"Context overflow: escalating {route.provider} → {cloud_name}"
+                                    )
+                                    active_provider = cloud_p
+                                    routed_model = ""
+                                    break
+                            except Exception:
+                                continue
+            except ImportError:
+                pass
+            except Exception as e:
+                logger.warning(f"Context compaction failed (non-fatal): {e}")
 
             if self._event_callback:
                 try:
@@ -688,17 +736,22 @@ class TaskExecutor:
                 except Exception:
                     pass
 
-            text_parts = []
-            async for token in active_provider.stream(
+            # Use generate_with_tools with empty tools list — this gives us
+            # the full failover chain while preventing tool calls.
+            response = await active_provider.generate_with_tools(
                 messages=messages,
                 model=routed_model,
-                temperature=route.temperature,
-                max_tokens=route.max_tokens,
+                tools=[],  # Empty = no tools, just text response
+                temperature=routed_temp,
+                max_tokens=routed_max_tokens,
                 api_key=self._api_key,
-            ):
-                text_parts.append(token)
+            )
 
-            text = "".join(text_parts)
+            text = response.get("content", "")
+            logger.info(
+                f"Simple chat result: {len(text)} chars, "
+                f"preview={text[:100]!r}"
+            )
             step.status = StepStatus.COMPLETE
             step.result = text
             step.completed_at = datetime.now(timezone.utc)
