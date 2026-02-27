@@ -461,7 +461,7 @@ class TaskExecutor:
                 
                 if not passed:
                     error_msg = f"Verification Failed. You must fix these unsupported claims before completing the task:\n{critique}"
-                    
+
                     yield TaskEvent(
                         type=TaskEventType.VERIFIER_FAILED,
                         task_id=task.id,
@@ -469,14 +469,22 @@ class TaskExecutor:
                         content=error_msg,
                         progress=self._progress_callback(task),
                     )
-                    
+
                     if self._metrics:
                         self._metrics.record_verifier_result(False, critique)
 
                     # Overwrite the success/output so the agent sees the failure
                     step.tool_calls[-1]["result"] = error_msg
                     step.tool_calls[-1]["success"] = False
-                    
+
+                    # Track the error so the agent loop can detect the
+                    # failure and manage retries properly (without this,
+                    # step.status stays IN_PROGRESS and the loop cannot
+                    # distinguish a verifier rejection from a normal turn).
+                    step.error = error_msg
+                    step.status = StepStatus.FAILED
+                    await self._persistence.update_task(task)
+
                     return # Abort completion, let agent retry
 
                 if self._metrics:

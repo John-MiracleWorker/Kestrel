@@ -326,10 +326,15 @@ export class ChannelRegistry {
                         userId: msg.userId,
                         error: chunk.error_message,
                     });
-                    await adapter.send(msg.userId, {
-                        conversationId: msg.conversationId || '',
-                        content: 'Sorry, something went wrong. Please try again.',
-                    });
+
+                    // If we already streamed some content, finalize it
+                    // with the error appended. Otherwise send the error
+                    // message directly so the user sees context.
+                    if (fullContent) {
+                        fullContent += `\n\n⚠️ ${chunk.error_message || 'An error occurred.'}`;
+                    } else {
+                        fullContent = `⚠️ ${chunk.error_message || 'Sorry, something went wrong. Please try again.'}`;
+                    }
                     break;
             }
         }
@@ -383,10 +388,12 @@ export class ChannelRegistry {
                         userId: msg.userId,
                         error: chunk.error_message,
                     });
-                    await adapter.send(msg.userId, {
-                        conversationId: msg.conversationId || '',
-                        content: 'Sorry, something went wrong. Please try again.',
-                    });
+                    // Append or set error content — will be sent on DONE
+                    if (fullContent) {
+                        fullContent += `\n\n⚠️ ${chunk.error_message || 'An error occurred.'}`;
+                    } else {
+                        fullContent = `⚠️ ${chunk.error_message || 'Sorry, something went wrong. Please try again.'}`;
+                    }
                     break;
             }
         }
