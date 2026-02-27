@@ -847,14 +847,84 @@ class TaskExecutor:
                 max_tokens=routed_max_tokens,
                 api_key=self._api_key,
             )
+
+            # Check for error content from the provider (not an exception)
+            content = response.get("content", "")
+            if content.startswith("[Error:") and not response.get("tool_calls"):
+                raise RuntimeError(content)
+
         except Exception as llm_err:
-            # API errors (400, 401, network failures, etc.) should fail the
-            # step gracefully rather than crash the entire agent loop.
-            logger.error(f"LLM API error during step execution: {llm_err}", exc_info=True)
-            step.status = StepStatus.FAILED
-            step.error = f"LLM API error: {str(llm_err)[:300]}"
-            await self._persistence.update_task(task)
-            return
+            # ── Graceful cloud failover ──────────────────────────────
+            # If the local provider failed (e.g. ollama 400), swap to
+            # a cloud provider and retry with the same context.
+            if route.provider in ("ollama", "local") and self._provider_resolver:
+                logger.warning(
+                    f"Provider {route.provider} failed: {llm_err}. "
+                    f"Attempting cloud failover..."
+                )
+                for cloud_name in ("google", "openai", "anthropic"):
+                    try:
+                        cloud_p = self._provider_resolver(cloud_name)
+                        if not cloud_p.is_ready():
+                            continue
+
+                        # Re-select tools with cloud limits (can handle more)
+                        try:
+                            from agent.tool_selector import ToolSelector
+                            selector = ToolSelector(self._tools.list_tools())
+                            cloud_tools = selector.select(
+                                step_description=step.description,
+                                expected_tools=step_expected,
+                                provider=cloud_name,
+                            )
+                            cloud_schemas = [t.to_openai_schema() for t in cloud_tools]
+                        except Exception:
+                            cloud_schemas = tool_schemas
+
+                        logger.info(
+                            f"Cloud failover: {route.provider} → {cloud_name} "
+                            f"({len(cloud_schemas)} tools)"
+                        )
+
+                        if self._event_callback:
+                            try:
+                                await self._event_callback("routing_info", {
+                                    "provider": cloud_name,
+                                    "model": "",
+                                    "was_escalated": True,
+                                    "complexity": 0,
+                                })
+                            except Exception:
+                                pass
+
+                        response = await cloud_p.generate_with_tools(
+                            messages=messages,
+                            model="",  # Use provider's default
+                            tools=cloud_schemas,
+                            temperature=routed_temp,
+                            max_tokens=max(routed_max_tokens, 8192),
+                            api_key=self._api_key,
+                        )
+                        # Update active_provider for subsequent logic
+                        active_provider = cloud_p
+                        break
+                    except Exception as cloud_err:
+                        logger.warning(f"Cloud failover to {cloud_name} failed: {cloud_err}")
+                        continue
+                else:
+                    # All cloud providers failed too
+                    logger.error(f"All providers failed for step: {llm_err}")
+                    step.status = StepStatus.FAILED
+                    step.error = f"All providers failed: {str(llm_err)[:300]}"
+                    await self._persistence.update_task(task)
+                    return
+            else:
+                # Non-local provider failed — just fail the step
+                logger.error(f"LLM API error during step execution: {llm_err}", exc_info=True)
+                step.status = StepStatus.FAILED
+                step.error = f"LLM API error: {str(llm_err)[:300]}"
+                await self._persistence.update_task(task)
+                return
 
         if response.get("usage"):
             usage = response["usage"]
