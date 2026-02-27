@@ -60,6 +60,8 @@ class AgentServicerMixin(BaseServicerMixin):
 
         # Dynamically resolve provider from workspace config instead of
         # using the hardcoded "local" provider from the global _agent_loop.
+        ws_config = {}
+        provider_name = "local"
         try:
             pool = await get_pool()
             ws_config = await ProviderConfig(pool).get_config(workspace_id)
@@ -97,6 +99,22 @@ class AgentServicerMixin(BaseServicerMixin):
             model=task_model,
         )
 
+        from agent.model_router import ModelRouter
+
+        def custom_provider_checker(name: str) -> bool:
+            if name == provider_name and getattr(task_provider, "is_ready", lambda: False)():
+                return True
+            try:
+                return get_provider(name).is_ready()
+            except Exception:
+                return False
+
+        task_model_router = ModelRouter(
+            provider_checker=custom_provider_checker,
+            workspace_provider=provider_name,
+            workspace_model=task_model,
+        )
+
         task_loop = AgentLoop(
             provider=task_provider,
             tool_registry=task_tool_registry,
@@ -109,6 +127,7 @@ class AgentServicerMixin(BaseServicerMixin):
             learner=task_learner,
             reflection_engine=task_reflection,
             provider_resolver=resolve_provider,
+            model_router=task_model_router,
         )
 
         # Register this task as an active session

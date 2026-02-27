@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import shlex
+import sys
 import uuid
 from typing import Any, Optional
 
@@ -57,11 +58,48 @@ class MCPClient:
         # Build environment
         env = {**os.environ, **self.env}
 
-        # Parse command into args (shlex handles quoted paths with spaces)
         try:
             parts = shlex.split(self.command)
         except ValueError:
             parts = self.command.split()
+
+        # Auto-install dependencies for local Python/Node scripts if possible
+        if parts and len(parts) >= 2:
+            cmd = parts[0].lower()
+            script_path = next((p for p in parts[1:] if p.endswith('.py') or p.endswith('.js') or p.endswith('.ts')), None)
+            
+            if script_path and os.path.exists(script_path):
+                script_dir = os.path.dirname(os.path.abspath(script_path))
+                
+                # Auto-install Python requirements
+                if cmd in ('python', 'python3') and os.path.exists(os.path.join(script_dir, 'requirements.txt')):
+                    req_file = os.path.join(script_dir, 'requirements.txt')
+                    logger.info(f"Auto-installing dependencies for {self.name} from {req_file}...")
+                    try:
+                        pip_proc = await asyncio.create_subprocess_exec(
+                            sys.executable, "-m", "pip", "install", "-r", req_file,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            env=env
+                        )
+                        await pip_proc.wait()
+                    except Exception as e:
+                        logger.warning(f"Failed to auto-install requirements for {self.name}: {e}")
+                        
+                # Auto-install Node (package.json)
+                elif cmd in ('node', 'npx', 'ts-node') and os.path.exists(os.path.join(script_dir, 'package.json')):
+                    logger.info(f"Auto-installing npm dependencies for {self.name} in {script_dir}...")
+                    try:
+                        npm_proc = await asyncio.create_subprocess_exec(
+                            "npm", "install",
+                            cwd=script_dir,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            env=env
+                        )
+                        await npm_proc.wait()
+                    except Exception as e:
+                        logger.warning(f"Failed to auto-install npm packages for {self.name}: {e}")
 
         try:
             self._process = await asyncio.create_subprocess_exec(

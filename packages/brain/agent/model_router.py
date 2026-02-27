@@ -404,6 +404,8 @@ class ModelRouter:
         strategy: RoutingStrategy = None,
         custom_routes: dict[StepType, ModelRoute] = None,
         provider_checker=None,  # callable: (name) -> bool
+        workspace_provider: str = None,
+        workspace_model: str = None,
     ):
         self._strategy = strategy or _DEFAULT_STRATEGY
         self._routes = _build_routes(self._strategy)
@@ -413,6 +415,8 @@ class ModelRouter:
         # Optional: inject a function that checks if a provider is available
         # Defaults to checking via providers_registry at runtime
         self._provider_checker = provider_checker
+        self._workspace_provider = workspace_provider
+        self._workspace_model = workspace_model
 
         # Stats for cost tracking
         self._route_counts: dict[StepType, int] = {}
@@ -433,21 +437,27 @@ class ModelRouter:
 
     def _find_fallback(self, original_provider: str, route: ModelRoute) -> ModelRoute:
         """Find a working fallback provider for a route."""
+        fallbacks = []
+
+        # Start with the configured workspace provider if available
+        if self._workspace_provider and self._workspace_provider != original_provider:
+            fallbacks.append((self._workspace_provider, self._workspace_model or ""))
+
         # Define fallback chains depending on original provider
         if original_provider == "ollama":
-            fallbacks = [
+            fallbacks.extend([
                 ("google", _CLOUD_FAST_MODEL),
                 ("openai", "gpt-5-mini"),
                 ("anthropic", "claude-sonnet-4-6"),
-            ]
+            ])
         else:
             # Cloud provider unavailable → try Ollama first, then other clouds
-            fallbacks = [
+            fallbacks.extend([
                 ("ollama", _OLLAMA_MODEL),
                 ("google", _CLOUD_FAST_MODEL),
                 ("openai", "gpt-5-mini"),
                 ("anthropic", "claude-sonnet-4-6"),
-            ]
+            ])
 
         for fb_provider, fb_model in fallbacks:
             if fb_provider == original_provider:
@@ -484,11 +494,15 @@ class ModelRouter:
             return route
 
         # Find the best available cloud provider
-        cloud_priority = [
+        cloud_priority = []
+        if self._workspace_provider and self._workspace_provider not in ("ollama", "local"):
+            cloud_priority.append((self._workspace_provider, self._workspace_model or ""))
+
+        cloud_priority.extend([
             ("google", _CLOUD_POWER_MODEL),
             ("openai", "gpt-5.2"),
             ("anthropic", "claude-sonnet-4-6"),
-        ]
+        ])
 
         for cloud_provider, cloud_model in cloud_priority:
             if self._is_provider_available(cloud_provider):

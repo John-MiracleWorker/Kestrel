@@ -129,7 +129,14 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
 
     elif event_type == "approval_needed":
         question = event.content or "The agent needs your input."
-        approval_text = f"\n\n🤔 **I need your input:**\n\n{question}\n\n*Reply in the chat to continue.*"
+        
+        if not event.approval_id:
+            # Conversational ask_human
+            approval_text = f"\n\n🤔 **I need your input:**\n\n{question}\n\n*Reply in the chat to continue.*"
+        else:
+            # Security approval (host_write, mcp_connect, etc.)
+            approval_text = f"\n\n🛡️ **Security Approval Required:**\n\n{question}\n\n*Please use the Approve/Deny buttons in the Task Panel to proceed.*"
+            
         words = approval_text.split(' ')
         for i, word in enumerate(words):
             chunk = word if i == 0 else ' ' + word

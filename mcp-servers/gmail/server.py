@@ -2,6 +2,24 @@ import sys
 import json
 import os
 import base64
+import subprocess
+import importlib
+
+# Ensure dependencies are installed
+required_packages = {
+    'google.oauth2.credentials': 'google-auth',
+    'google_auth_oauthlib.flow': 'google-auth-oauthlib',
+    'google.auth.transport.requests': 'google-auth-httplib2',
+    'googleapiclient.discovery': 'google-api-python-client'
+}
+
+for module, package in required_packages.items():
+    try:
+        importlib.import_module(module.split('.')[0])
+    except ImportError:
+        print(f"Installing missing package {package}...", file=sys.stderr)
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package, "--quiet"])
+
 from email.mime.text import MIMEText
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -121,9 +139,13 @@ def main():
         try:
             request = json.loads(line)
             response = handle_request(request)
-            print(json.dumps({"jsonrpc": "2.0", "id": request.get('id'), "result": response}), flush=True)
+            out = json.dumps({"jsonrpc": "2.0", "id": request.get('id'), "result": response})
+            sys.stdout.write(out + "\n")
+            sys.stdout.flush()
         except Exception as e:
-            print(json.dumps({"jsonrpc": "2.0", "error": {"code": -32603, "message": str(e)}}), flush=True)
+            out = json.dumps({"jsonrpc": "2.0", "error": {"code": -32603, "message": str(e)}})
+            sys.stdout.write(out + "\n")
+            sys.stdout.flush()
 
 if __name__ == '__main__':
     main()

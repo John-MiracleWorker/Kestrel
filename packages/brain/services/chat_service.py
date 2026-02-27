@@ -168,11 +168,6 @@ class ChatServicerMixin(BaseServicerMixin):
                 TaskPlan, TaskStep, StepStatus,
             )
 
-            user_content = next(
-                (m["content"] for m in reversed(messages) if m["role"] == "user"),
-                "",
-            )
-
             # ── 4a. Intercept /slash commands ───────────────────────
             if runtime.command_parser and runtime.command_parser.is_command(user_content):
                 cmd_context = {
@@ -372,6 +367,22 @@ class ChatServicerMixin(BaseServicerMixin):
             from agent.checkpoints import CheckpointManager
             checkpoint_mgr = CheckpointManager(pool=pool)
 
+            from agent.model_router import ModelRouter
+
+            def custom_provider_checker(name: str) -> bool:
+                if name == provider_name and getattr(provider, "is_ready", lambda: False)():
+                    return True
+                try:
+                    return get_provider(name).is_ready()
+                except Exception:
+                    return False
+
+            chat_model_router = ModelRouter(
+                provider_checker=custom_provider_checker,
+                workspace_provider=provider_name,
+                workspace_model=model,
+            )
+
             agent_loop = AgentLoop(
                 provider=provider,
                 tool_registry=tool_registry,
@@ -385,6 +396,7 @@ class ChatServicerMixin(BaseServicerMixin):
                 checkpoint_manager=checkpoint_mgr,
                 event_callback=_activity_callback,
                 provider_resolver=resolve_provider,
+                model_router=chat_model_router,
             )
 
             # Inject persona context into the system prompt if available

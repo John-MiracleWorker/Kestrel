@@ -509,6 +509,34 @@ class TaskExecutor:
 
         elif tool_name == "ask_human":
             question = tool_args.get("question", "The agent needs your input")
+            
+            if getattr(task, "messages", None) is not None:
+                # Chat Mode: yield the question and end the task.
+                # Do not set pending_approval so AgentLoop doesn't block.
+                yield TaskEvent(
+                    type=TaskEventType.APPROVAL_NEEDED,
+                    task_id=task.id,
+                    step_id=step.id,
+                    tool_name="ask_human",
+                    content=question,
+                    approval_id="",
+                    progress=self._progress_callback(task),
+                )
+                
+                step.result = "Asked user in chat. Ending current iteration."
+                step.status = StepStatus.COMPLETE
+                step.completed_at = datetime.now(timezone.utc)
+                
+                # Mark remaining steps as skipped so the loop completes naturally
+                for remaining in task.plan.steps:
+                    if remaining.status in (StepStatus.PENDING, StepStatus.IN_PROGRESS) and remaining.id != step.id:
+                        remaining.status = StepStatus.SKIPPED
+                        remaining.result = "Skipped — waiting for user reply in chat"
+                        remaining.completed_at = datetime.now(timezone.utc)
+                
+                await self._persistence.update_task(task)
+                return
+
             approval_request = ApprovalRequest(
                 id=str(uuid.uuid4()),
                 task_id=task.id,
