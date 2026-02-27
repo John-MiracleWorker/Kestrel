@@ -950,6 +950,13 @@ class TaskExecutor:
         if response.get("tool_calls"):
             tool_calls = response["tool_calls"]
 
+            # Capture LLM's text content alongside tool calls
+            # (e.g. "I'll check the MCP server..." before calling tools).
+            # This ensures step.result has meaningful content even if
+            # task_complete is never explicitly called.
+            if response.get("content") and not step.result:
+                step.result = response["content"]
+
             if len(tool_calls) > 1:
                 logger.info(f"LLM returned {len(tool_calls)} tool calls — dispatching in parallel")
                 async for event in self._execute_tools_parallel(tool_calls, task, step):
