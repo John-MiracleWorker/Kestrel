@@ -707,14 +707,23 @@ class TaskExecutor:
             f"(step={step.description[:50]}...)"
         )
 
-        response = await active_provider.generate_with_tools(
-            messages=messages,
-            model=routed_model,
-            tools=tool_schemas,
-            temperature=routed_temp,
-            max_tokens=routed_max_tokens,
-            api_key=self._api_key,
-        )
+        try:
+            response = await active_provider.generate_with_tools(
+                messages=messages,
+                model=routed_model,
+                tools=tool_schemas,
+                temperature=routed_temp,
+                max_tokens=routed_max_tokens,
+                api_key=self._api_key,
+            )
+        except Exception as llm_err:
+            # API errors (400, 401, network failures, etc.) should fail the
+            # step gracefully rather than crash the entire agent loop.
+            logger.error(f"LLM API error during step execution: {llm_err}", exc_info=True)
+            step.status = StepStatus.FAILED
+            step.error = f"LLM API error: {str(llm_err)[:300]}"
+            await self._persistence.update_task(task)
+            return
 
         if response.get("usage"):
             usage = response["usage"]
@@ -765,3 +774,19 @@ class TaskExecutor:
                     step.result = text
                     step.completed_at = datetime.now(timezone.utc)
                     await self._persistence.update_task(task)
+
+        else:
+            # LLM returned no tool calls AND no content — this is an API
+            # error or empty response.  Mark the step as failed so the
+            # agent loop can retry or surface the error instead of silently
+            # falling through to "Task completed successfully."
+            logger.warning(
+                f"LLM returned empty response for step '{step.description[:80]}' "
+                f"(provider={getattr(active_provider, 'provider', '?')}, model={routed_model})"
+            )
+            step.status = StepStatus.FAILED
+            step.error = (
+                "LLM returned an empty response (no content and no tool calls). "
+                "This usually means the API rejected the request or the model is unavailable."
+            )
+            await self._persistence.update_task(task)
