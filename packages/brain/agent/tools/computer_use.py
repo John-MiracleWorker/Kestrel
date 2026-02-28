@@ -53,17 +53,46 @@ COMPUTER_USE_MODEL = os.getenv("GEMINI_COMPUTER_USE_MODEL", "")
 MAX_TURNS = int(os.getenv("COMPUTER_USE_MAX_TURNS", "30"))
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
+# Models known to support the computerUse tool, in preference order.
+# The model registry may return speculative/future names that don't exist yet
+# in the real Google API, causing 404s.  This list pins stable, verified IDs.
+COMPUTER_USE_KNOWN_MODELS = [
+    "gemini-2.5-flash-preview-04-17",
+    "gemini-2.0-flash-exp",
+    "gemini-2.5-pro-preview-05-06",
+    "gemini-2.5-flash-lite-preview-06-17",
+]
+
+
 async def _resolve_computer_use_model() -> str:
-    """Resolve the computer use model dynamically from the registry."""
+    """Resolve the computer use model dynamically from the registry.
+
+    The model registry may return speculative model names (e.g. gemini-3-flash-preview)
+    from its hardcoded catalog that don't yet exist in the Google API, causing 404s.
+    We validate the resolved name against COMPUTER_USE_KNOWN_MODELS and fall back
+    to a stable known-working model when the registry returns something unfamiliar.
+    """
     global COMPUTER_USE_MODEL
     if COMPUTER_USE_MODEL:
         return COMPUTER_USE_MODEL
     try:
         from core.model_registry import model_registry
-        COMPUTER_USE_MODEL = await model_registry.get_fast_model("google")
-        logger.info(f"Computer use model resolved dynamically: {COMPUTER_USE_MODEL}")
+        candidate = await model_registry.get_fast_model("google")
+        # Only use the registry result if it looks like a real, versioned Gemini model
+        # (contains a date suffix or is in our known-good list).
+        import re as _re
+        is_dated = bool(_re.search(r"\d{2}-\d{2}", candidate))
+        if candidate and (is_dated or candidate in COMPUTER_USE_KNOWN_MODELS):
+            COMPUTER_USE_MODEL = candidate
+            logger.info(f"Computer use model resolved from registry: {COMPUTER_USE_MODEL}")
+        else:
+            COMPUTER_USE_MODEL = COMPUTER_USE_KNOWN_MODELS[0]
+            logger.info(
+                f"Registry returned '{candidate}' which may not support computerUse; "
+                f"using known-good fallback: {COMPUTER_USE_MODEL}"
+            )
     except Exception:
-        COMPUTER_USE_MODEL = "gemini-2.5-flash"
+        COMPUTER_USE_MODEL = COMPUTER_USE_KNOWN_MODELS[0]
     return COMPUTER_USE_MODEL
 
 # Host-side screen agent URL (runs natively on the Mac)
@@ -231,6 +260,21 @@ async def _call_gemini_computer_use(
                 await asyncio.sleep(delay)
                 continue
 
+            if resp.status_code == 404:
+                # The model doesn't exist at this endpoint.  This usually means
+                # the model name from the registry is speculative/future or doesn't
+                # support computerUse.  Surface a clear error so the caller can
+                # try a different model via COMPUTER_USE_KNOWN_MODELS.
+                import re
+                error_text = re.sub(r"key=[A-Za-z0-9_-]+", "key=***", resp.text[:500])
+                raise RuntimeError(
+                    f"Gemini Computer Use model not found (404): '{model}' does not exist "
+                    f"or does not support the computerUse tool. "
+                    f"Set GEMINI_COMPUTER_USE_MODEL to one of: "
+                    f"{', '.join(COMPUTER_USE_KNOWN_MODELS)}. "
+                    f"API response: {error_text}"
+                )
+
             if resp.status_code != 200:
                 error_text = resp.text[:1000]
                 # Scrub API key from error
@@ -320,6 +364,12 @@ async def run_computer_use(
 
     max_turns = max_turns or MAX_TURNS
     model = model or COMPUTER_USE_MODEL
+
+    # Build a fallback chain: preferred model first, then remaining known models
+    model_chain = [model] + [m for m in COMPUTER_USE_KNOWN_MODELS if m != model]
+    model = model_chain[0]
+    model_chain_idx = 0
+
     actions_taken: list[dict] = []
     commentary: list[str] = []
 
@@ -364,7 +414,7 @@ async def run_computer_use(
     for turn in range(max_turns):
         logger.info(f"Computer Use turn {turn + 1}/{max_turns}")
 
-        # Call Gemini
+        # Call Gemini — on 404 automatically try the next model in the chain
         try:
             response = await _call_gemini_computer_use(
                 contents=contents,
@@ -374,9 +424,22 @@ async def run_computer_use(
                 excluded_actions=excluded_actions,
             )
         except RuntimeError as e:
+            err_str = str(e)
+            if "404" in err_str and model_chain_idx + 1 < len(model_chain):
+                # Try the next known-good model
+                model_chain_idx += 1
+                model = model_chain[model_chain_idx]
+                # Update the global so the next top-level call starts here
+                global COMPUTER_USE_MODEL
+                COMPUTER_USE_MODEL = model
+                logger.warning(
+                    f"Computer Use model {model_chain[model_chain_idx - 1]} returned 404; "
+                    f"retrying with {model}"
+                )
+                continue
             return {
                 "success": False,
-                "error": str(e),
+                "error": err_str,
                 "turns": turn + 1,
                 "actions_taken": actions_taken,
                 "model_commentary": "\n".join(commentary),
