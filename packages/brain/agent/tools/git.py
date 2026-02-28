@@ -53,7 +53,9 @@ def register_git_tools(registry) -> None:
             name="git",
             description=(
                 "Perform git operations on the Kestrel codebase. "
-                "Use for version control: status, diff, branch, commit, push, log, add, pull, checkout, deploy. "
+                "Use for version control: status, diff, branch, commit, push, log, add, pull, checkout, deploy, stash, discard. "
+                "stash: save/pop/list/drop/clear the stash. "
+                "discard: hard-reset all local changes (staged + unstaged) — cannot be undone. "
                 "Safety: pushes are ONLY allowed on kestrel/* branches, never on main. "
                 "Deploy merges to main and rebuilds Docker — requires passing tests AND 30min user inactivity."
             ),
@@ -62,7 +64,7 @@ def register_git_tools(registry) -> None:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "diff", "branch", "commit", "push", "log", "add", "pull", "checkout", "deploy"],
+                        "enum": ["status", "diff", "branch", "commit", "push", "log", "add", "pull", "checkout", "deploy", "stash", "discard"],
                         "description": "Git action to perform",
                     },
                     "branch_name": {
@@ -80,6 +82,11 @@ def register_git_tools(registry) -> None:
                     "count": {
                         "type": "integer",
                         "description": "Number of log entries to show (default 5)",
+                    },
+                    "stash_action": {
+                        "type": "string",
+                        "enum": ["save", "pop", "list", "drop", "clear"],
+                        "description": "Sub-action for stash: save (default), pop, list, drop, clear",
                     },
                 },
                 "required": ["action"],
@@ -131,6 +138,7 @@ async def git_action(
     message: str = "",
     files: str = "",
     count: int = 5,
+    stash_action: str = "save",
 ) -> dict:
     """Route to the appropriate git action."""
 
@@ -159,6 +167,10 @@ async def git_action(
             return {"error": "🔒 Deploy is admin-only. Your changes remain local. Ask the admin to deploy."}
         from agent.tools.self_improve import deploy_codebase
         return await deploy_codebase()
+    elif action == "stash":
+        return _git_stash(stash_action)
+    elif action == "discard":
+        return _git_discard()
     else:
         return {"error": f"Unknown git action: {action}"}
 
@@ -383,3 +395,54 @@ def _git_log(count: int = 5) -> dict:
     if result.get("success"):
         return {"log": result["output"]}
     return result
+
+
+def _git_stash(stash_action: str = "save") -> dict:
+    """Manage the git stash stack."""
+    if stash_action == "save":
+        result = _run_git(["stash"])
+        if result.get("success"):
+            output = result.get("output", "")
+            if "No local changes to save" in output:
+                return {"message": "Nothing to stash — working tree is already clean."}
+            return {"message": f"✅ Changes stashed. {output}"}
+        return result
+    elif stash_action == "pop":
+        result = _run_git(["stash", "pop"])
+        if result.get("success"):
+            return {"message": f"✅ Stash applied and removed. {result.get('output', '')}"}
+        return result
+    elif stash_action == "list":
+        result = _run_git(["stash", "list"])
+        if result.get("success"):
+            return {"stashes": result.get("output") or "(stash is empty)"}
+        return result
+    elif stash_action == "drop":
+        result = _run_git(["stash", "drop"])
+        if result.get("success"):
+            return {"message": "✅ Top stash entry dropped."}
+        return result
+    elif stash_action == "clear":
+        result = _run_git(["stash", "clear"])
+        if result.get("success"):
+            return {"message": "✅ All stash entries cleared."}
+        return result
+    else:
+        return {
+            "error": f"Unknown stash_action: '{stash_action}'. "
+            "Valid options: save, pop, list, drop, clear."
+        }
+
+
+def _git_discard() -> dict:
+    """Discard ALL local changes — staged and unstaged. Cannot be undone."""
+    reset = _run_git(["reset", "--hard", "HEAD"])
+    if not reset.get("success"):
+        return reset
+    # Also remove untracked files and directories
+    clean = _run_git(["clean", "-fd"], check=False)
+    return {
+        "message": "✅ All local changes discarded. Working tree is clean.",
+        "reset_output": reset.get("output", ""),
+        "clean_output": clean.get("output", ""),
+    }

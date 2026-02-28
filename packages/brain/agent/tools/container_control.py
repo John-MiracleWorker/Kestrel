@@ -15,6 +15,8 @@ import os
 import shutil
 import subprocess
 
+import httpx
+
 from agent.types import RiskLevel, ToolDefinition
 
 logger = logging.getLogger("brain.agent.tools.container_control")
@@ -167,8 +169,8 @@ def register_container_tools(registry) -> None:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "logs", "restart", "rebuild", "rebuild_all", "stop", "start"],
-                        "description": "Operation to perform",
+                        "enum": ["status", "logs", "restart", "rebuild", "rebuild_all", "rebuild_log", "stop", "start"],
+                        "description": "Operation to perform. Use rebuild_log to check the output of the last self-rebuild attempt.",
                     },
                     "service": {
                         "type": "string",
@@ -211,6 +213,8 @@ async def container_action(
         if not _is_admin(user_id):
             return {"error": "🔒 Rebuild is admin-only."}
         return await _container_rebuild(service, user_requested=True)
+    elif action == "rebuild_log":
+        return _read_rebuild_log()
     elif action == "rebuild_all":
         if not _is_admin(user_id):
             return {"error": "🔒 Rebuild is admin-only."}
@@ -225,6 +229,23 @@ async def container_action(
         return _container_start(service)
     else:
         return {"error": f"Unknown action: {action}"}
+
+
+def _read_rebuild_log() -> dict:
+    """Return the contents of the last brain rebuild log."""
+    log_path = "/tmp/brain-rebuild.log"
+    try:
+        with open(log_path) as f:
+            content = f.read()
+        return {
+            "log_path": log_path,
+            "content": content[-4000:] if len(content) > 4000 else content,
+            "truncated": len(content) > 4000,
+        }
+    except FileNotFoundError:
+        return {"log_path": log_path, "content": "(no rebuild has been attempted yet)"}
+    except Exception as e:
+        return {"error": f"Could not read rebuild log: {e}"}
 
 
 def _container_status() -> dict:
@@ -268,15 +289,40 @@ def _container_restart(service: str) -> dict:
     return result
 
 
+async def _get_own_image() -> str:
+    """Return the Docker image tag of the currently running brain container.
+
+    Docker sets the container hostname to the short container ID by default,
+    which lets us look ourselves up in the Docker daemon.
+    """
+    hostname = os.uname().nodename
+    try:
+        transport = httpx.HTTPTransport(uds="/var/run/docker.sock")
+        async with httpx.AsyncClient(transport=transport, base_url="http://docker") as client:
+            resp = await client.get(f"/containers/{hostname}/json", timeout=5)
+            if resp.status_code == 200:
+                return resp.json().get("Config", {}).get("Image", "")
+    except Exception as e:
+        logger.warning(f"container_control: could not determine own image: {e}")
+    return ""
+
+
 async def _container_rebuild(service: str, user_requested: bool = False) -> dict:
     """Rebuild the image for a service and restart it.
 
     When rebuilding 'brain' (self), we face a chicken-and-egg problem: the
-    running process IS the container being rebuilt. We solve this with a
-    fire-and-forget pattern:
-      1. git pull latest code in /project
-      2. Launch 'docker compose up --build -d brain' via nohup so it survives
-         the current container being replaced.
+    running process IS the container being rebuilt.
+
+    The old nohup fire-and-forget approach had a fatal race condition:
+    `docker compose up --build -d brain` stops the old brain container in the
+    middle of its own lifecycle, killing the nohup process before it can send
+    the "start new container" request to the Docker daemon.  The image built
+    successfully but the new container was never started.
+
+    Fix: launch a helper container whose PID namespace is separate from ours.
+    The helper is a copy of the brain image (which already has docker-ce-cli)
+    running only a shell command.  It survives the brain container being
+    stopped/replaced and completes the compose up.
     """
     err = _validate_service(service)
     if err:
@@ -329,29 +375,78 @@ async def _container_rebuild(service: str, user_requested: bool = False) -> dict
     is_self_rebuild = (service == "brain")
 
     if is_self_rebuild:
-        # Fire-and-forget: launch the rebuild in a detached process that
-        # survives the current container being replaced by Docker Compose.
-        rebuild_cmd = " ".join(compose_cmd + ["up", "--build", "-d", "brain"])
-        nohup_cmd = f"nohup sh -c 'sleep 2 && cd {project_root} && {rebuild_cmd}' > /tmp/brain-rebuild.log 2>&1 &"
+        rebuild_cmd = " ".join(compose_cmd + ["up", "--build", "-d", service])
+        own_image = await _get_own_image()
 
-        logger.info(f"container_control: self-rebuild initiated (fire-and-forget)")
-        try:
-            subprocess.Popen(
-                nohup_cmd,
-                shell=True,
-                cwd=project_root,
-                start_new_session=True,
+        if own_image:
+            # Launch a helper container that lives OUTSIDE our PID namespace.
+            # The brain image already has docker-ce-cli installed, so we reuse
+            # it as a minimal shell environment.  We override the entrypoint so
+            # the brain server process is never started — only the rebuild shell
+            # command runs.  Because this container is distinct from the brain
+            # container, it is NOT killed when Docker stops the old brain, and
+            # can therefore complete the `docker compose up` lifecycle
+            # (stop-old → start-new) without the race condition.
+            helper_args = [
+                "docker", "run", "--rm", "-d",
+                "-v", "/var/run/docker.sock:/var/run/docker.sock",
+                "-v", f"{project_root}:{project_root}",
+                "-w", project_root,
+                "--entrypoint", "/bin/sh",
+                own_image,
+                "-c",
+                f"sleep 3 && {rebuild_cmd} >> /tmp/brain-rebuild.log 2>&1",
+            ]
+            logger.info(
+                f"container_control: launching rebuild helper container "
+                f"(image={own_image}, cmd={rebuild_cmd})"
             )
-        except Exception as e:
-            return {"success": False, "error": f"Failed to launch self-rebuild: {e}"}
+            try:
+                helper = subprocess.run(
+                    helper_args,
+                    capture_output=True, text=True, timeout=15,
+                )
+                if helper.returncode != 0:
+                    return {
+                        "success": False,
+                        "error": (
+                            f"Failed to launch rebuild helper container: "
+                            f"{helper.stderr.strip() or 'unknown error'}"
+                        ),
+                    }
+                helper_id = helper.stdout.strip()[:12]
+                logger.info(f"container_control: helper container started ({helper_id})")
+            except Exception as e:
+                return {"success": False, "error": f"Failed to launch rebuild helper: {e}"}
+        else:
+            # Fallback: nohup fire-and-forget (may fail silently due to the
+            # race condition described above, but better than nothing when the
+            # Docker socket lookup fails).
+            nohup_cmd = (
+                f"nohup sh -c 'sleep 2 && cd {project_root} && {rebuild_cmd}'"
+                f" > /tmp/brain-rebuild.log 2>&1 &"
+            )
+            logger.warning(
+                "container_control: could not determine own image, "
+                "falling back to nohup self-rebuild (may race)"
+            )
+            try:
+                subprocess.Popen(
+                    nohup_cmd,
+                    shell=True,
+                    cwd=project_root,
+                    start_new_session=True,
+                )
+            except Exception as e:
+                return {"success": False, "error": f"Failed to launch self-rebuild: {e}"}
 
         return {
             "success": True,
             "message": (
                 "🔄 Self-rebuild initiated! The brain service will be rebuilt and restarted "
-                "in ~2 seconds. I'll be briefly offline while the new container starts. "
-                "This process is fire-and-forget — it will complete even though this "
-                "container is being replaced."
+                "in ~5 seconds. I'll be briefly offline while the new container starts. "
+                "A helper container is managing the rebuild so it will complete even after "
+                "this container is replaced."
             ),
             "service": "brain",
             "git_pull": git_status,
