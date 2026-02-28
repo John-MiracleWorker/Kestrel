@@ -109,6 +109,20 @@ SPECIALISTS = {
         max_iterations=20,
         max_tool_calls=40,
     ),
+    "synthesizer": SpecialistConfig(
+        name="Synthesizer",
+        persona=(
+            "You are a synthesis specialist. Your job is to read available "
+            "information and produce a clear, concise, well-structured summary "
+            "or report. Combine findings from multiple sources. Be thorough "
+            "but avoid unnecessary repetition."
+        ),
+        allowed_tools=[
+            "file_read", "memory_search", "ask_human", "task_complete",
+        ],
+        max_iterations=8,
+        max_tool_calls=15,
+    ),
 }
 
 
@@ -136,9 +150,15 @@ class Coordinator:
         parent_task: AgentTask,
         goal: str,
         specialist_type: str,
+        max_tokens_override: int = None,
     ) -> str:
         """
         Spawn a specialist sub-agent to handle a subtask.
+
+        max_tokens_override: explicit token budget for the child task.
+          When None, defaults to parent_task.config.max_tokens // 3.
+          Pass a lower value when many children run in parallel so that
+          their budgets collectively don't exceed the parent budget.
 
         Returns the sub-agent's result string when complete.
         """
@@ -153,6 +173,9 @@ class Coordinator:
             "tools": spec.allowed_tools,
         })
 
+        # Determine child token budget
+        child_max_tokens = max_tokens_override or (parent_task.config.max_tokens // 3)
+
         # Create child task
         import uuid
         child_task = AgentTask(
@@ -165,7 +188,7 @@ class Coordinator:
             config=GuardrailConfig(
                 max_iterations=spec.max_iterations,
                 max_tool_calls=spec.max_tool_calls,
-                max_tokens=parent_task.config.max_tokens // 3,
+                max_tokens=child_max_tokens,
                 max_wall_time_seconds=min(
                     parent_task.config.max_wall_time_seconds // 2, 300
                 ),
@@ -272,8 +295,18 @@ class Coordinator:
             subtasks = subtasks[:max_parallel]
             logger.warning(f"Capped parallel subtasks to {max_parallel}")
 
+        # Smarter token budget: divide parent budget evenly across children
+        # while leaving headroom for the parent's own continuation.
+        # Formula: parent_budget / (n_children + 1), floored at 8192.
+        n_children = len(subtasks)
+        child_token_budget = max(
+            parent_task.config.max_tokens // (n_children + 1),
+            8192,
+        )
+
         await self._emit("parallel_delegation_started", {
             "count": len(subtasks),
+            "child_token_budget": child_token_budget,
             "subtasks": [
                 {"goal": s.get("goal", "")[:100], "specialist": s.get("specialist", "explorer")}
                 for s in subtasks
@@ -284,7 +317,10 @@ class Coordinator:
             goal = subtask.get("goal", "")
             specialist = subtask.get("specialist", "explorer")
             try:
-                result = await self.delegate(parent_task, goal, specialist)
+                result = await self.delegate(
+                    parent_task, goal, specialist,
+                    max_tokens_override=child_token_budget,
+                )
                 return result
             except Exception as e:
                 return f"Subtask {index} failed: {e}"

@@ -172,10 +172,28 @@ class TaskLearner:
         """
         Analyze a completed task and extract structured lessons.
         Returns the lessons and stores them in the knowledge base.
+
+        Trivial tasks (single-step, error-free, low tool-call count) are skipped
+        to avoid wasting a ~1024-token LLM call on runs with nothing novel to learn.
+        The caller (loop.py) applies the same guard, but this check ensures the
+        method is safe to call directly from other code paths too.
         """
         from agent.types import TaskStatus
 
         if task.status not in (TaskStatus.COMPLETE, TaskStatus.FAILED):
+            return []
+
+        # Skip trivial tasks — they have no novel failure modes or patterns worth capturing
+        is_trivial = (
+            task.status == TaskStatus.COMPLETE
+            and getattr(task, "iterations", 99) <= 2
+            and getattr(task, "tool_calls_count", 99) < 5
+            and (not task.plan or len(task.plan.steps) <= 1)
+        )
+        if is_trivial:
+            logger.debug(
+                f"Skipping lesson extraction for trivial task {getattr(task, 'id', '?')}"
+            )
             return []
 
         # Build step summary

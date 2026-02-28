@@ -295,6 +295,74 @@ class CouncilSession:
         if self._event_callback:
             await self._event_callback(activity_type, data)
 
+    async def deliberate_lite(
+        self,
+        proposal: str,
+        context: str = "",
+        top_n: int = 3,
+    ) -> CouncilVerdict:
+        """
+        Lightweight council deliberation using only the top-N most expertise-relevant
+        members for this proposal category. No debate round.
+
+        Use for moderate complexity tasks (5.0 < complexity ≤ 7.0) to save ~40–60%
+        of tokens versus a full deliberate() call while still getting meaningful
+        multi-perspective coverage.
+        """
+        verdict = CouncilVerdict(proposal=proposal)
+        category = self._classify_proposal(proposal)
+
+        # Pick top-N roles by expertise weight for this proposal category
+        weights = self.EXPERTISE_WEIGHTS.get(category, self.EXPERTISE_WEIGHTS["general"])
+        sorted_roles = sorted(self._roles, key=lambda r: weights.get(r, 1.0), reverse=True)
+        selected_roles = sorted_roles[:top_n]
+
+        logger.info(
+            f"Council lite: proposal='{category}', "
+            f"members={[r.value for r in selected_roles]}"
+        )
+
+        await self._emit("council_started", {
+            "topic": proposal[:200],
+            "roles": [r.value for r in selected_roles],
+            "member_count": len(selected_roles),
+            "category": category,
+            "mode": "lite",
+        })
+
+        # Parallel evaluation — no debate round
+        semaphore = asyncio.Semaphore(self.MAX_PARALLEL_EVALUATIONS)
+
+        async def evaluate_role(role: CouncilRole) -> CouncilMemberOpinion:
+            async with semaphore:
+                opinion = await self._get_evaluation(role, proposal, context)
+            await self._emit("council_opinion", {
+                "role": role.value,
+                "vote": opinion.vote.value,
+                "confidence": opinion.confidence,
+                "analysis": opinion.analysis[:200],
+            })
+            return opinion
+
+        opinions = await asyncio.gather(*(evaluate_role(role) for role in selected_roles))
+        verdict.opinions = list(opinions)
+
+        self._synthesize_verdict(verdict, category=category)
+
+        await self._emit("council_verdict", {
+            "consensus": verdict.consensus.value if verdict.consensus else "none",
+            "confidence": verdict.consensus_confidence,
+            "has_consensus": verdict.has_consensus,
+            "requires_user_review": verdict.requires_user_review,
+            "mode": "lite",
+        })
+
+        logger.info(
+            f"Council lite verdict: consensus={'yes' if verdict.has_consensus else 'no'}, "
+            f"votes={[o.vote.value for o in verdict.opinions]}"
+        )
+        return verdict
+
     async def deliberate(
         self,
         proposal: str,

@@ -172,8 +172,20 @@ class AgentLoop:
             memory_context = ""
             if self._memory_graph:
                 try:
-                    # Extract key terms from the goal for graph querying
-                    goal_terms = [w for w in task.goal.split() if len(w) > 3][:5]
+                    # Extract meaningful terms — skip stop words, keep technical nouns
+                    _STOP_WORDS = frozenset({
+                        "the", "this", "that", "then", "than", "with", "from", "have",
+                        "will", "your", "what", "when", "where", "how", "should", "would",
+                        "could", "into", "need", "make", "also", "some", "more", "just",
+                        "about", "been", "they", "them", "their", "does", "done", "task",
+                        "using", "which", "these", "those", "here", "there", "after",
+                        "before", "please", "like", "want", "help", "create", "build",
+                    })
+                    goal_terms = [
+                        w.lower().strip(".,!?:;")
+                        for w in task.goal.split()
+                        if len(w) > 3 and w.lower() not in _STOP_WORDS
+                    ][:8]  # up from 5 — more terms = better graph recall
                     memory_context = await self._memory_graph.format_for_prompt(
                         workspace_id=task.workspace_id,
                         query_entities=goal_terms,
@@ -197,7 +209,22 @@ class AgentLoop:
                 if lesson_context:
                     context += f"\n\n{lesson_context}"
                 if memory_context:
-                    context += f"\n\n{memory_context}"
+                    # Deduplicate: skip memory lines whose first 60 chars already
+                    # appear in the lesson context to avoid repeating known facts.
+                    if lesson_context:
+                        lesson_fingerprints = {
+                            line.strip().lower()[:60]
+                            for line in lesson_context.splitlines()
+                            if line.strip()
+                        }
+                        deduped_mem = "\n".join(
+                            line for line in memory_context.splitlines()
+                            if line.strip().lower()[:60] not in lesson_fingerprints
+                        )
+                        if deduped_mem.strip():
+                            context += f"\n\n{deduped_mem}"
+                    else:
+                        context += f"\n\n{memory_context}"
 
                 try:
                     plan = await self._planner.create_plan(
@@ -287,14 +314,27 @@ class AgentLoop:
                 except Exception:
                     pass
 
+                # Council thresholds:
+                #   < 5.0  — skip entirely (cheap tasks, no council needed)
+                #   5.0–7.0 — deliberate_lite(): 3 most relevant members, no debate (~40% cheaper)
+                #   > 7.0  — full deliberate(): all 5 members + optional debate round
                 if hasattr(self, "_council") and self._council and plan_complexity > 5.0:
                     try:
                         plan_text = json.dumps(task.plan.to_dict())
-                        verdict = await self._council.deliberate(
-                            proposal=plan_text,
-                            context=task.goal,
-                            include_debate=_council_debate_enabled()
-                        )
+                        if plan_complexity <= 7.0:
+                            # Moderate complexity — mini council (3 members, no debate)
+                            verdict = await self._council.deliberate_lite(
+                                proposal=plan_text,
+                                context=task.goal,
+                                top_n=3,
+                            )
+                        else:
+                            # High complexity — full council
+                            verdict = await self._council.deliberate(
+                                proposal=plan_text,
+                                context=task.goal,
+                                include_debate=_council_debate_enabled(),
+                            )
                         
                         if verdict.requires_user_review:
                             yield TaskEvent(
@@ -551,10 +591,24 @@ class AgentLoop:
 
             # ── Phase 5: Learn from this task ────────────────────
             if self._learner:
-                try:
-                    await self._learner.extract_lessons(task)
-                except Exception as e:
-                    logger.warning(f"Post-task learning failed: {e}")
+                # Skip extraction for trivial tasks — a 1-step, error-free,
+                # low-tool-call run has nothing novel worth a 1024-token LLM call.
+                _is_trivial = (
+                    task.iterations <= 2
+                    and task.tool_calls_count < 5
+                    and task.status == TaskStatus.COMPLETE
+                    and (not task.plan or len(task.plan.steps) <= 1)
+                )
+                if _is_trivial:
+                    logger.debug(
+                        f"Skipping lesson extraction for trivial task {task.id} "
+                        f"(iterations={task.iterations}, tools={task.tool_calls_count})"
+                    )
+                else:
+                    try:
+                        await self._learner.extract_lessons(task)
+                    except Exception as e:
+                        logger.warning(f"Post-task learning failed: {e}")
 
         except asyncio.CancelledError:
             task.status = TaskStatus.CANCELLED
