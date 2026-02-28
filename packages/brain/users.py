@@ -1,8 +1,12 @@
 """
 User creation and authentication.
 """
+import hashlib
+import hmac
 import uuid
 import logging
+
+import bcrypt
 
 from db import get_pool
 
@@ -10,8 +14,7 @@ logger = logging.getLogger("brain.users")
 
 
 async def create_user(email: str, password: str, display_name: str = "") -> dict:
-    """Create a new user with hashed password."""
-    import bcrypt
+    """Create a new user with bcrypt-hashed password."""
     pool = await get_pool()
     user_id = str(uuid.uuid4())
     salt = ""  # Bcrypt handles salting internally
@@ -27,8 +30,11 @@ async def create_user(email: str, password: str, display_name: str = "") -> dict
 
 
 async def authenticate_user(email: str, password: str) -> dict:
-    """Verify credentials and return user info."""
-    import bcrypt
+    """Verify credentials and return user info.
+
+    If a legacy SHA-256 hash is found and the password is valid,
+    the hash is transparently upgraded to bcrypt in-place.
+    """
     pool = await get_pool()
     row = await pool.fetchrow(
         "SELECT id, email, password_hash, salt, display_name FROM users WHERE email = $1",
@@ -37,16 +43,26 @@ async def authenticate_user(email: str, password: str) -> dict:
     if not row:
         raise ValueError("User not found")
 
-    if row["password_hash"].startswith("$2"):
+    is_bcrypt = row["password_hash"].startswith("$2")
+
+    if is_bcrypt:
         valid = bcrypt.checkpw(password.encode(), row["password_hash"].encode())
     else:
-        # Fallback to legacy SHA-256 for transition
-        import hashlib
+        # Legacy SHA-256 — constant-time comparison to avoid timing attacks
         old_hash = hashlib.sha256((password + row["salt"]).encode()).hexdigest()
-        valid = (old_hash == row["password_hash"])
+        valid = hmac.compare_digest(old_hash, row["password_hash"])
 
     if not valid:
         raise ValueError("Invalid password")
+
+    # Auto-upgrade legacy SHA-256 hashes to bcrypt on successful login
+    if not is_bcrypt:
+        new_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        await pool.execute(
+            "UPDATE users SET password_hash = $1, salt = '' WHERE id = $2",
+            new_hash, row["id"],
+        )
+        logger.info("Upgraded legacy SHA-256 hash to bcrypt for user %s", row["id"])
 
     # Fetch workspace memberships
     memberships = await pool.fetch(

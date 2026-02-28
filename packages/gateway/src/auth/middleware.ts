@@ -34,6 +34,27 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const ACCESS_TOKEN_EXPIRY = process.env.JWT_ACCESS_EXPIRY || '15m';
 const REFRESH_TOKEN_EXPIRY = process.env.JWT_REFRESH_EXPIRY || '7d';
 
+// ── Shared Redis Connection for API Key Validation ──────────────────
+// Reuse a single connection instead of creating one per request.
+
+let _apiKeyRedis: Redis | null = null;
+
+function getApiKeyRedis(): Redis {
+    if (!_apiKeyRedis) {
+        const redisUrl = process.env.REDIS_URL ||
+            `redis://${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || '6379'}`;
+        _apiKeyRedis = new Redis(redisUrl, {
+            lazyConnect: true,
+            maxRetriesPerRequest: 2,
+            enableReadyCheck: true,
+        });
+        _apiKeyRedis.on('error', (err) =>
+            logger.error('API key Redis connection error', { error: err.message })
+        );
+    }
+    return _apiKeyRedis;
+}
+
 // ── Token Generation ─────────────────────────────────────────────────
 
 /**
@@ -127,7 +148,7 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
 
 /**
  * Validate a Kestrel API key (ksk_{keyId}_{secret}) against Redis.
- * Returns the user info if valid, or null if invalid/expired.
+ * Uses the shared Redis connection instead of creating one per request.
  */
 async function validateApiKey(fullKey: string): Promise<{ userId: string; email: string; workspaces: any[] } | null> {
     try {
@@ -136,23 +157,16 @@ async function validateApiKey(fullKey: string): Promise<{ userId: string; email:
         if (parts.length < 3 || parts[0] !== 'ksk') return null;
         const keyId = parts[1];
 
-        const redisHost = process.env.REDIS_HOST || 'localhost';
-        const redisPort = process.env.REDIS_PORT || '6379';
-        const redis = new Redis(`redis://${redisHost}:${redisPort}`);
+        const redis = getApiKeyRedis();
+        const raw = await redis.get(`apikey:${keyId}`);
+        if (!raw) return null;
 
-        try {
-            const raw = await redis.get(`apikey:${keyId}`);
-            if (!raw) return null;
-
-            const data = JSON.parse(raw);
-            return {
-                userId: data.userId,
-                email: data.email,
-                workspaces: [],  // API keys don't carry workspace memberships
-            };
-        } finally {
-            await redis.quit();
-        }
+        const data = JSON.parse(raw);
+        return {
+            userId: data.userId,
+            email: data.email,
+            workspaces: [],  // API keys don't carry workspace memberships
+        };
     } catch (err) {
         logger.error('API key validation error', { error: (err as Error).message });
         return null;

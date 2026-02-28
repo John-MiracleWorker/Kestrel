@@ -27,7 +27,10 @@ logger = logging.getLogger("brain")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 
 # ── Configuration (canonical definitions in core.config / core.prompts) ──
-from core.config import GRPC_PORT, GRPC_HOST
+from core.config import GRPC_PORT, GRPC_HOST, validate_config
+
+# Validate configuration before any heavy initialization
+validate_config()
 
 # ── Agent Runtime Globals ─────────────────────────────────────────────
 from memory.vector_store import VectorStore

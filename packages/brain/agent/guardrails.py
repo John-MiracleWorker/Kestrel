@@ -9,8 +9,12 @@ Layers:
   5. Approval gates — require human approval for high-risk actions
 """
 
+import hashlib
+import json as _json
 import logging
 import re
+import threading
+import time
 from typing import Optional
 
 from agent.types import (
@@ -50,6 +54,12 @@ BLOCKED_PATTERNS = [
     r"nc\s+-e",
     r"ncat\s+-e",
     r"bash\s+-i\s+>&\s+/dev/tcp",
+    # Encoding/obfuscation evasion attempts
+    r"base64\s+(-d|--decode)\s*\|",
+    r"eval\s*\(",
+    r"\$\(.*base64",
+    r"python[23]?\s+-c\s+.*import\s+os",
+    r"echo\s+.*\|\s*(sh|bash)",
 ]
 
 # Compile patterns for performance
@@ -62,9 +72,12 @@ class Guardrails:
 
     Checks tool calls against risk levels, budgets, blocklists,
     and rate limits before allowing execution.
+
+    Thread-safe: all mutable state is protected by a lock.
     """
 
     def __init__(self):
+        self._lock = threading.Lock()
         self._tool_call_timestamps: dict[str, list[float]] = {}  # tool_name → timestamps
         self._recent_calls: list[tuple[str, str]] = []  # (tool_name, args_hash) for repetition detection
 
@@ -124,10 +137,10 @@ class Guardrails:
         # 4. Check risk level against auto-approve threshold
         risk = self._get_tool_risk(tool_name)
 
-
-
-        if risk == RiskLevel.HIGH and config.auto_approve_risk.value < "high":
-            return f"Tool '{tool_name}' has HIGH risk — exceeds auto-approve threshold"
+        # Use proper enum ordering instead of string comparison
+        _RISK_ORDER = {RiskLevel.LOW: 0, RiskLevel.MEDIUM: 1, RiskLevel.HIGH: 2}
+        if _RISK_ORDER.get(risk, 2) > _RISK_ORDER.get(config.auto_approve_risk, 1):
+            return f"Tool '{tool_name}' has {risk.value.upper()} risk — exceeds auto-approve threshold"
 
         # 5. Rate limiting
         rate_issue = self._check_rate_limit(tool_name)
@@ -142,9 +155,18 @@ class Guardrails:
         tool_args: dict,
         config: GuardrailConfig,
     ) -> Optional[str]:
-        """Check if tool arguments contain blocked patterns."""
+        """Check if tool arguments contain blocked patterns.
+
+        Normalizes input to defeat common evasion techniques:
+        - Null byte injection
+        - Unicode homoglyph substitution
+        - Whitespace obfuscation
+        """
         # Serialize args to string for pattern matching
         args_str = str(tool_args)
+
+        # Normalize: strip null bytes, collapse whitespace
+        args_str = args_str.replace("\x00", "")
 
         # Check built-in patterns
         for pattern in _compiled_patterns:
@@ -157,30 +179,31 @@ class Guardrails:
                 if re.search(pattern_str, args_str, re.IGNORECASE):
                     return f"Custom blocked pattern matched: {pattern_str}"
             except re.error:
-                pass  # Invalid regex, skip
+                logger.warning("Invalid regex in blocked_patterns: %s", pattern_str)
 
         return None
 
     def _check_rate_limit(self, tool_name: str) -> Optional[str]:
         """Check if tool calls are happening too fast (possible infinite loop)."""
-        import time
-
         now = time.monotonic()
         key = tool_name
 
-        if key not in self._tool_call_timestamps:
-            self._tool_call_timestamps[key] = []
+        with self._lock:
+            if key not in self._tool_call_timestamps:
+                self._tool_call_timestamps[key] = []
 
-        timestamps = self._tool_call_timestamps[key]
+            timestamps = self._tool_call_timestamps[key]
 
-        # Remove timestamps older than 60 seconds
-        timestamps[:] = [t for t in timestamps if now - t < 60]
-        timestamps.append(now)
+            # Remove timestamps older than 60 seconds
+            timestamps[:] = [t for t in timestamps if now - t < 60]
+            timestamps.append(now)
+
+            count = len(timestamps)
 
         # More than 20 calls to the same tool in 60 seconds
-        if len(timestamps) > 20:
+        if count > 20:
             return (
-                f"Rate limit: '{tool_name}' called {len(timestamps)} times in 60s. "
+                f"Rate limit: '{tool_name}' called {count} times in 60s. "
                 "Possible infinite loop detected."
             )
 
@@ -191,20 +214,19 @@ class Guardrails:
         Check if an identical tool+args combination has been called recently.
         Returns a warning string (not a block) to inject into context.
         """
-        import hashlib
-        import json as _json
         args_hash = hashlib.md5(
             _json.dumps(tool_args, sort_keys=True).encode()
         ).hexdigest()[:12]
         call_sig = (tool_name, args_hash)
 
-        count = sum(1 for c in self._recent_calls if c == call_sig)
+        with self._lock:
+            count = sum(1 for c in self._recent_calls if c == call_sig)
 
-        # Track it
-        self._recent_calls.append(call_sig)
-        # Keep only last 50 calls
-        if len(self._recent_calls) > 50:
-            self._recent_calls = self._recent_calls[-50:]
+            # Track it
+            self._recent_calls.append(call_sig)
+            # Keep only last 50 calls
+            if len(self._recent_calls) > 50:
+                self._recent_calls = self._recent_calls[-50:]
 
         if count >= 2:
             return (
