@@ -317,6 +317,7 @@ async def start_watchdog(filepath: str, backup_path: str, seconds: int = 300):
             logger.info(f"Watchdog started for {rel} ({seconds}s)")
             start_time = time.monotonic()
             baseline_errors = _count_recent_errors()
+            baseline_rate = max(baseline_errors, 1)  # Avoid division by zero
 
             while time.monotonic() - start_time < seconds:
                 await asyncio.sleep(30)  # Check every 30s
@@ -324,14 +325,19 @@ async def start_watchdog(filepath: str, backup_path: str, seconds: int = 300):
                 current_errors = _count_recent_errors()
                 new_errors = current_errors - baseline_errors
 
-                if new_errors > 5:
+                # Adaptive threshold: require BOTH an absolute minimum (5 errors)
+                # AND a significant rate increase (50%+) over the pre-patch baseline.
+                # This prevents false rollbacks from unrelated log noise.
+                error_rate_increase = new_errors / baseline_rate
+
+                if new_errors > 5 and error_rate_increase > 0.5:
                     logger.warning(
-                        f"Watchdog: {new_errors} new errors after patching {rel}. "
-                        f"Auto-rolling back!"
+                        f"Watchdog: {new_errors} new errors after patching {rel} "
+                        f"(rate increase: {error_rate_increase:.0%}). Auto-rolling back!"
                     )
                     result = rollback(abs_path, backup_path)
                     _record_history(rel, "auto_rollback", {
-                        "reason": f"{new_errors} errors in {int(time.monotonic() - start_time)}s",
+                        "reason": f"{new_errors} errors ({error_rate_increase:.0%} increase) in {int(time.monotonic() - start_time)}s",
                         "rollback_result": result,
                     })
 
@@ -341,14 +347,14 @@ async def start_watchdog(filepath: str, backup_path: str, seconds: int = 300):
                         _send_summary_to_telegram(
                             f"⚠️ <b>Auto-Rollback</b>\n\n"
                             f"File: <code>{rel}</code>\n"
-                            f"Reason: {new_errors} errors detected after patch\n"
+                            f"Reason: {new_errors} errors detected ({error_rate_increase:.0%} increase)\n"
                             f"Status: {'✅ Restored' if result.get('success') else '❌ Rollback failed'}"
                         )
                     except Exception:
                         pass
                     return
 
-            logger.info(f"Watchdog: {rel} stable for {seconds}s. Patch is good! ✅")
+            logger.info(f"Watchdog: {rel} stable for {seconds}s. Patch is good!")
             _record_history(rel, "watchdog_passed", {
                 "duration_seconds": seconds,
             })
@@ -490,6 +496,90 @@ async def _council_review(proposal: dict, patch_summary: str) -> dict:
         return {"approved": True, "verdict": None, "skipped": True, "error": str(e)}
 
 
+async def _generate_and_run_smoke_test(
+    proposal: dict,
+    filepath: str,
+    patched_content: str,
+) -> Optional[dict]:
+    """Generate a focused smoke test for the patch using LLM and run it.
+
+    Returns None if test generation is unavailable, or a dict with
+    'passed' (bool) and 'error' (str) keys.
+    """
+    import subprocess
+    import tempfile
+
+    description = proposal.get("description", "")
+    suggestion = proposal.get("suggestion", "")
+
+    # Read original content for context
+    try:
+        with open(filepath, "r") as f:
+            original_content = f.read()
+    except Exception:
+        return None
+
+    # Use a lightweight LLM call to generate a pytest smoke test
+    try:
+        from core.runtime import get_runtime
+        rt = get_runtime()
+        provider = rt.llm_provider
+        model = rt.model
+
+        prompt = (
+            f"Generate a single, focused pytest test function that validates "
+            f"the following code change.\n\n"
+            f"Change description: {description[:200]}\n"
+            f"Suggestion: {suggestion[:200]}\n\n"
+            f"The test should import from a temporary module and verify the "
+            f"specific behavior that changed. Output ONLY the Python test code, "
+            f"no explanation.\n\n"
+            f"Patched file content (first 500 chars):\n"
+            f"```python\n{patched_content[:500]}\n```"
+        )
+
+        response = await provider.generate(
+            messages=[{"role": "user", "content": prompt}],
+            model=model,
+            temperature=0.1,
+            max_tokens=512,
+        )
+        test_code = response if isinstance(response, str) else response.get("content", "")
+
+        # Strip markdown fences
+        if "```python" in test_code:
+            test_code = test_code.split("```python")[1].split("```")[0]
+        elif "```" in test_code:
+            test_code = test_code.split("```")[1].split("```")[0]
+
+        if not test_code.strip():
+            return None
+
+        # Write and run the smoke test
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix="_smoke_test.py", delete=False
+        ) as f:
+            f.write(test_code.strip())
+            test_file = f.name
+
+        try:
+            result = subprocess.run(
+                ["python", "-m", "pytest", test_file, "-x", "--timeout=15", "-q"],
+                capture_output=True, text=True, timeout=30,
+            )
+            return {
+                "passed": result.returncode == 0,
+                "output": result.stdout[-300:] if result.stdout else "",
+                "error": result.stderr[-200:] if result.returncode != 0 else None,
+            }
+        finally:
+            os.unlink(test_file)
+
+    except Exception as e:
+        logger.debug(f"Smoke test generation/execution failed: {e}")
+        return None
+
+
 async def apply_proposal(proposal: dict) -> dict:
     """
     Full self-improvement pipeline:
@@ -567,6 +657,20 @@ async def apply_proposal(proposal: dict) -> dict:
         results["success"] = False
         results["error"] = f"Patch has syntax error: {syntax_err}"
         return results
+
+    # Stage 2b: Smoke test generation (optional — skipped if test generation fails)
+    try:
+        smoke_result = await _generate_and_run_smoke_test(
+            proposal, abs_path, new_content
+        )
+        results["stages"]["smoke_test"] = smoke_result
+        if smoke_result and not smoke_result.get("passed", True):
+            results["success"] = False
+            results["error"] = f"Smoke test failed: {smoke_result.get('error', 'unknown')}"
+            return results
+    except Exception as e:
+        logger.debug(f"Smoke test stage skipped: {e}")
+        results["stages"]["smoke_test"] = {"skipped": True, "reason": str(e)}
 
     # Stage 3: Backup
     backup_path = backup_file(abs_path)

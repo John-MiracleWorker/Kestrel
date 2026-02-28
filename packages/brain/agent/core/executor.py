@@ -10,6 +10,7 @@ from agent.types import (
     AgentTask,
     ApprovalRequest,
     ApprovalStatus,
+    RiskLevel,
     StepStatus,
     TaskEvent,
     TaskEventType,
@@ -22,14 +23,23 @@ from agent.observability import MetricsCollector
 from agent.evidence import EvidenceChain
 from agent.model_router import ModelRouter
 from agent.core.verifier import VerifierEngine
-from agent.diagnostics import DiagnosticTracker
+from agent.diagnostics import DiagnosticTracker, classify_error, ErrorCategory
 
 logger = logging.getLogger("brain.agent.core.executor")
 
 # ── Constants ────────────────────────────────────────────────────────
-MAX_PARALLEL_TOOLS = 5       # Max concurrent tool executions per turn
+MAX_PARALLEL_TOOLS = 5       # Max concurrent tool executions per turn (default fallback)
 RETRY_MAX_ATTEMPTS = 3       # Max retries for transient tool failures
 RETRY_BASE_DELAY_S = 1.0     # Base delay for exponential backoff
+
+# ── Error categories that should never be retried ────────────────────
+_NO_RETRY_CATEGORIES = frozenset({
+    ErrorCategory.AUTH,
+    ErrorCategory.NOT_FOUND,
+    ErrorCategory.DEPENDENCY,
+    ErrorCategory.SEMANTIC,
+    ErrorCategory.IMPOSSIBLE,
+})
 
 # ── System Prompt for the Reasoning LLM ──────────────────────────────
 AGENT_SYSTEM_PROMPT = """\
@@ -116,6 +126,32 @@ class TaskExecutor:
             self._step_diagnostics[step_id] = DiagnosticTracker()
         return self._step_diagnostics[step_id]
 
+    def _compute_parallel_limit(self, tool_calls: list[dict]) -> int:
+        """Dynamic parallelism: lower for risky tools, higher for safe ones.
+
+        Returns:
+            2 if any tool in the batch is HIGH risk
+            4 if any tool is MEDIUM risk
+            8 if all tools are LOW risk (reads, searches)
+        """
+        has_high = False
+        has_medium = False
+        for tc in tool_calls:
+            name = tc.get("function", {}).get("name", "")
+            risk = self._tools.get_risk_level(name)
+            if risk == RiskLevel.HIGH:
+                has_high = True
+                break
+            elif risk == RiskLevel.MEDIUM:
+                has_medium = True
+
+        if has_high:
+            return 2
+        elif has_medium:
+            return 4
+        else:
+            return 8
+
     async def _wait_for_approval(self, task: AgentTask) -> bool:
         """
         Block until the pending approval is resolved.
@@ -147,6 +183,14 @@ class TaskExecutor:
         tool_context: dict,
         max_attempts: int = RETRY_MAX_ATTEMPTS,
     ) -> ToolResult:
+        """Execute a tool with smart retry based on error classification.
+
+        Uses the DiagnosticTracker's classify_error() to determine retry strategy:
+        - TRANSIENT: retry with exponential backoff (up to max_attempts)
+        - SERVER_CRASH: one retry after a longer 5s delay for process recovery
+        - UNKNOWN: one retry only
+        - AUTH/NOT_FOUND/DEPENDENCY/SEMANTIC/IMPOSSIBLE: fail immediately
+        """
         last_result = None
         for attempt in range(max_attempts):
             result = await self._tools.execute(tool_call, context=tool_context)
@@ -160,13 +204,15 @@ class TaskExecutor:
                 )
                 return result
 
-            error_lower = (result.error or "").lower()
-            is_transient = any(kw in error_lower for kw in [
-                "timeout", "rate limit", "connection", "network",
-                "503", "502", "429", "temporarily unavailable",
-            ])
+            # Classify the error to decide retry strategy
+            category, hint = classify_error(result.error or "")
 
-            if not is_transient or attempt == max_attempts - 1:
+            # Non-retryable errors: fail immediately
+            if category in _NO_RETRY_CATEGORIES:
+                logger.info(
+                    f"Tool {tool_call.name} failed with non-retryable error "
+                    f"[{category.value}]: {hint}"
+                )
                 self._metrics.record_tool_execution(
                     tool_name=tool_call.name,
                     execution_time_ms=result.execution_time_ms,
@@ -174,11 +220,49 @@ class TaskExecutor:
                 )
                 return result
 
-            delay = RETRY_BASE_DELAY_S * (2 ** attempt)
+            # Server crash: allow exactly one retry with longer delay
+            if category == ErrorCategory.SERVER_CRASH and attempt >= 1:
+                logger.info(
+                    f"Tool {tool_call.name} server crash persists after retry — giving up"
+                )
+                self._metrics.record_tool_execution(
+                    tool_name=tool_call.name,
+                    execution_time_ms=result.execution_time_ms,
+                    success=False,
+                )
+                return result
+
+            # Unknown errors: allow exactly one retry
+            if category == ErrorCategory.UNKNOWN and attempt >= 1:
+                logger.info(
+                    f"Tool {tool_call.name} unknown error persists after retry — giving up"
+                )
+                self._metrics.record_tool_execution(
+                    tool_name=tool_call.name,
+                    execution_time_ms=result.execution_time_ms,
+                    success=False,
+                )
+                return result
+
+            # Last attempt exhausted
+            if attempt == max_attempts - 1:
+                self._metrics.record_tool_execution(
+                    tool_name=tool_call.name,
+                    execution_time_ms=result.execution_time_ms,
+                    success=False,
+                )
+                return result
+
+            # Retryable: compute delay based on error type
+            if category == ErrorCategory.SERVER_CRASH:
+                delay = 5.0  # Longer delay for crash recovery
+            else:
+                delay = RETRY_BASE_DELAY_S * (2 ** attempt)
+
             logger.info(
-                f"Retrying {tool_call.name} after transient failure "
+                f"Retrying {tool_call.name} after [{category.value}] failure "
                 f"(attempt {attempt + 1}/{max_attempts}, delay {delay:.1f}s): "
-                f"{result.error[:100]}"
+                f"{(result.error or '')[:100]}"
             )
             await asyncio.sleep(delay)
 
@@ -218,7 +302,8 @@ class TaskExecutor:
                 f"({', '.join(tc.get('function', {}).get('name', '?') for tc in parallel_batch)})"
             )
 
-            semaphore = asyncio.Semaphore(MAX_PARALLEL_TOOLS)
+            parallel_limit = self._compute_parallel_limit(parallel_batch)
+            semaphore = asyncio.Semaphore(parallel_limit)
 
             async def _run_one(tc_data: dict) -> tuple[dict, ToolCall, ToolResult]:
                 async with semaphore:

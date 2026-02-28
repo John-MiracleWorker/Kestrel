@@ -128,6 +128,77 @@ class AgentLoop:
         # Callback for approval resolution (set by the gRPC handler)
         self._approval_callback: Optional[Callable] = None
 
+    def _should_replan(self, task: AgentTask) -> bool:
+        """Drift-based replanning: replan when the plan is going off-track,
+        not on a fixed iteration interval.
+
+        Triggers replanning when:
+        - 2+ consecutive recent step failures (plan is stale)
+        - On track to exceed 80% of the iteration budget
+        - Fallback: every 8 iterations (relaxed from 5)
+
+        Caps total replans at 3 per task.
+        """
+        if task.plan.revision_count >= 3:
+            return False
+
+        # Count consecutive recent failures (last 3 steps)
+        recent_steps = [s for s in task.plan.steps if s.status in (StepStatus.COMPLETE, StepStatus.FAILED)]
+        recent_failures = 0
+        for s in reversed(recent_steps[-3:]):
+            if s.status == StepStatus.FAILED:
+                recent_failures += 1
+            else:
+                break
+        if recent_failures >= 2:
+            return True
+
+        # Check if on track to exceed iteration budget
+        done_count = sum(1 for s in task.plan.steps if s.status == StepStatus.COMPLETE)
+        total_count = len(task.plan.steps)
+        if done_count > 0 and total_count > 0:
+            projected_iterations = task.iterations * (total_count / done_count)
+            if projected_iterations > task.config.max_iterations * 0.8:
+                return True
+
+        # Relaxed fallback: every 8 iterations
+        return task.iterations % 8 == 0
+
+    def _should_skip_council(self, task: AgentTask, plan_complexity: float) -> bool:
+        """Skip council deliberation for demonstrably safe plans.
+
+        A plan is safe when ALL of these hold:
+        - Complexity is below 6.5 (moderate tasks)
+        - All plan steps use only LOW risk tools
+        - No steps mention security-sensitive operations
+
+        Saves 3-5 LLM calls for simple, low-risk tasks.
+        """
+        if plan_complexity >= 6.5:
+            return False
+
+        if not task.plan or not task.plan.steps:
+            return False
+
+        for step in task.plan.steps:
+            # Check tool calls for risk levels
+            for tc in step.tool_calls:
+                tool_name = tc.get("tool", tc.get("function", {}).get("name", ""))
+                if tool_name:
+                    risk = self._tools.get_risk_level(tool_name)
+                    if risk != RiskLevel.LOW:
+                        return False
+            # Check description for security-sensitive keywords
+            desc_lower = step.description.lower()
+            if any(kw in desc_lower for kw in ("delete", "deploy", "credential", "secret", "admin", "sudo", "production")):
+                return False
+
+        logger.debug(
+            f"Council skip: all {len(task.plan.steps)} steps are LOW risk "
+            f"(complexity={plan_complexity:.1f})"
+        )
+        return True
+
     async def run(self, task: AgentTask) -> AsyncIterator[TaskEvent]:
         """
         Execute an agent task, yielding events as they occur.
@@ -316,9 +387,14 @@ class AgentLoop:
 
                 # Council thresholds:
                 #   < 5.0  — skip entirely (cheap tasks, no council needed)
+                #   5.0–6.5 + all LOW risk — skip (proactive safe-plan bypass)
                 #   5.0–7.0 — deliberate_lite(): 3 most relevant members, no debate (~40% cheaper)
                 #   > 7.0  — full deliberate(): all 5 members + optional debate round
-                if hasattr(self, "_council") and self._council and plan_complexity > 5.0:
+                if (
+                    hasattr(self, "_council") and self._council
+                    and plan_complexity > 5.0
+                    and not self._should_skip_council(task, plan_complexity)
+                ):
                     try:
                         plan_text = json.dumps(task.plan.to_dict())
                         if plan_complexity <= 7.0:
@@ -465,6 +541,32 @@ class AgentLoop:
                             content=step.result or "",
                             progress=self._progress(task),
                         )
+                        # Online learning: capture recovery patterns mid-execution
+                        if step.attempts > 1 and self._learner:
+                            try:
+                                from agent.learner import Lesson
+                                recovery_lesson = Lesson(
+                                    category="pattern",
+                                    summary=f"Recovery: {step.description[:80]}",
+                                    details=(
+                                        f"Step failed {step.attempts - 1} time(s) before succeeding. "
+                                        f"Error was: {(step.error or 'unknown')[:200]}"
+                                    ),
+                                    tools_used=[],
+                                    success=True,
+                                    confidence=0.7,
+                                    tags=["mid_execution", "recovery"],
+                                    source_task_id=task.id,
+                                )
+                                await self._learner._store_lessons(
+                                    task.workspace_id, [recovery_lesson]
+                                )
+                                logger.debug(
+                                    f"Mid-execution lesson captured for step "
+                                    f"'{step.description[:40]}' (attempts={step.attempts})"
+                                )
+                            except Exception as e:
+                                logger.debug(f"Mid-execution lesson capture failed: {e}")
                         break
 
                     if step.status == StepStatus.FAILED:
@@ -498,8 +600,7 @@ class AgentLoop:
                     budget_ok
                     and step
                     and step.status == StepStatus.COMPLETE
-                    and task.iterations % 5 == 0
-                    and task.plan.revision_count < 3
+                    and self._should_replan(task)
                 ):
                     task.status = TaskStatus.REFLECTING
                     await self._persistence.update_task(task)

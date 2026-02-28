@@ -146,19 +146,47 @@ def register_mcp_tools(registry, pool=None) -> None:
         """Search for MCP servers matching a query."""
         query_lower = query.lower()
 
-        # 1. Search built-in catalog (instant, always available)
+        # 0. Merge workspace-installed servers into the search catalog
+        workspace_servers: list[dict] = []
+        ws_id = _current_workspace_id or ""
+        if pool and ws_id:
+            try:
+                async with pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        """SELECT name, description, server_url, transport
+                           FROM installed_tools
+                           WHERE workspace_id = $1 AND enabled = true""",
+                        ws_id,
+                    )
+                for r in rows:
+                    workspace_servers.append({
+                        "name": r["name"],
+                        "description": r["description"] or "",
+                        "install": r["server_url"],
+                        "transport": r["transport"] or "stdio",
+                        "category": "workspace",
+                        "source": "installed",
+                    })
+            except Exception as e:
+                logger.debug(f"Failed to load workspace MCP servers: {e}")
+
+        # 1. Search built-in catalog + workspace-installed servers
+        combined_catalog = BUILTIN_CATALOG + workspace_servers
         results = []
-        for server in BUILTIN_CATALOG:
+        for server in combined_catalog:
             score = 0
             if query_lower in server["name"].lower():
                 score += 3
-            if query_lower in server["description"].lower():
+            if query_lower in server.get("description", "").lower():
                 score += 2
             if category and category.lower() == server.get("category", ""):
                 score += 2
+            # Workspace-installed servers get a relevance boost
+            if server.get("source") == "installed":
+                score += 1
             # Check word-level matches
             for word in query_lower.split():
-                if word in server["description"].lower():
+                if word in server.get("description", "").lower():
                     score += 1
                 if word in server["name"].lower():
                     score += 1
@@ -529,6 +557,18 @@ def register_mcp_tools(registry, pool=None) -> None:
                         if val:
                             env[required_var] = val
                 break
+
+        # Pre-call health check: verify existing connection is healthy
+        existing = await mcp_pool.get_client(name)
+        if existing and existing.connected:
+            return {
+                "already_connected": True,
+                "server": existing.server_info,
+                "tools": [
+                    {"name": t["name"], "description": t.get("description", "")}
+                    for t in existing.tools
+                ],
+            }
 
         result = await mcp_pool.connect(name, command, env)
         return result

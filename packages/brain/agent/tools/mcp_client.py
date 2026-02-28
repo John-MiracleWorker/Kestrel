@@ -352,10 +352,43 @@ class MCPClient:
 
 
 class MCPConnectionPool:
-    """Manages multiple MCP server connections."""
+    """Manages multiple MCP server connections with proactive health monitoring."""
 
     def __init__(self):
         self._connections: dict[str, MCPClient] = {}
+        self._health_task: Optional[asyncio.Task] = None
+
+    def start_health_monitor(self, interval_seconds: int = 60):
+        """Start background health monitoring that prunes dead connections."""
+        if self._health_task is not None and not self._health_task.done():
+            return  # Already running
+        self._health_task = asyncio.create_task(
+            self._health_loop(interval_seconds)
+        )
+
+    async def _health_loop(self, interval: int):
+        """Periodically check all MCP connections and remove dead ones."""
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                results = await self.health_check()
+                dead = [name for name, status in results.items() if status == "dead"]
+                if dead:
+                    logger.warning(
+                        f"MCP health sweep: {len(dead)} dead connection(s) removed: {dead}"
+                    )
+                    for name in dead:
+                        self._connections.pop(name, None)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"MCP health loop error: {e}")
+
+    def stop_health_monitor(self):
+        """Stop the background health monitor."""
+        if self._health_task and not self._health_task.done():
+            self._health_task.cancel()
+            self._health_task = None
 
     async def connect(
         self, name: str, command: str, env: Optional[dict] = None
@@ -393,10 +426,21 @@ class MCPConnectionPool:
         return result
 
     async def get_client(self, name: str) -> Optional[MCPClient]:
-        """Get a connected client by name."""
+        """Get a connected client by name, attempting auto-reconnect if disconnected."""
         client = self._connections.get(name)
-        if client and client.connected:
+        if not client:
+            return None
+        if client.connected:
             return client
+        # Attempt auto-reconnect for known but disconnected clients
+        try:
+            logger.info(f"MCP '{name}': auto-reconnecting disconnected client")
+            await client._try_reconnect()
+            if client.connected:
+                logger.info(f"MCP '{name}': auto-reconnect successful")
+                return client
+        except Exception as e:
+            logger.warning(f"MCP '{name}': auto-reconnect failed: {e}")
         return None
 
     async def disconnect(self, name: str) -> dict:
