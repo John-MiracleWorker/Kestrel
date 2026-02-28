@@ -34,8 +34,24 @@ class SpecialistConfig:
     name: str
     persona: str
     allowed_tools: list[str]
+    adjacent_tools: list[str] = None  # Auxiliary tools available as fallback
     max_iterations: int = 15
     max_tool_calls: int = 30
+
+    def __post_init__(self):
+        if self.adjacent_tools is None:
+            self.adjacent_tools = []
+
+
+# Relative complexity weights per specialist — used for proportional token budget allocation
+_SPECIALIST_WEIGHT: dict[str, float] = {
+    "researcher": 1.0,
+    "coder": 1.5,        # Code generation needs more tokens
+    "analyst": 1.3,      # Data analysis needs reasoning space
+    "reviewer": 0.6,     # Read-only, less output
+    "explorer": 1.2,     # File traversal + synthesis
+    "synthesizer": 0.8,  # Summary tasks
+}
 
 
 SPECIALISTS = {
@@ -50,6 +66,7 @@ SPECIALISTS = {
             "web_search", "web_browse", "memory_search", "memory_store",
             "ask_human", "task_complete",
         ],
+        adjacent_tools=["code_execute", "file_read"],
     ),
     "coder": SpecialistConfig(
         name="Coder",
@@ -62,6 +79,7 @@ SPECIALISTS = {
             "code_execute", "file_read", "file_write", "file_list",
             "memory_search", "ask_human", "task_complete",
         ],
+        adjacent_tools=["web_search", "host_read", "host_find", "host_search"],
     ),
     "analyst": SpecialistConfig(
         name="Data Analyst",
@@ -75,6 +93,7 @@ SPECIALISTS = {
             "memory_search", "memory_store", "file_write",
             "ask_human", "task_complete",
         ],
+        adjacent_tools=["web_search", "file_read"],
     ),
     "reviewer": SpecialistConfig(
         name="Reviewer",
@@ -87,6 +106,7 @@ SPECIALISTS = {
             "file_read", "file_list", "memory_search", "database_query",
             "ask_human", "task_complete",
         ],
+        adjacent_tools=["host_read", "host_search"],
     ),
     "explorer": SpecialistConfig(
         name="Code Explorer",
@@ -173,17 +193,29 @@ class Coordinator:
             "tools": spec.allowed_tools,
         })
 
-        # Determine child token budget
-        child_max_tokens = max_tokens_override or (parent_task.config.max_tokens // 3)
+        # Determine child token budget (weighted by specialist complexity)
+        if max_tokens_override:
+            child_max_tokens = max_tokens_override
+        else:
+            weight = _SPECIALIST_WEIGHT.get(specialist_type, 1.0)
+            child_max_tokens = int((parent_task.config.max_tokens // 3) * weight)
 
         # Create child task
         import uuid
+        # Enrich persona with adjacent tool guidance
+        persona_suffix = ""
+        if spec.adjacent_tools:
+            persona_suffix = (
+                f"\n\nYou also have access to these auxiliary tools: {spec.adjacent_tools}. "
+                "Only use them when your primary tools are insufficient for the task."
+            )
+
         child_task = AgentTask(
             id=str(uuid.uuid4()),
             user_id=parent_task.user_id,
             workspace_id=parent_task.workspace_id,
             conversation_id=parent_task.conversation_id,
-            goal=f"[{spec.name}] {goal}",
+            goal=f"[{spec.name}] {goal}{persona_suffix}",
             status=TaskStatus.PLANNING,
             config=GuardrailConfig(
                 max_iterations=spec.max_iterations,
@@ -211,8 +243,9 @@ class Coordinator:
             f"(child={child_task.id}, parent={parent_task.id})"
         )
 
-        # Create a filtered tool registry for the specialist
-        filtered_registry = self._full_registry.filter(spec.allowed_tools)
+        # Create a filtered tool registry including adjacent (auxiliary) tools
+        all_tools = spec.allowed_tools + spec.adjacent_tools
+        filtered_registry = self._full_registry.filter(all_tools)
 
         # Build a child loop with filtered tools
         from agent.loop import AgentLoop
@@ -295,14 +328,18 @@ class Coordinator:
             subtasks = subtasks[:max_parallel]
             logger.warning(f"Capped parallel subtasks to {max_parallel}")
 
-        # Smarter token budget: divide parent budget evenly across children
-        # while leaving headroom for the parent's own continuation.
-        # Formula: parent_budget / (n_children + 1), floored at 8192.
+        # Weight-proportional token budget: each specialist gets tokens
+        # proportional to their complexity weight, with 20% reserved for parent.
         n_children = len(subtasks)
-        child_token_budget = max(
-            parent_task.config.max_tokens // (n_children + 1),
-            8192,
+        parent_reserve = int(parent_task.config.max_tokens * 0.2)
+        distributable = parent_task.config.max_tokens - parent_reserve
+
+        total_weight = sum(
+            _SPECIALIST_WEIGHT.get(s.get("specialist", "explorer"), 1.0)
+            for s in subtasks
         )
+        # Default to even split (old behavior) if weights sum to 0
+        child_token_budget = max(distributable // max(n_children, 1), 8192)
 
         await self._emit("parallel_delegation_started", {
             "count": len(subtasks),
@@ -316,10 +353,13 @@ class Coordinator:
         async def _run_one(subtask: dict, index: int) -> str:
             goal = subtask.get("goal", "")
             specialist = subtask.get("specialist", "explorer")
+            # Per-specialist weighted budget
+            spec_weight = _SPECIALIST_WEIGHT.get(specialist, 1.0)
+            spec_budget = max(int(distributable * spec_weight / total_weight), 8192)
             try:
                 result = await self.delegate(
                     parent_task, goal, specialist,
-                    max_tokens_override=child_token_budget,
+                    max_tokens_override=spec_budget,
                 )
                 return result
             except Exception as e:

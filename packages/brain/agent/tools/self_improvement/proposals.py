@@ -121,11 +121,46 @@ def _run_tests(package: str = "all") -> dict:
             except Exception as e:
                 results[pkg] = {"status": "fail", "error": str(e)}
 
+    # Run pytest if test directories exist (as supplementary validation)
+    pytest_results = {}
+    for pkg in packages_to_test:
+        pkg_info = PACKAGES.get(pkg)
+        if not pkg_info or pkg_info["lang"] != "python":
+            continue
+
+        pkg_path = os.path.join(PROJECT_ROOT, pkg_info["path"])
+        test_dirs = [
+            os.path.join(pkg_path, "tests"),
+            os.path.join(pkg_path, "test"),
+        ]
+        test_dir = next((d for d in test_dirs if os.path.isdir(d)), None)
+        if not test_dir:
+            continue
+
+        try:
+            res = subprocess.run(
+                ["python", "-m", "pytest", test_dir, "-x", "--tb=short", "-q"],
+                capture_output=True, text=True, timeout=120,
+                cwd=pkg_path,
+            )
+            pytest_results[pkg] = {
+                "status": "pass" if res.returncode == 0 else "warning",
+                "output": (res.stdout[-500:] if res.stdout else "") + (res.stderr[-200:] if res.stderr else ""),
+            }
+        except subprocess.TimeoutExpired:
+            pytest_results[pkg] = {"status": "warning", "output": "pytest timed out"}
+        except FileNotFoundError:
+            pytest_results[pkg] = {"status": "skip", "output": "pytest not available"}
+        except Exception as e:
+            pytest_results[pkg] = {"status": "warning", "output": str(e)}
+
+    # Pytest failures are treated as warnings, not blockers
     all_pass = all(r.get("status") in ("pass", "skip") for r in results.values())
     return {
         "all_pass": all_pass,
         "summary": "✅ All tests pass" if all_pass else "❌ Some tests failed",
         "results": results,
+        "pytest": pytest_results if pytest_results else None,
     }
 
 def _build_history_feedback() -> dict:

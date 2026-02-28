@@ -107,9 +107,10 @@ class ToolRegistry:
                     import json
                     redis_client = await get_redis()
                     
-                    # Create deterministic cache key
+                    # Create deterministic cache key (workspace-scoped to prevent cross-workspace leaks)
                     args_json = json.dumps(merged_args, sort_keys=True)
-                    key_base = f"{tool_call.name}:{args_json}"
+                    ws_id = merged_args.get("workspace_id", "global")
+                    key_base = f"{tool_call.name}:{ws_id}:{args_json}"
                     cache_key = f"tool_cache:{hashlib.sha256(key_base.encode()).hexdigest()}"
                     
                     cached_data = await redis_client.get(cache_key)
@@ -144,9 +145,17 @@ class ToolRegistry:
             else:
                 output = str(result)
 
-            # Truncate very long outputs
+            # Smart truncation: preserve head + tail to keep error messages
+            # and final results that are typically at the end of the output
             if len(output) > 10_000:
-                output = output[:9_900] + f"\n\n... (truncated, {len(output)} total chars)"
+                head_size = 4_000
+                tail_size = 4_000
+                omitted = len(output) - head_size - tail_size
+                output = (
+                    output[:head_size]
+                    + f"\n\n... ({omitted:,} chars omitted from middle, {len(output):,} total) ...\n\n"
+                    + output[-tail_size:]
+                )
 
             tool_result = ToolResult(
                 tool_call_id=tool_call.id,

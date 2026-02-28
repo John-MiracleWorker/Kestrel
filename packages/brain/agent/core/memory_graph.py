@@ -130,7 +130,7 @@ Return ONLY a JSON object with this exact structure (no markdown, no explanation
 {{"entities": [{{"type": "...", "name": "...", "description": "..."}}], "relations": [{{"source": "name1", "target": "name2", "relation": "..."}}]}}
 
 Rules:
-- Extract 1-8 entities maximum, only genuinely important ones
+- Extract 1-{max_entities} entities maximum, only genuinely important ones
 - Names should be concise (1-4 words)
 - Skip generic words like "The", "System", "Data"
 - File entities should be actual filenames (e.g. "server.py")
@@ -142,6 +142,19 @@ Rules:
 USER: {user_message}
 
 ASSISTANT: {assistant_response}"""
+
+
+def _compute_max_entities(user_message: str, assistant_response: str) -> int:
+    """Dynamically compute entity extraction limit based on conversation richness."""
+    combined_length = len(user_message) + len(assistant_response)
+    if combined_length < 200:
+        return 3
+    elif combined_length < 800:
+        return 5
+    elif combined_length < 2000:
+        return 8
+    else:
+        return 12
 
 
 async def extract_entities_llm(
@@ -161,7 +174,9 @@ async def extract_entities_llm(
     user_msg = user_message[:800]
     asst_msg = assistant_response[:1200]
 
+    max_entities = _compute_max_entities(user_msg, asst_msg)
     prompt = _EXTRACTION_PROMPT.format(
+        max_entities=max_entities,
         user_message=user_msg,
         assistant_response=asst_msg,
     )
@@ -313,8 +328,9 @@ class MemoryGraph:
                 if existing:
                     node_id = existing["id"]
                     new_count = existing["mention_count"] + 1
-                    # Reinforce weight on re-mention
-                    new_weight = min(existing["weight"] + 0.2, 5.0)
+                    # Reinforce weight with diminishing returns based on mention frequency
+                    boost = 0.3 / (1 + existing["mention_count"] * 0.1)
+                    new_weight = min(existing["weight"] + boost, 5.0)
 
                     await conn.execute(
                         """
@@ -384,9 +400,9 @@ class MemoryGraph:
                 )
 
                 if dup:
-                    # Reinforce existing edge
+                    # Reinforce existing edge with diminishing returns
                     await conn.execute(
-                        "UPDATE memory_graph_edges SET strength = LEAST(strength + 0.3, 5.0) WHERE id = $1",
+                        "UPDATE memory_graph_edges SET strength = LEAST(strength + 0.4 / (1 + strength * 0.2), 5.0) WHERE id = $1",
                         dup["id"],
                     )
                 else:
@@ -586,6 +602,40 @@ class MemoryGraph:
 
         logger.info(f"Decayed {updated} nodes in workspace {workspace_id}")
         return updated
+
+    async def expire_stale_edges(self, workspace_id: str) -> int:
+        """Remove edges that are stale: both endpoints have decayed below threshold
+        OR the edge is older than EDGE_MAX_AGE_DAYS (default 90).
+
+        Should be called alongside decay_weights() in the periodic cron.
+        """
+        max_age_days = int(os.getenv("EDGE_MAX_AGE_DAYS", "90"))
+        ws_uuid = self._to_uuid(workspace_id)
+
+        async with self._pool.acquire() as conn:
+            deleted = await conn.fetchval(
+                """
+                WITH stale AS (
+                    SELECT e.id
+                    FROM memory_graph_edges e
+                    JOIN memory_graph_nodes src ON e.source_id = src.id
+                    JOIN memory_graph_nodes tgt ON e.target_id = tgt.id
+                    WHERE src.workspace_id = $1
+                      AND (
+                        (src.weight < 0.1 AND tgt.weight < 0.1)
+                        OR (e.created_at < NOW() - ($2::int || ' days')::interval)
+                      )
+                )
+                DELETE FROM memory_graph_edges WHERE id IN (SELECT id FROM stale)
+                RETURNING COUNT(*)
+                """,
+                ws_uuid, max_age_days,
+            )
+
+        expired = deleted or 0
+        if expired:
+            logger.info(f"Expired {expired} stale edges in workspace {workspace_id}")
+        return expired
 
     async def get_stats(self, workspace_id: str) -> dict:
         """Get graph statistics for a workspace."""

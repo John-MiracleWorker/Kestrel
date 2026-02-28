@@ -354,18 +354,46 @@ class TaskLearner:
                 if stored.get("category") != lesson.category:
                     continue
 
-                similarity = _summary_similarity(
+                # Tier 2a: Jaccard similarity (fast, word-level)
+                jaccard_sim = _summary_similarity(
                     lesson.summary,
                     stored.get("summary", ""),
                 )
 
-                if similarity >= DEDUP_SIMILARITY_THRESHOLD:
-                    # Reinforce existing lesson's confidence
+                # Tier 2b: Vector similarity from knowledge_search ranking
+                vector_score = r.get("score", 0.0)
+
+                # Combined check: either strong Jaccard OR strong vector similarity
+                is_dup = (
+                    jaccard_sim >= DEDUP_SIMILARITY_THRESHOLD
+                    or vector_score >= 0.85
+                )
+                best_sim = max(jaccard_sim, vector_score)
+
+                if is_dup:
+                    # Adaptive confidence reinforcement scaled by match quality + recency
                     old_conf = stored.get("confidence", 0.8)
-                    new_conf = min(old_conf + CONFIDENCE_REINFORCEMENT, 1.0)
+                    similarity_boost = max(best_sim - 0.6, 0.0)
+                    base_boost = 0.03 + similarity_boost * 0.15  # 0.03 to ~0.09
+
+                    # Recency factor: older lessons get smaller boosts (diminishing returns)
+                    recency_factor = 1.0
+                    created_at = stored.get("created_at", "")
+                    if created_at:
+                        try:
+                            created_dt = datetime.fromisoformat(created_at)
+                            age_days = (datetime.now(timezone.utc) - created_dt).days
+                            # Scale down boost for older lessons: 1.0 at 0 days, ~0.5 at 30 days
+                            recency_factor = 1.0 / (1.0 + age_days / 30.0)
+                        except (ValueError, TypeError):
+                            pass
+
+                    boost = base_boost * recency_factor
+                    new_conf = min(old_conf + boost, 1.0)
                     if new_conf != old_conf:
                         stored["confidence"] = new_conf
                         stored["reinforcement_count"] = stored.get("reinforcement_count", 0) + 1
+                        stored["last_reinforced"] = datetime.now(timezone.utc).isoformat()
                         # Re-store with updated confidence
                         await self._memory.knowledge_store(
                             workspace_id=workspace_id,
@@ -380,7 +408,8 @@ class TaskLearner:
                         )
                         logger.info(
                             f"Lesson dedup: reinforced existing lesson "
-                            f"(similarity={similarity:.2f}, new confidence={new_conf:.2f}): "
+                            f"(similarity={best_sim:.2f}, recency={recency_factor:.2f}, "
+                            f"new confidence={new_conf:.2f}): "
                             f"'{stored.get('summary', '')[:60]}'"
                         )
                     return True

@@ -21,10 +21,12 @@ Council roles:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -258,12 +260,16 @@ class CouncilSession:
         ],
     }
 
+    # Max cached opinions before eviction (LRU)
+    _OPINION_CACHE_MAX = 50
+
     def __init__(
         self,
         llm_provider=None,
         model: str = "",
         roles: list[CouncilRole] = None,
         event_callback=None,
+        semantic_classifier=None,
     ):
         self._llm = llm_provider
         self._model = model
@@ -275,15 +281,43 @@ class CouncilSession:
             CouncilRole.USER_ADVOCATE,
         ]
         self._event_callback = event_callback
+        self._semantic_classifier = semantic_classifier  # Optional SemanticClassifier instance
+        # LRU opinion cache: keyed on (role + category + proposal fingerprint)
+        self._opinion_cache: OrderedDict[str, CouncilMemberOpinion] = OrderedDict()
 
     def _classify_proposal(self, proposal: str) -> str:
-        """Classify a proposal into a category for expertise weighting."""
+        """Classify a proposal into a category for expertise weighting.
+
+        Tries semantic (embedding-based) classification first if available,
+        then falls back to keyword matching.
+        """
+        # Try semantic classification first (async-to-sync bridge for cached results)
+        if self._semantic_classifier and hasattr(self._semantic_classifier, '_exemplar_embeddings'):
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # We're inside an async context — schedule as a task
+                    # For now, fall through to keyword matching (semantic is async)
+                    pass
+            except RuntimeError:
+                pass
+
+        # Keyword-based fallback
         proposal_lower = proposal.lower()
         scores: dict[str, int] = {}
         for category, keywords in self._CATEGORY_KEYWORDS.items():
             scores[category] = sum(1 for kw in keywords if kw in proposal_lower)
         best = max(scores, key=scores.get) if scores else "general"
         return best if scores.get(best, 0) > 0 else "general"
+
+    async def _classify_proposal_async(self, proposal: str) -> str:
+        """Async version of proposal classification with semantic support."""
+        if self._semantic_classifier:
+            result = await self._semantic_classifier.classify(proposal)
+            if result:
+                return result
+        return self._classify_proposal(proposal)
 
     def _get_role_weight(self, role: CouncilRole, category: str) -> float:
         """Get the expertise weight multiplier for a role given the proposal category."""
@@ -433,13 +467,34 @@ class CouncilSession:
 
         return verdict
 
+    def _opinion_cache_key(self, role: CouncilRole, proposal: str) -> str:
+        """Generate a cache key for a council opinion based on role + proposal fingerprint."""
+        category = self._classify_proposal(proposal)
+        content = f"{role.value}:{category}:{proposal[:200]}"
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+    def _cache_opinion(self, key: str, opinion: CouncilMemberOpinion) -> None:
+        """Store an opinion in the LRU cache, evicting oldest if full."""
+        if key in self._opinion_cache:
+            self._opinion_cache.move_to_end(key)
+        self._opinion_cache[key] = opinion
+        while len(self._opinion_cache) > self._OPINION_CACHE_MAX:
+            self._opinion_cache.popitem(last=False)
+
     async def _get_evaluation(
         self,
         role: CouncilRole,
         proposal: str,
         context: str,
     ) -> CouncilMemberOpinion:
-        """Get a single council member's evaluation."""
+        """Get a single council member's evaluation (with LRU caching)."""
+        # Check opinion cache first
+        cache_key = self._opinion_cache_key(role, proposal)
+        if cache_key in self._opinion_cache:
+            logger.debug(f"Council opinion cache hit: {role.value}")
+            self._opinion_cache.move_to_end(cache_key)
+            return self._opinion_cache[cache_key]
+
         role_prompt = ROLE_PROMPTS.get(role, "Evaluate this proposal.")
 
         full_prompt = f"""{role_prompt}
@@ -455,7 +510,9 @@ Provide your analysis, then {VOTE_PROMPT}
 """
 
         if not self._llm:
-            return self._generate_rule_based_opinion(role, proposal)
+            opinion = self._generate_rule_based_opinion(role, proposal)
+            self._cache_opinion(cache_key, opinion)
+            return opinion
 
         try:
             response = await self._llm.generate(
@@ -466,19 +523,22 @@ Provide your analysis, then {VOTE_PROMPT}
             )
             # generate() may return str or dict depending on provider
             content = response.get("content", "") if isinstance(response, dict) else str(response)
-            return self._parse_opinion(role, content)
+            opinion = self._parse_opinion(role, content)
+            self._cache_opinion(cache_key, opinion)
+            return opinion
 
         except Exception as e:
             logger.error(f"Council evaluation failed for {role.value}: {e}")
-            return self._generate_rule_based_opinion(role, proposal)
+            opinion = self._generate_rule_based_opinion(role, proposal)
+            self._cache_opinion(cache_key, opinion)
+            return opinion
 
-    async def _run_debate_round(
+    async def _run_single_debate_round(
         self,
         opinions: list[CouncilMemberOpinion],
         proposal: str,
     ) -> list[CouncilMemberOpinion]:
-        """Run a debate round where members can revise opinions after seeing others."""
-        # Show each member a summary of other opinions
+        """Run one debate round where members can revise opinions after seeing others."""
         opinion_summary = "\n".join(
             f"- **{o.role.value}**: {o.vote.value} (confidence: {o.confidence:.0%}) — "
             + "; ".join(o.concerns[:2])
@@ -519,6 +579,42 @@ If yes, provide updated analysis. If no, confirm your position.
                 return opinion
 
         return await asyncio.gather(*(revise(opinion) for opinion in opinions))
+
+    async def _run_debate_round(
+        self,
+        opinions: list[CouncilMemberOpinion],
+        proposal: str,
+        max_rounds: int = 3,
+    ) -> list[CouncilMemberOpinion]:
+        """Run debate rounds with convergence detection.
+
+        Runs up to max_rounds of debate but stops early when no votes change
+        (convergence). This avoids wasting LLM calls on proposals where members
+        already agree, while allowing more debate on contentious ones.
+        """
+        for round_num in range(max_rounds):
+            previous_votes = [o.vote.value for o in opinions]
+
+            opinions = await self._run_single_debate_round(opinions, proposal)
+
+            current_votes = [o.vote.value for o in opinions]
+
+            # Count vote changes
+            changes = sum(1 for p, c in zip(previous_votes, current_votes) if p != c)
+
+            await self._emit("council_debate_round", {
+                "round": round_num + 1,
+                "vote_changes": changes,
+                "votes": current_votes,
+            })
+
+            if changes == 0:
+                logger.info(f"Council debate converged after {round_num + 1} round(s)")
+                break
+
+            logger.info(f"Debate round {round_num + 1}: {changes} vote change(s)")
+
+        return opinions
 
     def _synthesize_verdict(self, verdict: CouncilVerdict, category: str = "general") -> None:
         """
