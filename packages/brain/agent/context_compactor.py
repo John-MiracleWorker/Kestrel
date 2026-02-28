@@ -17,8 +17,16 @@ from typing import Optional
 
 logger = logging.getLogger("brain.agent.context_compactor")
 
-# Rough token estimate: ~4 chars per token for English
-_CHARS_PER_TOKEN = 4
+# Chars per token — used as prose baseline (~4 is standard for English).
+# Code and JSON are denser and use ~3 chars/token.
+_CHARS_PER_TOKEN_PROSE = 4
+_CHARS_PER_TOKEN_DENSE = 3
+
+# Markers that indicate code/structured content (denser tokenization)
+_CODE_MARKERS = ("```", "def ", "class ", "import ", '{\n', '":', "    ", "=>", "->")
+
+# Legacy alias kept for any external callers that reference the old constant
+_CHARS_PER_TOKEN = _CHARS_PER_TOKEN_PROSE
 
 # How many recent messages to ALWAYS preserve (never compacted)
 _PRESERVE_RECENT = int(os.getenv("COMPACTOR_PRESERVE_RECENT", "6"))
@@ -37,25 +45,47 @@ CONTEXT_LIMITS = {
 
 
 def estimate_tokens(messages: list[dict]) -> int:
-    """Rough token estimate for a message list (no tokenizer needed)."""
-    total_chars = 0
+    """
+    Content-aware token estimate for a message list.
+
+    Applies separate chars-per-token ratios for:
+    - Prose / conversational text (~4 chars/token)
+    - Code, JSON, tool results, structured data (~3 chars/token)
+
+    This is meaningfully more accurate than a flat 4-chars-per-token estimate,
+    particularly for agent conversations that mix natural language with large
+    code or JSON payloads (which would otherwise be underestimated).
+    """
+    prose_chars = 0
+    dense_chars = 0
+
     for msg in messages:
+        role = msg.get("role", "")
         content = msg.get("content", "")
+
         if isinstance(content, str):
-            total_chars += len(content)
+            # Tool results and code-heavy assistant turns tokenize more densely
+            is_dense = role == "tool" or any(m in content for m in _CODE_MARKERS)
+            if is_dense:
+                dense_chars += len(content)
+            else:
+                prose_chars += len(content)
         elif isinstance(content, list):
-            # Multimodal messages
+            # Multimodal messages — treat text parts as prose
             for part in content:
                 if isinstance(part, dict):
-                    total_chars += len(part.get("text", ""))
-        # Tool call arguments
+                    prose_chars += len(part.get("text", ""))
+
+        # Tool call arguments are always structured (dense)
         for tc in msg.get("tool_calls", []):
             fn = tc.get("function", {})
-            total_chars += len(fn.get("arguments", ""))
-            total_chars += len(fn.get("name", ""))
-        # Role and overhead
-        total_chars += len(msg.get("role", "")) + 10
-    return total_chars // _CHARS_PER_TOKEN
+            dense_chars += len(fn.get("arguments", ""))
+            dense_chars += len(fn.get("name", ""))
+
+        # Role label + message overhead (~10 chars, treat as prose)
+        prose_chars += len(role) + 10
+
+    return (dense_chars // _CHARS_PER_TOKEN_DENSE) + (prose_chars // _CHARS_PER_TOKEN_PROSE)
 
 
 def _build_summary_prompt(messages_to_summarize: list[dict]) -> str:
