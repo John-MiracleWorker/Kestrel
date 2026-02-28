@@ -199,8 +199,8 @@ class OllamaProvider:
         }
 
         # Convert OpenAI-style tool schemas to Ollama format
+        ollama_tools = []
         if tools:
-            ollama_tools = []
             for tool in tools:
                 # Handle both {type: function, function: {...}} and raw function schemas
                 if isinstance(tool, dict):

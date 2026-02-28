@@ -1,12 +1,11 @@
 import sys
-import json
 import os
-import base64
 import subprocess
 import importlib
 
 # Ensure dependencies are installed
 required_packages = {
+    'mcp': 'mcp',
     'google.oauth2.credentials': 'google-auth',
     'google_auth_oauthlib.flow': 'google-auth-oauthlib',
     'google.auth.transport.requests': 'google-auth-httplib2',
@@ -15,137 +14,101 @@ required_packages = {
 
 for module, package in required_packages.items():
     try:
-        importlib.import_module(module.split('.')[0])
+        if module == 'mcp':
+            importlib.import_module('mcp')
+        else:
+            importlib.import_module(module.split('.')[0])
     except ImportError:
         print(f"Installing missing package {package}...", file=sys.stderr)
         subprocess.check_call([sys.executable, "-m", "pip", "install", package, "--quiet"])
 
+from mcp.server.fastmcp import FastMCP
+import json
+import base64
 from email.mime.text import MIMEText
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
-# If modifying these SCOPES, delete the file token.json.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_PATH = os.path.join(BASE_DIR, 'token.json')
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
+
+# Create FastMCP server
+mcp = FastMCP("Gmail")
 
 def get_service():
     creds = None
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    if os.path.exists(TOKEN_PATH):
+        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            if not os.path.exists('credentials.json'):
-                print(json.dumps({"error": "credentials.json not found. Please follow instructions to set up Gmail API."}), flush=True)
-                sys.exit(1)
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open('token.json', 'w') as token:
+            raise Exception("Authentication required. Please run auth.py first.")
+        with open(TOKEN_PATH, 'w') as token:
             token.write(creds.to_json())
     return build('gmail', 'v1', credentials=creds)
 
-def list_messages(query='', max_results=10):
-    service = get_service()
-    results = service.users().messages().list(userId='me', q=query, maxResults=max_results).execute()
-    messages = results.get('messages', [])
-    return messages
+@mcp.tool()
+def list_emails(query: str = '', max_results: int = 5) -> str:
+    """List recent emails from Gmail. Returns a JSON string of email summaries."""
+    try:
+        service = get_service()
+        results = service.users().messages().list(userId='me', q=query, maxResults=max_results).execute()
+        messages = results.get('messages', [])
+        
+        if not messages:
+            return "No messages found."
+            
+        summaries = []
+        for msg in messages:
+            message = service.users().messages().get(userId='me', id=msg['id'], format='metadata', metadataHeaders=['Subject', 'From', 'Date']).execute()
+            headers = message['payload']['headers']
+            subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
+            sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown Sender')
+            date = next((h['value'] for h in headers if h['name'] == 'Date'), 'Unknown Date')
+            summaries.append(f"ID: {msg['id']} | From: {sender} | Date: {date} | Subject: {subject}")
+            
+        return "\n".join(summaries)
+    except Exception as e:
+        return f"Error: {str(e)}"
 
-def get_message(message_id):
-    service = get_service()
-    message = service.users().messages().get(userId='me', id=message_id, format='full').execute()
-    return message
+@mcp.tool()
+def read_email(message_id: str) -> str:
+    """Read the full content of a specific email by ID."""
+    try:
+        service = get_service()
+        message = service.users().messages().get(userId='me', id=message_id, format='full').execute()
+        
+        headers = message['payload']['headers']
+        subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
+        sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown Sender')
+        date = next((h['value'] for h in headers if h['name'] == 'Date'), 'Unknown Date')
+        
+        body = ""
+        def get_body(payload):
+            if 'parts' in payload:
+                for part in payload['parts']:
+                    if part['mimeType'] == 'text/plain':
+                        data = part['body'].get('data')
+                        if data:
+                            return base64.urlsafe_b64decode(data).decode('utf-8')
+                    elif 'parts' in part:
+                        res = get_body(part)
+                        if res: return res
+            else:
+                data = payload['body'].get('data')
+                if data:
+                    return base64.urlsafe_b64decode(data).decode('utf-8')
+            return ""
 
-def send_message(to, subject, body):
-    service = get_service()
-    message = MIMEText(body)
-    message['to'] = to
-    message['subject'] = subject
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-    return service.users().messages().send(userId='me', body={'raw': raw}).execute()
+        body = get_body(message['payload'])
+        
+        return f"From: {sender}\nDate: {date}\nSubject: {subject}\n\n{body}"
+    except Exception as e:
+        return f"Error: {str(e)}"
 
-def handle_request(request):
-    method = request.get('method')
-    params = request.get('params', {})
-    
-    if method == 'initialize':
-        return {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "tools": {
-                    "list_messages": {"description": "List Gmail messages"},
-                    "get_message": {"description": "Get a specific Gmail message"},
-                    "send_message": {"description": "Send a Gmail message"},
-                    "search_messages": {"description": "Search Gmail messages"}
-                }
-            },
-            "serverInfo": {"name": "gmail-mcp", "version": "0.1.0"}
-        }
-    elif method == 'tools/list':
-        return {
-            "tools": [
-                {
-                    "name": "gmail_list_messages",
-                    "description": "List messages in the user's mailbox",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string", "description": "Search query"},
-                            "max_results": {"type": "integer", "default": 10}
-                        }
-                    }
-                },
-                {
-                    "name": "gmail_get_message",
-                    "description": "Retrieve a specific message by ID",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "message_id": {"type": "string", "description": "The ID of the message to retrieve"}
-                        },
-                        "required": ["message_id"]
-                    }
-                },
-                {
-                    "name": "gmail_send_message",
-                    "description": "Send a new email message",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "to": {"type": "string", "description": "Recipient email address"},
-                            "subject": {"type": "string", "description": "Email subject"},
-                            "body": {"type": "string", "description": "Email body content"}
-                        },
-                        "required": ["to", "subject", "body"]
-                    }
-                }
-            ]
-        }
-    elif method == 'tools/call':
-        name = params.get('name')
-        args = params.get('arguments', {})
-        if name == 'gmail_list_messages':
-            return {"content": [{"type": "text", "text": json.dumps(list_messages(args.get('query', ''), args.get('max_results', 10)))}]}
-        elif name == 'gmail_get_message':
-            return {"content": [{"type": "text", "text": json.dumps(get_message(args.get('message_id')))}]}
-        elif name == 'gmail_send_message':
-            return {"content": [{"type": "text", "text": json.dumps(send_message(args.get('to'), args.get('subject'), args.get('body')))}]}
-    
-    return {"error": {"code": -32601, "message": f"Method {method} not found"}}
-
-def main():
-    for line in sys.stdin:
-        try:
-            request = json.loads(line)
-            response = handle_request(request)
-            out = json.dumps({"jsonrpc": "2.0", "id": request.get('id'), "result": response})
-            sys.stdout.write(out + "\n")
-            sys.stdout.flush()
-        except Exception as e:
-            out = json.dumps({"jsonrpc": "2.0", "error": {"code": -32603, "message": str(e)}})
-            sys.stdout.write(out + "\n")
-            sys.stdout.flush()
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    mcp.run()
