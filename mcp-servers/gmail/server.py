@@ -38,8 +38,7 @@ def get_service():
             creds.refresh(Request())
         else:
             if not os.path.exists('credentials.json'):
-                print(json.dumps({"error": "credentials.json not found. Please follow instructions to set up Gmail API."}), flush=True)
-                sys.exit(1)
+                raise RuntimeError("credentials.json not found. Please set up Gmail API OAuth credentials and save them to credentials.json.")
             flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
             creds = flow.run_local_server(port=0)
         with open('token.json', 'w') as token:
@@ -143,7 +142,7 @@ def main():
             sys.stdout.write(out + "\n")
             sys.stdout.flush()
         except Exception as e:
-            out = json.dumps({"jsonrpc": "2.0", "error": {"code": -32603, "message": str(e)}})
+            out = json.dumps({"jsonrpc": "2.0", "id": request.get('id'), "error": {"code": -32603, "message": str(e)}})
             sys.stdout.write(out + "\n")
             sys.stdout.flush()
 

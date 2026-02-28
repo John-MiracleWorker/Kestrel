@@ -297,7 +297,11 @@ class MCPClient:
             for _ in range(50):  # Safety limit
                 response = await self._read_message()
                 if response is None:
-                    return {"error": "Server closed connection"}
+                    stderr_output = await self._capture_stderr()
+                    error_msg = "Server closed connection"
+                    if stderr_output:
+                        error_msg += f"\nServer stderr:\n{stderr_output}"
+                    return {"error": error_msg}
 
                 # Skip notifications (no id field)
                 if "id" not in response:
@@ -349,6 +353,23 @@ class MCPClient:
         except json.JSONDecodeError as e:
             logger.error(f"MCP JSON decode error: {e}")
             return None
+
+    async def _capture_stderr(self) -> str:
+        """Read available stderr from a crashed server process for diagnostics."""
+        if not self._process or not self._process.stderr:
+            return ""
+        try:
+            if self._process.returncode is None:
+                try:
+                    await asyncio.wait_for(self._process.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+            stderr_bytes = await asyncio.wait_for(
+                self._process.stderr.read(4096), timeout=1.0
+            )
+            return stderr_bytes.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
 
 
 class MCPConnectionPool:
