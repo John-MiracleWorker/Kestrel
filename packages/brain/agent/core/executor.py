@@ -123,6 +123,11 @@ class TaskExecutor:
         self._evidence_chain = evidence_chain
         self._progress_callback = progress_callback or (lambda t: 0.0)
         self._verifier = verifier
+        # Detect if a workspace model was explicitly configured
+        # (e.g. 'glm-5:cloud') — prevents unwanted cloud escalation
+        self._has_explicit_model = bool(
+            model and model not in ('', 'default', 'qwen3:8b')
+        )
         self._approval_memory = approval_memory
         self._step_diagnostics: dict[str, DiagnosticTracker] = {}  # step_id → tracker
 
@@ -960,8 +965,12 @@ class TaskExecutor:
                 active_provider = self._provider
 
             # If the selected provider isn't ready (e.g. ollama from Docker),
-            # fall back to a cloud provider
-            if hasattr(active_provider, 'is_ready') and not active_provider.is_ready():
+            # fall back to a cloud provider — but NOT if user explicitly set a local model
+            if (
+                hasattr(active_provider, 'is_ready')
+                and not active_provider.is_ready()
+                and not self._has_explicit_model
+            ):
                 logger.info(f"Provider {route.provider} not ready, trying cloud fallback")
                 if self._provider_resolver:
                     for cloud_name in ("google", "openai", "anthropic"):
@@ -986,7 +995,7 @@ class TaskExecutor:
                     model=routed_model,
                 )
 
-                if was_compacted and needs_escalation(messages, route.provider):
+                if was_compacted and needs_escalation(messages, route.provider) and not self._has_explicit_model:
                     if self._provider_resolver:
                         for cloud_name in ("google", "openai", "anthropic"):
                             try:
@@ -1083,7 +1092,7 @@ class TaskExecutor:
                 model=routed_model,
             )
 
-            if was_compacted and needs_escalation(messages, route.provider):
+            if was_compacted and needs_escalation(messages, route.provider) and not self._has_explicit_model:
                 if self._provider_resolver:
                     for cloud_name in ("google", "openai", "anthropic"):
                         try:
