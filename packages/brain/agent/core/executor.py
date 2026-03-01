@@ -1146,9 +1146,11 @@ class TaskExecutor:
             # ── Graceful cloud failover ──────────────────────────────
             # If the local provider failed (e.g. ollama 400), swap to
             # a cloud provider and retry with the same context.
-            if route.provider in ("ollama", "local") and self._provider_resolver:
+            # BUT: if user explicitly set a workspace model (e.g. glm-5:cloud),
+            # do NOT silently swap to cloud — just fail with a clear error.
+            if route.provider in ("ollama", "local") and self._provider_resolver and not self._has_explicit_model:
                 logger.warning(
-                    f"Provider {route.provider} failed: {llm_err}. "
+                    f"Provider {route.provider} failed: {type(llm_err).__name__}: {llm_err}. "
                     f"Attempting cloud failover..."
                 )
                 # Build failover list: workspace's configured provider first

@@ -244,9 +244,10 @@ class OllamaProvider:
                 payload["tools"] = ollama_tools
 
         try:
-            # Short timeout for tool calls (quick failover to cloud),
-            # longer for plain chat (ollama can be slow but still cheaper).
-            timeout = 30 if ollama_tools else 120
+            # glm-5:cloud and similar remote models are proxied through Ollama
+            # to ollama.com — they can be slower than local models.
+            # Use generous timeout for all modes.
+            timeout = 120
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(
                     f"{self._base_url}/api/chat",
@@ -292,6 +293,15 @@ class OllamaProvider:
         except httpx.ConnectError:
             logger.error(f"Cannot connect to Ollama at {self._base_url}")
             raise
+        except httpx.ReadTimeout:
+            logger.error(
+                f"Ollama read timeout after {timeout}s "
+                f"(model={model}, messages={len(clean_messages)}, tools={len(ollama_tools)})"
+            )
+            raise RuntimeError(f"Ollama timeout after {timeout}s for model {model}")
         except Exception as e:
-            logger.error(f"Ollama generate_with_tools failed: {e}")
+            logger.error(
+                f"Ollama generate_with_tools failed: {type(e).__name__}: {e}\n"
+                f"  model={model}, messages={len(clean_messages)}, tools={len(ollama_tools)}"
+            )
             raise
