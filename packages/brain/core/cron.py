@@ -5,7 +5,7 @@ from . import runtime
 from providers_registry import get_provider, resolve_provider
 from provider_config import ProviderConfig
 from agent.loop import AgentLoop
-from agent.tools.registry import build_tool_registry
+from agent.tools import build_tool_registry
 from agent.types import AgentTask, GuardrailConfig as GCfg
 from agent.guardrails import Guardrails
 
