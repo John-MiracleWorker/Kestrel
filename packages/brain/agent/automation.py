@@ -17,7 +17,7 @@ import hashlib
 import hmac
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 from typing import Any, Optional
 
@@ -68,6 +68,20 @@ def cron_matches_now(expression: str, now: datetime = None) -> bool:
     )
 
 
+def compute_next_run(expression: str, after: datetime = None) -> Optional[str]:
+    """Compute the next datetime a cron expression will fire, searching up to 48h ahead."""
+    if after is None:
+        after = datetime.now(timezone.utc)
+    # Start from the next minute
+    candidate = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    # Search up to 48 hours (2880 minutes) ahead
+    for _ in range(2880):
+        if cron_matches_now(expression, candidate):
+            return candidate.isoformat()
+        candidate += timedelta(minutes=1)
+    return None
+
+
 # ── Data Models ──────────────────────────────────────────────────────
 
 class JobStatus(str, Enum):
@@ -102,6 +116,7 @@ class CronJob:
             "goal": self.goal,
             "status": self.status.value,
             "last_run": self.last_run,
+            "next_run": self.next_run,
             "run_count": self.run_count,
             "max_runs": self.max_runs,
             "created_at": self.created_at,
@@ -210,17 +225,19 @@ class CronScheduler:
         now = datetime.now(timezone.utc)
         job.last_run = now.isoformat()
         job.run_count += 1
+        job.next_run = compute_next_run(job.cron_expression, now)
 
         # Update DB
         try:
+            next_run_dt = datetime.fromisoformat(job.next_run) if job.next_run else None
             async with self._pool.acquire() as conn:
                 await conn.execute(
                     """
                     UPDATE automation_cron_jobs
-                    SET last_run = $2, run_count = $3
+                    SET last_run = $2, run_count = $3, next_run = $4
                     WHERE id = $1
                     """,
-                    uuid.UUID(job.id), now, job.run_count,
+                    uuid.UUID(job.id), now, job.run_count, next_run_dt,
                 )
         except Exception as e:
             logger.error(f"Failed to update cron job: {e}")
@@ -249,6 +266,7 @@ class CronScheduler:
     ) -> CronJob:
         """Create a new cron job."""
         now = datetime.now(timezone.utc)
+        next_run = compute_next_run(cron_expression, now)
         job = CronJob(
             id=str(uuid.uuid4()),
             workspace_id=workspace_id,
@@ -258,21 +276,23 @@ class CronScheduler:
             cron_expression=cron_expression,
             goal=goal,
             max_runs=max_runs,
+            next_run=next_run,
             created_at=now.isoformat(),
         )
 
         try:
+            next_run_dt = datetime.fromisoformat(next_run) if next_run else None
             async with self._pool.acquire() as conn:
                 await conn.execute(
                     """
                     INSERT INTO automation_cron_jobs
                         (id, workspace_id, user_id, name, description,
-                         cron_expression, goal, status, max_runs, created_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                         cron_expression, goal, status, max_runs, next_run, created_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                     """,
                     uuid.UUID(job.id), uuid.UUID(workspace_id), uuid.UUID(user_id),
                     name, description, cron_expression, goal,
-                    JobStatus.ACTIVE.value, max_runs, now,
+                    JobStatus.ACTIVE.value, max_runs, next_run_dt, now,
                 )
         except Exception as e:
             logger.error(f"Failed to persist cron job: {e}")
@@ -308,7 +328,10 @@ class CronScheduler:
                 rows = await conn.fetch(
                     "SELECT * FROM automation_cron_jobs WHERE status = 'active'"
                 )
+            now = datetime.now(timezone.utc)
             for row in rows:
+                # Always recompute next_run on load for accuracy
+                next_run = compute_next_run(row["cron_expression"], now)
                 job = CronJob(
                     id=str(row["id"]),
                     workspace_id=str(row["workspace_id"]),
@@ -319,11 +342,22 @@ class CronScheduler:
                     goal=row["goal"],
                     status=JobStatus(row["status"]),
                     last_run=str(row["last_run"]) if row["last_run"] else None,
+                    next_run=next_run,
                     run_count=row["run_count"],
                     max_runs=row["max_runs"],
                     created_at=str(row["created_at"]),
                 )
                 self._jobs[job.id] = job
+                # Persist the computed next_run back to DB
+                if next_run:
+                    try:
+                        async with self._pool.acquire() as conn:
+                            await conn.execute(
+                                "UPDATE automation_cron_jobs SET next_run = $2 WHERE id = $1",
+                                uuid.UUID(job.id), datetime.fromisoformat(next_run),
+                            )
+                    except Exception:
+                        pass  # Non-fatal, next_run is recomputed on each load
         except Exception as e:
             logger.error(f"Failed to load cron jobs: {e}")
 
