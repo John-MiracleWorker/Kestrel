@@ -202,7 +202,17 @@ class OllamaProvider:
             if "tool_calls" in clean and clean["tool_calls"]:
                 clean_tcs = []
                 for tc in clean["tool_calls"]:
-                    clean_tcs.append({k: v for k, v in tc.items() if k in ALLOWED_TC_KEYS})
+                    clean_tc = {k: v for k, v in tc.items() if k in ALLOWED_TC_KEYS}
+                    # Ollama expects function.arguments as a dict, not a JSON string.
+                    # The executor stores arguments as JSON strings (OpenAI format),
+                    # so we need to deserialize them for Ollama.
+                    if "function" in clean_tc and isinstance(clean_tc["function"].get("arguments"), str):
+                        try:
+                            clean_tc["function"] = dict(clean_tc["function"])  # shallow copy
+                            clean_tc["function"]["arguments"] = json.loads(clean_tc["function"]["arguments"])
+                        except (json.JSONDecodeError, TypeError):
+                            pass  # Leave as-is if we can't parse
+                    clean_tcs.append(clean_tc)
                 clean["tool_calls"] = clean_tcs
             clean_messages.append(clean)
 

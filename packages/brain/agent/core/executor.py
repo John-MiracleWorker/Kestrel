@@ -811,11 +811,21 @@ class TaskExecutor:
                 "content": system_prompt,
             })
             
-            for tc in step.tool_calls[-10:]:
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
+            # Group tool calls by turn_id so parallel tool calls from
+            # the same LLM response stay in a single assistant message.
+            # This is required for Gemini's thought_signature validation.
+            recent_tcs = step.tool_calls[-10:]
+            grouped_turns = {}
+            for tc in recent_tcs:
+                tid = tc.get("turn_id", tc.get("id", str(uuid.uuid4())))
+                if tid not in grouped_turns:
+                    grouped_turns[tid] = []
+                grouped_turns[tid].append(tc)
+
+            for tid, calls in grouped_turns.items():
+                tcs = []
+                for tc in calls:
+                    tcs.append({
                         "id": tc.get("id", "call_1"),
                         "type": "function",
                         "function": {
@@ -823,13 +833,20 @@ class TaskExecutor:
                             "arguments": json.dumps(tc.get("args", {})),
                         },
                         **({"_gemini_raw_part": tc["_gemini_raw_part"]} if "_gemini_raw_part" in tc else {}),
-                    }],
-                })
+                    })
+
                 messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.get("id", "call_1"),
-                    "content": tc.get("result", ""),
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": tcs,
                 })
+
+                for tc in calls:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.get("id", "call_1"),
+                        "content": tc.get("result", ""),
+                    })
         else:
             system_prompt = AGENT_SYSTEM_PROMPT.format(
                 goal=task.goal,
