@@ -567,10 +567,13 @@ class ModelRouter:
         # Escalate heavy tool steps from local to cloud proactively.
         # 1-2 tools: let ollama try (failover catches errors gracefully)
         # 3+ tools: go straight to cloud for speed/reliability.
+        # SKIP this escalation if a workspace model is explicitly configured —
+        # the user chose that model because it's capable enough.
         if (
             expected_tools
             and len(expected_tools) > 2
             and route.provider in ("ollama", "local")
+            and not self._workspace_model  # Don't override user's explicit choice
         ):
             logger.info(
                 f"Tool-calling step on {route.provider} → escalating to cloud "
