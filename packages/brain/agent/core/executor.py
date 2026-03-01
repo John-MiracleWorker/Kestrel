@@ -52,9 +52,10 @@ Current step: {step_description}
 Instructions:
 1. Analyze the current situation and decide which tool to call next.
 2. You may call up to 5 tools per turn if they are independent, read-only/low-risk, and do not require approval. Prefer batching and parallel-safe tools. Wait for all results before proceeding.
-3. If the step is complete, call `task_complete` with a summary of what you accomplished.
-4. If you need clarification from the user, call `ask_human` with your question.
-5. Think step-by-step. Explain your reasoning before acting.
+3. ONLY call `task_complete` when the ENTIRE original goal has been fully achieved — not just the current step. If the current step is done but there are more steps remaining in the plan, do NOT call `task_complete`. Instead, just finish your tool calls for this step and the system will automatically advance to the next step.
+4. Before calling `task_complete`, review the original goal and verify every part of it has been addressed. For example, if asked to "summarize 10 emails", do not complete until all 10 have been fetched AND summarized.
+5. If you need clarification from the user, call `ask_human` with your question.
+6. Think step-by-step. Explain your reasoning before acting.
 
 Error Recovery Protocol:
 - When a tool fails, DIAGNOSE before retrying. Read the error message carefully.
@@ -66,9 +67,11 @@ Error Recovery Protocol:
 - After 3 failures on the same step, STOP and use diagnostic tools (system_health, host_read, host_list) to gather information, or call `ask_human` to ask the user for help.
 
 Verification & Evidence Rules:
-- Before calling `task_complete`, you MUST explicitly cite the tool outputs that prove your work in your summary.
+- Before calling `task_complete`, you MUST verify that the ENTIRE original goal is satisfied, not just the current step.
+- You MUST explicitly cite the tool outputs that prove ALL parts of the goal were accomplished in your summary.
 - Your final summary will be strictly evaluated by an independent Verifier Engine against your tool execution history.
-- If you make unsupported claims or hallucinate actions you didn't take, your completion will be REJECTED.
+- If you make unsupported claims, hallucinate actions, or claim completion when parts of the goal are unfinished, your completion will be REJECTED.
+- If you are on step {step_index} of {total_steps} and earlier steps remain, you almost certainly should NOT be calling `task_complete` yet.
 
 Host Filesystem Strategy:
 - Use project_recall(name) FIRST to check for cached project context.
@@ -632,11 +635,31 @@ class TaskExecutor:
             step.status = StepStatus.COMPLETE
             step.result = tool_args.get("summary", result.output)
             step.completed_at = datetime.now(timezone.utc)
-            for remaining in task.plan.steps:
-                if remaining.status in (StepStatus.PENDING, StepStatus.IN_PROGRESS) and remaining.id != step.id:
-                    remaining.status = StepStatus.SKIPPED
-                    remaining.result = "Skipped — task completed early"
-                    remaining.completed_at = datetime.now(timezone.utc)
+
+            # Only skip remaining steps if this is genuinely the last step
+            # or the agent has explicitly addressed the full goal.
+            # Check whether there are pending steps that haven't been started.
+            pending_steps = [
+                s for s in task.plan.steps
+                if s.status == StepStatus.PENDING and s.id != step.id
+            ]
+            if pending_steps:
+                # There are still unexecuted steps — do NOT skip them.
+                # Log a warning so we can track how often the agent tries
+                # to complete early, and let the loop continue naturally.
+                logger.warning(
+                    f"task_complete called on step '{step.description[:60]}' "
+                    f"but {len(pending_steps)} step(s) still pending — "
+                    f"continuing execution instead of skipping."
+                )
+            else:
+                # All other steps are already complete/failed — safe to
+                # skip any lingering in-progress steps.
+                for remaining in task.plan.steps:
+                    if remaining.status == StepStatus.IN_PROGRESS and remaining.id != step.id:
+                        remaining.status = StepStatus.SKIPPED
+                        remaining.result = "Skipped — task completed early"
+                        remaining.completed_at = datetime.now(timezone.utc)
 
         elif tool_name == "ask_human":
             question = tool_args.get("question", "The agent needs your input")
