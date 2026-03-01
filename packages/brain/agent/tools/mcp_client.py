@@ -118,6 +118,7 @@ class MCPClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                limit=10 * 1024 * 1024,  # 10MB buffer for large MCP responses
             )
         except FileNotFoundError:
             return {"error": f"Command not found: {parts[0]}. Is it installed?"}
@@ -362,6 +363,20 @@ class MCPClient:
             return None
         except json.JSONDecodeError as e:
             logger.error(f"MCP JSON decode error: {e}")
+            return None
+        except (ValueError, asyncio.LimitOverrunError) as e:
+            # Oversized response — read the remaining data and try to parse
+            logger.warning(f"MCP oversized response for '{self.name}': {e}")
+            try:
+                # Read up to 10MB of remaining data
+                raw = await asyncio.wait_for(
+                    self._process.stdout.read(10 * 1024 * 1024),
+                    timeout=10,
+                )
+                if raw:
+                    return json.loads(raw.decode("utf-8").strip())
+            except Exception:
+                pass
             return None
 
     async def _capture_stderr(self) -> str:

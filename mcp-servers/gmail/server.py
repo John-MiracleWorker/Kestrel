@@ -60,7 +60,44 @@ def list_messages(query='', max_results=10):
 def get_message(message_id):
     service = get_service()
     message = service.users().messages().get(userId='me', id=message_id, format='full').execute()
-    return message
+    
+    # Extract useful fields only (full raw response can be 100KB+)
+    headers = {h['name'].lower(): h['value'] for h in message.get('payload', {}).get('headers', [])}
+    
+    # Extract plain text body (prefer plain text over HTML)
+    body_text = ""
+    payload = message.get('payload', {})
+    
+    def extract_text(part):
+        """Recursively extract text from message parts."""
+        if part.get('mimeType') == 'text/plain' and part.get('body', {}).get('data'):
+            return base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='replace')
+        for sub in part.get('parts', []):
+            result = extract_text(sub)
+            if result:
+                return result
+        return ""
+    
+    body_text = extract_text(payload)
+    # Fallback to snippet if no plain text body
+    if not body_text:
+        body_text = message.get('snippet', '')
+    
+    # Truncate body to 2000 chars for LLM consumption
+    if len(body_text) > 2000:
+        body_text = body_text[:2000] + "... [truncated]"
+    
+    return {
+        'id': message.get('id'),
+        'threadId': message.get('threadId'),
+        'labelIds': message.get('labelIds', []),
+        'snippet': message.get('snippet', ''),
+        'subject': headers.get('subject', ''),
+        'from': headers.get('from', ''),
+        'to': headers.get('to', ''),
+        'date': headers.get('date', ''),
+        'body': body_text,
+    }
 
 def send_message(to, subject, body):
     service = get_service()
@@ -133,7 +170,11 @@ def handle_request(request):
         if name == 'gmail_list_messages':
             return {"content": [{"type": "text", "text": json.dumps(list_messages(args.get('query', ''), args.get('max_results', 10)))}]}
         elif name == 'gmail_get_message':
-            return {"content": [{"type": "text", "text": json.dumps(get_message(args.get('message_id')))}]}
+            # Accept both 'message_id' and 'id' since models use either
+            msg_id = args.get('message_id') or args.get('id') or args.get('messageId')
+            if not msg_id:
+                return {"isError": True, "content": [{"type": "text", "text": f"Missing required parameter 'message_id'. Got args: {list(args.keys())}"}]}
+            return {"content": [{"type": "text", "text": json.dumps(get_message(msg_id))}]}
         elif name == 'gmail_send_message':
             return {"content": [{"type": "text", "text": json.dumps(send_message(args.get('to'), args.get('subject'), args.get('body')))}]}
     
