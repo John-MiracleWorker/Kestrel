@@ -102,8 +102,14 @@ async def task_complete(
     artifacts: Optional[list[str]] = None,
 ) -> dict:
     """
-    Mark the current step as complete.
-    The agent loop checks for this tool call and updates step status.
+    Signal that the ENTIRE task goal has been fully achieved.
+
+    Only call this when every part of the user's original request has been
+    completed — not when a single intermediate step finishes.  If the current
+    step is done but more steps remain, simply return without calling this tool
+    and the agent loop will advance to the next step automatically.
+
+    The agent loop checks for this tool call and updates task status.
     """
     result = {
         "summary": summary,
