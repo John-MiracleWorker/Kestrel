@@ -17,10 +17,15 @@ _providers: dict[str, Union[LocalProvider, CloudProvider, OllamaProvider]] = {}
 
 def get_provider(name: str):
     if name not in _providers:
-        if name == "local":
-            _providers[name] = LocalProvider()
-        elif name == "ollama":
-            _providers[name] = OllamaProvider()
+        if name in ("local", "ollama"):
+            # Both "local" and "ollama" use the Ollama HTTP backend.
+            # Re-use the same instance so health cache is shared.
+            if "ollama" in _providers:
+                _providers[name] = _providers["ollama"]
+            elif "local" in _providers:
+                _providers[name] = _providers["local"]
+            else:
+                _providers[name] = OllamaProvider()
         else:
             _providers[name] = CloudProvider(name)
     return _providers[name]
