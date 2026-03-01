@@ -265,8 +265,14 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
     from agent.tools.computer_use import register_computer_use_tools
     register_computer_use_tools(registry)
 
-    # Multi-agent delegation tools
-    from agent.tools.delegate import DELEGATE_TOOL, DELEGATE_PARALLEL_TOOL
+    # Multi-agent delegation tools (including dynamic specialist management)
+    from agent.tools.delegate import (
+        DELEGATE_TOOL,
+        DELEGATE_PARALLEL_TOOL,
+        CREATE_SPECIALIST_TOOL,
+        LIST_SPECIALISTS_TOOL,
+        REMOVE_SPECIALIST_TOOL,
+    )
     from agent.coordinator import Coordinator
 
     # Coordinator is lazily initialized — needs the agent loop reference
@@ -274,10 +280,16 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
     registry._coordinator = None
     registry._current_task = None
 
+    def _get_coordinator():
+        return getattr(registry, '_coordinator', None)
+
+    def _get_current_task():
+        return getattr(registry, '_current_task', None)
+
     async def delegate_handler(goal: str, specialist: str = "researcher") -> dict:
         """Delegate a subtask to a specialist sub-agent."""
-        coordinator = getattr(registry, '_coordinator', None)
-        current_task = getattr(registry, '_current_task', None)
+        coordinator = _get_coordinator()
+        current_task = _get_current_task()
 
         if not coordinator or not current_task:
             return {
@@ -303,8 +315,8 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
 
     async def delegate_parallel_handler(subtasks: list = None) -> dict:
         """Run multiple specialist sub-agents in parallel."""
-        coordinator = getattr(registry, '_coordinator', None)
-        current_task = getattr(registry, '_current_task', None)
+        coordinator = _get_coordinator()
+        current_task = _get_current_task()
 
         if not coordinator or not current_task:
             return {
@@ -333,6 +345,79 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
             return {"success": False, "error": f"Parallel delegation failed: {e}"}
 
     registry.register(definition=DELEGATE_PARALLEL_TOOL, handler=delegate_parallel_handler)
+
+    async def create_specialist_handler(
+        type_key: str,
+        name: str,
+        persona: str,
+        allowed_tools: list,
+        adjacent_tools: list = None,
+        max_iterations: int = 15,
+        max_tool_calls: int = 30,
+        complexity_weight: float = 1.0,
+    ) -> dict:
+        """Create a dynamic specialist agent type at runtime."""
+        coordinator = _get_coordinator()
+
+        if not coordinator:
+            return {
+                "success": False,
+                "error": "Coordinator not available — cannot create specialists outside task mode.",
+            }
+
+        return coordinator.create_specialist(
+            type_key=type_key,
+            name=name,
+            persona=persona,
+            allowed_tools=allowed_tools,
+            adjacent_tools=adjacent_tools,
+            max_iterations=max_iterations,
+            max_tool_calls=max_tool_calls,
+            complexity_weight=complexity_weight,
+        )
+
+    registry.register(definition=CREATE_SPECIALIST_TOOL, handler=create_specialist_handler)
+
+    async def list_specialists_handler() -> dict:
+        """List all available specialist types."""
+        coordinator = _get_coordinator()
+
+        if not coordinator:
+            # Fallback: show built-in specialists even without coordinator
+            from agent.coordinator import SPECIALISTS
+            return {
+                "specialists": [
+                    {
+                        "type": key,
+                        "name": spec.name,
+                        "tools": spec.allowed_tools,
+                        "dynamic": False,
+                    }
+                    for key, spec in SPECIALISTS.items()
+                ],
+                "note": "Coordinator not active — showing built-in specialists only.",
+            }
+
+        return {
+            "specialists": coordinator.get_specialist_info(),
+            "total": len(coordinator.get_specialist_info()),
+        }
+
+    registry.register(definition=LIST_SPECIALISTS_TOOL, handler=list_specialists_handler)
+
+    async def remove_specialist_handler(type_key: str) -> dict:
+        """Remove a dynamically created specialist type."""
+        coordinator = _get_coordinator()
+
+        if not coordinator:
+            return {
+                "success": False,
+                "error": "Coordinator not available.",
+            }
+
+        return coordinator.remove_specialist(type_key=type_key)
+
+    registry.register(definition=REMOVE_SPECIALIST_TOOL, handler=remove_specialist_handler)
 
     logger.info(f"Tool registry built: {len(registry._definitions)} tools")
     return registry
