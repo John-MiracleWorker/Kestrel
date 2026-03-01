@@ -10,6 +10,7 @@ from agent.types import (
     AgentTask,
     ApprovalRequest,
     ApprovalStatus,
+    ApprovalTier,
     RiskLevel,
     StepStatus,
     TaskEvent,
@@ -104,6 +105,7 @@ class TaskExecutor:
         evidence_chain: Optional[EvidenceChain] = None,
         progress_callback: Optional[Callable] = None,
         verifier: Optional[VerifierEngine] = None,
+        approval_memory=None,
     ):
         self._provider = provider
         self._tools = tool_registry
@@ -118,6 +120,7 @@ class TaskExecutor:
         self._evidence_chain = evidence_chain
         self._progress_callback = progress_callback or (lambda t: 0.0)
         self._verifier = verifier
+        self._approval_memory = approval_memory
         self._step_diagnostics: dict[str, DiagnosticTracker] = {}  # step_id → tracker
 
     def _get_tracker(self, step_id: str) -> DiagnosticTracker:
@@ -156,6 +159,9 @@ class TaskExecutor:
         """
         Block until the pending approval is resolved.
         Returns True if approved, False if denied/expired.
+
+        Records the decision in approval memory so future matching
+        patterns can be auto-approved.
         """
         if not task.pending_approval:
             return True
@@ -168,7 +174,20 @@ class TaskExecutor:
                 status = approval.status.value if isinstance(approval.status, ApprovalStatus) else str(approval.status)
                 status = status.lower()
                 if status != ApprovalStatus.PENDING.value:
-                    return status == ApprovalStatus.APPROVED.value
+                    approved = status == ApprovalStatus.APPROVED.value
+                    # Record in approval memory for pattern learning
+                    if self._approval_memory:
+                        try:
+                            await self._approval_memory.record_approval(
+                                tool_name=task.pending_approval.tool_name,
+                                tool_args=task.pending_approval.tool_args,
+                                approved=approved,
+                                user_id=task.user_id,
+                                workspace_id=task.workspace_id,
+                            )
+                        except Exception as e:
+                            logger.warning("Failed to record approval pattern: %s", e)
+                    return approved
             await asyncio.sleep(2.0)
         return False
 
@@ -286,12 +305,12 @@ class TaskExecutor:
                 tool_args = {}
 
             is_control = tool_name in ("task_complete", "ask_human")
-            needs_approval = self._guardrails.needs_approval(
+            tier, _reason = self._guardrails.check_tool(
                 tool_name, tool_args, task.config,
                 tool_registry=self._tools,
             )
 
-            if is_control or needs_approval:
+            if is_control or tier in (ApprovalTier.CONFIRM, ApprovalTier.BLOCK):
                 sequential_queue.append(tc_data)
             else:
                 parallel_batch.append(tc_data)
@@ -429,12 +448,37 @@ class TaskExecutor:
             arguments=tool_args,
         )
 
-        approval_needed = self._guardrails.needs_approval(
+        tier, tier_reason = self._guardrails.check_tool(
             tool_name, tool_args, task.config,
             tool_registry=self._tools,
         )
 
-        if approval_needed:
+        if tier == ApprovalTier.BLOCK:
+            # Blocked pattern — fail the step immediately
+            yield TaskEvent(
+                type=TaskEventType.TOOL_RESULT,
+                task_id=task.id,
+                step_id=step.id,
+                tool_name=tool_name,
+                tool_result=tier_reason,
+                progress=self._progress_callback(task),
+            )
+            return
+
+        if tier == ApprovalTier.INFORM:
+            # Auto-approved but notable — notify user without blocking
+            yield TaskEvent(
+                type=TaskEventType.TOOL_AUTO_APPROVED,
+                task_id=task.id,
+                step_id=step.id,
+                tool_name=tool_name,
+                tool_args=json.dumps(tool_args),
+                content=tier_reason,
+                progress=self._progress_callback(task),
+            )
+            # Fall through to execute the tool
+
+        if tier == ApprovalTier.CONFIRM:
             request = ApprovalRequest(
                 id=str(uuid.uuid4()),
                 task_id=task.id,
@@ -442,7 +486,7 @@ class TaskExecutor:
                 tool_name=tool_name,
                 tool_args=tool_args,
                 risk_level=self._tools.get_risk_level(tool_name),
-                reason=approval_needed,
+                reason=tier_reason,
             )
             task.pending_approval = request
             await self._persistence.save_approval(request)
@@ -454,7 +498,7 @@ class TaskExecutor:
                 tool_name=tool_name,
                 tool_args=json.dumps(tool_args),
                 approval_id=request.id,
-                content=approval_needed,
+                content=tier_reason,
                 progress=self._progress_callback(task),
             )
             # Generator suspends here. The loop in loop.py waits for
@@ -463,6 +507,8 @@ class TaskExecutor:
             # code below — so the approved tool actually runs.
             # If the approval is denied the loop breaks and this
             # generator is cleaned up without reaching the code below.
+
+        # SILENT tier: no notification, just execute
 
         yield TaskEvent(
             type=TaskEventType.TOOL_CALLED,

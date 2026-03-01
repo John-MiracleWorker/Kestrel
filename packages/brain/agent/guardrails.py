@@ -19,6 +19,7 @@ from typing import Optional
 
 from agent.types import (
     AgentTask,
+    ApprovalTier,
     GuardrailConfig,
     RiskLevel,
 )
@@ -108,6 +109,72 @@ class Guardrails:
 
         return None
 
+    def check_tool(
+        self,
+        tool_name: str,
+        tool_args: dict,
+        config: GuardrailConfig,
+        tool_registry=None,
+        approval_memory=None,
+    ) -> tuple[ApprovalTier, Optional[str]]:
+        """Determine the approval tier for a tool call.
+
+        Returns ``(tier, reason)`` where:
+          - BLOCK:   blocked pattern detected — tool must not run
+          - CONFIRM: requires human approval before executing
+          - INFORM:  auto-approved but notable — user gets a notification
+          - SILENT:  auto-approved silently
+        """
+        # 1. Blocked patterns → BLOCK
+        block_reason = self._check_blocked_patterns(tool_name, tool_args, config)
+        if block_reason:
+            return ApprovalTier.BLOCK, f"BLOCKED: {block_reason}"
+
+        # 2. Tool definition requires_approval flag → CONFIRM
+        if tool_registry:
+            tool_def = tool_registry.get_tool(tool_name)
+            if tool_def and getattr(tool_def, 'requires_approval', False):
+                return ApprovalTier.CONFIRM, f"Tool '{tool_name}' requires human approval before execution"
+
+        # 3. Task-level always-require list → CONFIRM
+        if tool_name in config.require_approval_tools:
+            return ApprovalTier.CONFIRM, f"Tool '{tool_name}' is configured to always require approval"
+
+        # 4. Risk assessment with contextual adjustment
+        risk = self._get_tool_risk(tool_name, tool_registry=tool_registry)
+        risk = self._contextual_risk_adjustment(tool_name, tool_args, risk)
+
+        _RISK_ORDER = {RiskLevel.LOW: 0, RiskLevel.MEDIUM: 1, RiskLevel.HIGH: 2}
+        risk_val = _RISK_ORDER.get(risk, 2)
+        threshold_val = _RISK_ORDER.get(config.auto_approve_risk, 1)
+
+        if risk_val > threshold_val:
+            # Would normally CONFIRM, but check approval memory first
+            if approval_memory is not None:
+                # approval_memory.should_auto_approve is sync-safe (cached)
+                auto, auto_reason = approval_memory.should_auto_approve_sync(
+                    tool_name, tool_args,
+                    workspace_id=getattr(config, '_workspace_id', ''),
+                )
+                if auto:
+                    return ApprovalTier.INFORM, auto_reason
+            return ApprovalTier.CONFIRM, (
+                f"Tool '{tool_name}' has {risk.value.upper()} risk "
+                f"— exceeds auto-approve threshold"
+            )
+
+        # 5. Rate limiting → CONFIRM
+        rate_issue = self._check_rate_limit(tool_name)
+        if rate_issue:
+            return ApprovalTier.CONFIRM, rate_issue
+
+        # 6. MEDIUM risk within threshold → INFORM (auto-approve but notify)
+        if risk == RiskLevel.MEDIUM:
+            return ApprovalTier.INFORM, f"Auto-approved: {tool_name} ({risk.value} risk)"
+
+        # 7. LOW risk → SILENT
+        return ApprovalTier.SILENT, None
+
     def needs_approval(
         self,
         tool_name: str,
@@ -115,39 +182,11 @@ class Guardrails:
         config: GuardrailConfig,
         tool_registry=None,
     ) -> Optional[str]:
-        """
-        Check if a tool call requires human approval.
-        Returns a reason string if approval needed, None if auto-approved.
-        """
-        # 1. Check blocked patterns first
-        block_reason = self._check_blocked_patterns(tool_name, tool_args, config)
-        if block_reason:
-            return f"BLOCKED: {block_reason}"
-
-        # 2. Check if tool definition has requires_approval=True
-        if tool_registry:
-            tool_def = tool_registry.get_tool(tool_name)
-            if tool_def and getattr(tool_def, 'requires_approval', False):
-                return f"Tool '{tool_name}' requires human approval before execution"
-
-        # 3. Check if tool is in the always-approve list
-        if tool_name in config.require_approval_tools:
-            return f"Tool '{tool_name}' is configured to always require approval"
-
-        # 4. Check risk level against auto-approve threshold
-        risk = self._get_tool_risk(tool_name)
-
-        # Use proper enum ordering instead of string comparison
-        _RISK_ORDER = {RiskLevel.LOW: 0, RiskLevel.MEDIUM: 1, RiskLevel.HIGH: 2}
-        if _RISK_ORDER.get(risk, 2) > _RISK_ORDER.get(config.auto_approve_risk, 1):
-            return f"Tool '{tool_name}' has {risk.value.upper()} risk — exceeds auto-approve threshold"
-
-        # 5. Rate limiting
-        rate_issue = self._check_rate_limit(tool_name)
-        if rate_issue:
-            return rate_issue
-
-        return None  # Auto-approved
+        """Backward-compatible wrapper: returns reason if CONFIRM/BLOCK, else None."""
+        tier, reason = self.check_tool(tool_name, tool_args, config, tool_registry)
+        if tier in (ApprovalTier.CONFIRM, ApprovalTier.BLOCK):
+            return reason
+        return None
 
     def _check_blocked_patterns(
         self,
@@ -236,9 +275,73 @@ class Guardrails:
 
         return None
 
-    def _get_tool_risk(self, tool_name: str) -> RiskLevel:
-        """Get the risk level for a tool (fallback mapping)."""
-        # Hardcoded fallback mapping for when we don't have the registry
+    # ── Contextual Risk Adjustment ─────────────────────────────────
+
+    # Paths that should escalate file operations to HIGH risk
+    _SYSTEM_PATH_PREFIXES = (
+        "/etc/", "/usr/", "/var/", "/sys/", "/proc/",
+        "/boot/", "/root/", "/sbin/", "/bin/",
+        "C:\\Windows", "C:\\Program Files",
+    )
+
+    def _contextual_risk_adjustment(
+        self, tool_name: str, tool_args: dict, base_risk: RiskLevel,
+    ) -> RiskLevel:
+        """Adjust risk level based on tool arguments and context.
+
+        Examples:
+          - file_write to /etc/ → escalate to HIGH
+          - git action=status → de-escalate to LOW
+          - mcp_call with read-like tool → de-escalate to LOW
+          - container_control action=logs → de-escalate to LOW
+        """
+        # File operation path checks
+        if tool_name in ("file_write", "host_write"):
+            path = tool_args.get("path", "") or tool_args.get("file_path", "")
+            if any(path.startswith(p) for p in self._SYSTEM_PATH_PREFIXES):
+                return RiskLevel.HIGH
+
+        # Git sub-action checks
+        if tool_name == "git":
+            action = str(tool_args.get("action", "")).lower()
+            if action in ("status", "diff", "log", "branch", "show"):
+                return RiskLevel.LOW
+            if action in ("add", "commit", "stash"):
+                return RiskLevel.MEDIUM
+            # push, deploy, force-push, checkout --force remain at base risk
+
+        # Container/daemon control sub-action checks
+        if tool_name in ("container_control", "daemon_list", "daemon_stop"):
+            action = str(tool_args.get("action", "")).lower()
+            if action in ("status", "logs", "list", "rebuild_log"):
+                return RiskLevel.LOW
+
+        # MCP call: risk depends on the underlying tool operation
+        if tool_name == "mcp_call":
+            tool = str(tool_args.get("tool_name", "")).lower()
+            if any(kw in tool for kw in ("search", "list", "get", "read", "query", "fetch", "find")):
+                return RiskLevel.LOW
+            if any(kw in tool for kw in ("create", "update", "delete", "push", "send", "post", "write")):
+                return RiskLevel.MEDIUM
+
+        return base_risk
+
+    def _get_tool_risk(self, tool_name: str, tool_registry=None) -> RiskLevel:
+        """Get the risk level for a tool.
+
+        Resolution order:
+          1. Tool registry definition (authoritative — set by tool author)
+          2. Hardcoded fallback map (for when registry isn't available)
+          3. MEDIUM default for unknown tools (blocked patterns still
+             catch destructive commands regardless of risk level)
+        """
+        # 1. Check tool registry (authoritative source)
+        if tool_registry:
+            tool_def = tool_registry.get_tool(tool_name)
+            if tool_def:
+                return tool_def.risk_level
+
+        # 2. Hardcoded fallback mapping for when we don't have the registry
         risk_map = {
             "code_execute": RiskLevel.MEDIUM,
             "web_search": RiskLevel.LOW,
@@ -258,7 +361,13 @@ class Guardrails:
             "task_complete": RiskLevel.LOW,
             "api_call": RiskLevel.MEDIUM,
         }
-        return risk_map.get(tool_name, RiskLevel.HIGH)  # Unknown = HIGH
+        if tool_name in risk_map:
+            return risk_map[tool_name]
+
+        # 3. Unknown tools default to MEDIUM (not HIGH).
+        # Truly dangerous operations are caught by blocked patterns (layer 1).
+        logger.info("Unknown tool '%s' — defaulting to MEDIUM risk", tool_name)
+        return RiskLevel.MEDIUM
 
     def validate_config(self, config: GuardrailConfig) -> list[str]:
         """

@@ -87,6 +87,7 @@ class AgentLoop:
         reflection_engine=None,
         model_router: Optional[ModelRouter] = None,
         provider_resolver=None,
+        approval_memory=None,
     ):
         self._provider = provider
         self._provider_resolver = provider_resolver  # callable: (name) -> provider
@@ -103,6 +104,7 @@ class AgentLoop:
         self._event_callback = event_callback
         self._reflection_engine = reflection_engine
         self._model_router = model_router or ModelRouter()
+        self._approval_memory = approval_memory
         self._metrics = MetricsCollector(model=model)
         self._council = CouncilSession(
             llm_provider=provider,
@@ -123,6 +125,7 @@ class AgentLoop:
             event_callback=event_callback,
             evidence_chain=evidence_chain,
             progress_callback=self._progress,
+            approval_memory=approval_memory,
         )
 
         # Callback for approval resolution (set by the gRPC handler)
@@ -165,36 +168,44 @@ class AgentLoop:
         return task.iterations % 8 == 0
 
     def _should_skip_council(self, task: AgentTask, plan_complexity: float) -> bool:
-        """Skip council deliberation for demonstrably safe plans.
+        """Skip council deliberation for routine plans.
 
-        A plan is safe when ALL of these hold:
-        - Complexity is below 6.5 (moderate tasks)
-        - All plan steps use only LOW risk tools
+        A plan is routine when ALL of these hold:
+        - Complexity is below 8.5
+        - No plan steps involve HIGH risk tools
         - No steps mention security-sensitive operations
 
-        Saves 3-5 LLM calls for simple, low-risk tasks.
+        MEDIUM-risk tools (file_write, code_execute, mcp_call, etc.) are
+        routine operations and no longer trigger council review.  Only
+        HIGH-risk tools (host_write, database_mutate, container rebuild)
+        warrant the full council.
+
+        Saves 3-5 LLM calls for the majority of real tasks.
         """
-        if plan_complexity >= 6.5:
+        if plan_complexity >= 8.5:
             return False
 
         if not task.plan or not task.plan.steps:
             return False
 
         for step in task.plan.steps:
-            # Check tool calls for risk levels
+            # Check tool calls — only HIGH risk triggers council
             for tc in step.tool_calls:
                 tool_name = tc.get("tool", tc.get("function", {}).get("name", ""))
                 if tool_name:
                     risk = self._tools.get_risk_level(tool_name)
-                    if risk != RiskLevel.LOW:
+                    if risk == RiskLevel.HIGH:
                         return False
             # Check description for security-sensitive keywords
             desc_lower = step.description.lower()
-            if any(kw in desc_lower for kw in ("delete", "deploy", "credential", "secret", "admin", "sudo", "production")):
+            if any(kw in desc_lower for kw in (
+                "delete", "deploy", "credential", "secret", "admin",
+                "sudo", "production", "database migration",
+            )):
                 return False
 
         logger.debug(
-            f"Council skip: all {len(task.plan.steps)} steps are LOW risk "
+            f"Council skip: no HIGH-risk tools in {len(task.plan.steps)} steps "
             f"(complexity={plan_complexity:.1f})"
         )
         return True
@@ -386,18 +397,18 @@ class AgentLoop:
                     pass
 
                 # Council thresholds:
-                #   < 5.0  — skip entirely (cheap tasks, no council needed)
-                #   5.0–6.5 + all LOW risk — skip (proactive safe-plan bypass)
-                #   5.0–7.0 — deliberate_lite(): 3 most relevant members, no debate (~40% cheaper)
-                #   > 7.0  — full deliberate(): all 5 members + optional debate round
+                #   < 7.0  — skip entirely (routine tasks, no council needed)
+                #   7.0–8.5 + no HIGH risk — skip (proactive safe-plan bypass)
+                #   7.0–9.0 — deliberate_lite(): 3 most relevant members, no debate (~40% cheaper)
+                #   > 9.0  — full deliberate(): all 5 members + optional debate round
                 if (
                     hasattr(self, "_council") and self._council
-                    and plan_complexity > 5.0
+                    and plan_complexity > 7.0
                     and not self._should_skip_council(task, plan_complexity)
                 ):
                     try:
                         plan_text = json.dumps(task.plan.to_dict())
-                        if plan_complexity <= 7.0:
+                        if plan_complexity <= 9.0:
                             # Moderate complexity — mini council (3 members, no debate)
                             verdict = await self._council.deliberate_lite(
                                 proposal=plan_text,
@@ -413,34 +424,45 @@ class AgentLoop:
                             )
                         
                         if verdict.requires_user_review:
-                            yield TaskEvent(
-                                type=TaskEventType.THINKING,
-                                task_id=task.id,
-                                content=f"⚖️ Council Review Required: {verdict.review_reason}\n\n" +
-                                        "\n".join(f"- {c}" for c in verdict.synthesized_concerns),
-                                progress=self._progress(task),
-                            )
-                            # Pause the loop and ask the user
-                            yield TaskEvent(
-                                type=TaskEventType.APPROVAL_NEEDED,
-                                task_id=task.id,
-                                content=f"The Council is divided or flagged a critical issue. Proceed?",
-                                progress=self._progress(task),
-                            )
-                            # The executor loop below handles the actual blocking/waiting for APPROVAL_NEEDED
-                            task.status = TaskStatus.WAITING_APPROVAL
-                            await self._persistence.update_task(task)
-                            
-                            # Wait for user approval
-                            approved = await self._executor._wait_for_approval(task)
-                            if not approved:
-                                task.status = TaskStatus.FAILED
-                                task.error = "User denied plan after Council review."
+                            from agent.council import VoteType as _VT
+                            _is_hard_reject = (verdict.consensus == _VT.REJECT)
+
+                            if _is_hard_reject:
+                                # Council explicitly rejected — block on user approval
+                                yield TaskEvent(
+                                    type=TaskEventType.THINKING,
+                                    task_id=task.id,
+                                    content=f"⚖️ Council Rejected Plan: {verdict.review_reason}\n\n" +
+                                            "\n".join(f"- {c}" for c in verdict.synthesized_concerns),
+                                    progress=self._progress(task),
+                                )
+                                yield TaskEvent(
+                                    type=TaskEventType.APPROVAL_NEEDED,
+                                    task_id=task.id,
+                                    content="The Council rejected this plan. Proceed anyway?",
+                                    progress=self._progress(task),
+                                )
+                                task.status = TaskStatus.WAITING_APPROVAL
                                 await self._persistence.update_task(task)
-                                return
-                                
-                            task.status = TaskStatus.EXECUTING
-                            await self._persistence.update_task(task)
+
+                                approved = await self._executor._wait_for_approval(task)
+                                if not approved:
+                                    task.status = TaskStatus.FAILED
+                                    task.error = "User denied plan after Council review."
+                                    await self._persistence.update_task(task)
+                                    return
+
+                                task.status = TaskStatus.EXECUTING
+                                await self._persistence.update_task(task)
+                            else:
+                                # Council has concerns but didn't reject — proceed with warning
+                                yield TaskEvent(
+                                    type=TaskEventType.THINKING,
+                                    task_id=task.id,
+                                    content=f"⚖️ Council noted concerns (proceeding): {verdict.review_reason}\n" +
+                                            "\n".join(f"- {c}" for c in verdict.synthesized_concerns[:3]),
+                                    progress=self._progress(task),
+                                )
 
                     except Exception as e:
                         logger.warning(f"Council deliberation failed: {e}")
