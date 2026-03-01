@@ -253,6 +253,10 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
     register_git_tools(registry)
     register_self_improve_tools(registry)
 
+    # Sub-agent codebase scanner (LLM-powered deep analysis)
+    from agent.tools.scanner import register_scanner_tools
+    register_scanner_tools(registry)
+
     # Container control (inspect and manage Compose services)
     from agent.tools.container_control import register_container_tools
     register_container_tools(registry)

@@ -19,7 +19,10 @@ DELEGATE_TOOL = ToolDefinition(
         "execute the task independently and return its result. Available "
         "specialists: 'researcher' (web research), 'coder' (code and files), "
         "'analyst' (data analysis), 'reviewer' (read-only validation), "
-        "'explorer' (host filesystem — uses host_tree, host_batch_read, host_find)."
+        "'explorer' (host filesystem — uses host_tree, host_batch_read, host_find), "
+        "'scanner' (deep codebase analysis — reads files and REASONS about them "
+        "using LLM, produces structured findings with architecture analysis, "
+        "patterns, issues, and implementation plans)."
     ),
     parameters={
         "type": "object",
@@ -30,7 +33,7 @@ DELEGATE_TOOL = ToolDefinition(
             },
             "specialist": {
                 "type": "string",
-                "enum": ["researcher", "coder", "analyst", "reviewer", "explorer"],
+                "enum": ["researcher", "coder", "analyst", "reviewer", "explorer", "scanner"],
                 "description": "Type of specialist to delegate to",
             },
         },
@@ -65,7 +68,7 @@ DELEGATE_PARALLEL_TOOL = ToolDefinition(
                         },
                         "specialist": {
                             "type": "string",
-                            "enum": ["researcher", "coder", "analyst", "reviewer", "explorer"],
+                            "enum": ["researcher", "coder", "analyst", "reviewer", "explorer", "scanner"],
                             "description": "Type of specialist",
                         },
                     },

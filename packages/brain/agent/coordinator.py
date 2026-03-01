@@ -51,6 +51,7 @@ _SPECIALIST_WEIGHT: dict[str, float] = {
     "reviewer": 0.6,     # Read-only, less output
     "explorer": 1.2,     # File traversal + synthesis
     "synthesizer": 0.8,  # Summary tasks
+    "scanner": 1.8,      # Deep analysis — reads files + reasons about them
 }
 
 
@@ -142,6 +143,35 @@ SPECIALISTS = {
         ],
         max_iterations=8,
         max_tool_calls=15,
+    ),
+    "scanner": SpecialistConfig(
+        name="Code Scanner",
+        persona=(
+            "You are a deep code analysis specialist. Your job is to thoroughly "
+            "read and REASON about source code in an assigned region of a codebase.\n\n"
+            "Strategy:\n"
+            "1. Use host_tree(path) to understand the structure of your assigned region\n"
+            "2. Identify the most important files (entry points, main modules, configs)\n"
+            "3. Use host_batch_read(paths) to read key files in bulk\n"
+            "4. Use host_search(query) to trace patterns, references, or dependencies\n"
+            "5. REASON deeply about what you read — understand architecture, patterns, "
+            "   data flow, and potential issues\n"
+            "6. Produce a STRUCTURED JSON report with your findings\n\n"
+            "You are not just listing files — you are UNDERSTANDING them. Explain WHY "
+            "things are designed the way they are. Identify patterns, anti-patterns, "
+            "risks, and opportunities. Your output must be a JSON object with keys: "
+            "region, files_analyzed, summary, architecture, findings, dependencies, "
+            "recommendations."
+        ),
+        allowed_tools=[
+            "project_recall", "host_tree", "host_batch_read", "host_read",
+            "host_find", "host_search", "host_list",
+            "memory_store", "memory_search",
+            "task_complete",
+        ],
+        adjacent_tools=["file_read", "host_write"],
+        max_iterations=25,
+        max_tool_calls=50,
     ),
 }
 
