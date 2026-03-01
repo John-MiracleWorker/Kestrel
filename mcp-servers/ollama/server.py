@@ -31,8 +31,8 @@ TOOLS = [
                 },
                 "model": {
                     "type": "string",
-                    "description": "Ollama model name (e.g., 'llama3', 'qwen3:8b')",
-                    "default": "qwen3:8b",
+                    "description": "Ollama model name (e.g., 'llama3', 'glm5')",
+                    "default": "glm5",
                 },
                 "system": {
                     "type": "string",
@@ -69,7 +69,7 @@ TOOLS = [
                 "model": {
                     "type": "string",
                     "description": "Ollama model name",
-                    "default": "qwen3:8b",
+                    "default": "glm5",
                 },
                 "temperature": {
                     "type": "number",
@@ -97,7 +97,7 @@ async def handle_tool_call(name: str, arguments: dict) -> dict:
 
     try:
         if name == "ollama_generate":
-            model = arguments.get("model", "qwen3:8b")
+            model = arguments.get("model", "glm5")
             prompt = arguments.get("prompt", "")
             system_prompt = arguments.get("system", "")
             temperature = arguments.get("temperature", 0.7)
@@ -124,7 +124,7 @@ async def handle_tool_call(name: str, arguments: dict) -> dict:
             return {"content": [{"type": "text", "text": content}]}
 
         elif name == "ollama_chat":
-            model = arguments.get("model", "qwen3:8b")
+            model = arguments.get("model", "glm5")
             messages = arguments.get("messages", [])
             temperature = arguments.get("temperature", 0.7)
 

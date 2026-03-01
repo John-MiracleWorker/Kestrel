@@ -126,7 +126,7 @@ class TaskExecutor:
         # Detect if a workspace model was explicitly configured
         # (e.g. 'glm-5:cloud') — prevents unwanted cloud escalation
         self._has_explicit_model = bool(
-            model and model not in ('', 'default', 'qwen3:8b')
+            model and model not in ('', 'default', 'glm5')
         )
         self._approval_memory = approval_memory
         self._step_diagnostics: dict[str, DiagnosticTracker] = {}  # step_id → tracker

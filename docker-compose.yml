@@ -110,6 +110,10 @@ services:
       AGENT_HOST_MOUNTS: ${AGENT_HOST_MOUNTS:-}
       MOLTBOOK_API_KEY: ${MOLTBOOK_API_KEY:-}
       SCREEN_AGENT_URL: ${SCREEN_AGENT_URL:-http://host.docker.internal:9800}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      OLLAMA_DEFAULT_MODEL: ${OLLAMA_DEFAULT_MODEL:-glm5}
+      ROUTER_OLLAMA_MODEL: ${ROUTER_OLLAMA_MODEL:-glm5}
+      ROUTER_OLLAMA_LARGE_MODEL: ${ROUTER_OLLAMA_LARGE_MODEL:-glm5}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes:
       - ${LOCAL_MODEL_DIR:-./models}:/models:ro
