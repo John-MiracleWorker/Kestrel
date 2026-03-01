@@ -187,9 +187,28 @@ class OllamaProvider:
         """
         model = model or OLLAMA_DEFAULT_MODEL
 
+        # ── Sanitize messages for Ollama ─────────────────────────────
+        # Strip non-standard keys that other providers add (e.g.
+        # _gemini_raw_part, turn_id, _attachments) and fix content: None.
+        clean_messages = []
+        ALLOWED_MSG_KEYS = {"role", "content", "tool_calls", "tool_call_id", "name", "images"}
+        ALLOWED_TC_KEYS = {"id", "type", "function"}
+        for msg in messages:
+            clean = {k: v for k, v in msg.items() if k in ALLOWED_MSG_KEYS}
+            # Ollama doesn't accept content=None (assistant with tool_calls)
+            if clean.get("content") is None:
+                clean["content"] = ""
+            # Sanitize tool_calls within assistant messages
+            if "tool_calls" in clean and clean["tool_calls"]:
+                clean_tcs = []
+                for tc in clean["tool_calls"]:
+                    clean_tcs.append({k: v for k, v in tc.items() if k in ALLOWED_TC_KEYS})
+                clean["tool_calls"] = clean_tcs
+            clean_messages.append(clean)
+
         payload: dict = {
             "model": model,
-            "messages": messages,
+            "messages": clean_messages,
             "stream": False,
             "options": {
                 "temperature": temperature,
@@ -199,8 +218,8 @@ class OllamaProvider:
         }
 
         # Convert OpenAI-style tool schemas to Ollama format
+        ollama_tools = []
         if tools:
-            ollama_tools = []
             for tool in tools:
                 # Handle both {type: function, function: {...}} and raw function schemas
                 if isinstance(tool, dict):
@@ -223,6 +242,15 @@ class OllamaProvider:
                     f"{self._base_url}/api/chat",
                     json=payload,
                 )
+                if resp.status_code != 200:
+                    try:
+                        err_body = resp.text[:500]
+                    except Exception:
+                        err_body = "(no body)"
+                    logger.error(
+                        f"Ollama API {resp.status_code}: {err_body}\n"
+                        f"  model={model}, messages={len(clean_messages)}, tools={len(ollama_tools)}"
+                    )
                 resp.raise_for_status()
                 data = resp.json()
 
