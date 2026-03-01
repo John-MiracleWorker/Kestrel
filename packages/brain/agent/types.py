@@ -54,6 +54,21 @@ class ApprovalStatus(str, Enum):
     EXPIRED = "expired"
 
 
+class ApprovalTier(str, Enum):
+    """Approval tiers for tool execution — from most to least permissive."""
+    SILENT = "silent"       # Auto-approve, no notification
+    INFORM = "inform"       # Auto-approve, log/notify user (non-blocking)
+    CONFIRM = "confirm"     # Pause and ask user before executing
+    BLOCK = "block"         # Always blocked, cannot execute
+
+
+class AutonomyLevel(str, Enum):
+    """Workspace-level autonomy presets."""
+    CAUTIOUS = "cautious"       # auto_approve_risk=LOW, council at complexity>5
+    BALANCED = "balanced"       # auto_approve_risk=MEDIUM, council at complexity>7
+    AUTONOMOUS = "autonomous"   # auto_approve_risk=HIGH, council at complexity>9
+
+
 # ── Tool Types ───────────────────────────────────────────────────────
 
 
@@ -216,6 +231,7 @@ class GuardrailConfig:
     max_tool_calls: int = 80
     max_wall_time_seconds: int = 600
     auto_approve_risk: RiskLevel = RiskLevel.MEDIUM
+    autonomy_level: AutonomyLevel = AutonomyLevel.BALANCED
     blocked_patterns: list[str] = field(default_factory=list)
     allowed_domains: list[str] = field(default_factory=list)
     require_approval_tools: list[str] = field(default_factory=list)
@@ -227,6 +243,7 @@ class GuardrailConfig:
             "max_tool_calls": self.max_tool_calls,
             "max_wall_time_seconds": self.max_wall_time_seconds,
             "auto_approve_risk": self.auto_approve_risk.value,
+            "autonomy_level": self.autonomy_level.value,
             "blocked_patterns": self.blocked_patterns,
             "allowed_domains": self.allowed_domains,
             "require_approval_tools": self.require_approval_tools,
@@ -240,6 +257,7 @@ class GuardrailConfig:
             max_tool_calls=data.get("max_tool_calls", 50),
             max_wall_time_seconds=data.get("max_wall_time_seconds", 600),
             auto_approve_risk=RiskLevel(data.get("auto_approve_risk", "medium")),
+            autonomy_level=AutonomyLevel(data.get("autonomy_level", "balanced")),
             blocked_patterns=data.get("blocked_patterns", []),
             allowed_domains=data.get("allowed_domains", []),
             require_approval_tools=data.get("require_approval_tools", []),
@@ -306,6 +324,7 @@ class TaskEventType(str, Enum):
     TOOL_RESULT = "tool_result"
     STEP_COMPLETE = "step_complete"
     APPROVAL_NEEDED = "approval_needed"
+    TOOL_AUTO_APPROVED = "tool_auto_approved"
     THINKING = "thinking"
     VERIFIER_STARTED = "verifier_started"
     VERIFIER_PASSED = "verifier_passed"

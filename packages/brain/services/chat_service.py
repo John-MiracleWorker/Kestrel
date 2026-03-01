@@ -165,7 +165,8 @@ class ChatServicerMixin(BaseServicerMixin):
             from agent.guardrails import Guardrails
             from agent.types import (
                 AgentTask, GuardrailConfig as GCfg, TaskEventType, TaskStatus,
-                TaskPlan, TaskStep, StepStatus,
+                TaskPlan, TaskStep, StepStatus, RiskLevel as _RL,
+                AutonomyLevel as _AL,
             )
 
             # ── 4a. Intercept /slash commands ───────────────────────
@@ -214,9 +215,15 @@ class ChatServicerMixin(BaseServicerMixin):
                 goal=user_content,
                 config=GCfg(
                     max_iterations=ws_guardrails.get("maxIterations", 40),
-                    max_tool_calls=ws_guardrails.get("maxToolCalls", 50),
+                    max_tool_calls=ws_guardrails.get("maxToolCalls", 80),
                     max_tokens=ws_guardrails.get("maxTokens", 100_000),
                     max_wall_time_seconds=ws_guardrails.get("maxWallTime", 600),
+                    auto_approve_risk=_RL(
+                        ws_guardrails.get("autoApproveRisk", "medium")
+                    ),
+                    autonomy_level=_AL(
+                        ws_guardrails.get("autonomyLevel", "balanced")
+                    ),
                 ),
             )
 
@@ -383,6 +390,14 @@ class ChatServicerMixin(BaseServicerMixin):
                 workspace_model=model,
             )
 
+            # Initialize approval memory for pattern learning
+            from agent.approval_memory import ApprovalMemory
+            _approval_memory = ApprovalMemory(pool=pool)
+            try:
+                await _approval_memory.load_workspace_cache(workspace_id)
+            except Exception as e:
+                logger.warning("Failed to load approval memory cache: %s", e)
+
             agent_loop = AgentLoop(
                 provider=provider,
                 tool_registry=tool_registry,
@@ -397,6 +412,7 @@ class ChatServicerMixin(BaseServicerMixin):
                 event_callback=_activity_callback,
                 provider_resolver=resolve_provider,
                 model_router=chat_model_router,
+                approval_memory=_approval_memory,
             )
 
             # Inject persona context into the system prompt if available
