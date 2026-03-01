@@ -16,3 +16,4 @@ gitpython
 docker
 psutil
 cryptography
+bcrypt

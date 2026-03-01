@@ -352,6 +352,8 @@ async def run_computer_use(
     Returns:
         Dict with keys: success, turns, actions_taken, model_commentary, error
     """
+    global COMPUTER_USE_MODEL
+
     api_key = api_key or os.getenv("GOOGLE_API_KEY", "")
     if not api_key:
         return {
@@ -430,7 +432,6 @@ async def run_computer_use(
                 model_chain_idx += 1
                 model = model_chain[model_chain_idx]
                 # Update the global so the next top-level call starts here
-                global COMPUTER_USE_MODEL
                 COMPUTER_USE_MODEL = model
                 logger.warning(
                     f"Computer Use model {model_chain[model_chain_idx - 1]} returned 404; "

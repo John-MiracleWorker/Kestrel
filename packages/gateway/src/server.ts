@@ -35,13 +35,22 @@ import workspaceWebhookRoutes from './routes/workspace-webhooks';
 
 dotenv.config();
 
+// ── Type Extensions ──────────────────────────────────────────────────
+declare module 'fastify' {
+    interface FastifyRequest {
+        correlationId: string;
+    }
+}
+
 // ── Configuration ────────────────────────────────────────────────────
 const config = {
     port: parseInt(process.env.GATEWAY_PORT || '8741'),
     host: process.env.GATEWAY_HOST || '0.0.0.0',
     wsPath: process.env.GATEWAY_WS_PATH || '/ws',
     jwtSecret: process.env.JWT_SECRET || 'dev-secret-change-me',
-    redisUrl: process.env.REDIS_URL || `redis://${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || 6379}`,
+    redisUrl:
+        process.env.REDIS_URL ||
+        `redis://${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || 6379}`,
     brainGrpcUrl: `${process.env.BRAIN_GRPC_HOST || 'localhost'}:${process.env.BRAIN_GRPC_PORT || '50051'}`,
     corsOrigin: process.env.CORS_ORIGIN || 'http://localhost:5173',
 };
@@ -63,7 +72,6 @@ app.addHook('onRequest', async (req, reply) => {
     reply.header('x-correlation-id', correlationId);
 });
 
-
 // Security Headers
 app.register(import('@fastify/helmet'), {
     contentSecurityPolicy: process.env.NODE_ENV === 'production' ? undefined : false,
@@ -78,8 +86,8 @@ app.register(import('@fastify/cors'), {
 // Multipart support for file uploads
 app.register(import('@fastify/multipart'), {
     limits: {
-        fileSize: 10 * 1024 * 1024,  // 10 MB
-        files: 5,                     // Max 5 files per request
+        fileSize: 10 * 1024 * 1024, // 10 MB
+        files: 5, // Max 5 files per request
     },
 });
 
@@ -92,9 +100,15 @@ app.setErrorHandler((error, request, reply) => {
 
     // Default fallback
     if (error.statusCode && error.statusCode >= 500) {
-        logger.error('Server Error', { error: error.message, stack: error.stack, path: request.url });
+        logger.error('Server Error', {
+            error: error.message,
+            stack: error.stack,
+            path: request.url,
+        });
     }
-    return reply.status(error.statusCode || 500).send({ error: error.message || 'Internal Server Error' });
+    return reply
+        .status(error.statusCode || 500)
+        .send({ error: error.message || 'Internal Server Error' });
 });
 
 // ── Services (initialized in start()) ────────────────────────────────
@@ -130,8 +144,13 @@ app.get('/api/mobile/sync', { preHandler: [requireAuth] }, async (req) => {
 // ── Startup ──────────────────────────────────────────────────────────
 async function start() {
     try {
-        if (process.env.NODE_ENV === 'production' && (!process.env.JWT_SECRET || process.env.JWT_SECRET === 'dev-secret-change-me')) {
-            throw new Error('FATAL ERROR: JWT_SECRET is not securely set in production environment!');
+        if (
+            process.env.NODE_ENV === 'production' &&
+            (!process.env.JWT_SECRET || process.env.JWT_SECRET === 'dev-secret-change-me')
+        ) {
+            throw new Error(
+                'FATAL ERROR: JWT_SECRET is not securely set in production environment!',
+            );
         }
 
         let telegramAdapter: TelegramAdapter | undefined;
@@ -235,14 +254,22 @@ async function start() {
         const server = app.server;
         const wss = new WebSocketServer({ server, path: config.wsPath });
 
-        const webAdapter = new WebChannelAdapter(wss, sessionManager, brainClient, config.jwtSecret);
+        const webAdapter = new WebChannelAdapter(
+            wss,
+            sessionManager,
+            brainClient,
+            config.jwtSecret,
+        );
         await channelRegistry.register(webAdapter);
         logger.info(`WebSocket server on ${config.wsPath}`);
 
         // Set up Redis Pub/Sub for notifications
         const redisSub = new Redis(config.redisUrl);
         redisSub.subscribe('notifications', (err, count) => {
-            if (err) logger.error('Failed to subscribe to notifications channel', { error: err.message });
+            if (err)
+                logger.error('Failed to subscribe to notifications channel', {
+                    error: err.message,
+                });
             else logger.info(`Subscribed to notifications channel (${count})`);
         });
 
@@ -254,7 +281,9 @@ async function start() {
                         webAdapter.sendNotification(data.userId, data.notification);
                     }
                 } catch (e) {
-                    logger.error('Failed to parse incoming notification', { error: (e as Error).message });
+                    logger.error('Failed to parse incoming notification', {
+                        error: (e as Error).message,
+                    });
                 }
             }
         });
@@ -272,7 +301,8 @@ async function start() {
                     const restoredAdapter = new TelegramAdapter({
                         botToken: token,
                         mode: 'polling',
-                        defaultWorkspaceId: savedWsId || process.env.DEFAULT_WORKSPACE_ID || 'default',
+                        defaultWorkspaceId:
+                            savedWsId || process.env.DEFAULT_WORKSPACE_ID || 'default',
                     });
                     restoredAdapter.setApprovalHandler(async (approvalId, userId, approved) =>
                         brainClient.approveAction(approvalId, userId, approved),
@@ -283,7 +313,9 @@ async function start() {
                     await channelRegistry.register(restoredAdapter);
                     logger.info('Telegram adapter restored from persisted config');
                 } catch (err: any) {
-                    logger.warn('Failed to restore Telegram adapter from persisted config', { error: err.message });
+                    logger.warn('Failed to restore Telegram adapter from persisted config', {
+                        error: err.message,
+                    });
                 }
             }
         }
@@ -318,7 +350,6 @@ async function start() {
 
         process.on('SIGINT', shutdown);
         process.on('SIGTERM', shutdown);
-
     } catch (err) {
         logger.error('Gateway startup failed', { error: err });
         process.exit(1);

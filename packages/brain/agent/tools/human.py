@@ -59,7 +59,13 @@ def register_human_tools(registry) -> None:
                 "properties": {
                     "summary": {
                         "type": "string",
-                        "description": "Summary of what was accomplished",
+                        "description": (
+                            "A comprehensive, user-facing summary of what was accomplished. "
+                            "CRITICAL: If the user asked you to find information, read emails, "
+                            "or summarize data, you MUST include the actual findings, content, "
+                            "and answers in this field. Do not just say 'I finished reading it.' "
+                            "Format this with markdown for the user to read."
+                        ),
                     },
                     "artifacts": {
                         "type": "array",

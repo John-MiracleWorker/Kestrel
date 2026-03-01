@@ -5,6 +5,9 @@ import base64
 import subprocess
 import importlib
 
+# Get the directory of the current script
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Ensure dependencies are installed
 required_packages = {
     'google.oauth2.credentials': 'google-auth',
@@ -31,17 +34,20 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 
 def get_service():
     creds = None
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    token_path = os.path.join(BASE_DIR, 'token.json')
+    creds_path = os.path.join(BASE_DIR, 'credentials.json')
+    
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            if not os.path.exists('credentials.json'):
-                raise RuntimeError("credentials.json not found. Please set up Gmail API OAuth credentials and save them to credentials.json.")
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+            if not os.path.exists(creds_path):
+                raise RuntimeError(f"credentials.json not found at {creds_path}. Please set up Gmail API OAuth credentials and save them to credentials.json.")
+            flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
             creds = flow.run_local_server(port=0)
-        with open('token.json', 'w') as token:
+        with open(token_path, 'w') as token:
             token.write(creds.to_json())
     return build('gmail', 'v1', credentials=creds)
 

@@ -58,10 +58,20 @@ class MCPClient:
         # Build environment
         env = {**os.environ, **self.env}
 
+        # Kestrel brain container maps the host's /Users -> /host_fs
+        # We must rewrite host paths so subprocesses can find the files.
+        mapped_command = self.command.replace("/Users/", "/host_fs/")
+
         try:
-            parts = shlex.split(self.command)
+            parts = shlex.split(mapped_command)
         except ValueError:
-            parts = self.command.split()
+            parts = mapped_command.split()
+
+        # Try to fix unquoted paths with spaces (e.g., 'python /host_fs/.../little bird alt/server.py')
+        if len(parts) >= 2 and parts[0] in ('python', 'python3', 'node', 'npx', 'ts-node'):
+            potential_path = mapped_command[len(parts[0]):].strip()
+            if os.path.exists(potential_path):
+                parts = [parts[0], potential_path]
 
         # Auto-install dependencies for local Python/Node scripts if possible
         if parts and len(parts) >= 2:
