@@ -418,6 +418,14 @@ class ModelRouter:
         self._workspace_provider = workspace_provider
         self._workspace_model = workspace_model
 
+        # If a workspace model is configured, override all local routes
+        # so the user's chosen model (e.g. glm-5:cloud) is used everywhere
+        # instead of the hardcoded default (qwen3:8b).
+        if workspace_model:
+            for st, route in self._routes.items():
+                if route.provider in ("ollama", "local"):
+                    route.model = workspace_model
+
         # Stats for cost tracking
         self._route_counts: dict[StepType, int] = {}
         self._fallback_counts: dict[str, int] = {}
