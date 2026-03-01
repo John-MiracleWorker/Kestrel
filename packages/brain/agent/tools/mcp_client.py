@@ -161,7 +161,7 @@ class MCPClient:
             tools_result = await self._send_request("tools/list", {})
             self._tools = tools_result.get("result", {}).get("tools", [])
         except Exception as e:
-            logger.debug(f"MCP '{self._name}': tools/list not supported: {e}")
+            logger.debug(f"MCP '{self.name}': tools/list not supported: {e}")
             self._tools = []
 
         return {
