@@ -372,6 +372,11 @@ class TaskExecutor:
                         reasoning=f"LLM selected {tool_name} (parallel batch) for step: {step.description[:80]}",
                     )
 
+                turn_id = tc_data.get("turn_id")
+                if not turn_id:
+                    # Fallback if somehow not set
+                    turn_id = str(uuid.uuid4())
+                
                 step.tool_calls.append({
                     "id": tool_call.id,
                     "tool": tool_name,
@@ -379,6 +384,7 @@ class TaskExecutor:
                     "result": result.output if result.success else result.error,
                     "success": result.success,
                     "time_ms": result.execution_time_ms,
+                    "turn_id": turn_id,
                     **({"_gemini_raw_part": tc_data["_gemini_raw_part"]} if "_gemini_raw_part" in tc_data else {}),
                 })
 
@@ -513,6 +519,62 @@ class TaskExecutor:
 
         # SILENT tier: no notification, just execute
 
+        # --- INTERCEPT PREMATURE TASK_COMPLETE BEFORE EXECUTION ---
+        if tool_name == "task_complete":
+            pending_steps = [
+                s for s in task.plan.steps
+                if s.status == StepStatus.PENDING and s.id != step.id
+            ]
+            if pending_steps:
+                error_msg = f"Error: Cannot call task_complete yet. There are {len(pending_steps)} pending steps remaining in the plan. Do NOT call task_complete to signal a step is done. To finish a step, simply explain your findings and the system will advance automatically."
+                
+                logger.warning(
+                    f"Blocked premature task_complete on step '{step.description[:60]}' "
+                    f"because {len(pending_steps)} step(s) are still pending."
+                )
+
+                yield TaskEvent(
+                    type=TaskEventType.TOOL_CALLED,
+                    task_id=task.id,
+                    step_id=step.id,
+                    tool_name=tool_name,
+                    tool_args=json.dumps(tool_args),
+                    progress=self._progress_callback(task),
+                )
+
+                yield TaskEvent(
+                    type=TaskEventType.TOOL_RESULT,
+                    task_id=task.id,
+                    step_id=step.id,
+                    tool_name=tool_name,
+                    tool_result=error_msg,
+                    progress=self._progress_callback(task),
+                )
+                
+                if not getattr(step, "tool_calls", None):
+                    step.tool_calls = []
+                    
+                step.tool_calls.append({
+                    "id": tool_call.id,
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "result": error_msg,
+                    "success": False,
+                    "time_ms": 0,
+                    **({"_gemini_raw_part": tc_data["_gemini_raw_part"]} if "_gemini_raw_part" in tc_data else {}),
+                })
+                
+                # Record in diagnostic tracker
+                tracker = self._get_tracker(step.id)
+                tracker.record(
+                    tool_name=tool_name,
+                    args=tool_args,
+                    result_output="",
+                    success=False,
+                    error=error_msg,
+                )
+                return
+
         yield TaskEvent(
             type=TaskEventType.TOOL_CALLED,
             task_id=task.id,
@@ -557,6 +619,7 @@ class TaskExecutor:
             "result": result.output if result.success else result.error,
             "success": result.success,
             "time_ms": result.execution_time_ms,
+            "turn_id": tc_data.get("turn_id", str(uuid.uuid4())),
             **({"_gemini_raw_part": tc_data["_gemini_raw_part"]} if "_gemini_raw_part" in tc_data else {}),
         })
 
@@ -636,30 +699,14 @@ class TaskExecutor:
             step.result = tool_args.get("summary", result.output)
             step.completed_at = datetime.now(timezone.utc)
 
-            # Only skip remaining steps if this is genuinely the last step
-            # or the agent has explicitly addressed the full goal.
-            # Check whether there are pending steps that haven't been started.
-            pending_steps = [
-                s for s in task.plan.steps
-                if s.status == StepStatus.PENDING and s.id != step.id
-            ]
-            if pending_steps:
-                # There are still unexecuted steps — do NOT skip them.
-                # Log a warning so we can track how often the agent tries
-                # to complete early, and let the loop continue naturally.
-                logger.warning(
-                    f"task_complete called on step '{step.description[:60]}' "
-                    f"but {len(pending_steps)} step(s) still pending — "
-                    f"continuing execution instead of skipping."
-                )
-            else:
-                # All other steps are already complete/failed — safe to
-                # skip any lingering in-progress steps.
-                for remaining in task.plan.steps:
-                    if remaining.status == StepStatus.IN_PROGRESS and remaining.id != step.id:
-                        remaining.status = StepStatus.SKIPPED
-                        remaining.result = "Skipped — task completed early"
-                        remaining.completed_at = datetime.now(timezone.utc)
+            # At this point, pending_steps is guaranteed to be empty because we 
+            # intercepted it above if it wasn't. It's safe to skip any lingering 
+            # in-progress continuous steps or leftover steps.
+            for remaining in task.plan.steps:
+                if remaining.status in (StepStatus.PENDING, StepStatus.IN_PROGRESS) and remaining.id != step.id:
+                    remaining.status = StepStatus.SKIPPED
+                    remaining.result = "Skipped — task completed early"
+                    remaining.completed_at = datetime.now(timezone.utc)
 
         elif tool_name == "ask_human":
             question = tool_args.get("question", "The agent needs your input")
@@ -745,12 +792,25 @@ class TaskExecutor:
 
         if task.messages:
             messages = list(task.messages)
-            # Inject diagnostic context into chat-mode as a system message
-            if diagnostic_context:
-                messages.append({
-                    "role": "system",
-                    "content": diagnostic_context,
-                })
+            
+            # Inject the agent execution rules and context so the LLM
+            # knows it's executing a specific step in a plan.
+            system_prompt = AGENT_SYSTEM_PROMPT.format(
+                goal=task.goal,
+                step_description=step.description,
+                step_index=step.index + 1,
+                total_steps=total,
+                iteration=task.iterations,
+                max_iterations=task.config.max_iterations,
+                observations=observations,
+                diagnostic_context=("\n" + diagnostic_context + "\n") if diagnostic_context else "",
+            )
+            
+            messages.append({
+                "role": "system",
+                "content": system_prompt,
+            })
+            
             for tc in step.tool_calls[-10:]:
                 messages.append({
                     "role": "assistant",
@@ -814,11 +874,17 @@ class TaskExecutor:
                     "role": "user",
                     "content": continue_msg,
                 })
+                grouped_turns = {}
                 for tc in recent:
-                    messages.append({
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
+                    tid = tc.get("turn_id", tc.get("id", str(uuid.uuid4())))
+                    if tid not in grouped_turns:
+                        grouped_turns[tid] = []
+                    grouped_turns[tid].append(tc)
+
+                for tid, calls in grouped_turns.items():
+                    tcs = []
+                    for tc in calls:
+                        tcs.append({
                             "id": tc.get("id", "call_1"),
                             "type": "function",
                             "function": {
@@ -826,13 +892,20 @@ class TaskExecutor:
                                 "arguments": json.dumps(tc.get("args", {})),
                             },
                             **({"_gemini_raw_part": tc["_gemini_raw_part"]} if "_gemini_raw_part" in tc else {}),
-                        }],
-                    })
+                        })
+
                     messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.get("id", "call_1"),
-                        "content": tc.get("result", ""),
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": tcs,
                     })
+
+                    for tc in calls:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", "call_1"),
+                            "content": tc.get("result", ""),
+                        })
 
         # ── Conversational shortcut ────────────────────────────────
         # For simple chat messages (greetings, small talk, basic Q&A),
@@ -1117,6 +1190,13 @@ class TaskExecutor:
                     step.status = StepStatus.FAILED
                     step.error = f"All providers failed: {str(llm_err)[:300]}"
                     await self._persistence.update_task(task)
+                    yield TaskEvent(
+                        type=TaskEventType.TASK_FAILED,
+                        task_id=task.id,
+                        step_id=step.id,
+                        content=step.error,
+                        progress=self._progress_callback(task),
+                    )
                     return
             else:
                 # Non-local provider failed — just fail the step
@@ -1124,6 +1204,13 @@ class TaskExecutor:
                 step.status = StepStatus.FAILED
                 step.error = f"LLM API error: {str(llm_err)[:300]}"
                 await self._persistence.update_task(task)
+                yield TaskEvent(
+                    type=TaskEventType.TASK_FAILED,
+                    task_id=task.id,
+                    step_id=step.id,
+                    content=step.error,
+                    progress=self._progress_callback(task),
+                )
                 return
 
         if response.get("usage"):
@@ -1149,39 +1236,44 @@ class TaskExecutor:
 
             if len(tool_calls) > 1:
                 logger.info(f"LLM returned {len(tool_calls)} tool calls — dispatching in parallel")
+                
+                # Assign a unified turn_id to all tool calls from this batch
+                turn_id = str(uuid.uuid4())
+                for tc in tool_calls:
+                    tc["turn_id"] = turn_id
+                    
                 async for event in self._execute_tools_parallel(tool_calls, task, step):
                     yield event
             else:
-                async for event in self._execute_single_tool(tool_calls[0], task, step):
+                tc = tool_calls[0]
+                tc["turn_id"] = str(uuid.uuid4())
+                async for event in self._execute_single_tool(tc, task, step):
                     yield event
 
         elif response.get("content"):
             text = response["content"]
 
-            if task.messages:
+            yield TaskEvent(
+                type=TaskEventType.THINKING,
+                task_id=task.id,
+                step_id=step.id,
+                content=text,
+                progress=self._progress_callback(task),
+            )
+
+            is_simple_chat = bool(task.messages and total == 1)
+            is_done_phrase = any(phrase in text.lower() for phrase in [
+                "step is complete",
+                "this step is done",
+                "completed this step",
+                "no tools needed",
+            ])
+
+            if is_simple_chat or is_done_phrase:
                 step.status = StepStatus.COMPLETE
                 step.result = text
                 step.completed_at = datetime.now(timezone.utc)
                 await self._persistence.update_task(task)
-            else:
-                yield TaskEvent(
-                    type=TaskEventType.THINKING,
-                    task_id=task.id,
-                    step_id=step.id,
-                    content=text,
-                    progress=self._progress_callback(task),
-                )
-
-                if any(phrase in text.lower() for phrase in [
-                    "step is complete",
-                    "this step is done",
-                    "completed this step",
-                    "no tools needed",
-                ]):
-                    step.status = StepStatus.COMPLETE
-                    step.result = text
-                    step.completed_at = datetime.now(timezone.utc)
-                    await self._persistence.update_task(task)
 
         else:
             # LLM returned no tool calls AND no content — this is an API
