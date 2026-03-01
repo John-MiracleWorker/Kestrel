@@ -389,6 +389,38 @@ async def serve():
     except Exception as e:
         logger.warning(f"Daemon manager wiring failed (non-fatal): {e}")
 
+    # ── Auto-connect installed MCP servers ─────────────────────────────
+    try:
+        from agent.tools.mcp_client import get_mcp_pool
+        _mcp_pool = get_mcp_pool()
+        async with pool.acquire() as conn:
+            mcp_rows = await conn.fetch(
+                "SELECT name, server_url, config FROM installed_tools WHERE enabled = true"
+            )
+        connected_count = 0
+        for row in mcp_rows:
+            name = row["name"]
+            command = row["server_url"]
+            if not command:
+                continue
+            env = {}
+            if row["config"]:
+                cfg = row["config"] if isinstance(row["config"], dict) else __import__("json").loads(row["config"])
+                env = cfg.get("env", {})
+            try:
+                result = await _mcp_pool.connect(name, command, env)
+                if "error" not in result:
+                    connected_count += 1
+                else:
+                    logger.debug(f"MCP auto-connect '{name}' failed: {result['error']}")
+            except Exception as e:
+                logger.debug(f"MCP auto-connect '{name}' error: {e}")
+        if mcp_rows:
+            logger.info(f"MCP auto-connect: {connected_count}/{len(mcp_rows)} servers connected")
+        _mcp_pool.start_health_monitor(interval_seconds=60)
+    except Exception as e:
+        logger.warning(f"MCP auto-connect failed (non-fatal): {e}")
+
     await server.start()
     logger.info("Brain service ready")
 
