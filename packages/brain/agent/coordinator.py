@@ -4,12 +4,19 @@ Multi-Agent Coordinator — orchestrates specialist sub-agents.
 
 The coordinator can delegate subtasks to focused sub-agents, each with
 a filtered tool registry and tailored persona. This enables complex tasks
-to be decomposed across specialists:
+to be decomposed across specialists.
 
+Built-in specialists:
   - Researcher: web_search, web_browse, memory tools
   - Coder: code_execute, file tools
   - Analyst: database tools, memory tools, code_execute
   - Reviewer: file_read, memory_search (read-only validation)
+  - Explorer: host filesystem traversal and analysis
+  - Scanner: deep codebase analysis with LLM reasoning
+  - Synthesizer: summary and report generation
+
+Dynamic specialists can be created at runtime via create_specialist(),
+allowing the agent to define task-specific sub-agents on the fly.
 """
 
 import asyncio
@@ -182,6 +189,9 @@ class Coordinator:
 
     The coordinator wraps an AgentLoop and creates child tasks with filtered
     tool registries and specialized personas.
+
+    Supports both built-in specialists (SPECIALISTS dict) and dynamically
+    created specialists defined at runtime via ``create_specialist``.
     """
 
     def __init__(self, agent_loop, persistence, tool_registry, event_callback=None):
@@ -189,11 +199,126 @@ class Coordinator:
         self._persistence = persistence
         self._full_registry = tool_registry
         self._event_callback = event_callback
+        # Runtime registry for dynamically created specialists (session-scoped)
+        self._dynamic_specialists: dict[str, SpecialistConfig] = {}
+        self._dynamic_weights: dict[str, float] = {}
 
     async def _emit(self, activity_type: str, data: dict):
         """Emit an agent activity event to the UI."""
         if self._event_callback:
             await self._event_callback(activity_type, data)
+
+    # ── Dynamic Specialist Management ────────────────────────────────
+
+    def _resolve_specialist(self, specialist_type: str) -> Optional[SpecialistConfig]:
+        """Look up a specialist by type, checking built-in then dynamic registry."""
+        return SPECIALISTS.get(specialist_type) or self._dynamic_specialists.get(specialist_type)
+
+    def _resolve_weight(self, specialist_type: str) -> float:
+        """Get the complexity weight for a specialist type."""
+        return (
+            _SPECIALIST_WEIGHT.get(specialist_type)
+            or self._dynamic_weights.get(specialist_type)
+            or 1.0
+        )
+
+    def create_specialist(
+        self,
+        type_key: str,
+        name: str,
+        persona: str,
+        allowed_tools: list[str],
+        adjacent_tools: list[str] | None = None,
+        max_iterations: int = 15,
+        max_tool_calls: int = 30,
+        complexity_weight: float = 1.0,
+    ) -> dict:
+        """
+        Create a dynamic specialist at runtime.
+
+        Validates that requested tools exist in the full registry and that
+        the type_key doesn't collide with a built-in specialist.
+
+        Returns a status dict with 'success' and details.
+        """
+        # Validate type_key format
+        type_key = type_key.strip().lower().replace(" ", "_")
+        if not type_key or not type_key.replace("_", "").isalnum():
+            return {
+                "success": False,
+                "error": f"Invalid specialist type key '{type_key}'. Use lowercase alphanumeric + underscores.",
+            }
+
+        # Block overwriting built-in specialists
+        if type_key in SPECIALISTS:
+            return {
+                "success": False,
+                "error": (
+                    f"Cannot overwrite built-in specialist '{type_key}'. "
+                    f"Built-in types: {list(SPECIALISTS.keys())}"
+                ),
+            }
+
+        # Validate requested tools exist in the full registry
+        available_tools = {t.name for t in self._full_registry.list_tools()}
+        unknown_tools = [t for t in allowed_tools if t not in available_tools]
+        if unknown_tools:
+            return {
+                "success": False,
+                "error": f"Unknown tools: {unknown_tools}. Available: {sorted(available_tools)}",
+            }
+
+        if adjacent_tools:
+            unknown_adj = [t for t in adjacent_tools if t not in available_tools]
+            if unknown_adj:
+                return {
+                    "success": False,
+                    "error": f"Unknown adjacent tools: {unknown_adj}. Available: {sorted(available_tools)}",
+                }
+
+        # Ensure task_complete is always available
+        if "task_complete" not in allowed_tools:
+            allowed_tools = allowed_tools + ["task_complete"]
+
+        spec = SpecialistConfig(
+            name=name,
+            persona=persona,
+            allowed_tools=allowed_tools,
+            adjacent_tools=adjacent_tools,
+            max_iterations=max(1, min(max_iterations, 40)),
+            max_tool_calls=max(1, min(max_tool_calls, 80)),
+        )
+
+        self._dynamic_specialists[type_key] = spec
+        self._dynamic_weights[type_key] = max(0.3, min(complexity_weight, 3.0))
+
+        logger.info(
+            f"Dynamic specialist created: {type_key} ({name}) "
+            f"tools={allowed_tools} weight={self._dynamic_weights[type_key]}"
+        )
+
+        return {
+            "success": True,
+            "type": type_key,
+            "name": name,
+            "tools": allowed_tools,
+            "adjacent_tools": adjacent_tools or [],
+            "max_iterations": spec.max_iterations,
+            "max_tool_calls": spec.max_tool_calls,
+            "complexity_weight": self._dynamic_weights[type_key],
+        }
+
+    def remove_specialist(self, type_key: str) -> dict:
+        """Remove a previously created dynamic specialist."""
+        if type_key in SPECIALISTS:
+            return {"success": False, "error": f"Cannot remove built-in specialist '{type_key}'."}
+        if type_key not in self._dynamic_specialists:
+            return {"success": False, "error": f"No dynamic specialist '{type_key}' found."}
+
+        del self._dynamic_specialists[type_key]
+        self._dynamic_weights.pop(type_key, None)
+        logger.info(f"Dynamic specialist removed: {type_key}")
+        return {"success": True, "removed": type_key}
 
     async def delegate(
         self,
@@ -212,9 +337,14 @@ class Coordinator:
 
         Returns the sub-agent's result string when complete.
         """
-        spec = SPECIALISTS.get(specialist_type)
+        spec = self._resolve_specialist(specialist_type)
         if not spec:
-            return f"Unknown specialist type: {specialist_type}. Available: {list(SPECIALISTS.keys())}"
+            all_types = list(SPECIALISTS.keys()) + list(self._dynamic_specialists.keys())
+            return (
+                f"Unknown specialist type: {specialist_type}. "
+                f"Available: {all_types}. "
+                f"Tip: Use 'create_specialist' to define a custom one."
+            )
 
         await self._emit("delegation_started", {
             "specialist": spec.name,
@@ -227,7 +357,7 @@ class Coordinator:
         if max_tokens_override:
             child_max_tokens = max_tokens_override
         else:
-            weight = _SPECIALIST_WEIGHT.get(specialist_type, 1.0)
+            weight = self._resolve_weight(specialist_type)
             child_max_tokens = int((parent_task.config.max_tokens // 3) * weight)
 
         # Create child task
@@ -365,7 +495,7 @@ class Coordinator:
         distributable = parent_task.config.max_tokens - parent_reserve
 
         total_weight = sum(
-            _SPECIALIST_WEIGHT.get(s.get("specialist", "explorer"), 1.0)
+            self._resolve_weight(s.get("specialist", "explorer"))
             for s in subtasks
         )
         # Default to even split (old behavior) if weights sum to 0
@@ -384,7 +514,7 @@ class Coordinator:
             goal = subtask.get("goal", "")
             specialist = subtask.get("specialist", "explorer")
             # Per-specialist weighted budget
-            spec_weight = _SPECIALIST_WEIGHT.get(specialist, 1.0)
+            spec_weight = self._resolve_weight(specialist)
             spec_budget = max(int(distributable * spec_weight / total_weight), 8192)
             try:
                 result = await self.delegate(
@@ -414,13 +544,24 @@ class Coordinator:
         return final
 
     def get_specialist_info(self) -> list[dict]:
-        """Return descriptions of available specialists for tool schema."""
-        return [
-            {
+        """Return descriptions of all available specialists (built-in + dynamic)."""
+        infos = []
+        for key, spec in SPECIALISTS.items():
+            infos.append({
                 "type": key,
                 "name": spec.name,
                 "persona": spec.persona,
                 "tools": spec.allowed_tools,
-            }
-            for key, spec in SPECIALISTS.items()
-        ]
+                "dynamic": False,
+            })
+        for key, spec in self._dynamic_specialists.items():
+            infos.append({
+                "type": key,
+                "name": spec.name,
+                "persona": spec.persona,
+                "tools": spec.allowed_tools,
+                "adjacent_tools": spec.adjacent_tools,
+                "complexity_weight": self._dynamic_weights.get(key, 1.0),
+                "dynamic": True,
+            })
+        return infos
