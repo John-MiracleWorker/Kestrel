@@ -497,26 +497,31 @@ def register_mcp_tools(registry, pool=None) -> None:
                     command = server["install"]
                     break
 
-        # Also check the installed_tools DB for this server
+        # Also check the installed_tools DB for this server.
+        # Always query the DB: use stored command only if none was found above,
+        # but always load stored env vars (e.g. API keys saved via mcp_install).
         stored_env = {}
-        if pool and not command:
-            try:
-                async with pool.acquire() as conn:
-                    row = await conn.fetchrow(
-                        """SELECT server_url, config FROM installed_tools
-                           WHERE (name = $1 OR name ILIKE '%' || $1 || '%')
-                             AND enabled = true
-                           ORDER BY CASE WHEN name = $1 THEN 0 ELSE 1 END
-                           LIMIT 1""",
-                        name,
-                    )
-                    if row:
-                        command = row["server_url"]
-                        if row["config"]:
-                            cfg = row["config"] if isinstance(row["config"], dict) else json.loads(row["config"])
-                            stored_env = cfg.get("env", {})
-            except Exception as e:
-                logger.warning(f"Failed to look up installed MCP server '{name}': {e}")
+        if pool:
+            ws_id = workspace_id or _current_workspace_id or ""
+            if ws_id:
+                try:
+                    async with pool.acquire() as conn:
+                        row = await conn.fetchrow(
+                            """SELECT server_url, config FROM installed_tools
+                               WHERE (name = $1 OR name ILIKE '%' || $1 || '%')
+                                 AND enabled = true
+                               ORDER BY CASE WHEN name = $1 THEN 0 ELSE 1 END
+                               LIMIT 1""",
+                            name,
+                        )
+                        if row:
+                            if not command:
+                                command = row["server_url"]
+                            if row["config"]:
+                                cfg = row["config"] if isinstance(row["config"], dict) else json.loads(row["config"])
+                                stored_env = cfg.get("env", {})
+                except Exception as e:
+                    logger.warning(f"Failed to look up installed MCP server '{name}': {e}")
 
         if not command:
             return {"error": f"No command specified for '{name}'. Use mcp_search to find it."}
