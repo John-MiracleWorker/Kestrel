@@ -498,6 +498,7 @@ class ChatServicerMixin(BaseServicerMixin):
             # Start the agent loop as a background task so activity callbacks
             # can push to the same queue concurrently
             agent_task_bg = _asyncio.create_task(_run_agent_loop())
+            thinking_shown = [False]  # Mutable flag to limit 💭 output to first thinking event
 
             while True:
                 item = await output_queue.get()
@@ -515,8 +516,9 @@ class ChatServicerMixin(BaseServicerMixin):
                 if isinstance(item, tuple):
                     from services.tool_parser import parse_agent_event
                     async for response_chunk in parse_agent_event(
-                        item, full_response_parts, tool_results_gathered, 
-                        provider, model, api_key, self._make_response
+                        item, full_response_parts, tool_results_gathered,
+                        provider, model, api_key, self._make_response,
+                        thinking_shown=thinking_shown,
                     ):
                         yield response_chunk
 

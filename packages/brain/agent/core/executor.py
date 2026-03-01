@@ -130,6 +130,7 @@ class TaskExecutor:
         )
         self._approval_memory = approval_memory
         self._step_diagnostics: dict[str, DiagnosticTracker] = {}  # step_id → tracker
+        self._text_only_streak: dict[str, int] = {}  # step_id → consecutive text-only responses
 
     def _get_tracker(self, step_id: str) -> DiagnosticTracker:
         """Get or create a DiagnosticTracker for a step."""
@@ -1255,6 +1256,9 @@ class TaskExecutor:
         if response.get("tool_calls"):
             tool_calls = response["tool_calls"]
 
+            # Reset text-only streak — LLM is actively using tools
+            self._text_only_streak[step.id] = 0
+
             # Capture LLM's text content alongside tool calls
             # (e.g. "I'll check the MCP server..." before calling tools).
             # This ensures step.result has meaningful content even if
@@ -1264,12 +1268,12 @@ class TaskExecutor:
 
             if len(tool_calls) > 1:
                 logger.info(f"LLM returned {len(tool_calls)} tool calls — dispatching in parallel")
-                
+
                 # Assign a unified turn_id to all tool calls from this batch
                 turn_id = str(uuid.uuid4())
                 for tc in tool_calls:
                     tc["turn_id"] = turn_id
-                    
+
                 async for event in self._execute_tools_parallel(tool_calls, task, step):
                     yield event
             else:
@@ -1289,15 +1293,34 @@ class TaskExecutor:
                 progress=self._progress_callback(task),
             )
 
+            # Track consecutive text-only responses to detect stuck loops
+            self._text_only_streak.setdefault(step.id, 0)
+            self._text_only_streak[step.id] += 1
+
             is_simple_chat = bool(task.messages and total == 1)
+            has_done_work = bool(step.tool_calls)
             is_done_phrase = any(phrase in text.lower() for phrase in [
                 "step is complete",
                 "this step is done",
                 "completed this step",
                 "no tools needed",
+                "done!",
+                "here's the summary",
+                "here's what was",
+                "here's what i",
+                "task complete",
+                "all tasks completed",
+                "cleanup complete",
+                "i've completed",
+                "successfully completed",
+                "successfully deleted",
+                "actions taken",
             ])
+            # Safety valve: if LLM returns text-only 2+ times in a row,
+            # it's stuck in a summary loop — force-complete the step.
+            has_high_streak = self._text_only_streak[step.id] >= 2
 
-            if is_simple_chat or is_done_phrase:
+            if is_simple_chat or has_done_work or is_done_phrase or has_high_streak:
                 step.status = StepStatus.COMPLETE
                 step.result = text
                 step.completed_at = datetime.now(timezone.utc)

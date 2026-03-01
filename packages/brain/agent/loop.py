@@ -596,7 +596,15 @@ class AgentLoop:
                         if step.attempts < 3:
                             step.status = StepStatus.IN_PROGRESS
                             step.attempts += 1
-                            backoff_delay = 2 ** (step.attempts - 1)  # 1s, 2s, 4s
+                            # Use longer backoff for rate-limit errors to avoid
+                            # hammering the provider and cascading 429s.
+                            is_rate_limited = step.error and (
+                                "429" in step.error or "rate limit" in step.error.lower()
+                            )
+                            if is_rate_limited:
+                                backoff_delay = 15 * step.attempts  # 15s, 30s, 45s
+                            else:
+                                backoff_delay = 2 ** (step.attempts - 1)  # 1s, 2s, 4s
                             logger.info(
                                 f"Retrying step {step.id} (attempt {step.attempts}/3, "
                                 f"backoff {backoff_delay}s): {step.error or 'unknown error'}"
