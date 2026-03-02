@@ -314,6 +314,16 @@ class CronScheduler:
             logger.error(f"Failed to delete cron job: {e}")
             return False
 
+    def remove_stale_jobs(self, job_ids: list[str]) -> int:
+        """Remove jobs from the in-memory cache by ID. Returns count removed."""
+        removed = 0
+        for jid in job_ids:
+            if self._jobs.pop(jid, None) is not None:
+                removed += 1
+        if removed:
+            logger.info(f"Evicted {removed} stale job(s) from in-memory cache")
+        return removed
+
     async def list_jobs(self, workspace_id: str) -> list[dict]:
         """List all cron jobs for a workspace."""
         return [
@@ -329,6 +339,7 @@ class CronScheduler:
                     "SELECT * FROM automation_cron_jobs WHERE status = 'active'"
                 )
             now = datetime.now(timezone.utc)
+            next_run_updates: list[tuple] = []
             for row in rows:
                 # Always recompute next_run on load for accuracy
                 next_run = compute_next_run(row["cron_expression"], now)
@@ -348,16 +359,19 @@ class CronScheduler:
                     created_at=str(row["created_at"]),
                 )
                 self._jobs[job.id] = job
-                # Persist the computed next_run back to DB
                 if next_run:
-                    try:
-                        async with self._pool.acquire() as conn:
-                            await conn.execute(
-                                "UPDATE automation_cron_jobs SET next_run = $2 WHERE id = $1",
-                                uuid.UUID(job.id), datetime.fromisoformat(next_run),
-                            )
-                    except Exception:
-                        pass  # Non-fatal, next_run is recomputed on each load
+                    next_run_updates.append((uuid.UUID(job.id), datetime.fromisoformat(next_run)))
+
+            # Batch-persist all computed next_run values in a single connection
+            if next_run_updates:
+                try:
+                    async with self._pool.acquire() as conn:
+                        await conn.executemany(
+                            "UPDATE automation_cron_jobs SET next_run = $2 WHERE id = $1",
+                            next_run_updates,
+                        )
+                except Exception:
+                    pass  # Non-fatal, next_run is recomputed on each load
         except Exception as e:
             logger.error(f"Failed to load cron jobs: {e}")
 

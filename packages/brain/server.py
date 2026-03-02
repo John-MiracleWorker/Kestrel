@@ -303,51 +303,8 @@ async def serve():
 
 
     # Initialize and start automation (cron scheduler + webhook handler)
-    async def launch_task_from_automation(workspace_id, user_id, goal, source="automation"):
-        """Task launcher callback for cron/webhook automation."""
-        from agent.types import AgentTask, GuardrailConfig as GCfg
-        task = AgentTask(
-            user_id=user_id,
-            workspace_id=workspace_id,
-            goal=goal,
-            config=GCfg(),
-        )
-        await runtime.agent_persistence.save_task(task)
-        logger.info(f"Automation task started: {task.id} — {goal} (source: {source})")
-        # Run in background
-        asyncio.create_task(_run_automation_task(task))
-
-    async def _run_automation_task(task):
-        """Run an automation-triggered task in the background."""
-        try:
-            ws_config = await ProviderConfig(pool).get_config(task.workspace_id)
-            provider_name = ws_config.get("provider", "local")
-            task_provider = get_provider(provider_name)
-            task_loop = AgentLoop(
-                provider=task_provider,
-                tool_registry=build_tool_registry(
-                    hands_client=runtime.hands_client,
-                    vector_store=runtime.vector_store,
-                    pool=pool,
-                ),
-                guardrails=Guardrails(),
-                persistence=runtime.agent_persistence,
-                memory_graph=runtime.memory_graph,
-                provider_resolver=resolve_provider,
-            )
-            # Set context for tools used in automated tasks
-            import agent.tools.moltbook as _moltbook_mod
-            _moltbook_mod._current_workspace_id = task.workspace_id
-            _moltbook_mod._current_user_id = task.user_id
-            import agent.tools.schedule as _schedule_mod
-            _schedule_mod._cron_scheduler = runtime.cron_scheduler
-            _schedule_mod._current_workspace_id = task.workspace_id
-            _schedule_mod._current_user_id = task.user_id
-            async for event in task_loop.run(task):
-                logger.debug(f"Automation task {task.id}: {event.type}")
-        except Exception as e:
-            logger.error(f"Automation task {task.id} failed: {e}")
-
+    # Task launcher is defined in core.cron to avoid duplication
+    from core.cron import launch_task_from_automation
     runtime.cron_scheduler = CronScheduler(pool=pool, task_launcher=launch_task_from_automation)
     runtime.webhook_handler = WebhookHandler(pool=pool, task_launcher=launch_task_from_automation)
     try:
@@ -382,7 +339,6 @@ async def serve():
 
     # ── Wire daemon manager and load persisted daemons ─────────────────
     try:
-        from core.cron import launch_task_from_automation
         _daemon_manager._task_launcher = launch_task_from_automation
         await _daemon_manager.load_daemons()
         logger.info("Daemon manager wired and persisted daemons loaded")

@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS automation_cron_jobs (
     status           TEXT NOT NULL DEFAULT 'active',  -- active, paused, disabled
     last_run         TIMESTAMPTZ,
     run_count        INTEGER DEFAULT 0,
+    next_run         TIMESTAMPTZ,      -- Pre-computed next trigger time
     max_runs         INTEGER,          -- NULL = unlimited
     created_at       TIMESTAMPTZ DEFAULT now(),
     updated_at       TIMESTAMPTZ DEFAULT now()

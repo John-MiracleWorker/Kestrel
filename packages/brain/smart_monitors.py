@@ -176,12 +176,14 @@ class SmartMonitors:
         Removes:
           - Retry cron jobs older than 24 hours
           - One-shot jobs that have already run
+        Also evicts deleted jobs from the CronScheduler in-memory cache.
         """
+        from core import runtime
         while self._running:
             try:
                 await asyncio.sleep(3600)  # every hour
                 async with self._pool.acquire() as conn:
-                    result = await conn.execute(
+                    deleted_rows = await conn.fetch(
                         """
                         DELETE FROM automation_cron_jobs
                         WHERE (
@@ -191,11 +193,14 @@ class SmartMonitors:
                             name LIKE 'oneshot_%'
                             AND last_run IS NOT NULL
                         )
+                        RETURNING id
                         """
                     )
-                    count = int(result.split(" ")[-1]) if result else 0
-                    if count > 0:
-                        logger.info(f"Cron janitor: cleaned {count} stale cron job(s)")
+                    if deleted_rows:
+                        deleted_ids = [str(r["id"]) for r in deleted_rows]
+                        logger.info(f"Cron janitor: cleaned {len(deleted_ids)} stale cron job(s)")
+                        if runtime.cron_scheduler:
+                            runtime.cron_scheduler.remove_stale_jobs(deleted_ids)
             except asyncio.CancelledError:
                 break
             except Exception as e:
