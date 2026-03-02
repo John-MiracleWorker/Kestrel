@@ -267,7 +267,7 @@ import { logger } from '../../utils/logger';
                         '  /workspace — Show current workspace\n' +
                         '  /new — Start a new conversation\n' +
                         '  /newthread `[name]` — Start a new topic thread\n' +
-                        '  /stop — Stop all typing indicators\n',
+                        '  /stop — Stop current response and typing indicator\n',
                     parse_mode: 'Markdown',
                 }));
                 break;
@@ -467,6 +467,10 @@ import { logger } from '../../utils/logger';
 
             case '/stop':
                 adapter.stopTyping(chatId);
+                if (msg.from) {
+                    const userId = adapter.resolveUserId(msg.from, chatId);
+                    adapter.cancelActiveStream(userId);
+                }
                 await adapter.api('sendMessage', withThread({
                     chat_id: chatId,
                     text: '⏹ Stopped.',
