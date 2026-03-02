@@ -115,6 +115,7 @@ services:
       ROUTER_OLLAMA_MODEL: ${ROUTER_OLLAMA_MODEL:-glm5}
       ROUTER_OLLAMA_LARGE_MODEL: ${ROUTER_OLLAMA_LARGE_MODEL:-glm5}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT:-}
     volumes:
       - ${LOCAL_MODEL_DIR:-./models}:/models:ro
       - .:/project # Mount project root for self-improvement git operations
