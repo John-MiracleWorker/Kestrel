@@ -398,9 +398,9 @@ class WebhookHandler:
                 )
             for row in rows:
                 ep = WebhookEndpoint(
-                    id=row["id"],
-                    workspace_id=row["workspace_id"],
-                    user_id=row["user_id"],
+                    id=str(row["id"]),
+                    workspace_id=str(row["workspace_id"]),
+                    user_id=str(row["user_id"]),
                     name=row["name"],
                     description=row["description"],
                     goal_template=row["goal_template"],
@@ -523,7 +523,7 @@ class WebhookHandler:
         try:
             async with self._pool.acquire() as conn:
                 await conn.execute(
-                    "DELETE FROM automation_webhooks WHERE id = $1", webhook_id
+                    "DELETE FROM automation_webhooks WHERE id = $1", uuid.UUID(webhook_id)
                 )
             return True
         except Exception as e:

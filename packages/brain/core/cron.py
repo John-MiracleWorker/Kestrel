@@ -54,7 +54,15 @@ async def _run_automation_task(task: AgentTask):
         _schedule_mod._cron_scheduler = runtime.cron_scheduler
         _schedule_mod._current_workspace_id = task.workspace_id
         _schedule_mod._current_user_id = task.user_id
-        
+
+        import agent.tools.build_automation as _ba_mod
+        _ba_mod._current_workspace_id = task.workspace_id
+        _ba_mod._current_user_id = task.user_id
+
+        import agent.tools.daemon_control as _dc_mod
+        _dc_mod._current_workspace_id = task.workspace_id
+        _dc_mod._current_user_id = task.user_id
+
         async for event in task_loop.run(task):
             logger.debug(f"Automation task {task.id}: {event.type}")
     except Exception as e:

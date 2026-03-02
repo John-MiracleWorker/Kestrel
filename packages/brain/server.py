@@ -337,13 +337,31 @@ async def serve():
     except Exception as e:
         logger.warning(f"Moltbook cron bootstrap failed (non-fatal): {e}")
 
-    # ── Wire daemon manager and load persisted daemons ─────────────────
+    # ── Wire task launcher into managers that were created before cron init ──
     try:
         _daemon_manager._task_launcher = launch_task_from_automation
         await _daemon_manager.load_daemons()
         logger.info("Daemon manager wired and persisted daemons loaded")
     except Exception as e:
         logger.warning(f"Daemon manager wiring failed (non-fatal): {e}")
+
+    try:
+        _proactive_engine._task_launcher = launch_task_from_automation
+        logger.info("Proactive engine task launcher wired")
+    except Exception as e:
+        logger.warning(f"Proactive engine wiring failed (non-fatal): {e}")
+
+    # Wire tool module refs that depend on managers created above
+    try:
+        import agent.tools.build_automation as _ba_mod
+        _ba_mod._automation_builder = _automation_builder
+        _ba_mod._cron_scheduler = runtime.cron_scheduler
+
+        import agent.tools.daemon_control as _dc_mod
+        _dc_mod._daemon_manager = _daemon_manager
+        logger.info("Automation tool module refs wired")
+    except Exception as e:
+        logger.warning(f"Tool module wiring failed (non-fatal): {e}")
 
     # ── Auto-connect installed MCP servers ─────────────────────────────
     try:

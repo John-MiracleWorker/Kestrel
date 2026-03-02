@@ -271,9 +271,9 @@ class ChatServicerMixin(BaseServicerMixin):
             tool_registry = build_tool_registry(hands_client=runtime.hands_client, vector_store=runtime.vector_store, pool=pool)
 
             # Set workspace context for Moltbook activity logging
-            from agent.tools.moltbook import _current_workspace_id as _mwid
             import agent.tools.moltbook as _moltbook_mod
             _moltbook_mod._current_workspace_id = workspace_id
+            _moltbook_mod._current_user_id = request.user_id
 
             # Set workspace context for MCP tools
             import agent.tools.mcp as _mcp_mod
@@ -284,6 +284,15 @@ class ChatServicerMixin(BaseServicerMixin):
             _schedule_mod._cron_scheduler = runtime.cron_scheduler
             _schedule_mod._current_workspace_id = workspace_id
             _schedule_mod._current_user_id = request.user_id
+
+            # Set per-request context for build_automation and daemon_control tools
+            import agent.tools.build_automation as _ba_mod
+            _ba_mod._current_workspace_id = workspace_id
+            _ba_mod._current_user_id = request.user_id
+
+            import agent.tools.daemon_control as _dc_mod
+            _dc_mod._current_workspace_id = workspace_id
+            _dc_mod._current_user_id = request.user_id
 
             # Create per-task evidence chain for auditable decision trail
             from agent.evidence import EvidenceChain
