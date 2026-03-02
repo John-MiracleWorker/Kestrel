@@ -263,12 +263,58 @@ class CronScheduler:
         cron_expression: str,
         goal: str,
         max_runs: int = None,
-    ) -> CronJob:
-        """Create a new cron job."""
+    ) -> tuple[CronJob, bool]:
+        """Create a new cron job, or return the existing one if a job with the
+        same name already exists in the workspace.
+
+        Returns ``(job, was_created)`` — *was_created* is ``False`` when an
+        existing duplicate was found and returned instead of inserting a new row.
+        """
         now = datetime.now(timezone.utc)
         next_run = compute_next_run(cron_expression, now)
+        job_id = str(uuid.uuid4())
+
+        try:
+            next_run_dt = datetime.fromisoformat(next_run) if next_run else None
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO automation_cron_jobs
+                        (id, workspace_id, user_id, name, description,
+                         cron_expression, goal, status, max_runs, next_run, created_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                    ON CONFLICT (workspace_id, name) DO UPDATE SET
+                        description  = EXCLUDED.description,
+                        cron_expression = EXCLUDED.cron_expression,
+                        goal         = EXCLUDED.goal,
+                        max_runs     = EXCLUDED.max_runs,
+                        next_run     = EXCLUDED.next_run,
+                        updated_at   = now()
+                    RETURNING id, created_at
+                    """,
+                    uuid.UUID(job_id), uuid.UUID(workspace_id), uuid.UUID(user_id),
+                    name, description, cron_expression, goal,
+                    JobStatus.ACTIVE.value, max_runs, next_run_dt, now,
+                )
+
+                was_created = True
+                if row:
+                    returned_id = str(row["id"])
+                    # If the returned id differs from the one we tried to
+                    # insert, the ON CONFLICT branch fired → existing job.
+                    if returned_id != job_id:
+                        was_created = False
+                        job_id = returned_id
+                        logger.info(
+                            f"Cron job '{name}' already exists in workspace "
+                            f"{workspace_id} — returning existing job {job_id}"
+                        )
+        except Exception as e:
+            logger.error(f"Failed to persist cron job: {e}")
+            was_created = True  # Assume new on error (best-effort)
+
         job = CronJob(
-            id=str(uuid.uuid4()),
+            id=job_id,
             workspace_id=workspace_id,
             user_id=user_id,
             name=name,
@@ -280,26 +326,10 @@ class CronScheduler:
             created_at=now.isoformat(),
         )
 
-        try:
-            next_run_dt = datetime.fromisoformat(next_run) if next_run else None
-            async with self._pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO automation_cron_jobs
-                        (id, workspace_id, user_id, name, description,
-                         cron_expression, goal, status, max_runs, next_run, created_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                    """,
-                    uuid.UUID(job.id), uuid.UUID(workspace_id), uuid.UUID(user_id),
-                    name, description, cron_expression, goal,
-                    JobStatus.ACTIVE.value, max_runs, next_run_dt, now,
-                )
-        except Exception as e:
-            logger.error(f"Failed to persist cron job: {e}")
-
         self._jobs[job.id] = job
-        logger.info(f"Cron job created: {name} for workspace {workspace_id} ({cron_expression})")
-        return job
+        if was_created:
+            logger.info(f"Cron job created: {name} for workspace {workspace_id} ({cron_expression})")
+        return job, was_created
 
     async def delete_job(self, job_id: str) -> bool:
         """Delete a cron job."""
