@@ -1,0 +1,287 @@
+{
+    "mode": "deep",
+    "files_considered": 240,
+    "cache_entries": 240,
+    "total_issues": 365,
+    "summary": "\ud83d\udfe1 76 medium | \ud83d\udd35 289 low",
+    "by_type": {
+        "complexity": 71,
+        "security": 4,
+        "error_handling": 1,
+        "dead_import": 285,
+        "todo": 4
+    },
+    "by_severity": { "medium": 76, "low": 289 },
+    "issues": [
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/server.py",
+            "line": 67,
+            "description": "Function `serve` is 374 lines long \u2014 consider refactoring",
+            "suggestion": "Break `serve` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/brain_pb2_grpc.py",
+            "line": 409,
+            "description": "Function `add_BrainServiceServicer_to_server` is 167 lines long \u2014 consider refactoring",
+            "suggestion": "Break `add_BrainServiceServicer_to_server` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/brain_pb2_grpc.py",
+            "line": 32,
+            "description": "Function `__init__` is 166 lines long \u2014 consider refactoring",
+            "suggestion": "Break `__init__` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/backfill_memory_graph.py",
+            "line": 23,
+            "description": "Function `main` is 152 lines long \u2014 consider refactoring",
+            "suggestion": "Break `main` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/providers/cloud.py",
+            "line": 234,
+            "description": "Function `_stream_google` is 93 lines long \u2014 consider refactoring",
+            "suggestion": "Break `_stream_google` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/providers/cloud.py",
+            "line": 571,
+            "description": "Function `_generate_with_tools_google` is 143 lines long \u2014 consider refactoring",
+            "suggestion": "Break `_generate_with_tools_google` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/providers/ollama.py",
+            "line": 178,
+            "description": "Function `generate_with_tools` is 136 lines long \u2014 consider refactoring",
+            "suggestion": "Break `generate_with_tools` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/council.py",
+            "line": 619,
+            "description": "Function `_synthesize_verdict` is 96 lines long \u2014 consider refactoring",
+            "suggestion": "Break `_synthesize_verdict` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/coordinator.py",
+            "line": 225,
+            "description": "Function `create_specialist` is 85 lines long \u2014 consider refactoring",
+            "suggestion": "Break `create_specialist` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/coordinator.py",
+            "line": 323,
+            "description": "Function `delegate` is 149 lines long \u2014 consider refactoring",
+            "suggestion": "Break `delegate` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/step_scheduler.py",
+            "line": 108,
+            "description": "Function `execute_plan` is 149 lines long \u2014 consider refactoring",
+            "suggestion": "Break `execute_plan` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/step_scheduler.py",
+            "line": 258,
+            "description": "Function `_execute_single_step` is 112 lines long \u2014 consider refactoring",
+            "suggestion": "Break `_execute_single_step` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/step_scheduler.py",
+            "line": 371,
+            "description": "Function `_execute_parallel_steps` is 95 lines long \u2014 consider refactoring",
+            "suggestion": "Break `_execute_parallel_steps` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/context_compactor.py",
+            "line": 124,
+            "description": "Function `compact_context` is 104 lines long \u2014 consider refactoring",
+            "suggestion": "Break `compact_context` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/loop.py",
+            "line": 231,
+            "description": "Function `run` is 476 lines long \u2014 consider refactoring",
+            "suggestion": "Break `run` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/model_router.py",
+            "line": 113,
+            "description": "Function `_build_routes` is 115 lines long \u2014 consider refactoring",
+            "suggestion": "Break `_build_routes` into smaller helper functions"
+        },
+        {
+            "type": "security",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/learner.py",
+            "line": 464,
+            "description": "Use of eval() detected",
+            "suggestion": "Avoid eval(); use safe parsing or explicit dispatch."
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/learner.py",
+            "line": 171,
+            "description": "Function `extract_lessons` is 98 lines long \u2014 consider refactoring",
+            "suggestion": "Break `extract_lessons` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/learner.py",
+            "line": 312,
+            "description": "Function `_is_duplicate` is 109 lines long \u2014 consider refactoring",
+            "suggestion": "Break `_is_duplicate` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/learner.py",
+            "line": 464,
+            "description": "Function `learn_from_eval` is 95 lines long \u2014 consider refactoring",
+            "suggestion": "Break `learn_from_eval` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/tools/files.py",
+            "line": 21,
+            "description": "Function `register_file_tools` is 96 lines long \u2014 consider refactoring",
+            "suggestion": "Break `register_file_tools` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/tools/scanner.py",
+            "line": 332,
+            "description": "Function `_synthesize_reports` is 98 lines long \u2014 consider refactoring",
+            "suggestion": "Break `_synthesize_reports` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/tools/scanner.py",
+            "line": 434,
+            "description": "Function `scan_codebase` is 143 lines long \u2014 consider refactoring",
+            "suggestion": "Break `scan_codebase` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/tools/scanner.py",
+            "line": 579,
+            "description": "Function `_direct_scan_fallback` is 93 lines long \u2014 consider refactoring",
+            "suggestion": "Break `_direct_scan_fallback` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/tools/scanner.py",
+            "line": 676,
+            "description": "Function `register_scanner_tools` is 82 lines long \u2014 consider refactoring",
+            "suggestion": "Break `register_scanner_tools` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/tools/model_swap.py",
+            "line": 215,
+            "description": "Function `model_swap_handler` is 120 lines long \u2014 consider refactoring",
+            "suggestion": "Break `model_swap_handler` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/tools/moltbook.py",
+            "line": 281,
+            "description": "Function `_register` is 94 lines long \u2014 consider refactoring",
+            "suggestion": "Break `_register` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/tools/container_control.py",
+            "line": 348,
+            "description": "Function `_container_rebuild` is 173 lines long \u2014 consider refactoring",
+            "suggestion": "Break `_container_rebuild` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/tools/__init__.py",
+            "line": 208,
+            "description": "Function `build_tool_registry` is 224 lines long \u2014 consider refactoring",
+            "suggestion": "Break `build_tool_registry` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/tools/__init__.py",
+            "line": 68,
+            "description": "Function `execute` is 138 lines long \u2014 consider refactoring",
+            "suggestion": "Break `execute` into smaller helper functions"
+        }
+    ]
+}

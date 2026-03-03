@@ -88,8 +88,10 @@ def register_file_tools(registry) -> None:
         definition=ToolDefinition(
             name="file_list",
             description=(
-                "List files and directories in a workspace path. "
-                "Shows file names, sizes, and types."
+                "List files and directories in the WORKSPACE SCRATCH directory "
+                "(not the host/project filesystem). This is an internal sandbox "
+                "for agent-created files only. To browse the user's actual project, "
+                "use host_list or host_tree instead."
             ),
             parameters={
                 "type": "object",

@@ -1,53 +1,54 @@
 {
-  "name": "kestrel",
-  "version": "0.1.0",
-  "private": true,
-  "description": "Personal AI agent platform with Gateway/Brain/Hands architecture",
-  "workspaces": [
-    "packages/*"
-  ],
-  "scripts": {
-    "install:all": "npm install",
-    "build": "npm run build --workspaces --if-present",
-    "test": "npm test --workspaces --if-present",
-    "lint": "npm run lint --workspaces --if-present",
-    "typecheck": "npm run typecheck --workspaces --if-present",
-    "clean": "rm -rf packages/*/node_modules packages/*/dist node_modules",
-    "proto:compile": "npm run proto:compile --workspace=@kestrel/shared",
-    "prepare": "husky install || true"
-  },
-  "lint-staged": {
-    "**/*.{js,jsx}": [
-      "eslint --fix",
-      "prettier --write"
+    "name": "kestrel",
+    "version": "0.1.0",
+    "private": true,
+    "description": "Personal AI agent platform with Gateway/Brain/Hands architecture",
+    "workspaces": [
+        "packages/*"
     ],
-    "**/*.{ts,tsx}": [
-      "prettier --write"
+    "scripts": {
+        "install:all": "npm install",
+        "start:desktop": "npm run dev --workspace=@kestrel/desktop",
+        "build": "npm run build --workspaces --if-present",
+        "test": "npm test --workspaces --if-present",
+        "lint": "npm run lint --workspaces --if-present",
+        "typecheck": "npm run typecheck --workspaces --if-present",
+        "clean": "rm -rf packages/*/node_modules packages/*/dist node_modules",
+        "proto:compile": "npm run proto:compile --workspace=@kestrel/shared",
+        "prepare": "husky install || true"
+    },
+    "lint-staged": {
+        "**/*.{js,jsx}": [
+            "eslint --fix",
+            "prettier --write"
+        ],
+        "**/*.{ts,tsx}": [
+            "prettier --write"
+        ],
+        "**/*.{json,css,md}": [
+            "prettier --write"
+        ]
+    },
+    "engines": {
+        "node": ">=18.0.0",
+        "npm": ">=9.0.0"
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/yourusername/kestrel"
+    },
+    "keywords": [
+        "ai",
+        "agent",
+        "llm",
+        "personal-assistant",
+        "automation"
     ],
-    "**/*.{json,css,md}": [
-      "prettier --write"
-    ]
-  },
-  "engines": {
-    "node": ">=18.0.0",
-    "npm": ">=9.0.0"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/yourusername/kestrel"
-  },
-  "keywords": [
-    "ai",
-    "agent",
-    "llm",
-    "personal-assistant",
-    "automation"
-  ],
-  "author": "",
-  "license": "MIT",
-  "devDependencies": {
-    "husky": "^9.1.7",
-    "lint-staged": "^16.2.7",
-    "prettier": "^3.8.1"
-  }
+    "author": "",
+    "license": "MIT",
+    "devDependencies": {
+        "husky": "^9.1.7",
+        "lint-staged": "^16.2.7",
+        "prettier": "^3.8.1"
+    }
 }

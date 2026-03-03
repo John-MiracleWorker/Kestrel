@@ -287,6 +287,15 @@ async def serve():
     except Exception as e:
         logger.warning(f"Proactive engine start failed (non-fatal): {e}")
 
+    # Feature 6.5: Filesystem Watcher
+    from agent.core.fs_watcher import KestrelFSWatcher
+    _fs_watcher = KestrelFSWatcher(engine=_proactive_engine)
+    try:
+        _fs_watcher.start()
+        logger.info("FS Watcher started")
+    except Exception as e:
+        logger.warning(f"FS Watcher start failed (non-fatal): {e}")
+
     # Wire SmartMonitors → ProactiveEngine for signal routing
     _smart_monitors.set_proactive_engine(_proactive_engine)
     logger.info("SmartMonitors wired to ProactiveEngine")
@@ -428,6 +437,10 @@ async def serve():
             await runtime.cron_scheduler.stop()
         if hasattr(runtime, "heartbeat_engine") and getattr(runtime, "heartbeat_engine", None):
             await runtime.heartbeat_engine.stop()
+        if hasattr(runtime, "fs_watcher") and getattr(runtime, "fs_watcher", None):
+            runtime.fs_watcher.stop()
+        elif '_fs_watcher' in locals():
+            _fs_watcher.stop()
         # Stop all daemons gracefully
         try:
             for daemon in _daemon_manager._daemons.values():

@@ -168,6 +168,38 @@ class ScanReport:
 
 # ── Partitioning Logic ──────────────────────────────────────────────
 
+def _parse_tree_line(line: str) -> tuple[int, str]:
+    """
+    Parse a single tree-formatted line and return (depth, name).
+
+    Tree lines look like:
+        "├── src/"                   → depth 0, name "src/"
+        "│   ├── main.py (2KB)"      → depth 1, name "main.py (2KB)"
+        "    └── utils/"             → depth 1, name "utils/"
+        "│   │   └── helpers.py"     → depth 2, name "helpers.py"
+    """
+    pos = 0
+    depth = 0
+
+    # Consume 4-char indentation units ("│   " or "    ") from the left
+    while pos + 4 <= len(line):
+        chunk = line[pos:pos + 4]
+        if chunk in ("│   ", "    "):
+            depth += 1
+            pos += 4
+        else:
+            break
+
+    # Now we should be at a connector: "├── " or "└── "
+    remainder = line[pos:]
+    for connector in ("├── ", "└── "):
+        if remainder.startswith(connector):
+            return depth, remainder[len(connector):]
+
+    # Fallback: if no connector found (e.g. "... (truncated)"), return as-is
+    return depth, remainder.strip()
+
+
 def _discover_regions(tree_data: dict, base_path: str) -> list[ScanRegion]:
     """
     Partition a project tree into scan regions for parallel sub-agents.
@@ -187,49 +219,31 @@ def _discover_regions(tree_data: dict, base_path: str) -> list[ScanRegion]:
 
     # Parse tree lines to identify top-level structure
     for line in tree_text.split("\n"):
-        stripped = line.strip()
-        if not stripped:
+        if not line.strip():
             continue
 
-        # Extract the file/dir name from tree-formatted line
-        # Lines look like: "├── src/" or "│   ├── main.py"
-        name = stripped
-        for prefix in ("├── ", "└── ", "│   ", "    "):
-            name = name.replace(prefix, "")
+        depth, name = _parse_tree_line(line)
         name = name.strip()
-
-        # Determine nesting depth by counting tree prefixes
-        depth = 0
-        temp = stripped
-        while temp.startswith(("│   ", "    ", "├── ", "└── ")):
-            depth += 1
-            for prefix in ("│   ", "    "):
-                if temp.startswith(prefix):
-                    temp = temp[len(prefix):]
-                    break
-            else:
-                # It's a connector (├── or └──), count it and strip
-                for prefix in ("├── ", "└── "):
-                    if temp.startswith(prefix):
-                        temp = temp[len(prefix):]
-                        break
-                break
+        if not name:
+            continue
 
         # Top-level directories become regions
-        if depth == 0 and name.endswith("/"):
-            dir_name = name.rstrip("/").split("[")[0].strip()
-            if dir_name in SKIP_REGION_DIRS:
+        if depth == 0 and name.rstrip().endswith("/") or (depth == 0 and "/" in name.split()[0]):
+            # Strip trailing annotations like "  [Node.js, Python]"
+            dir_part = name.split("[")[0].strip().rstrip("/").split("/")[0]
+            if not dir_part or dir_part in SKIP_REGION_DIRS:
                 continue
             regions.append(ScanRegion(
-                name=dir_name,
-                path=f"{base_path}/{dir_name}",
-                description=f"Module: {dir_name}",
+                name=dir_part,
+                path=f"{base_path}/{dir_part}",
+                description=f"Module: {dir_part}",
                 priority=5,
             ))
         elif depth == 0:
-            # Top-level file
-            clean_name = name.split("(")[0].strip()  # Remove size annotations
-            root_files.append(clean_name)
+            # Top-level file — strip size annotations like " (2KB)"
+            clean_name = name.split("(")[0].strip()
+            if clean_name:
+                root_files.append(clean_name)
 
     # Add root files as a region (config, README, etc.)
     if root_files:

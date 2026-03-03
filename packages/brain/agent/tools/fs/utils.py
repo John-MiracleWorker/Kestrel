@@ -115,23 +115,44 @@ def _is_blocked_path(path: Path) -> Optional[str]:
 
     return None
 
+# Container-internal paths that are always accessible (volume-mounted)
+_BUILTIN_CONTAINER_PATHS = ["/project"]
+
 def _resolve_host_path(path: str, mounts: list[str]) -> Path:
     """
     Resolve a path against configured mount roots.
     The path can be:
       - Absolute host path (must be under a mount root)
+      - Container-internal path (e.g. /project — always allowed)
       - Relative (resolved against the first mount root)
 
     Raises ValueError if the path escapes all mount roots.
-    Returns the container-internal path (under /host_fs).
+    Returns the container-internal path (under /host_fs or a builtin path).
     """
+    target = Path(path).expanduser()
+
+    # Allow container-internal paths (e.g. /project volume mount)
+    if target.is_absolute():
+        for builtin in _BUILTIN_CONTAINER_PATHS:
+            try:
+                target.resolve().relative_to(Path(builtin).resolve())
+                resolved = target.resolve()
+                if not resolved.exists():
+                    raise ValueError(f"Path not found: {path}")
+                blocked = _is_blocked_path(resolved)
+                if blocked:
+                    raise ValueError(blocked)
+                return resolved
+            except ValueError as e:
+                if "Access denied" in str(e) or "not found" in str(e):
+                    raise
+                continue
+
     if not mounts:
         raise ValueError(
             "No host directories are configured. "
             "Set AGENT_HOST_MOUNTS in .env or configure via Settings → Filesystem Access."
         )
-
-    target = Path(path).expanduser()
 
     # If relative, resolve against first mount
     if not target.is_absolute():

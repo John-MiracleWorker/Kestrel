@@ -148,6 +148,9 @@ class NotificationRouter:
         # Deliver via Telegram (if configured)
         await self._deliver_telegram(notification)
 
+        # Deliver via macOS Native Notification
+        await self._deliver_mac_notification(notification)
+
         logger.info(f"Notification sent: {title} → {user_id} (via {source})")
         return notification
 
@@ -193,6 +196,22 @@ class NotificationRouter:
             urlopen(req, timeout=10)
         except Exception as e:
             logger.warning(f"Telegram notification delivery failed: {e}")
+
+    async def _deliver_mac_notification(self, notification: Notification) -> None:
+        """Send a native macOS notification via pync."""
+        try:
+            import pync
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: pync.notify(
+                title=f"Kestrel: {notification.title}",
+                message=notification.body if notification.body else "New Kestrel notification",
+                subtitle=notification.source if notification.source else "",
+                group=notification.workspace_id,
+            ))
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"macOS notification failed: {e}")
 
     async def get_unread(self, user_id: str, limit: int = 20) -> list[dict]:
         """Get unread notifications for a user."""

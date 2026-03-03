@@ -19,8 +19,9 @@ from .utils import (
     _load_proposals, _save_proposals,
     _send_proposal_to_telegram, _send_summary_to_telegram,
     _extract_json_array, _last_scan_results,
+    _codebase_overview_cache,
 )
-from .ast_analyzer import _deep_scan
+from .ast_analyzer import _deep_scan, _CODEBASE_OVERVIEW_TTL
 
 async def _telegram_digest(package: str = "all") -> dict:
     """
@@ -108,7 +109,7 @@ def _run_tests(package: str = "all") -> dict:
                 results[pkg] = {"status": "fail", "error": str(e)}
         else:
             # TypeScript: try tsc --noEmit via docker exec (gateway/web containers)
-            container_name = f"littlebirdalt-{pkg}-1" if pkg == "gateway" else f"littlebirdalt-frontend-1"
+            container_name = f"kestrel-{pkg}-1" if pkg == "gateway" else f"kestrel-frontend-1"
             try:
                 res = subprocess.run(
                     ["docker", "exec", container_name, "npx", "tsc", "--noEmit"],

@@ -721,6 +721,19 @@ class AgentLoop:
         parts = [f"Workspace: {task.workspace_id}"]
         if task.conversation_id:
             parts.append(f"Conversation: {task.conversation_id}")
+            
+        workspace_file = os.path.expanduser("~/.kestrel/WORKSPACE.md")
+        if os.path.exists(workspace_file):
+            try:
+                with open(workspace_file, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content:
+                    parts.append("\n=== System Workspace Context ===")
+                    parts.append(content)
+                    parts.append("================================\n")
+            except Exception as e:
+                logger.warning(f"Failed to read WORKSPACE.md: {e}")
+                
         return "\n".join(parts)
 
 

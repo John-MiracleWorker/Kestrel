@@ -9,7 +9,7 @@ from agent.tools import build_tool_registry
 from agent.types import AgentTask, GuardrailConfig as GCfg
 from agent.guardrails import Guardrails
 
-async def launch_task_from_automation(workspace_id: str, user_id: str, goal: str, source: str = "automation"):
+async def launch_task_from_automation(workspace_id: str, user_id: str, goal: str, source: str = "automation", model_override: str = None):
     """Task launcher callback for cron/webhook automation."""
     task = AgentTask(
         user_id=user_id,
@@ -21,9 +21,9 @@ async def launch_task_from_automation(workspace_id: str, user_id: str, goal: str
         await runtime.agent_persistence.save_task(task)
     logger.info(f"Automation task started: {task.id} — {goal} (source: {source})")
     # Run in background
-    asyncio.create_task(_run_automation_task(task))
+    asyncio.create_task(_run_automation_task(task, source, model_override))
 
-async def _run_automation_task(task: AgentTask):
+async def _run_automation_task(task: AgentTask, source: str = "automation", model_override: str = None):
     """Run an automation-triggered task in the background."""
     from db import get_pool # Late import to avoid cycles
     try:
@@ -34,6 +34,7 @@ async def _run_automation_task(task: AgentTask):
         
         task_loop = AgentLoop(
             provider=task_provider,
+            model=model_override or ws_config.get("model", ""),
             tool_registry=build_tool_registry(
                 hands_client=runtime.hands_client,
                 vector_store=runtime.vector_store,

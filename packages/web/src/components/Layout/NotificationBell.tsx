@@ -10,6 +10,12 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { request, createChatSocket } from '../../api/client';
 import { useAuth } from '../../hooks/useAuth';
+import {
+    isPermissionGranted,
+    requestPermission,
+    sendNotification,
+} from '@tauri-apps/plugin-notification';
+import { isTauri } from '@tauri-apps/api/core';
 
 interface Notification {
     id: string;
@@ -80,6 +86,26 @@ export function NotificationBell() {
                         setNotifications((prev) => [data.notification, ...prev]);
                         setIsPulsing(true);
                         setTimeout(() => setIsPulsing(false), 2000);
+
+                        if (isTauri()) {
+                            isPermissionGranted()
+                                .then(async (granted) => {
+                                    let permissionGranted = granted;
+                                    if (!permissionGranted) {
+                                        const permission = await requestPermission();
+                                        permissionGranted = permission === 'granted';
+                                    }
+                                    if (permissionGranted) {
+                                        sendNotification({
+                                            title: data.notification.title,
+                                            body: data.notification.body || '',
+                                        });
+                                    }
+                                })
+                                .catch(() => {
+                                    /* ignore */
+                                });
+                        }
                     }
                 } catch (e) {
                     // Ignore parsing errors
@@ -109,17 +135,19 @@ export function NotificationBell() {
     const markRead = async (id: string) => {
         try {
             await request(`/notifications/${id}/read`, { method: 'POST' });
-            setNotifications((prev) =>
-                prev.map((n) => (n.id === id ? { ...n, read: true } : n)),
-            );
-        } catch { /* ignore */ }
+            setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, read: true } : n)));
+        } catch {
+            /* ignore */
+        }
     };
 
     const markAllRead = async () => {
         try {
             await request('/notifications/read-all', { method: 'POST' });
             setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
-        } catch { /* ignore */ }
+        } catch {
+            /* ignore */
+        }
     };
 
     const timeAgo = (iso: string) => {
@@ -271,7 +299,9 @@ export function NotificationBell() {
                                         background: 'transparent',
                                     }}
                                     onMouseEnter={(e) => {
-                                        if (!n.read) e.currentTarget.style.background = 'rgba(255,255,255,0.02)';
+                                        if (!n.read)
+                                            e.currentTarget.style.background =
+                                                'rgba(255,255,255,0.02)';
                                     }}
                                     onMouseLeave={(e) => {
                                         e.currentTarget.style.background = 'transparent';
@@ -330,7 +360,8 @@ export function NotificationBell() {
                                                 width: '6px',
                                                 height: '6px',
                                                 borderRadius: '50%',
-                                                background: TYPE_COLORS[n.type] || 'var(--accent-purple)',
+                                                background:
+                                                    TYPE_COLORS[n.type] || 'var(--accent-purple)',
                                                 flexShrink: 0,
                                                 marginTop: '6px',
                                             }}

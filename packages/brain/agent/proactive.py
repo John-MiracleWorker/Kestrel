@@ -391,6 +391,43 @@ class HeartbeatEngine:
         if not self._task_launcher:
             return
 
+        # Quiet hours and idle detection
+        try:
+            import yaml
+            import os
+            from datetime import datetime
+            config_path = os.path.expanduser("~/.kestrel/config.yml")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    config = yaml.safe_load(f) or {}
+                    
+                q_hours = config.get("heartbeat", {}).get("quiet_hours", {})
+                if q_hours:
+                    start = q_hours.get("start")
+                    end = q_hours.get("end")
+                    if start and end:
+                        now = datetime.now()
+                        current_time = now.strftime("%H:%M")
+                        if start <= end:
+                            in_quiet_hours = start <= current_time <= end
+                        else:
+                            in_quiet_hours = current_time >= start or current_time <= end
+                            
+                        if in_quiet_hours:
+                            logger.info(f"Heartbeat skipped: Quiet hours ({start} - {end})")
+                            return
+        except Exception as e:
+            logger.warning(f"Error checking quiet hours: {e}")
+
+        try:
+            from agent.core.heartbeat_parser import HeartbeatParser
+            parser = HeartbeatParser()
+            heartbeat_tasks = parser.parse()
+            user_goals = "\n".join(f"- {t.description}" for t in heartbeat_tasks)
+        except Exception as e:
+            logger.warning(f"Failed to parse Heartbeat tasks: {e}")
+            user_goals = ""
+
         try:
             async with self._pool.acquire() as conn:
                 # Target workspaces that have memory graph nodes
@@ -402,17 +439,33 @@ class HeartbeatEngine:
 
             for row in rows:
                 ws_id = str(row["workspace_id"])
+                
+                # Bi-directional memory sync: ingest manual edits from markdown
+                try:
+                    from agent.core.markdown_memory import LocalMarkdownMemoryManager
+                    from agent.core.memory_graph import MemoryGraph
+                    mg = MemoryGraph(self._pool)
+                    mm = LocalMarkdownMemoryManager(mg)
+                    await mm.ingest_from_disk(ws_id)
+                except Exception as e:
+                    logger.warning(f"Failed to ingest markdown memory during heartbeat: {e}")
+                
                 goal = (
                     "Background Heartbeat Sweep: Assess current state, check for stalled tasks, "
-                    "compress memory, and prepare next steps. If nothing to do, safely exit."
+                    "compress memory, and prepare next steps."
                 )
+                if user_goals:
+                    goal += f"\n\nUser-defined autonomous tasks:\n{user_goals}"
+                goal += "\n\nIf nothing to do, safely exit."
                 
                 # Launch the background sweep task
+                # Passing a cheaper model for routine sweeps to optimize costs
                 await self._task_launcher(
                     workspace_id=ws_id,
                     user_id=user_id,
                     goal=goal,
-                    source="heartbeat_engine"
+                    source="heartbeat_engine",
+                    model_override="gemini-2.5-flash"
                 )
                 logger.debug(f"Triggered heartbeat sweep for workspace {ws_id}")
 

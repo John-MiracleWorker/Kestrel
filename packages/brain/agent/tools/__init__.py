@@ -230,6 +230,7 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
     from agent.tools.moltbook_autonomous import register_moltbook_autonomous_tools
     from agent.tools.schedule import register_schedule_tools
     from agent.tools.system_tools import register_system_tools
+    from agent.tools.host_execution import register_host_execution_tools
 
     register_code_tools(registry, hands_client=hands_client)
     register_web_tools(registry)
@@ -242,6 +243,7 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
     register_moltbook_autonomous_tools(registry)
     register_schedule_tools(registry)
     register_system_tools(registry)
+    register_host_execution_tools(registry)
 
     # Model swap (search + switch models across Ollama & cloud providers)
     from agent.tools.model_swap import register_model_swap_tools

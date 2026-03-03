@@ -47,9 +47,9 @@
                 }
             ]
         },
-        "packages/brain/brain_pb2.py": { "sig": "1771907312598620152:27880", "issues": [] },
+        "packages/brain/brain_pb2.py": { "sig": "1772565629775469930:29667", "issues": [] },
         "packages/brain/server.py": {
-            "sig": "1772537694827127426:17742",
+            "sig": "1772565144918987457:18299",
             "issues": [
                 {
                     "type": "complexity",
@@ -57,7 +57,7 @@
                     "package": "brain",
                     "file": "packages/brain/server.py",
                     "line": 67,
-                    "description": "Function `serve` is 362 lines long \u2014 consider refactoring",
+                    "description": "Function `serve` is 374 lines long \u2014 consider refactoring",
                     "suggestion": "Break `serve` into smaller helper functions"
                 },
                 {
@@ -91,15 +91,15 @@
         },
         "packages/brain/encryption.py": { "sig": "1772239600830346883:2477", "issues": [] },
         "packages/brain/brain_pb2_grpc.py": {
-            "sig": "1771907294756664664:54785",
+            "sig": "1772565629775733804:58360",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/brain_pb2_grpc.py",
-                    "line": 387,
-                    "description": "Function `add_BrainServiceServicer_to_server` is 157 lines long \u2014 consider refactoring",
+                    "line": 409,
+                    "description": "Function `add_BrainServiceServicer_to_server` is 167 lines long \u2014 consider refactoring",
                     "suggestion": "Break `add_BrainServiceServicer_to_server` into smaller helper functions"
                 },
                 {
@@ -108,7 +108,7 @@
                     "package": "brain",
                     "file": "packages/brain/brain_pb2_grpc.py",
                     "line": 32,
-                    "description": "Function `__init__` is 156 lines long \u2014 consider refactoring",
+                    "description": "Function `__init__` is 166 lines long \u2014 consider refactoring",
                     "suggestion": "Break `__init__` into smaller helper functions"
                 },
                 {
@@ -773,7 +773,7 @@
             ]
         },
         "packages/brain/agent/step_scheduler.py": {
-            "sig": "1772549871349841750:18573",
+            "sig": "1772565568679758009:18623",
             "issues": [
                 {
                     "type": "complexity",
@@ -879,7 +879,7 @@
         },
         "packages/brain/agent/diagnostics.py": { "sig": "1772128565960969904:9578", "issues": [] },
         "packages/brain/agent/proactive.py": {
-            "sig": "1772537694761212048:12511",
+            "sig": "1772565122733102165:15386",
             "issues": [
                 {
                     "type": "dead_import",
@@ -1244,7 +1244,7 @@
             ]
         },
         "packages/brain/agent/model_router.py": {
-            "sig": "1772537955465634037:26838",
+            "sig": "1772565468666186809:26959",
             "issues": [
                 {
                     "type": "complexity",
@@ -1431,7 +1431,7 @@
             ]
         },
         "packages/brain/agent/tools/files.py": {
-            "sig": "1771627751786380949:8319",
+            "sig": "1772569151897871054:8501",
             "issues": [
                 {
                     "type": "complexity",
@@ -1439,7 +1439,7 @@
                     "package": "brain",
                     "file": "packages/brain/agent/tools/files.py",
                     "line": 21,
-                    "description": "Function `register_file_tools` is 94 lines long \u2014 consider refactoring",
+                    "description": "Function `register_file_tools` is 96 lines long \u2014 consider refactoring",
                     "suggestion": "Break `register_file_tools` into smaller helper functions"
                 },
                 {
@@ -1472,14 +1472,14 @@
             ]
         },
         "packages/brain/agent/tools/scanner.py": {
-            "sig": "1772389630261879406:28685",
+            "sig": "1772567459612561143:29090",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/tools/scanner.py",
-                    "line": 318,
+                    "line": 332,
                     "description": "Function `_synthesize_reports` is 98 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_synthesize_reports` into smaller helper functions"
                 },
@@ -1488,7 +1488,7 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/tools/scanner.py",
-                    "line": 420,
+                    "line": 434,
                     "description": "Function `scan_codebase` is 143 lines long \u2014 consider refactoring",
                     "suggestion": "Break `scan_codebase` into smaller helper functions"
                 },
@@ -1497,7 +1497,7 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/tools/scanner.py",
-                    "line": 565,
+                    "line": 579,
                     "description": "Function `_direct_scan_fallback` is 93 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_direct_scan_fallback` into smaller helper functions"
                 },
@@ -1506,7 +1506,7 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/tools/scanner.py",
-                    "line": 662,
+                    "line": 676,
                     "description": "Function `register_scanner_tools` is 82 lines long \u2014 consider refactoring",
                     "suggestion": "Break `register_scanner_tools` into smaller helper functions"
                 },
@@ -2772,14 +2772,14 @@
             ]
         },
         "packages/brain/agent/tools/self_improvement/proposals.py": {
-            "sig": "1772563217866287227:28190",
+            "sig": "1772569149914710143:28232",
             "issues": [
                 {
                     "type": "todo",
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/agent/tools/self_improvement/proposals.py",
-                    "line": 255,
+                    "line": 256,
                     "description": "Only propose actionable issues (not info/low TODOs in node_modules)",
                     "suggestion": "Implement or remove: Only propose actionable issues (not info/low TODOs in node_modules)"
                 },
@@ -2788,7 +2788,7 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/tools/self_improvement/proposals.py",
-                    "line": 77,
+                    "line": 78,
                     "description": "Function `_run_tests` is 93 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_run_tests` into smaller helper functions"
                 },
@@ -2797,7 +2797,7 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/tools/self_improvement/proposals.py",
-                    "line": 383,
+                    "line": 384,
                     "description": "Function `_llm_analyze` is 264 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_llm_analyze` into smaller helper functions"
                 },
@@ -3047,7 +3047,7 @@
             "issues": []
         },
         "packages/brain/agent/tools/fs/utils.py": {
-            "sig": "1771907312598453735:6044",
+            "sig": "1772569143816773201:6940",
             "issues": [
                 {
                     "type": "dead_import",
@@ -3405,7 +3405,7 @@
             ]
         },
         "packages/brain/agent/core/memory_graph.py": {
-            "sig": "1772239600825398668:32772",
+            "sig": "1772565043465072783:33359",
             "issues": [
                 {
                     "type": "complexity",
@@ -3422,7 +3422,7 @@
                     "package": "brain",
                     "file": "packages/brain/agent/core/memory_graph.py",
                     "line": 282,
-                    "description": "Function `extract_and_store` is 173 lines long \u2014 consider refactoring",
+                    "description": "Function `extract_and_store` is 185 lines long \u2014 consider refactoring",
                     "suggestion": "Break `extract_and_store` into smaller helper functions"
                 },
                 {
@@ -3430,7 +3430,7 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/core/memory_graph.py",
-                    "line": 456,
+                    "line": 468,
                     "description": "Function `query_context` is 113 lines long \u2014 consider refactoring",
                     "suggestion": "Break `query_context` into smaller helper functions"
                 },
@@ -3501,6 +3501,20 @@
             ]
         },
         "packages/brain/agent/core/__init__.py": { "sig": "1771973228960891018:63", "issues": [] },
+        "packages/brain/agent/core/markdown_memory.py": {
+            "sig": "1772565007847372501:4903",
+            "issues": [
+                {
+                    "type": "complexity",
+                    "severity": "medium",
+                    "package": "brain",
+                    "file": "packages/brain/agent/core/markdown_memory.py",
+                    "line": 19,
+                    "description": "Function `sync_workspace_to_disk` is 88 lines long \u2014 consider refactoring",
+                    "suggestion": "Break `sync_workspace_to_disk` into smaller helper functions"
+                }
+            ]
+        },
         "packages/brain/agent/core/verifier.py": {
             "sig": "1771990373626600176:3715",
             "issues": []
@@ -3646,16 +3660,25 @@
             ]
         },
         "packages/brain/services/system_service.py": {
-            "sig": "1771897497473948323:8756",
+            "sig": "1772565720585869250:9892",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/services/system_service.py",
-                    "line": 9,
-                    "description": "Function `GetCapabilities` is 99 lines long \u2014 consider refactoring",
+                    "line": 10,
+                    "description": "Function `GetCapabilities` is 122 lines long \u2014 consider refactoring",
                     "suggestion": "Break `GetCapabilities` into smaller helper functions"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/services/system_service.py",
+                    "line": 6,
+                    "description": "Potentially unused import: `get_available_providers`",
+                    "suggestion": "Remove unused import `get_available_providers` at line 6"
                 }
             ]
         },
@@ -3683,7 +3706,7 @@
             ]
         },
         "packages/brain/services/agent_service.py": {
-            "sig": "1772537694763052716:13212",
+            "sig": "1772565656803484475:19861",
             "issues": [
                 {
                     "type": "complexity",
@@ -3693,6 +3716,15 @@
                     "line": 12,
                     "description": "Function `StartTask` is 184 lines long \u2014 consider refactoring",
                     "suggestion": "Break `StartTask` into smaller helper functions"
+                },
+                {
+                    "type": "complexity",
+                    "severity": "medium",
+                    "package": "brain",
+                    "file": "packages/brain/services/agent_service.py",
+                    "line": 337,
+                    "description": "Function `RunHeadlessTask` is 147 lines long \u2014 consider refactoring",
+                    "suggestion": "Break `RunHeadlessTask` into smaller helper functions"
                 },
                 {
                     "type": "dead_import",
@@ -3711,6 +3743,15 @@
                     "line": 15,
                     "description": "Potentially unused import: `TaskStatus`",
                     "suggestion": "Remove unused import `TaskStatus` at line 15"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/services/agent_service.py",
+                    "line": 344,
+                    "description": "Potentially unused import: `TaskStatus`",
+                    "suggestion": "Remove unused import `TaskStatus` at line 344"
                 }
             ]
         },

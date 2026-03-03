@@ -420,12 +420,34 @@ async def cmd_status(client: KestrelClient, args: argparse.Namespace):
     """Show system status."""
     config = load_config()
     print_header("System Status")
-    print(f"  {c('API:', Colors.MUTED)}        {c(config['api_url'], Colors.PRIMARY)}")
+    
+    state_file = os.path.expanduser("~/.kestrel/state/heartbeat.json")
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, "r") as f:
+                state = json.load(f)
+            ago = int(time.time() - state.get("last_heartbeat", 0))
+            uptime = int(state.get("uptime", 0))
+            days, rem = divmod(uptime, 86400)
+            hrs, rem = divmod(rem, 3600)
+            mins, seq = divmod(rem, 60)
+            uptime_str = f"{days}d {hrs}h {mins}m" if days > 0 else f"{hrs}h {mins}m"
+            print(c(f"  🦅 Kestrel Agent OS — Running (uptime: {uptime_str})", Colors.SUCCESS))
+            print(c("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.MUTED))
+            print(f"  {c('HEARTBEAT', Colors.KESTREL)}     Last: {ago}s ago | State: {state.get('status')}")
+            print()
+        except Exception:
+            print(c("  🦅 Kestrel Agent OS — Offline or state unreadable", Colors.ERROR))
+            print()
+    else:
+        print(c("  🦅 Kestrel Agent OS — Offline (daemon not running)", Colors.MUTED))
+        print()
+
+    print(f"  {c('API:', Colors.MUTED)}        {c(config.get('api_url', 'not set'), Colors.PRIMARY)}")
     print(f"  {c('Workspace:', Colors.MUTED)}  {c(config.get('workspace_id', 'not set'), Colors.WHITE)}")
     print(f"  {c('Model:', Colors.MUTED)}      {c(config.get('model', 'default'), Colors.WHITE)}")
     print(f"  {c('Thinking:', Colors.MUTED)}   {c(config.get('thinking_level', 'medium'), Colors.WHITE)}")
     print(f"  {c('Usage:', Colors.MUTED)}      {c(config.get('usage_mode', 'tokens'), Colors.WHITE)}")
-
 
 async def cmd_config(client: KestrelClient, args: argparse.Namespace):
     """Configure Kestrel CLI settings."""
@@ -448,6 +470,131 @@ async def cmd_config(client: KestrelClient, args: argparse.Namespace):
             print(f"  {c(k, Colors.PRIMARY):>30} = {c(str(v), Colors.WHITE)}")
         print()
         print(c("  Set a value: kestrel config <key> <value>", Colors.DIM))
+
+
+async def cmd_install(client: KestrelClient, args: argparse.Namespace):
+    """Install Kestrel as a background macOS daemon."""
+    import subprocess
+    print_header("Installing Kestrel Daemon")
+    
+    home = os.path.expanduser("~")
+    plist_dir = os.path.join(home, "Library", "LaunchAgents")
+    os.makedirs(plist_dir, exist_ok=True)
+    plist_path = os.path.join(plist_dir, "ai.kestrel.daemon.plist")
+    
+    cli_dir = os.path.abspath(os.path.dirname(__file__))
+    daemon_path = os.path.join(cli_dir, "kestrel_daemon.py")
+    
+    if not os.path.exists(daemon_path):
+        print_error(f"Daemon script not found at {daemon_path}")
+        return
+        
+    audit_dir = os.path.join(home, ".kestrel", "audit")
+    os.makedirs(audit_dir, exist_ok=True)
+        
+    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.kestrel.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{sys.executable}</string>
+        <string>{daemon_path}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>{audit_dir}/daemon.err</string>
+    <key>StandardOutPath</key>
+    <string>{audit_dir}/daemon.out</string>
+</dict>
+</plist>
+"""
+    with open(plist_path, "w") as f:
+        f.write(plist_content)
+    
+    try:
+        subprocess.run(["launchctl", "unload", plist_path], capture_output=True)
+        res = subprocess.run(["launchctl", "load", "-w", plist_path], capture_output=True, text=True)
+        if res.returncode == 0:
+            print_success("Daemon installed and started via launchctl.")
+            print_info("State directory: ~/.kestrel/")
+        else:
+            print_error(f"Failed to load daemon: {res.stderr}")
+    except Exception as e:
+        print_error(f"Error starting daemon: {e}")
+
+
+# ── Memory CLI Commands ──────────────────────────────────────────────
+
+def cmd_memory_show(args, config: dict):
+    """Show contents of Kestrel Dual Memory markdown files."""
+    import glob
+    import os
+    memory_base = os.path.expanduser(config.get("memory_dir", "~/.kestrel/memory"))
+    
+    # Check if a category was provided (e.g. "preferences")
+    category = args.category.lower() if hasattr(args, "category") and args.category else None
+    
+    # We look inside the first workspace folder we find, or default
+    ws_dirs = [d for d in glob.glob(os.path.join(memory_base, "*")) if os.path.isdir(d)]
+    if not ws_dirs:
+        print_info("No memory synchronized yet. The daemon will sync memory shortly.")
+        return
+        
+    ws_dir = ws_dirs[0]  # Just use the first one for CLI
+    print_info(f"Showing memory for workspace: {os.path.basename(ws_dir)}\n")
+    
+    if category:
+        filename = f"{category}.md" if category.endswith('s') else f"{category}s.md"
+        filepaths = [os.path.join(ws_dir, filename)]
+        if not os.path.exists(filepaths[0]):
+            filepaths = [os.path.join(ws_dir, f"{category}.md")] # Fallback to singular
+            if not os.path.exists(filepaths[0]):
+                 print_error(f"No memory found for category: {category}")
+                 return
+    else:
+        filepaths = glob.glob(os.path.join(ws_dir, "*.md"))
+        
+    for fp in filepaths:
+        if not os.path.exists(fp):
+            continue
+        print(c(f"--- {os.path.basename(fp)} ---", Colors.KESTREL))
+        try:
+            with open(fp, "r") as f:
+                print(f.read())
+        except Exception as e:
+            print_error(f"Could not read {fp}: {e}")
+        print()
+
+
+def cmd_memory_edit(args, config: dict):
+    """Open Kestrel memory directory in the default editor."""
+    import os
+    import subprocess
+    memory_base = os.path.expanduser(config.get("memory_dir", "~/.kestrel/memory"))
+    
+    print_info(f"Opening memory directory: {memory_base}")
+    if not os.path.exists(memory_base):
+        os.makedirs(memory_base, exist_ok=True)
+        print_info("Created new memory directory.")
+        
+    editor = os.environ.get("EDITOR", "nano")
+    
+    # On macOS, if code/cursor/subl/etc is not available, try to open the folder
+    try:
+        if editor in ("nano", "vim", "vi"):
+            # These can't act as full folder explorers easily without a file
+            subprocess.run(["open", memory_base])
+        else:
+            subprocess.run([editor, memory_base])
+    except Exception as e:
+        print_error(f"Failed to launch editor ({editor}): {e}")
+        subprocess.run(["open", memory_base]) # Fallback to Finder
 
 
 # ── Interactive REPL ─────────────────────────────────────────────────
@@ -575,10 +722,22 @@ Examples:
     # status
     subparsers.add_parser("status", help="Show system status")
 
+    # install
+    subparsers.add_parser("install", help="Install Kestrel as a background macOS daemon")
+
     # config
     config_p = subparsers.add_parser("config", help="Configure settings")
     config_p.add_argument("key", nargs="?", help="Config key")
     config_p.add_argument("value", nargs="?", help="Config value")
+
+    # memory
+    memory_parser = subparsers.add_parser("memory", help="Manage Kestrel transparent knowledge memory")
+    memory_subparsers = memory_parser.add_subparsers(dest="memory_cmd", help="Memory subcommand")
+    
+    mem_show_parser = memory_subparsers.add_parser("show", help="Show memory contents")
+    mem_show_parser.add_argument("category", nargs="?", help="Specific memory category to show (e.g. preferences)")
+    
+    mem_edit_parser = memory_subparsers.add_parser("edit", help="Open memory directory in default editor")
 
     return parser
 
@@ -599,10 +758,26 @@ def main():
         "webhooks": cmd_webhooks,
         "status": cmd_status,
         "config": cmd_config,
+        "install": cmd_install,
     }
 
+    if args.command == "memory":
+        if args.memory_cmd == "show":
+            cmd_memory_show(args, config)
+        elif args.memory_cmd == "edit":
+            cmd_memory_edit(args, config)
+        else:
+            parser.parse_args(["memory", "--help"])
+        return
+
     if args.command and args.command in command_map:
-        asyncio.run(command_map[args.command](client, args))
+        cmd_func = command_map[args.command]
+        if args.command in ["task", "tasks", "workflows", "cron", "webhooks"]:
+            # Async commands
+            asyncio.run(cmd_func(args, client))
+        else:
+            # Sync commands
+            cmd_func(args, config)
     else:
         # No subcommand — launch interactive REPL
         asyncio.run(interactive_repl(client, config))
