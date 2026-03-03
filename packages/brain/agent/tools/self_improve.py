@@ -16,7 +16,7 @@ from urllib.error import URLError
 from agent.types import RiskLevel, ToolDefinition
 
 from .self_improvement.utils import (
-    PROJECT_ROOT, PACKAGES,
+    PROJECT_ROOT, PACKAGES, logger,
     _load_proposals, _save_proposals,
     _persist_scan_results, _restore_scan_results,
     _send_summary_to_telegram, _send_proposal_to_telegram,
