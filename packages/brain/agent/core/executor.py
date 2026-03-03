@@ -1340,9 +1340,14 @@ class TaskExecutor:
             # it's stuck in a summary loop — force-complete the step.
             has_high_streak = self._text_only_streak[step.id] >= 2
 
+            # Always capture the LLM's text — even if we don't mark
+            # the step complete yet, the text may contain useful output
+            # and ensures the deadlock detector treats partial work as
+            # complete rather than failed.
+            step.result = text
+
             if is_simple_chat or has_done_work or is_done_phrase or has_high_streak:
                 step.status = StepStatus.COMPLETE
-                step.result = text
                 step.completed_at = datetime.now(timezone.utc)
                 await self._persistence.update_task(task)
 

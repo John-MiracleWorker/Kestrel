@@ -209,8 +209,14 @@ class TaskPlan:
 
     @property
     def is_complete(self) -> bool:
+        """True when every step has reached a terminal state.
+
+        Terminal states are COMPLETE, SKIPPED, and FAILED.  Including
+        FAILED prevents the scheduler loop from spinning when a step
+        has permanently failed but the task hasn't been aborted yet.
+        """
         return all(
-            s.status in (StepStatus.COMPLETE, StepStatus.SKIPPED)
+            s.status in (StepStatus.COMPLETE, StepStatus.SKIPPED, StepStatus.FAILED)
             for s in self.steps
         )
 

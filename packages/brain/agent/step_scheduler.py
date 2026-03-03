@@ -62,14 +62,19 @@ class StepScheduler:
         self._max_parallel = max_parallel_steps
 
     def _get_ready_steps(self, plan: TaskPlan) -> list[TaskStep]:
-        """Return all pending steps whose dependencies are satisfied."""
+        """Return all pending or in-progress steps whose dependencies are satisfied.
+
+        IN_PROGRESS steps are included so the scheduler re-runs them if
+        the executor returned without completing the step (e.g. text-only
+        LLM response that didn't match done-criteria on the first pass).
+        """
         completed_ids = {
             s.id for s in plan.steps
             if s.status in (StepStatus.COMPLETE, StepStatus.SKIPPED)
         }
         ready = []
         for step in plan.steps:
-            if step.status != StepStatus.PENDING:
+            if step.status not in (StepStatus.PENDING, StepStatus.IN_PROGRESS):
                 continue
             deps_met = all(dep in completed_ids for dep in (step.depends_on or []))
             if deps_met:
@@ -207,6 +212,49 @@ class StepScheduler:
                 task.status = TaskStatus.EXECUTING
                 await self._persistence.update_task(task)
 
+        # ── Deadlock detection ──────────────────────────────────────
+        # If we exit the while loop but the plan isn't complete, some
+        # steps are stuck (e.g. FAILED steps that exhausted retries,
+        # or IN_PROGRESS steps with unsatisfiable dependencies).
+        # Force-resolve them so the task doesn't hang silently.
+        if not task.plan.is_complete:
+            stuck_steps = [
+                s for s in task.plan.steps
+                if s.status in (StepStatus.IN_PROGRESS, StepStatus.PENDING)
+            ]
+            if stuck_steps:
+                logger.warning(
+                    f"Plan deadlock: {len(stuck_steps)} step(s) stuck after "
+                    f"scheduler loop exited: "
+                    f"{[f'{s.id}({s.status.value})' for s in stuck_steps]}"
+                )
+                for s in stuck_steps:
+                    if s.result:
+                        # Step has partial results — treat as complete
+                        s.status = StepStatus.COMPLETE
+                        s.completed_at = datetime.now(timezone.utc)
+                    else:
+                        s.status = StepStatus.FAILED
+                        s.error = s.error or "Step could not be completed (scheduler deadlock)"
+                await self._persistence.update_task(task)
+
+                # If any were force-failed, propagate task failure
+                force_failed = [s for s in stuck_steps if s.status == StepStatus.FAILED]
+                if force_failed:
+                    from agent.types import TaskStatus
+                    task.status = TaskStatus.FAILED
+                    task.error = (
+                        f"{len(force_failed)} step(s) could not be completed: "
+                        + "; ".join(s.description[:60] for s in force_failed[:3])
+                    )
+                    await self._persistence.update_task(task)
+                    yield TaskEvent(
+                        type=TaskEventType.TASK_FAILED,
+                        task_id=task.id,
+                        content=task.error,
+                        progress=progress_fn(task),
+                    )
+
     async def _execute_single_step(
         self,
         task: AgentTask,
@@ -310,6 +358,16 @@ class StepScheduler:
                     await self._persistence.update_task(task)
                     return
 
+        # ── Safety guard: step still IN_PROGRESS after executor finished ──
+        # This happens when the LLM returns text-only content that doesn't
+        # match done-criteria. The step will be re-queued by _get_ready_steps
+        # on the next scheduler iteration. Log it so we have visibility.
+        if step.status == StepStatus.IN_PROGRESS:
+            logger.info(
+                f"Step {step.id} still IN_PROGRESS after executor run "
+                f"(attempts={step.attempts}, has_result={bool(step.result)})"
+            )
+
     async def _execute_parallel_steps(
         self,
         task: AgentTask,
@@ -381,6 +439,13 @@ class StepScheduler:
                 )
             elif step.status == StepStatus.FAILED:
                 any_failed = True
+            elif step.status == StepStatus.IN_PROGRESS:
+                # Step wasn't resolved by the executor — will be
+                # re-queued by _get_ready_steps on the next iteration.
+                logger.info(
+                    f"Parallel step {step.id} still IN_PROGRESS after "
+                    f"executor run (has_result={bool(step.result)})"
+                )
 
         await self._persistence.update_task(task)
 
