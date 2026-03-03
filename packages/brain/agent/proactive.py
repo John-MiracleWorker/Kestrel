@@ -229,8 +229,54 @@ class ProactiveEngine:
         self._cooldown[signal.fingerprint] = now
 
     async def _generate_hypothesis(self, signal: Signal) -> Hypothesis:
-        """Form a hypothesis from a signal (fast, rule-based)."""
-        # Simple rule-based hypothesis generation
+        """Form a hypothesis from a signal. Uses LLM when available, falls back to rules."""
+        if not self._provider:
+            return self._rule_based_hypothesis(signal)
+
+        try:
+            import json as _json
+            import re as _re
+
+            prompt = (
+                f"Analyze this system signal and generate a hypothesis:\n"
+                f"Source: {signal.source.value}\n"
+                f"Title: {signal.title}\n"
+                f"Body: {signal.body}\n"
+                f"Severity: {signal.severity}\n\n"
+                f"Respond with JSON only:\n"
+                f'{{"title": "...", "explanation": "...", "confidence": 0.X, '
+                f'"recommendation": "...", "auto_actionable": true/false, '
+                f'"goal_template": "..."}}'
+            )
+
+            response = await self._provider.generate(
+                messages=[{"role": "user", "content": prompt}],
+                model=self._model,
+                temperature=0.3,
+                max_tokens=512,
+            )
+
+            raw = response if isinstance(response, str) else response.get("content", "")
+            raw = _re.sub(r"```json\s*", "", raw)
+            raw = _re.sub(r"```\s*$", "", raw)
+            data = _json.loads(raw.strip())
+
+            return Hypothesis(
+                id=signal.fingerprint,
+                title=data.get("title", signal.title),
+                explanation=data.get("explanation", signal.body),
+                confidence=float(data.get("confidence", 0.6)),
+                signals=[signal.fingerprint],
+                recommendation=data.get("recommendation", f"Investigate: {signal.title}"),
+                auto_actionable=bool(data.get("auto_actionable", False)),
+                goal_template=data.get("goal_template", ""),
+            )
+        except Exception as e:
+            logger.warning(f"LLM hypothesis generation failed, using rules: {e}")
+            return self._rule_based_hypothesis(signal)
+
+    def _rule_based_hypothesis(self, signal: Signal) -> Hypothesis:
+        """Fast rule-based fallback for hypothesis generation."""
         return Hypothesis(
             id=signal.fingerprint,
             title=signal.title,

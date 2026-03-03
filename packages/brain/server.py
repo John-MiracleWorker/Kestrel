@@ -274,16 +274,26 @@ async def serve():
     )
     logger.info("Outcome simulator initialized")
 
-    # Feature 6: Proactive Interrupt Engine
+    # Feature 6: Proactive Interrupt Engine (with LLM-powered hypothesis)
     _proactive_engine = ProactiveEngine(
         notification_router=runtime.notification_router,
         task_launcher=None,  # Set after cron scheduler init
+        llm_provider=_resolve_default_provider(),
+        model="",
     )
     try:
         await _proactive_engine.start()
         logger.info("Proactive interrupt engine started")
     except Exception as e:
         logger.warning(f"Proactive engine start failed (non-fatal): {e}")
+
+    # Wire SmartMonitors → ProactiveEngine for signal routing
+    _smart_monitors.set_proactive_engine(_proactive_engine)
+    logger.info("SmartMonitors wired to ProactiveEngine")
+
+    # Store references on runtime for access by services
+    runtime.outcome_simulator = _outcome_simulator
+    runtime.proactive_engine = _proactive_engine
 
     # Feature 7: UI Artifact Manager
     _ui_artifact_manager = UIArtifactManager(pool=pool)

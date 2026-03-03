@@ -22,15 +22,45 @@ logger = logging.getLogger("brain.smart_monitors")
 class SmartMonitors:
     """
     Proactive monitors for background tasks.
-    Triggers web notifications via NotificationRouter.
+    Triggers web notifications via NotificationRouter and emits
+    Signal objects to the ProactiveEngine when one is connected.
     """
     def __init__(self, pool, notification_router, metrics, agent_persistence):
         self._pool = pool
         self._router = notification_router
         self._metrics = metrics
         self._agent_persistence = agent_persistence
+        self._proactive_engine = None
         self._running = False
         self._tasks: list[asyncio.Task] = []
+
+    def set_proactive_engine(self, engine) -> None:
+        """Wire in the ProactiveEngine to receive signals from monitors."""
+        self._proactive_engine = engine
+
+    async def _emit_signal(
+        self,
+        source_id: str,
+        title: str,
+        body: str,
+        severity: str = "warning",
+        metadata: dict = None,
+    ) -> None:
+        """Emit a signal to the ProactiveEngine if available."""
+        if not self._proactive_engine:
+            return
+        try:
+            from agent.proactive import Signal, SignalSource
+            await self._proactive_engine.process_signal(Signal(
+                source=SignalSource.MONITOR,
+                source_id=source_id,
+                title=title,
+                body=body,
+                severity=severity,
+                metadata=metadata or {},
+            ))
+        except Exception as e:
+            logger.debug(f"Failed to emit signal to proactive engine: {e}")
 
     def start(self):
         if self._running:
@@ -70,13 +100,21 @@ class SmartMonitors:
                         """
                     )
                     for row in rows:
+                        msg_body = f"Your task '{row['goal'][:50]}…' has been running for over an hour."
                         await self._router.send(
                             user_id=row['user_id'],
                             workspace_id=row['workspace_id'],
                             type='warning',
                             title='Task stuck or forgotten',
-                            body=f"Your task '{row['goal'][:50]}…' has been running for over an hour.",
+                            body=msg_body,
                             source='smart_monitors',
+                        )
+                        await self._emit_signal(
+                            source_id="stuck_tasks",
+                            title="Task stuck or forgotten",
+                            body=msg_body,
+                            severity="warning",
+                            metadata={"workspace_id": str(row['workspace_id']), "user_id": str(row['user_id'])},
                         )
                         logger.warning(f"Stuck task detected: {row['id']}")
             except asyncio.CancelledError:
@@ -105,29 +143,43 @@ class SmartMonitors:
 
                 if disk.percent > DISK_THRESHOLD:
                     logger.warning(f"Disk usage critical: {disk.percent}%")
+                    disk_body = f"Disk usage at {disk.percent}% ({disk.free // (1024**3)} GB free)"
                     try:
                         await self._router.send(
                             user_id="system", workspace_id="system",
                             type="warning",
                             title="Disk Space Low",
-                            body=f"Disk usage at {disk.percent}% ({disk.free // (1024**3)} GB free)",
+                            body=disk_body,
                             source="smart_monitors",
                         )
                     except Exception:
                         pass
+                    await self._emit_signal(
+                        source_id="disk_usage",
+                        title="Disk Space Low",
+                        body=disk_body,
+                        severity="critical" if disk.percent > 95 else "warning",
+                    )
 
                 if mem.percent > MEM_THRESHOLD:
                     logger.warning(f"Memory usage critical: {mem.percent}%")
+                    mem_body = f"Memory usage at {mem.percent}% ({mem.available // (1024**2)} MB available)"
                     try:
                         await self._router.send(
                             user_id="system", workspace_id="system",
                             type="warning",
                             title="Memory Usage High",
-                            body=f"Memory usage at {mem.percent}% ({mem.available // (1024**2)} MB available)",
+                            body=mem_body,
                             source="smart_monitors",
                         )
                     except Exception:
                         pass
+                    await self._emit_signal(
+                        source_id="memory_usage",
+                        title="Memory Usage High",
+                        body=mem_body,
+                        severity="critical" if mem.percent > 95 else "warning",
+                    )
 
             except asyncio.CancelledError:
                 break

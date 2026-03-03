@@ -109,6 +109,7 @@ class TaskExecutor:
         progress_callback: Optional[Callable] = None,
         verifier: Optional[VerifierEngine] = None,
         approval_memory=None,
+        persona_context: str = "",
     ):
         self._provider = provider
         self._tools = tool_registry
@@ -123,6 +124,7 @@ class TaskExecutor:
         self._evidence_chain = evidence_chain
         self._progress_callback = progress_callback or (lambda t: 0.0)
         self._verifier = verifier
+        self._persona_context = persona_context
         # Detect if a workspace model was explicitly configured
         # (e.g. 'glm-5:cloud') — prevents unwanted cloud escalation
         self._has_explicit_model = bool(
@@ -823,7 +825,10 @@ class TaskExecutor:
                 observations=observations,
                 diagnostic_context=("\n" + diagnostic_context + "\n") if diagnostic_context else "",
             )
-            
+            # Inject persona context if available
+            if self._persona_context:
+                system_prompt += f"\n\n{self._persona_context}"
+
             messages.append({
                 "role": "system",
                 "content": system_prompt,
@@ -876,6 +881,9 @@ class TaskExecutor:
                 observations=observations,
                 diagnostic_context=("\n" + diagnostic_context + "\n") if diagnostic_context else "",
             )
+            # Inject persona context if available
+            if self._persona_context:
+                system_prompt += f"\n\n{self._persona_context}"
 
             messages = [{"role": "system", "content": system_prompt}]
 

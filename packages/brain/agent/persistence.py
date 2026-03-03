@@ -19,6 +19,7 @@ from agent.types import (
     TaskStatus,
 )
 from agent.loop import TaskPersistence
+from agent.state_machine import TaskStateMachine
 
 logger = logging.getLogger("brain.agent.persistence")
 
@@ -28,6 +29,7 @@ class PostgresTaskPersistence(TaskPersistence):
 
     def __init__(self, pool):
         self._pool = pool
+        self._state_machine = TaskStateMachine(strict=False)
 
     async def save_task(self, task: AgentTask) -> None:
         """Insert a new agent task."""
@@ -70,7 +72,14 @@ class PostgresTaskPersistence(TaskPersistence):
         )
 
     async def update_task(self, task: AgentTask) -> None:
-        """Update an existing agent task."""
+        """Update an existing agent task with state transition validation."""
+        last_status = self._state_machine.get_last_status(task.id)
+        if last_status and last_status != task.status:
+            self._state_machine.check_transition(task.id, last_status, task.status)
+        elif not last_status:
+            # First update — just record it
+            self._state_machine._last_status[task.id] = task.status
+
         await self._pool.execute(
             """
             UPDATE agent_tasks
