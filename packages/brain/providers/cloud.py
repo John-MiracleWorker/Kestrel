@@ -127,7 +127,7 @@ class CloudProvider:
         messages: list[dict],
         model: str = "",
         temperature: float = 0.7,
-        max_tokens: int = 2048,
+        max_tokens: int = 8192,
         api_key: str = "",
     ) -> AsyncIterator[str]:
         """Stream tokens from the cloud provider."""
@@ -455,7 +455,7 @@ class CloudProvider:
         messages: list[dict],
         model: str = "",
         temperature: float = 0.7,
-        max_tokens: int = 2048,
+        max_tokens: int = 8192,
     ) -> str:
         result = []
         async for token in self.stream(messages, model, temperature, max_tokens):

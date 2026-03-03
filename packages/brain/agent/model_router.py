@@ -132,7 +132,7 @@ def _build_routes(strategy: RoutingStrategy) -> dict[StepType, ModelRoute]:
             ),
             StepType.REFLECTION: ModelRoute(
                 StepType.REFLECTION, "ollama", _OLLAMA_MODEL,
-                temperature=0.4, max_tokens=2048,
+                temperature=0.4, max_tokens=4096,
                 reason="Meta-reasoning; fast local model is fine",
             ),
             StepType.SECURITY: ModelRoute(
@@ -176,7 +176,7 @@ def _build_routes(strategy: RoutingStrategy) -> dict[StepType, ModelRoute]:
             ),
             StepType.REFLECTION: ModelRoute(
                 StepType.REFLECTION, "google", _CLOUD_FAST_MODEL,
-                temperature=0.4, max_tokens=2048,
+                temperature=0.4, max_tokens=4096,
                 reason="Fast cloud model for reflection",
             ),
             StepType.SECURITY: ModelRoute(

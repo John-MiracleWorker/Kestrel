@@ -109,7 +109,7 @@ class OllamaProvider:
         messages: list[dict],
         model: str = "",
         temperature: float = 0.7,
-        max_tokens: int = 2048,
+        max_tokens: int = 4096,
         api_key: str = "",  # unused, kept for interface compat
     ) -> AsyncIterator[str]:
         """Stream tokens from an Ollama model."""
@@ -159,7 +159,7 @@ class OllamaProvider:
         messages: list[dict],
         model: str = "",
         temperature: float = 0.7,
-        max_tokens: int = 2048,
+        max_tokens: int = 4096,
     ) -> str:
         """Non-streaming chat completion."""
         result: list[str] = []

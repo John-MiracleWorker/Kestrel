@@ -59,7 +59,7 @@ class LocalProvider:
         messages: list[dict],
         model: str = "",
         temperature: float = 0.7,
-        max_tokens: int = 2048,
+        max_tokens: int = 4096,
         api_key: str = "",
     ) -> AsyncIterator[str]:
         """Stream tokens from the local model."""
@@ -94,7 +94,7 @@ class LocalProvider:
         messages: list[dict],
         model: str = "",
         temperature: float = 0.7,
-        max_tokens: int = 2048,
+        max_tokens: int = 4096,
     ) -> str:
         result = []
         async for token in self.stream(messages, model, temperature, max_tokens):
