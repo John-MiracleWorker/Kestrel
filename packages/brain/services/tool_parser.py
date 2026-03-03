@@ -208,6 +208,21 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
             yield make_response_fn(chunk_type=0, content_delta=failure_note)
             full_response_parts.append(failure_note)
 
+    elif event_type == "step_started":
+        progress = event.progress or {}
+        current = progress.get("current_step", 0)
+        total = progress.get("total_steps", 0)
+        description = (event.content or "Working on task...")[:150]
+        step_label = f"Step {current + 1}/{total}" if total else "Working"
+        yield make_response_fn(
+            chunk_type=0,
+            metadata={
+                "agent_status": "step_started",
+                "tool_name": step_label,
+                "thinking": description,
+            },
+        )
+
     elif event_type == "plan_created":
         yield make_response_fn(
             chunk_type=0,
