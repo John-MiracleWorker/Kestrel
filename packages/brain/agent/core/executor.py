@@ -1244,7 +1244,12 @@ class TaskExecutor:
                         active_provider = cloud_p
                         break
                     except Exception as cloud_err:
-                        logger.warning(f"Cloud failover to {cloud_name} failed: {cloud_err}")
+                        import traceback
+                        logger.warning(
+                            f"Cloud failover to {cloud_name} failed: "
+                            f"{type(cloud_err).__name__}: {cloud_err!r}\n"
+                            f"{traceback.format_exc()}"
+                        )
                         continue
                 else:
                     # All cloud providers failed too
