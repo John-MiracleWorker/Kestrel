@@ -16,10 +16,15 @@ from urllib.error import URLError
 from agent.types import RiskLevel, ToolDefinition
 
 from .self_improvement.utils import *
+from .self_improvement.utils import _last_scan_results as _imported_scan_results, _restore_scan_results
 from .self_improvement.ast_analyzer import _deep_scan
 from .self_improvement.github_sync import _github_sync
 from .self_improvement.proposals import _run_tests, _propose_improvements, _telegram_digest, _handle_approval
 from .self_improvement.patcher import apply_proposal, rollback, get_history
+
+# Module-level variable to cache latest scan results in THIS module's namespace.
+# Initialized from the persisted results on disk so 'report' works after restart.
+_last_scan_results: dict = _restore_scan_results() or {}
 
 def register_self_improve_tools(registry) -> None:
     """Register the self-improvement engine tool."""
