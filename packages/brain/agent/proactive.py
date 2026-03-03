@@ -344,3 +344,77 @@ class ProactiveEngine:
             f"Delivered {interrupt.channel.value} interrupt: {h.title} "
             f"(priority={interrupt.priority})"
         )
+
+
+class HeartbeatEngine:
+    """
+    OpenClaw Upgrade: Periodic Heartbeat Scheduler.
+    Wakes up the agent periodically to assess state, run sweeps, execute
+    routine maintenance, and continue background tasks without user prompting.
+    """
+    def __init__(self, pool, task_launcher, interval_seconds: int = 3600):
+        self._pool = pool
+        self._task_launcher = task_launcher
+        self._interval = interval_seconds
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+
+    async def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._task = asyncio.create_task(self._loop())
+        logger.info(f"Heartbeat engine started (interval: {self._interval}s)")
+
+    async def stop(self) -> None:
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info("Heartbeat engine stopped")
+
+    async def _loop(self) -> None:
+        while self._running:
+            try:
+                await asyncio.sleep(self._interval)
+                await self._run_sweeps()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Heartbeat loop error: {e}")
+
+    async def _run_sweeps(self) -> None:
+        """Query DB for active workspaces and run maintenance tasks for each."""
+        if not self._task_launcher:
+            return
+
+        try:
+            async with self._pool.acquire() as conn:
+                # Target workspaces that have memory graph nodes
+                rows = await conn.fetch("SELECT DISTINCT workspace_id FROM memory_graph_nodes LIMIT 50")
+                
+                # We need a user ID for the task launcher, default to a system or admin user UUID if possible
+                user_row = await conn.fetchrow("SELECT id FROM auth_users LIMIT 1")
+                user_id = str(user_row["id"]) if user_row else "00000000-0000-0000-0000-000000000000"
+
+            for row in rows:
+                ws_id = str(row["workspace_id"])
+                goal = (
+                    "Background Heartbeat Sweep: Assess current state, check for stalled tasks, "
+                    "compress memory, and prepare next steps. If nothing to do, safely exit."
+                )
+                
+                # Launch the background sweep task
+                await self._task_launcher(
+                    workspace_id=ws_id,
+                    user_id=user_id,
+                    goal=goal,
+                    source="heartbeat_engine"
+                )
+                logger.debug(f"Triggered heartbeat sweep for workspace {ws_id}")
+
+        except Exception as e:
+            logger.error(f"Failed to run heartbeat sweeps: {e}")

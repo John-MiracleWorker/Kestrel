@@ -451,6 +451,18 @@ class MemoryGraph:
                 logger.warning(f"Vector indexing of memory graph entities failed (non-fatal): {e}")
 
         logger.info(f"Memory graph updated: {nodes_upserted} nodes, {edges_created} edges")
+
+        # OpenClaw Dual Memory: Sync to local markdown file
+        if nodes_upserted > 0 or edges_created > 0:
+            try:
+                from .markdown_memory import LocalMarkdownMemoryManager
+                import asyncio
+                md_manager = LocalMarkdownMemoryManager(self)
+                # Fire and forget to avoid blocking the main extraction pipeline
+                asyncio.create_task(md_manager.sync_workspace_to_disk(str(workspace_id)))
+            except Exception as e:
+                logger.warning(f"Dual Memory Markdown sync failed (non-fatal): {e}")
+
         return {"nodes_upserted": nodes_upserted, "edges_created": edges_created}
 
     async def query_context(

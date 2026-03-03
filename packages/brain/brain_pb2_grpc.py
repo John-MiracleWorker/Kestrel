@@ -145,6 +145,11 @@ class BrainServiceStub(object):
                 request_serializer=brain__pb2.ApproveActionRequest.SerializeToString,
                 response_deserializer=brain__pb2.ApproveActionResponse.FromString,
                 _registered_method=True)
+        self.ListPendingApprovals = channel.unary_unary(
+                '/kestrel.brain.BrainService/ListPendingApprovals',
+                request_serializer=brain__pb2.ListPendingApprovalsRequest.SerializeToString,
+                response_deserializer=brain__pb2.ListPendingApprovalsResponse.FromString,
+                _registered_method=True)
         self.CancelTask = channel.unary_unary(
                 '/kestrel.brain.BrainService/CancelTask',
                 request_serializer=brain__pb2.CancelTaskRequest.SerializeToString,
@@ -164,6 +169,11 @@ class BrainServiceStub(object):
                 '/kestrel.brain.BrainService/ListWorkflows',
                 request_serializer=brain__pb2.ListWorkflowsRequest.SerializeToString,
                 response_deserializer=brain__pb2.ListWorkflowsResponse.FromString,
+                _registered_method=True)
+        self.RunHeadlessTask = channel.unary_unary(
+                '/kestrel.brain.BrainService/RunHeadlessTask',
+                request_serializer=brain__pb2.RunHeadlessTaskRequest.SerializeToString,
+                response_deserializer=brain__pb2.RunHeadlessTaskResponse.FromString,
                 _registered_method=True)
         self.GetCapabilities = channel.unary_unary(
                 '/kestrel.brain.BrainService/GetCapabilities',
@@ -331,6 +341,12 @@ class BrainServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ListPendingApprovals(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def CancelTask(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -351,6 +367,12 @@ class BrainServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def ListWorkflows(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RunHeadlessTask(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -496,6 +518,11 @@ def add_BrainServiceServicer_to_server(servicer, server):
                     request_deserializer=brain__pb2.ApproveActionRequest.FromString,
                     response_serializer=brain__pb2.ApproveActionResponse.SerializeToString,
             ),
+            'ListPendingApprovals': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListPendingApprovals,
+                    request_deserializer=brain__pb2.ListPendingApprovalsRequest.FromString,
+                    response_serializer=brain__pb2.ListPendingApprovalsResponse.SerializeToString,
+            ),
             'CancelTask': grpc.unary_unary_rpc_method_handler(
                     servicer.CancelTask,
                     request_deserializer=brain__pb2.CancelTaskRequest.FromString,
@@ -515,6 +542,11 @@ def add_BrainServiceServicer_to_server(servicer, server):
                     servicer.ListWorkflows,
                     request_deserializer=brain__pb2.ListWorkflowsRequest.FromString,
                     response_serializer=brain__pb2.ListWorkflowsResponse.SerializeToString,
+            ),
+            'RunHeadlessTask': grpc.unary_unary_rpc_method_handler(
+                    servicer.RunHeadlessTask,
+                    request_deserializer=brain__pb2.RunHeadlessTaskRequest.FromString,
+                    response_serializer=brain__pb2.RunHeadlessTaskResponse.SerializeToString,
             ),
             'GetCapabilities': grpc.unary_unary_rpc_method_handler(
                     servicer.GetCapabilities,
@@ -1143,6 +1175,33 @@ class BrainService(object):
             _registered_method=True)
 
     @staticmethod
+    def ListPendingApprovals(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/ListPendingApprovals',
+            brain__pb2.ListPendingApprovalsRequest.SerializeToString,
+            brain__pb2.ListPendingApprovalsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def CancelTask(request,
             target,
             options=(),
@@ -1240,6 +1299,33 @@ class BrainService(object):
             '/kestrel.brain.BrainService/ListWorkflows',
             brain__pb2.ListWorkflowsRequest.SerializeToString,
             brain__pb2.ListWorkflowsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RunHeadlessTask(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/RunHeadlessTask',
+            brain__pb2.RunHeadlessTaskRequest.SerializeToString,
+            brain__pb2.RunHeadlessTaskResponse.FromString,
             options,
             channel_credentials,
             insecure,

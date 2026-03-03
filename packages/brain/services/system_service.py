@@ -3,6 +3,7 @@ from core.grpc_setup import brain_pb2
 from .base import BaseServicerMixin
 from core import runtime
 from db import get_pool
+from providers_registry import get_provider, get_available_providers
 from core.config import logger
 
 class SystemServicerMixin(BaseServicerMixin):
@@ -102,6 +103,29 @@ class SystemServicerMixin(BaseServicerMixin):
             status="active" if runtime.session_manager else "disabled",
             category="tools",
             icon="💬",
+        ))
+
+        # Agent OS subsystems (Unified Control Plane)
+        caps.append(brain_pb2.CapabilityItem(
+            name="Proactive Heartbeat Engine",
+            description="Background scheduler for proactive tasks and repository maintenance",
+            status="active" if getattr(runtime, 'heartbeat_engine', None) else "disabled",
+            category="automation",
+            icon="⏱️",
+        ))
+        caps.append(brain_pb2.CapabilityItem(
+            name="Dual Memory Sync",
+            description="Bi-directional vector graph and physical markdown memory persistence",
+            status="active",
+            category="intelligence",
+            icon="📝",
+        ))
+        caps.append(brain_pb2.CapabilityItem(
+            name="Headless Workflows",
+            description="CI/CD integrated JSON-only background execution",
+            status="active",
+            category="automation",
+            icon="🤖",
         ))
 
         return brain_pb2.GetCapabilitiesResponse(capabilities=caps)
@@ -211,8 +235,11 @@ class SystemServicerMixin(BaseServicerMixin):
     async def HealthCheck(self, request, context):
         """Return health status."""
         status = {}
-        for name, provider in _providers.items():
-            status[name] = "ready" if provider.is_ready() else "not_ready"
+        for name in ["openai", "anthropic", "google", "ollama"]:
+            try:
+                status[name] = "ready" if get_provider(name).is_ready() else "not_ready"
+            except Exception:
+                status[name] = "not_ready"
 
         return brain_pb2.HealthCheckResponse(
             healthy=True,

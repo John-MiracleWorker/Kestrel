@@ -105,9 +105,9 @@ async def init_models() -> None:
         _CLOUD_POWER_MODEL = _CLOUD_POWER_MODEL or "gemini-2.5-pro"
 
 # Step types considered "simple" (can run on local models)
-_SIMPLE_STEPS = {StepType.PLANNING, StepType.REFLECTION, StepType.WRITING, StepType.GENERAL}
+_SIMPLE_STEPS = {StepType.RESEARCH, StepType.REFLECTION, StepType.WRITING, StepType.GENERAL}
 # Step types considered "complex" (benefit from powerful models)
-_COMPLEX_STEPS = {StepType.CODING, StepType.SECURITY, StepType.DATA_ANALYSIS, StepType.RESEARCH}
+_COMPLEX_STEPS = {StepType.CODING, StepType.SECURITY, StepType.DATA_ANALYSIS, StepType.PLANNING}
 
 
 def _build_routes(strategy: RoutingStrategy) -> dict[StepType, ModelRoute]:
@@ -296,6 +296,7 @@ _COMPLEXITY_SIGNALS_HIGH: list[str] = [
     "complex", "advanced", "sophisticated", "comprehensive",
     "production", "enterprise", "scale", "high-availability",
     "generate a full", "build a complete", "create an entire",
+    "plan", "synthesize", "evaluate", "orchestrate",
 ]
 
 _COMPLEXITY_SIGNALS_LOW: list[str] = [
@@ -303,6 +304,7 @@ _COMPLEXITY_SIGNALS_LOW: list[str] = [
     "rename", "typo", "fix typo", "update comment",
     "list", "show", "display", "print", "log",
     "add a field", "change the", "set the",
+    "read", "fetch", "scrape", "search", "find",
 ]
 
 # Threshold: complexity >= this → escalate to cloud
@@ -351,9 +353,9 @@ def estimate_complexity(
     type_baselines = {
         StepType.SECURITY: 3.0,      # Security always leans complex
         StepType.CODING: 2.0,        # Code gen benefits from reasoning
-        StepType.DATA_ANALYSIS: 2.0, # Data tasks need precision
-        StepType.RESEARCH: 1.5,      # Research can be deep
-        StepType.PLANNING: 1.0,      # Planning is usually manageable
+        StepType.PLANNING: 1.5,      # Planning requires synthesis and reasoning
+        StepType.DATA_ANALYSIS: 1.5, # Data tasks need precision
+        StepType.RESEARCH: 0.5,      # Research/scraping is trivial
         StepType.REFLECTION: 0.5,    # Meta-reasoning, light
         StepType.WRITING: 0.5,       # Writing is straightforward
         StepType.GENERAL: 0.5,       # Default

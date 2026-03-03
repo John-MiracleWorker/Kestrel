@@ -250,3 +250,51 @@ Kestrel is 100× more powerful when:
 - Tool caching reduces latency
 - Agent installs new tools autonomously
 - Eval harness shows measurable improvement
+
+### 6.11 Upgrade 11 — The Proactive Heartbeat Engine
+
+**Concept:** Move Kestrel from a purely reactive assistant (waiting for user input) to a proactive autonomous entity.
+**Flow:** A background scheduler (e.g., Cron or APScheduler) wakes up the agent loop periodically.
+**Features:**
+
+- Assess current state and determine if background work is needed.
+- Run maintenance sweeps (e.g., checking for stale PRs, running evaluations).
+- Continue long-running tasks without requiring the user to prompt it.
+  **Acceptance:** Agent can initiate and complete tasks asynchronously based on time or external events, creating a persistent "always-on" behavior.
+
+### 6.12 Upgrade 12 — Agent-Native Intelligent Router
+
+**Concept:** Move beyond basic API failover into semantic, cost-aware model dispatching (inspired by ClawRouter).
+**Features:**
+
+- Trivial read-only tasks (e.g., scraping, basic formatting) are routed to fast, cheap models (e.g., local Ollama, Claude Haiku, Gemini Flash).
+- Heavy reasoning, planning, and verification tasks are routed to flagship models (e.g., Claude 3.5 Sonnet, GPT-4o).
+  **Acceptance:** Overall latency and LLM API costs drop significantly without a reduction in complex reasoning capabilities.
+
+### 6.13 Upgrade 13 — Headless Workflow Automation (`llm-task`)
+
+**Concept:** Dedicated pipeline for running strict, JSON-only workflow execution without the overhead of the conversational chat layer.
+**Features:**
+
+- CI/CD integration or script execution that triggers Kestrel.
+- Agent loop bypasses the conversational output and directly yields structured JSON payloads matching a requested schema.
+  **Acceptance:** External systems (like GitHub Actions or external scripts) can reliably use Kestrel as a structured data processor without parsing conversational text.
+
+### 6.14 Upgrade 14 — Dual Memory: Markdown-Backed Persistence
+
+**Concept:** Enhance the black-box Vector DB memory with a transparent, human-editable text layer.
+**Features:**
+
+- Introduce a `Local Markdown Memory Manager`.
+- Persist core knowledge, procedures, and rules into an easily accessible `.agents.md` or dedicated `memory/` folder on disk.
+- Bi-directional sync: Edits to the markdown files update the agent's context and vice versa.
+  **Acceptance:** Users can physically read and manually edit the agent's long-term memory, increasing trust and steerability.
+
+### 6.15 Upgrade 15 — Unified "Agent OS" Control Plane
+
+**Concept:** Solidify Kestrel's container, executor, and routing into a unified "Operating System for AI."
+**Features:**
+
+- Tighten the integration between the Gateway, the Executor Sandbox, and the Core Loop.
+- Ensure the agent has full, safe, and observable control over its host environment as a true persistent background system rather than a temporary script.
+  **Acceptance:** The system feels like an autonomous service layer (an OS) rather than a CLI tool or simple chatbot wrapper.

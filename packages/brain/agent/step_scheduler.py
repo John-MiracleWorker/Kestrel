@@ -297,40 +297,7 @@ class StepScheduler:
                 task.status = TaskStatus.EXECUTING
                 await self._persistence.update_task(task)
 
-            # Step completed
-            if step.status == StepStatus.COMPLETE:
-                yield TaskEvent(
-                    type=TaskEventType.STEP_COMPLETE,
-                    task_id=task.id,
-                    step_id=step.id,
-                    content=step.result or "",
-                    progress=progress_fn(task),
-                )
-                # Capture recovery pattern for online learning
-                if step.attempts > 1 and self._learner:
-                    try:
-                        from agent.learner import Lesson
-                        recovery_lesson = Lesson(
-                            category="pattern",
-                            summary=f"Recovery: {step.description[:80]}",
-                            details=(
-                                f"Step failed {step.attempts - 1} time(s) before succeeding. "
-                                f"Error was: {(step.error or 'unknown')[:200]}"
-                            ),
-                            tools_used=[],
-                            success=True,
-                            confidence=0.7,
-                            tags=["mid_execution", "recovery"],
-                            source_task_id=task.id,
-                        )
-                        await self._learner._store_lessons(
-                            task.workspace_id, [recovery_lesson]
-                        )
-                    except Exception as e:
-                        logger.debug(f"Mid-execution lesson capture failed: {e}")
-                return
-
-            # Step failed — retry logic
+            # Step failed — retry logic (checked inside loop to retry immediately)
             if step.status == StepStatus.FAILED:
                 if step.attempts < 3:
                     step.status = StepStatus.IN_PROGRESS
@@ -357,6 +324,39 @@ class StepScheduler:
                     task.error = f"Step '{step.description[:80]}' failed after 3 retries: {step.error}"
                     await self._persistence.update_task(task)
                     return
+
+        # Step completed check after the executor finishes
+        if step.status == StepStatus.COMPLETE:
+            yield TaskEvent(
+                type=TaskEventType.STEP_COMPLETE,
+                task_id=task.id,
+                step_id=step.id,
+                content=step.result or "",
+                progress=progress_fn(task),
+            )
+            # Capture recovery pattern for online learning
+            if step.attempts > 1 and self._learner:
+                try:
+                    from agent.learner import Lesson
+                    recovery_lesson = Lesson(
+                        category="pattern",
+                        summary=f"Recovery: {step.description[:80]}",
+                        details=(
+                            f"Step failed {step.attempts - 1} time(s) before succeeding. "
+                            f"Error was: {(step.error or 'unknown')[:200]}"
+                        ),
+                        tools_used=[],
+                        success=True,
+                        confidence=0.7,
+                        tags=["mid_execution", "recovery"],
+                        source_task_id=task.id,
+                    )
+                    await self._learner._store_lessons(
+                        task.workspace_id, [recovery_lesson]
+                    )
+                except Exception as e:
+                    logger.debug(f"Mid-execution lesson capture failed: {e}")
+            return
 
         # ── Safety guard: step still IN_PROGRESS after executor finished ──
         # This happens when the LLM returns text-only content that doesn't
@@ -392,74 +392,74 @@ class StepScheduler:
                 progress=progress_fn(task),
             )
 
-        # Collect events from all steps concurrently
-        events_by_step: dict[str, list[TaskEvent]] = {s.id: [] for s in steps}
+        queue = asyncio.Queue()
+        active_workers = len(steps)
 
-        async def _run_step(step: TaskStep) -> list[TaskEvent]:
-            """Run a step and collect its events."""
-            collected = []
-            async for event in self._executor.run_step(task, step):
-                collected.append(event)
-            return collected
-
-        # Run all steps concurrently
-        results = await asyncio.gather(
-            *[_run_step(s) for s in steps],
-            return_exceptions=True,
-        )
-
-        # Process results and yield events
-        any_failed = False
-        for step, result in zip(steps, results):
-            if isinstance(result, Exception):
+        async def _run_step(step: TaskStep):
+            """Run a step and push events to the queue."""
+            try:
+                async for event in self._executor.run_step(task, step):
+                    await queue.put((step, event))
+                
+                # Check status after execution
+                if step.status == StepStatus.COMPLETE:
+                    await queue.put((step, TaskEvent(
+                        type=TaskEventType.STEP_COMPLETE,
+                        task_id=task.id,
+                        step_id=step.id,
+                        content=step.result or "",
+                        progress=progress_fn(task),
+                    )))
+                elif step.status == StepStatus.IN_PROGRESS:
+                    # Step wasn't resolved by the executor
+                    logger.info(
+                        f"Parallel step {step.id} still IN_PROGRESS after "
+                        f"executor run (has_result={bool(step.result)})"
+                    )
+            except Exception as e:
                 step.status = StepStatus.FAILED
-                step.error = str(result)
-                any_failed = True
-                yield TaskEvent(
+                step.error = str(e)
+                await queue.put((step, TaskEvent(
                     type=TaskEventType.TASK_FAILED,
                     task_id=task.id,
                     step_id=step.id,
-                    content=f"Parallel step failed: {result}",
+                    content=f"Parallel step failed: {e}",
                     progress=progress_fn(task),
-                )
-                continue
+                )))
+            finally:
+                # Sentinel to indicate worker is done
+                await queue.put((step, None))
 
-            # Yield all collected events from this step
-            for event in result:
-                yield event
+        workers = [asyncio.create_task(_run_step(s)) for s in steps]
+        any_failed = False
 
-            # Check step status after execution
-            if step.status == StepStatus.COMPLETE:
-                yield TaskEvent(
-                    type=TaskEventType.STEP_COMPLETE,
-                    task_id=task.id,
-                    step_id=step.id,
-                    content=step.result or "",
-                    progress=progress_fn(task),
-                )
-            elif step.status == StepStatus.FAILED:
-                any_failed = True
-            elif step.status == StepStatus.IN_PROGRESS:
-                # Step wasn't resolved by the executor — will be
-                # re-queued by _get_ready_steps on the next iteration.
-                logger.info(
-                    f"Parallel step {step.id} still IN_PROGRESS after "
-                    f"executor run (has_result={bool(step.result)})"
-                )
+        try:
+            while active_workers > 0:
+                step, event = await queue.get()
+                if event is None:
+                    active_workers -= 1
+                else:
+                    yield event
+                    if event.type == TaskEventType.TASK_FAILED:
+                        any_failed = True
+                        
+            await self._persistence.update_task(task)
 
-        await self._persistence.update_task(task)
-
-        if any_failed:
-            # Check if all steps failed (fatal) vs some (continue)
-            all_failed = all(s.status == StepStatus.FAILED for s in steps)
-            if all_failed:
-                from agent.types import TaskStatus
-                task.status = TaskStatus.FAILED
-                task.error = "All parallel steps failed"
-                await self._persistence.update_task(task)
-                yield TaskEvent(
-                    type=TaskEventType.TASK_FAILED,
-                    task_id=task.id,
-                    content=task.error,
-                    progress=progress_fn(task),
-                )
+            if any_failed:
+                # Check if all steps failed (fatal) vs some (continue)
+                all_failed = all(s.status == StepStatus.FAILED for s in steps)
+                if all_failed:
+                    from agent.types import TaskStatus
+                    task.status = TaskStatus.FAILED
+                    task.error = "All parallel steps failed"
+                    await self._persistence.update_task(task)
+                    yield TaskEvent(
+                        type=TaskEventType.TASK_FAILED,
+                        task_id=task.id,
+                        content=task.error,
+                        progress=progress_fn(task),
+                    )
+        finally:
+            for w in workers:
+                if not w.done():
+                    w.cancel()

@@ -334,3 +334,151 @@ class AgentServicerMixin(BaseServicerMixin):
 
         return brain_pb2.ListTasksResponse(tasks=tasks)
 
+    async def RunHeadlessTask(self, request, context):
+        """
+        Execute a task headlessly, waiting for completion and returning
+        a strict JSON output based on the provided schema. No event streaming.
+        Useful for CI/CD or background jobs.
+        """
+        import json
+        from agent.types import AgentTask, GuardrailConfig as GCfg, TaskStatus
+
+        user_id = request.user_id
+        workspace_id = request.workspace_id
+        goal = request.goal
+        schema_json = request.expected_schema_json
+
+        # Append schema requirements to the goal
+        headless_goal = goal
+        if schema_json:
+             headless_goal += f"\n\n[HEADLESS EXECUTION SYSTEM PROMPT]\nYou are running in headless mode. Your final answer (via task_complete) MUST be a raw, valid JSON object conforming exactly to this schema:\n{schema_json}\nDo not include any markdown formatting (like ```json), commentary, or extra text in your final summary. Just the raw JSON object."
+
+        config = GCfg()
+        if request.guardrails:
+            g = request.guardrails
+            if g.max_iterations > 0: config.max_iterations = g.max_iterations
+            if g.max_tool_calls > 0: config.max_tool_calls = g.max_tool_calls
+            if g.max_tokens > 0:     config.max_tokens = g.max_tokens
+            if g.max_wall_time_seconds > 0: config.max_wall_time_seconds = g.max_wall_time_seconds
+
+        task = AgentTask(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            goal=headless_goal,
+            conversation_id=None,
+            config=config,
+        )
+
+        await runtime.agent_persistence.save_task(task)
+        logger.info(f"Headless task started: {task.id} — {goal[:50]}...")
+        runtime.running_tasks[task.id] = task
+
+        provider_name = "local"
+        try:
+            pool = await get_pool()
+            ws_config = await ProviderConfig(pool).get_config(workspace_id)
+            provider_name = ws_config.get("provider", "local")
+            task_provider = get_provider(provider_name)
+        except Exception as e:
+            logger.warning(f"Failed to resolve workspace provider for headless task, using local: {e}")
+            task_provider = get_provider("local")
+
+        from agent.tools import build_tool_registry
+        from agent.guardrails import Guardrails
+        from agent.loop import AgentLoop
+        from agent.evidence import EvidenceChain
+        from agent.learner import TaskLearner
+        from agent.core.memory import WorkingMemory
+        from agent.core.reflection import ReflectionEngine
+        from agent.simulation import OutcomeSimulator
+        from agent.core.verifier import VerifierEngine
+        from agent.model_router import ModelRouter
+
+        task_model = ws_config.get("model", "") if ws_config else ""
+        task_api_key = ws_config.get("api_key", "") if ws_config else ""
+        task_tool_registry = build_tool_registry(hands_client=runtime.hands_client, pool=pool)
+        evidence_chain = EvidenceChain(task_id=task.id, pool=pool)
+
+        task_working_memory = WorkingMemory(redis_client=None, vector_store=runtime.vector_store)
+        task_learner = TaskLearner(provider=task_provider, model=task_model, working_memory=task_working_memory)
+        task_reflection = ReflectionEngine(llm_provider=task_provider, model=task_model)
+        task_simulator = OutcomeSimulator(llm_provider=task_provider, model=task_model)
+        task_verifier = VerifierEngine(provider=task_provider, model=task_model)
+
+        def custom_provider_checker(name: str) -> bool:
+            if name == provider_name and getattr(task_provider, "is_ready", lambda: False)(): return True
+            try: return get_provider(name).is_ready()
+            except Exception: return False
+
+        task_model_router = ModelRouter(
+            provider_checker=custom_provider_checker,
+            workspace_provider=provider_name,
+            workspace_model=task_model,
+        )
+
+        task_loop = AgentLoop(
+            provider=task_provider,
+            tool_registry=task_tool_registry,
+            guardrails=Guardrails(),
+            persistence=runtime.agent_persistence,
+            model=task_model,
+            api_key=task_api_key,
+            memory_graph=runtime.memory_graph,
+            evidence_chain=evidence_chain,
+            learner=task_learner,
+            reflection_engine=task_reflection,
+            provider_resolver=resolve_provider,
+            model_router=task_model_router,
+            simulator=task_simulator,
+            verifier=task_verifier,
+            persona_learner=runtime.persona_learner,
+        )
+
+        iterations = 0
+        final_result = ""
+        error_msg = ""
+        try:
+            async for event in task_loop.run(task):
+                iterations += 1
+                if str(event.type) == "EventType.TASK_COMPLETE" or str(event.type) == "TASK_COMPLETE":
+                    final_result = event.content or event.tool_result or ""
+                elif str(event.type) == "EventType.TASK_FAILED" or str(event.type) == "TASK_FAILED":
+                    error_msg = event.content or "Task failed without explicit error"
+        except Exception as e:
+            logger.error(f"Headless task error {task.id}: {e}", exc_info=True)
+            error_msg = str(e)
+        finally:
+            runtime.running_tasks.pop(task.id, None)
+
+        if not final_result and task.result:
+            final_result = task.result
+
+        # Optional: Auto-strip markdown block if the model included it despite prompt
+        if final_result.startswith("```json"):
+            final_result = final_result[7:]
+            if final_result.endswith("```"):
+                final_result = final_result[:-3]
+            final_result = final_result.strip()
+        elif final_result.startswith("```"):
+            final_result = final_result[3:]
+            if final_result.endswith("```"):
+                final_result = final_result[:-3]
+            final_result = final_result.strip()
+
+        # Try to parse it to ensure it is JSON, though we return the string anyway
+        # If it fails, that's up to the client, but we log it.
+        try:
+            if final_result:
+                json.loads(final_result)
+        except json.JSONDecodeError:
+            logger.warning(f"Headless task {task.id} returned invalid JSON: {final_result[:100]}")
+
+        success = (not error_msg) and bool(final_result)
+
+        return brain_pb2.RunHeadlessTaskResponse(
+            success=success,
+            result_json=final_result,
+            error=error_msg,
+            iterations=iterations
+        )
+

@@ -360,8 +360,18 @@ async def serve():
     try:
         _proactive_engine._task_launcher = launch_task_from_automation
         logger.info("Proactive engine task launcher wired")
+
+        from agent.proactive import HeartbeatEngine
+        _heartbeat_engine = HeartbeatEngine(
+            pool=pool,
+            task_launcher=launch_task_from_automation,
+            interval_seconds=3600  # Runs background sweeps every hour
+        )
+        await _heartbeat_engine.start()
+        runtime.heartbeat_engine = _heartbeat_engine
+        logger.info("Heartbeat engine wired and started")
     except Exception as e:
-        logger.warning(f"Proactive engine wiring failed (non-fatal): {e}")
+        logger.warning(f"Proactive/Heartbeat wiring failed (non-fatal): {e}")
 
     # Wire tool module refs that depend on managers created above
     try:
@@ -416,6 +426,8 @@ async def serve():
         logger.info("Shutting down Brain service...")
         if runtime.cron_scheduler:
             await runtime.cron_scheduler.stop()
+        if hasattr(runtime, "heartbeat_engine") and getattr(runtime, "heartbeat_engine", None):
+            await runtime.heartbeat_engine.stop()
         # Stop all daemons gracefully
         try:
             for daemon in _daemon_manager._daemons.values():

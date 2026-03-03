@@ -47,6 +47,7 @@ service BrainService {
   // ── Workflows ──────────────────────────────────────────────
   rpc LaunchWorkflow(LaunchWorkflowRequest) returns (stream TaskEvent);
   rpc ListWorkflows(ListWorkflowsRequest) returns (ListWorkflowsResponse);
+  rpc RunHeadlessTask(RunHeadlessTaskRequest) returns (RunHeadlessTaskResponse);
 
   // ── Capabilities ───────────────────────────────────────────
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
@@ -486,6 +487,21 @@ message LaunchWorkflowRequest {
   string workspace_id = 3;
   map<string, string> variables = 4;
   string conversation_id = 5;
+}
+
+message RunHeadlessTaskRequest {
+  string workspace_id = 1;
+  string user_id = 2;
+  string goal = 3;
+  string expected_schema_json = 4;  // JSON schema for output
+  GuardrailConfig guardrails = 5;
+}
+
+message RunHeadlessTaskResponse {
+  bool success = 1;
+  string result_json = 2;  // The parsed JSON output matching schema
+  string error = 3;
+  int32 iterations = 4;
 }
 
 // ═══════════════════════════════════════════════════════════════
