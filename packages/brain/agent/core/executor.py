@@ -1056,14 +1056,46 @@ class TaskExecutor:
 
             # Use generate_with_tools with empty tools list — this gives us
             # the full failover chain while preventing tool calls.
-            response = await active_provider.generate_with_tools(
-                messages=messages,
-                model=routed_model,
-                tools=[],  # Empty = no tools, just text response
-                temperature=routed_temp,
-                max_tokens=routed_max_tokens,
-                api_key=self._api_key,
-            )
+            try:
+                response = await active_provider.generate_with_tools(
+                    messages=messages,
+                    model=routed_model,
+                    tools=[],  # Empty = no tools, just text response
+                    temperature=routed_temp,
+                    max_tokens=routed_max_tokens,
+                    api_key=self._api_key,
+                )
+            except Exception as chat_err:
+                # ── Cloud failover for simple chat path ──────────────
+                # If Ollama fails (timeout, connection error), try cloud.
+                from providers.ollama import OllamaUnavailableError
+                is_ollama_failure = (
+                    isinstance(chat_err, OllamaUnavailableError)
+                    or 'timeout' in str(chat_err).lower()
+                    or 'connect' in str(chat_err).lower()
+                )
+                if is_ollama_failure and self._provider_resolver:
+                    logger.warning(
+                        f"Simple chat: {route.provider} failed ({chat_err}), "
+                        f"attempting cloud failover..."
+                    )
+                    from providers_registry import get_cloud_fallback
+                    fallback = get_cloud_fallback()
+                    if fallback:
+                        cloud_name, cloud_p = fallback
+                        logger.info(f"Simple chat: falling back to {cloud_name}")
+                        response = await cloud_p.generate_with_tools(
+                            messages=messages,
+                            model="",  # Use provider's default
+                            tools=[],
+                            temperature=routed_temp,
+                            max_tokens=routed_max_tokens,
+                            api_key=self._api_key,
+                        )
+                    else:
+                        raise  # No cloud available, propagate original error
+                else:
+                    raise  # Not an Ollama failure, propagate
 
             text = response.get("content", "")
             logger.info(
@@ -1173,19 +1205,34 @@ class TaskExecutor:
 
         except Exception as llm_err:
             # ── Graceful cloud failover ──────────────────────────────
-            # If the local provider failed (e.g. ollama 400), swap to
-            # a cloud provider and retry with the same context.
-            # BUT: if user explicitly set a workspace model (e.g. glm-5:cloud),
-            # do NOT silently swap to cloud — just fail with a clear error.
-            # 429 = rate limit: provider is genuinely unavailable,
-            # so always failover regardless of explicit model setting.
+            # If the local provider failed, swap to a cloud provider and
+            # retry with the same context.
+            #
+            # ALWAYS failover when Ollama is genuinely unavailable:
+            #   - OllamaUnavailableError (timeout, connection refused, crash)
+            #   - 429 rate limit
+            # These indicate the provider cannot serve ANY request, so
+            # respecting _has_explicit_model would just cause task failure.
+            from providers.ollama import OllamaUnavailableError
+            is_ollama_down = isinstance(llm_err, OllamaUnavailableError)
             is_rate_limited = '429' in str(llm_err)
+            is_timeout = 'timeout' in str(llm_err).lower()
+            is_connection_error = 'connect' in str(llm_err).lower()
+            should_always_failover = is_ollama_down or is_rate_limited or is_timeout or is_connection_error
+
             if route.provider in ("ollama", "local") and self._provider_resolver and (
-                not self._has_explicit_model or is_rate_limited
+                not self._has_explicit_model or should_always_failover
             ):
+                failover_reason = (
+                    "Ollama unavailable" if is_ollama_down else
+                    "429 rate limit" if is_rate_limited else
+                    "timeout" if is_timeout else
+                    "connection error" if is_connection_error else
+                    "error"
+                )
                 logger.warning(
                     f"Provider {route.provider} failed: {type(llm_err).__name__}: {llm_err}. "
-                    f"Attempting cloud failover{' (429 rate limit)' if is_rate_limited else ''}..."
+                    f"Attempting cloud failover ({failover_reason})..."
                 )
                 # Build failover list: workspace's configured provider first
                 configured = getattr(self._provider, 'provider', '')

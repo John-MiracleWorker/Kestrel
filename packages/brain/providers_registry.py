@@ -7,7 +7,7 @@ from typing import Optional, Union
 
 from providers.local import LocalProvider
 from providers.cloud import CloudProvider
-from providers.ollama import OllamaProvider
+from providers.ollama import OllamaProvider, OllamaUnavailableError
 from db import get_pool
 
 logger = logging.getLogger("brain.providers")
@@ -74,6 +74,33 @@ def resolve_provider(provider_name: str):
     logger.warning(f"No providers available, returning '{provider_name}' as-is")
     return get_provider(provider_name)
 
+
+def get_cloud_fallback(preferred_order: list[str] = None) -> Optional[tuple[str, "CloudProvider"]]:
+    """Return the first available cloud provider as (name, instance).
+
+    This is the primary entry point for Ollama → cloud failover.
+    Unlike resolve_provider(), this ONLY checks cloud providers and
+    never falls back to Ollama (avoiding a circular fallback).
+
+    Args:
+        preferred_order: Optional list of provider names to try first.
+            Defaults to ["google", "openai", "anthropic"].
+
+    Returns:
+        (provider_name, provider_instance) or None if no cloud is available.
+    """
+    order = preferred_order or ["google", "openai", "anthropic"]
+    for name in order:
+        if name in ("ollama", "local"):
+            continue  # Never fallback to Ollama from this helper
+        try:
+            p = get_provider(name)
+            if p.is_ready():
+                logger.info(f"Cloud fallback resolved to '{name}'")
+                return name, p
+        except Exception:
+            continue
+    return None
 
 
 async def list_provider_configs(workspace_id):
