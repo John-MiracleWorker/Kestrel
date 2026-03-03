@@ -1,6 +1,9 @@
+import logging
 import os
 import re
 from pathlib import Path
+
+logger = logging.getLogger("brain.agent.core.heartbeat_parser")
 
 class HeartbeatTask:
     def __init__(self, description: str, frequency: str = "every"):
@@ -31,21 +34,20 @@ class HeartbeatParser:
 
                 if line.startswith("## "):
                     header = line[3:].strip().lower()
-                    if "every heartbeat" in header or "always" in header:
+                    if re.search(r"\bevery heartbeat\b|\balways\b", header):
                         current_frequency = "every"
-                    elif "hourly" in header:
+                    elif re.search(r"\bhourly\b", header):
                         current_frequency = "hourly"
-                    elif "daily" in header:
+                    elif re.search(r"\bdaily\b", header):
                         current_frequency = "daily"
                     else:
-                        current_frequency = "every" # default fallback
-                elif line.startswith("- ") or line.startswith("* "):
-                    task_desc = line[2:].strip()
+                        current_frequency = "every"  # default fallback
+                elif re.match(r"[-*]\s+", line):
+                    task_desc = re.sub(r"^[-*]\s+", "", line).strip()
                     if task_desc:
                         tasks.append(HeartbeatTask(description=task_desc, frequency=current_frequency))
 
         except Exception as e:
-            import logging
-            logging.getLogger("brain.agent.core.heartbeat_parser").error(f"Failed to parse HEARTBEAT.md: {e}")
+            logger.error(f"Failed to parse HEARTBEAT.md: {e}")
 
         return tasks

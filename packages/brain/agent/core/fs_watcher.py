@@ -24,12 +24,19 @@ class KestrelFSEventHandler(FileSystemEventHandler):
     def _emit(self, event_type: str, event):
         if event.is_directory:
             return
-            
+
         path = event.src_path
-        
-        # Ignore common noise
-        noise_dirs = ['.git', '__pycache__', '.DS_Store', 'node_modules', '.idea', '.vscode']
+
+        # Ignore directory-based noise
+        noise_dirs = ['.git', '__pycache__', 'node_modules', '.idea', '.vscode']
         if any(f"/{x}/" in path or path.endswith(f"/{x}") for x in noise_dirs):
+            return
+
+        # Ignore file-based noise (e.g. macOS metadata, compiled artifacts, editor swaps)
+        basename = os.path.basename(path)
+        noise_files = {'.DS_Store', 'Thumbs.db', 'desktop.ini'}
+        noise_suffixes = ('.pyc', '.pyo', '.swp', '.swo', '.tmp')
+        if basename in noise_files or basename.endswith(noise_suffixes):
             return
 
         signal = Signal(
@@ -46,6 +53,8 @@ class KestrelFSEventHandler(FileSystemEventHandler):
             asyncio.run_coroutine_threadsafe(
                 self.engine.process_signal(signal), self._loop
             )
+        else:
+            logger.debug(f"FS signal dropped (no event loop): {event_type} {path}")
 
     def on_modified(self, event):
         self._emit("modified", event)
@@ -105,11 +114,11 @@ class KestrelFSWatcher:
             
         paths = self.load_watchlist()
         
-        # Don't try to watch nested paths if parent is already watched by watchdog
-        # watchdog recursive=True handles it all
+        # Deduplicate: skip any path that is a subdirectory of an already-queued
+        # path (watchdog recursive=True covers all descendants automatically).
+        # Processing shorter paths first guarantees parents are added before children.
         to_watch = set()
-        for p in paths:
-            # Check if any existing path in to_watch is a parent of p
+        for p in sorted(paths, key=len):
             if not any(p.startswith(w + os.sep) for w in to_watch):
                 to_watch.add(p)
         

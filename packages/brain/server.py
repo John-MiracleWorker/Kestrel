@@ -279,7 +279,7 @@ async def serve():
         notification_router=runtime.notification_router,
         task_launcher=None,  # Set after cron scheduler init
         llm_provider=_resolve_default_provider(),
-        model="",
+        model=os.getenv("PROACTIVE_MODEL", "gemini-2.0-flash"),
     )
     try:
         await _proactive_engine.start()
@@ -295,6 +295,7 @@ async def serve():
         logger.info("FS Watcher started")
     except Exception as e:
         logger.warning(f"FS Watcher start failed (non-fatal): {e}")
+    runtime.fs_watcher = _fs_watcher
 
     # Wire SmartMonitors → ProactiveEngine for signal routing
     _smart_monitors.set_proactive_engine(_proactive_engine)
@@ -437,10 +438,8 @@ async def serve():
             await runtime.cron_scheduler.stop()
         if hasattr(runtime, "heartbeat_engine") and getattr(runtime, "heartbeat_engine", None):
             await runtime.heartbeat_engine.stop()
-        if hasattr(runtime, "fs_watcher") and getattr(runtime, "fs_watcher", None):
+        if getattr(runtime, "fs_watcher", None):
             runtime.fs_watcher.stop()
-        elif '_fs_watcher' in locals():
-            _fs_watcher.stop()
         # Stop all daemons gracefully
         try:
             for daemon in _daemon_manager._daemons.values():
@@ -448,7 +447,6 @@ async def serve():
         except Exception:
             pass
         await server.stop(5)
-        pool = await get_pool()
         if pool:
             await pool.close()
 

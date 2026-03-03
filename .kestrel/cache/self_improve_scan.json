@@ -49,7 +49,7 @@
         },
         "packages/brain/brain_pb2.py": { "sig": "1772565629775469930:29667", "issues": [] },
         "packages/brain/server.py": {
-            "sig": "1772565144918987457:18299",
+            "sig": "1772570270768127267:18821",
             "issues": [
                 {
                     "type": "complexity",
@@ -57,7 +57,7 @@
                     "package": "brain",
                     "file": "packages/brain/server.py",
                     "line": 67,
-                    "description": "Function `serve` is 374 lines long \u2014 consider refactoring",
+                    "description": "Function `serve` is 387 lines long \u2014 consider refactoring",
                     "suggestion": "Break `serve` into smaller helper functions"
                 },
                 {
@@ -176,17 +176,8 @@
             ]
         },
         "packages/brain/notifications.py": {
-            "sig": "1772560793724688106:8790",
+            "sig": "1772570356395736242:9617",
             "issues": [
-                {
-                    "type": "dead_import",
-                    "severity": "low",
-                    "package": "brain",
-                    "file": "packages/brain/notifications.py",
-                    "line": 15,
-                    "description": "Potentially unused import: `asyncio`",
-                    "suggestion": "Remove unused import `asyncio` at line 15"
-                },
                 {
                     "type": "dead_import",
                     "severity": "low",
@@ -339,7 +330,7 @@
             ]
         },
         "packages/brain/core/config.py": { "sig": "1772239600829933674:3458", "issues": [] },
-        "packages/brain/core/cron.py": { "sig": "1772560793724537398:9651", "issues": [] },
+        "packages/brain/core/cron.py": { "sig": "1772570466001825601:9823", "issues": [] },
         "packages/brain/core/__init__.py": { "sig": "1771973228963504397:68", "issues": [] },
         "packages/brain/core/runtime.py": {
             "sig": "1772537694761652340:2513",
@@ -879,8 +870,17 @@
         },
         "packages/brain/agent/diagnostics.py": { "sig": "1772128565960969904:9578", "issues": [] },
         "packages/brain/agent/proactive.py": {
-            "sig": "1772565122733102165:15386",
+            "sig": "1772570659391970333:17869",
             "issues": [
+                {
+                    "type": "complexity",
+                    "severity": "medium",
+                    "package": "brain",
+                    "file": "packages/brain/agent/proactive.py",
+                    "line": 389,
+                    "description": "Function `_run_sweeps` is 85 lines long \u2014 consider refactoring",
+                    "suggestion": "Break `_run_sweeps` into smaller helper functions"
+                },
                 {
                     "type": "dead_import",
                     "severity": "low",
@@ -1094,7 +1094,7 @@
             ]
         },
         "packages/brain/agent/loop.py": {
-            "sig": "1772537694760355048:34776",
+            "sig": "1772570330853565928:35370",
             "issues": [
                 {
                     "type": "complexity",
@@ -1891,7 +1891,7 @@
             ]
         },
         "packages/brain/agent/tools/__init__.py": {
-            "sig": "1772560793723803234:16363",
+            "sig": "1772570540535032559:16480",
             "issues": [
                 {
                     "type": "complexity",
@@ -1899,7 +1899,7 @@
                     "package": "brain",
                     "file": "packages/brain/agent/tools/__init__.py",
                     "line": 208,
-                    "description": "Function `build_tool_registry` is 224 lines long \u2014 consider refactoring",
+                    "description": "Function `build_tool_registry` is 226 lines long \u2014 consider refactoring",
                     "suggestion": "Break `build_tool_registry` into smaller helper functions"
                 },
                 {
@@ -1916,9 +1916,9 @@
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/agent/tools/__init__.py",
-                    "line": 284,
+                    "line": 286,
                     "description": "Potentially unused import: `Coordinator`",
-                    "suggestion": "Remove unused import `Coordinator` at line 284"
+                    "suggestion": "Remove unused import `Coordinator` at line 286"
                 }
             ]
         },
@@ -2162,6 +2162,10 @@
                     "suggestion": "Remove unused import `asyncio` at line 11"
                 }
             ]
+        },
+        "packages/brain/agent/tools/host_execution.py": {
+            "sig": "1772570538510622345:7596",
+            "issues": []
         },
         "packages/brain/agent/tools/project_context.py": {
             "sig": "1771769050865964099:8533",
@@ -3500,20 +3504,38 @@
                 }
             ]
         },
+        "packages/brain/agent/core/heartbeat_parser.py": {
+            "sig": "1772570373727915352:1816",
+            "issues": [
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/agent/core/heartbeat_parser.py",
+                    "line": 2,
+                    "description": "Potentially unused import: `re`",
+                    "suggestion": "Remove unused import `re` at line 2"
+                }
+            ]
+        },
         "packages/brain/agent/core/__init__.py": { "sig": "1771973228960891018:63", "issues": [] },
         "packages/brain/agent/core/markdown_memory.py": {
-            "sig": "1772565007847372501:4903",
+            "sig": "1772570647807179916:7816",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/core/markdown_memory.py",
-                    "line": 19,
-                    "description": "Function `sync_workspace_to_disk` is 88 lines long \u2014 consider refactoring",
+                    "line": 20,
+                    "description": "Function `sync_workspace_to_disk` is 101 lines long \u2014 consider refactoring",
                     "suggestion": "Break `sync_workspace_to_disk` into smaller helper functions"
                 }
             ]
+        },
+        "packages/brain/agent/core/fs_watcher.py": {
+            "sig": "1772570255500903873:4666",
+            "issues": []
         },
         "packages/brain/agent/core/verifier.py": {
             "sig": "1771990373626600176:3715",
@@ -4081,7 +4103,7 @@
             "issues": []
         },
         "packages/web/src/components/Layout/NotificationBell.tsx": {
-            "sig": "1771991020919526234:14737",
+            "sig": "1772571917018428191:16103",
             "issues": []
         },
         "packages/web/src/components/Layout/StatusOrb.tsx": {

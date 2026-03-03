@@ -63,16 +63,30 @@ def setup_directories():
 
 def update_state():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    now = time.time()
     state = {
-        "last_heartbeat": time.time(),
+        "last_heartbeat": now,
         "status": "active",
-        "uptime": time.time() - START_TIME,
+        "uptime": now - START_TIME,
         "tasks_completed": 0,
         "tasks_failed": 0,
-        "next_heartbeat": time.time() + 1800, # default 30 min
+        "next_heartbeat": now + 1800,
     }
-    with open(HEARTBEAT_STATE_FILE, "w") as f:
-        json.dump(state, f)
+    # Write atomically: write to a temp file then rename so a crash mid-write
+    # cannot leave a corrupted state file.
+    tmp_path = None
+    try:
+        with Path(str(HEARTBEAT_STATE_FILE) + ".tmp").open("w") as f:
+            json.dump(state, f)
+            tmp_path = f.name
+        os.replace(tmp_path, HEARTBEAT_STATE_FILE)
+    except Exception as e:
+        logger.error(f"Failed to write heartbeat state: {e}")
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 async def heartbeat_loop():
     logger.info("Daemon started, heartbeat loop active.")

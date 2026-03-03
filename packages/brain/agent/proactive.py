@@ -53,8 +53,13 @@ class Signal:
     fingerprint: str = ""          # For deduplication
 
     def compute_fingerprint(self) -> str:
-        """Generate a dedup fingerprint from source + title."""
-        raw = f"{self.source.value}:{self.source_id}:{self.title}"
+        """Generate a dedup fingerprint from source + title + 5-minute time bucket.
+
+        The time bucket ensures the same signal received in a different 5-minute
+        window gets a fresh fingerprint and is not blocked by the cooldown.
+        """
+        time_bucket = int(time.time() // 300)
+        raw = f"{self.source.value}:{self.source_id}:{self.title}:{time_bucket}"
         self.fingerprint = hashlib.md5(raw.encode()).hexdigest()[:12]
         return self.fingerprint
 
@@ -277,15 +282,23 @@ class ProactiveEngine:
 
     def _rule_based_hypothesis(self, signal: Signal) -> Hypothesis:
         """Fast rule-based fallback for hypothesis generation."""
+        # Sanitize signal content before embedding into a task goal to prevent
+        # prompt injection from external signal sources (fs events, monitors, etc.)
+        safe_title = signal.title[:120].replace("\n", " ").replace("\r", "")
+        safe_body = signal.body[:200].replace("\n", " ").replace("\r", "")
         return Hypothesis(
             id=signal.fingerprint,
             title=signal.title,
             explanation=signal.body,
             confidence=0.7 if signal.severity == "critical" else 0.5,
             signals=[signal.fingerprint],
-            recommendation=f"Investigate: {signal.title}",
+            recommendation=f"Investigate: {safe_title}",
             auto_actionable=signal.severity == "critical",
-            goal_template=f"Investigate and resolve: {signal.title}. Details: {signal.body[:200]}",
+            goal_template=(
+                f"[System-generated] Investigate and resolve the following detected event. "
+                f"Event title: {safe_title}. "
+                f"Event details: {safe_body}"
+            ),
         )
 
     def _route_interrupt(

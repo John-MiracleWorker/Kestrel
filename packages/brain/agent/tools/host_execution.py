@@ -5,8 +5,10 @@ on the host machine. Regulated by an allowlist and native macOS approval dialogs
 """
 
 import os
+import sys
 import asyncio
 import logging
+import tempfile
 from datetime import datetime
 from agent.types import RiskLevel, ToolDefinition
 
@@ -75,8 +77,11 @@ def _check_allowlist(command: str) -> bool:
             config = yaml.safe_load(f) or {}
             allowed_patterns = config.get("allowed_commands", [])
             for pattern in allowed_patterns:
-                if re.search(pattern, command):
-                    return True
+                try:
+                    if re.search(pattern, command):
+                        return True
+                except re.error as re_err:
+                    logger.warning(f"Invalid allowlist regex pattern '{pattern}': {re_err}")
     except Exception as e:
         logger.warning(f"Error reading allowlist: {e}")
         
@@ -139,20 +144,18 @@ async def execute_host_python(code: str) -> dict:
         }
 
     _audit_log("Python Script", "python", approved=True)
-    import tempfile
+    tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
             f.write(code)
             tmp_path = f.name
-            
+
         proc = await asyncio.create_subprocess_exec(
-            "python3", tmp_path,
+            sys.executable, tmp_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await proc.communicate()
-        os.remove(tmp_path)
-        
         return {
             "success": proc.returncode == 0,
             "output": stdout.decode(),
@@ -166,6 +169,12 @@ async def execute_host_python(code: str) -> dict:
             "error": str(e),
             "output": ""
         }
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 def register_host_execution_tools(registry) -> None:
     registry.register(

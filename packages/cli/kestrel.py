@@ -473,26 +473,29 @@ async def cmd_config(client: KestrelClient, args: argparse.Namespace):
 
 
 async def cmd_install(client: KestrelClient, args: argparse.Namespace):
-    """Install Kestrel as a background macOS daemon."""
+    """Install Kestrel as a persistent background daemon (macOS, Linux, Windows)."""
     import subprocess
+    import platform
     print_header("Installing Kestrel Daemon")
-    
+
     home = os.path.expanduser("~")
-    plist_dir = os.path.join(home, "Library", "LaunchAgents")
-    os.makedirs(plist_dir, exist_ok=True)
-    plist_path = os.path.join(plist_dir, "ai.kestrel.daemon.plist")
-    
     cli_dir = os.path.abspath(os.path.dirname(__file__))
     daemon_path = os.path.join(cli_dir, "kestrel_daemon.py")
-    
+
     if not os.path.exists(daemon_path):
         print_error(f"Daemon script not found at {daemon_path}")
         return
-        
+
     audit_dir = os.path.join(home, ".kestrel", "audit")
     os.makedirs(audit_dir, exist_ok=True)
-        
-    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+
+    plat = platform.system()
+
+    if plat == "Darwin":
+        plist_dir = os.path.join(home, "Library", "LaunchAgents")
+        os.makedirs(plist_dir, exist_ok=True)
+        plist_path = os.path.join(plist_dir, "ai.kestrel.daemon.plist")
+        plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -514,19 +517,66 @@ async def cmd_install(client: KestrelClient, args: argparse.Namespace):
 </dict>
 </plist>
 """
-    with open(plist_path, "w") as f:
-        f.write(plist_content)
-    
-    try:
-        subprocess.run(["launchctl", "unload", plist_path], capture_output=True)
-        res = subprocess.run(["launchctl", "load", "-w", plist_path], capture_output=True, text=True)
-        if res.returncode == 0:
-            print_success("Daemon installed and started via launchctl.")
+        try:
+            with open(plist_path, "w") as f:
+                f.write(plist_content)
+            subprocess.run(["launchctl", "unload", plist_path], capture_output=True)
+            res = subprocess.run(["launchctl", "load", "-w", plist_path], capture_output=True, text=True)
+            if res.returncode == 0:
+                print_success("Daemon installed and started via launchctl.")
+                print_info("State directory: ~/.kestrel/")
+            else:
+                print_error(f"Failed to load daemon: {res.stderr}")
+        except Exception as e:
+            print_error(f"Error installing daemon on macOS: {e}")
+
+    elif plat == "Linux":
+        service_dir = os.path.join(home, ".config", "systemd", "user")
+        os.makedirs(service_dir, exist_ok=True)
+        service_path = os.path.join(service_dir, "kestrel-daemon.service")
+        service_content = f"""[Unit]
+Description=Kestrel Agent OS Daemon
+After=network.target
+
+[Service]
+ExecStart={sys.executable} {daemon_path}
+Restart=always
+StandardOutput=append:{audit_dir}/daemon.out
+StandardError=append:{audit_dir}/daemon.err
+
+[Install]
+WantedBy=default.target
+"""
+        try:
+            with open(service_path, "w") as f:
+                f.write(service_content)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+            subprocess.run(["systemctl", "--user", "enable", "--now", "kestrel-daemon"], check=True)
+            print_success("Daemon installed and started via systemd (user service).")
             print_info("State directory: ~/.kestrel/")
-        else:
-            print_error(f"Failed to load daemon: {res.stderr}")
-    except Exception as e:
-        print_error(f"Error starting daemon: {e}")
+        except Exception as e:
+            print_error(f"Error installing daemon on Linux: {e}")
+            print_info("You may need to run: loginctl enable-linger $USER")
+
+    elif plat == "Windows":
+        try:
+            task_name = "KestrelDaemon"
+            cmd = (
+                f'schtasks /Create /F /SC ONLOGON /TN "{task_name}" '
+                f'/TR "\\"{sys.executable}\\" \\"{daemon_path}\\"" /RL HIGHEST'
+            )
+            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if res.returncode == 0:
+                subprocess.run(f'schtasks /Run /TN "{task_name}"', shell=True, capture_output=True)
+                print_success("Daemon installed via Windows Task Scheduler and started.")
+                print_info("State directory: %USERPROFILE%\\.kestrel\\")
+            else:
+                print_error(f"Failed to create scheduled task: {res.stderr}")
+        except Exception as e:
+            print_error(f"Error installing daemon on Windows: {e}")
+
+    else:
+        print_error(f"Unsupported platform: {plat}")
 
 
 # ── Memory CLI Commands ──────────────────────────────────────────────
@@ -574,27 +624,41 @@ def cmd_memory_show(args, config: dict):
 
 def cmd_memory_edit(args, config: dict):
     """Open Kestrel memory directory in the default editor."""
-    import os
     import subprocess
+    import platform
     memory_base = os.path.expanduser(config.get("memory_dir", "~/.kestrel/memory"))
-    
+
     print_info(f"Opening memory directory: {memory_base}")
     if not os.path.exists(memory_base):
         os.makedirs(memory_base, exist_ok=True)
         print_info("Created new memory directory.")
-        
-    editor = os.environ.get("EDITOR", "nano")
-    
-    # On macOS, if code/cursor/subl/etc is not available, try to open the folder
-    try:
-        if editor in ("nano", "vim", "vi"):
-            # These can't act as full folder explorers easily without a file
-            subprocess.run(["open", memory_base])
-        else:
+
+    editor = os.environ.get("EDITOR", "")
+    plat = platform.system()
+
+    def open_folder_native():
+        """Open the folder in the OS file manager."""
+        try:
+            if plat == "Darwin":
+                subprocess.run(["open", memory_base])
+            elif plat == "Windows":
+                os.startfile(memory_base)  # type: ignore[attr-defined]
+            else:
+                subprocess.run(["xdg-open", memory_base])
+        except Exception as e:
+            print_error(f"Could not open folder: {e}")
+            print_info(f"Memory files are at: {memory_base}")
+
+    terminal_editors = ("nano", "vim", "vi", "emacs", "pico", "micro")
+    if editor and editor not in terminal_editors:
+        try:
             subprocess.run([editor, memory_base])
-    except Exception as e:
-        print_error(f"Failed to launch editor ({editor}): {e}")
-        subprocess.run(["open", memory_base]) # Fallback to Finder
+            return
+        except Exception as e:
+            print_error(f"Failed to launch editor ({editor}): {e}")
+
+    # Fall back to native folder opener for terminal editors or when EDITOR is unset
+    open_folder_native()
 
 
 # ── Interactive REPL ─────────────────────────────────────────────────
@@ -771,13 +835,7 @@ def main():
         return
 
     if args.command and args.command in command_map:
-        cmd_func = command_map[args.command]
-        if args.command in ["task", "tasks", "workflows", "cron", "webhooks"]:
-            # Async commands
-            asyncio.run(cmd_func(args, client))
-        else:
-            # Sync commands
-            cmd_func(args, config)
+        asyncio.run(command_map[args.command](client, args))
     else:
         # No subcommand — launch interactive REPL
         asyncio.run(interactive_repl(client, config))
