@@ -177,6 +177,7 @@ class CronScheduler:
         self._jobs: dict[str, CronJob] = {}
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._running_jobs: set[str] = set()  # Guard against concurrent launches
 
     async def start(self) -> None:
         """Start the cron scheduler loop."""
@@ -220,6 +221,12 @@ class CronScheduler:
 
     async def _trigger_job(self, job: CronJob) -> None:
         """Trigger a cron job by launching an agent task."""
+        # Concurrency guard — skip if this job is already running
+        if job.id in self._running_jobs:
+            logger.info(f"Skipping cron job '{job.name}' — already running")
+            return
+
+        self._running_jobs.add(job.id)
         logger.info(f"Triggering cron job: {job.name} ({job.id})")
 
         now = datetime.now(timezone.utc)
@@ -242,7 +249,7 @@ class CronScheduler:
         except Exception as e:
             logger.error(f"Failed to update cron job: {e}")
 
-        # Launch agent task
+        # Launch agent task with completion callback to release the guard
         if self._launcher:
             try:
                 await self._launcher(
@@ -253,6 +260,21 @@ class CronScheduler:
                 )
             except Exception as e:
                 logger.error(f"Failed to launch cron task: {e}")
+
+        # Release the concurrency guard after a max duration so it doesn't
+        # block forever if the task hangs.  The launcher fires a background
+        # asyncio.Task, so we schedule a delayed release.
+        asyncio.create_task(self._release_guard_after(job.id, timeout_minutes=30))
+
+    async def _release_guard_after(self, job_id: str, timeout_minutes: int = 30) -> None:
+        """Release the concurrency guard after a timeout so stuck tasks don't block forever."""
+        try:
+            await asyncio.sleep(timeout_minutes * 60)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._running_jobs.discard(job_id)
+            logger.debug(f"Concurrency guard released for job {job_id}")
 
     async def create_job(
         self,
