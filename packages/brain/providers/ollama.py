@@ -146,6 +146,12 @@ class OllamaProvider:
                                 return
                         except json.JSONDecodeError:
                             continue
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                logger.error(f"Ollama rate limited (429): {e}")
+                raise  # Let executor handle failover
+            logger.error(f"Ollama stream error: {e}")
+            yield f"[Error: {e}]"
         except httpx.ConnectError:
             yield f"[Error: Cannot connect to Ollama at {self._base_url}]"
         except Exception as e:

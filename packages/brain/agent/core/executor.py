@@ -128,7 +128,7 @@ class TaskExecutor:
         # Detect if a workspace model was explicitly configured
         # (e.g. 'glm-5:cloud') — prevents unwanted cloud escalation
         self._has_explicit_model = bool(
-            model and model not in ('', 'default', 'glm5')
+            model and model not in ('', 'default', 'glm5', 'glm-5:cloud', 'glm5:cloud')
         )
         self._approval_memory = approval_memory
         self._step_diagnostics: dict[str, DiagnosticTracker] = {}  # step_id → tracker
@@ -1169,10 +1169,15 @@ class TaskExecutor:
             # a cloud provider and retry with the same context.
             # BUT: if user explicitly set a workspace model (e.g. glm-5:cloud),
             # do NOT silently swap to cloud — just fail with a clear error.
-            if route.provider in ("ollama", "local") and self._provider_resolver and not self._has_explicit_model:
+            # 429 = rate limit: provider is genuinely unavailable,
+            # so always failover regardless of explicit model setting.
+            is_rate_limited = '429' in str(llm_err)
+            if route.provider in ("ollama", "local") and self._provider_resolver and (
+                not self._has_explicit_model or is_rate_limited
+            ):
                 logger.warning(
                     f"Provider {route.provider} failed: {type(llm_err).__name__}: {llm_err}. "
-                    f"Attempting cloud failover..."
+                    f"Attempting cloud failover{' (429 rate limit)' if is_rate_limited else ''}..."
                 )
                 # Build failover list: workspace's configured provider first
                 configured = getattr(self._provider, 'provider', '')
