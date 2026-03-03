@@ -663,7 +663,7 @@ class CloudProvider:
         base_delay = 1.0
         last_error = None
 
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=300) as client:
             for attempt in range(max_retries + 1):
                 resp = await client.post(url, json=payload)
                 if resp.status_code == 400:
