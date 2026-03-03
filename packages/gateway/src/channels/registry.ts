@@ -14,8 +14,21 @@ export class ChannelRegistry {
     private adapters = new Map<ChannelType, BaseChannelAdapter>();
     private userChannels = new Map<string, Set<ChannelType>>(); // userId → active channels
     private knownConversations = new Map<string, string>(); // channelKey → conversationId
+    private activeStreams = new Map<string, AbortController>(); // userId → active stream controller
 
     constructor(private brain: BrainClient, private deduplicator?: Deduplicator) { }
+
+    /**
+     * Cancel the active streaming response for a user (e.g. from /stop).
+     */
+    cancelActiveStream(userId: string): void {
+        const controller = this.activeStreams.get(userId);
+        if (controller) {
+            controller.abort();
+            this.activeStreams.delete(userId);
+            logger.info('Active stream cancelled by user', { userId });
+        }
+    }
 
     /**
      * Register and connect an adapter.
@@ -38,6 +51,13 @@ export class ChannelRegistry {
         adapter.on('status', (status) => {
             logger.info(`Channel ${type} status: ${status}`);
         });
+
+        // Wire cancel-stream handler so adapters can abort active responses (e.g. /stop)
+        if (typeof (adapter as any).setCancelStreamHandler === 'function') {
+            (adapter as any).setCancelStreamHandler((userId: string) => {
+                this.cancelActiveStream(userId);
+            });
+        }
 
         // Connect
         try {
@@ -149,6 +169,10 @@ export class ChannelRegistry {
         // Pass channel type so Brain can tag conversations correctly
         parameters.channel = channel;
 
+        // Track active stream so it can be cancelled (e.g. /stop)
+        const controller = new AbortController();
+        this.activeStreams.set(msg.userId, controller);
+
         // Stream response from Brain
         try {
             const stream = this.brain.streamChat({
@@ -163,10 +187,10 @@ export class ChannelRegistry {
 
             // ── Streaming path (Telegram, Discord, etc.) ─────────────
             if (adapter.supportsStreaming) {
-                await this.routeWithStreaming(adapter, msg, stream, conversationKey, useConversationId);
+                await this.routeWithStreaming(adapter, msg, stream, conversationKey, useConversationId, controller.signal);
             } else {
                 // ── Accumulate path (legacy adapters) ────────────────
-                await this.routeWithAccumulate(adapter, msg, stream, conversationKey, useConversationId);
+                await this.routeWithAccumulate(adapter, msg, stream, conversationKey, useConversationId, controller.signal);
             }
         } catch (err) {
             logger.error('Failed to route message through Brain', {
@@ -179,6 +203,11 @@ export class ChannelRegistry {
                 conversationId: msg.conversationId || '',
                 content: 'Sorry, I couldn\'t process your message. Please try again later.',
             });
+        } finally {
+            // Clean up the abort controller once the stream finishes or errors
+            if (this.activeStreams.get(msg.userId) === controller) {
+                this.activeStreams.delete(msg.userId);
+            }
         }
     }
 
@@ -192,6 +221,7 @@ export class ChannelRegistry {
         stream: AsyncIterable<any>,
         conversationKey: string,
         useConversationId: string,
+        signal?: AbortSignal,
     ): Promise<void> {
         const FLUSH_INTERVAL_MS = 1500; // Telegram: ~1 edit/sec max
 
@@ -227,6 +257,16 @@ export class ChannelRegistry {
         };
 
         for await (const chunk of stream) {
+            // Honour cancellation (e.g. user sent /stop)
+            if (signal?.aborted) {
+                if (flushTimer) { clearTimeout(flushTimer); flushTimer = undefined; }
+                await flushPromise;
+                if (fullContent) {
+                    try { await adapter.sendStreamEnd!(handle, fullContent); } catch { /* ignore */ }
+                }
+                return;
+            }
+
             const chunkType = typeof chunk.type === 'number' ? chunk.type :
                 (enumMap[chunk.type as string] ?? -1);
 
@@ -354,10 +394,14 @@ export class ChannelRegistry {
         stream: AsyncIterable<any>,
         conversationKey: string,
         useConversationId: string,
+        signal?: AbortSignal,
     ): Promise<void> {
         let fullContent = '';
 
         for await (const chunk of stream) {
+            if (signal?.aborted) {
+                return;
+            }
             switch (chunk.type) {
                 case 'CONTENT_DELTA':
                     fullContent += chunk.content_delta || '';
