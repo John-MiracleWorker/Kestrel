@@ -421,6 +421,13 @@ class DaemonManager:
 
     def _get_observer(self, config: DaemonConfig) -> Callable:
         """Get the appropriate observer function for a daemon type."""
+        try:
+            from agent.daemon_observers import OBSERVER_MAP
+            observer = OBSERVER_MAP.get(config.daemon_type.value)
+            if observer:
+                return observer
+        except ImportError:
+            logger.debug("daemon_observers module not available, using generic")
 
         async def generic_observer(cfg: DaemonConfig) -> Observation:
             """Generic observer that just records a timestamp."""
@@ -429,10 +436,6 @@ class DaemonManager:
                 content=f"Observation from {cfg.name} watching {cfg.watch_target}",
             )
 
-        # Can be extended with type-specific observers:
-        # REPO_WATCHER → poll GitHub API
-        # CI_MONITOR → poll GitHub Actions
-        # SYSTEM_MONITOR → psutil checks
         return generic_observer
 
     def _get_analyzer(self, config: DaemonConfig) -> Callable:

@@ -359,3 +359,134 @@ class ContextCompactor:
             logger.warning(f"Context compaction failed: {e}")
 
         return messages  # Fallback: return original
+
+
+# ── Aggregated Metrics for Dashboard ──────────────────────────────────
+
+
+class MetricsAggregator:
+    """
+    Queries aggregated agent performance metrics from the database.
+    Used by dashboard endpoints and the auto-improvement loop.
+    """
+
+    def __init__(self, pool=None):
+        self._pool = pool
+
+    async def get_task_stats(self, workspace_id: str = "", days: int = 30) -> dict:
+        """Get aggregated task statistics."""
+        if not self._pool:
+            return {}
+
+        try:
+            where = "WHERE created_at > now() - $1 * interval '1 day'"
+            params = [days]
+
+            if workspace_id:
+                where += " AND workspace_id = $2"
+                params.append(workspace_id)
+
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    f"""
+                    SELECT
+                        COUNT(*) as total_tasks,
+                        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+                        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+                        AVG(iterations) as avg_iterations,
+                        AVG(tool_calls_count) as avg_tool_calls,
+                        AVG(token_usage) as avg_tokens
+                    FROM agent_tasks
+                    {where}
+                    """,
+                    *params,
+                )
+
+            if not row:
+                return {}
+
+            total = row["total_tasks"] or 0
+            completed = row["completed"] or 0
+            return {
+                "total_tasks": total,
+                "completed": completed,
+                "failed": row["failed"] or 0,
+                "success_rate": round(completed / max(total, 1), 3),
+                "avg_iterations": round(float(row["avg_iterations"] or 0), 1),
+                "avg_tool_calls": round(float(row["avg_tool_calls"] or 0), 1),
+                "avg_tokens": round(float(row["avg_tokens"] or 0), 0),
+            }
+        except Exception as e:
+            logger.error(f"Task stats query failed: {e}")
+            return {}
+
+    async def get_tool_usage(self, workspace_id: str = "", days: int = 30) -> list[dict]:
+        """Get tool usage frequency breakdown."""
+        if not self._pool:
+            return []
+
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        tool_name,
+                        COUNT(*) as total_calls,
+                        SUM(CASE WHEN success THEN 1 ELSE 0 END) as successes,
+                        AVG(execution_time_ms) as avg_time_ms
+                    FROM tool_executions
+                    WHERE created_at > now() - $1 * interval '1 day'
+                    GROUP BY tool_name
+                    ORDER BY total_calls DESC
+                    LIMIT 20
+                    """,
+                    days,
+                )
+
+            return [
+                {
+                    "tool_name": row["tool_name"],
+                    "total_calls": row["total_calls"],
+                    "successes": row["successes"],
+                    "success_rate": round(row["successes"] / max(row["total_calls"], 1), 3),
+                    "avg_time_ms": round(float(row["avg_time_ms"] or 0), 1),
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            logger.debug(f"Tool usage query failed: {e}")
+            return []
+
+    async def get_cost_trend(self, days: int = 30) -> list[dict]:
+        """Get daily LLM cost trend."""
+        if not self._pool:
+            return []
+
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        DATE(created_at) as day,
+                        SUM(token_usage) as total_tokens,
+                        COUNT(*) as total_tasks
+                    FROM agent_tasks
+                    WHERE created_at > now() - $1 * interval '1 day'
+                      AND token_usage > 0
+                    GROUP BY DATE(created_at)
+                    ORDER BY day
+                    """,
+                    days,
+                )
+
+            return [
+                {
+                    "day": str(row["day"]),
+                    "total_tokens": row["total_tokens"],
+                    "total_tasks": row["total_tasks"],
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            logger.debug(f"Cost trend query failed: {e}")
+            return []

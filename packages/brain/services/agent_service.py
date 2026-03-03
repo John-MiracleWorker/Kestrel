@@ -78,6 +78,8 @@ class AgentServicerMixin(BaseServicerMixin):
         from agent.learner import TaskLearner
         from agent.core.memory import WorkingMemory
         from agent.core.reflection import ReflectionEngine
+        from agent.simulation import OutcomeSimulator
+        from agent.core.verifier import VerifierEngine
 
         task_model = ws_config.get("model", "") if ws_config else ""
         task_api_key = ws_config.get("api_key", "") if ws_config else ""
@@ -96,6 +98,16 @@ class AgentServicerMixin(BaseServicerMixin):
         )
         task_reflection = ReflectionEngine(
             llm_provider=task_provider,
+            model=task_model,
+        )
+
+        # Build simulation gate and verifier engine
+        task_simulator = OutcomeSimulator(
+            llm_provider=task_provider,
+            model=task_model,
+        )
+        task_verifier = VerifierEngine(
+            provider=task_provider,
             model=task_model,
         )
 
@@ -128,6 +140,9 @@ class AgentServicerMixin(BaseServicerMixin):
             reflection_engine=task_reflection,
             provider_resolver=resolve_provider,
             model_router=task_model_router,
+            simulator=task_simulator,
+            verifier=task_verifier,
+            persona_learner=runtime.persona_learner,
         )
 
         # Register this task as an active session

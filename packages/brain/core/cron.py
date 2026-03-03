@@ -68,10 +68,144 @@ async def _run_automation_task(task: AgentTask):
     except Exception as e:
         logger.error(f"Automation task {task.id} failed: {e}")
 
+async def _bootstrap_cron_job(
+    pool: Any,
+    job_name: str,
+    cron_expression: str,
+    description: str,
+    goal: str,
+) -> int:
+    """Generic helper to bootstrap a cron job for every workspace owner.
+
+    Returns the number of newly created jobs.
+    """
+    if not runtime.cron_scheduler:
+        return 0
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT wm.workspace_id, wm.user_id
+            FROM workspace_members wm
+            WHERE wm.role = 'owner'
+            ORDER BY wm.workspace_id
+            """
+        )
+
+    async with pool.acquire() as conn:
+        existing = await conn.fetch(
+            "SELECT workspace_id, name FROM automation_cron_jobs WHERE name = $1",
+            job_name,
+        )
+    existing_names = {(str(r["workspace_id"]), r["name"]) for r in existing}
+
+    created = 0
+    for row in rows:
+        ws_id = str(row["workspace_id"])
+        u_id = str(row["user_id"])
+        if (ws_id, job_name) in existing_names:
+            continue
+        await runtime.cron_scheduler.create_job(
+            workspace_id=ws_id,
+            user_id=u_id,
+            name=job_name,
+            description=description,
+            cron_expression=cron_expression,
+            goal=goal,
+        )
+        created += 1
+    return created
+
+
+async def bootstrap_gmail_cron(pool: Any) -> None:
+    """
+    Ensure every workspace has a Gmail monitoring cron job.
+    Runs every 2 hours. Checks unread emails and sends a summary to Telegram.
+    """
+    _GMAIL_JOB_NAME = "gmail_summary"
+    _GMAIL_CRON = "0 */2 * * *"  # every 2 hours
+    _GMAIL_GOAL = (
+        "Check my Gmail inbox for unread and recent emails from the last 2 hours. "
+        "Use the Gmail MCP tools (gmail_list_messages, gmail_get_message) to retrieve them. "
+        "Summarize the important emails — include sender, subject, and a brief summary of the content. "
+        "Group them by priority: urgent/action-needed first, then informational. "
+        "Skip obvious spam and marketing emails. "
+        "Send the summary to Telegram using the Telegram channel. "
+        "If there are no important new emails, send a short 'Inbox clear' message instead."
+    )
+    try:
+        created = await _bootstrap_cron_job(
+            pool=pool,
+            job_name=_GMAIL_JOB_NAME,
+            cron_expression=_GMAIL_CRON,
+            description="Gmail inbox monitoring — summarize unread emails to Telegram every 2 hours",
+            goal=_GMAIL_GOAL,
+        )
+        if created:
+            logger.info(f"Bootstrapped Gmail summary cron job for {created} workspace(s)")
+    except Exception as e:
+        logger.warning(f"Gmail cron bootstrap failed (non-fatal): {e}")
+
+
+async def bootstrap_ai_news_cron(pool: Any) -> None:
+    """
+    Ensure every workspace has AI news briefing cron jobs.
+    Morning briefing at 8am UTC, afternoon briefing at 1pm UTC.
+    """
+    _NEWS_JOBS = [
+        {
+            "name": "ai_news_morning",
+            "cron": "0 8 * * *",  # daily at 8am UTC
+            "description": "Morning AI news briefing — top stories and developments",
+            "goal": (
+                "Compile a morning AI news briefing. "
+                "Use your web search and digest tools to find the latest AI news, research papers, "
+                "and industry developments from the last 24 hours. "
+                "Focus on: major model releases, breakthrough research, industry moves, "
+                "open-source updates, and regulation news. "
+                "Format it as a clean briefing with headlines and 1-2 sentence summaries. "
+                "Send the briefing to Telegram. "
+                "Keep it concise — aim for 5-8 top stories maximum."
+            ),
+        },
+        {
+            "name": "ai_news_afternoon",
+            "cron": "0 13 * * *",  # daily at 1pm UTC
+            "description": "Afternoon AI news briefing — updates and developments",
+            "goal": (
+                "Compile an afternoon AI news briefing. "
+                "Use your web search and digest tools to find AI news and developments "
+                "that broke since this morning. "
+                "Focus on: new announcements, trending discussions, notable tweets or blog posts, "
+                "and any breaking developments in AI/ML. "
+                "Format it as a clean briefing with headlines and 1-2 sentence summaries. "
+                "Send the briefing to Telegram. "
+                "Keep it concise — aim for 3-5 stories. If nothing notable happened, "
+                "send a short 'No major updates this afternoon' message."
+            ),
+        },
+    ]
+    try:
+        total_created = 0
+        for job_config in _NEWS_JOBS:
+            created = await _bootstrap_cron_job(
+                pool=pool,
+                job_name=job_config["name"],
+                cron_expression=job_config["cron"],
+                description=job_config["description"],
+                goal=job_config["goal"],
+            )
+            total_created += created
+        if total_created:
+            logger.info(f"Bootstrapped AI news cron jobs: {total_created} new job(s)")
+    except Exception as e:
+        logger.warning(f"AI news cron bootstrap failed (non-fatal): {e}")
+
+
 async def bootstrap_moltbook_cron(pool: Any) -> None:
     """
     Ensure every workspace has an autonomous Moltbook session cron job.
-    Runs every 2 hours. Skips workspaces that already have the job.
+    Runs every 6 hours. Skips workspaces that already have the job.
     The job is a no-op if no Moltbook credentials are present.
     """
     _MOLTBOOK_JOB_NAME = "moltbook_autonomous_session"
@@ -85,43 +219,13 @@ async def bootstrap_moltbook_cron(pool: Any) -> None:
         "Stay in character as Kestrel throughout."
     )
     try:
-        if not runtime.cron_scheduler:
-            return
-            
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT wm.workspace_id, wm.user_id
-                FROM workspace_members wm
-                WHERE wm.role = 'owner'
-                ORDER BY wm.workspace_id
-                """
-            )
-
-        # Check the DATABASE for existing jobs (not in-memory cache which may be stale)
-        async with pool.acquire() as conn:
-            existing = await conn.fetch(
-                "SELECT workspace_id, name FROM automation_cron_jobs WHERE name = $1",
-                _MOLTBOOK_JOB_NAME,
-            )
-        existing_names = {(str(r["workspace_id"]), r["name"]) for r in existing}
-
-        created = 0
-        for row in rows:
-            ws_id = str(row["workspace_id"])
-            u_id = str(row["user_id"])
-            if (ws_id, _MOLTBOOK_JOB_NAME) in existing_names:
-                continue
-            await runtime.cron_scheduler.create_job(
-                workspace_id=ws_id,
-                user_id=u_id,
-                name=_MOLTBOOK_JOB_NAME,
-                description="Autonomous Moltbook participation — browse, engage, post",
-                cron_expression=_MOLTBOOK_CRON,
-                goal=_MOLTBOOK_GOAL,
-            )
-            created += 1
-
+        created = await _bootstrap_cron_job(
+            pool=pool,
+            job_name=_MOLTBOOK_JOB_NAME,
+            cron_expression=_MOLTBOOK_CRON,
+            description="Autonomous Moltbook participation — browse, engage, post",
+            goal=_MOLTBOOK_GOAL,
+        )
         if created:
             logger.info(f"Bootstrapped Moltbook autonomous cron job for {created} workspace(s)")
     except Exception as e:

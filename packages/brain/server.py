@@ -274,16 +274,26 @@ async def serve():
     )
     logger.info("Outcome simulator initialized")
 
-    # Feature 6: Proactive Interrupt Engine
+    # Feature 6: Proactive Interrupt Engine (with LLM-powered hypothesis)
     _proactive_engine = ProactiveEngine(
         notification_router=runtime.notification_router,
         task_launcher=None,  # Set after cron scheduler init
+        llm_provider=_resolve_default_provider(),
+        model="",
     )
     try:
         await _proactive_engine.start()
         logger.info("Proactive interrupt engine started")
     except Exception as e:
         logger.warning(f"Proactive engine start failed (non-fatal): {e}")
+
+    # Wire SmartMonitors → ProactiveEngine for signal routing
+    _smart_monitors.set_proactive_engine(_proactive_engine)
+    logger.info("SmartMonitors wired to ProactiveEngine")
+
+    # Store references on runtime for access by services
+    runtime.outcome_simulator = _outcome_simulator
+    runtime.proactive_engine = _proactive_engine
 
     # Feature 7: UI Artifact Manager
     _ui_artifact_manager = UIArtifactManager(pool=pool)
@@ -330,12 +340,14 @@ async def serve():
     except Exception as e:
         logger.warning(f"Model registry init failed (non-fatal, will use env defaults): {e}")
 
-    # Bootstrap autonomous Moltbook cron jobs (canonical version from cron.py)
+    # Bootstrap autonomous cron jobs (canonical versions from core/cron.py)
     try:
-        from core.cron import bootstrap_moltbook_cron
+        from core.cron import bootstrap_moltbook_cron, bootstrap_gmail_cron, bootstrap_ai_news_cron
         await bootstrap_moltbook_cron(pool)
+        await bootstrap_gmail_cron(pool)
+        await bootstrap_ai_news_cron(pool)
     except Exception as e:
-        logger.warning(f"Moltbook cron bootstrap failed (non-fatal): {e}")
+        logger.warning(f"Cron bootstrap failed (non-fatal): {e}")
 
     # ── Wire task launcher into managers that were created before cron init ──
     try:

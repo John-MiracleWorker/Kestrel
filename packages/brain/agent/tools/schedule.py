@@ -134,7 +134,7 @@ async def _create_job(name: str, description: str, cron: str, goal: str, max_run
         return {"error": "Cannot determine workspace/user context for scheduling."}
 
     try:
-        job = await _cron_scheduler.create_job(
+        job, was_created = await _cron_scheduler.create_job(
             workspace_id=workspace_id,
             user_id=user_id,
             name=name,
@@ -143,6 +143,19 @@ async def _create_job(name: str, description: str, cron: str, goal: str, max_run
             goal=goal,
             max_runs=max_runs,
         )
+        if not was_created:
+            return {
+                "status": "already_exists",
+                "job_id": job.id,
+                "name": name,
+                "cron": cron,
+                "goal": goal,
+                "message": (
+                    f"A scheduled task named '{name}' already exists "
+                    f"(id: {job.id}). Updated its settings instead of "
+                    f"creating a duplicate. No further action needed."
+                ),
+            }
         result = {
             "status": "created",
             "job_id": job.id,

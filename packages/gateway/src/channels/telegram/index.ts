@@ -84,6 +84,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
         userId: string,
         workspaceId: string,
     ) => Promise<Array<{ approval_id: string }>>;
+    private cancelStreamHandler?: (userId: string) => void;
 
     public setApprovalHandler(
         handler: (
@@ -99,6 +100,16 @@ export class TelegramAdapter extends BaseChannelAdapter {
         handler: (userId: string, workspaceId: string) => Promise<Array<{ approval_id: string }>>,
     ): void {
         this.pendingApprovalsLookupHandler = handler;
+    }
+
+    public setCancelStreamHandler(handler: (userId: string) => void): void {
+        this.cancelStreamHandler = handler;
+    }
+
+    public cancelActiveStream(userId: string): void {
+        if (this.cancelStreamHandler) {
+            this.cancelStreamHandler(userId);
+        }
     }
 
     public async resolvePendingApproval(
