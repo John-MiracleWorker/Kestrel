@@ -15,8 +15,14 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError
 from agent.types import RiskLevel, ToolDefinition
 
-from .self_improvement.utils import *
-from .self_improvement.utils import _last_scan_results as _imported_scan_results, _restore_scan_results
+from .self_improvement.utils import (
+    PROJECT_ROOT, PACKAGES,
+    _load_proposals, _save_proposals,
+    _persist_scan_results, _restore_scan_results,
+    _send_summary_to_telegram, _send_proposal_to_telegram,
+    _extract_json_array,
+    is_user_inactive, get_inactivity_seconds, touch_user_activity,
+)
 from .self_improvement.ast_analyzer import _deep_scan
 from .self_improvement.github_sync import _github_sync
 from .self_improvement.proposals import _run_tests, _propose_improvements, _telegram_digest, _handle_approval

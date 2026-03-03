@@ -14,7 +14,12 @@ from typing import Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 from agent.types import RiskLevel, ToolDefinition
-from .utils import *
+from .utils import (
+    PROJECT_ROOT, PACKAGES,
+    _load_proposals, _save_proposals,
+    _send_proposal_to_telegram, _send_summary_to_telegram,
+    _extract_json_array, _last_scan_results,
+)
 from .ast_analyzer import _deep_scan
 
 async def _telegram_digest(package: str = "all") -> dict:

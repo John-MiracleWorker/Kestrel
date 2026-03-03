@@ -45,7 +45,8 @@ _CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "file": [
         "file", "read", "write", "directory", "folder", "path",
         "create", "delete", "list", "tree", "find", "workspace",
-        "project", "codebase", "source",
+        "project", "codebase", "source", "improve", "scan", "patch",
+        "fix", "edit", "modify", "analyze",
     ],
     "memory": [
         "remember", "memory", "recall", "store", "knowledge",
@@ -73,7 +74,8 @@ _CATEGORY_KEYWORDS: dict[str, list[str]] = {
     ],
     "skill": [
         "skill", "create_skill", "learn", "improve", "self_improve",
-        "proposal",
+        "proposal", "scan", "patch", "fix", "self-improvement",
+        "codebase", "analyze",
     ],
     "delegation": [
         "delegate", "parallel", "sub-agent", "specialist",
@@ -122,9 +124,9 @@ _TOOL_CATEGORY_MAP: dict[str, str] = {
 }
 
 # Maximum tools to send to a local model (ollama)
-MAX_LOCAL_TOOLS = 8
-# Maximum tools to send to a cloud model
-MAX_CLOUD_TOOLS = 20
+MAX_LOCAL_TOOLS = 20
+# Maximum tools to send to a cloud model (effectively all tools)
+MAX_CLOUD_TOOLS = 45
 
 
 class ToolSelector:

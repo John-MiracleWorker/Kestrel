@@ -14,7 +14,11 @@ from typing import Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 from agent.types import RiskLevel, ToolDefinition
-from .utils import *
+from .utils import (
+    PROJECT_ROOT, PACKAGES, INACTIVITY_THRESHOLD_SECONDS,
+    _load_scan_cache, _save_scan_cache, _file_signature,
+    _persist_scan_results, _restore_scan_results, _last_scan_results,
+)
 
 _SECRET_RE = re.compile(
     r"(password|secret|api_key|token)\s*=\s*['\"][^'\"]{8,}['\"]",

@@ -14,7 +14,7 @@ from typing import Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 from agent.types import RiskLevel, ToolDefinition
-from .utils import *
+from .utils import PROJECT_ROOT, _send_summary_to_telegram
 from .ast_analyzer import _deep_scan
 
 _SYNCED_ISSUES_FILE = os.path.join(PROJECT_ROOT, ".kestrel", "cache", "kestrel_synced_issues.json")
