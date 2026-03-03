@@ -145,8 +145,54 @@ class NotificationRouter:
             except Exception as e:
                 logger.error(f"Redis notification publish failed: {e}")
 
+        # Deliver via Telegram (if configured)
+        await self._deliver_telegram(notification)
+
         logger.info(f"Notification sent: {title} → {user_id} (via {source})")
         return notification
+
+    async def _deliver_telegram(self, notification: Notification) -> None:
+        """Send a notification to Telegram via Bot API (if configured)."""
+        import os
+        token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+        if not token or not chat_id:
+            return  # Telegram not configured, skip silently
+
+        # Format the notification for Telegram
+        type_icons = {
+            "info": "ℹ️",
+            "success": "✅",
+            "warning": "⚠️",
+            "task_complete": "🎯",
+            "mention": "💬",
+        }
+        icon = type_icons.get(notification.type, "📬")
+        text = f"{icon} <b>{notification.title}</b>"
+        if notification.body:
+            text += f"\n\n{notification.body}"
+        if notification.source:
+            text += f"\n\n<i>Source: {notification.source}</i>"
+
+        # Truncate for Telegram limit
+        if len(text) > 4000:
+            text = text[:3997] + "..."
+
+        try:
+            from urllib.request import Request, urlopen
+            import json as _json
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {
+                "chat_id": int(chat_id),
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_notification": notification.type == "info",
+            }
+            data = _json.dumps(payload).encode("utf-8")
+            req = Request(url, data=data, headers={"Content-Type": "application/json"})
+            urlopen(req, timeout=10)
+        except Exception as e:
+            logger.warning(f"Telegram notification delivery failed: {e}")
 
     async def get_unread(self, user_id: str, limit: int = 20) -> list[dict]:
         """Get unread notifications for a user."""

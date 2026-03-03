@@ -294,6 +294,11 @@ class ChatServicerMixin(BaseServicerMixin):
             _dc_mod._current_workspace_id = workspace_id
             _dc_mod._current_user_id = request.user_id
 
+            # Set context for model swap tool
+            import agent.tools.model_swap as _ms_mod
+            _ms_mod._current_workspace_id = workspace_id
+            _ms_mod._current_user_id = request.user_id
+
             # Create per-task evidence chain for auditable decision trail
             from agent.evidence import EvidenceChain
             evidence_chain = EvidenceChain(task_id=chat_task.id, pool=pool)

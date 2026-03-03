@@ -243,6 +243,14 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
     register_schedule_tools(registry)
     register_system_tools(registry)
 
+    # Model swap (search + switch models across Ollama & cloud providers)
+    from agent.tools.model_swap import register_model_swap_tools
+    register_model_swap_tools(registry)
+
+    # Telegram direct messaging (used by cron jobs and agent tasks)
+    from agent.tools.telegram_notify import register_telegram_tools
+    register_telegram_tools(registry)
+
     # MCP discovery + management tools
     from agent.tools.mcp import register_mcp_tools
     register_mcp_tools(registry, pool=pool)

@@ -63,6 +63,11 @@ async def _run_automation_task(task: AgentTask):
         _dc_mod._current_workspace_id = task.workspace_id
         _dc_mod._current_user_id = task.user_id
 
+        # Set context for model swap tool (if used in automation)
+        import agent.tools.model_swap as _ms_mod
+        _ms_mod._current_workspace_id = task.workspace_id
+        _ms_mod._current_user_id = task.user_id
+
         async for event in task_loop.run(task):
             logger.debug(f"Automation task {task.id}: {event.type}")
     except Exception as e:

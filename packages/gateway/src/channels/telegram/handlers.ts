@@ -375,21 +375,72 @@ import { logger } from '../../utils/logger';
                 break;
             }
 
-            case '/model':
-                if (args[0]) {
+            case '/model': {
+                const modelQuery = args.join(' ').trim();
+                if (modelQuery) {
+                    // Send a confirmation that we're searching
                     await adapter.api('sendMessage', withThread({
                         chat_id: chatId,
-                        text: `🔄 Model switched to \`${args[0]}\``,
+                        text: `🔍 Searching for model \`${modelQuery}\` across Ollama and cloud providers...`,
                         parse_mode: 'Markdown',
                     }));
+                    adapter.startTyping(chatId, threadId);
+
+                    // Emit as a chat message so the agent uses the model_swap tool
+                    if (msg.from) {
+                        const userId = adapter.resolveUserId(msg.from, chatId);
+                        adapter.userThreadMap.set(userId, threadId);
+                        const incoming: IncomingMessage = {
+                            id: randomUUID(),
+                            channel: 'telegram',
+                            userId,
+                            workspaceId: adapter.config.defaultWorkspaceId,
+                            conversationId: adapter.resolveConversationId(chatId, undefined, threadId),
+                            content: `Search all available Ollama and cloud models for "${modelQuery}" and switch to the best match. Use the model_swap tool with action="swap" and query="${modelQuery}".`,
+                            metadata: {
+                                channelUserId: String(msg.from.id),
+                                channelMessageId: String(msg.message_id),
+                                timestamp: new Date(msg.date * 1000),
+                                telegramChatId: chatId,
+                                telegramThreadId: threadId,
+                                telegramUsername: msg.from.username,
+                            },
+                        };
+                        (adapter as any).emit('message', incoming);
+                    }
                 } else {
+                    // No model specified — ask agent to list all available models
                     await adapter.api('sendMessage', withThread({
                         chat_id: chatId,
-                        text: '❓ Usage: `/model <model_name>`\n\nExamples:\n`/model gpt-4o`\n`/model claude-sonnet-4-20250514`\n`/model gemini-2.5-pro`',
+                        text: '🔍 Listing all available models...',
                         parse_mode: 'Markdown',
                     }));
+                    adapter.startTyping(chatId, threadId);
+
+                    if (msg.from) {
+                        const userId = adapter.resolveUserId(msg.from, chatId);
+                        adapter.userThreadMap.set(userId, threadId);
+                        const incoming: IncomingMessage = {
+                            id: randomUUID(),
+                            channel: 'telegram',
+                            userId,
+                            workspaceId: adapter.config.defaultWorkspaceId,
+                            conversationId: adapter.resolveConversationId(chatId, undefined, threadId),
+                            content: 'List all available models from Ollama and cloud providers. Use the model_swap tool with action="list".',
+                            metadata: {
+                                channelUserId: String(msg.from.id),
+                                channelMessageId: String(msg.message_id),
+                                timestamp: new Date(msg.date * 1000),
+                                telegramChatId: chatId,
+                                telegramThreadId: threadId,
+                                telegramUsername: msg.from.username,
+                            },
+                        };
+                        (adapter as any).emit('message', incoming);
+                    }
                 }
                 break;
+            }
 
             case '/workspace':
                 await adapter.api('sendMessage', withThread({
