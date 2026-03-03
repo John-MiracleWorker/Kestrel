@@ -517,8 +517,31 @@ export class TelegramAdapter extends BaseChannelAdapter {
                 emoji = '⏳';
                 text = `Needs approval: **${activity.toolName || 'tool action'}**`;
                 break;
+            case 'planning':
+                emoji = '📋';
+                text = 'Planning your request...';
+                break;
+            case 'step_started':
+                emoji = '▶️';
+                text = activity.thinking
+                    ? `${activity.toolName}: ${activity.thinking.slice(0, 100)}`
+                    : activity.toolName || 'Starting next step...';
+                break;
+            case 'calling':
+                emoji = '⚡';
+                text = `Using **${activity.toolName}**...`;
+                break;
+            case 'result':
+                // Skip individual result events to avoid spam — step_complete covers it
+                return;
+            case 'delegation':
+            case 'agent_activity':
+                emoji = '🤝';
+                text = activity.toolName || 'Coordinating...';
+                break;
             default:
-                text = `${activity.status}: ${activity.toolName || 'processing'}`;
+                // Suppress unknown/internal statuses rather than leaking raw strings
+                return;
         }
 
         try {

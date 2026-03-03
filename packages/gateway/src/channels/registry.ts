@@ -224,6 +224,7 @@ export class ChannelRegistry {
         signal?: AbortSignal,
     ): Promise<void> {
         const FLUSH_INTERVAL_MS = 1500; // Telegram: ~1 edit/sec max
+        const HEARTBEAT_INTERVAL_MS = 25000; // Send "still working" after 25s silence
 
         // Start streaming — sends "Thinking..." placeholder
         const handle = await adapter.sendStreamStart!(msg.userId, {
@@ -234,6 +235,27 @@ export class ChannelRegistry {
         let lastFlushLen = 0;
         let flushTimer: NodeJS.Timeout | undefined;
         let flushPromise: Promise<void> = Promise.resolve();
+        let doneReceived = false;
+        let lastActivityAt = Date.now();
+
+        // Heartbeat: send a silent "still working" status if no events arrive for a while.
+        // This prevents the user thinking Kestrel died during long LLM/tool calls.
+        const heartbeatInterval = setInterval(async () => {
+            if (doneReceived || signal?.aborted) {
+                clearInterval(heartbeatInterval);
+                return;
+            }
+            const silenceMs = Date.now() - lastActivityAt;
+            if (silenceMs >= HEARTBEAT_INTERVAL_MS && adapter.sendToolActivity) {
+                try {
+                    await adapter.sendToolActivity(msg.userId, handle, {
+                        status: 'thinking',
+                        toolName: '',
+                        thinking: `Still working... (${Math.round(silenceMs / 1000)}s)`,
+                    });
+                } catch { /* best effort */ }
+            }
+        }, HEARTBEAT_INTERVAL_MS);
 
         const scheduleFlush = () => {
             if (flushTimer) return;
@@ -257,9 +279,12 @@ export class ChannelRegistry {
         };
 
         for await (const chunk of stream) {
+            lastActivityAt = Date.now();
+
             // Honour cancellation (e.g. user sent /stop)
             if (signal?.aborted) {
                 if (flushTimer) { clearTimeout(flushTimer); flushTimer = undefined; }
+                clearInterval(heartbeatInterval);
                 await flushPromise;
                 if (fullContent) {
                     try { await adapter.sendStreamEnd!(handle, fullContent); } catch { /* ignore */ }
@@ -325,6 +350,9 @@ export class ChannelRegistry {
                     break;
 
                 case 2: { // DONE
+                    doneReceived = true;
+                    clearInterval(heartbeatInterval);
+
                     // Cancel pending timer
                     if (flushTimer) {
                         clearTimeout(flushTimer);
@@ -379,9 +407,33 @@ export class ChannelRegistry {
             }
         }
 
-        // Safety: clean up timer if stream ended without DONE
+        // Safety: clean up timer and heartbeat if stream ended
+        clearInterval(heartbeatInterval);
         if (flushTimer) {
             clearTimeout(flushTimer);
+        }
+
+        // If stream ended without a DONE chunk (e.g. gRPC timeout / network drop),
+        // send whatever content was accumulated so the user is never left hanging.
+        if (!doneReceived && fullContent) {
+            try {
+                await adapter.sendStreamEnd!(handle, fullContent);
+            } catch (err) {
+                logger.warn('Fallback stream-end flush failed', { error: (err as Error).message });
+                try {
+                    await adapter.send(msg.userId, {
+                        conversationId: msg.conversationId || '',
+                        content: fullContent,
+                        options: { markdown: true },
+                    });
+                } catch { /* best effort */ }
+            }
+        } else if (!doneReceived && !fullContent) {
+            // Nothing at all was produced — send a generic failure so the user
+            // knows something went wrong rather than seeing a frozen "Thinking..." bubble.
+            try {
+                await adapter.sendStreamEnd!(handle, '⚠️ The request timed out or was interrupted. Please try again.');
+            } catch { /* best effort */ }
         }
     }
 
