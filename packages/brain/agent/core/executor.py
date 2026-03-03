@@ -126,10 +126,11 @@ class TaskExecutor:
         # Detect if a workspace model was explicitly configured
         # (e.g. 'glm-5:cloud') — prevents unwanted cloud escalation
         self._has_explicit_model = bool(
-            model and model not in ('', 'default', 'qwen3:8b')
+            model and model not in ('', 'default', 'glm5')
         )
         self._approval_memory = approval_memory
         self._step_diagnostics: dict[str, DiagnosticTracker] = {}  # step_id → tracker
+        self._text_only_streak: dict[str, int] = {}  # step_id → consecutive text-only responses
 
     def _get_tracker(self, step_id: str) -> DiagnosticTracker:
         """Get or create a DiagnosticTracker for a step."""
@@ -303,14 +304,25 @@ class TaskExecutor:
     ) -> AsyncIterator[TaskEvent]:
         parallel_batch = []
         sequential_queue = []
+        seen_signatures: set[tuple[str, str]] = set()
 
         for tc_data in parsed_calls:
             func = tc_data.get("function", {})
             tool_name = func.get("name", "")
+            raw_args = func.get("arguments", "{}")
             try:
-                tool_args = json.loads(func.get("arguments", "{}"))
+                tool_args = json.loads(raw_args)
             except json.JSONDecodeError:
                 tool_args = {}
+
+            # Deduplicate: skip tool calls with identical (name, arguments)
+            sig = (tool_name, raw_args)
+            if sig in seen_signatures:
+                logger.warning(
+                    f"Skipping duplicate tool call in parallel batch: {tool_name}"
+                )
+                continue
+            seen_signatures.add(sig)
 
             is_control = tool_name in ("task_complete", "ask_human")
             tier, _reason = self._guardrails.check_tool(
@@ -531,12 +543,34 @@ class TaskExecutor:
                 if s.status == StepStatus.PENDING and s.id != step.id
             ]
             if pending_steps:
-                error_msg = f"Error: Cannot call task_complete yet. There are {len(pending_steps)} pending steps remaining in the plan. Do NOT call task_complete to signal a step is done. To finish a step, simply explain your findings and the system will advance automatically."
-                
-                logger.warning(
-                    f"Blocked premature task_complete on step '{step.description[:60]}' "
-                    f"because {len(pending_steps)} step(s) are still pending."
+                # The LLM believes this step is done.  Instead of returning
+                # an error (which keeps the step IN_PROGRESS and causes the
+                # outer loop to re-invoke _reason_and_act — hammering the
+                # LLM API until the iteration budget is exhausted), auto-
+                # complete the *current* step so the system advances.
+                summary = tool_args.get("summary", step.result or "Step completed")
+
+                logger.info(
+                    f"task_complete called with {len(pending_steps)} pending step(s) — "
+                    f"auto-completing current step '{step.description[:60]}' and advancing."
                 )
+
+                step.status = StepStatus.COMPLETE
+                step.result = summary
+                step.completed_at = datetime.now(timezone.utc)
+
+                if not getattr(step, "tool_calls", None):
+                    step.tool_calls = []
+
+                step.tool_calls.append({
+                    "id": tool_call.id,
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "result": summary,
+                    "success": True,
+                    "time_ms": 0,
+                    **({"_gemini_raw_part": tc_data["_gemini_raw_part"]} if "_gemini_raw_part" in tc_data else {}),
+                })
 
                 yield TaskEvent(
                     type=TaskEventType.TOOL_CALLED,
@@ -552,32 +586,11 @@ class TaskExecutor:
                     task_id=task.id,
                     step_id=step.id,
                     tool_name=tool_name,
-                    tool_result=error_msg,
+                    tool_result=summary,
                     progress=self._progress_callback(task),
                 )
-                
-                if not getattr(step, "tool_calls", None):
-                    step.tool_calls = []
-                    
-                step.tool_calls.append({
-                    "id": tool_call.id,
-                    "tool": tool_name,
-                    "args": tool_args,
-                    "result": error_msg,
-                    "success": False,
-                    "time_ms": 0,
-                    **({"_gemini_raw_part": tc_data["_gemini_raw_part"]} if "_gemini_raw_part" in tc_data else {}),
-                })
-                
-                # Record in diagnostic tracker
-                tracker = self._get_tracker(step.id)
-                tracker.record(
-                    tool_name=tool_name,
-                    args=tool_args,
-                    result_output="",
-                    success=False,
-                    error=error_msg,
-                )
+
+                await self._persistence.update_task(task)
                 return
 
         yield TaskEvent(
@@ -1255,6 +1268,9 @@ class TaskExecutor:
         if response.get("tool_calls"):
             tool_calls = response["tool_calls"]
 
+            # Reset text-only streak — LLM is actively using tools
+            self._text_only_streak[step.id] = 0
+
             # Capture LLM's text content alongside tool calls
             # (e.g. "I'll check the MCP server..." before calling tools).
             # This ensures step.result has meaningful content even if
@@ -1264,12 +1280,12 @@ class TaskExecutor:
 
             if len(tool_calls) > 1:
                 logger.info(f"LLM returned {len(tool_calls)} tool calls — dispatching in parallel")
-                
+
                 # Assign a unified turn_id to all tool calls from this batch
                 turn_id = str(uuid.uuid4())
                 for tc in tool_calls:
                     tc["turn_id"] = turn_id
-                    
+
                 async for event in self._execute_tools_parallel(tool_calls, task, step):
                     yield event
             else:
@@ -1289,15 +1305,34 @@ class TaskExecutor:
                 progress=self._progress_callback(task),
             )
 
+            # Track consecutive text-only responses to detect stuck loops
+            self._text_only_streak.setdefault(step.id, 0)
+            self._text_only_streak[step.id] += 1
+
             is_simple_chat = bool(task.messages and total == 1)
+            has_done_work = bool(step.tool_calls)
             is_done_phrase = any(phrase in text.lower() for phrase in [
                 "step is complete",
                 "this step is done",
                 "completed this step",
                 "no tools needed",
+                "done!",
+                "here's the summary",
+                "here's what was",
+                "here's what i",
+                "task complete",
+                "all tasks completed",
+                "cleanup complete",
+                "i've completed",
+                "successfully completed",
+                "successfully deleted",
+                "actions taken",
             ])
+            # Safety valve: if LLM returns text-only 2+ times in a row,
+            # it's stuck in a summary loop — force-complete the step.
+            has_high_streak = self._text_only_streak[step.id] >= 2
 
-            if is_simple_chat or is_done_phrase:
+            if is_simple_chat or has_done_work or is_done_phrase or has_high_streak:
                 step.status = StepStatus.COMPLETE
                 step.result = text
                 step.completed_at = datetime.now(timezone.utc)

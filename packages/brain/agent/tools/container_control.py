@@ -307,6 +307,44 @@ async def _get_own_image() -> str:
     return ""
 
 
+def _get_host_project_path() -> str | None:
+    """Resolve the host-side path that is bind-mounted to ``/project``.
+
+    Inside a Docker container the project lives at ``/project``, but Docker
+    volume mounts require the **host** path.  We inspect our own container
+    metadata via the Docker CLI (which talks to the daemon over the mounted
+    socket) to find the ``Source`` of the bind-mount whose ``Destination``
+    is ``/project``.
+
+    Falls back to the ``HOST_PROJECT_ROOT`` env-var when inspection fails.
+    """
+    hostname = os.uname().nodename
+    try:
+        result = subprocess.run(
+            [
+                "docker", "inspect", "--format",
+                '{{range .Mounts}}{{if eq .Destination "/project"}}{{.Source}}{{end}}{{end}}',
+                hostname,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            host_path = result.stdout.strip()
+            logger.info(f"container_control: resolved host project path: {host_path}")
+            return host_path
+    except Exception as e:
+        logger.warning(f"container_control: could not inspect host project path: {e}")
+
+    fallback = os.getenv("HOST_PROJECT_ROOT", "")
+    if fallback:
+        logger.info(f"container_control: using HOST_PROJECT_ROOT fallback: {fallback}")
+        return fallback
+
+    return None
+
+
 async def _container_rebuild(service: str, user_requested: bool = False) -> dict:
     """Rebuild the image for a service and restart it.
 
@@ -356,6 +394,15 @@ async def _container_rebuild(service: str, user_requested: bool = False) -> dict
     if not compose_cmd:
         return {"success": False, "error": "No container runtime found."}
 
+    # Resolve the real host path so Docker volume mounts use a path that
+    # exists on the host rather than the container-internal "/project".
+    host_project_path = _get_host_project_path()
+    if not host_project_path:
+        logger.warning(
+            "container_control: could not determine host project path; "
+            "volume mounts will use the container path and may fail"
+        )
+
     # Step 1: Pull latest code
     try:
         pull_result = subprocess.run(
@@ -375,6 +422,10 @@ async def _container_rebuild(service: str, user_requested: bool = False) -> dict
     is_self_rebuild = (service == "brain")
 
     if is_self_rebuild:
+        # When we know the host path, the helper container mounts the project
+        # at that real host path so that `docker compose` resolves relative
+        # volume paths (e.g. `.:/project`) against the actual host filesystem.
+        helper_work_dir = host_project_path or project_root
         rebuild_cmd = " ".join(compose_cmd + ["up", "--build", "-d", service])
         own_image = await _get_own_image()
 
@@ -390,8 +441,8 @@ async def _container_rebuild(service: str, user_requested: bool = False) -> dict
             helper_args = [
                 "docker", "run", "--rm", "-d",
                 "-v", "/var/run/docker.sock:/var/run/docker.sock",
-                "-v", f"{project_root}:{project_root}",
-                "-w", project_root,
+                "-v", f"{helper_work_dir}:{helper_work_dir}",
+                "-w", helper_work_dir,
                 "--entrypoint", "/bin/sh",
                 own_image,
                 "-c",
@@ -452,9 +503,13 @@ async def _container_rebuild(service: str, user_requested: bool = False) -> dict
             "git_pull": git_status,
         }
 
-    # Non-self rebuild: normal synchronous path
+    # Non-self rebuild: normal synchronous path.
+    # When the host project path is known, pass --project-directory so that
+    # relative volume paths in docker-compose.yml resolve against the real
+    # host filesystem rather than the container-internal "/project".
     logger.info(f"container_control: rebuilding {service}")
-    result = _run_compose(["up", "--build", "-d", service], timeout=300)
+    proj_dir_args = ["--project-directory", host_project_path] if host_project_path else []
+    result = _run_compose(proj_dir_args + ["up", "--build", "-d", service], timeout=300)
     if result.get("success"):
         return {
             "message": f"✅ Rebuilt and restarted '{service}'",

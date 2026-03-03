@@ -78,8 +78,8 @@ class ModelRoute:
 # ── Default Routing Table ────────────────────────────────────────────
 
 # Environment-driven defaults for local models (these don't need API discovery)
-_OLLAMA_MODEL = os.getenv("ROUTER_OLLAMA_MODEL", "qwen3:8b")
-_OLLAMA_LARGE_MODEL = os.getenv("ROUTER_OLLAMA_LARGE_MODEL", "qwen3:32b")
+_OLLAMA_MODEL = os.getenv("ROUTER_OLLAMA_MODEL", "glm5")
+_OLLAMA_LARGE_MODEL = os.getenv("ROUTER_OLLAMA_LARGE_MODEL", "glm5")
 _DEFAULT_STRATEGY = RoutingStrategy(
     os.getenv("ROUTER_STRATEGY", RoutingStrategy.LOCAL_FIRST.value)
 )
@@ -420,7 +420,7 @@ class ModelRouter:
 
         # If a workspace model is configured, override all local routes
         # so the user's chosen model (e.g. glm-5:cloud) is used everywhere
-        # instead of the hardcoded default (qwen3:8b).
+        # instead of the hardcoded default (glm5).
         if workspace_model:
             for st, route in self._routes.items():
                 if route.provider in ("ollama", "local"):

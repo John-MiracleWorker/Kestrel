@@ -55,7 +55,7 @@ def _build_failure_note(reason: str) -> str:
 
     return f"*(Note: Task stopped before completion: {normalized[:160]})*"
 
-async def parse_agent_event(item, full_response_parts, tool_results_gathered, provider, model, api_key, make_response_fn):
+async def parse_agent_event(item, full_response_parts, tool_results_gathered, provider, model, api_key, make_response_fn, thinking_shown=None):
     msg_type, payload = item
 
     if msg_type == "error":
@@ -74,9 +74,12 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
             metadata={"agent_status": "thinking", "thinking": event.content[:200]},
         )
         thinking_preview = (event.content or "")[:150].replace('\n', ' ')
-        if thinking_preview and not full_response_parts:
+        already_shown = thinking_shown and thinking_shown[0]
+        if thinking_preview and not full_response_parts and not already_shown:
             thinking_text = f"\n\n💭 *{thinking_preview}...*\n\n"
             yield make_response_fn(chunk_type=0, content_delta=thinking_text)
+            if thinking_shown is not None:
+                thinking_shown[0] = True
 
     elif event_type == "tool_called":
         yield make_response_fn(
