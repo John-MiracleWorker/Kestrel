@@ -16,6 +16,15 @@ import httpx
 
 logger = logging.getLogger("brain.providers.ollama")
 
+
+class OllamaUnavailableError(Exception):
+    """Raised when Ollama is unreachable or times out.
+
+    Callers should catch this and failover to a cloud provider.
+    """
+    pass
+
+
 # Configurable base URL — defaults to standard Ollama address
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
 
@@ -66,6 +75,16 @@ class OllamaProvider:
         if not ready:
             logger.debug("Ollama health check failed")
         return ready
+
+    @staticmethod
+    def invalidate_health() -> None:
+        """Force-clear the health cache so next call re-checks.
+
+        Call this after a runtime failure (timeout, connection error) so
+        subsequent resolve_provider() calls don't keep routing to Ollama.
+        """
+        _health_cache["ready"] = False
+        _health_cache["checked_at"] = 0
 
     @property
     def last_response(self) -> str:
@@ -151,12 +170,26 @@ class OllamaProvider:
                 logger.error(f"Ollama rate limited (429): {e}")
                 raise  # Let executor handle failover
             logger.error(f"Ollama stream error: {e}")
-            yield f"[Error: {e}]"
-        except httpx.ConnectError:
-            yield f"[Error: Cannot connect to Ollama at {self._base_url}]"
+            self.invalidate_health()
+            raise OllamaUnavailableError(f"Ollama HTTP error: {e}") from e
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            logger.error(f"Cannot connect to Ollama at {self._base_url}: {e}")
+            self.invalidate_health()
+            raise OllamaUnavailableError(
+                f"Cannot connect to Ollama at {self._base_url}"
+            ) from e
+        except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
+            logger.error(f"Ollama stream timeout for model {model}: {e}")
+            self.invalidate_health()
+            raise OllamaUnavailableError(
+                f"Ollama stream timeout for model {model}"
+            ) from e
+        except OllamaUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"Ollama stream error: {e}")
-            yield f"[Error: {e}]"
+            self.invalidate_health()
+            raise OllamaUnavailableError(f"Ollama stream error: {e}") from e
 
     # ── Non-Streaming Generate ───────────────────────────────────────
 
@@ -296,18 +329,40 @@ class OllamaProvider:
                 "tool_calls": tool_calls,
             }
 
-        except httpx.ConnectError:
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             logger.error(f"Cannot connect to Ollama at {self._base_url}")
-            raise
-        except httpx.ReadTimeout:
+            self.invalidate_health()
+            raise OllamaUnavailableError(
+                f"Cannot connect to Ollama at {self._base_url}"
+            ) from e
+        except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
             logger.error(
-                f"Ollama read timeout after {timeout}s "
+                f"Ollama timeout after {timeout}s "
                 f"(model={model}, messages={len(clean_messages)}, tools={len(ollama_tools)})"
             )
-            raise RuntimeError(f"Ollama timeout after {timeout}s for model {model}")
+            self.invalidate_health()
+            raise OllamaUnavailableError(
+                f"Ollama timeout after {timeout}s for model {model}"
+            ) from e
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"Ollama generate_with_tools HTTP error: {e}\n"
+                f"  model={model}, messages={len(clean_messages)}, tools={len(ollama_tools)}"
+            )
+            if e.response.status_code in (502, 503, 504):
+                self.invalidate_health()
+                raise OllamaUnavailableError(
+                    f"Ollama server error {e.response.status_code} for model {model}"
+                ) from e
+            raise
+        except OllamaUnavailableError:
+            raise
         except Exception as e:
             logger.error(
                 f"Ollama generate_with_tools failed: {type(e).__name__}: {e}\n"
                 f"  model={model}, messages={len(clean_messages)}, tools={len(ollama_tools)}"
             )
-            raise
+            self.invalidate_health()
+            raise OllamaUnavailableError(
+                f"Ollama failed: {type(e).__name__}: {e}"
+            ) from e
