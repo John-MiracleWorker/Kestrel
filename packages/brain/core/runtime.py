@@ -45,6 +45,10 @@ class Runtime:
     session_manager: Any = None
     sandbox_manager: Any = None
 
+    # God-tier feature references
+    outcome_simulator: Any = None
+    proactive_engine: Any = None
+
     def validate_required(self) -> list[str]:
         """Return names of critical services that are still None."""
         required = [

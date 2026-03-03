@@ -51,6 +51,8 @@ from agent.observability import MetricsCollector
 from agent.model_router import ModelRouter, classify_step
 from agent.council import CouncilSession, CouncilRole
 from agent.core.executor import TaskExecutor
+from agent.step_scheduler import StepScheduler
+from agent.simulation import OutcomeSimulator
 
 logger = logging.getLogger("brain.agent.loop")
 
@@ -88,6 +90,9 @@ class AgentLoop:
         model_router: Optional[ModelRouter] = None,
         provider_resolver=None,
         approval_memory=None,
+        simulator: Optional[OutcomeSimulator] = None,
+        verifier=None,
+        persona_learner=None,
     ):
         self._provider = provider
         self._provider_resolver = provider_resolver  # callable: (name) -> provider
@@ -105,6 +110,8 @@ class AgentLoop:
         self._reflection_engine = reflection_engine
         self._model_router = model_router or ModelRouter()
         self._approval_memory = approval_memory
+        self._simulator = simulator
+        self._persona_learner = persona_learner
         self._metrics = MetricsCollector(model=model)
         self._council = CouncilSession(
             llm_provider=provider,
@@ -126,6 +133,17 @@ class AgentLoop:
             evidence_chain=evidence_chain,
             progress_callback=self._progress,
             approval_memory=approval_memory,
+            verifier=verifier,
+        )
+
+        self._step_scheduler = StepScheduler(
+            executor=self._executor,
+            planner=self._planner,
+            guardrails=guardrails,
+            persistence=persistence,
+            tool_registry=tool_registry,
+            learner=learner,
+            event_callback=event_callback,
         )
 
         # Callback for approval resolution (set by the gRPC handler)
@@ -282,6 +300,21 @@ class AgentLoop:
                 except Exception as e:
                     logger.warning(f"Memory graph query failed: {e}")
 
+            # ── Phase 0b: Load user persona for prompt injection ──
+            if self._persona_learner and task.user_id:
+                try:
+                    persona_prefs = await self._persona_learner.load_persona(task.user_id)
+                    persona_context = self._persona_learner.format_for_prompt(persona_prefs)
+                    if persona_context:
+                        self._executor._persona_context = persona_context
+                        if self._event_callback:
+                            await self._event_callback("persona_loaded", {
+                                "user_id": task.user_id,
+                                "preview": persona_context[:200],
+                            })
+                except Exception as e:
+                    logger.warning(f"Persona loading failed: {e}")
+
             # ── Phase 1: Planning ────────────────────────────────
             if task.status == TaskStatus.PLANNING:
                 task.status = TaskStatus.PLANNING
@@ -385,6 +418,54 @@ class AgentLoop:
                     except Exception as e:
                         logger.warning(f"Reflection engine failed: {e}")
 
+                # ── Simulation Gate: Pre-flight outcome simulation ─────
+                if self._simulator and len(task.plan.steps) > 1:
+                    try:
+                        sim_result = await self._simulator.simulate(
+                            plan=task.plan,
+                            tool_names=[t.name for t in self._tools.list_tools()],
+                        )
+                        if self._evidence_chain:
+                            self._evidence_chain.record_plan_decision(
+                                plan_summary=f"Simulation: {sim_result.recommendation} (risk={sim_result.overall_risk})",
+                                reasoning=sim_result.summary(),
+                                confidence=0.8 if sim_result.should_proceed else 0.3,
+                            )
+                        if not sim_result.should_proceed:
+                            yield TaskEvent(
+                                type=TaskEventType.SIMULATION_COMPLETE,
+                                task_id=task.id,
+                                content=sim_result.summary(),
+                                progress=self._progress(task),
+                            )
+                            yield TaskEvent(
+                                type=TaskEventType.APPROVAL_NEEDED,
+                                task_id=task.id,
+                                content="Simulation recommends aborting this plan. Proceed anyway?",
+                                progress=self._progress(task),
+                            )
+                            task.status = TaskStatus.WAITING_APPROVAL
+                            await self._persistence.update_task(task)
+
+                            approved = await self._executor._wait_for_approval(task)
+                            if not approved:
+                                task.status = TaskStatus.FAILED
+                                task.error = "User aborted after simulation warning."
+                                await self._persistence.update_task(task)
+                                return
+
+                            task.status = TaskStatus.EXECUTING
+                            await self._persistence.update_task(task)
+                        else:
+                            yield TaskEvent(
+                                type=TaskEventType.SIMULATION_COMPLETE,
+                                task_id=task.id,
+                                content=sim_result.summary(),
+                                progress=self._progress(task),
+                            )
+                    except Exception as e:
+                        logger.warning(f"Simulation gate failed: {e}")
+
                 # ── Council Deliberation: Multi-Agent Consensus ─────
                 # Only invoke council for complex plans (complexity > 5.0)
                 # to avoid wasting 5+ LLM calls on simple tasks
@@ -482,167 +563,16 @@ class AgentLoop:
             task.status = TaskStatus.EXECUTING
             await self._persistence.update_task(task)
 
-            while not task.plan.is_complete:
-                task.iterations += 1
-
-                # Budget checks
-                budget_error = self._guardrails.check_budget(task)
-                if budget_error:
-                    task.status = TaskStatus.FAILED
-                    task.error = budget_error
-                    await self._persistence.update_task(task)
-                    yield TaskEvent(
-                        type=TaskEventType.TASK_FAILED,
-                        task_id=task.id,
-                        content=budget_error,
-                        progress=self._progress(task),
-                    )
+            # Use the parallel step scheduler for DAG-aware execution
+            async for event in self._step_scheduler.execute_plan(
+                task=task,
+                start_time=start_time,
+                should_replan_fn=self._should_replan,
+                progress_fn=self._progress,
+            ):
+                yield event
+                if event.type == TaskEventType.TASK_FAILED:
                     return
-
-                # Wall-clock time check
-                elapsed = time.monotonic() - start_time
-                if elapsed > task.config.max_wall_time_seconds:
-                    task.status = TaskStatus.FAILED
-                    task.error = f"Wall-clock time limit exceeded ({int(elapsed)}s)"
-                    await self._persistence.update_task(task)
-                    yield TaskEvent(
-                        type=TaskEventType.TASK_FAILED,
-                        task_id=task.id,
-                        content=task.error,
-                        progress=self._progress(task),
-                    )
-                    return
-
-                # Get next step
-                step = task.plan.current_step
-                if not step:
-                    # No more executable steps (deps not met or all done)
-                    break
-
-                if step.status == StepStatus.PENDING:
-                    step.status = StepStatus.IN_PROGRESS
-                    step.started_at = datetime.now(timezone.utc)
-                    await self._persistence.update_task(task)
-
-                    yield TaskEvent(
-                        type=TaskEventType.STEP_STARTED,
-                        task_id=task.id,
-                        step_id=step.id,
-                        content=step.description,
-                        progress=self._progress(task),
-                    )
-
-                # ── Reason: Ask LLM what to do ───────────────────
-                async for event in self._executor.run_step(task, step):
-                    yield event
-
-                    # Check if we need to pause for approval
-                    if event.type == TaskEventType.APPROVAL_NEEDED:
-                        task.status = TaskStatus.WAITING_APPROVAL
-                        await self._persistence.update_task(task)
-
-                        # Wait for approval (this blocks until resolved)
-                        approved = await self._executor._wait_for_approval(task)
-                        if not approved:
-                            # Denied — skip this step
-                            step.status = StepStatus.SKIPPED
-                            step.result = "Skipped — human denied approval"
-                            task.status = TaskStatus.EXECUTING
-                            await self._persistence.update_task(task)
-                            break  # Move to next step
-
-                        task.status = TaskStatus.EXECUTING
-                        await self._persistence.update_task(task)
-
-                    # Check if step completed
-                    if step.status == StepStatus.COMPLETE:
-                        yield TaskEvent(
-                            type=TaskEventType.STEP_COMPLETE,
-                            task_id=task.id,
-                            step_id=step.id,
-                            content=step.result or "",
-                            progress=self._progress(task),
-                        )
-                        # Online learning: capture recovery patterns mid-execution
-                        if step.attempts > 1 and self._learner:
-                            try:
-                                from agent.learner import Lesson
-                                recovery_lesson = Lesson(
-                                    category="pattern",
-                                    summary=f"Recovery: {step.description[:80]}",
-                                    details=(
-                                        f"Step failed {step.attempts - 1} time(s) before succeeding. "
-                                        f"Error was: {(step.error or 'unknown')[:200]}"
-                                    ),
-                                    tools_used=[],
-                                    success=True,
-                                    confidence=0.7,
-                                    tags=["mid_execution", "recovery"],
-                                    source_task_id=task.id,
-                                )
-                                await self._learner._store_lessons(
-                                    task.workspace_id, [recovery_lesson]
-                                )
-                                logger.debug(
-                                    f"Mid-execution lesson captured for step "
-                                    f"'{step.description[:40]}' (attempts={step.attempts})"
-                                )
-                            except Exception as e:
-                                logger.debug(f"Mid-execution lesson capture failed: {e}")
-                        break
-
-                    if step.status == StepStatus.FAILED:
-                        # Try retry with exponential backoff (max 3 attempts per step)
-                        if step.attempts < 3:
-                            step.status = StepStatus.IN_PROGRESS
-                            step.attempts += 1
-                            # Use longer backoff for rate-limit errors to avoid
-                            # hammering the provider and cascading 429s.
-                            is_rate_limited = step.error and (
-                                "429" in step.error or "rate limit" in step.error.lower()
-                            )
-                            if is_rate_limited:
-                                backoff_delay = 15 * step.attempts  # 15s, 30s, 45s
-                            else:
-                                backoff_delay = 2 ** (step.attempts - 1)  # 1s, 2s, 4s
-                            logger.info(
-                                f"Retrying step {step.id} (attempt {step.attempts}/3, "
-                                f"backoff {backoff_delay}s): {step.error or 'unknown error'}"
-                            )
-                            await asyncio.sleep(backoff_delay)
-                        else:
-                            yield TaskEvent(
-                                type=TaskEventType.TASK_FAILED,
-                                task_id=task.id,
-                                step_id=step.id,
-                                content=step.error or "Step failed after 3 attempts",
-                                progress=self._progress(task),
-                            )
-                            task.status = TaskStatus.FAILED
-                            task.error = f"Step '{step.description[:80]}' failed after 3 retries: {step.error}"
-                            await self._persistence.update_task(task)
-                            return
-
-                # ── Reflect: Should we replan? ───────────────────
-                # Skip reflection if budget is already exhausted
-                budget_ok = self._guardrails.check_budget(task) is None
-                if (
-                    budget_ok
-                    and step
-                    and step.status == StepStatus.COMPLETE
-                    and self._should_replan(task)
-                ):
-                    task.status = TaskStatus.REFLECTING
-                    await self._persistence.update_task(task)
-
-                    revised = await self._planner.revise_plan(
-                        plan=task.plan,
-                        observations=step.result or "",
-                        available_tools=self._tools.list_tools(),
-                    )
-                    task.plan = revised
-                    task.status = TaskStatus.EXECUTING
-                    await self._persistence.update_task(task)
 
             # ── Phase 3: Completion ──────────────────────────────
             task.status = TaskStatus.COMPLETE
@@ -719,6 +649,18 @@ class AgentLoop:
                         logger.info(f"Memory graph: stored {len(_entities)} entities, {len(_relations)} relations from task {task.id}")
                 except Exception as e:
                     logger.warning(f"Memory graph update failed: {e}")
+
+            # ── Phase 4b: Observe persona signals ──────────────────
+            if self._persona_learner and task.result:
+                try:
+                    await self._persona_learner.observe_communication(
+                        user_id=task.user_id,
+                        user_message=task.goal,
+                        agent_response=task.result[:500],
+                    )
+                    await self._persona_learner.observe_session_timing(task.user_id)
+                except Exception as e:
+                    logger.warning(f"Persona observation failed: {e}")
 
             # ── Phase 5: Learn from this task ────────────────────
             if self._learner:

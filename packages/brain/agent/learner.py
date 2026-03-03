@@ -460,3 +460,99 @@ class TaskLearner:
                 f"Lesson storage: {stored_count} new, {dedup_count} deduplicated "
                 f"(workspace {workspace_id})"
             )
+
+    async def learn_from_eval(
+        self,
+        eval_results: list,
+        workspace_id: str = "eval-workspace",
+    ) -> list[Lesson]:
+        """
+        Extract systemic lessons from a batch of evaluation results.
+
+        Identifies patterns:
+          - Which tool sequences consistently succeed
+          - Which scenario types consistently fail
+          - Common error patterns
+          - Model routing insights
+        """
+        if not eval_results:
+            return []
+
+        # Aggregate stats
+        total = len(eval_results)
+        successes = sum(1 for r in eval_results if r.success)
+        failures = total - successes
+        avg_iters = sum(r.iterations for r in eval_results) / max(total, 1)
+
+        # Identify patterns
+        failing_scenarios = [r for r in eval_results if not r.success]
+        succeeding_scenarios = [r for r in eval_results if r.success]
+
+        lessons = []
+
+        # Lesson: Overall success rate
+        if total >= 3:
+            rate = successes / total
+            if rate < 0.5:
+                lessons.append(Lesson(
+                    category="pitfall",
+                    summary=f"Low eval success rate: {rate:.0%} ({successes}/{total})",
+                    details=(
+                        f"Only {successes} of {total} eval scenarios passed. "
+                        f"Average iterations: {avg_iters:.1f}. "
+                        f"Failing scenarios: {', '.join(r.scenario_name for r in failing_scenarios[:3])}"
+                    ),
+                    success=False,
+                    confidence=0.9,
+                    tags=["eval", "systemic"],
+                ))
+            elif rate >= 0.8:
+                lessons.append(Lesson(
+                    category="pattern",
+                    summary=f"Strong eval success rate: {rate:.0%} ({successes}/{total})",
+                    details=(
+                        f"{successes} of {total} scenarios passed. "
+                        f"Average iterations: {avg_iters:.1f}. The agent is performing well."
+                    ),
+                    success=True,
+                    confidence=0.85,
+                    tags=["eval", "positive"],
+                ))
+
+        # Lesson: High-iteration failures
+        slow_failures = [r for r in failing_scenarios if r.iterations >= 10]
+        if slow_failures:
+            lessons.append(Lesson(
+                category="pitfall",
+                summary="Slow failures detected in eval scenarios",
+                details=(
+                    f"{len(slow_failures)} scenario(s) used 10+ iterations before failing: "
+                    f"{', '.join(r.scenario_name for r in slow_failures[:3])}. "
+                    f"Consider adding early exit conditions or better planning."
+                ),
+                success=False,
+                confidence=0.8,
+                tags=["eval", "efficiency"],
+            ))
+
+        # Lesson: Fast successes
+        fast_successes = [r for r in succeeding_scenarios if r.iterations <= 3]
+        if fast_successes and len(fast_successes) >= 2:
+            lessons.append(Lesson(
+                category="shortcut",
+                summary=f"{len(fast_successes)} scenarios completed in 3 or fewer iterations",
+                details=(
+                    f"Scenarios: {', '.join(r.scenario_name for r in fast_successes[:3])}. "
+                    f"These represent well-optimized tool usage patterns."
+                ),
+                success=True,
+                confidence=0.75,
+                tags=["eval", "efficiency"],
+            ))
+
+        # Store lessons
+        if lessons:
+            await self._store_lessons(workspace_id, lessons)
+            logger.info(f"Extracted {len(lessons)} lessons from {total} eval results")
+
+        return lessons

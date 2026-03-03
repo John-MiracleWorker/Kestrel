@@ -543,6 +543,72 @@ class Coordinator:
 
         return final
 
+    async def auto_decompose(
+        self,
+        task: AgentTask,
+        llm_provider=None,
+        model: str = "",
+    ) -> list[dict] | None:
+        """
+        Analyze a task goal and determine if it should be auto-decomposed
+        into specialist subtasks.
+
+        Returns a list of subtask dicts [{goal, specialist}] if decomposition
+        is beneficial, or None if the task should run as a single agent.
+        """
+        if not llm_provider:
+            llm_provider = getattr(self._loop, '_provider', None)
+        if not llm_provider:
+            return None
+
+        model = model or getattr(self._loop, '_model', '')
+        specialists = self.get_specialist_info()
+        spec_descriptions = "\n".join(
+            f"  - {s['type']}: {s['persona'][:100]}"
+            for s in specialists[:8]
+        )
+
+        try:
+            import json as _json
+            prompt = (
+                f"Analyze this task goal and decide if it should be split "
+                f"across specialist sub-agents for better results.\n\n"
+                f"Goal: {task.goal}\n\n"
+                f"Available specialists:\n{spec_descriptions}\n\n"
+                f"If the task should be split, respond with a JSON array of subtasks:\n"
+                f'[{{"goal": "...", "specialist": "researcher|coder|analyst|..."}}]\n\n'
+                f"If the task should NOT be split (it's simple enough for one agent), "
+                f'respond with: {{"should_split": false}}'
+            )
+
+            response = await llm_provider.generate(
+                messages=[{"role": "user", "content": prompt}],
+                model=model,
+                temperature=0.3,
+                max_tokens=1024,
+            )
+
+            raw = response if isinstance(response, str) else response.get("content", "")
+            # Strip markdown fences
+            import re
+            raw = re.sub(r"```json\s*", "", raw)
+            raw = re.sub(r"```\s*$", "", raw)
+            data = _json.loads(raw.strip())
+
+            if isinstance(data, dict) and not data.get("should_split", True):
+                return None
+
+            if isinstance(data, list) and len(data) >= 2:
+                logger.info(
+                    f"Auto-decomposition: splitting task into {len(data)} subtasks"
+                )
+                return data
+
+        except Exception as e:
+            logger.debug(f"Auto-decomposition failed: {e}")
+
+        return None
+
     def get_specialist_info(self) -> list[dict]:
         """Return descriptions of all available specialists (built-in + dynamic)."""
         infos = []
