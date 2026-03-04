@@ -207,13 +207,19 @@ class MCPClient:
                 # Second attempt after reconnect failed
                 return {"error": "Reconnect failed — MCP server unreachable"}
 
-            # Validate tool exists
+            # Validate tool exists (with fuzzy name resolution)
             valid_tools = [t["name"] for t in self._tools]
             if tool_name not in valid_tools:
-                return {
-                    "error": f"Tool '{tool_name}' not found on '{self.name}'",
-                    "available_tools": valid_tools,
-                }
+                # Try fuzzy match: e.g. "list_messages" -> "gmail_list_messages"
+                matches = [t for t in valid_tools if t.endswith(f"_{tool_name}") or t.endswith(tool_name)]
+                if len(matches) == 1:
+                    logger.info(f"MCP '{self.name}': resolved '{tool_name}' -> '{matches[0]}'")
+                    tool_name = matches[0]
+                else:
+                    return {
+                        "error": f"Tool '{tool_name}' not found on '{self.name}'",
+                        "available_tools": valid_tools,
+                    }
 
             try:
                 result = await self._send_request("tools/call", {
