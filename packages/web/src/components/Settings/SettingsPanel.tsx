@@ -17,8 +17,14 @@ import { PrReviewsTab } from './tabs/PrReviewsTab';
 import { ApiKeysTab } from './tabs/ApiKeysTab';
 import { GeneralTab } from './tabs/GeneralTab';
 import { ProfileTab } from './tabs/ProfileTab';
+import { OllamaTab } from './tabs/OllamaTab';
 
-export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId }: SettingsPanelProps) {
+export function SettingsPanel({
+    onClose,
+    userEmail,
+    userDisplayName,
+    workspaceId,
+}: SettingsPanelProps) {
     const [activeTab, setActiveTab] = useState<TabId>('model');
     const [saving, setSaving] = useState(false);
     const [saveStatus, setSaveStatus] = useState<string | null>(null);
@@ -83,18 +89,20 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                     setSystemPrompt(defaultProv.systemPrompt || defaultProv.system_prompt || '');
                     setRagEnabled(defaultProv.ragEnabled ?? defaultProv.rag_enabled ?? true);
                     setRagTopK(defaultProv.ragTopK || defaultProv.rag_top_k || 5);
-                    setRagMinSimilarity(defaultProv.ragMinSimilarity || defaultProv.rag_min_similarity || 0.7);
+                    setRagMinSimilarity(
+                        defaultProv.ragMinSimilarity || defaultProv.rag_min_similarity || 0.7,
+                    );
                     // API key: gRPC keepCase returns api_key_encrypted
                     const hasKey = !!(defaultProv.apiKeyEncrypted || defaultProv.api_key_encrypted);
                     setApiKeyInput(hasKey ? DISPLAY_MASK : '');
                 }
             })
-            .catch(err => setError(err.message));
+            .catch((err) => setError(err.message));
 
         // 2. Capabilities
         request(`/workspaces/${workspaceId}/capabilities`)
             .then((data: any) => setCapabilities(data.capabilities || []))
-            .catch(err => console.error('Capabilities fail', err));
+            .catch((err) => console.error('Capabilities fail', err));
 
         // 3. Integration status (telegram, discord — runtime state)
         request(`/workspaces/${workspaceId}/integrations/status`)
@@ -106,7 +114,7 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                 setDiscordEnabled(dc.connected || false);
                 setDiscordToken(dc.tokenConfigured ? DISPLAY_MASK : '');
             })
-            .catch(err => console.error('Integrations status fail', err));
+            .catch((err) => console.error('Integrations status fail', err));
 
         // 4. Workspace settings (agent guardrails, cron, webhooks, PR reviews)
         request(`/workspaces/${workspaceId}/settings`)
@@ -140,7 +148,7 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                     setPrSeverityFilter(data.prReviews.severityFilter || 'all');
                 }
             })
-            .catch(err => console.error('Workspace settings fail', err));
+            .catch((err) => console.error('Workspace settings fail', err));
     }, [workspaceId]);
 
     useEffect(() => {
@@ -148,7 +156,7 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
             .then((data: any) => setAvailableModels(data.models || []))
             .catch(() => setAvailableModels([]));
 
-        const conf = providerConfigs.find(c => c.provider === selectedProvider);
+        const conf = providerConfigs.find((c) => c.provider === selectedProvider);
         if (conf) {
             setModel(conf.model || '');
             setTemperature(conf.temperature ?? 0.7);
@@ -156,12 +164,15 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
             const hasKey = !!(conf.apiKeyEncrypted || conf.api_key_encrypted);
             setApiKeyInput(hasKey ? DISPLAY_MASK : '');
         } else {
-            setModel(''); setApiKeyInput('');
+            setModel('');
+            setApiKeyInput('');
         }
     }, [selectedProvider, providerConfigs]);
 
     const handleWebhookEventToggle = (ev: string) => {
-        setWebhookEvents(prev => prev.includes(ev) ? prev.filter(e => e !== ev) : [...prev, ev]);
+        setWebhookEvents((prev) =>
+            prev.includes(ev) ? prev.filter((e) => e !== ev) : [...prev, ev],
+        );
     };
 
     const handleSave = async () => {
@@ -170,14 +181,21 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
         setSaveStatus(null);
         try {
             // 1. Save provider config (model, API key, temperature, etc.)
-            const apiReq = apiKeyInput && apiKeyInput !== DISPLAY_MASK ? { apiKey: apiKeyInput } : {};
+            const apiReq =
+                apiKeyInput && apiKeyInput !== DISPLAY_MASK ? { apiKey: apiKeyInput } : {};
             await request(`/workspaces/${workspaceId}/providers/${selectedProvider}`, {
                 method: 'PUT',
                 body: {
-                    model, temperature, maxTokens, systemPrompt,
-                    ragEnabled, ragTopK, ragMinSimilarity,
-                    isDefault: true, ...apiReq,
-                }
+                    model,
+                    temperature,
+                    maxTokens,
+                    systemPrompt,
+                    ragEnabled,
+                    ragTopK,
+                    ragMinSimilarity,
+                    isDefault: true,
+                    ...apiReq,
+                },
             });
 
             // 2. Save workspace settings (agent, cron, webhooks, PR reviews)
@@ -186,20 +204,29 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
                 body: {
                     agent: {
                         disabledTools: [...disabledTools],
-                        maxIterations, maxToolCalls, maxWallTime, autoApproveRisk,
+                        maxIterations,
+                        maxToolCalls,
+                        maxWallTime,
+                        autoApproveRisk,
                     },
                     cron: {
-                        enabled: cronEnabled, schedule: cronSchedule,
-                        maxRuns: cronMaxRuns, systemPrompt: cronSystemPrompt,
+                        enabled: cronEnabled,
+                        schedule: cronSchedule,
+                        maxRuns: cronMaxRuns,
+                        systemPrompt: cronSystemPrompt,
                     },
                     webhooks: {
-                        url: webhookUrl, secret: webhookSecret, events: webhookEvents,
+                        url: webhookUrl,
+                        secret: webhookSecret,
+                        events: webhookEvents,
                     },
                     prReviews: {
-                        enabled: prEnabled, autoApprove: prAutoApprove,
-                        postComments: prPostComments, severityFilter: prSeverityFilter,
+                        enabled: prEnabled,
+                        autoApprove: prAutoApprove,
+                        postComments: prPostComments,
+                        severityFilter: prSeverityFilter,
                     },
-                }
+                },
             });
 
             // 3. Save Telegram if token was updated (not masked)
@@ -224,7 +251,7 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
         }
     };
 
-    const tabs: Array<{ id: TabId, label: string, icon: string, section?: string }> = [
+    const tabs: Array<{ id: TabId; label: string; icon: string; section?: string }> = [
         { id: 'model', label: 'AI Model', icon: '⚡', section: 'Core' },
         { id: 'persona', label: 'Persona', icon: '🎭' },
         { id: 'memory', label: 'Memory (RAG)', icon: '🧠' },
@@ -232,6 +259,7 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
         { id: 'agent', label: 'Autonomy', icon: '🤖' },
         { id: 'capabilities', label: 'Capabilities', icon: '✨' },
         { id: 'integrations', label: 'Integrations', icon: '🔌', section: 'External' },
+        { id: 'ollama', label: 'Ollama Servers', icon: '⬡' },
         { id: 'automation', label: 'Automation', icon: '⏰' },
         { id: 'pr-reviews', label: 'PR Reviews', icon: '📝' },
         { id: 'api-keys', label: 'API Keys', icon: '🔑', section: 'Account' },
@@ -241,49 +269,203 @@ export function SettingsPanel({ onClose, userEmail, userDisplayName, workspaceId
 
     const renderContent = () => {
         switch (activeTab) {
-            case 'model': return <ModelTab {...{ providerConfigs, selectedProvider, onProviderSelect: setSelectedProvider, apiKeyInput, setApiKeyInput, model, setModel, availableModels, temperature, setTemperature, maxTokens, setMaxTokens }} />;
-            case 'persona': return <PersonaTab {...{ systemPrompt, setSystemPrompt }} />;
-            case 'memory': return <MemoryTab {...{ ragEnabled, setRagEnabled, ragTopK, setRagTopK, ragMinSimilarity, setRagMinSimilarity }} />;
-            case 'tools': return <ToolsTab {...{ workspaceId, disabledTools, setDisabledTools, setSaveStatus, setError }} />;
-            case 'agent': return <AgentTab {...{ maxIterations, setMaxIterations, maxToolCalls, setMaxToolCalls, maxWallTime, setMaxWallTime, autoApproveRisk, setAutoApproveRisk }} />;
-            case 'capabilities': return <CapabilitiesTab {...{ workspaceId, capabilities, setCapabilities, setError }} />;
-            case 'integrations': return <IntegrationsTab {...{ telegramEnabled, setTelegramEnabled, telegramToken, setTelegramToken, discordEnabled, setDiscordEnabled, discordToken, setDiscordToken, webhookUrl, setWebhookUrl, webhookSecret, setWebhookSecret, webhookEvents, handleWebhookEventToggle }} />;
-            case 'automation': return <AutomationTab {...{ cronEnabled, setCronEnabled, cronSchedule, setCronSchedule, cronMaxRuns, setCronMaxRuns, cronSystemPrompt, setCronSystemPrompt }} />;
-            case 'pr-reviews': return <PrReviewsTab {...{ prEnabled, setPrEnabled, prAutoApprove, setPrAutoApprove, prPostComments, setPrPostComments, prSeverityFilter, setPrSeverityFilter }} />;
-            case 'api-keys': return <ApiKeysTab workspaceId={workspaceId} />;
-            case 'general': return <GeneralTab />;
-            case 'profile': return <ProfileTab {...{ displayName, setDisplayName, userEmail }} />;
+            case 'model':
+                return (
+                    <ModelTab
+                        {...{
+                            providerConfigs,
+                            selectedProvider,
+                            onProviderSelect: setSelectedProvider,
+                            apiKeyInput,
+                            setApiKeyInput,
+                            model,
+                            setModel,
+                            availableModels,
+                            temperature,
+                            setTemperature,
+                            maxTokens,
+                            setMaxTokens,
+                            workspaceId,
+                        }}
+                    />
+                );
+            case 'persona':
+                return <PersonaTab {...{ systemPrompt, setSystemPrompt }} />;
+            case 'memory':
+                return (
+                    <MemoryTab
+                        {...{
+                            ragEnabled,
+                            setRagEnabled,
+                            ragTopK,
+                            setRagTopK,
+                            ragMinSimilarity,
+                            setRagMinSimilarity,
+                        }}
+                    />
+                );
+            case 'tools':
+                return (
+                    <ToolsTab
+                        {...{
+                            workspaceId,
+                            disabledTools,
+                            setDisabledTools,
+                            setSaveStatus,
+                            setError,
+                        }}
+                    />
+                );
+            case 'agent':
+                return (
+                    <AgentTab
+                        {...{
+                            maxIterations,
+                            setMaxIterations,
+                            maxToolCalls,
+                            setMaxToolCalls,
+                            maxWallTime,
+                            setMaxWallTime,
+                            autoApproveRisk,
+                            setAutoApproveRisk,
+                        }}
+                    />
+                );
+            case 'capabilities':
+                return (
+                    <CapabilitiesTab
+                        {...{ workspaceId, capabilities, setCapabilities, setError }}
+                    />
+                );
+            case 'integrations':
+                return (
+                    <IntegrationsTab
+                        {...{
+                            telegramEnabled,
+                            setTelegramEnabled,
+                            telegramToken,
+                            setTelegramToken,
+                            discordEnabled,
+                            setDiscordEnabled,
+                            discordToken,
+                            setDiscordToken,
+                            webhookUrl,
+                            setWebhookUrl,
+                            webhookSecret,
+                            setWebhookSecret,
+                            webhookEvents,
+                            handleWebhookEventToggle,
+                        }}
+                    />
+                );
+            case 'automation':
+                return (
+                    <AutomationTab
+                        {...{
+                            cronEnabled,
+                            setCronEnabled,
+                            cronSchedule,
+                            setCronSchedule,
+                            cronMaxRuns,
+                            setCronMaxRuns,
+                            cronSystemPrompt,
+                            setCronSystemPrompt,
+                        }}
+                    />
+                );
+            case 'pr-reviews':
+                return (
+                    <PrReviewsTab
+                        {...{
+                            prEnabled,
+                            setPrEnabled,
+                            prAutoApprove,
+                            setPrAutoApprove,
+                            prPostComments,
+                            setPrPostComments,
+                            prSeverityFilter,
+                            setPrSeverityFilter,
+                        }}
+                    />
+                );
+            case 'api-keys':
+                return <ApiKeysTab workspaceId={workspaceId} />;
+            case 'general':
+                return <GeneralTab />;
+            case 'profile':
+                return <ProfileTab {...{ displayName, setDisplayName, userEmail }} />;
+            case 'ollama':
+                return <OllamaTab workspaceId={workspaceId} />;
         }
     };
 
     return createPortal(
         <div style={S.backdrop} onClick={onClose}>
-            <div style={S.panel} onClick={e => e.stopPropagation()}>
+            <div style={S.panel} onClick={(e) => e.stopPropagation()}>
                 <nav style={S.nav}>
                     <div style={S.navHeader}>⚙ System Config</div>
-                    {tabs.map(tab => (
+                    {tabs.map((tab) => (
                         <div key={tab.id}>
                             {tab.section && <div style={S.navSection}>{tab.section}</div>}
-                            <button style={S.navItem(activeTab === tab.id)} onClick={() => setActiveTab(tab.id as TabId)}>
-                                <span style={{ fontSize: '0.9rem', width: '18px', textAlign: 'center' }}>{tab.icon}</span>
+                            <button
+                                style={S.navItem(activeTab === tab.id)}
+                                onClick={() => setActiveTab(tab.id as TabId)}
+                            >
+                                <span
+                                    style={{
+                                        fontSize: '0.9rem',
+                                        width: '18px',
+                                        textAlign: 'center',
+                                    }}
+                                >
+                                    {tab.icon}
+                                </span>
                                 {tab.label}
                             </button>
                         </div>
                     ))}
                     <div style={{ marginTop: 'auto', padding: '16px' }}>
-                        {saveStatus && <div style={{ fontSize: '0.7rem', color: '#00ff9d', marginBottom: '8px', textAlign: 'center' }}>✓ {saveStatus}</div>}
-                        {error && <div style={{ fontSize: '0.7rem', color: '#ff0055', marginBottom: '8px', textAlign: 'center' }}>✗ {error}</div>}
-                        <button style={{ ...S.btnPrimary, width: '100%', opacity: saving ? 0.5 : 1 }} onClick={handleSave} disabled={saving}>
+                        {saveStatus && (
+                            <div
+                                style={{
+                                    fontSize: '0.7rem',
+                                    color: '#00ff9d',
+                                    marginBottom: '8px',
+                                    textAlign: 'center',
+                                }}
+                            >
+                                ✓ {saveStatus}
+                            </div>
+                        )}
+                        {error && (
+                            <div
+                                style={{
+                                    fontSize: '0.7rem',
+                                    color: '#ff0055',
+                                    marginBottom: '8px',
+                                    textAlign: 'center',
+                                }}
+                            >
+                                ✗ {error}
+                            </div>
+                        )}
+                        <button
+                            style={{ ...S.btnPrimary, width: '100%', opacity: saving ? 0.5 : 1 }}
+                            onClick={handleSave}
+                            disabled={saving}
+                        >
                             {saving ? 'Saving...' : 'Save Changes'}
                         </button>
                     </div>
                 </nav>
                 <div style={S.content}>
-                    <button style={S.closeBtn} onClick={onClose}>✕</button>
+                    <button style={S.closeBtn} onClick={onClose}>
+                        ✕
+                    </button>
                     {renderContent()}
                 </div>
             </div>
         </div>,
-        document.body
+        document.body,
     );
 }

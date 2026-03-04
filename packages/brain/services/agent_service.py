@@ -67,6 +67,18 @@ class AgentServicerMixin(BaseServicerMixin):
             ws_config = await ProviderConfig(pool).get_config(workspace_id)
             provider_name = ws_config.get("provider", "local")
             task_provider = get_provider(provider_name)
+
+            # If workspace config specifies an explicit Ollama server URL,
+            # override the provider's base URL to connect to that host.
+            _ws_settings = ws_config.get("settings") or {}
+            if provider_name in ("ollama", "local") and _ws_settings.get("ollama_host"):
+                _host = _ws_settings["ollama_host"].rstrip("/")
+                logger.info(f"Task using workspace Ollama host: {_host}")
+                task_provider._base_url = _host
+                task_provider._explicit_url = _host
+                # Invalidate stale health cache so is_ready() re-checks the new URL
+                from providers.ollama import _health_cache
+                _health_cache["checked_at"] = 0
         except Exception as e:
             logger.warning(f"Failed to resolve workspace provider for task, using local: {e}")
             task_provider = get_provider("local")

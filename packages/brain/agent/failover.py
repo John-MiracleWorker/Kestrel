@@ -79,10 +79,17 @@ class ModelHealth:
 DEFAULT_CHAINS: dict[str, list[str]] = {}
 
 async def build_dynamic_chains() -> None:
-    """Populate DEFAULT_CHAINS from the model registry's discovered models."""
+    """Populate DEFAULT_CHAINS from the model registry's discovered models.
+    
+    Builds chains for both cloud providers and the local Ollama instance so
+    that failover can move seamlessly between local and cloud without hardcoded
+    model names.
+    """
     global DEFAULT_CHAINS
     try:
         from core.model_registry import model_registry
+
+        # 1. Cloud providers — build inter-model failover chains
         for provider in ("google", "openai", "anthropic"):
             models = await model_registry.list_models(provider)
             if not models:
@@ -92,6 +99,25 @@ async def build_dynamic_chains() -> None:
                 chain = await model_registry.build_failover_chain(provider, mid)
                 if chain:
                     DEFAULT_CHAINS[mid] = chain
+
+        # 2. Ollama — build a chain that goes local-fast → local-power → best cloud
+        ollama_models = await model_registry.get_ollama_models()
+        ollama_fast = await model_registry.get_ollama_fast_model()
+        ollama_power = await model_registry.get_ollama_power_model()
+        cloud_fast = await model_registry.get_fast_model("google")
+        for m in ollama_models:
+            mid = m["id"]
+            chain = [mid]
+            # Add the other power model if it differs from the primary
+            if ollama_power and ollama_power != mid:
+                chain.append(ollama_power)
+            elif ollama_fast and ollama_fast != mid:
+                chain.append(ollama_fast)
+            # Always append a cloud safety net
+            if cloud_fast:
+                chain.append(cloud_fast)
+            DEFAULT_CHAINS[mid] = chain
+
         logger.info(f"Failover: built dynamic chains for {len(DEFAULT_CHAINS)} models")
     except Exception as e:
         logger.warning(f"Failover: dynamic chain build failed, chains remain empty: {e}")
@@ -219,12 +245,19 @@ class ModelFailover:
     @staticmethod
     def _infer_provider(model: str) -> str:
         """Infer provider from model name."""
-        if "gpt" in model or "o3" in model or "o1" in model:
+        m = model.lower()
+        if "gpt" in m or m.startswith("o1") or m.startswith("o3"):
             return "openai"
-        if "claude" in model:
+        if "claude" in m:
             return "anthropic"
-        if "gemini" in model:
+        if "gemini" in m:
             return "google"
-        if "mistral" in model or "mixtral" in model:
+        if "mistral" in m or "mixtral" in m:
             return "mistral"
+        # Anything that looks like an Ollama tag (contains ':' or known local families)
+        if ":" in m or any(family in m for family in (
+            "qwen", "llama", "phi", "gemma", "glm", "deepseek",
+            "mistral", "mixtral", "codellama", "vicuna", "orca",
+        )):
+            return "ollama"
         return "unknown"

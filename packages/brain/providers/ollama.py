@@ -25,11 +25,14 @@ class OllamaUnavailableError(Exception):
     pass
 
 
-# Configurable base URL — defaults to standard Ollama address
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
+# Configurable base URL — if set, skips network scanning
+_EXPLICIT_OLLAMA_HOST = os.getenv("OLLAMA_HOST", "")
+
+# For backwards-compatibility: module-level constant still usable
+OLLAMA_HOST = _EXPLICIT_OLLAMA_HOST or "http://host.docker.internal:11434"
 
 # Default model to use when none specified
-OLLAMA_DEFAULT_MODEL = os.getenv("OLLAMA_DEFAULT_MODEL", "glm5")
+OLLAMA_DEFAULT_MODEL = os.getenv("OLLAMA_DEFAULT_MODEL", "")
 
 # Default context window — set higher for agent workflows
 OLLAMA_CONTEXT_LENGTH = int(os.getenv("OLLAMA_CONTEXT_LENGTH", "16384"))
@@ -50,30 +53,78 @@ class OllamaProvider:
       - Model discovery (list installed models)
     """
 
+    provider = "ollama"  # provider identifier for the registry
+
     def __init__(self, base_url: str = ""):
-        self._base_url = (base_url or OLLAMA_HOST).rstrip("/")
+        # If a base_url is explicitly passed or OLLAMA_HOST env var is set,
+        # use it directly. Otherwise, we'll resolve via discovery on first use.
+        self._explicit_url = base_url or _EXPLICIT_OLLAMA_HOST
+        self._base_url = (self._explicit_url or OLLAMA_HOST).rstrip("/")
         self._last_response = ""
         self._models_cache: list[dict] = []
         self._models_cached_at = 0.0
 
+    @classmethod
+    def start_discovery(cls) -> None:
+        """Start background network scanning for Ollama instances.
+        
+        Call this once at application startup. If OLLAMA_HOST is explicitly
+        set, scanning is skipped. Otherwise kestrel will probe the LAN and
+        pick the most capable Ollama instance automatically.
+        """
+        try:
+            from providers.ollama_discovery import ollama_discovery
+            ollama_discovery.start_background_scanning()
+        except Exception as e:
+            logger.warning(f"Failed to start Ollama discovery: {e}")
+
+    async def _resolve_url(self) -> str:
+        """Return the best Ollama URL, using discovery if no explicit host set."""
+        if self._explicit_url:
+            return self._explicit_url.rstrip("/")
+        try:
+            from providers.ollama_discovery import ollama_discovery
+            best = await ollama_discovery.get_best_host()
+            if best and best != self._base_url:
+                logger.info(f"Ollama discovery: switching to best host {best}")
+                self._base_url = best.rstrip("/")
+        except Exception as e:
+            logger.debug(f"Ollama discovery resolution failed (using cached): {e}")
+        return self._base_url
+
     # ── Health / Ready ────────────────────────────────────────────────
 
     def is_ready(self) -> bool:
-        """Check if Ollama is reachable (cached for 30s)."""
+        """Check if the currently selected Ollama host is reachable (cached 30s)."""
         now = time.time()
         if now - _health_cache.get("checked_at", 0) < _HEALTH_TTL:
             return bool(_health_cache.get("ready"))
 
+        # If we have a discovery module and no explicit host, check if any
+        # discovered host is reachable — fall back to probing _base_url.
         try:
-            resp = httpx.get(f"{self._base_url}/api/tags", timeout=3)
+            from providers.ollama_discovery import ollama_discovery
+            cached = ollama_discovery.get_cached_hosts()
+            if cached and not self._explicit_url:
+                # Use the best cached host for the health check
+                check_url = cached[0]["url"]
+            else:
+                check_url = self._base_url
+        except Exception:
+            check_url = self._base_url
+
+        try:
+            resp = httpx.get(f"{check_url}/api/tags", timeout=3)
             ready = resp.status_code == 200
+            if ready and check_url != self._base_url:
+                self._base_url = check_url  # Switch to the live host
         except Exception:
             ready = False
 
         _health_cache["ready"] = ready
         _health_cache["checked_at"] = now
         if not ready:
-            logger.debug("Ollama health check failed")
+            logger.debug(f"Ollama health check failed for {check_url}")
         return ready
 
     @staticmethod

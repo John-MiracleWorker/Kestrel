@@ -1,17 +1,17 @@
 {
     "mode": "deep",
-    "files_considered": 240,
-    "cache_entries": 240,
+    "files_considered": 243,
+    "cache_entries": 243,
     "total_issues": 365,
-    "summary": "\ud83d\udfe1 76 medium | \ud83d\udd35 289 low",
+    "summary": "\ud83d\udfe1 77 medium | \ud83d\udd35 288 low",
     "by_type": {
-        "complexity": 71,
+        "complexity": 72,
         "security": 4,
         "error_handling": 1,
-        "dead_import": 285,
+        "dead_import": 284,
         "todo": 4
     },
-    "by_severity": { "medium": 76, "low": 289 },
+    "by_severity": { "medium": 77, "low": 288 },
     "issues": [
         {
             "type": "complexity",
@@ -19,7 +19,7 @@
             "package": "brain",
             "file": "packages/brain/server.py",
             "line": 67,
-            "description": "Function `serve` is 374 lines long \u2014 consider refactoring",
+            "description": "Function `serve` is 385 lines long \u2014 consider refactoring",
             "suggestion": "Break `serve` into smaller helper functions"
         },
         {
@@ -138,6 +138,15 @@
             "line": 124,
             "description": "Function `compact_context` is 104 lines long \u2014 consider refactoring",
             "suggestion": "Break `compact_context` into smaller helper functions"
+        },
+        {
+            "type": "complexity",
+            "severity": "medium",
+            "package": "brain",
+            "file": "packages/brain/agent/proactive.py",
+            "line": 402,
+            "description": "Function `_run_sweeps` is 85 lines long \u2014 consider refactoring",
+            "suggestion": "Break `_run_sweeps` into smaller helper functions"
         },
         {
             "type": "complexity",
@@ -271,17 +280,8 @@
             "package": "brain",
             "file": "packages/brain/agent/tools/__init__.py",
             "line": 208,
-            "description": "Function `build_tool_registry` is 224 lines long \u2014 consider refactoring",
+            "description": "Function `build_tool_registry` is 226 lines long \u2014 consider refactoring",
             "suggestion": "Break `build_tool_registry` into smaller helper functions"
-        },
-        {
-            "type": "complexity",
-            "severity": "medium",
-            "package": "brain",
-            "file": "packages/brain/agent/tools/__init__.py",
-            "line": 68,
-            "description": "Function `execute` is 138 lines long \u2014 consider refactoring",
-            "suggestion": "Break `execute` into smaller helper functions"
         }
     ]
 }

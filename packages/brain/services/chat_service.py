@@ -132,6 +132,19 @@ class ChatServicerMixin(BaseServicerMixin):
                     api_key = ""
             
             provider = get_provider(provider_name)
+
+            # If the workspace selected a specific Ollama server, override the
+            # provider's base URL so it talks to that host instead of the
+            # default (localhost / host.docker.internal).
+            provider_settings = ws_config.get("settings") or {}
+            if provider_name in ("ollama", "local") and provider_settings.get("ollama_host"):
+                ollama_host_url = provider_settings["ollama_host"].rstrip("/")
+                logger.info(f"Using workspace Ollama host: {ollama_host_url}")
+                provider._base_url = ollama_host_url
+                provider._explicit_url = ollama_host_url
+                # Invalidate stale health cache so is_ready() re-checks the new URL
+                from providers.ollama import _health_cache
+                _health_cache["checked_at"] = 0
             
             from services.context_builder import build_chat_context
             messages = await build_chat_context(
@@ -391,6 +404,19 @@ class ChatServicerMixin(BaseServicerMixin):
             from agent.model_router import ModelRouter
 
             def custom_provider_checker(name: str) -> bool:
+                # For ollama/local with a workspace-configured host, probe
+                # that specific URL directly — bypasses stale health caches
+                if name in ("ollama", "local") and provider_settings.get("ollama_host"):
+                    try:
+                        import httpx as _httpx
+                        _probe_url = provider_settings["ollama_host"].rstrip("/")
+                        resp = _httpx.get(f"{_probe_url}/api/tags", timeout=3)
+                        _ok = resp.status_code == 200
+                        logger.info(f"Ollama probe {_probe_url}: {'OK' if _ok else resp.status_code}")
+                        return _ok
+                    except Exception as _e:
+                        logger.warning(f"Ollama probe failed for {provider_settings['ollama_host']}: {_e}")
+                        return False
                 if name == provider_name and getattr(provider, "is_ready", lambda: False)():
                     return True
                 try:

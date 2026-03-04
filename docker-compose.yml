@@ -58,7 +58,7 @@ services:
       REDIS_SESSION_TTL: ${REDIS_SESSION_TTL:-604800}
       BRAIN_GRPC_HOST: brain
       BRAIN_GRPC_PORT: 50051
-      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:5173}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:5173,http://localhost:1420,tauri://localhost}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       DEFAULT_WORKSPACE_ID: ${DEFAULT_WORKSPACE_ID:-}

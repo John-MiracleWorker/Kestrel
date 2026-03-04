@@ -75,10 +75,31 @@ def _classify_anthropic(model_id: str) -> str:
     return "other"
 
 
+def _classify_ollama(model_id: str) -> str:
+    """Classify an Ollama model by parameter count hint in tag name.
+    
+    Tags like 'qwen3:4b', 'llama3:8b'  -> fast
+    Tags like 'qwen3:32b', 'mistral:70b' -> power
+    Tags ending in ':cloud' are fast (cloud-relay, minimal local load).
+    Unknown tags without size hints default to fast.
+    """
+    mid = model_id.lower()
+    # Extract numeric size hint from the tag (e.g. '70b', '32b', '8b')
+    m = re.search(r':(\d+)b', mid)
+    if m:
+        params_b = int(m.group(1))
+        return "power" if params_b >= 20 else "fast"
+    if ":cloud" in mid:
+        return "fast"   # Cloud-relay models (e.g. glm-5:cloud) are treated as fast
+    # No size info — assume fast to avoid over-escalating
+    return "fast"
+
+
 _CLASSIFIERS = {
     "google": _classify_google,
     "openai": _classify_openai,
     "anthropic": _classify_anthropic,
+    "ollama": _classify_ollama,
 }
 
 
@@ -172,6 +193,28 @@ class ModelRegistry:
         else:
             self._fetched_at.clear()
 
+    async def get_ollama_models(self) -> list[dict]:
+        """Return the list of models actually installed in the local Ollama instance."""
+        await self._ensure("ollama")
+        return self._cache.get("ollama", [])
+
+    async def get_ollama_fast_model(self) -> str:
+        """Best small/fast Ollama model currently installed."""
+        await self._ensure("ollama")
+        return self._pick("ollama", "fast")
+
+    async def get_ollama_power_model(self) -> str:
+        """Best large/power Ollama model currently installed."""
+        await self._ensure("ollama")
+        m = self._pick("ollama", "power")
+        # If no large model exists, fall back to the best fast model
+        return m or self._pick("ollama", "fast")
+
+    async def is_ollama_model_available(self, model_id: str) -> bool:
+        """Check whether a specific model tag is installed in Ollama."""
+        models = await self.get_ollama_models()
+        return any(m["id"] == model_id for m in models)
+
     # ── Private ───────────────────────────────────────────────────────
 
     def _pick(self, provider: str, tier: str) -> str:
@@ -193,10 +236,57 @@ class ModelRegistry:
             # Double-check after acquiring lock
             if provider in self._cache and (now - self._fetched_at.get(provider, 0)) < _CACHE_TTL:
                 return
-            await self._fetch(provider, api_key)
+            if provider == "ollama":
+                await self._fetch_ollama()
+            else:
+                await self._fetch(provider, api_key)
+
+    async def _fetch_ollama(self):
+        """Fetch installed models from the best available Ollama instance."""
+        import aiohttp
+        # Prefer the best-discovered host; fall back to OLLAMA_HOST env var
+        try:
+            from providers.ollama_discovery import ollama_discovery
+            host = await ollama_discovery.get_best_host()
+        except Exception:
+            host = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
+        url = f"{host}/api/tags"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"Ollama /api/tags returned {resp.status}")
+                    data = await resp.json()
+            models = [
+                {"id": m["name"], "name": m["name"]}
+                for m in data.get("models", [])
+            ]
+            # Sort: true local models (with parameter size) first, cloud-relay tags last.
+            # Within each group, sort by version/parameter size descending.
+            def _ollama_sort_key(m: dict) -> tuple:
+                mid = m["id"].lower()
+                is_cloud_relay = ":cloud" in mid
+                # Extract the numeric parameter size (higher = more capable)
+                param_match = re.search(r':(\d+)b', mid)
+                params = -int(param_match.group(1)) if param_match else 0  # negative for desc sort
+                return (int(is_cloud_relay), params)
+            models.sort(key=_ollama_sort_key)
+            self._cache["ollama"] = models
+            self._fetched_at["ollama"] = time.time()
+            classify = _classify_ollama
+            fast_names  = [m["id"] for m in models if classify(m["id"]) == "fast"]
+            power_names = [m["id"] for m in models if classify(m["id"]) == "power"]
+            logger.info(
+                f"Model registry: discovered {len(models)} Ollama models "
+                f"(fast={fast_names}, power={power_names})"
+            )
+        except Exception as e:
+            logger.warning(f"Model registry: Ollama discovery failed: {e}")
+            if "ollama" not in self._cache:
+                self._cache["ollama"] = []
 
     async def _fetch(self, provider: str, api_key: str = ""):
-        """Fetch models from the provider API."""
+        """Fetch models from a cloud provider API."""
         try:
             from providers.cloud import CloudProvider
             cp = CloudProvider(provider)

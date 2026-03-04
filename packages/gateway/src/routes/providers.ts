@@ -23,7 +23,7 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
     const typedApp = app.withTypeProvider<ZodTypeProvider>();
 
     const workspaceParamsSchema = z.object({
-        workspaceId: z.string()
+        workspaceId: z.string(),
     });
     type WorkspaceParams = z.infer<typeof workspaceParamsSchema>;
 
@@ -33,7 +33,7 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
         '/api/workspaces/:workspaceId/providers',
         {
             preHandler: [requireAuth, requireWorkspace],
-            schema: { params: workspaceParamsSchema }
+            schema: { params: workspaceParamsSchema },
         },
         async (req, reply) => {
             const user = req.user!;
@@ -51,12 +51,12 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
             });
 
             return configs;
-        }
+        },
     );
 
     const providerParamsSchema = z.object({
         workspaceId: z.string(),
-        provider: z.string()
+        provider: z.string(),
     });
     type ProviderParams = z.infer<typeof providerParamsSchema>;
 
@@ -70,6 +70,7 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
         ragMinSimilarity: z.number().min(0).max(1).optional(),
         isDefault: z.boolean().optional(),
         apiKey: z.string().optional(),
+        settings: z.record(z.string(), z.any()).optional(),
     });
     type PutProviderBody = z.infer<typeof putProviderBodySchema>;
 
@@ -79,20 +80,38 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
         '/api/workspaces/:workspaceId/providers/:provider',
         {
             preHandler: [requireAuth, requireWorkspace, requireRole('admin')],
-            schema: { params: providerParamsSchema, body: putProviderBodySchema }
+            schema: { params: providerParamsSchema, body: putProviderBodySchema },
         },
         async (req, reply) => {
             const { workspaceId, provider } = req.params as ProviderParams;
             const body = req.body as PutProviderBody;
 
-            const validProviders = ['local', 'openai', 'anthropic', 'google'];
+            const validProviders = ['local', 'ollama', 'openai', 'anthropic', 'google'];
             if (!validProviders.includes(provider)) {
                 return reply.status(400).send({
                     error: `Invalid provider. Must be one of: ${validProviders.join(', ')}`,
                 });
             }
 
-            // Validate settings
+            // Reconstruct the final settings to save:
+            // Combine existing DB settings with any new ones sent by the client.
+            let finalSettings: Record<string, any> = {};
+            try {
+                const existing = await getPool().query(
+                    `SELECT settings FROM workspace_provider_config 
+                     WHERE workspace_id = $1 AND provider = $2`,
+                    [workspaceId, provider],
+                );
+                if (existing.rows.length > 0 && existing.rows[0].settings) {
+                    finalSettings = existing.rows[0].settings;
+                }
+            } catch (e) {
+                // Ignore DB error, just start with empty settings
+            }
+            if (body.settings) {
+                finalSettings = { ...finalSettings, ...body.settings };
+            }
+
             const config: Record<string, any> = {
                 workspace_id: workspaceId,
                 provider,
@@ -104,16 +123,31 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
                 rag_top_k: Math.max(1, Math.min(20, body.ragTopK ?? 5)),
                 rag_min_similarity: Math.max(0, Math.min(1, body.ragMinSimilarity ?? 0.3)),
                 is_default: body.isDefault ?? false,
+                settings: finalSettings,
             };
 
-            // API key handling — Send to Brain service for secure encryption and storage
+            // API key handling
             if (body.apiKey) {
                 config.api_key_encrypted = body.apiKey;
             }
 
             const result = await brainClient.call('SetProviderConfig', config);
+
+            // SetProviderConfig gRPC wipes the settings field since it's missing from protobuf.
+            // We must rewrite the merged finalSettings back to the DB immediately.
+            try {
+                await getPool().query(
+                    `UPDATE workspace_provider_config
+                     SET settings = $1
+                     WHERE workspace_id = $2 AND provider = $3`,
+                    [JSON.stringify(finalSettings), workspaceId, provider],
+                );
+            } catch (e) {
+                app.log.warn({ err: e }, 'Failed to rewrite provider settings');
+            }
+
             return result;
-        }
+        },
     );
 
     // ── DELETE /api/workspaces/:workspaceId/providers/:provider ──────
@@ -122,7 +156,7 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
         '/api/workspaces/:workspaceId/providers/:provider',
         {
             preHandler: [requireAuth, requireWorkspace, requireRole('admin')],
-            schema: { params: providerParamsSchema }
+            schema: { params: providerParamsSchema },
         },
         async (req, _reply) => {
             const { workspaceId, provider } = req.params as ProviderParams;
@@ -135,7 +169,7 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
             });
 
             return { success: true };
-        }
+        },
     );
 
     // ── GET /api/providers ───────────────────────────────────────────
@@ -175,9 +209,8 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
         };
     });
 
-
     const providerQuerySchema = z.object({
-        apiKey: z.string().optional()
+        apiKey: z.string().optional(),
     });
     type ProviderQuery = z.infer<typeof providerQuerySchema>;
 
@@ -186,7 +219,7 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
         '/api/workspaces/:workspaceId/providers/:provider/models',
         {
             preHandler: [requireAuth, requireWorkspace],
-            schema: { params: providerParamsSchema, querystring: providerQuerySchema }
+            schema: { params: providerParamsSchema, querystring: providerQuerySchema },
         },
         async (req, reply) => {
             const { workspaceId, provider } = req.params as ProviderParams;
@@ -201,7 +234,7 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
                 logger.error('Fetch models failed', { error: err.message });
                 return { models: [] };
             }
-        }
+        },
     );
 
     const toolCacheTtlSeconds = 60 * 10;
@@ -227,16 +260,16 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
         '/api/workspaces/:workspaceId/tools',
         {
             preHandler: [requireAuth, requireWorkspace],
-            schema: { params: workspaceParamsSchema }
+            schema: { params: workspaceParamsSchema },
         },
         async (req, reply) => {
             const { workspaceId } = req.params as WorkspaceParams;
             const cacheKey = getToolCacheKey(workspaceId);
 
             try {
-                const response = await brainClient.call('ListTools', {
+                const response = (await brainClient.call('ListTools', {
                     workspace_id: workspaceId,
-                }) as { tools?: any[] };
+                })) as { tools?: any[] };
 
                 const tools: WorkspaceTool[] = (response.tools || []).map((tool: any) => ({
                     name: tool.name,
@@ -277,7 +310,7 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
                     stale: true,
                 });
             }
-        }
+        },
     );
 
     // ══════════════════════════════════════════════════════════════════
@@ -296,14 +329,14 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
             try {
                 const { rows } = await getPool().query(
                     'SELECT settings FROM workspace_settings WHERE workspace_id = $1',
-                    [workspaceId]
+                    [workspaceId],
                 );
                 return rows.length > 0 ? rows[0].settings : {};
             } catch (err: any) {
                 logger.error('Get workspace settings failed', { error: err.message });
                 return {};
             }
-        }
+        },
     );
 
     // PUT — save workspace settings (deep-merges with existing)
@@ -323,13 +356,13 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
                      ON CONFLICT (workspace_id) DO UPDATE SET
                          settings = workspace_settings.settings || $2,
                          updated_at = NOW()`,
-                    [workspaceId, JSON.stringify(body)]
+                    [workspaceId, JSON.stringify(body)],
                 );
                 return { success: true };
             } catch (err: any) {
                 logger.error('Save workspace settings failed', { error: err.message });
                 return { error: err.message };
             }
-        }
+        },
     );
 }

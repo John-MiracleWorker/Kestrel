@@ -49,7 +49,7 @@
         },
         "packages/brain/brain_pb2.py": { "sig": "1772565629775469930:29667", "issues": [] },
         "packages/brain/server.py": {
-            "sig": "1772570270768127267:18821",
+            "sig": "1772581382746277489:19076",
             "issues": [
                 {
                     "type": "complexity",
@@ -57,7 +57,7 @@
                     "package": "brain",
                     "file": "packages/brain/server.py",
                     "line": 67,
-                    "description": "Function `serve` is 387 lines long \u2014 consider refactoring",
+                    "description": "Function `serve` is 391 lines long \u2014 consider refactoring",
                     "suggestion": "Break `serve` into smaller helper functions"
                 },
                 {
@@ -124,16 +124,16 @@
         },
         "packages/brain/users.py": { "sig": "1772239600831170092:2695", "issues": [] },
         "packages/brain/providers_registry.py": {
-            "sig": "1772389630280628498:4806",
+            "sig": "1772579141018733926:5873",
             "issues": [
                 {
                     "type": "dead_import",
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/providers_registry.py",
-                    "line": 6,
-                    "description": "Potentially unused import: `Optional`",
-                    "suggestion": "Remove unused import `Optional` at line 6"
+                    "line": 10,
+                    "description": "Potentially unused import: `OllamaUnavailableError`",
+                    "suggestion": "Remove unused import `OllamaUnavailableError` at line 10"
                 }
             ]
         },
@@ -357,7 +357,7 @@
         },
         "packages/brain/core/prompts.py": { "sig": "1771897497472797868:4229", "issues": [] },
         "packages/brain/core/model_registry.py": {
-            "sig": "1772177652538767438:8707",
+            "sig": "1772581342231045212:12874",
             "issues": [
                 {
                     "type": "dead_import",
@@ -474,16 +474,30 @@
         },
         "packages/brain/providers/local.py": { "sig": "1772537933587494126:4400", "issues": [] },
         "packages/brain/providers/__init__.py": { "sig": "1771204357051503083:3287", "issues": [] },
+        "packages/brain/providers/ollama_discovery.py": {
+            "sig": "1772581289825604631:12019",
+            "issues": [
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/providers/ollama_discovery.py",
+                    "line": 22,
+                    "description": "Potentially unused import: `annotations`",
+                    "suggestion": "Remove unused import `annotations` at line 22"
+                }
+            ]
+        },
         "packages/brain/providers/ollama.py": {
-            "sig": "1772561162518955012:12793",
+            "sig": "1772581328465461779:17470",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/providers/ollama.py",
-                    "line": 178,
-                    "description": "Function `generate_with_tools` is 136 lines long \u2014 consider refactoring",
+                    "line": 262,
+                    "description": "Function `generate_with_tools` is 158 lines long \u2014 consider refactoring",
                     "suggestion": "Break `generate_with_tools` into smaller helper functions"
                 },
                 {
@@ -870,14 +884,14 @@
         },
         "packages/brain/agent/diagnostics.py": { "sig": "1772128565960969904:9578", "issues": [] },
         "packages/brain/agent/proactive.py": {
-            "sig": "1772570659391970333:17869",
+            "sig": "1772575023367618765:18561",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/proactive.py",
-                    "line": 389,
+                    "line": 402,
                     "description": "Function `_run_sweeps` is 85 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_run_sweeps` into smaller helper functions"
                 },
@@ -941,7 +955,7 @@
         },
         "packages/brain/agent/__init__.py": { "sig": "1771279343760990686:109", "issues": [] },
         "packages/brain/agent/failover.py": {
-            "sig": "1772148708488994361:7805",
+            "sig": "1772576775874204974:9245",
             "issues": [
                 {
                     "type": "dead_import",
@@ -1244,15 +1258,15 @@
             ]
         },
         "packages/brain/agent/model_router.py": {
-            "sig": "1772565468666186809:26959",
+            "sig": "1772577146599528070:29545",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/model_router.py",
-                    "line": 113,
-                    "description": "Function `_build_routes` is 115 lines long \u2014 consider refactoring",
+                    "line": 131,
+                    "description": "Function `_build_routes` is 123 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_build_routes` into smaller helper functions"
                 },
                 {
@@ -2164,7 +2178,7 @@
             ]
         },
         "packages/brain/agent/tools/host_execution.py": {
-            "sig": "1772570538510622345:7596",
+            "sig": "1772574864435546798:7911",
             "issues": []
         },
         "packages/brain/agent/tools/project_context.py": {
@@ -3505,18 +3519,8 @@
             ]
         },
         "packages/brain/agent/core/heartbeat_parser.py": {
-            "sig": "1772570373727915352:1816",
-            "issues": [
-                {
-                    "type": "dead_import",
-                    "severity": "low",
-                    "package": "brain",
-                    "file": "packages/brain/agent/core/heartbeat_parser.py",
-                    "line": 2,
-                    "description": "Potentially unused import: `re`",
-                    "suggestion": "Remove unused import `re` at line 2"
-                }
-            ]
+            "sig": "1772575207752291024:1854",
+            "issues": []
         },
         "packages/brain/agent/core/__init__.py": { "sig": "1771973228960891018:63", "issues": [] },
         "packages/brain/agent/core/markdown_memory.py": {
@@ -3534,7 +3538,7 @@
             ]
         },
         "packages/brain/agent/core/fs_watcher.py": {
-            "sig": "1772570255500903873:4666",
+            "sig": "1772575174397909966:5157",
             "issues": []
         },
         "packages/brain/agent/core/verifier.py": {
@@ -3542,7 +3546,7 @@
             "issues": []
         },
         "packages/brain/agent/core/executor.py": {
-            "sig": "1772562049409214041:60157",
+            "sig": "1772579141018035925:62578",
             "issues": [
                 {
                     "type": "complexity",
@@ -3577,7 +3581,7 @@
                     "package": "brain",
                     "file": "packages/brain/agent/core/executor.py",
                     "line": 805,
-                    "description": "Function `_reason_and_act` is 582 lines long \u2014 consider refactoring",
+                    "description": "Function `_reason_and_act` is 629 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_reason_and_act` into smaller helper functions"
                 }
             ]
@@ -3587,7 +3591,7 @@
             "issues": []
         },
         "packages/brain/services/chat_service.py": {
-            "sig": "1772560793725219730:29217",
+            "sig": "1772585018497335164:30902",
             "issues": [
                 {
                     "type": "complexity",
@@ -3604,7 +3608,7 @@
                     "package": "brain",
                     "file": "packages/brain/services/chat_service.py",
                     "line": 106,
-                    "description": "Function `StreamChat` is 499 lines long \u2014 consider refactoring",
+                    "description": "Function `StreamChat` is 525 lines long \u2014 consider refactoring",
                     "suggestion": "Break `StreamChat` into smaller helper functions"
                 },
                 {
@@ -3648,9 +3652,9 @@
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/services/chat_service.py",
-                    "line": 166,
+                    "line": 179,
                     "description": "Potentially unused import: `TaskEventType`",
-                    "suggestion": "Remove unused import `TaskEventType` at line 166"
+                    "suggestion": "Remove unused import `TaskEventType` at line 179"
                 }
             ]
         },
@@ -3728,7 +3732,7 @@
             ]
         },
         "packages/brain/services/agent_service.py": {
-            "sig": "1772565656803484475:19861",
+            "sig": "1772584417281845333:20586",
             "issues": [
                 {
                     "type": "complexity",
@@ -3736,7 +3740,7 @@
                     "package": "brain",
                     "file": "packages/brain/services/agent_service.py",
                     "line": 12,
-                    "description": "Function `StartTask` is 184 lines long \u2014 consider refactoring",
+                    "description": "Function `StartTask` is 196 lines long \u2014 consider refactoring",
                     "suggestion": "Break `StartTask` into smaller helper functions"
                 },
                 {
@@ -3744,7 +3748,7 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/services/agent_service.py",
-                    "line": 337,
+                    "line": 349,
                     "description": "Function `RunHeadlessTask` is 147 lines long \u2014 consider refactoring",
                     "suggestion": "Break `RunHeadlessTask` into smaller helper functions"
                 },
@@ -3771,9 +3775,9 @@
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/services/agent_service.py",
-                    "line": 344,
+                    "line": 356,
                     "description": "Potentially unused import: `TaskStatus`",
-                    "suggestion": "Remove unused import `TaskStatus` at line 344"
+                    "suggestion": "Remove unused import `TaskStatus` at line 356"
                 }
             ]
         },
@@ -3851,7 +3855,7 @@
             "sig": "1771897497471059873:5103",
             "issues": []
         },
-        "packages/gateway/src/server.ts": { "sig": "1772389630284855805:14628", "issues": [] },
+        "packages/gateway/src/server.ts": { "sig": "1772581784754147382:14705", "issues": [] },
         "packages/gateway/src/types/fastify.d.ts": {
             "sig": "1771542268922687249:374",
             "issues": []
@@ -3887,6 +3891,10 @@
             "sig": "1771801511027445961:14110",
             "issues": []
         },
+        "packages/gateway/src/routes/ollama.ts": {
+            "sig": "1772582927864546148:11804",
+            "issues": []
+        },
         "packages/gateway/src/routes/integrations.ts": {
             "sig": "1772042228332175262:6203",
             "issues": []
@@ -3897,7 +3905,7 @@
         },
         "packages/gateway/src/routes/pr.ts": { "sig": "1771727964947823761:7760", "issues": [] },
         "packages/gateway/src/routes/providers.ts": {
-            "sig": "1771907312600299241:13085",
+            "sig": "1772585340350842296:14566",
             "issues": []
         },
         "packages/gateway/src/routes/features.ts": {
@@ -4003,11 +4011,11 @@
             "issues": []
         },
         "packages/web/src/components/Settings/types.ts": {
-            "sig": "1771900324803454350:1082",
+            "sig": "1772581907386069721:1093",
             "issues": []
         },
         "packages/web/src/components/Settings/SettingsPanel.tsx": {
-            "sig": "1771907312600859035:15395",
+            "sig": "1772582679232452921:15593",
             "issues": []
         },
         "packages/web/src/components/Settings/constants.ts": {
@@ -4020,6 +4028,10 @@
         },
         "packages/web/src/components/Settings/tabs/ToolsTab.tsx": {
             "sig": "1771900324803354642:32638",
+            "issues": []
+        },
+        "packages/web/src/components/Settings/tabs/OllamaTab.tsx": {
+            "sig": "1772584017486973351:10772",
             "issues": []
         },
         "packages/web/src/components/Settings/tabs/AutomationTab.tsx": {
@@ -4035,7 +4047,7 @@
             "issues": []
         },
         "packages/web/src/components/Settings/tabs/ModelTab.tsx": {
-            "sig": "1771900324802928730:4449",
+            "sig": "1772583254859894456:14140",
             "issues": []
         },
         "packages/web/src/components/Settings/tabs/AgentTab.tsx": {
@@ -4161,7 +4173,7 @@
             "sig": "1771893723017995909:1915",
             "issues": []
         },
-        "packages/web/src/api/client.ts": { "sig": "1771907312600698367:19085", "issues": [] },
+        "packages/web/src/api/client.ts": { "sig": "1772576037378342147:19381", "issues": [] },
         "packages/hands/server.py": {
             "sig": "1771739628096145335:10684",
             "issues": [

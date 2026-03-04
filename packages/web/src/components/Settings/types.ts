@@ -28,7 +28,20 @@ export interface ProviderConfig {
     api_key_encrypted?: string;
 }
 
-export type TabId = 'model' | 'persona' | 'memory' | 'tools' | 'agent' | 'capabilities' | 'integrations' | 'automation' | 'pr-reviews' | 'api-keys' | 'general' | 'profile';
+export type TabId =
+    | 'model'
+    | 'persona'
+    | 'memory'
+    | 'tools'
+    | 'agent'
+    | 'capabilities'
+    | 'integrations'
+    | 'automation'
+    | 'pr-reviews'
+    | 'api-keys'
+    | 'general'
+    | 'profile'
+    | 'ollama';
 
 export interface McpServer {
     id?: string;

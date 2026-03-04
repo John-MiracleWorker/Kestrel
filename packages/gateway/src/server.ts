@@ -20,6 +20,7 @@ import apiKeyRoutes from './routes/api-keys';
 import oauthRoutes from './auth/strategies/oauth';
 import magicLinkRoutes from './auth/strategies/magic-link';
 import providerRoutes from './routes/providers';
+import ollamaRoutes from './routes/ollama';
 import telegramWebhookRoutes from './routes/webhooks/telegram';
 import whatsappWebhookRoutes from './routes/webhooks/whatsapp';
 import taskRoutes from './routes/tasks';
@@ -214,6 +215,7 @@ async function start() {
         }
 
         await providerRoutes(app, deps);
+        await ollamaRoutes(app);
         await taskRoutes(app, { brainClient });
         await automationRoutes(app, { brainClient });
         await uploadRoutes(app);

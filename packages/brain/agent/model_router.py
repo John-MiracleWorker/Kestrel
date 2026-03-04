@@ -77,9 +77,10 @@ class ModelRoute:
 
 # ── Default Routing Table ────────────────────────────────────────────
 
-# Environment-driven defaults for local models (these don't need API discovery)
-_OLLAMA_MODEL = os.getenv("ROUTER_OLLAMA_MODEL", "glm5")
-_OLLAMA_LARGE_MODEL = os.getenv("ROUTER_OLLAMA_LARGE_MODEL", "glm5")
+# ── Dynamic Model Resolution ────────────────────────────────────────
+# We no longer hardcode model names. Instead, at routing time we query
+# the model_registry which discovers models from live APIs.
+
 _DEFAULT_STRATEGY = RoutingStrategy(
     os.getenv("ROUTER_STRATEGY", RoutingStrategy.LOCAL_FIRST.value)
 )
@@ -89,18 +90,35 @@ _DEFAULT_STRATEGY = RoutingStrategy(
 _CLOUD_FAST_MODEL = os.getenv("ROUTER_CLOUD_FAST_MODEL", "")   # filled at startup
 _CLOUD_POWER_MODEL = os.getenv("ROUTER_CLOUD_POWER_MODEL", "") # filled at startup
 
+# Ollama model names — populated dynamically from /api/tags at startup.
+# Never read from env vars so we only use models that are actually installed.
+_OLLAMA_FAST_MODEL = ""   # filled at startup
+_OLLAMA_POWER_MODEL = ""  # filled at startup
+
+
 async def init_models() -> None:
-    """Discover cloud models from the API and populate the module globals."""
-    global _CLOUD_FAST_MODEL, _CLOUD_POWER_MODEL
+    """Discover cloud AND Ollama models, populate module globals."""
+    global _CLOUD_FAST_MODEL, _CLOUD_POWER_MODEL, _OLLAMA_FAST_MODEL, _OLLAMA_POWER_MODEL
     try:
         from core.model_registry import model_registry
+
+        # Cloud models — use env override if set, otherwise discover
         if not _CLOUD_FAST_MODEL:
             _CLOUD_FAST_MODEL = await model_registry.get_fast_model("google") or "gemini-2.5-flash"
         if not _CLOUD_POWER_MODEL:
             _CLOUD_POWER_MODEL = await model_registry.get_power_model("google") or "gemini-2.5-pro"
-        logger.info(f"Model router: fast={_CLOUD_FAST_MODEL}, power={_CLOUD_POWER_MODEL}")
+
+        # Ollama — always discover from the live /api/tags endpoint, never env vars
+        _OLLAMA_FAST_MODEL = await model_registry.get_ollama_fast_model()
+        _OLLAMA_POWER_MODEL = await model_registry.get_ollama_power_model()
+
+        logger.info(
+            f"Model router init: "
+            f"cloud_fast={_CLOUD_FAST_MODEL}, cloud_power={_CLOUD_POWER_MODEL}, "
+            f"ollama_fast={_OLLAMA_FAST_MODEL or '(none)'}, ollama_power={_OLLAMA_POWER_MODEL or '(none)'}"
+        )
     except Exception as e:
-        logger.warning(f"Dynamic model discovery failed, using env defaults: {e}")
+        logger.warning(f"Dynamic model discovery failed: {e}")
         _CLOUD_FAST_MODEL = _CLOUD_FAST_MODEL or "gemini-2.5-flash"
         _CLOUD_POWER_MODEL = _CLOUD_POWER_MODEL or "gemini-2.5-pro"
 
@@ -111,27 +129,35 @@ _COMPLEX_STEPS = {StepType.CODING, StepType.SECURITY, StepType.DATA_ANALYSIS, St
 
 
 def _build_routes(strategy: RoutingStrategy) -> dict[StepType, ModelRoute]:
-    """Build routing table based on strategy."""
+    """Build routing table based on strategy.
+    
+    Ollama model names are read from the already-populated module globals
+    (_OLLAMA_FAST_MODEL, _OLLAMA_POWER_MODEL).  If Ollama is unavailable,
+    the globals will be empty strings; the router's _is_provider_available
+    check + _find_fallback will handle escalation gracefully.
+    """
+    ollama_fast  = _OLLAMA_FAST_MODEL
+    ollama_power = _OLLAMA_POWER_MODEL or ollama_fast  # fall back to fast if no large model
 
     if strategy == RoutingStrategy.LOCAL_FIRST:
         return {
             StepType.PLANNING: ModelRoute(
-                StepType.PLANNING, "ollama", _OLLAMA_MODEL,
+                StepType.PLANNING, "ollama", ollama_fast,
                 temperature=0.3, max_tokens=4096,
                 reason="Planning is fast; local model is sufficient",
             ),
             StepType.CODING: ModelRoute(
-                StepType.CODING, "ollama", _OLLAMA_LARGE_MODEL,
+                StepType.CODING, "ollama", ollama_power,
                 temperature=0.2, max_tokens=8192,
                 reason="Code gen with largest local model for quality",
             ),
             StepType.RESEARCH: ModelRoute(
-                StepType.RESEARCH, "ollama", _OLLAMA_MODEL,
+                StepType.RESEARCH, "ollama", ollama_fast,
                 temperature=0.5, max_tokens=4096,
                 reason="Research is exploratory; local model handles it",
             ),
             StepType.REFLECTION: ModelRoute(
-                StepType.REFLECTION, "ollama", _OLLAMA_MODEL,
+                StepType.REFLECTION, "ollama", ollama_fast,
                 temperature=0.4, max_tokens=4096,
                 reason="Meta-reasoning; fast local model is fine",
             ),
@@ -141,17 +167,17 @@ def _build_routes(strategy: RoutingStrategy) -> dict[StepType, ModelRoute]:
                 reason="Security review needs maximum accuracy → cloud",
             ),
             StepType.DATA_ANALYSIS: ModelRoute(
-                StepType.DATA_ANALYSIS, "ollama", _OLLAMA_LARGE_MODEL,
+                StepType.DATA_ANALYSIS, "ollama", ollama_power,
                 temperature=0.3, max_tokens=8192,
                 reason="Data analysis with large local model",
             ),
             StepType.WRITING: ModelRoute(
-                StepType.WRITING, "ollama", _OLLAMA_MODEL,
+                StepType.WRITING, "ollama", ollama_fast,
                 temperature=0.7, max_tokens=4096,
                 reason="Writing benefits from creativity; local is fine",
             ),
             StepType.GENERAL: ModelRoute(
-                StepType.GENERAL, "ollama", _OLLAMA_MODEL,
+                StepType.GENERAL, "ollama", ollama_fast,
                 temperature=0.7, max_tokens=4096,
                 reason="Default: local model for uncategorized steps",
             ),
@@ -202,12 +228,12 @@ def _build_routes(strategy: RoutingStrategy) -> dict[StepType, ModelRoute]:
         }
 
     elif strategy == RoutingStrategy.COST_OPTIMIZED:
-        # Simple steps → local, complex steps → cloud
+        # Simple steps → fast local, complex steps → cloud
         routes = {}
         for st in StepType:
             if st in _SIMPLE_STEPS:
                 routes[st] = ModelRoute(
-                    st, "ollama", _OLLAMA_MODEL,
+                    st, "ollama", ollama_fast,
                     temperature=0.5, max_tokens=4096,
                     reason=f"Cost-optimized: {st.value} runs locally",
                 )
@@ -420,12 +446,14 @@ class ModelRouter:
         self._workspace_provider = workspace_provider
         self._workspace_model = workspace_model
 
-        # If a workspace model is configured, override all local routes
-        # so the user's chosen model (e.g. glm-5:cloud) is used everywhere
-        # instead of the hardcoded default (glm5).
-        if workspace_model:
+        # If a workspace model is configured, only override routes whose
+        # provider matches the workspace provider.
+        # IMPORTANT: Do NOT apply a model name across providers — a Google
+        # model name (e.g. gemini-3-flash-preview) applied to an Ollama
+        # route will cause a 404 since Ollama doesn't have that model.
+        if workspace_model and workspace_provider:
             for st, route in self._routes.items():
-                if route.provider in ("ollama", "local"):
+                if route.provider == workspace_provider:
                     route.model = workspace_model
 
         # Stats for cost tracking
@@ -446,36 +474,53 @@ class ModelRouter:
             return False
 
     def _find_fallback(self, original_provider: str, route: ModelRoute) -> ModelRoute:
-        """Find a working fallback provider for a route."""
+        """Find a working fallback provider for a route, using live-discovered model names."""
+        from core.model_registry import model_registry
+        import asyncio
+
+        def _get_ollama_fast() -> str:
+            """Return the best fast Ollama model from the registry (sync wrapper)."""
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # We're inside an async context — return the cached value directly
+                    return model_registry._pick("ollama", "fast") or _OLLAMA_FAST_MODEL
+                return loop.run_until_complete(model_registry.get_ollama_fast_model())
+            except Exception:
+                return _OLLAMA_FAST_MODEL
+
         fallbacks = []
 
         # Start with the configured workspace provider if available
         if self._workspace_provider and self._workspace_provider != original_provider:
             fallbacks.append((self._workspace_provider, self._workspace_model or ""))
 
-        # Define fallback chains depending on original provider
-        if original_provider == "ollama":
+        # Define fallback chains with live model names
+        if original_provider in ("ollama", "local"):
+            # Local failed → escalate to cloud (use dynamic model names)
             fallbacks.extend([
                 ("google", _CLOUD_FAST_MODEL),
-                ("openai", "gpt-5-mini"),
-                ("anthropic", "claude-sonnet-4-6"),
+                ("google", _CLOUD_POWER_MODEL),
+                ("openai", model_registry._pick("openai", "fast") or ""),
+                ("anthropic", model_registry._pick("anthropic", "fast") or ""),
             ])
         else:
-            # Cloud provider unavailable → try Ollama first, then other clouds
+            # Cloud failed → try Ollama first (also with live model names), then other clouds
+            fast_local = _get_ollama_fast()
             fallbacks.extend([
-                ("ollama", _OLLAMA_MODEL),
+                ("ollama", fast_local),
                 ("google", _CLOUD_FAST_MODEL),
-                ("openai", "gpt-5-mini"),
-                ("anthropic", "claude-sonnet-4-6"),
+                ("openai", model_registry._pick("openai", "fast") or ""),
+                ("anthropic", model_registry._pick("anthropic", "fast") or ""),
             ])
 
         for fb_provider, fb_model in fallbacks:
-            if fb_provider == original_provider:
+            if not fb_model or fb_provider == original_provider:
                 continue
             if self._is_provider_available(fb_provider):
                 self._fallback_counts[fb_provider] = self._fallback_counts.get(fb_provider, 0) + 1
                 logger.info(
-                    f"Fallback: {original_provider} → {fb_provider} "
+                    f"Fallback: {original_provider} → {fb_provider}:{fb_model} "
                     f"for {route.step_type.value}"
                 )
                 return ModelRoute(
@@ -515,6 +560,9 @@ class ModelRouter:
         ])
 
         for cloud_provider, cloud_model in cloud_priority:
+            cloud_model = cloud_model or model_registry._pick(cloud_provider, "power") or model_registry._pick(cloud_provider, "fast")
+            if not cloud_model:
+                continue
             if self._is_provider_available(cloud_provider):
                 self._escalation_counts[route.step_type] = (
                     self._escalation_counts.get(route.step_type, 0) + 1
