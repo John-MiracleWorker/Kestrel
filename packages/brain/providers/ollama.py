@@ -400,12 +400,16 @@ class OllamaProvider:
                 f"Ollama generate_with_tools HTTP error: {e}\n"
                 f"  model={model}, messages={len(clean_messages)}, tools={len(ollama_tools)}"
             )
-            if e.response.status_code in (502, 503, 504):
-                self.invalidate_health()
-                raise OllamaUnavailableError(
-                    f"Ollama server error {e.response.status_code} for model {model}"
-                ) from e
-            raise
+            if e.response.status_code == 429:
+                raise  # Let executor handle rate-limit failover
+            # All other HTTP errors (404 model-not-found, 502/503/504
+            # server errors, etc.) mean Ollama can't serve this request
+            # — mark unhealthy so the provider registry fails over to
+            # a cloud provider.
+            self.invalidate_health()
+            raise OllamaUnavailableError(
+                f"Ollama HTTP {e.response.status_code} for model {model}"
+            ) from e
         except OllamaUnavailableError:
             raise
         except Exception as e:
