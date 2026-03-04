@@ -420,12 +420,19 @@ class ModelRouter:
         self._workspace_provider = workspace_provider
         self._workspace_model = workspace_model
 
-        # If a workspace model is configured, override all local routes
-        # so the user's chosen model (e.g. glm-5:cloud) is used everywhere
-        # instead of the hardcoded default (glm5).
-        if workspace_model:
+        # If the workspace is configured with a *local* model (ollama/local),
+        # override all local routes so the user's chosen model (e.g.
+        # glm-5:cloud) is used instead of the hardcoded default (glm5).
+        # Do NOT apply this override when the workspace model belongs to a
+        # cloud provider — sending "gemini-3.1-pro" to Ollama causes a 404.
+        if workspace_model and workspace_provider in ("ollama", "local", None, ""):
             for st, route in self._routes.items():
                 if route.provider in ("ollama", "local"):
+                    route.model = workspace_model
+        elif workspace_model and workspace_provider not in ("ollama", "local", None, ""):
+            # Cloud workspace model: override cloud routes instead of local
+            for st, route in self._routes.items():
+                if route.provider == workspace_provider:
                     route.model = workspace_model
 
         # Stats for cost tracking
