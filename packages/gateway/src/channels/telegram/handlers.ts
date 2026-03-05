@@ -618,14 +618,52 @@ import { logger } from '../../utils/logger';
 
     const OLLAMA_PORT = 11434;
 
-    function getOllamaBaseUrl(): string {
-        const explicit = process.env.OLLAMA_HOST;
-        if (explicit) return explicit.replace(/\/$/, '');
-        return `http://host.docker.internal:${OLLAMA_PORT}`;
+    interface OllamaModelInfo {
+        name: string;
+        parameterSize: string;
+        family: string;
+        host: string;        // which server this model lives on
     }
 
-    async function fetchOllamaModels(): Promise<{ name: string; parameterSize: string; family: string }[]> {
-        const baseUrl = getOllamaBaseUrl();
+    /**
+     * Build the list of Ollama hosts to probe.
+     * - OLLAMA_HOST (explicit, highest priority)
+     * - OLLAMA_REMOTE_HOSTS (comma-separated list of extra servers)
+     * - Standard Docker/localhost fallbacks
+     */
+    function getOllamaHosts(): string[] {
+        const hosts: string[] = [];
+        const seen = new Set<string>();
+
+        const add = (h: string) => {
+            const normalized = h.replace(/\/$/, '');
+            const url = normalized.startsWith('http') ? normalized : `http://${normalized}:${OLLAMA_PORT}`;
+            if (!seen.has(url)) {
+                seen.add(url);
+                hosts.push(url);
+            }
+        };
+
+        // Explicit host — top priority
+        if (process.env.OLLAMA_HOST) add(process.env.OLLAMA_HOST);
+
+        // Additional remote hosts (comma-separated)
+        if (process.env.OLLAMA_REMOTE_HOSTS) {
+            for (const h of process.env.OLLAMA_REMOTE_HOSTS.split(',')) {
+                const trimmed = h.trim();
+                if (trimmed) add(trimmed);
+            }
+        }
+
+        // Standard fallbacks
+        add('host.docker.internal');
+        add('172.17.0.1');
+        add('127.0.0.1');
+
+        return hosts;
+    }
+
+    async function probeOllamaHost(baseUrl: string): Promise<OllamaModelInfo[]> {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 5000);
         try {
@@ -637,11 +675,31 @@ import { logger } from '../../utils/logger';
                 name: m.name as string,
                 parameterSize: (m.details?.parameter_size || '') as string,
                 family: (m.details?.family || '') as string,
+                host: baseUrl,
             }));
         } catch {
             clearTimeout(timer);
             return [];
         }
+    }
+
+    async function fetchAllOllamaModels(): Promise<OllamaModelInfo[]> {
+        const hosts = getOllamaHosts();
+        const results = await Promise.allSettled(hosts.map((h) => probeOllamaHost(h)));
+
+        // Collect models, deduplicating by name (keep from first/highest-priority host)
+        const seen = new Set<string>();
+        const models: OllamaModelInfo[] = [];
+        for (const r of results) {
+            if (r.status !== 'fulfilled') continue;
+            for (const m of r.value) {
+                if (!seen.has(m.name)) {
+                    seen.add(m.name);
+                    models.push(m);
+                }
+            }
+        }
+        return models;
     }
 
     async function fetchAndShowOllamaModels(
@@ -650,19 +708,33 @@ import { logger } from '../../utils/logger';
         threadId: number | undefined,
         withThread: (params: Record<string, any>) => Record<string, any>,
     ): Promise<void> {
-        const models = await fetchOllamaModels();
+        const models = await fetchAllOllamaModels();
 
         if (models.length === 0) {
             await adapter.api('sendMessage', withThread({
                 chat_id: chatId,
-                text: '⚠️ No Ollama models found. Make sure Ollama is running and has models installed.',
+                text: '⚠️ No Ollama models found. Make sure Ollama is running and has models installed.\n\nTip: Set OLLAMA_HOST or OLLAMA_REMOTE_HOSTS to connect to remote servers.',
             }));
             return;
         }
 
+        // Check if models come from multiple hosts
+        const uniqueHosts = new Set(models.map((m) => m.host));
+        const multiHost = uniqueHosts.size > 1;
+
         // Build inline keyboard — 2 models per row
         const buttons = models.map((m) => {
-            const label = m.parameterSize ? `${m.name} (${m.parameterSize})` : m.name;
+            let label = m.parameterSize ? `${m.name} (${m.parameterSize})` : m.name;
+            // If multiple hosts, add a short host indicator
+            if (multiHost) {
+                try {
+                    const hostname = new URL(m.host).hostname;
+                    // Only annotate non-local hosts
+                    if (!['host.docker.internal', '172.17.0.1', '127.0.0.1', 'localhost'].includes(hostname)) {
+                        label += ` @${hostname}`;
+                    }
+                } catch { /* ignore */ }
+            }
             return { text: label, callback_data: `model:${m.name}` };
         });
 
@@ -671,9 +743,13 @@ import { logger } from '../../utils/logger';
             keyboard.push(buttons.slice(i, i + 2));
         }
 
+        const headerParts = [`🤖 *Available Ollama Models* (${models.length})`];
+        if (multiHost) headerParts.push(`from ${uniqueHosts.size} servers`);
+        headerParts.push('\nTap a model to switch:');
+
         await adapter.api('sendMessage', withThread({
             chat_id: chatId,
-            text: `🤖 *Available Ollama Models* (${models.length})\nTap a model to switch:`,
+            text: headerParts.join(' '),
             parse_mode: 'Markdown',
             reply_markup: JSON.stringify({ inline_keyboard: keyboard }),
         }));
