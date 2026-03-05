@@ -151,6 +151,10 @@ class ChatServicerMixin(BaseServicerMixin):
                 request, workspace_id, pool, r, runtime, provider_name, model, ws_config, api_key
             )
             
+            user_content = next(
+                (m["content"] for m in reversed(messages) if m["role"] == "user"),
+                "",
+            )
             # ── 3. Save user message before streaming ───────────────
             if conversation_id:
                 # Ensure conversation row exists (external channels like
@@ -163,10 +167,6 @@ class ChatServicerMixin(BaseServicerMixin):
                     channel=channel_name,
                 )
 
-                user_content = next(
-                    (m["content"] for m in reversed(messages) if m["role"] == "user"),
-                    "",
-                )
                 if user_content:
                     await save_message(conversation_id, "user", user_content)
 
