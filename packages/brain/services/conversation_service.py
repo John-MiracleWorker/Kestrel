@@ -108,6 +108,7 @@ class ConversationServicerMixin(BaseServicerMixin):
                 pool = await get_pool()
                 ws_config = await ProviderConfig(pool).get_config(request.workspace_id)
                 provider_name = ws_config.get("provider", "local")
+                model_name = ws_config.get("model", "")
                 api_key = ws_config.get("api_key", "")
                 # Resolve Redis key reference
                 if api_key and api_key.startswith("provider_key:"):
@@ -117,16 +118,17 @@ class ConversationServicerMixin(BaseServicerMixin):
                 provider = get_provider(provider_name)
             except Exception:
                 provider_name = "local"
+                model_name = ""
                 api_key = ""
                 provider = get_provider("local")
 
             # Allow "smart" title generation:
             response_chunks = []
-            logger.info(f"GenerateTitle: using provider={provider_name}, model=default, api_key={'present' if api_key else 'MISSING'}")
+            logger.info(f"GenerateTitle: using provider={provider_name}, model={model_name}, api_key={'present' if api_key else 'MISSING'}")
             try:
                 async for token in provider.stream(
                     messages=[{"role": "user", "content": prompt}],
-                    model="",
+                    model=model_name,
                     temperature=0.3,
                     max_tokens=20,
                     api_key=api_key,
