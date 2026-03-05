@@ -381,7 +381,7 @@ import { logger } from '../../utils/logger';
                     // Send a confirmation that we're searching
                     await adapter.api('sendMessage', withThread({
                         chat_id: chatId,
-                        text: `🔍 Searching for model \`${modelQuery}\` across Ollama and cloud providers...`,
+                        text: `🔍 Searching for model \`${modelQuery}\`...`,
                         parse_mode: 'Markdown',
                     }));
                     adapter.startTyping(chatId, threadId);
@@ -409,35 +409,8 @@ import { logger } from '../../utils/logger';
                         (adapter as any).emit('message', incoming);
                     }
                 } else {
-                    // No model specified — ask agent to list all available models
-                    await adapter.api('sendMessage', withThread({
-                        chat_id: chatId,
-                        text: '🔍 Listing all available models...',
-                        parse_mode: 'Markdown',
-                    }));
-                    adapter.startTyping(chatId, threadId);
-
-                    if (msg.from) {
-                        const userId = adapter.resolveUserId(msg.from, chatId);
-                        adapter.userThreadMap.set(userId, threadId);
-                        const incoming: IncomingMessage = {
-                            id: randomUUID(),
-                            channel: 'telegram',
-                            userId,
-                            workspaceId: adapter.config.defaultWorkspaceId,
-                            conversationId: adapter.resolveConversationId(chatId, undefined, threadId),
-                            content: 'List all available models from Ollama and cloud providers. Use the model_swap tool with action="list".',
-                            metadata: {
-                                channelUserId: String(msg.from.id),
-                                channelMessageId: String(msg.message_id),
-                                timestamp: new Date(msg.date * 1000),
-                                telegramChatId: chatId,
-                                telegramThreadId: threadId,
-                                telegramUsername: msg.from.username,
-                            },
-                        };
-                        (adapter as any).emit('message', incoming);
-                    }
+                    // No model specified — fetch Ollama models directly and show inline keyboard
+                    await fetchAndShowOllamaModels(adapter, chatId, threadId, withThread);
                 }
                 break;
             }
@@ -641,6 +614,71 @@ import { logger } from '../../utils/logger';
         await adapter.api('sendMessage', params);
     }
 
+    // ── Ollama Model Picker ──────────────────────────────────────────
+
+    const OLLAMA_PORT = 11434;
+
+    function getOllamaBaseUrl(): string {
+        const explicit = process.env.OLLAMA_HOST;
+        if (explicit) return explicit.replace(/\/$/, '');
+        return `http://host.docker.internal:${OLLAMA_PORT}`;
+    }
+
+    async function fetchOllamaModels(): Promise<{ name: string; parameterSize: string; family: string }[]> {
+        const baseUrl = getOllamaBaseUrl();
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 5000);
+        try {
+            const resp = await fetch(`${baseUrl}/api/tags`, { signal: controller.signal });
+            clearTimeout(timer);
+            if (!resp.ok) return [];
+            const data = (await resp.json()) as { models?: any[] };
+            return (data.models || []).map((m: any) => ({
+                name: m.name as string,
+                parameterSize: (m.details?.parameter_size || '') as string,
+                family: (m.details?.family || '') as string,
+            }));
+        } catch {
+            clearTimeout(timer);
+            return [];
+        }
+    }
+
+    async function fetchAndShowOllamaModels(
+        adapter: TelegramAdapter,
+        chatId: number,
+        threadId: number | undefined,
+        withThread: (params: Record<string, any>) => Record<string, any>,
+    ): Promise<void> {
+        const models = await fetchOllamaModels();
+
+        if (models.length === 0) {
+            await adapter.api('sendMessage', withThread({
+                chat_id: chatId,
+                text: '⚠️ No Ollama models found. Make sure Ollama is running and has models installed.',
+            }));
+            return;
+        }
+
+        // Build inline keyboard — 2 models per row
+        const buttons = models.map((m) => {
+            const label = m.parameterSize ? `${m.name} (${m.parameterSize})` : m.name;
+            return { text: label, callback_data: `model:${m.name}` };
+        });
+
+        const keyboard: { text: string; callback_data: string }[][] = [];
+        for (let i = 0; i < buttons.length; i += 2) {
+            keyboard.push(buttons.slice(i, i + 2));
+        }
+
+        await adapter.api('sendMessage', withThread({
+            chat_id: chatId,
+            text: `🤖 *Available Ollama Models* (${models.length})\nTap a model to switch:`,
+            parse_mode: 'Markdown',
+            reply_markup: JSON.stringify({ inline_keyboard: keyboard }),
+        }));
+    }
+
     // ── Callback Queries ───────────────────────────────────────────
 
     export async function handleCallbackQuery(adapter: TelegramAdapter, query: {
@@ -656,6 +694,41 @@ import { logger } from '../../utils/logger';
         const chatId = query.message.chat.id;
         // Extract thread context from the button's parent message
         const threadId = query.message.message_thread_id;
+
+        // Handle model selection from /model inline keyboard
+        if (query.data.startsWith('model:')) {
+            const modelName = query.data.substring('model:'.length);
+            const userId = adapter.resolveUserId(query.from, chatId);
+            adapter.userThreadMap.set(userId, threadId);
+
+            const confirmParams: Record<string, any> = {
+                chat_id: chatId,
+                text: `🔄 Switching to \`${modelName}\`...`,
+                parse_mode: 'Markdown',
+            };
+            if (threadId !== undefined) confirmParams.message_thread_id = threadId;
+            await adapter.api('sendMessage', confirmParams);
+
+            // Emit as a message so the agent performs the swap via model_swap tool
+            const incoming: IncomingMessage = {
+                id: randomUUID(),
+                channel: 'telegram',
+                userId,
+                workspaceId: adapter.config.defaultWorkspaceId,
+                conversationId: adapter.resolveConversationId(chatId, undefined, threadId),
+                content: `Switch to model "${modelName}" on Ollama. Use the model_swap tool with action="swap", model_id="${modelName}", provider="ollama".`,
+                metadata: {
+                    channelUserId: String(query.from.id),
+                    channelMessageId: String(query.message.message_id),
+                    timestamp: new Date(),
+                    telegramChatId: chatId,
+                    telegramThreadId: threadId,
+                    isCallbackQuery: true,
+                },
+            };
+            (adapter as any).emit('message', incoming);
+            return;
+        }
 
         // Handle self-improvement callbacks (si_approve / si_deny)
         if (query.data.startsWith('si_approve:') || query.data.startsWith('si_deny:')) {
