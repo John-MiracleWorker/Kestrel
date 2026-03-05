@@ -838,8 +838,8 @@ class TaskExecutor:
                 system_prompt += f"\n\n{self._persona_context}"
 
             messages.append({
-                "role": "system",
-                "content": system_prompt,
+                "role": "user",
+                "content": f"[System Instructions]\n{system_prompt}",
             })
             
             # Group tool calls by turn_id so parallel tool calls from

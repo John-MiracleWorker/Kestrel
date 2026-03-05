@@ -6,7 +6,7 @@
 CREATE TABLE workspace_provider_config (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    provider TEXT NOT NULL CHECK (provider IN ('local', 'openai', 'anthropic', 'google')),
+    provider TEXT NOT NULL CHECK (provider IN ('local', 'openai', 'anthropic', 'google', 'ollama')),
     is_default BOOLEAN DEFAULT FALSE,
     model TEXT,                       -- override default model for this provider
     api_key_encrypted TEXT,           -- workspace-specific API key (encrypted)
