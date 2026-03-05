@@ -1158,7 +1158,10 @@ class TaskExecutor:
                     for cloud_name in ("google", "openai", "anthropic"):
                         try:
                             cloud_p = self._provider_resolver(cloud_name)
-                            if cloud_p.is_ready():
+                            # Provider resolver may silently fall back to ollama if cloud is not ready.
+                            # Ensure we actually got the cloud provider we asked for before blanking the model.
+                            actual_provider_name = getattr(cloud_p, "provider", "")
+                            if actual_provider_name == cloud_name and cloud_p.is_ready():
                                 logger.info(
                                     f"Context overflow: escalating {route.provider} → {cloud_name}"
                                 )
