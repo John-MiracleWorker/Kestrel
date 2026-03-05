@@ -337,7 +337,7 @@ class OllamaProvider:
             # glm-5:cloud and similar remote models are proxied through Ollama
             # to ollama.com — they can be slower than local models.
             # Use generous timeout for all modes.
-            timeout = 120
+            timeout = int(os.getenv("OLLAMA_TIMEOUT", "600"))
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(
                     f"{self._base_url}/api/chat",
