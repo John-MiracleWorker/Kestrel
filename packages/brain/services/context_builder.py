@@ -40,18 +40,42 @@ async def build_chat_context(request, workspace_id, pool, r, runtime, provider_n
                 conversation_id,
             )
             if history:
-                history_messages = []
+                # Split history into conversation messages and tool messages.
+                # Tool messages (from agent tool calls) are numerous and crowd
+                # out actual user/assistant conversation context when capped.
+                conversation_msgs = []
+                tool_msgs = []
                 for h in history:
                     h_role = h["role"]
-                    if h_role in ("user", "assistant", "system", "tool"):
-                        history_messages.append({
+                    if h_role in ("user", "assistant"):
+                        conversation_msgs.append({
                             "role": h_role,
                             "content": h["content"],
                         })
+                    elif h_role in ("system", "tool"):
+                        tool_msgs.append({
+                            "role": h_role,
+                            "content": h["content"],
+                        })
+
+                # Keep generous conversation history (user + assistant turns)
+                # but strictly limit tool messages which bloat context fast.
+                limit = _history_limit()
+                conv_limit = min(len(conversation_msgs), limit * 2)  # Up to 2x limit for conversations
+                tool_limit = min(len(tool_msgs), max(10, limit // 2))  # Fewer tool msgs
+
+                kept_conv = conversation_msgs[-conv_limit:]
+                kept_tool = tool_msgs[-tool_limit:]
+
+                # Merge back in chronological order (approximate — conv msgs
+                # come first, then recent tool results)
+                history_messages = kept_conv + kept_tool
                 if history_messages:
-                    history_messages = history_messages[-_history_limit():]
                     messages = history_messages + messages
-                    logger.info(f"Loaded {len(history_messages)} messages from history")
+                    logger.info(
+                        f"Loaded {len(kept_conv)} conversation + "
+                        f"{len(kept_tool)} tool messages from history"
+                    )
         except Exception as hist_err:
             logger.warning(f"Failed to load conversation history: {hist_err}")
 
