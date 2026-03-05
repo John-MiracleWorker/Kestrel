@@ -155,7 +155,7 @@ def register_host_file_tools(registry, vector_store=None) -> None:
                         "description": "Directory to search in (default: first mounted directory)",
                         "default": ".",
                     },
-                    "file_pattern": {
+                    "pattern": {
                         "type": "string",
                         "description": "Regex to filter filenames (e.g. '\\.ts$' for TypeScript)",
                     },

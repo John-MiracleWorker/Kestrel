@@ -221,7 +221,7 @@ async def host_list(
 async def host_search(
     query: str,
     path: str = ".",
-    file_pattern: str = "",
+    pattern: str = "",
     max_results: int = 30,
     workspace_id: str = "default",
 ) -> dict:
@@ -234,7 +234,7 @@ async def host_search(
             return {"error": f"Path not found: {path}"}
 
         search_root = resolved if resolved.is_dir() else resolved.parent
-        file_re = re.compile(file_pattern, re.IGNORECASE) if file_pattern else None
+        file_re = re.compile(pattern, re.IGNORECASE) if pattern else None
 
         cmd = [
             "rg",
@@ -333,7 +333,7 @@ async def host_search(
                     fpath = Path(root_dir) / fname
                     if _is_blocked_path(fpath) is not None:
                         continue
-                    if file_pattern and not re.search(file_pattern, fname, re.IGNORECASE):
+                    if pattern and not re.search(pattern, fname, re.IGNORECASE):
                         continue
 
                     try:

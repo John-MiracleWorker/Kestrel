@@ -489,7 +489,7 @@
             ]
         },
         "packages/brain/providers/ollama.py": {
-            "sig": "1772581328465461779:17470",
+            "sig": "1772663412757395901:17727",
             "issues": [
                 {
                     "type": "complexity",
@@ -497,7 +497,7 @@
                     "package": "brain",
                     "file": "packages/brain/providers/ollama.py",
                     "line": 262,
-                    "description": "Function `generate_with_tools` is 158 lines long \u2014 consider refactoring",
+                    "description": "Function `generate_with_tools` is 162 lines long \u2014 consider refactoring",
                     "suggestion": "Break `generate_with_tools` into smaller helper functions"
                 },
                 {
@@ -1258,7 +1258,7 @@
             ]
         },
         "packages/brain/agent/model_router.py": {
-            "sig": "1772577146599528070:29545",
+            "sig": "1772663448132372073:29545",
             "issues": [
                 {
                     "type": "complexity",
@@ -1997,7 +1997,7 @@
             ]
         },
         "packages/brain/agent/tools/host_files.py": {
-            "sig": "1771990373629883418:12293",
+            "sig": "1772664808454037910:12288",
             "issues": [
                 {
                     "type": "complexity",
@@ -3169,7 +3169,7 @@
             ]
         },
         "packages/brain/agent/tools/fs/explore.py": {
-            "sig": "1771900324795412263:23027",
+            "sig": "1772664801016765481:23002",
             "issues": [
                 {
                     "type": "complexity",
@@ -3892,7 +3892,7 @@
             "issues": []
         },
         "packages/gateway/src/routes/ollama.ts": {
-            "sig": "1772582927864546148:11804",
+            "sig": "1772663387195906120:12710",
             "issues": []
         },
         "packages/gateway/src/routes/integrations.ts": {
@@ -3905,7 +3905,7 @@
         },
         "packages/gateway/src/routes/pr.ts": { "sig": "1771727964947823761:7760", "issues": [] },
         "packages/gateway/src/routes/providers.ts": {
-            "sig": "1772585340350842296:14566",
+            "sig": "1772663387229787986:14586",
             "issues": []
         },
         "packages/gateway/src/routes/features.ts": {
@@ -4011,11 +4011,11 @@
             "issues": []
         },
         "packages/web/src/components/Settings/types.ts": {
-            "sig": "1772581907386069721:1093",
+            "sig": "1772663387343728676:1147",
             "issues": []
         },
         "packages/web/src/components/Settings/SettingsPanel.tsx": {
-            "sig": "1772582679232452921:15593",
+            "sig": "1772663387301772415:20111",
             "issues": []
         },
         "packages/web/src/components/Settings/constants.ts": {
@@ -4031,7 +4031,7 @@
             "issues": []
         },
         "packages/web/src/components/Settings/tabs/OllamaTab.tsx": {
-            "sig": "1772584017486973351:10772",
+            "sig": "1772663387335179032:13769",
             "issues": []
         },
         "packages/web/src/components/Settings/tabs/AutomationTab.tsx": {
@@ -4047,7 +4047,7 @@
             "issues": []
         },
         "packages/web/src/components/Settings/tabs/ModelTab.tsx": {
-            "sig": "1772583254859894456:14140",
+            "sig": "1772663387323316690:18066",
             "issues": []
         },
         "packages/web/src/components/Settings/tabs/AgentTab.tsx": {
@@ -4173,7 +4173,7 @@
             "sig": "1771893723017995909:1915",
             "issues": []
         },
-        "packages/web/src/api/client.ts": { "sig": "1772576037378342147:19381", "issues": [] },
+        "packages/web/src/api/client.ts": { "sig": "1772663387280422681:19380", "issues": [] },
         "packages/hands/server.py": {
             "sig": "1771739628096145335:10684",
             "issues": [

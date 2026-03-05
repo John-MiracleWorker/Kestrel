@@ -116,10 +116,7 @@ def handle_request(request):
             "protocolVersion": "2024-11-05",
             "capabilities": {
                 "tools": {
-                    "list_messages": {"description": "List Gmail messages"},
-                    "get_message": {"description": "Get a specific Gmail message"},
-                    "send_message": {"description": "Send a Gmail message"},
-                    "search_messages": {"description": "Search Gmail messages"}
+                    "listChanged": False
                 }
             },
             "serverInfo": {"name": "gmail-mcp", "version": "0.1.0"}
