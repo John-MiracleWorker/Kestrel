@@ -29,7 +29,7 @@ export default function App() {
     const autoCreateAttempted = useRef<string | null>(null);
     const [showCanvas, setShowCanvas] = useState(true);
 
-    const { messages, streamingMessage, sendMessage, isConnected } = useChat(
+    const { messages, streamingMessage, sendMessage, isConnected, pendingApproval, handleApproval } = useChat(
         currentWorkspace?.id || null,
         currentConversation?.id || null,
         initialMessages,
@@ -148,6 +148,8 @@ export default function App() {
                     isConnected={isConnected}
                     conversationTitle={currentConversation?.title}
                     onToggleCanvas={() => setShowCanvas(!showCanvas)}
+                    pendingApproval={pendingApproval}
+                    onApproval={handleApproval}
                 />
             </div>
 

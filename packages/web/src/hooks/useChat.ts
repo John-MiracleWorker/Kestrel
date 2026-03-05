@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { createChatSocket, conversations, forceRefresh, type Message } from '../api/client';
+import { createChatSocket, conversations, tasks, forceRefresh, type Message } from '../api/client';
 import { useAuth } from './useAuth';
 
 interface AgentActivity {
@@ -45,6 +45,12 @@ export interface RoutingInfo {
     complexity: number;
 }
 
+export interface PendingApproval {
+    approvalId: string;
+    taskId: string;
+    question: string;
+}
+
 interface StreamingMessage {
     id: string;
     role: 'assistant';
@@ -54,6 +60,7 @@ interface StreamingMessage {
     agentActivities?: AgentActivity[];
     delegationEvents?: DelegationEvent[];
     routingInfo?: RoutingInfo | null;
+    pendingApproval?: PendingApproval | null;
 }
 
 interface UseChatReturn {
@@ -66,6 +73,8 @@ interface UseChatReturn {
         attachments?: Array<{ url: string; filename: string; mimeType: string; size: number }>,
     ) => void;
     isConnected: boolean;
+    pendingApproval: PendingApproval | null;
+    handleApproval: (approved: boolean) => void;
 }
 
 function generateId(): string {
@@ -98,6 +107,7 @@ export function useChat(
     const activitiesRef = useRef<AgentActivity[]>([]);
     const delegationEventsRef = useRef<DelegationEvent[]>([]);
     const routingInfoRef = useRef<RoutingInfo | null>(null);
+    const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
     const reconnectAttemptRef = useRef(0);
     const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const isMountedRef = useRef(true);
@@ -134,6 +144,9 @@ export function useChat(
                 delegationType?: string;
                 delegation?: string;
                 activity?: string;
+                approvalId?: string;
+                taskId?: string;
+                question?: string;
             };
 
             switch (data.type) {
@@ -223,6 +236,28 @@ export function useChat(
                             agentActivities: [...activitiesRef.current],
                             delegationEvents: [...delegationEventsRef.current],
                             routingInfo: prev?.routingInfo ?? routingInfoRef.current,
+                        }));
+                        break;
+                    }
+
+                    // Check for approval request
+                    if (data.status === 'waiting_for_human' && data.approvalId) {
+                        const approval: PendingApproval = {
+                            approvalId: data.approvalId,
+                            taskId: data.taskId || '',
+                            question: data.question || 'The agent needs your approval.',
+                        };
+                        setPendingApproval(approval);
+                        setStreamingMessage((prev) => ({
+                            id: prev?.id || data.messageId || 'streaming',
+                            role: 'assistant',
+                            content: prev?.content || contentRef.current || '',
+                            isStreaming: true,
+                            toolActivity: prev?.toolActivity ?? null,
+                            agentActivities: [...activitiesRef.current],
+                            delegationEvents: [...delegationEventsRef.current],
+                            routingInfo: prev?.routingInfo ?? routingInfoRef.current,
+                            pendingApproval: approval,
                         }));
                         break;
                     }
@@ -475,5 +510,16 @@ export function useChat(
         [workspaceId, conversationId],
     );
 
-    return { messages, streamingMessage, sendMessage, isConnected };
+    const handleApproval = useCallback(
+        (approved: boolean) => {
+            if (!pendingApproval) return;
+            tasks
+                .approve(pendingApproval.taskId, pendingApproval.approvalId, approved)
+                .then(() => setPendingApproval(null))
+                .catch((err) => console.error('Approval failed:', err));
+        },
+        [pendingApproval],
+    );
+
+    return { messages, streamingMessage, sendMessage, isConnected, pendingApproval, handleApproval };
 }

@@ -261,6 +261,10 @@ export class WebChannelAdapter extends BaseChannelAdapter {
                                             // Delegation panel fields
                                             delegationType: chunk.metadata.delegation_type || '',
                                             delegation: chunk.metadata.delegation || '',
+                                            // Approval fields (for inline approve/deny buttons)
+                                            approvalId: chunk.metadata.approval_id || '',
+                                            taskId: chunk.metadata.task_id || '',
+                                            question: chunk.metadata.question || '',
                                             messageId,
                                         }));
                                     }

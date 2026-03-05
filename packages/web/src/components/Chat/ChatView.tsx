@@ -7,7 +7,7 @@ import { StatusOrb } from '../Layout/StatusOrb';
 import { InputComposer } from './InputComposer';
 import { MessageBubble } from './MessageBubble';
 
-import type { RoutingInfo } from '../../hooks/useChat';
+import type { RoutingInfo, PendingApproval } from '../../hooks/useChat';
 
 interface ChatViewProps {
     workspaceId: string | null;
@@ -36,6 +36,8 @@ interface ChatViewProps {
     isConnected: boolean;
     conversationTitle?: string;
     onToggleCanvas?: () => void;
+    pendingApproval?: PendingApproval | null;
+    onApproval?: (approved: boolean) => void;
 }
 
 export function ChatView({
@@ -46,6 +48,8 @@ export function ChatView({
     isConnected,
     conversationTitle,
     onToggleCanvas,
+    pendingApproval,
+    onApproval,
 }: ChatViewProps) {
     const [input, setInput] = useState('');
     const [selectedProvider, setSelectedProvider] = useState('');
@@ -400,6 +404,71 @@ export function ChatView({
                     )}
 
                     <div ref={messagesEndRef} />
+
+                    {/* Inline Approval Buttons */}
+                    {pendingApproval && onApproval && (
+                        <div style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '12px',
+                            padding: '16px 20px',
+                            margin: '8px 0',
+                            background: 'rgba(0, 243, 255, 0.05)',
+                            border: '1px solid rgba(0, 243, 255, 0.2)',
+                            borderRadius: '8px',
+                        }}>
+                            <span style={{ fontSize: '1.2rem' }}>🛡️</span>
+                            <span style={{ flex: 1, fontSize: '0.85rem', color: 'var(--text-primary)' }}>
+                                Approval required
+                            </span>
+                            <button
+                                onClick={() => onApproval(true)}
+                                style={{
+                                    background: 'rgba(34, 197, 94, 0.15)',
+                                    border: '1px solid #22c55e',
+                                    color: '#22c55e',
+                                    padding: '8px 20px',
+                                    fontSize: '0.8rem',
+                                    fontFamily: 'var(--font-mono)',
+                                    fontWeight: 600,
+                                    cursor: 'pointer',
+                                    borderRadius: '4px',
+                                    transition: 'all 0.15s',
+                                }}
+                                onMouseOver={(e) => {
+                                    e.currentTarget.style.background = 'rgba(34, 197, 94, 0.3)';
+                                }}
+                                onMouseOut={(e) => {
+                                    e.currentTarget.style.background = 'rgba(34, 197, 94, 0.15)';
+                                }}
+                            >
+                                ✓ APPROVE
+                            </button>
+                            <button
+                                onClick={() => onApproval(false)}
+                                style={{
+                                    background: 'rgba(239, 68, 68, 0.15)',
+                                    border: '1px solid #ef4444',
+                                    color: '#ef4444',
+                                    padding: '8px 20px',
+                                    fontSize: '0.8rem',
+                                    fontFamily: 'var(--font-mono)',
+                                    fontWeight: 600,
+                                    cursor: 'pointer',
+                                    borderRadius: '4px',
+                                    transition: 'all 0.15s',
+                                }}
+                                onMouseOver={(e) => {
+                                    e.currentTarget.style.background = 'rgba(239, 68, 68, 0.3)';
+                                }}
+                                onMouseOut={(e) => {
+                                    e.currentTarget.style.background = 'rgba(239, 68, 68, 0.15)';
+                                }}
+                            >
+                                ✗ DENY
+                            </button>
+                        </div>
+                    )}
                 </div>
             </div>
 
