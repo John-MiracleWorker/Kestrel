@@ -1155,7 +1155,7 @@ class TaskExecutor:
                 model=routed_model,
             )
 
-            if was_compacted and needs_escalation(messages, route.provider) and not self._has_explicit_model:
+            if was_compacted and needs_escalation(messages, route.provider, model=routed_model) and not self._has_explicit_model:
                 if self._provider_resolver:
                     for cloud_name in ("google", "openai", "anthropic"):
                         try:
