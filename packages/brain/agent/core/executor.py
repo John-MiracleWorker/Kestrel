@@ -1005,7 +1005,8 @@ class TaskExecutor:
                     for cloud_name in ("google", "openai", "anthropic"):
                         try:
                             cloud_p = self._provider_resolver(cloud_name)
-                            if cloud_p.is_ready():
+                            actual_provider_name = getattr(cloud_p, "provider", "")
+                            if actual_provider_name == cloud_name and cloud_p.is_ready():
                                 active_provider = cloud_p
                                 routed_model = ""  # Use provider's default
                                 logger.info(f"Fell back to {cloud_name}")
@@ -1029,7 +1030,8 @@ class TaskExecutor:
                         for cloud_name in ("google", "openai", "anthropic"):
                             try:
                                 cloud_p = self._provider_resolver(cloud_name)
-                                if cloud_p.is_ready():
+                                actual_provider_name = getattr(cloud_p, "provider", "")
+                                if actual_provider_name == cloud_name and cloud_p.is_ready():
                                     logger.info(
                                         f"Context overflow: escalating {route.provider} → {cloud_name}"
                                     )
