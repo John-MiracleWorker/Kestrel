@@ -247,12 +247,12 @@ export function useChat(
                         toolActivity: isAgentActivity
                             ? (prev?.toolActivity ?? null)
                             : {
-                                  status: data.status || 'thinking',
-                                  toolName: data.toolName,
-                                  toolArgs: data.toolArgs,
-                                  toolResult: data.toolResult,
-                                  thinking: data.thinking,
-                              },
+                                status: data.status || 'thinking',
+                                toolName: data.toolName,
+                                toolArgs: data.toolArgs,
+                                toolResult: data.toolResult,
+                                thinking: data.thinking,
+                            },
                         agentActivities: [...activitiesRef.current],
                         delegationEvents: [...delegationEventsRef.current],
                         routingInfo: prev?.routingInfo ?? routingInfoRef.current,
@@ -413,13 +413,24 @@ export function useChat(
         }
     }, [conversationId]);
 
-    // Hydrate messages when the async fetch in App.tsx completes
-    // (initialMessages gets a new array identity each time setInitialMessages is called)
+    // Hydrate messages when the async fetch in App.tsx completes.
+    // IMPORTANT: Only hydrate when we have NO local messages (i.e., fresh
+    // conversation load). Once local messages exist (user sent a message,
+    // assistant responded), we must NOT overwrite them with stale DB data
+    // because the DB may not yet have the latest assistant response.
     const prevInitialMessagesRef = useRef<Message[]>(initialMessages);
     useEffect(() => {
         if (initialMessages !== prevInitialMessagesRef.current) {
             prevInitialMessagesRef.current = initialMessages;
-            setMessages(initialMessages);
+            // Only replace if we have no local messages yet, or if the
+            // incoming initial messages have MORE messages than local state
+            // (meaning the DB has caught up and has data we don't).
+            setMessages((prev) => {
+                if (prev.length === 0 || initialMessages.length > prev.length) {
+                    return initialMessages;
+                }
+                return prev;
+            });
         }
     }, [initialMessages]);
 
