@@ -37,11 +37,23 @@ _COMPACT_THRESHOLD = float(os.getenv("COMPACTOR_THRESHOLD", "0.75"))
 # Provider context limits (tokens)
 CONTEXT_LIMITS = {
     "ollama": int(os.getenv("OLLAMA_CONTEXT_LENGTH", "16384")),
+    "ollama_cloud": 128_000,  # Cloud models proxied through Ollama (e.g. glm-5:cloud)
     "local": 4096,
     "google": 1_000_000,
     "openai": 128_000,
     "anthropic": 200_000,
 }
+
+
+def _effective_provider(provider_name: str, model: str = "") -> str:
+    """Return the effective provider key for context limits.
+
+    Cloud models proxied through Ollama (model names containing ':cloud')
+    have much larger context windows than local Ollama models.
+    """
+    if provider_name in ("ollama", "local") and ":cloud" in model:
+        return "ollama_cloud"
+    return provider_name
 
 
 def estimate_tokens(messages: list[dict]) -> int:
@@ -142,7 +154,8 @@ async def compact_context(
         4. Summarize older_messages into a single assistant "memory" message
         5. Return [system, memory_summary, recent_messages]
     """
-    context_limit = CONTEXT_LIMITS.get(provider_name, 128_000)
+    effective = _effective_provider(provider_name, model)
+    context_limit = CONTEXT_LIMITS.get(effective, 128_000)
     token_estimate = estimate_tokens(messages)
     threshold = int(context_limit * _COMPACT_THRESHOLD)
 
@@ -230,12 +243,14 @@ async def compact_context(
 def needs_escalation(
     messages: list[dict],
     provider_name: str,
+    model: str = "",
 ) -> bool:
     """
     Check if messages are STILL too large for the provider after compaction.
     This signals the caller should escalate to a larger-context provider.
     """
-    context_limit = CONTEXT_LIMITS.get(provider_name, 128_000)
+    effective = _effective_provider(provider_name, model)
+    context_limit = CONTEXT_LIMITS.get(effective, 128_000)
     token_estimate = estimate_tokens(messages)
 
     # If we're still over 90% of the limit after compaction, escalate
