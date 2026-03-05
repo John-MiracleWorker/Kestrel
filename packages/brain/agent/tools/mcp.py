@@ -582,6 +582,7 @@ def register_mcp_tools(registry, pool=None) -> None:
         server_name: str,
         tool_name: str,
         arguments: str = "{}",
+        **kwargs,
     ) -> dict:
         """Call a tool on a connected MCP server."""
         client = await mcp_pool.get_client(server_name)
@@ -598,6 +599,12 @@ def register_mcp_tools(registry, pool=None) -> None:
             args = json.loads(arguments) if isinstance(arguments, str) else arguments
         except json.JSONDecodeError:
             return {"error": f"Invalid JSON arguments: {arguments}"}
+
+        # Merge any extra keyword arguments (e.g. 'limit') into the tool
+        # arguments dict.  LLMs sometimes pass tool parameters as top-level
+        # kwargs to mcp_call instead of embedding them in the JSON string.
+        if kwargs:
+            args.update(kwargs)
 
         return await client.call_tool(tool_name, args)
 
