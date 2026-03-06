@@ -971,16 +971,16 @@
             ]
         },
         "packages/brain/agent/tool_selector.py": {
-            "sig": "1772563245244406891:8441",
+            "sig": "1772764628807672136:12433",
             "issues": [
                 {
-                    "type": "dead_import",
-                    "severity": "low",
+                    "type": "complexity",
+                    "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/tool_selector.py",
-                    "line": 19,
-                    "description": "Potentially unused import: `re`",
-                    "suggestion": "Remove unused import `re` at line 19"
+                    "line": 171,
+                    "description": "Function `select_with_llm` is 92 lines long \u2014 consider refactoring",
+                    "suggestion": "Break `select_with_llm` into smaller helper functions"
                 }
             ]
         },
@@ -3601,7 +3601,7 @@
             "issues": []
         },
         "packages/brain/agent/core/executor.py": {
-            "sig": "1772763308605014176:67226",
+            "sig": "1772764647310733251:67853",
             "issues": [
                 {
                     "type": "complexity",
@@ -3636,7 +3636,7 @@
                     "package": "brain",
                     "file": "packages/brain/agent/core/executor.py",
                     "line": 805,
-                    "description": "Function `_reason_and_act` is 723 lines long \u2014 consider refactoring",
+                    "description": "Function `_reason_and_act` is 737 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_reason_and_act` into smaller helper functions"
                 },
                 {

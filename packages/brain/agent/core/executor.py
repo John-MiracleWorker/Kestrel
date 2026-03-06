@@ -1202,11 +1202,25 @@ class TaskExecutor:
         try:
             from agent.tool_selector import ToolSelector
             selector = ToolSelector(self._tools.list_tools())
-            selected_tools = selector.select(
-                step_description=step.description,
-                expected_tools=step_expected,
-                provider=route.provider,
-            )
+
+            # Two-stage tool selection: use LLM to pick relevant tools
+            # from a compact catalog, then send only those tools' schemas.
+            try:
+                selected_tools = await selector.select_with_llm(
+                    step_description=step.description,
+                    provider=active_provider,
+                    model=routed_model,
+                    api_key=self._api_key,
+                    expected_tools=step_expected,
+                )
+            except Exception as e:
+                logger.warning(f"LLM tool selection failed: {e}, using keyword fallback")
+                selected_tools = selector.select(
+                    step_description=step.description,
+                    expected_tools=step_expected,
+                    provider=route.provider,
+                )
+
             tool_schemas = [t.to_openai_schema() for t in selected_tools]
         except Exception as e:
             logger.warning(f"ToolSelector failed, using all tools: {e}")
