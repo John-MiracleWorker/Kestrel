@@ -1,3 +1,4 @@
+import re
 from provider_config import ProviderConfig
 import grpc
 from core.grpc_setup import brain_pb2
@@ -9,6 +10,8 @@ from crud import (
 from db import get_pool, get_redis
 from providers_registry import get_provider
 from core.config import logger
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 class ConversationServicerMixin(BaseServicerMixin):
     async def ListConversations(self, request, context):
@@ -95,7 +98,8 @@ class ConversationServicerMixin(BaseServicerMixin):
             # 2. Construct prompt
             conversation_text = ""
             for m in messages[:6]: # Use first few messages
-                conversation_text += f"{m['role']}: {m['content']}\n"
+                content = _THINK_RE.sub("", m['content']).strip()
+                conversation_text += f"{m['role']}: {content}\n"
             
             prompt = (
                 "Summarize the following conversation into a short, concise title (max 6 words). "
@@ -138,7 +142,7 @@ class ConversationServicerMixin(BaseServicerMixin):
                 logger.warning(f"Title generation stream failed: {stream_err}")
 
             # If LLM failed or returned nothing, derive title from first user message
-            raw_response = "".join(response_chunks).strip()
+            raw_response = _THINK_RE.sub("", "".join(response_chunks)).strip()
             logger.info(f"GenerateTitle: raw_response='{raw_response[:100]}', chunks={len(response_chunks)}")
             if not response_chunks or raw_response.startswith("[Error"):
                 first_user = next((m["content"] for m in messages if m["role"] == "user"), "")
