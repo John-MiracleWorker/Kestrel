@@ -971,15 +971,15 @@
             ]
         },
         "packages/brain/agent/tool_selector.py": {
-            "sig": "1772764628807672136:12433",
+            "sig": "1772765247367802324:12598",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/tool_selector.py",
-                    "line": 171,
-                    "description": "Function `select_with_llm` is 92 lines long \u2014 consider refactoring",
+                    "line": 170,
+                    "description": "Function `select_with_llm` is 98 lines long \u2014 consider refactoring",
                     "suggestion": "Break `select_with_llm` into smaller helper functions"
                 }
             ]
@@ -3601,14 +3601,14 @@
             "issues": []
         },
         "packages/brain/agent/core/executor.py": {
-            "sig": "1772764647310733251:67853",
+            "sig": "1772765677730348501:68921",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/core/executor.py",
-                    "line": 218,
+                    "line": 237,
                     "description": "Function `_execute_tool_with_retry` is 90 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_execute_tool_with_retry` into smaller helper functions"
                 },
@@ -3617,7 +3617,7 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/core/executor.py",
-                    "line": 309,
+                    "line": 328,
                     "description": "Function `_execute_tools_parallel` is 158 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_execute_tools_parallel` into smaller helper functions"
                 },
@@ -3626,7 +3626,7 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/core/executor.py",
-                    "line": 468,
+                    "line": 487,
                     "description": "Function `_execute_single_tool` is 336 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_execute_single_tool` into smaller helper functions"
                 },
@@ -3635,8 +3635,8 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/core/executor.py",
-                    "line": 805,
-                    "description": "Function `_reason_and_act` is 737 lines long \u2014 consider refactoring",
+                    "line": 824,
+                    "description": "Function `_reason_and_act` is 746 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_reason_and_act` into smaller helper functions"
                 },
                 {
@@ -3644,7 +3644,7 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/core/executor.py",
-                    "line": 1065,
+                    "line": 1084,
                     "description": "Function `_do_stream` is 85 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_do_stream` into smaller helper functions"
                 }
@@ -3655,7 +3655,7 @@
             "issues": []
         },
         "packages/brain/services/chat_service.py": {
-            "sig": "1772759582536017898:32092",
+            "sig": "1772765605635670335:32683",
             "issues": [
                 {
                     "type": "complexity",
@@ -3672,7 +3672,7 @@
                     "package": "brain",
                     "file": "packages/brain/services/chat_service.py",
                     "line": 106,
-                    "description": "Function `StreamChat` is 544 lines long \u2014 consider refactoring",
+                    "description": "Function `StreamChat` is 560 lines long \u2014 consider refactoring",
                     "suggestion": "Break `StreamChat` into smaller helper functions"
                 },
                 {

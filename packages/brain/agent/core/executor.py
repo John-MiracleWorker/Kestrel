@@ -94,6 +94,25 @@ Previous observations for this step:
 {observations}
 """
 
+# ── Compact system prompt for local models (~300 tokens) ─────────────
+AGENT_SYSTEM_PROMPT_LOCAL = """\
+You are Kestrel, an autonomous AI agent.
+
+Goal: {goal}
+Step: {step_description}
+
+Rules:
+- Call the appropriate tool to accomplish the current step.
+- Call `task_complete` ONLY when the ENTIRE goal is done, not just this step.
+- Call `ask_human` if you need clarification.
+- If a tool fails, read the error and try a different approach. Never retry identical calls.
+- After 3 failures, call `ask_human` for help.
+
+Progress: Step {step_index}/{total_steps} | Iteration {iteration}/{max_iterations}
+{diagnostic_context}
+{observations}
+"""
+
 
 class TaskExecutor:
     """
@@ -823,7 +842,10 @@ class TaskExecutor:
             
             # Inject the agent execution rules and context so the LLM
             # knows it's executing a specific step in a plan.
-            system_prompt = AGENT_SYSTEM_PROMPT.format(
+            # Use compact prompt for local models to reduce input tokens
+            _is_local_strategy = str(getattr(self._model_router, '_strategy', '')) == 'local_first'
+            _prompt_template = AGENT_SYSTEM_PROMPT_LOCAL if _is_local_strategy else AGENT_SYSTEM_PROMPT
+            system_prompt = _prompt_template.format(
                 goal=task.goal,
                 step_description=step.description,
                 step_index=step.index + 1,
@@ -879,7 +901,9 @@ class TaskExecutor:
                         "content": tc.get("result", ""),
                     })
         else:
-            system_prompt = AGENT_SYSTEM_PROMPT.format(
+            _is_local_strategy = str(getattr(self._model_router, '_strategy', '')) == 'local_first'
+            _prompt_template = AGENT_SYSTEM_PROMPT_LOCAL if _is_local_strategy else AGENT_SYSTEM_PROMPT
+            system_prompt = _prompt_template.format(
                 goal=task.goal,
                 step_description=step.description,
                 step_index=step.index + 1,
@@ -1214,24 +1238,32 @@ class TaskExecutor:
         try:
             from agent.tool_selector import ToolSelector
             selector = ToolSelector(self._tools.list_tools())
+            is_local = route.provider in ("ollama", "local", "lmstudio")
 
-            # Two-stage tool selection: use LLM to pick relevant tools
-            # from a compact catalog, then send only those tools' schemas.
-            try:
-                selected_tools = await selector.select_with_llm(
-                    step_description=step.description,
-                    provider=active_provider,
-                    model=routed_model,
-                    api_key=self._api_key,
-                    expected_tools=step_expected,
-                )
-            except Exception as e:
-                logger.warning(f"LLM tool selection failed: {e}, using keyword fallback")
+            if is_local:
+                # Local models: use instant keyword matching (no extra LLM call)
                 selected_tools = selector.select(
                     step_description=step.description,
                     expected_tools=step_expected,
                     provider=route.provider,
                 )
+            else:
+                # Cloud models: use LLM picker to save token cost
+                try:
+                    selected_tools = await selector.select_with_llm(
+                        step_description=step.description,
+                        provider=active_provider,
+                        model=routed_model,
+                        api_key=self._api_key,
+                        expected_tools=step_expected,
+                    )
+                except Exception as e:
+                    logger.warning(f"LLM tool selection failed: {e}, using keyword fallback")
+                    selected_tools = selector.select(
+                        step_description=step.description,
+                        expected_tools=step_expected,
+                        provider=route.provider,
+                    )
 
             tool_schemas = [t.to_openai_schema() for t in selected_tools]
         except Exception as e:

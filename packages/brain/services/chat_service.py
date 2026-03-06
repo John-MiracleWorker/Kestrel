@@ -411,7 +411,19 @@ class ChatServicerMixin(BaseServicerMixin):
 
             from agent.model_router import ModelRouter
 
+            # ── Probe cache: avoid re-probing on every request ──────
+            import time as _time
+            _probe_cache: dict[str, tuple[bool, float]] = {}
+            _PROBE_TTL = 60  # seconds
+
             def custom_provider_checker(name: str) -> bool:
+                # Check cache first
+                cached = _probe_cache.get(name)
+                if cached and (_time.time() - cached[1]) < _PROBE_TTL:
+                    return cached[0]
+
+                result = False
+
                 # For ollama/local with a workspace-configured host, probe
                 # that specific URL directly — bypasses stale health caches
                 if name in ("ollama", "local") and provider_settings.get("ollama_host"):
@@ -419,23 +431,27 @@ class ChatServicerMixin(BaseServicerMixin):
                         import httpx as _httpx
                         _probe_url = provider_settings["ollama_host"].rstrip("/")
                         resp = _httpx.get(f"{_probe_url}/api/tags", timeout=3)
-                        _ok = resp.status_code == 200
-                        logger.info(f"Ollama probe {_probe_url}: {'OK' if _ok else resp.status_code}")
-                        return _ok
+                        result = resp.status_code == 200
+                        logger.info(f"Ollama probe {_probe_url}: {'OK' if result else resp.status_code}")
                     except Exception as _e:
                         logger.warning(f"Ollama probe failed for {provider_settings['ollama_host']}: {_e}")
-                        return False
+                        result = False
+                    _probe_cache[name] = (result, _time.time())
+                    return result
+
                 if name == "lmstudio" and provider_settings.get("lmstudio_host"):
                     try:
                         import httpx as _httpx
                         _probe_url = provider_settings["lmstudio_host"].rstrip("/")
                         resp = _httpx.get(f"{_probe_url}/v1/models", timeout=15)
-                        _ok = resp.status_code == 200
-                        logger.info(f"LM Studio probe {_probe_url}: {'OK' if _ok else resp.status_code}")
-                        return _ok
+                        result = resp.status_code == 200
+                        logger.info(f"LM Studio probe {_probe_url}: {'OK' if result else resp.status_code}")
                     except Exception as _e:
                         logger.warning(f"LM Studio probe failed for {provider_settings['lmstudio_host']}: {_e}")
-                        return False
+                        result = False
+                    _probe_cache[name] = (result, _time.time())
+                    return result
+
                 if name == provider_name and getattr(provider, "is_ready", lambda: False)():
                     return True
                 try:
