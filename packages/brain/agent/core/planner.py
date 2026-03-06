@@ -213,8 +213,10 @@ class TaskPlanner:
 
     def _parse_plan_response(self, response: str, goal: str) -> TaskPlan:
         """Parse the LLM's JSON response into a TaskPlan."""
+        import re
+        # Strip <think>...</think> blocks (reasoning models like GLM)
+        text = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
         # Strip markdown code fences if present
-        text = response.strip()
         if text.startswith("```"):
             lines = text.split("\n")
             # Remove first and last lines (fences)

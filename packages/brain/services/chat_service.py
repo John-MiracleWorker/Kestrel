@@ -586,7 +586,7 @@ class ChatServicerMixin(BaseServicerMixin):
                 agent_task_bg.cancel()
 
             # ── 5. Save response + auto-embed + persona observation ──
-            full_response = "\n".join(full_response_parts) if full_response_parts else ""
+            full_response = "".join(full_response_parts) if full_response_parts else ""
             if conversation_id and full_response:
                 await save_message(conversation_id, "assistant", full_response)
 
