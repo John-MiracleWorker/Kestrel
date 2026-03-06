@@ -18,6 +18,7 @@ import { ApiKeysTab } from './tabs/ApiKeysTab';
 import { GeneralTab } from './tabs/GeneralTab';
 import { ProfileTab } from './tabs/ProfileTab';
 import { OllamaTab } from './tabs/OllamaTab';
+import { LMStudioTab } from './tabs/LMStudioTab';
 
 export function SettingsPanel({
     onClose,
@@ -260,6 +261,7 @@ export function SettingsPanel({
         { id: 'capabilities', label: 'Capabilities', icon: '✨' },
         { id: 'integrations', label: 'Integrations', icon: '🔌', section: 'External' },
         { id: 'ollama', label: 'Ollama Servers', icon: '⬡' },
+        { id: 'lmstudio', label: 'LM Studio', icon: '◆' },
         { id: 'automation', label: 'Automation', icon: '⏰' },
         { id: 'pr-reviews', label: 'PR Reviews', icon: '📝' },
         { id: 'api-keys', label: 'API Keys', icon: '🔑', section: 'Account' },
@@ -396,6 +398,8 @@ export function SettingsPanel({
                 return <ProfileTab {...{ displayName, setDisplayName, userEmail }} />;
             case 'ollama':
                 return <OllamaTab workspaceId={workspaceId} />;
+            case 'lmstudio':
+                return <LMStudioTab workspaceId={workspaceId} />;
         }
     };
 

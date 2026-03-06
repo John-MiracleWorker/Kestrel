@@ -95,10 +95,15 @@ _CLOUD_POWER_MODEL = os.getenv("ROUTER_CLOUD_POWER_MODEL", "") # filled at start
 _OLLAMA_FAST_MODEL = ""   # filled at startup
 _OLLAMA_POWER_MODEL = ""  # filled at startup
 
+# LM Studio model names — populated dynamically from /v1/models at startup.
+_LMSTUDIO_FAST_MODEL = ""   # filled at startup
+_LMSTUDIO_POWER_MODEL = ""  # filled at startup
+
 
 async def init_models() -> None:
-    """Discover cloud AND Ollama models, populate module globals."""
+    """Discover cloud, Ollama, AND LM Studio models, populate module globals."""
     global _CLOUD_FAST_MODEL, _CLOUD_POWER_MODEL, _OLLAMA_FAST_MODEL, _OLLAMA_POWER_MODEL
+    global _LMSTUDIO_FAST_MODEL, _LMSTUDIO_POWER_MODEL
     try:
         from core.model_registry import model_registry
 
@@ -112,10 +117,15 @@ async def init_models() -> None:
         _OLLAMA_FAST_MODEL = await model_registry.get_ollama_fast_model()
         _OLLAMA_POWER_MODEL = await model_registry.get_ollama_power_model()
 
+        # LM Studio — discover from /v1/models endpoint
+        _LMSTUDIO_FAST_MODEL = await model_registry.get_lmstudio_fast_model()
+        _LMSTUDIO_POWER_MODEL = await model_registry.get_lmstudio_power_model()
+
         logger.info(
             f"Model router init: "
             f"cloud_fast={_CLOUD_FAST_MODEL}, cloud_power={_CLOUD_POWER_MODEL}, "
-            f"ollama_fast={_OLLAMA_FAST_MODEL or '(none)'}, ollama_power={_OLLAMA_POWER_MODEL or '(none)'}"
+            f"ollama_fast={_OLLAMA_FAST_MODEL or '(none)'}, ollama_power={_OLLAMA_POWER_MODEL or '(none)'}, "
+            f"lmstudio_fast={_LMSTUDIO_FAST_MODEL or '(none)'}, lmstudio_power={_LMSTUDIO_POWER_MODEL or '(none)'}"
         )
     except Exception as e:
         logger.warning(f"Dynamic model discovery failed: {e}")
@@ -131,33 +141,50 @@ _COMPLEX_STEPS = {StepType.CODING, StepType.SECURITY, StepType.DATA_ANALYSIS, St
 def _build_routes(strategy: RoutingStrategy) -> dict[StepType, ModelRoute]:
     """Build routing table based on strategy.
     
-    Ollama model names are read from the already-populated module globals
-    (_OLLAMA_FAST_MODEL, _OLLAMA_POWER_MODEL).  If Ollama is unavailable,
-    the globals will be empty strings; the router's _is_provider_available
-    check + _find_fallback will handle escalation gracefully.
+    Ollama and LM Studio model names are read from already-populated module
+    globals.  If neither local provider is available, the router's
+    _is_provider_available check + _find_fallback will handle escalation.
     """
     ollama_fast  = _OLLAMA_FAST_MODEL
-    ollama_power = _OLLAMA_POWER_MODEL or ollama_fast  # fall back to fast if no large model
+    ollama_power = _OLLAMA_POWER_MODEL or ollama_fast
+
+    lmstudio_fast  = _LMSTUDIO_FAST_MODEL
+    lmstudio_power = _LMSTUDIO_POWER_MODEL or lmstudio_fast
+
+    # Pick the best available local provider: prefer Ollama, fall back to LM Studio
+    if ollama_fast:
+        local_provider = "ollama"
+        local_fast = ollama_fast
+        local_power = ollama_power
+    elif lmstudio_fast:
+        local_provider = "lmstudio"
+        local_fast = lmstudio_fast
+        local_power = lmstudio_power
+    else:
+        # Neither is available — use ollama as placeholder, will fail over to cloud
+        local_provider = "ollama"
+        local_fast = ""
+        local_power = ""
 
     if strategy == RoutingStrategy.LOCAL_FIRST:
         return {
             StepType.PLANNING: ModelRoute(
-                StepType.PLANNING, "ollama", ollama_fast,
+                StepType.PLANNING, local_provider, local_fast,
                 temperature=0.3, max_tokens=4096,
                 reason="Planning is fast; local model is sufficient",
             ),
             StepType.CODING: ModelRoute(
-                StepType.CODING, "ollama", ollama_power,
+                StepType.CODING, local_provider, local_power,
                 temperature=0.2, max_tokens=8192,
                 reason="Code gen with largest local model for quality",
             ),
             StepType.RESEARCH: ModelRoute(
-                StepType.RESEARCH, "ollama", ollama_fast,
+                StepType.RESEARCH, local_provider, local_fast,
                 temperature=0.5, max_tokens=4096,
                 reason="Research is exploratory; local model handles it",
             ),
             StepType.REFLECTION: ModelRoute(
-                StepType.REFLECTION, "ollama", ollama_fast,
+                StepType.REFLECTION, local_provider, local_fast,
                 temperature=0.4, max_tokens=4096,
                 reason="Meta-reasoning; fast local model is fine",
             ),
@@ -167,17 +194,17 @@ def _build_routes(strategy: RoutingStrategy) -> dict[StepType, ModelRoute]:
                 reason="Security review needs maximum accuracy → cloud",
             ),
             StepType.DATA_ANALYSIS: ModelRoute(
-                StepType.DATA_ANALYSIS, "ollama", ollama_power,
+                StepType.DATA_ANALYSIS, local_provider, local_power,
                 temperature=0.3, max_tokens=8192,
                 reason="Data analysis with large local model",
             ),
             StepType.WRITING: ModelRoute(
-                StepType.WRITING, "ollama", ollama_fast,
+                StepType.WRITING, local_provider, local_fast,
                 temperature=0.7, max_tokens=4096,
                 reason="Writing benefits from creativity; local is fine",
             ),
             StepType.GENERAL: ModelRoute(
-                StepType.GENERAL, "ollama", ollama_fast,
+                StepType.GENERAL, local_provider, local_fast,
                 temperature=0.7, max_tokens=4096,
                 reason="Default: local model for uncategorized steps",
             ),
@@ -233,7 +260,7 @@ def _build_routes(strategy: RoutingStrategy) -> dict[StepType, ModelRoute]:
         for st in StepType:
             if st in _SIMPLE_STEPS:
                 routes[st] = ModelRoute(
-                    st, "ollama", ollama_fast,
+                    st, local_provider, local_fast,
                     temperature=0.5, max_tokens=4096,
                     reason=f"Cost-optimized: {st.value} runs locally",
                 )

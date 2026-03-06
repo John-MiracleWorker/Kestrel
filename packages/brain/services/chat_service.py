@@ -145,6 +145,14 @@ class ChatServicerMixin(BaseServicerMixin):
                 # Invalidate stale health cache so is_ready() re-checks the new URL
                 from providers.ollama import _health_cache
                 _health_cache["checked_at"] = 0
+
+            if provider_name == "lmstudio" and provider_settings.get("lmstudio_host"):
+                lmstudio_host_url = provider_settings["lmstudio_host"].rstrip("/")
+                logger.info(f"Using workspace LM Studio host: {lmstudio_host_url}")
+                provider._base_url = lmstudio_host_url
+                provider._explicit_url = lmstudio_host_url
+                from providers.lmstudio import _health_cache as _lm_health_cache
+                _lm_health_cache["checked_at"] = 0
             
             from services.context_builder import build_chat_context
             messages = await build_chat_context(
@@ -416,6 +424,17 @@ class ChatServicerMixin(BaseServicerMixin):
                         return _ok
                     except Exception as _e:
                         logger.warning(f"Ollama probe failed for {provider_settings['ollama_host']}: {_e}")
+                        return False
+                if name == "lmstudio" and provider_settings.get("lmstudio_host"):
+                    try:
+                        import httpx as _httpx
+                        _probe_url = provider_settings["lmstudio_host"].rstrip("/")
+                        resp = _httpx.get(f"{_probe_url}/v1/models", timeout=3)
+                        _ok = resp.status_code == 200
+                        logger.info(f"LM Studio probe {_probe_url}: {'OK' if _ok else resp.status_code}")
+                        return _ok
+                    except Exception as _e:
+                        logger.warning(f"LM Studio probe failed for {provider_settings['lmstudio_host']}: {_e}")
                         return False
                 if name == provider_name and getattr(provider, "is_ready", lambda: False)():
                     return True

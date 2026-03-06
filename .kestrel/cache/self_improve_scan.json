@@ -49,7 +49,7 @@
         },
         "packages/brain/brain_pb2.py": { "sig": "1772565629775469930:29667", "issues": [] },
         "packages/brain/server.py": {
-            "sig": "1772581382746277489:19076",
+            "sig": "1772751328774439346:19174",
             "issues": [
                 {
                     "type": "complexity",
@@ -57,7 +57,7 @@
                     "package": "brain",
                     "file": "packages/brain/server.py",
                     "line": 67,
-                    "description": "Function `serve` is 391 lines long \u2014 consider refactoring",
+                    "description": "Function `serve` is 393 lines long \u2014 consider refactoring",
                     "suggestion": "Break `serve` into smaller helper functions"
                 },
                 {
@@ -124,7 +124,7 @@
         },
         "packages/brain/users.py": { "sig": "1772239600831170092:2695", "issues": [] },
         "packages/brain/providers_registry.py": {
-            "sig": "1772579141018733926:5873",
+            "sig": "1772751225476819258:6054",
             "issues": [
                 {
                     "type": "dead_import",
@@ -134,6 +134,15 @@
                     "line": 10,
                     "description": "Potentially unused import: `OllamaUnavailableError`",
                     "suggestion": "Remove unused import `OllamaUnavailableError` at line 10"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/providers_registry.py",
+                    "line": 11,
+                    "description": "Potentially unused import: `LMStudioUnavailableError`",
+                    "suggestion": "Remove unused import `LMStudioUnavailableError` at line 11"
                 }
             ]
         },
@@ -357,7 +366,7 @@
         },
         "packages/brain/core/prompts.py": { "sig": "1771897497472797868:4229", "issues": [] },
         "packages/brain/core/model_registry.py": {
-            "sig": "1772581342231045212:12874",
+            "sig": "1772751203679520265:15983",
             "issues": [
                 {
                     "type": "dead_import",
@@ -449,6 +458,38 @@
                 }
             ]
         },
+        "packages/brain/providers/lmstudio.py": {
+            "sig": "1772751160772935996:15843",
+            "issues": [
+                {
+                    "type": "complexity",
+                    "severity": "medium",
+                    "package": "brain",
+                    "file": "packages/brain/providers/lmstudio.py",
+                    "line": 257,
+                    "description": "Function `generate_with_tools` is 124 lines long \u2014 consider refactoring",
+                    "suggestion": "Break `generate_with_tools` into smaller helper functions"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/providers/lmstudio.py",
+                    "line": 1,
+                    "description": "Potentially unused import: `annotations`",
+                    "suggestion": "Remove unused import `annotations` at line 1"
+                },
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/providers/lmstudio.py",
+                    "line": 13,
+                    "description": "Potentially unused import: `Optional`",
+                    "suggestion": "Remove unused import `Optional` at line 13"
+                }
+            ]
+        },
         "packages/brain/providers/cloud.py": {
             "sig": "1772562902292038341:32613",
             "issues": [
@@ -474,6 +515,20 @@
         },
         "packages/brain/providers/local.py": { "sig": "1772537933587494126:4400", "issues": [] },
         "packages/brain/providers/__init__.py": { "sig": "1771204357051503083:3287", "issues": [] },
+        "packages/brain/providers/lmstudio_discovery.py": {
+            "sig": "1772751086874962878:11907",
+            "issues": [
+                {
+                    "type": "dead_import",
+                    "severity": "low",
+                    "package": "brain",
+                    "file": "packages/brain/providers/lmstudio_discovery.py",
+                    "line": 23,
+                    "description": "Potentially unused import: `annotations`",
+                    "suggestion": "Remove unused import `annotations` at line 23"
+                }
+            ]
+        },
         "packages/brain/providers/ollama_discovery.py": {
             "sig": "1772581289825604631:12019",
             "issues": [
@@ -489,7 +544,7 @@
             ]
         },
         "packages/brain/providers/ollama.py": {
-            "sig": "1772663412757395901:17727",
+            "sig": "1772750937896214855:17763",
             "issues": [
                 {
                     "type": "complexity",
@@ -842,15 +897,15 @@
             ]
         },
         "packages/brain/agent/context_compactor.py": {
-            "sig": "1772239600823949124:9002",
+            "sig": "1772750937894168305:9618",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/context_compactor.py",
-                    "line": 124,
-                    "description": "Function `compact_context` is 104 lines long \u2014 consider refactoring",
+                    "line": 136,
+                    "description": "Function `compact_context` is 105 lines long \u2014 consider refactoring",
                     "suggestion": "Break `compact_context` into smaller helper functions"
                 },
                 {
@@ -1258,15 +1313,15 @@
             ]
         },
         "packages/brain/agent/model_router.py": {
-            "sig": "1772663448132372073:29545",
+            "sig": "1772751276942576806:30676",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/model_router.py",
-                    "line": 131,
-                    "description": "Function `_build_routes` is 123 lines long \u2014 consider refactoring",
+                    "line": 141,
+                    "description": "Function `_build_routes` is 140 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_build_routes` into smaller helper functions"
                 },
                 {
@@ -2137,7 +2192,7 @@
             ]
         },
         "packages/brain/agent/tools/mcp.py": {
-            "sig": "1772389630252399673:28217",
+            "sig": "1772713291217571661:28511",
             "issues": [
                 {
                     "type": "complexity",
@@ -2145,7 +2200,7 @@
                     "package": "brain",
                     "file": "packages/brain/agent/tools/mcp.py",
                     "line": 142,
-                    "description": "Function `register_mcp_tools` is 583 lines long \u2014 consider refactoring",
+                    "description": "Function `register_mcp_tools` is 590 lines long \u2014 consider refactoring",
                     "suggestion": "Break `register_mcp_tools` into smaller helper functions"
                 },
                 {
@@ -2214,7 +2269,7 @@
             ]
         },
         "packages/brain/agent/tools/mcp_client.py": {
-            "sig": "1772389630257908847:22137",
+            "sig": "1772713291217910162:22569",
             "issues": [
                 {
                     "type": "complexity",
@@ -3546,7 +3601,7 @@
             "issues": []
         },
         "packages/brain/agent/core/executor.py": {
-            "sig": "1772579141018035925:62578",
+            "sig": "1772751306881660953:63452",
             "issues": [
                 {
                     "type": "complexity",
@@ -3581,7 +3636,7 @@
                     "package": "brain",
                     "file": "packages/brain/agent/core/executor.py",
                     "line": 805,
-                    "description": "Function `_reason_and_act` is 629 lines long \u2014 consider refactoring",
+                    "description": "Function `_reason_and_act` is 636 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_reason_and_act` into smaller helper functions"
                 }
             ]
@@ -3591,7 +3646,7 @@
             "issues": []
         },
         "packages/brain/services/chat_service.py": {
-            "sig": "1772585018497335164:30902",
+            "sig": "1772758375383359542:32094",
             "issues": [
                 {
                     "type": "complexity",
@@ -3608,7 +3663,7 @@
                     "package": "brain",
                     "file": "packages/brain/services/chat_service.py",
                     "line": 106,
-                    "description": "Function `StreamChat` is 525 lines long \u2014 consider refactoring",
+                    "description": "Function `StreamChat` is 544 lines long \u2014 consider refactoring",
                     "suggestion": "Break `StreamChat` into smaller helper functions"
                 },
                 {
@@ -3652,14 +3707,14 @@
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/services/chat_service.py",
-                    "line": 179,
+                    "line": 187,
                     "description": "Potentially unused import: `TaskEventType`",
-                    "suggestion": "Remove unused import `TaskEventType` at line 179"
+                    "suggestion": "Remove unused import `TaskEventType` at line 187"
                 }
             ]
         },
         "packages/brain/services/conversation_service.py": {
-            "sig": "1771907312599556697:6996",
+            "sig": "1772750937897093525:7097",
             "issues": []
         },
         "packages/brain/services/tool_parser.py": {
@@ -3709,7 +3764,7 @@
             ]
         },
         "packages/brain/services/context_builder.py": {
-            "sig": "1772042228327548691:6312",
+            "sig": "1772750937896796816:7508",
             "issues": [
                 {
                     "type": "complexity",
@@ -3717,7 +3772,7 @@
                     "package": "brain",
                     "file": "packages/brain/services/context_builder.py",
                     "line": 23,
-                    "description": "Function `build_chat_context` is 132 lines long \u2014 consider refactoring",
+                    "description": "Function `build_chat_context` is 156 lines long \u2014 consider refactoring",
                     "suggestion": "Break `build_chat_context` into smaller helper functions"
                 },
                 {
@@ -3855,7 +3910,7 @@
             "sig": "1771897497471059873:5103",
             "issues": []
         },
-        "packages/gateway/src/server.ts": { "sig": "1772581784754147382:14705", "issues": [] },
+        "packages/gateway/src/server.ts": { "sig": "1772755640303912013:14788", "issues": [] },
         "packages/gateway/src/types/fastify.d.ts": {
             "sig": "1771542268922687249:374",
             "issues": []
@@ -3905,7 +3960,7 @@
         },
         "packages/gateway/src/routes/pr.ts": { "sig": "1771727964947823761:7760", "issues": [] },
         "packages/gateway/src/routes/providers.ts": {
-            "sig": "1772663387229787986:14586",
+            "sig": "1772756489514340377:15102",
             "issues": []
         },
         "packages/gateway/src/routes/features.ts": {
@@ -3915,6 +3970,10 @@
         "packages/gateway/src/routes/docs.ts": { "sig": "1771727964947449343:5370", "issues": [] },
         "packages/gateway/src/routes/automation.ts": {
             "sig": "1771907312600162865:19821",
+            "issues": []
+        },
+        "packages/gateway/src/routes/lmstudio.ts": {
+            "sig": "1772755604396336957:7655",
             "issues": []
         },
         "packages/gateway/src/routes/memory.ts": {
@@ -3960,7 +4019,7 @@
             "issues": []
         },
         "packages/gateway/src/channels/web.ts": {
-            "sig": "1771991000737734343:14624",
+            "sig": "1772750937897616361:14978",
             "issues": []
         },
         "packages/gateway/src/channels/discord/types.ts": {
@@ -3984,7 +4043,7 @@
             "issues": []
         },
         "packages/gateway/src/channels/telegram/handlers.ts": {
-            "sig": "1772560793725520729:33355",
+            "sig": "1772728904863373945:38794",
             "issues": []
         },
         "packages/gateway/src/channels/telegram/index.ts": {
@@ -3995,7 +4054,7 @@
             "sig": "1771204260400190082:2361",
             "issues": []
         },
-        "packages/web/src/App.tsx": { "sig": "1771909238148772394:9462", "issues": [] },
+        "packages/web/src/App.tsx": { "sig": "1772750937897963362:9597", "issues": [] },
         "packages/web/src/main.tsx": { "sig": "1771279343794018334:345", "issues": [] },
         "packages/web/src/vite-env.d.ts": { "sig": "1771279343794384916:38", "issues": [] },
         "packages/web/src/components/Sidebar/ProcessesPanel.tsx": {
@@ -4011,11 +4070,11 @@
             "issues": []
         },
         "packages/web/src/components/Settings/types.ts": {
-            "sig": "1772663387343728676:1147",
+            "sig": "1772755621778435626:1164",
             "issues": []
         },
         "packages/web/src/components/Settings/SettingsPanel.tsx": {
-            "sig": "1772663387301772415:20111",
+            "sig": "1772755623799855889:20317",
             "issues": []
         },
         "packages/web/src/components/Settings/constants.ts": {
@@ -4040,6 +4099,10 @@
         },
         "packages/web/src/components/Settings/tabs/GeneralTab.tsx": {
             "sig": "1771900324802427610:1751",
+            "issues": []
+        },
+        "packages/web/src/components/Settings/tabs/LMStudioTab.tsx": {
+            "sig": "1772755605030389848:13280",
             "issues": []
         },
         "packages/web/src/components/Settings/tabs/CapabilitiesTab.tsx": {
@@ -4087,7 +4150,7 @@
             "issues": []
         },
         "packages/web/src/components/Chat/ChatView.tsx": {
-            "sig": "1771900324801181456:20420",
+            "sig": "1772750937898393322:24008",
             "issues": []
         },
         "packages/web/src/components/Chat/MessageBubble.tsx": {
@@ -4162,12 +4225,16 @@
             "sig": "1771696903934095389:13645",
             "issues": []
         },
+        "packages/web/src/components/Clinical/ClinicalPanel.tsx": {
+            "sig": "1772750937898716365:16231",
+            "issues": []
+        },
         "packages/web/src/components/PRReview/PRReview.tsx": {
             "sig": "1771728001723683813:21707",
             "issues": []
         },
         "packages/web/src/hooks/useAgent.ts": { "sig": "1771279343793431268:5688", "issues": [] },
-        "packages/web/src/hooks/useChat.ts": { "sig": "1772182454083442405:19952", "issues": [] },
+        "packages/web/src/hooks/useChat.ts": { "sig": "1772750937899256034:22645", "issues": [] },
         "packages/web/src/hooks/useAuth.tsx": { "sig": "1771279343793660877:2589", "issues": [] },
         "packages/web/src/hooks/useUIArtifacts.ts": {
             "sig": "1771893723017995909:1915",

@@ -95,11 +95,27 @@ def _classify_ollama(model_id: str) -> str:
     return "fast"
 
 
+def _classify_lmstudio(model_id: str) -> str:
+    """Classify an LM Studio model by parameter count in the model path.
+    
+    LM Studio model IDs are like:
+      'lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF'
+      'bartowski/Qwen2.5-Coder-32B-Instruct-GGUF'
+    """
+    mid = model_id.lower()
+    m = re.search(r'(\d+)b', mid)
+    if m:
+        params_b = int(m.group(1))
+        return "power" if params_b >= 20 else "fast"
+    return "fast"
+
+
 _CLASSIFIERS = {
     "google": _classify_google,
     "openai": _classify_openai,
     "anthropic": _classify_anthropic,
     "ollama": _classify_ollama,
+    "lmstudio": _classify_lmstudio,
 }
 
 
@@ -215,6 +231,24 @@ class ModelRegistry:
         models = await self.get_ollama_models()
         return any(m["id"] == model_id for m in models)
 
+    # ── LM Studio helpers ─────────────────────────────────────────────
+
+    async def get_lmstudio_models(self) -> list[dict]:
+        """Return the list of models loaded in the discovered LM Studio instance."""
+        await self._ensure("lmstudio")
+        return self._cache.get("lmstudio", [])
+
+    async def get_lmstudio_fast_model(self) -> str:
+        """Best small/fast LM Studio model currently loaded."""
+        await self._ensure("lmstudio")
+        return self._pick("lmstudio", "fast")
+
+    async def get_lmstudio_power_model(self) -> str:
+        """Best large/power LM Studio model currently loaded."""
+        await self._ensure("lmstudio")
+        m = self._pick("lmstudio", "power")
+        return m or self._pick("lmstudio", "fast")
+
     # ── Private ───────────────────────────────────────────────────────
 
     def _pick(self, provider: str, tier: str) -> str:
@@ -238,6 +272,8 @@ class ModelRegistry:
                 return
             if provider == "ollama":
                 await self._fetch_ollama()
+            elif provider == "lmstudio":
+                await self._fetch_lmstudio()
             else:
                 await self._fetch(provider, api_key)
 
@@ -284,6 +320,40 @@ class ModelRegistry:
             logger.warning(f"Model registry: Ollama discovery failed: {e}")
             if "ollama" not in self._cache:
                 self._cache["ollama"] = []
+
+    async def _fetch_lmstudio(self):
+        """Fetch loaded models from the best available LM Studio instance."""
+        import aiohttp
+        try:
+            from providers.lmstudio_discovery import lmstudio_discovery
+            host = await lmstudio_discovery.get_best_host()
+        except Exception:
+            host = os.getenv("LMSTUDIO_HOST", f"http://host.docker.internal:{os.getenv('LMSTUDIO_PORT', '1234')}")
+        url = f"{host}/v1/models"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"LM Studio /v1/models returned {resp.status}")
+                    data = await resp.json()
+            models = [
+                {"id": m["id"], "name": m["id"]}
+                for m in data.get("data", [])
+            ]
+            models.sort(key=lambda m: _version_key(m["id"]))
+            self._cache["lmstudio"] = models
+            self._fetched_at["lmstudio"] = time.time()
+            classify = _classify_lmstudio
+            fast_names  = [m["id"] for m in models if classify(m["id"]) == "fast"]
+            power_names = [m["id"] for m in models if classify(m["id"]) == "power"]
+            logger.info(
+                f"Model registry: discovered {len(models)} LM Studio models "
+                f"(fast={fast_names}, power={power_names})"
+            )
+        except Exception as e:
+            logger.warning(f"Model registry: LM Studio discovery failed: {e}")
+            if "lmstudio" not in self._cache:
+                self._cache["lmstudio"] = []
 
     async def _fetch(self, provider: str, api_key: str = ""):
         """Fetch models from a cloud provider API."""

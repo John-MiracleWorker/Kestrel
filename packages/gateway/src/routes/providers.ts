@@ -86,7 +86,7 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
             const { workspaceId, provider } = req.params as ProviderParams;
             const body = req.body as PutProviderBody;
 
-            const validProviders = ['local', 'ollama', 'openai', 'anthropic', 'google'];
+            const validProviders = ['local', 'ollama', 'lmstudio', 'openai', 'anthropic', 'google'];
             if (!validProviders.includes(provider)) {
                 return reply.status(400).send({
                     error: `Invalid provider. Must be one of: ${validProviders.join(', ')}`,
@@ -204,6 +204,20 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
                     description: 'Gemini 2.0 Flash, Gemini 1.5 Pro',
                     requiresApiKey: true,
                     models: ['gemini-2.0-flash', 'gemini-1.5-pro'],
+                },
+                {
+                    id: 'ollama',
+                    name: 'Ollama',
+                    description: 'Local models via Ollama',
+                    requiresApiKey: false,
+                    models: ['auto'],
+                },
+                {
+                    id: 'lmstudio',
+                    name: 'LM Studio',
+                    description: 'Local models via LM Studio',
+                    requiresApiKey: false,
+                    models: ['auto'],
                 },
             ],
         };

@@ -1056,27 +1056,111 @@ class TaskExecutor:
                 except Exception:
                     pass
 
-            # Use generate_with_tools with empty tools list — this gives us
-            # the full failover chain while preventing tool calls.
-            try:
-                response = await active_provider.generate_with_tools(
+            # Stream tokens directly so the user sees real-time output.
+            # Parse <think>...</think> tags into THINKING events.
+            streamed_text = []
+            think_buffer = []
+            in_think = False
+
+            async def _do_stream(provider_to_use, model_to_use):
+                nonlocal in_think
+                async for token in provider_to_use.stream(
                     messages=messages,
-                    model=routed_model,
-                    tools=[],  # Empty = no tools, just text response
+                    model=model_to_use,
                     temperature=routed_temp,
                     max_tokens=routed_max_tokens,
-                    api_key=self._api_key,
-                )
+                ):
+                    # Detect <think> tags
+                    combined = "".join(think_buffer) + token if think_buffer else token
+
+                    if not in_think and "<think>" in combined:
+                        in_think = True
+                        # Split: before <think> goes as content, after starts thinking
+                        before = combined.split("<think>", 1)[0]
+                        after = combined.split("<think>", 1)[1]
+                        if before.strip():
+                            streamed_text.append(before)
+                            yield TaskEvent(
+                                type=TaskEventType.STEP_COMPLETE,
+                                task_id=task.id,
+                                step_id=step.id,
+                                content=before,
+                            )
+                        think_buffer.clear()
+                        think_buffer.append(after)
+                        continue
+
+                    if in_think:
+                        think_buffer.append(token)
+                        joined = "".join(think_buffer)
+                        if "</think>" in joined:
+                            # End of thinking block
+                            think_content = joined.split("</think>", 1)[0]
+                            remainder = joined.split("</think>", 1)[1]
+                            in_think = False
+                            think_buffer.clear()
+                            # Emit thinking event
+                            if think_content.strip():
+                                yield TaskEvent(
+                                    type=TaskEventType.THINKING,
+                                    task_id=task.id,
+                                    step_id=step.id,
+                                    content=think_content.strip(),
+                                )
+                            # Emit any text after </think>
+                            if remainder.strip():
+                                streamed_text.append(remainder)
+                                yield TaskEvent(
+                                    type=TaskEventType.STEP_COMPLETE,
+                                    task_id=task.id,
+                                    step_id=step.id,
+                                    content=remainder,
+                                )
+                        continue
+
+                    # Regular token — stream it
+                    streamed_text.append(token)
+                    yield TaskEvent(
+                        type=TaskEventType.STEP_COMPLETE,
+                        task_id=task.id,
+                        step_id=step.id,
+                        content=token,
+                    )
+
+                # Flush any remaining think buffer as thinking
+                if think_buffer:
+                    remaining = "".join(think_buffer)
+                    if remaining.strip():
+                        if in_think:
+                            yield TaskEvent(
+                                type=TaskEventType.THINKING,
+                                task_id=task.id,
+                                step_id=step.id,
+                                content=remaining.strip(),
+                            )
+                        else:
+                            streamed_text.append(remaining)
+                            yield TaskEvent(
+                                type=TaskEventType.STEP_COMPLETE,
+                                task_id=task.id,
+                                step_id=step.id,
+                                content=remaining,
+                            )
+                    think_buffer.clear()
+
+            try:
+                async for event in _do_stream(active_provider, routed_model):
+                    yield event
             except Exception as chat_err:
                 # ── Cloud failover for simple chat path ──────────────
-                # If Ollama fails (timeout, connection error), try cloud.
                 from providers.ollama import OllamaUnavailableError
-                is_ollama_failure = (
-                    isinstance(chat_err, OllamaUnavailableError)
+                from providers.lmstudio import LMStudioUnavailableError
+                is_local_failure = (
+                    isinstance(chat_err, (OllamaUnavailableError, LMStudioUnavailableError))
                     or 'timeout' in str(chat_err).lower()
                     or 'connect' in str(chat_err).lower()
                 )
-                if is_ollama_failure and self._provider_resolver:
+                if is_local_failure and self._provider_resolver:
                     logger.warning(
                         f"Simple chat: {route.provider} failed ({chat_err}), "
                         f"attempting cloud failover..."
@@ -1086,20 +1170,14 @@ class TaskExecutor:
                     if fallback:
                         cloud_name, cloud_p = fallback
                         logger.info(f"Simple chat: falling back to {cloud_name}")
-                        response = await cloud_p.generate_with_tools(
-                            messages=messages,
-                            model="",  # Use provider's default
-                            tools=[],
-                            temperature=routed_temp,
-                            max_tokens=routed_max_tokens,
-                            api_key=self._api_key,
-                        )
+                        async for event in _do_stream(cloud_p, ""):
+                            yield event
                     else:
-                        raise  # No cloud available, propagate original error
+                        raise
                 else:
-                    raise  # Not an Ollama failure, propagate
+                    raise
 
-            text = response.get("content", "")
+            text = "".join(streamed_text)
             logger.info(
                 f"Simple chat result: {len(text)} chars, "
                 f"preview={text[:100]!r}"
@@ -1213,23 +1291,24 @@ class TaskExecutor:
             # If the local provider failed, swap to a cloud provider and
             # retry with the same context.
             #
-            # ALWAYS failover when Ollama is genuinely unavailable:
-            #   - OllamaUnavailableError (timeout, connection refused, crash)
+            # ALWAYS failover when a local provider is genuinely unavailable:
+            #   - OllamaUnavailableError / LMStudioUnavailableError
             #   - 429 rate limit
             # These indicate the provider cannot serve ANY request, so
             # respecting _has_explicit_model would just cause task failure.
             from providers.ollama import OllamaUnavailableError
-            is_ollama_down = isinstance(llm_err, OllamaUnavailableError)
+            from providers.lmstudio import LMStudioUnavailableError
+            is_local_down = isinstance(llm_err, (OllamaUnavailableError, LMStudioUnavailableError))
             is_rate_limited = '429' in str(llm_err)
             is_timeout = 'timeout' in str(llm_err).lower()
             is_connection_error = 'connect' in str(llm_err).lower()
-            should_always_failover = is_ollama_down or is_rate_limited or is_timeout or is_connection_error
+            should_always_failover = is_local_down or is_rate_limited or is_timeout or is_connection_error
 
-            if route.provider in ("ollama", "local") and self._provider_resolver and (
+            if route.provider in ("ollama", "lmstudio", "local") and self._provider_resolver and (
                 not self._has_explicit_model or should_always_failover
             ):
                 failover_reason = (
-                    "Ollama unavailable" if is_ollama_down else
+                    "Local provider unavailable" if is_local_down else
                     "429 rate limit" if is_rate_limited else
                     "timeout" if is_timeout else
                     "connection error" if is_connection_error else

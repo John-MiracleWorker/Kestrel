@@ -41,7 +41,8 @@ export type TabId =
     | 'api-keys'
     | 'general'
     | 'profile'
-    | 'ollama';
+    | 'ollama'
+    | 'lmstudio';
 
 export interface McpServer {
     id?: string;

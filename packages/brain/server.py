@@ -342,11 +342,13 @@ async def serve():
         from agent.model_router import init_models as init_router_models
         from agent.failover import build_dynamic_chains
         from providers.ollama import OllamaProvider
+        from providers.lmstudio import LMStudioProvider
 
-        # Start Ollama LAN discovery first — this scans the network for the
-        # most capable Ollama instance (e.g. a more powerful machine on the
-        # same subnet) so model_registry uses the right host.
+        # Start Ollama + LM Studio LAN discovery — scans the network for the
+        # most capable local instances (Ollama on port 11434, LM Studio on
+        # port 1234) so model_registry uses the right hosts.
         OllamaProvider.start_discovery()
+        LMStudioProvider.start_discovery()
 
         # Pre-warm the registry for Google (primary provider)
         await model_registry.list_models("google")

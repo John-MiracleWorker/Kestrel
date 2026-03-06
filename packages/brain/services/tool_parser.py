@@ -71,13 +71,15 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
     if event_type == "thinking":
         yield make_response_fn(
             chunk_type=0,
-            metadata={"agent_status": "thinking", "thinking": event.content[:200]},
+            metadata={"agent_status": "thinking", "thinking": event.content[:500]},
         )
-        thinking_preview = (event.content or "")[:150].replace('\n', ' ')
+        thinking_text = (event.content or "").strip()
         already_shown = thinking_shown and thinking_shown[0]
-        if thinking_preview and not full_response_parts and not already_shown:
-            thinking_text = f"\n\n💭 *{thinking_preview}...*\n\n"
-            yield make_response_fn(chunk_type=0, content_delta=thinking_text)
+        if thinking_text and not already_shown:
+            # Show full thinking in a collapsible details block
+            formatted = f"\n\n<details><summary>💭 Thinking...</summary>\n\n{thinking_text}\n\n</details>\n\n"
+            yield make_response_fn(chunk_type=0, content_delta=formatted)
+            full_response_parts.append(formatted)
             if thinking_shown is not None:
                 thinking_shown[0] = True
 
@@ -124,10 +126,9 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
 
     elif event_type == "step_complete":
         if event.content:
-            words = event.content.split(' ')
-            for i, word in enumerate(words):
-                chunk = word if i == 0 else ' ' + word
-                yield make_response_fn(chunk_type=0, content_delta=chunk)
+            # Yield the content delta directly — may be a single token
+            # from streaming or a larger chunk from non-streaming paths.
+            yield make_response_fn(chunk_type=0, content_delta=event.content)
             full_response_parts.append(event.content)
 
     elif event_type == "approval_needed":

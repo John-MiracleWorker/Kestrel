@@ -5,7 +5,7 @@
     "identifier": "ai.kestrel.desktop",
     "build": {
         "frontendDist": "../../web/dist",
-        "devUrl": "http://localhost:5173",
+        "devUrl": "http://localhost:5173/?v=2",
         "beforeDevCommand": "",
         "beforeBuildCommand": "npm run build --workspace=@kestrel/web"
     },

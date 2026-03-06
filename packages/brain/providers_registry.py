@@ -8,6 +8,7 @@ from typing import Optional, Union
 from providers.local import LocalProvider
 from providers.cloud import CloudProvider
 from providers.ollama import OllamaProvider, OllamaUnavailableError
+from providers.lmstudio import LMStudioProvider, LMStudioUnavailableError
 from db import get_pool
 
 logger = logging.getLogger("brain.providers")
@@ -26,6 +27,8 @@ def get_provider(name: str):
                 _providers[name] = _providers["local"]
             else:
                 _providers[name] = OllamaProvider()
+        elif name == "lmstudio":
+            _providers[name] = LMStudioProvider()
         else:
             _providers[name] = CloudProvider(name)
     return _providers[name]
@@ -34,7 +37,7 @@ def get_provider(name: str):
 def get_available_providers() -> list[str]:
     """Return list of provider names that are currently ready."""
     available = []
-    for name in ("ollama", "google", "openai", "anthropic", "local"):
+    for name in ("ollama", "lmstudio", "google", "openai", "anthropic", "local"):
         try:
             p = get_provider(name)
             if p.is_ready():
@@ -59,7 +62,7 @@ def resolve_provider(provider_name: str):
         pass
 
     # Fallback chain
-    for fallback in ("ollama", "google", "openai", "anthropic", "local"):
+    for fallback in ("ollama", "lmstudio", "google", "openai", "anthropic", "local"):
         if fallback == provider_name:
             continue
         try:
