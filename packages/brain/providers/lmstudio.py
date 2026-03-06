@@ -180,6 +180,7 @@ class LMStudioProvider:
         temperature: float = 0.7,
         max_tokens: int = 4096,
         api_key: str = "",  # unused, kept for interface compat
+        enable_thinking: bool = True,
     ) -> AsyncIterator[str]:
         """Stream tokens from an LM Studio model."""
         model = model or LMSTUDIO_DEFAULT_MODEL
@@ -193,6 +194,8 @@ class LMStudioProvider:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if not enable_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
 
         try:
             async with httpx.AsyncClient(timeout=300) as client:
@@ -249,10 +252,11 @@ class LMStudioProvider:
         model: str = "",
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        enable_thinking: bool = True,
     ) -> str:
         """Non-streaming chat completion."""
         result: list[str] = []
-        async for token in self.stream(messages, model, temperature, max_tokens):
+        async for token in self.stream(messages, model, temperature, max_tokens, enable_thinking=enable_thinking):
             result.append(token)
         return "".join(result)
 
@@ -300,6 +304,9 @@ class LMStudioProvider:
                         })
             if openai_tools:
                 payload["tools"] = openai_tools
+                # Disable thinking for tool calls — reasoning wastes tokens
+                # when the model just needs to pick a tool and args
+                payload["chat_template_kwargs"] = {"enable_thinking": False}
 
         try:
             timeout = int(os.getenv("LMSTUDIO_TIMEOUT", "600"))

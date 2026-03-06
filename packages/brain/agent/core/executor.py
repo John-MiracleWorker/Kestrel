@@ -1319,6 +1319,19 @@ class TaskExecutor:
         )
 
         try:
+            # Notify UI that we are blocked on tool generation
+            # Extremely important for local models like Qwen 3.5 that "think"
+            # for 90 seconds without streaming during tool calls.
+            yield TaskEvent(
+                type=TaskEventType.THINKING,
+                task_id=task.id,
+                step_id=step.id,
+                content="Analyzing prompt to select optimal tools...",
+            )
+        except Exception:
+            pass
+
+        try:
             response = await active_provider.generate_with_tools(
                 messages=messages,
                 model=routed_model,
@@ -1409,6 +1422,16 @@ class TaskExecutor:
                                 })
                             except Exception:
                                 pass
+
+                        try:
+                            yield TaskEvent(
+                                type=TaskEventType.THINKING,
+                                task_id=task.id,
+                                step_id=step.id,
+                                content=f"Analyzing prompt with {cloud_name} fallback...",
+                            )
+                        except Exception:
+                            pass
 
                         response = await cloud_p.generate_with_tools(
                             messages=messages,

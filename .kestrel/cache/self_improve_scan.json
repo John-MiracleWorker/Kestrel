@@ -459,15 +459,15 @@
             ]
         },
         "packages/brain/providers/lmstudio.py": {
-            "sig": "1772760845313741203:16170",
+            "sig": "1772766400597329059:16607",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/providers/lmstudio.py",
-                    "line": 261,
-                    "description": "Function `generate_with_tools` is 127 lines long \u2014 consider refactoring",
+                    "line": 265,
+                    "description": "Function `generate_with_tools` is 130 lines long \u2014 consider refactoring",
                     "suggestion": "Break `generate_with_tools` into smaller helper functions"
                 },
                 {
@@ -3601,7 +3601,7 @@
             "issues": []
         },
         "packages/brain/agent/core/executor.py": {
-            "sig": "1772765677730348501:68921",
+            "sig": "1772765775464022599:69396",
             "issues": [
                 {
                     "type": "complexity",
@@ -3636,7 +3636,7 @@
                     "package": "brain",
                     "file": "packages/brain/agent/core/executor.py",
                     "line": 824,
-                    "description": "Function `_reason_and_act` is 746 lines long \u2014 consider refactoring",
+                    "description": "Function `_reason_and_act` is 751 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_reason_and_act` into smaller helper functions"
                 },
                 {
@@ -3644,7 +3644,7 @@
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/agent/core/executor.py",
-                    "line": 1084,
+                    "line": 1089,
                     "description": "Function `_do_stream` is 85 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_do_stream` into smaller helper functions"
                 }
@@ -3655,7 +3655,7 @@
             "issues": []
         },
         "packages/brain/services/chat_service.py": {
-            "sig": "1772765605635670335:32683",
+            "sig": "1772766051260013736:33130",
             "issues": [
                 {
                     "type": "complexity",
@@ -3672,7 +3672,7 @@
                     "package": "brain",
                     "file": "packages/brain/services/chat_service.py",
                     "line": 106,
-                    "description": "Function `StreamChat` is 560 lines long \u2014 consider refactoring",
+                    "description": "Function `StreamChat` is 569 lines long \u2014 consider refactoring",
                     "suggestion": "Break `StreamChat` into smaller helper functions"
                 },
                 {

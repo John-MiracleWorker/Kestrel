@@ -256,11 +256,11 @@ class LMStudioDiscovery:
     async def _ensure_scanned(self) -> None:
         """Scan if we haven't scanned recently."""
         now = time.time()
-        if now - self._scanned_at < _SCAN_INTERVAL and self._hosts:
+        if self._scanned_at > 0 and now - self._scanned_at < _SCAN_INTERVAL:
             return
         async with self._lock:
             now = time.time()
-            if now - self._scanned_at < _SCAN_INTERVAL and self._hosts:
+            if self._scanned_at > 0 and now - self._scanned_at < _SCAN_INTERVAL:
                 return
             await self._do_scan()
 
