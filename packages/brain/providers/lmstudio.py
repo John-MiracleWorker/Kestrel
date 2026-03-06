@@ -14,6 +14,7 @@ import time
 from typing import AsyncIterator, Optional
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_THINK_UNCLOSED_RE = re.compile(r"<think>.*", re.DOTALL)
 
 import httpx
 
@@ -325,6 +326,7 @@ class LMStudioProvider:
             content = message.get("content", "") or ""
             # Strip <think>...</think> blocks from reasoning models (e.g. GLM)
             content = _THINK_RE.sub("", content).strip()
+            content = _THINK_UNCLOSED_RE.sub("", content).strip()
             self._last_response = content
 
             # Extract tool calls (already in OpenAI format)

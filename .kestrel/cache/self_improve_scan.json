@@ -459,15 +459,15 @@
             ]
         },
         "packages/brain/providers/lmstudio.py": {
-            "sig": "1772751160772935996:15843",
+            "sig": "1772760271004960445:16047",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/providers/lmstudio.py",
-                    "line": 257,
-                    "description": "Function `generate_with_tools` is 124 lines long \u2014 consider refactoring",
+                    "line": 260,
+                    "description": "Function `generate_with_tools` is 126 lines long \u2014 consider refactoring",
                     "suggestion": "Break `generate_with_tools` into smaller helper functions"
                 },
                 {
@@ -484,9 +484,9 @@
                     "severity": "low",
                     "package": "brain",
                     "file": "packages/brain/providers/lmstudio.py",
-                    "line": 13,
+                    "line": 14,
                     "description": "Potentially unused import: `Optional`",
-                    "suggestion": "Remove unused import `Optional` at line 13"
+                    "suggestion": "Remove unused import `Optional` at line 14"
                 }
             ]
         },

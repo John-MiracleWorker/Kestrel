@@ -216,6 +216,8 @@ class TaskPlanner:
         import re
         # Strip <think>...</think> blocks (reasoning models like GLM)
         text = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
+        # Also handle unclosed <think> (truncated by max_tokens)
+        text = re.sub(r"<think>.*", "", text, flags=re.DOTALL).strip()
         # Strip markdown code fences if present
         if text.startswith("```"):
             lines = text.split("\n")
@@ -313,12 +315,14 @@ class TaskPlanner:
         return groups
 
     def _format_tool_descriptions(self, tools: list[ToolDefinition]) -> str:
-        """Format tool list for the planning prompt."""
+        """Format tool list for the planning prompt.
+
+        Uses a compact format (name: short description) to keep the prompt
+        small for local models that reason slowly with large contexts.
+        """
         lines = []
         for tool in tools:
-            params = ", ".join(
-                f"{k}: {v.get('type', 'any')}"
-                for k, v in tool.parameters.get("properties", {}).items()
-            )
-            lines.append(f"- {tool.name}({params}): {tool.description}")
+            # Truncate description to keep prompt lean
+            desc = tool.description[:80].rstrip('.')
+            lines.append(f"- {tool.name}: {desc}")
         return "\n".join(lines)
