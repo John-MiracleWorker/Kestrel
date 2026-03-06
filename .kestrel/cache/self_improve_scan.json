@@ -1163,7 +1163,7 @@
             ]
         },
         "packages/brain/agent/loop.py": {
-            "sig": "1772570330853565928:35370",
+            "sig": "1772763505538136449:36488",
             "issues": [
                 {
                     "type": "complexity",
@@ -1171,7 +1171,7 @@
                     "package": "brain",
                     "file": "packages/brain/agent/loop.py",
                     "line": 231,
-                    "description": "Function `run` is 476 lines long \u2014 consider refactoring",
+                    "description": "Function `run` is 495 lines long \u2014 consider refactoring",
                     "suggestion": "Break `run` into smaller helper functions"
                 },
                 {
@@ -3601,7 +3601,7 @@
             "issues": []
         },
         "packages/brain/agent/core/executor.py": {
-            "sig": "1772758945632598758:66826",
+            "sig": "1772763308605014176:67226",
             "issues": [
                 {
                     "type": "complexity",
@@ -3636,7 +3636,7 @@
                     "package": "brain",
                     "file": "packages/brain/agent/core/executor.py",
                     "line": 805,
-                    "description": "Function `_reason_and_act` is 713 lines long \u2014 consider refactoring",
+                    "description": "Function `_reason_and_act` is 723 lines long \u2014 consider refactoring",
                     "suggestion": "Break `_reason_and_act` into smaller helper functions"
                 },
                 {
