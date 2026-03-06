@@ -61,6 +61,12 @@ class StepScheduler:
         self._event_callback = event_callback
         self._max_parallel = max_parallel_steps
 
+    # Maximum number of scheduler iterations an IN_PROGRESS step can be
+    # re-executed before being force-completed.  This prevents infinite
+    # loops when the LLM alternates between text-only and tool-call
+    # responses without ever marking the step done.
+    MAX_IN_PROGRESS_REEXECUTIONS = 10
+
     def _get_ready_steps(self, plan: TaskPlan) -> list[TaskStep]:
         """Return all pending or in-progress steps whose dependencies are satisfied.
 
@@ -361,12 +367,42 @@ class StepScheduler:
         # ── Safety guard: step still IN_PROGRESS after executor finished ──
         # This happens when the LLM returns text-only content that doesn't
         # match done-criteria. The step will be re-queued by _get_ready_steps
-        # on the next scheduler iteration. Log it so we have visibility.
+        # on the next scheduler iteration.
         if step.status == StepStatus.IN_PROGRESS:
+            # Track how many times the scheduler has re-executed this step
+            step.attempts += 1
             logger.info(
                 f"Step {step.id} still IN_PROGRESS after executor run "
                 f"(attempts={step.attempts}, has_result={bool(step.result)})"
             )
+
+            # Force-complete the step if it has been re-executed too many
+            # times.  This breaks infinite loops where the LLM alternates
+            # between text-only and tool-call responses without ever
+            # explicitly completing the step.
+            if step.attempts >= self.MAX_IN_PROGRESS_REEXECUTIONS:
+                logger.warning(
+                    f"Step {step.id} hit max re-execution limit "
+                    f"({self.MAX_IN_PROGRESS_REEXECUTIONS}). "
+                    f"Force-completing to prevent infinite loop."
+                )
+                step.status = StepStatus.COMPLETE
+                step.completed_at = datetime.now(timezone.utc)
+                if not step.result:
+                    step.result = (
+                        "Step auto-completed after exceeding maximum "
+                        "re-execution attempts."
+                    )
+                await self._persistence.update_task(task)
+
+                yield TaskEvent(
+                    type=TaskEventType.STEP_COMPLETE,
+                    task_id=task.id,
+                    step_id=step.id,
+                    content=step.result or "",
+                    progress=progress_fn(task),
+                )
+                return
 
     async def _execute_parallel_steps(
         self,
@@ -412,10 +448,25 @@ class StepScheduler:
                     )))
                 elif step.status == StepStatus.IN_PROGRESS:
                     # Step wasn't resolved by the executor
+                    step.attempts += 1
                     logger.info(
                         f"Parallel step {step.id} still IN_PROGRESS after "
-                        f"executor run (has_result={bool(step.result)})"
+                        f"executor run (attempts={step.attempts}, "
+                        f"has_result={bool(step.result)})"
                     )
+                    # Force-complete if re-executed too many times
+                    if step.attempts >= self.MAX_IN_PROGRESS_REEXECUTIONS:
+                        logger.warning(
+                            f"Parallel step {step.id} hit max re-execution "
+                            f"limit. Force-completing."
+                        )
+                        step.status = StepStatus.COMPLETE
+                        step.completed_at = datetime.now(timezone.utc)
+                        if not step.result:
+                            step.result = (
+                                "Step auto-completed after exceeding "
+                                "maximum re-execution attempts."
+                            )
             except Exception as e:
                 step.status = StepStatus.FAILED
                 step.error = str(e)

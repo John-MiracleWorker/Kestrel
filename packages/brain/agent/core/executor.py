@@ -160,6 +160,7 @@ class TaskExecutor:
         self._approval_memory = approval_memory
         self._step_diagnostics: dict[str, DiagnosticTracker] = {}  # step_id → tracker
         self._text_only_streak: dict[str, int] = {}  # step_id → consecutive text-only responses
+        self._text_only_total: dict[str, int] = {}   # step_id → total text-only responses (never resets)
 
     def _get_tracker(self, step_id: str) -> DiagnosticTracker:
         """Get or create a DiagnosticTracker for a step."""
@@ -1531,6 +1532,7 @@ class TaskExecutor:
             logger.info(
                 f"LLM returned text-only (no tool calls): "
                 f"streak={self._text_only_streak.get(step.id, 0)+1}, "
+                f"total={self._text_only_total.get(step.id, 0)+1}, "
                 f"preview={text[:80]!r}"
             )
 
@@ -1545,6 +1547,12 @@ class TaskExecutor:
             # Track consecutive text-only responses to detect stuck loops
             self._text_only_streak.setdefault(step.id, 0)
             self._text_only_streak[step.id] += 1
+
+            # Track TOTAL text-only responses (never resets on tool calls).
+            # This catches the alternating pattern: text → tool → text → tool
+            # where the consecutive streak resets but the LLM is clearly stuck.
+            self._text_only_total.setdefault(step.id, 0)
+            self._text_only_total[step.id] += 1
 
             is_simple_chat = bool(task.messages and total == 1)
             has_done_work = bool(step.tool_calls)
@@ -1568,6 +1576,10 @@ class TaskExecutor:
             # Safety valve: if LLM returns text-only 2+ times in a row,
             # it's stuck in a summary loop — force-complete the step.
             has_high_streak = self._text_only_streak[step.id] >= 2
+            # Also force-complete if total text-only responses (including
+            # non-consecutive) exceed threshold — catches alternating
+            # text/tool-call loops where the streak keeps resetting.
+            has_excessive_text = self._text_only_total[step.id] >= 5
 
             # Always capture the LLM's text — even if we don't mark
             # the step complete yet, the text may contain useful output
@@ -1575,7 +1587,7 @@ class TaskExecutor:
             # complete rather than failed.
             step.result = text
 
-            if is_simple_chat or has_done_work or is_done_phrase or has_high_streak:
+            if is_simple_chat or has_done_work or is_done_phrase or has_high_streak or has_excessive_text:
                 step.status = StepStatus.COMPLETE
                 step.completed_at = datetime.now(timezone.utc)
                 await self._persistence.update_task(task)
