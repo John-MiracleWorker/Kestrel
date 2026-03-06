@@ -71,6 +71,7 @@ _CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "system": [
         "container", "docker", "rebuild", "restart", "deploy",
         "health", "status", "system", "server", "service",
+        "cron", "job", "kill", "process", "stuck", "failing",
     ],
     "skill": [
         "skill", "create_skill", "learn", "improve", "self_improve",
@@ -101,7 +102,8 @@ _TOOL_CATEGORY_MAP: dict[str, str] = {
     "host_list": "file",
     "host_tree": "file",
     "host_find": "file",
-    "host_exec": "code",
+    "host_exec": "system",
+    "host_search": "file",
     "project_recall": "memory",
     "memory_store": "memory",
     "memory_search": "memory",
@@ -169,7 +171,7 @@ class ToolSelector:
 
         Returns list of ToolDefinition objects.
         """
-        is_local = provider in ("ollama", "local")
+        is_local = provider in ("ollama", "local", "lmstudio")
         limit = max_tools or (MAX_LOCAL_TOOLS if is_local else MAX_CLOUD_TOOLS)
 
         selected: dict[str, ToolDefinition] = {}
