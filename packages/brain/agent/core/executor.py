@@ -1199,6 +1199,18 @@ class TaskExecutor:
             expected_tools=step_expected,
         )
 
+        routed_model = route.model if route.model else self._model
+        routed_temp = route.temperature
+        routed_max_tokens = route.max_tokens
+
+        if self._provider_resolver and route.provider:
+            try:
+                active_provider = self._provider_resolver(route.provider)
+            except Exception:
+                active_provider = self._provider
+        else:
+            active_provider = self._provider
+
         try:
             from agent.tool_selector import ToolSelector
             selector = ToolSelector(self._tools.list_tools())
@@ -1225,17 +1237,6 @@ class TaskExecutor:
         except Exception as e:
             logger.warning(f"ToolSelector failed, using all tools: {e}")
             tool_schemas = [t.to_openai_schema() for t in self._tools.list_tools()]
-        routed_model = route.model if route.model else self._model
-        routed_temp = route.temperature
-        routed_max_tokens = route.max_tokens
-
-        if self._provider_resolver and route.provider:
-            try:
-                active_provider = self._provider_resolver(route.provider)
-            except Exception:
-                active_provider = self._provider
-        else:
-            active_provider = self._provider
 
         try:
             from agent.context_compactor import compact_context, needs_escalation
