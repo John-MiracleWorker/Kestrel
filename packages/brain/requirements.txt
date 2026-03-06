@@ -18,3 +18,4 @@ psutil
 cryptography
 bcrypt
 watchdog
+websockets>=12.0
