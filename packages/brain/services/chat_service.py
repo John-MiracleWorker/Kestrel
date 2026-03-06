@@ -429,7 +429,7 @@ class ChatServicerMixin(BaseServicerMixin):
                     try:
                         import httpx as _httpx
                         _probe_url = provider_settings["lmstudio_host"].rstrip("/")
-                        resp = _httpx.get(f"{_probe_url}/v1/models", timeout=8)
+                        resp = _httpx.get(f"{_probe_url}/v1/models", timeout=15)
                         _ok = resp.status_code == 200
                         logger.info(f"LM Studio probe {_probe_url}: {'OK' if _ok else resp.status_code}")
                         return _ok
