@@ -139,14 +139,13 @@ def _build_catalog(tools: dict[str, ToolDefinition]) -> str:
     return "\n".join(lines)
 
 
-_PICKER_PROMPT = """You are a tool selector. Given a task, pick the tools needed from this catalog.
+_PICKER_PROMPT = """/nothink
+Pick 1-5 tools from this list for the task. Reply with ONLY tool names, one per line.
 
 TOOLS:
 {catalog}
 
-TASK: {task}
-
-Reply with ONLY the tool names needed (1-5 tools), one per line. No explanations."""
+TASK: {task}"""
 
 
 class ToolSelector:
@@ -201,17 +200,14 @@ class ToolSelector:
             )
 
             # Use the provider's generate method (no tools, just text)
-            # Most providers: generate() returns str
-            # Some providers: generate() returns dict with "content"
             try:
                 response = await provider.generate(
                     messages=[{"role": "user", "content": prompt}],
                     model=model,
                     temperature=0.0,
-                    max_tokens=100,
+                    max_tokens=150,
                 )
             except TypeError:
-                # Some providers may have different signatures
                 response = await provider.generate(
                     messages=[{"role": "user", "content": prompt}],
                     model=model,
@@ -224,7 +220,6 @@ class ToolSelector:
             elif isinstance(response, str):
                 content = response
             else:
-                # Try async generator (streaming)
                 chunks = []
                 async for chunk in response:
                     if isinstance(chunk, dict):
@@ -232,6 +227,8 @@ class ToolSelector:
                     elif isinstance(chunk, str):
                         chunks.append(chunk)
                 content = "".join(chunks)
+
+            logger.debug(f"Tool picker raw response: {content[:200]!r}")
 
             # Strip <think> tags if present
             content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
