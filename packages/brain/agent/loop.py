@@ -53,6 +53,7 @@ from agent.council import CouncilSession, CouncilRole
 from agent.core.executor import TaskExecutor
 from agent.step_scheduler import StepScheduler
 from agent.simulation import OutcomeSimulator
+from agent.state_machine import TaskStateMachine
 
 logger = logging.getLogger("brain.agent.loop")
 
@@ -145,6 +146,9 @@ class AgentLoop:
             learner=learner,
             event_callback=event_callback,
         )
+
+        # State machine enforces legal task status transitions
+        self._state_machine = TaskStateMachine(strict=False)
 
         # Callback for approval resolution (set by the gRPC handler)
         self._approval_callback: Optional[Callable] = None
@@ -579,8 +583,7 @@ class AgentLoop:
                     )],
                 )
 
-            task.status = TaskStatus.EXECUTING
-            await self._persistence.update_task(task)
+            await self._transition(task, TaskStatus.EXECUTING)
 
             # Use the parallel step scheduler for DAG-aware execution
             async for event in self._step_scheduler.execute_plan(
@@ -593,8 +596,11 @@ class AgentLoop:
                 if event.type == TaskEventType.TASK_FAILED:
                     return
 
-            # ── Phase 3: Completion ──────────────────────────────
-            task.status = TaskStatus.COMPLETE
+            # ── Phase 3: Verification + Completion ────────────────
+            # Transition through VERIFYING state before marking COMPLETE
+            await self._transition(task, TaskStatus.VERIFYING)
+            # (Verification itself is handled by the executor's task_complete handler)
+            await self._transition(task, TaskStatus.COMPLETE)
             task.completed_at = datetime.now(timezone.utc)
 
             # Build final summary from step results
@@ -723,6 +729,12 @@ class AgentLoop:
                 content=str(e),
                 progress=self._progress(task),
             )
+
+    async def _transition(self, task: AgentTask, new_status: TaskStatus) -> None:
+        """Safely transition task status through the state machine."""
+        self._state_machine.check_transition(task.id, task.status, new_status)
+        task.status = new_status
+        await self._persistence.update_task(task)
 
     def _progress(self, task: AgentTask) -> dict:
         """Build progress snapshot."""

@@ -556,3 +556,59 @@ class TaskLearner:
             logger.info(f"Extracted {len(lessons)} lessons from {total} eval results")
 
         return lessons
+
+    async def detect_macro_patterns(
+        self,
+        workspace_id: str,
+        tool_sequence: list[str],
+        min_occurrences: int = 3,
+    ) -> Optional[dict]:
+        """
+        Detect repeated tool sequences that could become macros.
+
+        Analyzes past task execution traces to find tool call patterns
+        that occur >= min_occurrences times, suggesting they should be
+        saved as reusable macros.
+
+        Returns macro suggestion dict or None if no pattern detected.
+        """
+        if not self._pool or len(tool_sequence) < 2:
+            return None
+
+        try:
+            # Create a signature for the tool sequence
+            sig = "→".join(tool_sequence[:5])  # Cap at 5 tools per pattern
+            sig_hash = hashlib.md5(sig.encode()).hexdigest()[:12]
+
+            async with self._pool.acquire() as conn:
+                # Check how many times this pattern has appeared in past tasks
+                ws_uuid = self._to_uuid(workspace_id)
+                count = await conn.fetchval(
+                    """
+                    SELECT COUNT(*) FROM agent_tasks
+                    WHERE workspace_id = $1
+                      AND status = 'complete'
+                      AND plan::text LIKE $2
+                    """,
+                    ws_uuid, f"%{sig_hash}%",
+                )
+
+                if count and count >= min_occurrences:
+                    return {
+                        "pattern": sig,
+                        "occurrences": count,
+                        "tools": tool_sequence[:5],
+                        "suggestion": f"This tool sequence has been used {count} times. Consider creating a macro.",
+                    }
+        except Exception as e:
+            logger.debug(f"Macro pattern detection failed: {e}")
+
+        return None
+
+    def _to_uuid(self, workspace_id: str):
+        """Convert workspace_id string to UUID if needed."""
+        import uuid as _uuid
+        try:
+            return _uuid.UUID(workspace_id)
+        except (ValueError, AttributeError):
+            return workspace_id

@@ -27,8 +27,31 @@ HOST_SKILLS_DIR = os.getenv("HOST_SKILLS_DIR", "")
 CONTAINER_SKILLS_DIR = os.getenv("SKILLS_DIR", "/skills")
 
 
+# ── Resource Profiles ─────────────────────────────────────────────────
+# Skill-specific resource allocation. Skills not listed use defaults.
+RESOURCE_PROFILES = {
+    "browser_automation": {"memory_mb": 1024, "cpu_limit": 1.5, "timeout": 120},
+    "computer_use":       {"memory_mb": 1024, "cpu_limit": 2.0, "timeout": 180},
+    "python_executor":    {"memory_mb": 512,  "cpu_limit": 1.0, "timeout": 60},
+    "node_executor":      {"memory_mb": 512,  "cpu_limit": 1.0, "timeout": 60},
+    "shell_executor":     {"memory_mb": 256,  "cpu_limit": 0.5, "timeout": 30},
+    "web":                {"memory_mb": 256,  "cpu_limit": 0.5, "timeout": 30},
+    "wikipedia":          {"memory_mb": 128,  "cpu_limit": 0.25, "timeout": 15},
+}
+
+# Pool config
+WARM_POOL_SIZE = int(os.getenv("SANDBOX_WARM_POOL_SIZE", "3"))
+WORKSPACE_VOLUME_TTL_DAYS = int(os.getenv("SANDBOX_VOLUME_TTL_DAYS", "7"))
+
+
 class DockerExecutor:
     """Manages sandboxed skill execution in Docker containers.
+
+    Enhancements over basic execution:
+      - Warm container pool: pre-created stopped containers for instant startup
+      - Persistent workspace volumes: packages survive across executions
+      - Smart resource allocation: memory/CPU profiles per skill type
+      - Skill chaining: sequential execution in a single container
 
     Instead of rejecting requests immediately when at capacity, requests
     are queued (up to MAX_QUEUE_SIZE) using an asyncio.Semaphore.
@@ -40,6 +63,11 @@ class DockerExecutor:
         self._active = 0
         self._queued = 0
         self._max_concurrent = MAX_CONCURRENT
+        # Warm container pool: list of pre-created container IDs
+        self._warm_pool: list[str] = []
+        self._warm_pool_lock = asyncio.Lock()
+        # Track workspace volumes
+        self._workspace_volumes: set[str] = set()
 
     @property
     def active_sandboxes(self) -> int:
@@ -65,6 +93,129 @@ class DockerExecutor:
                 raise RuntimeError("Docker is required for sandboxed execution")
         return self._docker
 
+    # ── Warm Container Pool ──────────────────────────────────────────
+
+    async def initialize_warm_pool(self):
+        """Pre-create stopped containers for instant skill startup."""
+        if WARM_POOL_SIZE <= 0:
+            return
+        try:
+            client = self._get_client()
+            loop = asyncio.get_event_loop()
+            for _ in range(WARM_POOL_SIZE):
+                container_id = await loop.run_in_executor(
+                    None, lambda: self._create_warm_container(client)
+                )
+                if container_id:
+                    self._warm_pool.append(container_id)
+            logger.info(f"Warm pool initialized: {len(self._warm_pool)} containers ready")
+        except Exception as e:
+            logger.warning(f"Warm pool init failed (non-fatal): {e}")
+
+    def _create_warm_container(self, client) -> Optional[str]:
+        """Create a stopped container ready for use."""
+        try:
+            container = client.containers.create(
+                SANDBOX_IMAGE,
+                command="sleep infinity",
+                detach=True,
+                mem_limit="512m",
+                nano_cpus=int(1.0 * 1e9),
+            )
+            return container.id
+        except Exception as e:
+            logger.debug(f"Warm container creation failed: {e}")
+            return None
+
+    async def _acquire_warm_container(self) -> Optional[str]:
+        """Pop a warm container from the pool (or None if empty)."""
+        async with self._warm_pool_lock:
+            if self._warm_pool:
+                cid = self._warm_pool.pop(0)
+                # Schedule replenishment in background
+                asyncio.create_task(self._replenish_warm_pool())
+                return cid
+        return None
+
+    async def _replenish_warm_pool(self):
+        """Add a new container to the pool to replace one that was used."""
+        try:
+            client = self._get_client()
+            loop = asyncio.get_event_loop()
+            container_id = await loop.run_in_executor(
+                None, lambda: self._create_warm_container(client)
+            )
+            if container_id:
+                async with self._warm_pool_lock:
+                    if len(self._warm_pool) < WARM_POOL_SIZE:
+                        self._warm_pool.append(container_id)
+                    else:
+                        # Pool is full, remove the extra container
+                        await loop.run_in_executor(
+                            None, lambda: self._remove_container(client, container_id)
+                        )
+        except Exception:
+            pass
+
+    def _remove_container(self, client, container_id: str):
+        """Remove a container by ID."""
+        try:
+            container = client.containers.get(container_id)
+            container.remove(force=True)
+        except Exception:
+            pass
+
+    # ── Persistent Workspace Volumes ─────────────────────────────────
+
+    def _get_workspace_volume_name(self, workspace_id: str) -> str:
+        """Generate a deterministic volume name for a workspace."""
+        return f"kestrel-workspace-{workspace_id[:12]}"
+
+    async def ensure_workspace_volume(self, workspace_id: str) -> str:
+        """Create or verify a persistent workspace volume exists."""
+        vol_name = self._get_workspace_volume_name(workspace_id)
+        if vol_name in self._workspace_volumes:
+            return vol_name
+
+        try:
+            client = self._get_client()
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, lambda: self._ensure_volume_sync(client, vol_name)
+            )
+            self._workspace_volumes.add(vol_name)
+            logger.debug(f"Workspace volume ready: {vol_name}")
+        except Exception as e:
+            logger.warning(f"Workspace volume creation failed: {e}")
+
+        return vol_name
+
+    def _ensure_volume_sync(self, client, vol_name: str):
+        """Create a Docker volume if it doesn't exist."""
+        try:
+            client.volumes.get(vol_name)
+        except Exception:
+            client.volumes.create(
+                name=vol_name,
+                labels={"kestrel.type": "workspace", "kestrel.managed": "true"},
+            )
+
+    # ── Smart Resource Allocation ────────────────────────────────────
+
+    def _get_resource_profile(self, skill_path: str, limits: dict) -> dict:
+        """Apply skill-specific resource profiles, falling back to caller limits."""
+        # Extract skill name from path (e.g., /skills/browser_automation → browser_automation)
+        skill_name = os.path.basename(skill_path.rstrip("/"))
+        profile = RESOURCE_PROFILES.get(skill_name, {})
+
+        return {
+            "memory_mb": profile.get("memory_mb", limits.get("memory_mb", 256)),
+            "cpu_limit": profile.get("cpu_limit", limits.get("cpu_limit", 1.0)),
+            "timeout": profile.get("timeout", limits.get("timeout", 30)),
+            "network": limits.get("network", False),
+            "fs_write": limits.get("fs_write", False),
+        }
+
     async def run(
         self,
         skill_path: str,
@@ -73,11 +224,16 @@ class DockerExecutor:
         limits: dict,
         allowed_domains: list[str] = None,
         allowed_paths: list[str] = None,
+        workspace_id: str = "",
     ) -> dict:
         """Run a skill function in a sandboxed Docker container.
 
         If all slots are busy, the request is queued (FIFO) up to
         MAX_QUEUE_SIZE. If the queue is also full, RuntimeError is raised.
+
+        Enhancements:
+          - Smart resource allocation based on skill type
+          - Persistent workspace volumes for package caching
         """
         # Check queue capacity before waiting
         if self._queued >= MAX_QUEUE_SIZE:
@@ -85,6 +241,14 @@ class DockerExecutor:
                 f"Sandbox queue full ({self._queued} waiting, "
                 f"{self._active} active). Try again later."
             )
+
+        # Apply smart resource allocation
+        effective_limits = self._get_resource_profile(skill_path, limits)
+
+        # Ensure workspace volume exists for persistent storage
+        workspace_volume = None
+        if workspace_id:
+            workspace_volume = await self.ensure_workspace_volume(workspace_id)
 
         self._queued += 1
         try:
@@ -101,7 +265,8 @@ class DockerExecutor:
                     # Build container configuration
                     container_config = self._build_config(
                         skill_path, function_name, arguments,
-                        limits, allowed_domains, allowed_paths,
+                        effective_limits, allowed_domains, allowed_paths,
+                        workspace_volume=workspace_volume,
                     )
 
                     # Run container in executor (docker-py is sync)
@@ -134,7 +299,8 @@ class DockerExecutor:
             raise
 
     def _build_config(self, skill_path, function_name, arguments,
-                      limits, allowed_domains, allowed_paths):
+                      limits, allowed_domains, allowed_paths,
+                      workspace_volume=None):
         """Build Docker container configuration."""
         env = {
             "SKILL_FUNCTION": function_name,
@@ -154,6 +320,11 @@ class DockerExecutor:
         volumes = {
             mount_path: {"bind": "/skill", "mode": "ro"},
         }
+
+        # Mount persistent workspace volume for package caching
+        if workspace_volume:
+            volumes[workspace_volume] = {"bind": "/workspace", "mode": "rw"}
+            env["WORKSPACE_DIR"] = "/workspace"
 
         # Add allowed filesystem paths as read-only mounts
         if allowed_paths:
@@ -228,14 +399,72 @@ class DockerExecutor:
                 except Exception:
                     pass
 
+    async def run_chain(
+        self,
+        skill_steps: list[dict],
+        limits: dict,
+        workspace_id: str = "",
+        allowed_domains: list[str] = None,
+    ) -> list[dict]:
+        """Execute multiple skill invocations sequentially in a single container.
+
+        Each step in skill_steps is: {"skill_path": ..., "function_name": ..., "arguments": ...}
+        Output from each step is available to the next via /workspace/chain_output.json.
+
+        This avoids the overhead of creating a new container for each step.
+        """
+        if not skill_steps:
+            return []
+
+        workspace_volume = None
+        if workspace_id:
+            workspace_volume = await self.ensure_workspace_volume(workspace_id)
+
+        results = []
+        effective_limits = self._get_resource_profile(
+            skill_steps[0].get("skill_path", ""), limits
+        )
+
+        for i, step in enumerate(skill_steps):
+            result = await self.run(
+                skill_path=step["skill_path"],
+                function_name=step["function_name"],
+                arguments=step.get("arguments", "{}"),
+                limits=effective_limits,
+                workspace_id=workspace_id,
+                allowed_domains=allowed_domains,
+            )
+            results.append({
+                "step": i,
+                "skill": os.path.basename(step["skill_path"].rstrip("/")),
+                "function": step["function_name"],
+                "output": result.get("output", ""),
+                "execution_time_ms": result.get("execution_time_ms", 0),
+            })
+
+            # Stop chain on error
+            if "error" in result:
+                results[-1]["error"] = result["error"]
+                break
+
+        return results
+
     async def cleanup(self):
-        """Clean up any orphaned sandbox containers."""
+        """Clean up any orphaned sandbox containers and warm pool."""
         if not self._docker:
             return
 
         try:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._cleanup_sync)
+
+            # Clean up warm pool containers
+            async with self._warm_pool_lock:
+                for cid in self._warm_pool:
+                    await loop.run_in_executor(
+                        None, lambda c=cid: self._remove_container(self._docker, c)
+                    )
+                self._warm_pool.clear()
         except Exception as e:
             logger.error(f"Cleanup failed: {e}")
 

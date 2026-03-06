@@ -30,19 +30,27 @@ class IllegalTransitionError(Exception):
 LEGAL_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.PLANNING: {
         TaskStatus.EXECUTING,
+        TaskStatus.WAITING_APPROVAL,  # Council/simulation rejection
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
     },
     TaskStatus.EXECUTING: {
         TaskStatus.REFLECTING,
+        TaskStatus.VERIFYING,
         TaskStatus.WAITING_APPROVAL,
         TaskStatus.COMPLETE,
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
+        TaskStatus.PAUSED,
     },
     TaskStatus.REFLECTING: {
         TaskStatus.EXECUTING,
         TaskStatus.PLANNING,  # Replan
+        TaskStatus.FAILED,
+    },
+    TaskStatus.VERIFYING: {
+        TaskStatus.COMPLETE,
+        TaskStatus.EXECUTING,  # Verification failed → repair loop
         TaskStatus.FAILED,
     },
     TaskStatus.WAITING_APPROVAL: {
@@ -53,6 +61,10 @@ LEGAL_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.OBSERVING: {
         TaskStatus.EXECUTING,
         TaskStatus.REFLECTING,
+    },
+    TaskStatus.PAUSED: {
+        TaskStatus.EXECUTING,  # Resume
+        TaskStatus.CANCELLED,
     },
     TaskStatus.COMPLETE: set(),     # Terminal — no transitions out
     TaskStatus.FAILED: set(),       # Terminal — no transitions out

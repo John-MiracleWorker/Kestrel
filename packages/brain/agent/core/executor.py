@@ -25,6 +25,8 @@ from agent.evidence import EvidenceChain
 from agent.model_router import ModelRouter
 from agent.core.verifier import VerifierEngine
 from agent.diagnostics import DiagnosticTracker, classify_error, ErrorCategory
+from agent.tool_cache import ToolCache
+from agent.mcp_expansion import MCPExpansionEngine
 
 logger = logging.getLogger("brain.agent.core.executor")
 
@@ -137,6 +139,7 @@ class TaskExecutor:
         verifier: Optional[VerifierEngine] = None,
         approval_memory=None,
         persona_context: str = "",
+        tool_cache: Optional[ToolCache] = None,
     ):
         self._provider = provider
         self._tools = tool_registry
@@ -152,6 +155,8 @@ class TaskExecutor:
         self._progress_callback = progress_callback or (lambda t: 0.0)
         self._verifier = verifier
         self._persona_context = persona_context
+        self._tool_cache = tool_cache or ToolCache()
+        self._mcp_expansion = MCPExpansionEngine()
         # Detect if a workspace model was explicitly configured
         # (e.g. 'glm-5:cloud') — prevents unwanted cloud escalation
         self._has_explicit_model = bool(
@@ -249,6 +254,20 @@ class TaskExecutor:
         - UNKNOWN: one retry only
         - AUTH/NOT_FOUND/DEPENDENCY/SEMANTIC/IMPOSSIBLE: fail immediately
         """
+        # ── Cache check: return cached result for deterministic read-only tools ──
+        workspace_id = tool_context.get("workspace_id", "")
+        tool_def = self._tools.get_tool(tool_call.name)
+        cached = await self._tool_cache.get(
+            tool_call.name, tool_call.arguments, workspace_id, tool_def
+        )
+        if cached is not None:
+            self._metrics.record_tool_execution(
+                tool_name=tool_call.name,
+                execution_time_ms=0,
+                success=True,
+            )
+            return cached
+
         last_result = None
         for attempt in range(max_attempts):
             result = await self._tools.execute(tool_call, context=tool_context)
@@ -259,6 +278,11 @@ class TaskExecutor:
                     tool_name=tool_call.name,
                     execution_time_ms=result.execution_time_ms,
                     success=True,
+                )
+                # Cache successful results for cacheable tools
+                await self._tool_cache.set(
+                    tool_call.name, tool_call.arguments,
+                    workspace_id, result, tool_def
                 )
                 return result
 

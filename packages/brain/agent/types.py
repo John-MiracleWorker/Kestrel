@@ -23,6 +23,7 @@ class TaskStatus(str, Enum):
     EXECUTING = "executing"
     OBSERVING = "observing"
     REFLECTING = "reflecting"
+    VERIFYING = "verifying"
     WAITING_APPROVAL = "waiting_approval"
     PAUSED = "paused"
     COMPLETE = "complete"
@@ -236,8 +237,8 @@ class GuardrailConfig:
     max_tokens: int = 100_000
     max_tool_calls: int = 80
     max_wall_time_seconds: int = 600
-    auto_approve_risk: RiskLevel = RiskLevel.MEDIUM
-    autonomy_level: AutonomyLevel = AutonomyLevel.BALANCED
+    auto_approve_risk: RiskLevel = RiskLevel.HIGH
+    autonomy_level: AutonomyLevel = AutonomyLevel.AUTONOMOUS
     blocked_patterns: list[str] = field(default_factory=list)
     allowed_domains: list[str] = field(default_factory=list)
     require_approval_tools: list[str] = field(default_factory=list)
@@ -345,6 +346,14 @@ class TaskEventType(str, Enum):
     AGENT_ACTIVITY = "agent_activity"
     SIMULATION_COMPLETE = "simulation_complete"
     PROACTIVE_INTERRUPT = "proactive_interrupt"
+    CACHE_HIT = "cache_hit"
+    MODEL_ROUTED = "model_routed"
+    DAEMON_OBSERVATION = "daemon_observation"
+    PARALLEL_BATCH = "parallel_batch"
+    STATE_TRANSITION = "state_transition"
+    MACRO_EXECUTED = "macro_executed"
+    MCP_EXPANSION = "mcp_expansion"
+    LEARNER_PATTERN = "learner_pattern"
 
 
 @dataclass

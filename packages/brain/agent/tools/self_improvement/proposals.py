@@ -665,6 +665,42 @@ async def _handle_approval(proposal_id: str, approved: bool) -> dict:
         return {"error": f"Proposal not found: {proposal_id}", "pending": list(pending.keys())}
 
     if approved:
+        # Council review gate: validate proposal before applying
+        try:
+            from agent.council import CouncilSession
+            council = CouncilSession()
+            proposal_text = (
+                f"Self-improvement proposal:\n"
+                f"Description: {matching.get('description', '')[:500]}\n"
+                f"File: {matching.get('file', 'unknown')}\n"
+                f"Severity: {matching.get('severity', 'unknown')}\n"
+                f"Changes: {matching.get('changes', matching.get('fix', ''))[:500]}"
+            )
+            verdict = await council.deliberate_lite(
+                proposal=proposal_text,
+                context="Self-improvement code change review",
+                top_n=3,
+            )
+            if verdict.requires_user_review:
+                from agent.council import VoteType
+                if verdict.consensus == VoteType.REJECT:
+                    _send_summary_to_telegram(
+                        f"⚖️ <b>Council REJECTED self-improvement:</b>\n"
+                        f"{matching.get('description', '')[:200]}\n\n"
+                        f"Reason: {verdict.review_reason}\n"
+                        f"Concerns: {'; '.join(verdict.synthesized_concerns[:3])}"
+                    )
+                    del pending[proposal_id]
+                    _save_proposals(pending)
+                    return {
+                        "status": "council_rejected",
+                        "message": f"Council rejected: {verdict.review_reason}",
+                        "concerns": verdict.synthesized_concerns,
+                    }
+            logger.info(f"Council approved self-improvement: {proposal_id[:8]}")
+        except Exception as e:
+            logger.warning(f"Council review skipped for self-improvement: {e}")
+
         # Remove from pending
         del pending[proposal_id]
         _save_proposals(pending)

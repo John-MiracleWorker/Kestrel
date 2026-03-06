@@ -680,6 +680,97 @@ class MemoryGraph:
             ],
         }
 
+    async def query_by_type_and_relation(
+        self,
+        workspace_id: str,
+        entity_type: Optional[str] = None,
+        relation_type: Optional[str] = None,
+        name_pattern: Optional[str] = None,
+        min_weight: float = 0.1,
+        max_results: int = 20,
+    ) -> list[dict]:
+        """
+        Structured query: find entities by type, relation, or name pattern.
+
+        This enables questions like:
+          - "What decisions were made about authentication?" → type=DECISION, name_pattern="auth"
+          - "What errors occurred recently?" → type=ERROR, sorted by last_seen
+          - "What does the user prefer?" → type=PREFERENCE
+
+        Returns entities sorted by weight (relevance) descending.
+        """
+        ws_uuid = self._to_uuid(workspace_id)
+        conditions = ["workspace_id = $1", "weight >= $2"]
+        params: list = [ws_uuid, min_weight]
+        param_idx = 3
+
+        if entity_type:
+            conditions.append(f"entity_type = ${param_idx}")
+            params.append(entity_type)
+            param_idx += 1
+
+        if name_pattern:
+            conditions.append(f"(name ILIKE ${param_idx} OR description ILIKE ${param_idx})")
+            params.append(f"%{name_pattern}%")
+            param_idx += 1
+
+        where_clause = " AND ".join(conditions)
+        query = f"""
+            SELECT id, entity_type, name, description, weight, mention_count, last_seen
+            FROM memory_graph_nodes
+            WHERE {where_clause}
+            ORDER BY weight DESC, mention_count DESC
+            LIMIT {max_results}
+        """
+
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(query, *params)
+
+                results = []
+                for row in rows:
+                    node_data = {
+                        "id": row["id"],
+                        "type": row["entity_type"],
+                        "name": row["name"],
+                        "description": (row["description"] or "")[:300],
+                        "weight": float(row["weight"]),
+                        "mentions": row["mention_count"],
+                        "last_seen": row["last_seen"],
+                    }
+
+                    # If filtering by relation_type, check edges
+                    if relation_type:
+                        edges = await conn.fetch(
+                            """
+                            SELECT e.*, n.name as related_name, n.entity_type as related_type
+                            FROM memory_graph_edges e
+                            JOIN memory_graph_nodes n ON (
+                                CASE WHEN e.source_id = $1 THEN e.target_id
+                                     ELSE e.source_id END = n.id
+                            )
+                            WHERE (e.source_id = $1 OR e.target_id = $1)
+                              AND e.relation_type = $2
+                            ORDER BY e.strength DESC
+                            LIMIT 5
+                            """,
+                            row["id"], relation_type,
+                        )
+                        if not edges:
+                            continue  # Skip if no matching relations
+                        node_data["related"] = [
+                            {"name": e["related_name"], "type": e["related_type"], "relation": relation_type}
+                            for e in edges
+                        ]
+
+                    results.append(node_data)
+
+                return results
+
+        except Exception as e:
+            logger.warning(f"Structured query failed: {e}")
+            return []
+
     async def query_by_vector_similarity(
         self,
         workspace_id: str,
