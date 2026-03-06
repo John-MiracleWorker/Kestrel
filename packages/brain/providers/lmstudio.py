@@ -9,8 +9,11 @@ This provider supports streaming, tool calling, and model discovery.
 import json
 import logging
 import os
+import re
 import time
 from typing import AsyncIterator, Optional
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 import httpx
 
@@ -320,6 +323,8 @@ class LMStudioProvider:
             choice = data.get("choices", [{}])[0]
             message = choice.get("message", {})
             content = message.get("content", "") or ""
+            # Strip <think>...</think> blocks from reasoning models (e.g. GLM)
+            content = _THINK_RE.sub("", content).strip()
             self._last_response = content
 
             # Extract tool calls (already in OpenAI format)

@@ -3450,7 +3450,7 @@
             ]
         },
         "packages/brain/agent/core/planner.py": {
-            "sig": "1772389197562281027:11204",
+            "sig": "1772759662692993161:11344",
             "issues": [
                 {
                     "type": "dead_import",
@@ -3655,7 +3655,7 @@
             "issues": []
         },
         "packages/brain/services/chat_service.py": {
-            "sig": "1772758375383359542:32094",
+            "sig": "1772759582536017898:32092",
             "issues": [
                 {
                     "type": "complexity",
