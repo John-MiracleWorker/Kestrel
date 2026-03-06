@@ -275,6 +275,10 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
     from agent.tools.computer_use import register_computer_use_tools
     register_computer_use_tools(registry)
 
+    # Remote media generation (SwarmUI/ComfyUI on LAN GPU host)
+    from agent.tools.media_gen import register_media_gen_tools
+    register_media_gen_tools(registry)
+
     # Multi-agent delegation tools (including dynamic specialist management)
     from agent.tools.delegate import (
         DELEGATE_TOOL,
