@@ -473,6 +473,15 @@ class ChatServicerMixin(BaseServicerMixin):
             except Exception as e:
                 logger.warning("Failed to load approval memory cache: %s", e)
 
+            # Wrap resolve_provider to inject workspace-specific URLs
+            def _workspace_resolve_provider(name: str):
+                p = resolve_provider(name)
+                if name == "lmstudio" and provider_settings.get("lmstudio_host"):
+                    _host = provider_settings["lmstudio_host"].rstrip("/")
+                    p._base_url = _host
+                    p._explicit_url = _host
+                return p
+
             agent_loop = AgentLoop(
                 provider=provider,
                 tool_registry=tool_registry,
@@ -485,7 +494,7 @@ class ChatServicerMixin(BaseServicerMixin):
                 evidence_chain=evidence_chain,
                 checkpoint_manager=checkpoint_mgr,
                 event_callback=_activity_callback,
-                provider_resolver=resolve_provider,
+                provider_resolver=_workspace_resolve_provider,
                 model_router=chat_model_router,
                 approval_memory=_approval_memory,
             )
