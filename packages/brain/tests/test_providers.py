@@ -3,7 +3,7 @@ Tests for Brain LLM provider initialization and routing.
 """
 
 import os
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 import pytest
 
 
@@ -52,11 +52,11 @@ def test_cloud_provider_initializes():
 # ── Test Provider Registry ────────────────────────────────────────────
 
 def test_get_provider_local():
-    """get_provider('local') should return a LocalProvider."""
+    """get_provider('local') should return an OllamaProvider alias."""
     from server import get_provider
-    from providers.local import LocalProvider
+    from providers.ollama import OllamaProvider
     provider = get_provider("local")
-    assert isinstance(provider, LocalProvider)
+    assert isinstance(provider, OllamaProvider)
 
 
 def test_get_provider_cloud():
