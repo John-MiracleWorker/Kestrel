@@ -459,15 +459,15 @@
             ]
         },
         "packages/brain/providers/lmstudio.py": {
-            "sig": "1772760271004960445:16047",
+            "sig": "1772760845313741203:16170",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/providers/lmstudio.py",
-                    "line": 260,
-                    "description": "Function `generate_with_tools` is 126 lines long \u2014 consider refactoring",
+                    "line": 261,
+                    "description": "Function `generate_with_tools` is 127 lines long \u2014 consider refactoring",
                     "suggestion": "Break `generate_with_tools` into smaller helper functions"
                 },
                 {
@@ -3450,7 +3450,7 @@
             ]
         },
         "packages/brain/agent/core/planner.py": {
-            "sig": "1772759662692993161:11344",
+            "sig": "1772760813696405052:11555",
             "issues": [
                 {
                     "type": "dead_import",

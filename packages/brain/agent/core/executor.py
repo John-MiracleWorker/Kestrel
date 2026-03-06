@@ -1424,6 +1424,10 @@ class TaskExecutor:
 
         if response.get("tool_calls"):
             tool_calls = response["tool_calls"]
+            logger.info(
+                f"LLM returned {len(tool_calls)} tool call(s): "
+                f"{[tc.get('function', {}).get('name', '?') for tc in tool_calls]}"
+            )
 
             # Reset text-only streak — LLM is actively using tools
             self._text_only_streak[step.id] = 0
@@ -1453,6 +1457,12 @@ class TaskExecutor:
 
         elif response.get("content"):
             text = response["content"]
+
+            logger.info(
+                f"LLM returned text-only (no tool calls): "
+                f"streak={self._text_only_streak.get(step.id, 0)+1}, "
+                f"preview={text[:80]!r}"
+            )
 
             yield TaskEvent(
                 type=TaskEventType.THINKING,

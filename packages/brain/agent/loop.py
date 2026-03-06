@@ -320,45 +320,64 @@ class AgentLoop:
                 task.status = TaskStatus.PLANNING
                 await self._persistence.update_task(task)
 
-                context = self._build_context(task)
-                if lesson_context:
-                    context += f"\n\n{lesson_context}"
-                if memory_context:
-                    # Deduplicate: skip memory lines whose first 60 chars already
-                    # appear in the lesson context to avoid repeating known facts.
-                    if lesson_context:
-                        lesson_fingerprints = {
-                            line.strip().lower()[:60]
-                            for line in lesson_context.splitlines()
-                            if line.strip()
-                        }
-                        deduped_mem = "\n".join(
-                            line for line in memory_context.splitlines()
-                            if line.strip().lower()[:60] not in lesson_fingerprints
-                        )
-                        if deduped_mem.strip():
-                            context += f"\n\n{deduped_mem}"
-                    else:
-                        context += f"\n\n{memory_context}"
-
-                try:
-                    plan = await self._planner.create_plan(
-                        goal=task.goal,
-                        available_tools=self._tools.list_tools(),
-                        context=context,
+                # Fast-path: chat-originated tasks skip the expensive planner
+                # LLM call.  A single-step plan is sufficient because the
+                # executor already handles tool selection and calling.
+                # The planner's multi-step decomposition only adds value for
+                # complex automated agent tasks, not interactive chat.
+                if task.messages:
+                    logger.info(
+                        f"Chat fast-path: skipping planner for '{task.goal[:60]}'"
                     )
-                    task.plan = plan
-                except Exception as e:
-                    logger.warning(f"Planning failed, using single-step fallback: {e}")
                     task.plan = TaskPlan(
                         goal=task.goal,
                         steps=[TaskStep(
                             index=0,
-                            description=f"Execute the goal directly: {task.goal[:200]}",
+                            description=task.goal[:200],
                             status=StepStatus.PENDING,
                         )],
-                        reasoning=f"Planning failed ({e}) — executing as single step",
+                        reasoning="Chat-originated task — direct execution",
                     )
+                else:
+                    context = self._build_context(task)
+                    if lesson_context:
+                        context += f"\n\n{lesson_context}"
+                    if memory_context:
+                        # Deduplicate: skip memory lines whose first 60 chars already
+                        # appear in the lesson context to avoid repeating known facts.
+                        if lesson_context:
+                            lesson_fingerprints = {
+                                line.strip().lower()[:60]
+                                for line in lesson_context.splitlines()
+                                if line.strip()
+                            }
+                            deduped_mem = "\n".join(
+                                line for line in memory_context.splitlines()
+                                if line.strip().lower()[:60] not in lesson_fingerprints
+                            )
+                            if deduped_mem.strip():
+                                context += f"\n\n{deduped_mem}"
+                        else:
+                            context += f"\n\n{memory_context}"
+
+                    try:
+                        plan = await self._planner.create_plan(
+                            goal=task.goal,
+                            available_tools=self._tools.list_tools(),
+                            context=context,
+                        )
+                        task.plan = plan
+                    except Exception as e:
+                        logger.warning(f"Planning failed, using single-step fallback: {e}")
+                        task.plan = TaskPlan(
+                            goal=task.goal,
+                            steps=[TaskStep(
+                                index=0,
+                                description=f"Execute the goal directly: {task.goal[:200]}",
+                                status=StepStatus.PENDING,
+                            )],
+                            reasoning=f"Planning failed ({e}) — executing as single step",
+                        )
 
                 await self._persistence.update_task(task)
 
