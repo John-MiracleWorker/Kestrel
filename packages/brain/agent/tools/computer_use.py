@@ -36,12 +36,20 @@ import base64
 import json
 import logging
 import os
+import sys
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 
 from agent.types import RiskLevel, ToolDefinition
+
+_SHARED_PATH = Path(__file__).resolve().parents[3] / "shared"
+if str(_SHARED_PATH) not in sys.path:
+    sys.path.append(str(_SHARED_PATH))
+
+from action_event_schema import build_action_event, stable_hash
 
 logger = logging.getLogger("brain.agent.tools.computer_use")
 
@@ -484,26 +492,67 @@ async def run_computer_use(
 
         # Execute each action via the screen agent
         function_responses = []
+        before_screenshot_hash = stable_hash(screenshot_b64)
         for action in actions:
             action_name = action["name"]
             action_args = action["args"]
+            command_hash = stable_hash(json.dumps({"action": action_name, "args": action_args}, sort_keys=True))
+            policy_decision = "auto_approved" if not action.get("needs_confirmation") else "confirmation_required"
 
             if action_name not in SUPPORTED_ACTIONS:
                 result_text = f"Unsupported action: {action_name}"
                 logger.warning(result_text)
+                status = "unsupported"
             else:
                 try:
                     result_text = await _execute_action(action_name, action_args)
                     logger.info(f"Executed: {result_text}")
+                    status = "success"
                 except Exception as e:
                     result_text = f"Action failed: {e}"
                     logger.error(result_text, exc_info=True)
+                    status = "failed"
+
+            # Capture post-action screenshot for reversible action history
+            try:
+                screenshot_bytes = await _capture_screenshot()
+                screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+                after_screenshot_hash = stable_hash(screenshot_b64)
+            except RuntimeError as e:
+                return {
+                    "success": False,
+                    "error": f"Screenshot failed after action '{action_name}': {e}",
+                    "turns": turn + 1,
+                    "actions_taken": actions_taken,
+                    "model_commentary": "\n".join(commentary),
+                }
+
+            action_event = build_action_event(
+                source="brain.computer_use",
+                action_type=action_name,
+                status=status,
+                before_state={
+                    "screenshot_hash": before_screenshot_hash,
+                    "window_title": str(action_args.get("window_title", "")),
+                    "command_hash": command_hash,
+                    "policy_decision": policy_decision,
+                },
+                after_state={
+                    "screenshot_hash": after_screenshot_hash,
+                    "window_title": str(action_args.get("window_title", "")),
+                    "command_hash": command_hash,
+                    "policy_decision": "executed" if status == "success" else status,
+                },
+                metadata={"args": action_args, "turn": turn + 1, "result": result_text[:500]},
+            )
+            before_screenshot_hash = after_screenshot_hash
 
             actions_taken.append({
                 "action": action_name,
                 "args": action_args,
                 "result": result_text,
                 "turn": turn + 1,
+                "action_event": action_event,
             })
 
             function_responses.append({
@@ -515,20 +564,6 @@ async def run_computer_use(
 
         # Short pause for the UI to settle after actions
         await asyncio.sleep(0.5)
-
-        # Capture fresh screenshot after actions
-        try:
-            screenshot_bytes = await _capture_screenshot()
-        except RuntimeError as e:
-            return {
-                "success": False,
-                "error": f"Screenshot failed after actions: {e}",
-                "turns": turn + 1,
-                "actions_taken": actions_taken,
-                "model_commentary": "\n".join(commentary),
-            }
-
-        screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
 
         # Send function responses + new screenshot back to the model
         user_parts = function_responses + [

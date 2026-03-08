@@ -5,7 +5,15 @@ Audit logger — records all skill executions for accountability.
 import json
 import logging
 import os
+import sys
 from datetime import datetime
+from pathlib import Path
+
+_SHARED_PATH = Path(__file__).resolve().parents[2] / "shared"
+if str(_SHARED_PATH) not in sys.path:
+    sys.path.append(str(_SHARED_PATH))
+
+from action_event_schema import build_action_event, normalize_action_event, stable_hash
 
 logger = logging.getLogger("hands.security.audit")
 
@@ -25,15 +33,24 @@ class AuditLogger:
     def log_start(self, exec_id: str, user_id: str, workspace_id: str,
                   skill_name: str, function_name: str, arguments: str):
         """Log the start of a skill execution."""
+        command_hash = stable_hash(arguments)
+        start_event = build_action_event(
+            source="hands.security.audit",
+            action_type=f"{skill_name}.{function_name}",
+            status="running",
+            before_state={"command_hash": command_hash, "policy_decision": "admitted"},
+            after_state={"command_hash": command_hash, "policy_decision": "running"},
+        )
         entry = {
             "exec_id": exec_id,
             "user_id": user_id,
             "workspace_id": workspace_id,
             "skill_name": skill_name,
             "function_name": function_name,
-            "arguments_hash": hash(arguments),  # Don't log raw args for security
+            "arguments_hash": command_hash,  # Don't log raw args for security
             "started_at": datetime.utcnow().isoformat(),
             "status": "running",
+            "action_events": [start_event],
         }
         self._entries[exec_id] = entry
         logger.info(f"Audit: START {skill_name}.{function_name} [{exec_id[:8]}]")
@@ -57,6 +74,22 @@ class AuditLogger:
                 "file_accesses": len(audit_log.get("file_accesses", [])),
                 "system_calls": len(audit_log.get("system_calls", [])),
             }
+
+        completion_event = build_action_event(
+            source="hands.security.audit",
+            action_type=f"{entry.get('skill_name', '?')}.{entry.get('function_name', '?')}",
+            status=status,
+            before_state={
+                "command_hash": entry.get("arguments_hash", ""),
+                "policy_decision": "running",
+            },
+            after_state={
+                "command_hash": entry.get("arguments_hash", ""),
+                "policy_decision": status,
+            },
+            metadata={"error": error or "", "execution_time_ms": execution_time_ms},
+        )
+        entry.setdefault("action_events", []).append(normalize_action_event(completion_event))
 
         # Persist to file
         self._write_entry(entry)
