@@ -17,7 +17,7 @@
 
 Ever wanted an AI assistant that doesn't just reply to your messages, but actually thinks, argues with itself, spins up Docker containers, and executes real-world actions while you sip your coffee? Welcome to **Kestrel**.
 
-We firmly believe your data should stay yours. Kestrel is a privacy-first, heavily-armed (with tools) AI engine that runs *entirely* on your own infrastructure. You can hook it up to lightweight local MLX models on Apple Silicon, or plug in heavy hitters like Gemini, Claude, or GPT-4.
+We firmly believe your data should stay yours. Kestrel is a privacy-first, heavily-armed (with tools) AI engine that runs _entirely_ on your own infrastructure. You can hook it up to lightweight local MLX models on Apple Silicon, or plug in heavy hitters like Gemini, Claude, or GPT-4.
 
 ---
 
@@ -26,8 +26,8 @@ We firmly believe your data should stay yours. Kestrel is a privacy-first, heavi
 Because typical chatbots are boring. Kestrel has agency.
 
 - � **Multi-Phase Cognitive Loop:** It doesn't just guess an answer. It accesses persistent memory, generates a multi-step plan, uses sandboxed tools, and reflects on whether it messed up.
-- 🏛️ **The Council:** Got a highly complex prompt? Kestrel convenes a literal *Multi-Agent Debate*. The Architect, the Security Expert, the Implementer, and the Devil's Advocate will argue in real-time until they reach a consensus.
-- �️ **See Everything:** The *KestrelProcessBar* in the UI streams the agent's internal monologue, memory recalls, and council votes. Zero black boxes.
+- 🏛️ **The Council:** Got a highly complex prompt? Kestrel convenes a literal _Multi-Agent Debate_. The Architect, the Security Expert, the Implementer, and the Devil's Advocate will argue in real-time until they reach a consensus.
+- �️ **See Everything:** The _KestrelProcessBar_ in the UI streams the agent's internal monologue, memory recalls, and council votes. Zero black boxes.
 - 📦 **Sandboxed Toolkit:** 30+ built-in skills (web scraping, shell execution, GitHub manipulating, smart-home toggling) that run securely in isolated Docker containers via the `Hands` service.
 - 📱 **Omnipresent:** Chat via the gorgeous Web UI, native macOS app, Telegram, Discord, or WhatsApp. It's the exact same persistent brain everywhere.
 
@@ -40,7 +40,7 @@ Kestrel is built like a tank, split into clean, modular microservices (because m
 ```mermaid
 graph TD
     User([You, in your pajamas]) <-->|Web/Discord/Telegram/Voice| Gateway
-    
+
     subgraph Kestrel Stack
         Gateway[Gateway Node.js<br>WebSocket/REST Router]
         Brain[The Brain Python<br>Cognitive Engine & Planning]
@@ -58,6 +58,7 @@ graph TD
 ```
 
 ### The Core Microservices:
+
 1. **The Brain (Python / gRPC):** The absolute core. Orchestrates the Plan → Execute → Reflect loop, coordinates the Council, accesses persistent Vector Memory (Chroma / pgvector), and manages 30+ tools. Recently heavily modularized into clean `core`, `memory`, and `services` namespaces!
 2. **The Hands (Python / gRPC):** The executing muscles. Spawns secure, transient Docker containers to run risky code, fetch URLs, and manipulate files without nuking your host machine.
 3. **The Gateway (Node.js / TS):** The fast, lightweight router that handles JWT auth, WebSockets, rate limiting, and normalizes inputs from Telegram, Discord, and Web clients.
@@ -81,10 +82,12 @@ Kestrel comes equipped with enough tools to build an empire (or at least automat
 Want to unleash Kestrel on your local network?
 
 ### Prerequisites
+
 - Docker & Docker Compose
 - LLM API Keys (OpenAI, Anthropic, or Google) **OR** a local GGUF model if you're feeling entirely off-grid.
 
 ### 1-2-3 Deploy
+
 ```bash
 # 1. Grab the code
 git clone https://github.com/John-MiracleWorker/Kestrel.git
@@ -97,7 +100,8 @@ code .env # Add your API keys and secure passwords
 # 3. Fire it all up
 docker compose up -d --build
 ```
-*Boom.* Head over to **http://localhost:5173**. Your new hyper-capable assistant awaits.
+
+_Boom._ Head over to **http://localhost:5173**. Your new hyper-capable assistant awaits.
 
 ---
 
@@ -106,6 +110,7 @@ docker compose up -d --build
 The codebase is meticulously typed and documented. We love PRs!
 
 If you want to spin up services natively instead of in Docker:
+
 ```bash
 # Terminal 1: Gateway
 cd packages/gateway && npm install && npm run dev
@@ -118,17 +123,35 @@ cd packages/web && npm install && npm run dev
 ```
 
 Run tests natively:
+
 ```bash
 npm run test --prefix packages/gateway
 pytest packages/brain/tests/
 ```
 
+### Desktop-first native/hybrid startup profile
+
+If you are migrating from Docker-first to desktop-first, use the documented startup profile:
+
+```bash
+cp config/startup/native-hybrid.env.example config/startup/native-hybrid.env
+./scripts/startup/native-hybrid.sh check
+./scripts/startup/native-hybrid.sh up
+```
+
+- `screen-agent` is enabled by default.
+- Native runtime is selected.
+- Docker-heavy subsystems are optional.
+- Native write/exec tools are disabled by default until policy is configured.
+
+See the full migration guide and OS compatibility matrix in `docs/desktop-first-migration.md`.
+
 ---
 
 ## 🛡️ Security Note
 
-Kestrel is *powerful*. It can run code and access your filesystem. We use Row-Level Security in Postgres, Docker sandboxing, and strict JWT auth to keep you safe, but **please do not expose the Gateway port (8741) to the public internet** without putting it behind a reverse proxy (like Nginx or Caddy) with proper TLS enabled. 
+Kestrel is _powerful_. It can run code and access your filesystem. We use Row-Level Security in Postgres, Docker sandboxing, and strict JWT auth to keep you safe, but **please do not expose the Gateway port (8741) to the public internet** without putting it behind a reverse proxy (like Nginx or Caddy) with proper TLS enabled.
 
 ---
 
-*Built with ❤️ (and entirely too much caffeine) by the Kestrel Team.*
+_Built with ❤️ (and entirely too much caffeine) by the Kestrel Team._
