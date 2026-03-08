@@ -132,6 +132,7 @@ async def serve():
         logger.warning(f"Could not connect to Hands service: {e}")
 
     # Initialize agent runtime
+    from agent.runtime import build_runtime_policy
     from agent.tools import build_tool_registry
     from agent.guardrails import Guardrails
     from agent.loop import AgentLoop
@@ -156,7 +157,12 @@ async def serve():
     from agent.proactive import ProactiveEngine
     from agent.ui_artifacts import UIArtifactManager
     pool = await get_pool()
-    runtime.tool_registry = build_tool_registry(hands_client=runtime.hands_client, pool=pool)
+    runtime.execution_runtime = build_runtime_policy(hands_client=runtime.hands_client)
+    runtime.tool_registry = build_tool_registry(
+        hands_client=runtime.hands_client,
+        pool=pool,
+        runtime_policy=runtime.execution_runtime,
+    )
     guardrails = Guardrails()
     runtime.agent_persistence = PostgresTaskPersistence(pool=pool)
 

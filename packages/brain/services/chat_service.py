@@ -287,7 +287,7 @@ class ChatServicerMixin(BaseServicerMixin):
                 chat_task.plan = None
 
             # Build tool registry and agent loop
-            tool_registry = build_tool_registry(hands_client=runtime.hands_client, vector_store=runtime.vector_store, pool=pool)
+            tool_registry = build_tool_registry(hands_client=runtime.hands_client, vector_store=runtime.vector_store, pool=pool, runtime_policy=runtime.execution_runtime)
 
             # Set workspace context for Moltbook activity logging
             import agent.tools.moltbook as _moltbook_mod

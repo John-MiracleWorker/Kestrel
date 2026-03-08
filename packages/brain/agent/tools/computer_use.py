@@ -43,6 +43,7 @@ from typing import Any, Optional
 
 import httpx
 
+from agent.runtime import get_active_runtime
 from agent.types import RiskLevel, ToolDefinition
 
 _SHARED_PATH = Path(__file__).resolve().parents[3] / "shared"
@@ -727,12 +728,27 @@ def register_computer_use_tools(registry) -> None:
         excluded_actions: Optional[list[str]] = None,
     ) -> dict:
         """Handle computer_use tool calls from the agent loop."""
-        return await run_computer_use(
+        active_runtime = get_active_runtime()
+        if not active_runtime:
+            return {"success": False, "error": "Runtime policy is not initialized."}
+
+        capabilities = active_runtime.capabilities
+        if not capabilities.supports_computer_use:
+            return {
+                "success": False,
+                "error": f"computer_use is disabled in runtime mode '{capabilities.mode.value}'.",
+                "capabilities": capabilities.as_dict(),
+            }
+
+        result = await run_computer_use(
             goal=goal,
             max_turns=max_turns,
             excluded_actions=excluded_actions,
             require_confirmation=True,
         )
+        if isinstance(result, dict):
+            result.setdefault("capabilities", capabilities.as_dict())
+        return result
 
     registry.register(definition=COMPUTER_USE_TOOL, handler=computer_use_handler)
     logger.info("Computer Use tool registered")
