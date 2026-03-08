@@ -1,261 +1,289 @@
 """
-Host Execution Tools — Native shell/python execution on the host macOS.
-WARNING: These tools bypass the container isolation and execute directly
-on the host machine. Regulated by an allowlist and native macOS approval dialogs.
+Host Execution Tools — Native shell/python execution on the host OS.
+WARNING: These tools bypass container isolation and execute directly on host.
+Policy decisions and approval are delegated to native policy evaluators/providers.
 """
 
+import asyncio
+import json
+import logging
 import os
 import sys
-import asyncio
-import logging
 import tempfile
-import json
-from pathlib import Path
+import uuid
 from datetime import datetime
+
+from agent.security.native_policy import (
+    NativeExecutionRequest,
+    DEFAULT_NATIVE_POLICY_EVALUATOR,
+    make_default_approval_provider,
+)
 from agent.types import RiskLevel, ToolDefinition
-
-_SHARED_PATH = Path(__file__).resolve().parents[3] / "shared"
-if str(_SHARED_PATH) not in sys.path:
-    sys.path.append(str(_SHARED_PATH))
-
-from action_event_schema import build_action_event, stable_hash
 
 logger = logging.getLogger("brain.agent.tools.host_execution")
 
-def _audit_log(command: str, language: str, approved: bool, error: str = "", action_event: dict | None = None):
-    """Append execution attempts to the local audit log."""
+_POLICY_EVALUATOR = DEFAULT_NATIVE_POLICY_EVALUATOR
+
+
+def _audit_log(
+    *,
+    exec_id: str,
+    workspace_id: str,
+    user_id: str,
+    tool_name: str,
+    function_name: str,
+    arguments: str,
+    status: str,
+    policy_reason: str,
+    approval_provider: str,
+    approval_reason: str,
+    started_at: datetime,
+    error: str = "",
+    exit_code: int | None = None,
+):
+    """Write native execution audit entries using hands-compatible schema concepts."""
     audit_dir = os.path.expanduser("~/.kestrel/audit")
     os.makedirs(audit_dir, exist_ok=True)
-    log_file = os.path.join(audit_dir, "execution.log")
-    
-    timestamp = datetime.now().isoformat()
-    status = "APPROVED" if approved else "DENIED"
-    if error:
-        status = f"FAILED ({error})"
-        
-    log_entry = {
-        "timestamp": timestamp,
-        "language": language,
+    log_file = os.path.join(audit_dir, f"audit-{datetime.utcnow().strftime('%Y-%m-%d')}.jsonl")
+
+    elapsed_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
+
+    entry = {
+        "exec_id": exec_id,
+        "user_id": user_id,
+        "workspace_id": workspace_id,
+        "skill_name": tool_name,
+        "function_name": function_name,
+        "arguments_hash": hash(arguments),
+        "started_at": started_at.isoformat(),
+        "completed_at": datetime.utcnow().isoformat(),
         "status": status,
-        "command": command,
-        "action_event": action_event or {},
+        "execution_time_ms": elapsed_ms,
+        "native_policy": {
+            "policy_reason": policy_reason,
+            "approval_provider": approval_provider,
+            "approval_reason": approval_reason,
+        },
     }
-    try:
-        with open(log_file, "a") as f:
-            f.write(json.dumps(log_entry) + "\n")
-    except Exception as e:
-        logger.error(f"Failed to write audit log: {e}")
+    if error:
+        entry["error"] = error
+    if exit_code is not None:
+        entry["exit_code"] = exit_code
 
-async def _prompt_mac_approval(command: str) -> bool:
-    """Prompt the user for approval using macOS native dialog via osascript."""
-    safe_command = command.replace('"', '\\"')
-    if len(safe_command) > 150:
-         safe_command = safe_command[:147] + "..."
-         
-    script = f'''
-    try
-        set dialogResult to display dialog "Kestrel Agent OS is requesting to natively execute:\\n\\n{safe_command}" buttons {{"Deny", "Approve"}} default button "Deny" with icon caution with title "Security Authorization"
-        if button returned of dialogResult is "Approve" then
-            return "true"
-        else
-            return "false"
-        end if
-    on error number -128
-        return "false"
-    end try
-    '''
-    
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await proc.communicate()
-        result = stdout.decode().strip()
-        return result == "true"
-    except Exception as e:
-        logger.error(f"macOS approval dialog failed: {e}")
-        return False
+        with open(log_file, "a", encoding="utf-8") as file_handle:
+            file_handle.write(json.dumps(entry) + "\n")
+    except Exception as exc:  # pragma: no cover - file system issues are env-specific
+        logger.error("Failed to write audit log: %s", exc)
 
-def _check_allowlist(command: str) -> bool:
-    """Check if a command matches the allowlist in ~/.kestrel/allowlist.yml"""
-    allowlist_path = os.path.expanduser("~/.kestrel/allowlist.yml")
-    if not os.path.exists(allowlist_path):
-        return False
-        
-    try:
-        import yaml
-        import re
-        with open(allowlist_path, "r") as f:
-            config = yaml.safe_load(f) or {}
-            allowed_patterns = config.get("allowed_commands", [])
-            for pattern in allowed_patterns:
-                try:
-                    if re.search(pattern, command):
-                        return True
-                except re.error as re_err:
-                    logger.warning(f"Invalid allowlist regex pattern '{pattern}': {re_err}")
-    except Exception as e:
-        logger.warning(f"Error reading allowlist: {e}")
-        
-    return False
+
+async def _authorize_native_execution(tool_name: str, command: str) -> tuple[bool, str, str, str]:
+    workspace_id = os.getenv("KESTREL_WORKSPACE_ID", "default")
+    interactive = os.getenv("NATIVE_APPROVAL_INTERACTIVE", "false").lower() == "true"
+
+    request = NativeExecutionRequest(
+        workspace_id=workspace_id,
+        tool_name=tool_name,
+        function_name="execute",
+        command=command,
+        command_class=_POLICY_EVALUATOR.classify(tool_name, command),
+        interactive=interactive,
+    )
+
+    decision = _POLICY_EVALUATOR.evaluate(request)
+    if not decision.allowed:
+        return False, decision.reason, "policy", "DENIED_BY_POLICY"
+
+    if not decision.requires_approval:
+        return True, decision.reason, "policy", "NOT_REQUIRED"
+
+    provider = make_default_approval_provider(interactive=interactive)
+    approval = await provider.approve(request)
+    return approval.approved, decision.reason, approval.provider, approval.reason
+
 
 async def execute_host_shell(command: str) -> dict:
     """Execute a shell command directly on the host OS."""
-    command_hash = stable_hash(command)
-    
-    # 1. Check Allowlist
-    is_allowed = _check_allowlist(command)
-    
-    # 2. If not in allowlist, prompt for local approval
-    if not is_allowed:
-        approved = await _prompt_mac_approval(command)
-        if not approved:
-            action_event = build_action_event(
-                source="brain.host_execution",
-                action_type="host_shell",
-                status="denied",
-                before_state={"command_hash": command_hash, "policy_decision": "approval_required"},
-                after_state={"command_hash": command_hash, "policy_decision": "denied"},
-            )
-            _audit_log(command, "shell", approved=False, action_event=action_event)
-            return {
-                "success": False,
-                "error": "User denied execution of high-risk command via native macOS dialog.",
-                "output": "",
-                "action_event": action_event,
-            }
-            
-    # 3. Execute and audit
-    action_event = build_action_event(
-        source="brain.host_execution",
-        action_type="host_shell",
-        status="running",
-        before_state={
-            "command_hash": command_hash,
-            "policy_decision": "allowlist" if is_allowed else "user_approved",
-        },
-        after_state={"command_hash": command_hash, "policy_decision": "running"},
+    started_at = datetime.utcnow()
+    exec_id = str(uuid.uuid4())
+    workspace_id = os.getenv("KESTREL_WORKSPACE_ID", "default")
+    user_id = os.getenv("KESTREL_USER_ID", "agent")
+
+    approved, policy_reason, approval_provider, approval_reason = await _authorize_native_execution(
+        "host_shell",
+        command,
     )
-    _audit_log(command, "shell", approved=True, action_event=action_event)
+    if not approved:
+        _audit_log(
+            exec_id=exec_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            tool_name="host_execution",
+            function_name="host_shell",
+            arguments=command,
+            status="denied",
+            policy_reason=policy_reason,
+            approval_provider=approval_provider,
+            approval_reason=approval_reason,
+            started_at=started_at,
+            error="Native shell execution denied by policy/approval",
+        )
+        return {
+            "success": False,
+            "error": "Native shell execution denied by policy/approval.",
+            "output": "",
+            "policy_reason": policy_reason,
+            "approval_reason": approval_reason,
+        }
+
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await proc.communicate()
-        final_event = build_action_event(
-            source="brain.host_execution",
-            action_type="host_shell",
-            status="success" if proc.returncode == 0 else "failed",
-            before_state=action_event["before_state"],
-            after_state={
-                "command_hash": command_hash,
-                "policy_decision": "executed",
-            },
-            metadata={"exit_code": proc.returncode},
+        status = "success" if proc.returncode == 0 else "error"
+        _audit_log(
+            exec_id=exec_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            tool_name="host_execution",
+            function_name="host_shell",
+            arguments=command,
+            status=status,
+            policy_reason=policy_reason,
+            approval_provider=approval_provider,
+            approval_reason=approval_reason,
+            started_at=started_at,
+            error=stderr.decode() if proc.returncode != 0 else "",
+            exit_code=proc.returncode,
         )
         return {
             "success": proc.returncode == 0,
             "output": stdout.decode(),
             "error": stderr.decode(),
             "exit_code": proc.returncode,
-            "action_event": final_event,
+            "policy_reason": policy_reason,
+            "approval_reason": approval_reason,
         }
-    except Exception as e:
-        failed_event = build_action_event(
-            source="brain.host_execution",
-            action_type="host_shell",
-            status="failed",
-            before_state=action_event["before_state"],
-            after_state={"command_hash": command_hash, "policy_decision": "execution_error"},
-            metadata={"error": str(e)},
+    except Exception as exc:
+        _audit_log(
+            exec_id=exec_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            tool_name="host_execution",
+            function_name="host_shell",
+            arguments=command,
+            status="error",
+            policy_reason=policy_reason,
+            approval_provider=approval_provider,
+            approval_reason=approval_reason,
+            started_at=started_at,
+            error=str(exc),
         )
-        _audit_log(command, "shell", approved=True, error=str(e), action_event=failed_event)
         return {
             "success": False,
-            "error": str(e),
+            "error": str(exc),
             "output": "",
-            "action_event": failed_event,
+            "policy_reason": policy_reason,
+            "approval_reason": approval_reason,
         }
+
 
 async def execute_host_python(code: str) -> dict:
     """Execute python code directly on the host OS."""
-    
-    # We serialize the code to a temporary file and run `python3 cache_file.py`
-    # Always prompt for native approval for host python unless we build a complex analysis
-    # For MVP, prompt approval for all raw python code
-    
-    command_hash = stable_hash(code)
-    approved = await _prompt_mac_approval("Python script with length: " + str(len(code)))
+    started_at = datetime.utcnow()
+    exec_id = str(uuid.uuid4())
+    workspace_id = os.getenv("KESTREL_WORKSPACE_ID", "default")
+    user_id = os.getenv("KESTREL_USER_ID", "agent")
+
+    command_preview = f"python(script_length={len(code)})"
+    approved, policy_reason, approval_provider, approval_reason = await _authorize_native_execution(
+        "host_python",
+        command_preview,
+    )
     if not approved:
-        denied_event = build_action_event(
-            source="brain.host_execution",
-            action_type="host_python",
+        _audit_log(
+            exec_id=exec_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            tool_name="host_execution",
+            function_name="host_python",
+            arguments=command_preview,
             status="denied",
-            before_state={"command_hash": command_hash, "policy_decision": "approval_required"},
-            after_state={"command_hash": command_hash, "policy_decision": "denied"},
+            policy_reason=policy_reason,
+            approval_provider=approval_provider,
+            approval_reason=approval_reason,
+            started_at=started_at,
+            error="Native python execution denied by policy/approval",
         )
-        _audit_log("Python Script", "python", approved=False, action_event=denied_event)
         return {
             "success": False,
-            "error": "User denied execution of high-risk python code via native macOS dialog.",
+            "error": "Native python execution denied by policy/approval.",
             "output": "",
-            "action_event": denied_event,
+            "policy_reason": policy_reason,
+            "approval_reason": approval_reason,
         }
 
-    running_event = build_action_event(
-        source="brain.host_execution",
-        action_type="host_python",
-        status="running",
-        before_state={"command_hash": command_hash, "policy_decision": "user_approved"},
-        after_state={"command_hash": command_hash, "policy_decision": "running"},
-    )
-    _audit_log("Python Script", "python", approved=True, action_event=running_event)
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            f.write(code)
-            tmp_path = f.name
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as file_handle:
+            file_handle.write(code)
+            tmp_path = file_handle.name
 
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, tmp_path,
+            sys.executable,
+            tmp_path,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await proc.communicate()
-        final_event = build_action_event(
-            source="brain.host_execution",
-            action_type="host_python",
-            status="success" if proc.returncode == 0 else "failed",
-            before_state=running_event["before_state"],
-            after_state={"command_hash": command_hash, "policy_decision": "executed"},
-            metadata={"exit_code": proc.returncode},
+        status = "success" if proc.returncode == 0 else "error"
+        _audit_log(
+            exec_id=exec_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            tool_name="host_execution",
+            function_name="host_python",
+            arguments=command_preview,
+            status=status,
+            policy_reason=policy_reason,
+            approval_provider=approval_provider,
+            approval_reason=approval_reason,
+            started_at=started_at,
+            error=stderr.decode() if proc.returncode != 0 else "",
+            exit_code=proc.returncode,
         )
         return {
             "success": proc.returncode == 0,
             "output": stdout.decode(),
             "error": stderr.decode(),
             "exit_code": proc.returncode,
-            "action_event": final_event,
+            "policy_reason": policy_reason,
+            "approval_reason": approval_reason,
         }
-    except Exception as e:
-        failed_event = build_action_event(
-            source="brain.host_execution",
-            action_type="host_python",
-            status="failed",
-            before_state=running_event["before_state"],
-            after_state={"command_hash": command_hash, "policy_decision": "execution_error"},
-            metadata={"error": str(e)},
+    except Exception as exc:
+        _audit_log(
+            exec_id=exec_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            tool_name="host_execution",
+            function_name="host_python",
+            arguments=command_preview,
+            status="error",
+            policy_reason=policy_reason,
+            approval_provider=approval_provider,
+            approval_reason=approval_reason,
+            started_at=started_at,
+            error=str(exc),
         )
-        _audit_log("Python Script", "python", approved=True, error=str(e), action_event=failed_event)
         return {
             "success": False,
-            "error": str(e),
+            "error": str(exc),
             "output": "",
-            "action_event": failed_event,
+            "policy_reason": policy_reason,
+            "approval_reason": approval_reason,
         }
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -264,56 +292,52 @@ async def execute_host_python(code: str) -> dict:
             except Exception:
                 pass
 
-def register_host_execution_tools(registry, enable_native_exec: bool = False) -> None:
-    if not enable_native_exec:
-        logger.info("Skipping host execution tool registration (disabled by startup policy)")
-        return
 
+def register_host_execution_tools(registry) -> None:
     registry.register(
         definition=ToolDefinition(
             name="host_shell",
             description=(
-                "Execute a shell command DIRECTLY on the host macOS. "
-                "Use this for tasks that require native OS access. "
-                "WARNING: High risk. Commands not in the allowlist will trigger a native popup dialog."
+                "Execute a shell command DIRECTLY on the host OS. "
+                "Uses workspace-scoped native policy evaluation and approval providers. "
+                "WARNING: High risk operation."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The shell command to execute"
+                        "description": "The shell command to execute",
                     }
                 },
-                "required": ["command"]
+                "required": ["command"],
             },
             risk_level=RiskLevel.HIGH,
-            category="control"
+            category="control",
         ),
-        handler=execute_host_shell
+        handler=execute_host_shell,
     )
-    
+
     registry.register(
         definition=ToolDefinition(
             name="host_python",
             description=(
-                "Execute Python code DIRECTLY on the host macOS. "
-                "Allows the agent to use host resources, credentials, and modules. "
-                "WARNING: High risk. Will trigger a native popup dialog for authorization."
+                "Execute Python code DIRECTLY on the host OS. "
+                "Uses workspace-scoped native policy evaluation and approval providers. "
+                "WARNING: High risk operation."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": "The python code to execute"
+                        "description": "The python code to execute",
                     }
                 },
-                "required": ["code"]
+                "required": ["code"],
             },
             risk_level=RiskLevel.HIGH,
-            category="control"
+            category="control",
         ),
-        handler=execute_host_python
+        handler=execute_host_python,
     )
-    command_hash = stable_hash(command)
