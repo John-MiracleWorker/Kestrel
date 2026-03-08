@@ -28,6 +28,8 @@ from typing import Optional
 
 import requests
 
+from agent.tools.media_gen.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
 logger = logging.getLogger("kestrel.vram_orchestrator")
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -403,6 +405,43 @@ def _save_images(images_data: list, prompt: str) -> list[str]:
     return saved_paths
 
 
+# ── Telegram Delivery ────────────────────────────────────────────────────────
+
+
+async def _send_to_telegram(file_path: str, caption: str) -> bool:
+    """
+    Send a generated image to Telegram via python-telegram-bot.
+
+    Returns True on success, False on failure (non-fatal).
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram delivery skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
+        return False
+
+    try:
+        from telegram import Bot
+
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        truncated_caption = caption[:1024] if len(caption) > 1024 else caption
+
+        with open(file_path, "rb") as f:
+            await bot.send_photo(
+                chat_id=int(TELEGRAM_CHAT_ID),
+                photo=f,
+                caption=truncated_caption,
+            )
+
+        logger.info(f"Sent image to Telegram chat {TELEGRAM_CHAT_ID}")
+        return True
+
+    except ImportError:
+        logger.warning("python-telegram-bot not installed. Skipping Telegram delivery.")
+        return False
+    except Exception as e:
+        logger.error(f"Telegram delivery failed: {e}")
+        return False
+
+
 # ── Main Orchestrator ────────────────────────────────────────────────────────
 
 
@@ -416,6 +455,7 @@ def generate_image(
     cfg_scale: float = 7.0,
     seed: int = -1,
     swarm_model: str = "",
+    send_telegram: bool = False,
 ) -> dict:
     """
     Full VRAM orchestration pipeline: unload LLM -> generate image -> reload LLM.
@@ -443,6 +483,7 @@ def generate_image(
         cfg_scale: Classifier-free guidance scale.
         seed: RNG seed (-1 for random).
         swarm_model: Override the SwarmUI model (empty = SwarmUI default).
+        send_telegram: If True, deliver the generated image(s) to Telegram.
 
     Returns:
         dict with keys:
@@ -451,6 +492,7 @@ def generate_image(
           - llm_unloaded (bool): Whether LLM was successfully unloaded
           - llm_reloaded (bool): Whether LLM was successfully reloaded
           - image_result (dict): Raw SwarmUI response details
+          - telegram_sent (bool): Whether Telegram delivery succeeded
           - error (str): Error message if failed
           - phase (str): Which phase failed (unload / verify / generate / save / reload)
     """
@@ -460,6 +502,7 @@ def generate_image(
         "llm_unloaded": False,
         "llm_reloaded": False,
         "image_result": {},
+        "telegram_sent": False,
         "error": "",
         "phase": "",
     }
@@ -545,6 +588,10 @@ def generate_image(
         result["error"] = f"Unexpected error during image generation: {exc}"
         result["phase"] = "generate"
         logger.error(result["error"], exc_info=True)
+
+    # NOTE: Telegram delivery (when send_telegram=True) is handled by the
+    # async tool handler in __init__.py, which can properly await the Bot API.
+    # The result dict includes a "telegram_sent" field for the handler to set.
 
     # ── Phase 5: Reload LLM (always attempted) ───────────────────────
     logger.info("Phase 5/5: Reloading LLM into VRAM...")
