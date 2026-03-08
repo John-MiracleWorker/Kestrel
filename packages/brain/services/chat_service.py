@@ -140,8 +140,7 @@ class ChatServicerMixin(BaseServicerMixin):
             if provider_name in ("ollama", "local") and provider_settings.get("ollama_host"):
                 ollama_host_url = provider_settings["ollama_host"].rstrip("/")
                 logger.info(f"Using workspace Ollama host: {ollama_host_url}")
-                provider._base_url = ollama_host_url
-                provider._explicit_url = ollama_host_url
+                provider.set_explicit_url(ollama_host_url)
                 # Invalidate stale health cache so is_ready() re-checks the new URL
                 from providers.ollama import _health_cache
                 _health_cache["checked_at"] = 0
@@ -149,8 +148,7 @@ class ChatServicerMixin(BaseServicerMixin):
             if provider_name == "lmstudio" and provider_settings.get("lmstudio_host"):
                 lmstudio_host_url = provider_settings["lmstudio_host"].rstrip("/")
                 logger.info(f"Using workspace LM Studio host: {lmstudio_host_url}")
-                provider._base_url = lmstudio_host_url
-                provider._explicit_url = lmstudio_host_url
+                provider.set_explicit_url(lmstudio_host_url)
                 from providers.lmstudio import _health_cache as _lm_health_cache
                 _lm_health_cache["checked_at"] = 0
             
@@ -476,10 +474,12 @@ class ChatServicerMixin(BaseServicerMixin):
             # Wrap resolve_provider to inject workspace-specific URLs
             def _workspace_resolve_provider(name: str):
                 p = resolve_provider(name)
+                if name == "ollama" and provider_settings.get("ollama_host"):
+                    _host = provider_settings["ollama_host"].rstrip("/")
+                    p.set_explicit_url(_host)
                 if name == "lmstudio" and provider_settings.get("lmstudio_host"):
                     _host = provider_settings["lmstudio_host"].rstrip("/")
-                    p._base_url = _host
-                    p._explicit_url = _host
+                    p.set_explicit_url(_host)
                 return p
 
             agent_loop = AgentLoop(

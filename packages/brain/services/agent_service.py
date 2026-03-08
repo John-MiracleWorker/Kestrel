@@ -74,8 +74,7 @@ class AgentServicerMixin(BaseServicerMixin):
             if provider_name in ("ollama", "local") and _ws_settings.get("ollama_host"):
                 _host = _ws_settings["ollama_host"].rstrip("/")
                 logger.info(f"Task using workspace Ollama host: {_host}")
-                task_provider._base_url = _host
-                task_provider._explicit_url = _host
+                task_provider.set_explicit_url(_host)
                 # Invalidate stale health cache so is_ready() re-checks the new URL
                 from providers.ollama import _health_cache
                 _health_cache["checked_at"] = 0

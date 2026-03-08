@@ -137,6 +137,16 @@ class OllamaProvider:
         _health_cache["ready"] = False
         _health_cache["checked_at"] = 0
 
+    def set_explicit_url(self, url: str) -> None:
+        """Set an explicit URL for this provider, bypassing discovery."""
+        self._explicit_url = url.rstrip("/")
+        self._base_url = self._explicit_url
+        try:
+            from providers.ollama_discovery import ollama_discovery
+            ollama_discovery.set_static_host(self._explicit_url)
+        except Exception as e:
+            logger.debug(f"Failed to update Ollama discovery static host: {e}")
+
     @property
     def last_response(self) -> str:
         return self._last_response

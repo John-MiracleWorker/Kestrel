@@ -251,6 +251,13 @@ class LMStudioDiscovery:
         """Return cached hosts synchronously (may be empty if not yet scanned)."""
         return list(self._hosts)
 
+    def set_static_host(self, host: str) -> None:
+        """Set a static host explicitly and stop any background scanning."""
+        self._static_host = host
+        if self._bg_task and not self._bg_task.done():
+            self._bg_task.cancel()
+            logger.info(f"LM Studio discovery: background scan cancelled, using static host {host}")
+
     # ── Private ───────────────────────────────────────────────────────
 
     async def _ensure_scanned(self) -> None:
