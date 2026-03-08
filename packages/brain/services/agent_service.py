@@ -96,7 +96,7 @@ class AgentServicerMixin(BaseServicerMixin):
         task_model = ws_config.get("model", "") if ws_config else ""
         task_api_key = ws_config.get("api_key", "") if ws_config else ""
 
-        task_tool_registry = build_tool_registry(hands_client=runtime.hands_client, pool=pool)
+        task_tool_registry = build_tool_registry(hands_client=runtime.hands_client, pool=pool, runtime_policy=runtime.execution_runtime)
         evidence_chain = EvidenceChain(task_id=task.id, pool=pool)
 
         task_working_memory = WorkingMemory(
@@ -408,7 +408,7 @@ class AgentServicerMixin(BaseServicerMixin):
 
         task_model = ws_config.get("model", "") if ws_config else ""
         task_api_key = ws_config.get("api_key", "") if ws_config else ""
-        task_tool_registry = build_tool_registry(hands_client=runtime.hands_client, pool=pool)
+        task_tool_registry = build_tool_registry(hands_client=runtime.hands_client, pool=pool, runtime_policy=runtime.execution_runtime)
         evidence_chain = EvidenceChain(task_id=task.id, pool=pool)
 
         task_working_memory = WorkingMemory(redis_client=None, vector_store=runtime.vector_store)

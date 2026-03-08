@@ -1,37 +1,23 @@
 """
 Code execution tool — runs Python/JS/Shell in a sandboxed environment.
 
-Routes execution through the Hands gRPC service for containerized sandboxing
-with resource limits, network controls, and audit logging.
-
-SECURITY: Local fallback execution has been removed. If the Hands service
-is not available, code execution fails safely. Python's exec() cannot be
-secured via globals restriction — object introspection allows trivial escape.
+Routes execution through the active runtime policy (docker/native/hybrid)
+and exposes runtime capability metadata in responses.
 """
 
-import json
 import logging
-from typing import Optional
 
+from agent.runtime import get_active_runtime
 from agent.types import RiskLevel, ToolDefinition
 
 logger = logging.getLogger("brain.agent.tools.code")
 
-# Hands gRPC client reference (set during registration)
-_hands_client = None
-
-
-def register_code_tools(registry, hands_client=None) -> None:
+def register_code_tools(registry) -> None:
     """Register code execution tools.
 
     Args:
         registry: The tool registry to register with.
-        hands_client: The Hands gRPC client for sandboxed execution.
-            If None, code execution will return an error directing
-            the user to start the Hands service.
     """
-    global _hands_client
-    _hands_client = hands_client
 
     registry.register(
         definition=ToolDefinition(
@@ -75,77 +61,33 @@ async def execute_code(
     timeout: int = 30,
 ) -> dict:
     """
-    Execute code in a sandboxed environment via the Hands gRPC service.
-
-    If the Hands service is not available, returns an error. Local fallback
-    execution has been removed for security — Python's exec() cannot be
-    safely sandboxed via globals restriction.
+    Execute code through the active runtime backend selected at startup.
     """
     timeout = min(timeout, 60)  # Cap at 60s
 
-    if not _hands_client:
+    active_runtime = get_active_runtime()
+    if not active_runtime:
         return {
             "success": False,
-            "error": (
-                "Code execution requires the Hands service for secure sandboxing. "
-                "The Hands service is not connected. Please ensure it is running "
-                "and properly configured."
-            ),
+            "error": "Runtime policy is not initialized.",
         }
 
-    return await _execute_via_hands(language, code, timeout)
-
-
-async def _execute_via_hands(language: str, code: str, timeout: int) -> dict:
-    """Execute code via the Hands gRPC service."""
-    try:
-        # Import proto types
-        import hands_pb2
-
-        # Map language to skill name
-        skill_map = {
-            "python": "python_executor",
-            "javascript": "node_executor",
-            "shell": "shell_executor",
-        }
-
-        skill_name = skill_map.get(language, "python_executor")
-
-        # Build protobuf request
-        request = hands_pb2.SkillExecutionRequest(
-            skill_name=skill_name,
-            function_name="run",
-            arguments=json.dumps({"code": code}),
-            limits=hands_pb2.ResourceLimits(
-                timeout_seconds=timeout,
-                memory_mb=512,
-                network_enabled=True,
-            ),
-        )
-
-        # Call Hands service (streaming response)
-        output_parts = []
-        error_parts = []
-        status = "RUNNING"
-        exec_time = 0
-
-        async for chunk in _hands_client.ExecuteSkill(request):
-            if chunk.output:
-                output_parts.append(chunk.output)
-            if chunk.error:
-                error_parts.append(chunk.error)
-            if chunk.execution_time_ms:
-                exec_time = chunk.execution_time_ms
-            # Map proto enum to string
-            status = hands_pb2.SkillExecutionResponse.Status.Name(chunk.status)
-
+    capabilities = active_runtime.capabilities
+    if language not in capabilities.supports_code_languages:
         return {
-            "success": status == "SUCCESS",
-            "output": "".join(output_parts),
-            "error": "".join(error_parts),
-            "execution_time_ms": exec_time,
+            "success": False,
+            "error": f"Language '{language}' is not supported in active runtime mode '{capabilities.mode.value}'.",
+            "capabilities": capabilities.as_dict(),
         }
 
+    try:
+        result = await active_runtime.execute(
+            tool_name="code_execute",
+            payload={"language": language, "code": code, "timeout": timeout},
+        )
+        if "capabilities" not in result:
+            result["capabilities"] = capabilities.as_dict()
+        return result
     except Exception as e:
-        logger.error(f"Hands execution failed: {e}")
-        return {"success": False, "error": str(e)}
+        logger.error(f"Runtime execution failed: {e}")
+        return {"success": False, "error": str(e), "capabilities": capabilities.as_dict()}

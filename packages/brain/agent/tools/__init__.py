@@ -10,6 +10,7 @@ import logging
 import time
 from typing import Callable, Dict, Optional
 
+from agent.runtime import set_active_runtime
 from agent.types import (
     RiskLevel,
     ToolCall,
@@ -205,7 +206,7 @@ class ToolRegistry:
             )
 
 
-def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> ToolRegistry:
+def build_tool_registry(hands_client=None, vector_store=None, pool=None, runtime_policy=None) -> ToolRegistry:
     """
     Build the default tool registry with all built-in tools.
     Called during server startup.
@@ -215,8 +216,11 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
             If provided, code execution routes through the Hands service.
             If None, code execution will fail safely with an error message.
         vector_store: Optional VectorStore for memory tools.
+        runtime_policy: Active runtime policy used by execution-oriented tools.
     """
     registry = ToolRegistry()
+
+    set_active_runtime(runtime_policy)
 
     # Import and register all built-in tools
     from agent.tools.code import register_code_tools
@@ -232,7 +236,7 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
     from agent.tools.system_tools import register_system_tools
     from agent.tools.host_execution import register_host_execution_tools
 
-    register_code_tools(registry, hands_client=hands_client)
+    register_code_tools(registry)
     register_web_tools(registry)
     register_file_tools(registry)
     register_host_file_tools(registry, vector_store=vector_store)

@@ -5,11 +5,10 @@ on the host machine. Regulated by an allowlist and native macOS approval dialogs
 """
 
 import os
-import sys
 import asyncio
 import logging
-import tempfile
 from datetime import datetime
+from agent.runtime import get_active_runtime
 from agent.types import RiskLevel, ToolDefinition
 
 logger = logging.getLogger("brain.agent.tools.host_execution")
@@ -89,6 +88,18 @@ def _check_allowlist(command: str) -> bool:
 
 async def execute_host_shell(command: str) -> dict:
     """Execute a shell command directly on the host OS."""
+    active_runtime = get_active_runtime()
+    if not active_runtime:
+        return {"success": False, "error": "Runtime policy is not initialized.", "output": ""}
+
+    capabilities = active_runtime.capabilities
+    if not capabilities.supports_host_shell:
+        return {
+            "success": False,
+            "error": f"host_shell is disabled in runtime mode '{capabilities.mode.value}'.",
+            "output": "",
+            "capabilities": capabilities.as_dict(),
+        }
     
     # 1. Check Allowlist
     is_allowed = _check_allowlist(command)
@@ -107,18 +118,9 @@ async def execute_host_shell(command: str) -> dict:
     # 3. Execute and audit
     _audit_log(command, "shell", approved=True)
     try:
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        return {
-            "success": proc.returncode == 0,
-            "output": stdout.decode(),
-            "error": stderr.decode(),
-            "exit_code": proc.returncode
-        }
+        result = await active_runtime.execute(tool_name="host_shell", payload={"command": command})
+        result["capabilities"] = capabilities.as_dict()
+        return result
     except Exception as e:
         _audit_log(command, "shell", approved=True, error=str(e))
         return {
@@ -129,6 +131,18 @@ async def execute_host_shell(command: str) -> dict:
 
 async def execute_host_python(code: str) -> dict:
     """Execute python code directly on the host OS."""
+    active_runtime = get_active_runtime()
+    if not active_runtime:
+        return {"success": False, "error": "Runtime policy is not initialized.", "output": ""}
+
+    capabilities = active_runtime.capabilities
+    if not capabilities.supports_host_python:
+        return {
+            "success": False,
+            "error": f"host_python is disabled in runtime mode '{capabilities.mode.value}'.",
+            "output": "",
+            "capabilities": capabilities.as_dict(),
+        }
     
     # We serialize the code to a temporary file and run `python3 cache_file.py`
     # Always prompt for native approval for host python unless we build a complex analysis
@@ -144,24 +158,10 @@ async def execute_host_python(code: str) -> dict:
         }
 
     _audit_log("Python Script", "python", approved=True)
-    tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            f.write(code)
-            tmp_path = f.name
-
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, tmp_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        return {
-            "success": proc.returncode == 0,
-            "output": stdout.decode(),
-            "error": stderr.decode(),
-            "exit_code": proc.returncode
-        }
+        result = await active_runtime.execute(tool_name="host_python", payload={"code": code})
+        result["capabilities"] = capabilities.as_dict()
+        return result
     except Exception as e:
         _audit_log("Python Script", "python", approved=True, error=str(e))
         return {
@@ -169,12 +169,6 @@ async def execute_host_python(code: str) -> dict:
             "error": str(e),
             "output": ""
         }
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
 
 def register_host_execution_tools(registry) -> None:
     registry.register(
