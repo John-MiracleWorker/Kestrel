@@ -9,12 +9,20 @@ import sys
 import asyncio
 import logging
 import tempfile
+import json
+from pathlib import Path
 from datetime import datetime
 from agent.types import RiskLevel, ToolDefinition
 
+_SHARED_PATH = Path(__file__).resolve().parents[3] / "shared"
+if str(_SHARED_PATH) not in sys.path:
+    sys.path.append(str(_SHARED_PATH))
+
+from action_event_schema import build_action_event, stable_hash
+
 logger = logging.getLogger("brain.agent.tools.host_execution")
 
-def _audit_log(command: str, language: str, approved: bool, error: str = ""):
+def _audit_log(command: str, language: str, approved: bool, error: str = "", action_event: dict | None = None):
     """Append execution attempts to the local audit log."""
     audit_dir = os.path.expanduser("~/.kestrel/audit")
     os.makedirs(audit_dir, exist_ok=True)
@@ -25,10 +33,16 @@ def _audit_log(command: str, language: str, approved: bool, error: str = ""):
     if error:
         status = f"FAILED ({error})"
         
-    log_entry = f"[{timestamp}] [{language}] [{status}] {command}\n"
+    log_entry = {
+        "timestamp": timestamp,
+        "language": language,
+        "status": status,
+        "command": command,
+        "action_event": action_event or {},
+    }
     try:
         with open(log_file, "a") as f:
-            f.write(log_entry)
+            f.write(json.dumps(log_entry) + "\n")
     except Exception as e:
         logger.error(f"Failed to write audit log: {e}")
 
@@ -89,6 +103,7 @@ def _check_allowlist(command: str) -> bool:
 
 async def execute_host_shell(command: str) -> dict:
     """Execute a shell command directly on the host OS."""
+    command_hash = stable_hash(command)
     
     # 1. Check Allowlist
     is_allowed = _check_allowlist(command)
@@ -97,15 +112,33 @@ async def execute_host_shell(command: str) -> dict:
     if not is_allowed:
         approved = await _prompt_mac_approval(command)
         if not approved:
-            _audit_log(command, "shell", approved=False)
+            action_event = build_action_event(
+                source="brain.host_execution",
+                action_type="host_shell",
+                status="denied",
+                before_state={"command_hash": command_hash, "policy_decision": "approval_required"},
+                after_state={"command_hash": command_hash, "policy_decision": "denied"},
+            )
+            _audit_log(command, "shell", approved=False, action_event=action_event)
             return {
                 "success": False,
                 "error": "User denied execution of high-risk command via native macOS dialog.",
-                "output": ""
+                "output": "",
+                "action_event": action_event,
             }
             
     # 3. Execute and audit
-    _audit_log(command, "shell", approved=True)
+    action_event = build_action_event(
+        source="brain.host_execution",
+        action_type="host_shell",
+        status="running",
+        before_state={
+            "command_hash": command_hash,
+            "policy_decision": "allowlist" if is_allowed else "user_approved",
+        },
+        after_state={"command_hash": command_hash, "policy_decision": "running"},
+    )
+    _audit_log(command, "shell", approved=True, action_event=action_event)
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -113,18 +146,39 @@ async def execute_host_shell(command: str) -> dict:
             stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await proc.communicate()
+        final_event = build_action_event(
+            source="brain.host_execution",
+            action_type="host_shell",
+            status="success" if proc.returncode == 0 else "failed",
+            before_state=action_event["before_state"],
+            after_state={
+                "command_hash": command_hash,
+                "policy_decision": "executed",
+            },
+            metadata={"exit_code": proc.returncode},
+        )
         return {
             "success": proc.returncode == 0,
             "output": stdout.decode(),
             "error": stderr.decode(),
-            "exit_code": proc.returncode
+            "exit_code": proc.returncode,
+            "action_event": final_event,
         }
     except Exception as e:
-        _audit_log(command, "shell", approved=True, error=str(e))
+        failed_event = build_action_event(
+            source="brain.host_execution",
+            action_type="host_shell",
+            status="failed",
+            before_state=action_event["before_state"],
+            after_state={"command_hash": command_hash, "policy_decision": "execution_error"},
+            metadata={"error": str(e)},
+        )
+        _audit_log(command, "shell", approved=True, error=str(e), action_event=failed_event)
         return {
             "success": False,
             "error": str(e),
-            "output": ""
+            "output": "",
+            "action_event": failed_event,
         }
 
 async def execute_host_python(code: str) -> dict:
@@ -134,16 +188,32 @@ async def execute_host_python(code: str) -> dict:
     # Always prompt for native approval for host python unless we build a complex analysis
     # For MVP, prompt approval for all raw python code
     
+    command_hash = stable_hash(code)
     approved = await _prompt_mac_approval("Python script with length: " + str(len(code)))
     if not approved:
-        _audit_log("Python Script", "python", approved=False)
+        denied_event = build_action_event(
+            source="brain.host_execution",
+            action_type="host_python",
+            status="denied",
+            before_state={"command_hash": command_hash, "policy_decision": "approval_required"},
+            after_state={"command_hash": command_hash, "policy_decision": "denied"},
+        )
+        _audit_log("Python Script", "python", approved=False, action_event=denied_event)
         return {
             "success": False,
             "error": "User denied execution of high-risk python code via native macOS dialog.",
-            "output": ""
+            "output": "",
+            "action_event": denied_event,
         }
 
-    _audit_log("Python Script", "python", approved=True)
+    running_event = build_action_event(
+        source="brain.host_execution",
+        action_type="host_python",
+        status="running",
+        before_state={"command_hash": command_hash, "policy_decision": "user_approved"},
+        after_state={"command_hash": command_hash, "policy_decision": "running"},
+    )
+    _audit_log("Python Script", "python", approved=True, action_event=running_event)
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
@@ -156,18 +226,36 @@ async def execute_host_python(code: str) -> dict:
             stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await proc.communicate()
+        final_event = build_action_event(
+            source="brain.host_execution",
+            action_type="host_python",
+            status="success" if proc.returncode == 0 else "failed",
+            before_state=running_event["before_state"],
+            after_state={"command_hash": command_hash, "policy_decision": "executed"},
+            metadata={"exit_code": proc.returncode},
+        )
         return {
             "success": proc.returncode == 0,
             "output": stdout.decode(),
             "error": stderr.decode(),
-            "exit_code": proc.returncode
+            "exit_code": proc.returncode,
+            "action_event": final_event,
         }
     except Exception as e:
-        _audit_log("Python Script", "python", approved=True, error=str(e))
+        failed_event = build_action_event(
+            source="brain.host_execution",
+            action_type="host_python",
+            status="failed",
+            before_state=running_event["before_state"],
+            after_state={"command_hash": command_hash, "policy_decision": "execution_error"},
+            metadata={"error": str(e)},
+        )
+        _audit_log("Python Script", "python", approved=True, error=str(e), action_event=failed_event)
         return {
             "success": False,
             "error": str(e),
-            "output": ""
+            "output": "",
+            "action_event": failed_event,
         }
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -224,3 +312,4 @@ def register_host_execution_tools(registry) -> None:
         ),
         handler=execute_host_python
     )
+    command_hash = stable_hash(command)
