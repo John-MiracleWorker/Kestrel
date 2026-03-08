@@ -21,7 +21,7 @@ from .fs.read import host_read, host_batch_read
 from .fs.write import host_write
 from .fs.explore import host_list, host_search, host_tree, host_find, project_recall
 
-def register_host_file_tools(registry, vector_store=None) -> None:
+def register_host_file_tools(registry, vector_store=None, enable_write: bool = False) -> None:
     """Register host filesystem tools."""
     # Inject vector store for project context memoization
     if vector_store:
@@ -175,41 +175,46 @@ def register_host_file_tools(registry, vector_store=None) -> None:
         handler=host_search,
     )
 
-    registry.register(
-        definition=ToolDefinition(
-            name="host_write",
-            description=(
-                "Write content to a file on the user's host filesystem. "
-                "⚠️ This is a HIGH-RISK operation — it will modify files on the "
-                "user's actual machine and requires human approval before execution. "
-                "A diff preview is shown to the user for review."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute file path or path relative to first mounted directory",
+    if enable_write:
+        registry.register(
+            definition=ToolDefinition(
+                name="host_write",
+                description=(
+                    "Write content to a file on the user's host filesystem. "
+                    "⚠️ This is a HIGH-RISK operation — it will modify files on the "
+                    "user's actual machine and requires human approval before execution. "
+                    "A diff preview is shown to the user for review."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute file path or path relative to first mounted directory",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Full content to write to the file",
+                        },
+                        "create_dirs": {
+                            "type": "boolean",
+                            "description": "Create parent directories if they don't exist",
+                            "default": False,
+                        },
                     },
-                    "content": {
-                        "type": "string",
-                        "description": "Full content to write to the file",
-                    },
-                    "create_dirs": {
-                        "type": "boolean",
-                        "description": "Create parent directories if they don't exist",
-                        "default": False,
-                    },
+                    "required": ["path", "content"],
                 },
-                "required": ["path", "content"],
-            },
-            risk_level=RiskLevel.HIGH,
-            requires_approval=True,
-            timeout_seconds=15,
-            category="host_file",
-        ),
-        handler=host_write,
-    )
+                risk_level=RiskLevel.HIGH,
+                requires_approval=True,
+                timeout_seconds=15,
+                category="host_file",
+            ),
+            handler=host_write,
+        )
+    else:
+        logger.info(
+            "Skipping host_write tool registration (disabled by startup policy)"
+        )
 
     registry.register(
         definition=ToolDefinition(

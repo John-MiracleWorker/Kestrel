@@ -7,6 +7,7 @@ and result formatting.
 """
 
 import logging
+import os
 import time
 from typing import Callable, Dict, Optional
 
@@ -232,10 +233,13 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
     from agent.tools.system_tools import register_system_tools
     from agent.tools.host_execution import register_host_execution_tools
 
+    native_write_enabled = os.getenv("KESTREL_ENABLE_HOST_WRITE", "false").lower() in {"1", "true", "yes", "on"}
+    native_exec_enabled = os.getenv("KESTREL_ENABLE_HOST_EXEC", "false").lower() in {"1", "true", "yes", "on"}
+
     register_code_tools(registry, hands_client=hands_client)
     register_web_tools(registry)
     register_file_tools(registry)
-    register_host_file_tools(registry, vector_store=vector_store)
+    register_host_file_tools(registry, vector_store=vector_store, enable_write=native_write_enabled)
     register_data_tools(registry)
     register_memory_tools(registry, vector_store=vector_store)
     register_human_tools(registry)
@@ -243,7 +247,7 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None) -> Tool
     register_moltbook_autonomous_tools(registry)
     register_schedule_tools(registry)
     register_system_tools(registry)
-    register_host_execution_tools(registry)
+    register_host_execution_tools(registry, enable_native_exec=native_exec_enabled)
 
     # Model swap (search + switch models across Ollama & cloud providers)
     from agent.tools.model_swap import register_model_swap_tools

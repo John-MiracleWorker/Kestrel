@@ -176,7 +176,11 @@ async def execute_host_python(code: str) -> dict:
             except Exception:
                 pass
 
-def register_host_execution_tools(registry) -> None:
+def register_host_execution_tools(registry, enable_native_exec: bool = False) -> None:
+    if not enable_native_exec:
+        logger.info("Skipping host execution tool registration (disabled by startup policy)")
+        return
+
     registry.register(
         definition=ToolDefinition(
             name="host_shell",
