@@ -13,13 +13,26 @@ Usage:
 import base64
 import io
 import logging
+import os
+import subprocess
 import time
+import uuid
+from threading import Lock
 from typing import Any, Optional
 
 import pyautogui
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+try:
+    import pytesseract
+except Exception:  # pragma: no cover - optional dependency
+    pytesseract = None
+
+try:
+    import pygetwindow as gw
+except Exception:  # pragma: no cover - optional dependency
+    gw = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("screen-agent")
@@ -42,12 +55,60 @@ pyautogui.FAILSAFE = True  # Move mouse to corner to abort
 class ActionRequest(BaseModel):
     action: str
     args: dict[str, Any] = {}
+    idempotency_key: Optional[str] = None
 
 
 class ActionResponse(BaseModel):
     success: bool
     result: str = ""
     error: str = ""
+    action_id: str = ""
+    replayed: bool = False
+    validation: dict[str, Any] = {}
+
+
+class OCRRequest(BaseModel):
+    region: Optional[dict[str, int]] = None
+    needle: Optional[str] = None
+
+
+class ValidationRequest(BaseModel):
+    app: Optional[str] = None
+    window_title: Optional[str] = None
+    url_contains: Optional[str] = None
+    text_contains: Optional[str] = None
+
+
+class UIElementsRequest(BaseModel):
+    provider: str = "none"
+    options: dict[str, Any] = {}
+
+
+ACTION_RESULT_CACHE: dict[str, dict[str, Any]] = {}
+ACTION_CACHE_LOCK = Lock()
+ACTION_CACHE_TTL_SECONDS = int(os.getenv("SCREEN_AGENT_ACTION_CACHE_TTL_SECONDS", "600"))
+
+
+def _cache_set(key: str, value: dict[str, Any]) -> None:
+    with ACTION_CACHE_LOCK:
+        ACTION_RESULT_CACHE[key] = {"ts": time.time(), "value": value}
+
+
+def _cache_get(key: str) -> Optional[dict[str, Any]]:
+    now = time.time()
+    with ACTION_CACHE_LOCK:
+        expired = [
+            cache_key
+            for cache_key, entry in ACTION_RESULT_CACHE.items()
+            if now - entry["ts"] > ACTION_CACHE_TTL_SECONDS
+        ]
+        for cache_key in expired:
+            ACTION_RESULT_CACHE.pop(cache_key, None)
+
+        entry = ACTION_RESULT_CACHE.get(key)
+        if not entry:
+            return None
+        return entry["value"]
 
 
 # ── Coordinate Helpers ───────────────────────────────────────────────
@@ -161,6 +222,125 @@ def execute_action(action_name: str, args: dict) -> str:
         return f"Unknown action: {action_name}"
 
 
+def _run_osascript(script: str) -> str:
+    try:
+        output = subprocess.check_output(["osascript", "-e", script], text=True)
+        return output.strip()
+    except Exception:
+        return ""
+
+
+def _active_context() -> dict[str, str]:
+    app_name = ""
+    window_title = ""
+    current_url = ""
+
+    if gw is not None:
+        try:
+            active_window = gw.getActiveWindow()
+            if active_window:
+                window_title = getattr(active_window, "title", "") or ""
+        except Exception:
+            pass
+
+    app_name = _run_osascript(
+        'tell application "System Events" to get name of first application process whose frontmost is true'
+    )
+    if not window_title:
+        window_title = _run_osascript(
+            'tell application "System Events" to tell (first application process whose frontmost is true) to get name of front window'
+        )
+
+    if app_name == "Safari":
+        current_url = _run_osascript('tell application "Safari" to return URL of front document')
+    elif app_name == "Google Chrome":
+        current_url = _run_osascript('tell application "Google Chrome" to return URL of active tab of front window')
+
+    return {
+        "app": app_name,
+        "window_title": window_title,
+        "url": current_url,
+    }
+
+
+def _capture_screen_image(region: Optional[dict[str, int]] = None):
+    if region:
+        left = max(0, region.get("left", 0))
+        top = max(0, region.get("top", 0))
+        width = max(1, region.get("width", SCREEN_WIDTH))
+        height = max(1, region.get("height", SCREEN_HEIGHT))
+        return pyautogui.screenshot(region=(left, top, width, height))
+    return pyautogui.screenshot()
+
+
+def _run_ocr(region: Optional[dict[str, int]] = None) -> dict[str, Any]:
+    if pytesseract is None:
+        return {
+            "success": False,
+            "error": "pytesseract not available in screen-agent environment",
+            "text": "",
+        }
+
+    image = _capture_screen_image(region)
+    text = pytesseract.image_to_string(image)
+    return {
+        "success": True,
+        "text": text,
+        "char_count": len(text),
+    }
+
+
+def _validate_expectations(expectations: ValidationRequest) -> dict[str, Any]:
+    checks: dict[str, Any] = {}
+    context = _active_context()
+
+    if expectations.app:
+        expected = expectations.app.lower()
+        actual = context.get("app", "")
+        checks["app"] = {
+            "expected": expectations.app,
+            "actual": actual,
+            "ok": expected in actual.lower(),
+        }
+
+    if expectations.window_title:
+        expected = expectations.window_title.lower()
+        actual = context.get("window_title", "")
+        checks["window_title"] = {
+            "expected": expectations.window_title,
+            "actual": actual,
+            "ok": expected in actual.lower(),
+        }
+
+    if expectations.url_contains:
+        expected = expectations.url_contains.lower()
+        actual = context.get("url", "")
+        checks["url_contains"] = {
+            "expected": expectations.url_contains,
+            "actual": actual,
+            "ok": expected in actual.lower(),
+        }
+
+    if expectations.text_contains:
+        ocr_result = _run_ocr()
+        actual_text = ocr_result.get("text", "") if ocr_result.get("success") else ""
+        expected = expectations.text_contains.lower()
+        checks["text_contains"] = {
+            "expected": expectations.text_contains,
+            "actual_excerpt": actual_text[:500],
+            "ok": expected in actual_text.lower(),
+            "ocr_success": ocr_result.get("success", False),
+            "ocr_error": ocr_result.get("error", ""),
+        }
+
+    passed = all(item.get("ok", False) for item in checks.values()) if checks else True
+    return {
+        "passed": passed,
+        "checks": checks,
+        "context": context,
+    }
+
+
 # ── Endpoints ────────────────────────────────────────────────────────
 
 
@@ -184,16 +364,92 @@ async def screenshot():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/active_window")
+async def active_window():
+    try:
+        return {"success": True, **_active_context()}
+    except Exception as e:
+        logger.error(f"Active window introspection failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ocr")
+async def ocr(req: OCRRequest):
+    try:
+        result = _run_ocr(req.region)
+        if req.needle and result.get("success"):
+            text = result.get("text", "")
+            result["contains_needle"] = req.needle.lower() in text.lower()
+        return result
+    except Exception as e:
+        logger.error(f"OCR failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/detect_ui_elements")
+async def detect_ui_elements(req: UIElementsRequest):
+    """
+    Optional UI element detection hook.
+    Integrators can replace this with a provider-backed implementation.
+    """
+    return {
+        "success": False,
+        "provider": req.provider,
+        "elements": [],
+        "error": "No UI element detector configured",
+    }
+
+
+@app.post("/validate")
+async def validate(req: ValidationRequest):
+    try:
+        return {"success": True, **_validate_expectations(req)}
+    except Exception as e:
+        logger.error(f"Validation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/action", response_model=ActionResponse)
 async def perform_action(req: ActionRequest):
     """Execute a desktop action via PyAutoGUI."""
+    action_id = req.idempotency_key or str(uuid.uuid4())
+
+    cached = _cache_get(action_id)
+    if cached:
+        return ActionResponse(
+            success=cached.get("success", False),
+            result=cached.get("result", ""),
+            error=cached.get("error", ""),
+            validation=cached.get("validation", {}),
+            action_id=action_id,
+            replayed=True,
+        )
+
     try:
         result = execute_action(req.action, req.args)
         logger.info(f"Action: {req.action} -> {result}")
-        return ActionResponse(success=True, result=result)
+        validation = {}
+        validate_args = req.args.get("validate")
+        if isinstance(validate_args, dict):
+            validation = _validate_expectations(ValidationRequest(**validate_args))
+        response = {
+            "success": True,
+            "result": result,
+            "error": "",
+            "validation": validation,
+        }
+        _cache_set(action_id, response)
+        return ActionResponse(**response, action_id=action_id)
     except Exception as e:
         logger.error(f"Action failed: {req.action} — {e}", exc_info=True)
-        return ActionResponse(success=False, error=str(e))
+        response = {
+            "success": False,
+            "result": "",
+            "error": str(e),
+            "validation": {},
+        }
+        _cache_set(action_id, response)
+        return ActionResponse(**response, action_id=action_id)
 
 
 # ── Entry Point ──────────────────────────────────────────────────────
