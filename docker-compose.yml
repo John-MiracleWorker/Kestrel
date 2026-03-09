@@ -128,6 +128,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       HOST_MOUNT_ROOT: ${HOST_MOUNT_ROOT:-/Users}
       HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT:-}
+      USE_LANGGRAPH: "true"
     volumes:
       - ${LOCAL_MODEL_DIR:-./models}:/models:ro
       - .:/project # Mount project root for self-improvement git operations

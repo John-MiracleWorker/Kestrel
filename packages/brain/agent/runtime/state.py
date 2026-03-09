@@ -38,7 +38,7 @@ class KestrelState(TypedDict, total=False):
     # ── Control flow ─────────────────────────────────────────────
     status: str                            # Maps to TaskStatus enum value
     iteration: int
-    checkpoint_id: Optional[str]
+    kestrel_checkpoint_id: Optional[str]
 
     # ── Context enrichment ───────────────────────────────────────
     lesson_context: str                    # Past lessons from TaskLearner
@@ -98,7 +98,7 @@ def create_initial_state(task: AgentTask) -> KestrelState:
         council_verdict=None,
         status=task.status.value,
         iteration=0,
-        checkpoint_id=None,
+        kestrel_checkpoint_id=None,
         lesson_context="",
         persona_context="",
         route=None,

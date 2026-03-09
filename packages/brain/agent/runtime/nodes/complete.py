@@ -45,6 +45,9 @@ async def complete_node(
     plan = state.get("plan") or task.plan
     updates: dict[str, Any] = {}
 
+    if state.get("messages") and not task.messages:
+        task.messages = state.get("messages", [])
+
     # ── Handle cancelled/denied tasks ────────────────────────────
     if state.get("approval_granted") is False:
         task.status = TaskStatus.CANCELLED

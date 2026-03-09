@@ -19,3 +19,7 @@ cryptography
 bcrypt
 watchdog
 websockets>=12.0
+langgraph
+langchain-core
+langgraph-checkpoint-postgres
+psycopg[binary]

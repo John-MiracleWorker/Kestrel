@@ -128,16 +128,26 @@ class LangGraphEngine:
             event_callback=self._event_callback,
         )
 
-    def _build_graph(self):
+    async def _build_graph(self):
         """Build the LangGraph state graph with all dependencies bound."""
         self._ensure_components()
 
         from agent.runtime.agent_graph import build_agent_graph
-        from agent.runtime.checkpointer import PostgresCheckpointer
 
         checkpointer = None
         if self._checkpoint_manager:
-            checkpointer = PostgresCheckpointer(self._checkpoint_manager)
+            try:
+                from langgraph.checkpoint.memory import MemorySaver
+                checkpointer = MemorySaver()
+            except ImportError as e:
+                logger.error(f"ImportError setting up LangGraph checkpointer: {e}")
+                from agent.runtime.checkpointer import PostgresCheckpointer
+                checkpointer = PostgresCheckpointer(self._checkpoint_manager)
+            except Exception as e:
+                import traceback
+                logger.error(f"Failed to setup LangGraph checkpointer: {e}\n{traceback.format_exc()}")
+                from agent.runtime.checkpointer import PostgresCheckpointer
+                checkpointer = PostgresCheckpointer(self._checkpoint_manager)
 
         self._graph = build_agent_graph(
             provider=self._provider,
@@ -176,7 +186,7 @@ class LangGraphEngine:
         Queue, giving streaming parity with the legacy loop.
         """
         if self._graph is None:
-            self._build_graph()
+            await self._build_graph()
 
         initial_state = create_initial_state(task)
 
@@ -188,21 +198,28 @@ class LangGraphEngine:
 
         _callback_to_event_type = {
             "plan_created": TaskEventType.PLAN_CREATED,
+            "step_started": TaskEventType.STEP_STARTED,
             "thinking": TaskEventType.THINKING,
             "tool_called": TaskEventType.TOOL_CALLED,
             "tool_result": TaskEventType.TOOL_RESULT,
+            "step_complete": TaskEventType.STEP_COMPLETE,
             "simulation_complete": TaskEventType.SIMULATION_COMPLETE,
             "approval_needed": TaskEventType.APPROVAL_NEEDED,
             "task_complete": TaskEventType.TASK_COMPLETE,
             "task_failed": TaskEventType.TASK_FAILED,
         }
 
+        # Capture the original callback BEFORE defining the closure
+        # to avoid infinite recursion when _bridging_callback is later
+        # assigned to self._event_callback.
+        _original_callback = self._event_callback
+
         async def _bridging_callback(event_type: str, payload: dict) -> None:
             """Forward event_callback calls as TaskEvents into the queue."""
             # Always call the original outer callback if one was configured
-            if self._event_callback:
+            if _original_callback:
                 try:
-                    await self._event_callback(event_type, payload)
+                    await _original_callback(event_type, payload)
                 except Exception as e:
                     logger.warning(f"Outer event_callback error: {e}")
 
@@ -229,7 +246,6 @@ class LangGraphEngine:
         # (only if the caller didn't already inject an event_callback directly
         # into the constructor — in that case we still wrap it above)
         if self._event_callback is not _bridging_callback:
-            _original_callback = self._event_callback
             # Temporarily swap in the bridge; restore on exit
             self._event_callback = _bridging_callback
             # Re-bind the callback on already-built components

@@ -108,18 +108,15 @@ async def plan_node(
     task = state["task"]
     updates: dict[str, Any] = {}
 
-    # ── Fast-path for chat tasks ─────────────────────────────────
-    if task.messages:
+    # ── Fast-path for simple chat tasks ─────────────────────────
+    # chat_service.py pre-classifies messages:
+    #   - Simple (greetings, short Q&A) → task.plan is already set
+    #   - Complex (research, actions)   → task.plan is None
+    # Only fast-path when the plan was pre-set. Complex chat messages
+    # fall through to the full planner so they get tool access.
+    if task.messages and task.plan is not None:
         logger.info(f"Chat fast-path: skipping planner for '{task.goal[:60]}'")
-        plan = TaskPlan(
-            goal=task.goal,
-            steps=[TaskStep(
-                index=0,
-                description=task.goal[:200],
-                status=StepStatus.PENDING,
-            )],
-            reasoning="Chat-originated task — direct execution",
-        )
+        plan = task.plan
         updates["plan"] = plan
         updates["plan_complexity"] = 1.0
         updates["needs_council"] = False

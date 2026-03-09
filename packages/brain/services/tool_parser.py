@@ -159,7 +159,8 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
         )
 
     elif event_type == "task_complete":
-        if event.content and event.content not in '\n'.join(full_response_parts):
+        joined_response = ''.join(full_response_parts)
+        if event.content and event.content not in joined_response:
             words = event.content.split(' ')
             for i, word in enumerate(words):
                 chunk = word if i == 0 else ' ' + word
@@ -169,7 +170,7 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
     elif event_type == "task_failed":
         failure_note = _build_failure_note(event.content or "")
         if full_response_parts:
-            combined = '\n'.join(full_response_parts)
+            combined = ''.join(full_response_parts)
             combined += f"\n\n{failure_note}"
             words = combined.split(' ')
             for i, word in enumerate(words):

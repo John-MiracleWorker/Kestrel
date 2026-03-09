@@ -53,9 +53,18 @@ async def execute_node(
         updates["route"] = "done"
         return updates
 
-    # Ensure task has the latest plan
+    # Ensure task has the latest plan and runtime properties
     task.plan = plan
     task.status = TaskStatus.EXECUTING
+    state_msgs = state.get("messages", [])
+    logger.info(
+        f"execute_node: task.messages={len(task.messages)} items, "
+        f"state['messages']={len(state_msgs)} items, "
+        f"step_desc={task.plan.steps[0].description[:80] if task.plan and task.plan.steps else 'N/A'}"
+    )
+    if state_msgs and not task.messages:
+        task.messages = state_msgs
+        logger.info(f"execute_node: restored {len(state_msgs)} messages from state")
 
     if persistence:
         await persistence.update_task(task)
