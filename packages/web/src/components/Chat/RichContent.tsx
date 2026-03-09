@@ -91,8 +91,18 @@ export function RichContent({ content }: { content: string }) {
 
 // ── Markdown Text ────────────────────────────────────────────────────
 function markdownToHtml(md: string): string {
-    let html = md
-        // Escape HTML
+    // ── Step 1: Preserve <details>/<summary> blocks ─────────────────
+    // These are intentionally included in the LLM output for thinking
+    // blocks and should NOT be HTML-escaped.
+    const detailsPlaceholders: string[] = [];
+    let processed = md.replace(/<details>([\s\S]*?)<\/details>/gi, (match) => {
+        const idx = detailsPlaceholders.length;
+        detailsPlaceholders.push(match);
+        return `__DETAILS_${idx}__`;
+    });
+
+    let html = processed
+        // Escape HTML (safe now that <details> blocks are placeholdered)
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
@@ -115,6 +125,14 @@ function markdownToHtml(md: string): string {
 
         // Inline code
         .replace(/`([^`]+)`/g, '<code style="background:rgba(0,243,255,0.08);color:var(--accent-cyan);padding:1px 5px;border-radius:3px;font-family:var(--font-mono);font-size:0.85em">$1</code>')
+
+        // Videos (detect by extension before general images)
+        .replace(/!\[([^\]]*)\]\(([^)]+\.(?:mp4|webm|mov))\)/gi,
+            '<video src="$2" controls style="max-width:100%;border-radius:8px;border:1px solid var(--border-subtle);margin:8px 0;display:block">$1</video>')
+
+        // Images (must be before links — ![alt](url) before [text](url))
+        .replace(/!\[([^\]]*)\]\(([^)]+)\)/g,
+            '<img src="$2" alt="$1" style="max-width:100%;border-radius:8px;border:1px solid var(--border-subtle);margin:8px 0;display:block" />')
 
         // Links
         .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" style="color:var(--accent-cyan);text-decoration:underline">$1</a>')
@@ -140,6 +158,11 @@ function markdownToHtml(md: string): string {
     // Clean up empty paragraphs
     html = html.replace(/<p style="margin:0"><\/p>/g, '');
     html = html.replace(/<p style="margin:8px 0"><\/p>/g, '');
+
+    // ── Restore <details>/<summary> blocks ────────────────────────
+    for (let i = 0; i < detailsPlaceholders.length; i++) {
+        html = html.replace(`__DETAILS_${i}__`, detailsPlaceholders[i]);
+    }
 
     return html;
 }

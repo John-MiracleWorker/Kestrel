@@ -85,6 +85,12 @@ _CATEGORY_KEYWORDS: dict[str, list[str]] = {
         "computer", "screen", "screenshot", "click", "type",
         "browser", "automation", "ui",
     ],
+    "media": [
+        "image", "picture", "photo", "draw", "generate", "art",
+        "video", "animate", "animation", "render", "diffusion",
+        "illustrate", "painting", "sketch", "visual", "create image",
+        "create video", "ballerina", "portrait", "landscape",
+    ],
 }
 
 # ── Tool name → category overrides ──────────────────────────────────
@@ -119,6 +125,9 @@ _TOOL_CATEGORY_MAP: dict[str, str] = {
     "delegate_task": "delegation",
     "delegate_parallel": "delegation",
     "computer_use": "computer",
+    "generate_media": "media",
+    "vram_generate_image": "media",
+    "check_media_host": "media",
     "ask_human": "control",
     "task_complete": "control",
 }

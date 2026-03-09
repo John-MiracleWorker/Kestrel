@@ -33,6 +33,8 @@ def _format_tool_result_preview(tool_result: str) -> str:
 
         items = []
         for key in list(parsed.keys())[:4]:
+            if key in ("display_markdown", "instruction"):
+                continue  # Exclude media markdown to prevent duplicate rendering
             value = str(parsed[key]).replace("\n", " ")
             items.append(f"{key}={value[:60]}")
         return ", ".join(items)[:200]

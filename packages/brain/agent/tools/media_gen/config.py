@@ -10,8 +10,8 @@ import uuid
 
 # ── Remote Host ──────────────────────────────────────────────────────
 
-SWARM_HOST_IP = os.getenv("SWARM_HOST_IP", "192.168.1.100")
-SWARM_PORT = int(os.getenv("SWARM_PORT", "8188"))
+SWARM_HOST_IP = os.getenv("SWARM_HOST_IP", "192.168.1.19")
+SWARM_PORT = int(os.getenv("SWARM_PORT", "7822"))
 
 # ── Derived URLs ─────────────────────────────────────────────────────
 

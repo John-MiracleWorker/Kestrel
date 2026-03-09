@@ -40,11 +40,23 @@ LMSTUDIO_BASE_URL = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234")
 # SwarmUI endpoint
 SWARMUI_BASE_URL = os.getenv("SWARMUI_BASE_URL", "http://localhost:7801")
 
+# Default SwarmUI diffusion model — used when the LLM doesn't specify one
+SWARM_DEFAULT_MODEL = os.getenv(
+    "KESTREL_SWARM_MODEL",
+    "Flux/flux1-dev-fp8.safetensors",
+)
+
+# Default SwarmUI video model — used for video generation
+SWARM_DEFAULT_VIDEO_MODEL = os.getenv(
+    "KESTREL_SWARM_VIDEO_MODEL",
+    "Wan/wan2.2_fun_480p_bf16.safetensors",
+)
+
 # Drop in your exact LM Studio model identifier here, e.g.:
 #   "glm-4-9b-chat-q4_k_m"  or  "THUDM/glm-4-flash-30b-gguf"
 GLM_MODEL_ID = os.getenv(
     "KESTREL_GLM_MODEL_ID",
-    "YOUR_GLM_MODEL_ID_HERE",  # <-- PLACEHOLDER: replace with your LM Studio model ID
+    "zai-org/glm-4.7-flash",
 )
 
 # Seconds to wait after unload before hitting SwarmUI.
@@ -54,8 +66,11 @@ VRAM_FLUSH_DELAY = float(os.getenv("KESTREL_VRAM_FLUSH_DELAY", "6.0"))
 # How long to wait for a single image generation (seconds).
 IMAGE_GEN_TIMEOUT = int(os.getenv("KESTREL_IMAGE_GEN_TIMEOUT", "300"))
 
-# Directory to save generated images
-OUTPUT_DIR = os.getenv("KESTREL_IMAGE_OUTPUT_DIR", os.path.join(os.path.expanduser("~"), "Kestrel", "generated_images"))
+# How long to wait for video generation (seconds) — much longer than images.
+VIDEO_GEN_TIMEOUT = int(os.getenv("KESTREL_VIDEO_GEN_TIMEOUT", "900"))
+
+# Directory to save generated images (shared volume with gateway for serving)
+OUTPUT_DIR = os.getenv("KESTREL_IMAGE_OUTPUT_DIR", "/app/generated_media")
 
 # HTTP timeouts for API calls (seconds)
 API_TIMEOUT = 30
@@ -64,16 +79,48 @@ API_TIMEOUT = 30
 # ── LM Studio: Model Lifecycle ──────────────────────────────────────────────
 
 
+def _get_all_loaded_instance_ids(
+    model_id: str,
+    base_url: str,
+) -> list[str]:
+    """
+    Query LM Studio's /v1/models endpoint to find ALL instance_ids for a
+    model. LM Studio appends ':N' suffixes for duplicate loads (e.g.
+    'zai-org/glm-4.7-flash:2'), so we match by prefix.
+
+    Returns a list of instance_id strings (may be empty).
+    """
+    instance_ids = []
+    try:
+        url = f"{base_url}/v1/models"
+        resp = requests.get(url, timeout=API_TIMEOUT)
+        if resp.status_code == 200:
+            data = resp.json()
+            for model in data.get("data", []):
+                mid = model.get("id", "")
+                # Match exact ID or ID with ':N' suffix
+                if mid == model_id or mid.startswith(f"{model_id}:"):
+                    iid = model.get("instance_id") or mid
+                    instance_ids.append(iid)
+            if instance_ids:
+                logger.info(f"Found {len(instance_ids)} instance(s) for {model_id}: {instance_ids}")
+            else:
+                logger.warning(f"Model {model_id} not found in loaded models list")
+    except requests.RequestException as exc:
+        logger.warning(f"Failed to query loaded models: {exc}")
+    return instance_ids
+
+
 def unload_llm(
     model_id: str = None,
     base_url: str = None,
 ) -> dict:
     """
-    Unload the GLM model from VRAM via LM Studio's REST API.
+    Unload ALL instances of the GLM model from VRAM via LM Studio's REST API.
 
-    Tries the documented /api/v1/models/unload endpoint first, then falls back
-    to the DELETE /v1/models/{model_id} convention if the first one isn't
-    available.
+    First queries /v1/models to discover all instance_ids (LM Studio may
+    have multiple instances loaded after failed reload attempts). Unloads
+    each one via POST /api/v1/models/unload.
 
     Args:
         model_id: The LM Studio model identifier. Defaults to GLM_MODEL_ID.
@@ -95,38 +142,52 @@ def unload_llm(
             ),
         }
 
-    # ── Attempt 1: POST /api/v1/models/unload ────────────────────────
-    try:
-        url = f"{base_url}/api/v1/models/unload"
-        payload = {"model": model_id}
-        logger.info(f"Unloading LLM via POST {url}  model={model_id}")
+    # ── Discover all instance_ids from loaded models ────────────────
+    instance_ids = _get_all_loaded_instance_ids(model_id, base_url)
 
-        resp = requests.post(url, json=payload, timeout=API_TIMEOUT)
+    # ── Attempt 1: POST /api/v1/models/unload for each instance ─────
+    if instance_ids:
+        all_ok = True
+        for iid in instance_ids:
+            try:
+                url = f"{base_url}/api/v1/models/unload"
+                payload = {"instance_id": iid}
+                logger.info(f"Unloading instance via POST {url}  instance_id={iid}")
 
-        if resp.status_code in (200, 204):
-            logger.info("LLM unloaded successfully (POST /api/v1/models/unload)")
-            return {"success": True, "method": "post_unload", "detail": resp.text}
+                resp = requests.post(url, json=payload, timeout=60)
 
-        logger.warning(
-            f"POST /api/v1/models/unload returned {resp.status_code}: {resp.text}. "
-            "Trying fallback..."
-        )
-    except requests.ConnectionError:
-        logger.error(f"Cannot reach LM Studio at {base_url}. Is it running?")
-        return {
-            "success": False,
-            "method": "post_unload",
-            "detail": f"Connection refused: {base_url}",
-        }
-    except requests.RequestException as exc:
-        logger.warning(f"POST /api/v1/models/unload failed: {exc}. Trying fallback...")
+                if resp.status_code in (200, 204):
+                    logger.info(f"Instance {iid} unloaded successfully")
+                else:
+                    logger.warning(
+                        f"POST /api/v1/models/unload for {iid} returned "
+                        f"{resp.status_code}: {resp.text}"
+                    )
+                    all_ok = False
+            except requests.ConnectionError:
+                logger.error(f"Cannot reach LM Studio at {base_url}. Is it running?")
+                return {
+                    "success": False,
+                    "method": "post_unload",
+                    "detail": f"Connection refused: {base_url}",
+                }
+            except requests.RequestException as exc:
+                logger.warning(f"POST /api/v1/models/unload for {iid} failed: {exc}")
+                all_ok = False
+
+        if all_ok:
+            return {
+                "success": True,
+                "method": "post_unload",
+                "detail": f"Unloaded {len(instance_ids)} instance(s)",
+            }
 
     # ── Attempt 2: DELETE /v1/models/{model_id} ──────────────────────
     try:
         url = f"{base_url}/v1/models/{model_id}"
         logger.info(f"Unloading LLM via DELETE {url}")
 
-        resp = requests.delete(url, timeout=API_TIMEOUT)
+        resp = requests.delete(url, timeout=60)
 
         if resp.status_code in (200, 204):
             logger.info("LLM unloaded successfully (DELETE /v1/models/)")
@@ -168,7 +229,7 @@ def load_llm(
         payload = {"model": model_id}
         logger.info(f"Loading LLM via POST {url}  model={model_id}")
 
-        resp = requests.post(url, json=payload, timeout=API_TIMEOUT)
+        resp = requests.post(url, json=payload, timeout=120)
 
         if resp.status_code in (200, 204):
             logger.info("LLM loaded successfully (POST /api/v1/models/load)")
@@ -194,7 +255,7 @@ def load_llm(
         payload = {"model": model_id}
         logger.info(f"Loading LLM via POST {url}")
 
-        resp = requests.post(url, json=payload, timeout=API_TIMEOUT)
+        resp = requests.post(url, json=payload, timeout=120)
 
         if resp.status_code in (200, 204):
             logger.info("LLM loaded successfully (POST /v1/models)")
@@ -212,13 +273,15 @@ def load_llm(
 
 def verify_vram_cleared(
     base_url: str = None,
-    max_retries: int = 5,
-    retry_delay: float = 2.0,
+    max_retries: int = 10,
+    retry_delay: float = 4.0,
 ) -> bool:
     """
     Verify that no models are loaded in LM Studio (VRAM is free).
 
     Polls GET /v1/models and checks that the returned list is empty.
+    Uses generous retries since an 18GB model can take 30+ seconds to
+    fully release from GPU memory.
 
     Args:
         base_url: LM Studio base URL.
@@ -276,6 +339,13 @@ def generate_image_swarmui(
     seed: int = -1,
     model: str = "",
     base_url: str = None,
+    # Video generation params
+    video_model: str = "",
+    video_frames: int = 0,
+    video_steps: int = 20,
+    video_cfg: float = 3.0,
+    video_fps: int = 24,
+    video_format: str = "mp4",
 ) -> dict:
     """
     Send an image generation request to SwarmUI's Text2Image endpoint.
@@ -298,9 +368,31 @@ def generate_image_swarmui(
         depending on SwarmUI configuration.
     """
     base_url = (base_url or SWARMUI_BASE_URL).rstrip("/")
-    url = f"{base_url}/API/GenerateText2Image"
 
+    # ── Get a SwarmUI session (required by all API calls) ────────────
+    try:
+        sess_resp = requests.post(
+            f"{base_url}/API/GetNewSession", json={}, timeout=15
+        )
+        if sess_resp.status_code != 200:
+            detail = f"SwarmUI GetNewSession returned {sess_resp.status_code}"
+            logger.error(detail)
+            return {"success": False, "images": [], "detail": detail}
+        session_id = sess_resp.json().get("session_id", "")
+        if not session_id:
+            detail = "SwarmUI GetNewSession returned no session_id"
+            logger.error(detail)
+            return {"success": False, "images": [], "detail": detail}
+        logger.info(f"SwarmUI session acquired: {session_id[:12]}...")
+    except requests.RequestException as exc:
+        detail = f"SwarmUI session request failed: {exc}"
+        logger.error(detail)
+        return {"success": False, "images": [], "detail": detail}
+
+    # ── Build and send the generation request ────────────────────────
+    url = f"{base_url}/API/GenerateText2Image"
     payload = {
+        "session_id": session_id,
         "prompt": prompt,
         "negativeprompt": negative_prompt,
         "images": images,
@@ -310,16 +402,29 @@ def generate_image_swarmui(
         "cfgscale": cfg_scale,
         "seed": seed,
     }
-    if model:
-        payload["model"] = model
+    # Always include a model — SwarmUI requires it
+    payload["model"] = model or SWARM_DEFAULT_MODEL
 
+    # Add video generation params if a video model is specified
+    is_video = bool(video_model or video_frames > 0)
+    if is_video:
+        payload["videomodel"] = video_model or SWARM_DEFAULT_VIDEO_MODEL
+        payload["videoframes"] = video_frames or 25
+        payload["videosteps"] = video_steps
+        payload["videocfg"] = video_cfg
+        payload["videofps"] = video_fps
+        payload["videoformat"] = video_format
+
+    media_type = "video" if is_video else "image"
     logger.info(
-        f"Sending image generation request to SwarmUI: "
+        f"Sending {media_type} generation request to SwarmUI: "
         f"prompt={prompt[:80]!r}  steps={steps}  size={width}x{height}"
+        + (f"  video_frames={payload.get('videoframes')}  video_model={payload.get('videomodel', '')[:40]}" if is_video else "")
     )
 
+    timeout = VIDEO_GEN_TIMEOUT if is_video else IMAGE_GEN_TIMEOUT
     try:
-        resp = requests.post(url, json=payload, timeout=IMAGE_GEN_TIMEOUT)
+        resp = requests.post(url, json=payload, timeout=timeout)
 
         if resp.status_code != 200:
             detail = f"SwarmUI returned {resp.status_code}: {resp.text[:500]}"
@@ -328,7 +433,12 @@ def generate_image_swarmui(
 
         data = resp.json()
 
-        # SwarmUI returns images as base64 strings in the "images" field
+        if "error" in data and data["error"]:
+            detail = f"SwarmUI API error: {data['error']}"
+            logger.error(detail)
+            return {"success": False, "images": [], "detail": detail}
+
+        # SwarmUI returns relative URL paths in the "images" field
         result_images = data.get("images", [])
         if not result_images:
             detail = f"SwarmUI returned 200 but no images in response: {list(data.keys())}"
@@ -339,13 +449,14 @@ def generate_image_swarmui(
         return {
             "success": True,
             "images": result_images,
+            "base_url": base_url,
             "detail": f"Generated {len(result_images)} image(s)",
         }
 
     except requests.ConnectionError:
         detail = (
             f"Cannot reach SwarmUI at {base_url}. "
-            "Is SwarmUI running on localhost:7801?"
+            "Is SwarmUI running?"
         )
         logger.error(detail)
         return {"success": False, "images": [], "detail": detail}
@@ -359,16 +470,19 @@ def generate_image_swarmui(
         return {"success": False, "images": [], "detail": detail}
 
 
-def _save_images(images_data: list, prompt: str) -> list[str]:
+def _save_images(images_data: list, prompt: str, base_url: str = None) -> list[dict]:
     """
-    Save base64-encoded images to disk.
+    Save images to disk. Handles both:
+      - URL paths from SwarmUI (e.g. 'View/local/raw/...')
+      - base64-encoded strings
 
     Args:
-        images_data: List of base64-encoded image strings from SwarmUI.
+        images_data: List of image references (URL paths or base64 strings).
         prompt: The original prompt (used to build a readable filename).
+        base_url: SwarmUI base URL (needed to download URL-path images).
 
     Returns:
-        List of absolute file paths for saved images.
+        List of dicts with keys: path (abs file path), url (gateway-relative URL).
     """
     import base64
 
@@ -379,30 +493,65 @@ def _save_images(images_data: list, prompt: str) -> list[str]:
     safe_prefix = safe_prefix.replace(" ", "_") or "image"
     timestamp = int(time.time())
 
-    saved_paths = []
-    for idx, img_b64 in enumerate(images_data):
-        # Strip data URI prefix if present (e.g. "data:image/png;base64,...")
-        if "," in img_b64 and img_b64.startswith("data:"):
-            img_b64 = img_b64.split(",", 1)[1]
+    saved = []
+    for idx, img_ref in enumerate(images_data):
+        img_bytes = None
 
-        try:
-            img_bytes = base64.b64decode(img_b64)
-        except Exception as exc:
-            logger.error(f"Failed to decode image {idx}: {exc}")
+        # Case 1: URL path from SwarmUI (e.g. "View/local/raw/...")
+        if img_ref and not img_ref.startswith("data:") and "/" in img_ref and base_url:
+            url = img_ref if img_ref.startswith("http") else f"{base_url}/{img_ref}"
+            try:
+                logger.info(f"Downloading image from SwarmUI: {url[:120]}")
+                dl = requests.get(url, timeout=30)
+                if dl.status_code == 200 and len(dl.content) > 100:
+                    img_bytes = dl.content
+                else:
+                    logger.error(f"Image download failed: status={dl.status_code} size={len(dl.content)}")
+            except requests.RequestException as exc:
+                logger.error(f"Image download failed: {exc}")
+
+        # Case 2: base64-encoded (data URI or raw)
+        if img_bytes is None and img_ref:
+            if "," in img_ref and img_ref.startswith("data:"):
+                img_ref = img_ref.split(",", 1)[1]
+            try:
+                img_bytes = base64.b64decode(img_ref)
+            except Exception as exc:
+                logger.error(f"Failed to decode image {idx}: {exc}")
+                continue
+
+        if img_bytes is None:
+            logger.error(f"No image data for index {idx}")
             continue
 
         suffix = idx if len(images_data) > 1 else ""
-        filename = f"{safe_prefix}_{timestamp}{f'_{suffix}' if suffix != '' else ''}.png"
+        # Detect file type from content or URL
+        ext = ".png"
+        if isinstance(img_ref, str):
+            lower_ref = img_ref.lower()
+            if any(lower_ref.endswith(ve) for ve in (".mp4", ".webm", ".mov", ".gif")):
+                ext = os.path.splitext(lower_ref)[1]
+            elif lower_ref.endswith(".webp"):
+                ext = ".webp"
+        # Also check binary magic bytes for video
+        if img_bytes[:4] in (b'\x00\x00\x00\x1c', b'\x00\x00\x00\x18', b'\x00\x00\x00\x20'):
+            ext = ".mp4"  # ftyp box
+        elif img_bytes[:4] == b'\x1a\x45\xdf\xa3':
+            ext = ".webm"  # EBML header
+
+        filename = f"{safe_prefix}_{timestamp}{f'_{suffix}' if suffix != '' else ''}{ext}"
         filepath = os.path.join(OUTPUT_DIR, filename)
 
         with open(filepath, "wb") as f:
             f.write(img_bytes)
 
         abs_path = os.path.abspath(filepath)
-        saved_paths.append(abs_path)
-        logger.info(f"Saved image: {abs_path} ({len(img_bytes):,} bytes)")
+        media_url = f"/media/{filename}"
+        saved.append({"path": abs_path, "url": media_url})
+        media_label = "video" if ext in (".mp4", ".webm", ".mov") else "image"
+        logger.info(f"Saved {media_label}: {abs_path} ({len(img_bytes):,} bytes) → {media_url}")
 
-    return saved_paths
+    return saved
 
 
 # ── Telegram Delivery ────────────────────────────────────────────────────────
@@ -456,6 +605,11 @@ def generate_image(
     seed: int = -1,
     swarm_model: str = "",
     send_telegram: bool = False,
+    # Video generation params
+    media_type: str = "image",
+    video_frames: int = 25,
+    video_steps: int = 20,
+    video_fps: int = 24,
 ) -> dict:
     """
     Full VRAM orchestration pipeline: unload LLM -> generate image -> reload LLM.
@@ -509,11 +663,15 @@ def generate_image(
 
     # ── Phase 1: Unload LLM ──────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("VRAM ORCHESTRATOR: Starting image generation pipeline")
+    is_video = media_type == "video"
+    pipeline_type = "video" if is_video else "image"
+    logger.info(f"VRAM ORCHESTRATOR: Starting {pipeline_type} generation pipeline")
     logger.info(f"  Prompt: {prompt[:100]!r}")
+    if is_video:
+        logger.info(f"  Video: frames={video_frames}  steps={video_steps}  fps={video_fps}")
     logger.info("=" * 60)
 
-    logger.info("Phase 1/5: Unloading LLM from VRAM...")
+    logger.info("Phase 1/6: Unloading LLM from VRAM...")
     unload_result = unload_llm()
     if not unload_result["success"]:
         result["error"] = (
@@ -526,10 +684,10 @@ def generate_image(
         return result
 
     result["llm_unloaded"] = True
-    logger.info("Phase 1/5: LLM unload command accepted.")
+    logger.info("Phase 1/6: LLM unload command accepted.")
 
     # ── Phase 2: Verify VRAM cleared ─────────────────────────────────
-    logger.info("Phase 2/5: Verifying VRAM is cleared...")
+    logger.info("Phase 2/6: Verifying VRAM is cleared...")
     if not verify_vram_cleared():
         # LLM is supposedly unloaded but verification failed.
         # Attempt to reload the LLM and abort safely.
@@ -547,15 +705,15 @@ def generate_image(
 
     # ── Phase 3: Flush delay ─────────────────────────────────────────
     logger.info(
-        f"Phase 3/5: Waiting {VRAM_FLUSH_DELAY}s for Windows GPU driver "
+        f"Phase 3/6: Waiting {VRAM_FLUSH_DELAY}s for Windows GPU driver "
         f"to release VRAM..."
     )
     time.sleep(VRAM_FLUSH_DELAY)
 
     # ── Phase 4: Generate image via SwarmUI ──────────────────────────
-    logger.info("Phase 4/5: Sending generation request to SwarmUI...")
+    logger.info("Phase 4/6: Sending generation request to SwarmUI...")
     try:
-        img_result = generate_image_swarmui(
+        gen_kwargs = dict(
             prompt=prompt,
             negative_prompt=negative_prompt,
             images=images,
@@ -566,15 +724,24 @@ def generate_image(
             seed=seed,
             model=swarm_model,
         )
+        if is_video:
+            gen_kwargs.update(
+                video_model=SWARM_DEFAULT_VIDEO_MODEL,
+                video_frames=video_frames,
+                video_steps=video_steps,
+                video_fps=video_fps,
+            )
+        img_result = generate_image_swarmui(**gen_kwargs)
         result["image_result"] = img_result
 
         if img_result["success"]:
             # Save images to disk
-            saved = _save_images(img_result["images"], prompt)
-            result["file_paths"] = saved
+            saved = _save_images(img_result["images"], prompt, base_url=img_result.get("base_url"))
+            result["file_paths"] = [s["path"] for s in saved]
+            result["image_urls"] = [s["url"] for s in saved]
             if saved:
                 result["success"] = True
-                logger.info(f"Phase 4/5: Image generation complete. Saved {len(saved)} file(s).")
+                logger.info(f"Phase 4/6: Image generation complete. Saved {len(saved)} file(s).")
             else:
                 result["error"] = "SwarmUI returned images but all failed to decode/save."
                 result["phase"] = "save"
@@ -593,8 +760,58 @@ def generate_image(
     # async tool handler in __init__.py, which can properly await the Bot API.
     # The result dict includes a "telegram_sent" field for the handler to set.
 
-    # ── Phase 5: Reload LLM (always attempted) ───────────────────────
-    logger.info("Phase 5/5: Reloading LLM into VRAM...")
+    # ── Phase 5: Free diffusion model from VRAM ──────────────────────
+    logger.info("Phase 5/6: Freeing diffusion model from VRAM...")
+    swarm_base = (SWARMUI_BASE_URL or "").rstrip("/")
+    try:
+        # Loop FreeBackendMemory until SwarmUI reports 0 backends freed.
+        # SwarmUI can take multiple calls to fully release all cached models.
+        total_freed = 0
+        for attempt in range(5):
+            sess_resp = requests.post(
+                f"{swarm_base}/API/GetNewSession", json={}, timeout=10
+            )
+            if sess_resp.status_code != 200:
+                logger.warning(
+                    f"Phase 5/6: Could not get SwarmUI session (attempt {attempt+1}): "
+                    f"{sess_resp.status_code}"
+                )
+                break
+
+            free_sid = sess_resp.json().get("session_id", "")
+            free_resp = requests.post(
+                f"{swarm_base}/API/FreeBackendMemory",
+                json={"session_id": free_sid},
+                timeout=30,
+            )
+            if free_resp.status_code == 200:
+                count = free_resp.json().get("count", 0)
+                total_freed += count
+                logger.info(
+                    f"Phase 5/6: Attempt {attempt+1} freed {count} backend(s) "
+                    f"(total freed: {total_freed})"
+                )
+                if count == 0:
+                    break  # Nothing left to free
+                time.sleep(4)  # Give GPU time to release memory
+            else:
+                logger.warning(
+                    f"Phase 5/6: FreeBackendMemory returned "
+                    f"{free_resp.status_code}: {free_resp.text[:200]}"
+                )
+                break
+
+        # Extra wait after all frees for the GPU driver to fully release VRAM
+        if total_freed > 0:
+            logger.info("Phase 5/6: Waiting 8s for GPU VRAM to fully clear...")
+            time.sleep(8)
+
+        logger.info(f"Phase 5/6: Complete. Total backends freed: {total_freed}")
+    except requests.RequestException as exc:
+        logger.warning(f"Phase 5/6: Failed to free backend memory: {exc}")
+
+    # ── Phase 6: Reload LLM (always attempted) ───────────────────────
+    logger.info("Phase 6/6: Reloading LLM into VRAM...")
     reload_result = load_llm()
     result["llm_reloaded"] = reload_result["success"]
 
@@ -611,7 +828,7 @@ def generate_image(
         else:
             result["error"] = reload_warning
     else:
-        logger.info("Phase 5/5: LLM reloaded successfully. Kestrel is ready to chat.")
+        logger.info("Phase 6/6: LLM reloaded successfully. Kestrel is ready to chat.")
 
     logger.info("=" * 60)
     logger.info(

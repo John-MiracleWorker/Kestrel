@@ -21,6 +21,8 @@ from .fs.read import host_read, host_batch_read
 from .fs.write import host_write
 from .fs.explore import host_list, host_search, host_tree, host_find, project_recall
 
+logger = logging.getLogger("brain.agent.tools.host_files")
+
 def register_host_file_tools(registry, vector_store=None, enable_write: bool = False) -> None:
     """Register host filesystem tools."""
     # Inject vector store for project context memoization

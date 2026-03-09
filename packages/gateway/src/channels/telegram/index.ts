@@ -1,4 +1,6 @@
 import { randomUUID, createHash } from 'crypto';
+import { createReadStream, existsSync } from 'fs';
+import path from 'path';
 import {
     BaseChannelAdapter,
     ChannelType,
@@ -424,8 +426,81 @@ export class TelegramAdapter extends BaseChannelAdapter {
     }
 
     /**
+     * Extract image/video markdown patterns and return the media info
+     * and the text content with media references stripped.
+     */
+    private extractMediaFromMarkdown(content: string): {
+        textContent: string;
+        mediaFiles: Array<{ alt: string; filePath: string; type: 'photo' | 'video' }>;
+    } {
+        const mediaFiles: Array<{ alt: string; filePath: string; type: 'photo' | 'video' }> = [];
+        const videoExts = ['.mp4', '.webm', '.mov'];
+
+        // Match ![alt](/media/filename)
+        const mediaRegex = /!\[([^\]]*)\]\((\/media\/[^)]+)\)/g;
+        const textContent = content.replace(mediaRegex, (_match, alt: string, url: string) => {
+            // Map /media/filename to the Docker volume path
+            const filename = url.replace('/media/', '');
+            const filePath = path.join('/app/generated_media', filename);
+            const ext = path.extname(filename).toLowerCase();
+            const type = videoExts.includes(ext) ? 'video' : 'photo';
+            mediaFiles.push({ alt: alt || 'Generated media', filePath, type });
+            return ''; // Strip the markdown from the text
+        }).replace(/\n{3,}/g, '\n\n').trim(); // Clean up leftover whitespace
+
+        return { textContent, mediaFiles };
+    }
+
+    /**
+     * Send a media file to Telegram via multipart form upload.
+     * Falls back gracefully if the file doesn't exist.
+     */
+    private async sendMediaFile(
+        chatId: number,
+        media: { alt: string; filePath: string; type: 'photo' | 'video' },
+        threadId?: number,
+    ): Promise<void> {
+        if (!existsSync(media.filePath)) {
+            logger.warn('Media file not found for Telegram upload', { path: media.filePath });
+            return;
+        }
+
+        const method = media.type === 'video' ? 'sendVideo' : 'sendPhoto';
+        const fieldName = media.type === 'video' ? 'video' : 'photo';
+        const url = `${this.apiBase}/${method}`;
+
+        try {
+            const formData = new FormData();
+            // Read file as a blob for upload
+            const { readFileSync } = await import('fs');
+            const fileBuffer = readFileSync(media.filePath);
+            const ext = path.extname(media.filePath).toLowerCase();
+            const mimeMap: Record<string, string> = {
+                '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+                '.webp': 'image/webp', '.gif': 'image/gif',
+                '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime',
+            };
+            const mime = mimeMap[ext] || 'application/octet-stream';
+            const blob = new Blob([fileBuffer], { type: mime });
+            formData.append(fieldName, blob, path.basename(media.filePath));
+            formData.append('chat_id', String(chatId));
+            if (media.alt) formData.append('caption', media.alt);
+            if (threadId !== undefined) formData.append('message_thread_id', String(threadId));
+
+            const res = await fetch(url, { method: 'POST', body: formData });
+            const data = await res.json() as { ok: boolean; description?: string };
+            if (!data.ok) {
+                logger.warn('Telegram sendPhoto/sendVideo failed', { error: data.description, path: media.filePath });
+            }
+        } catch (err) {
+            logger.warn('Failed to send media to Telegram', { error: (err as Error).message, path: media.filePath });
+        }
+    }
+
+    /**
      * Finalize the streaming message with the complete content.
      * Removes the cursor indicator and applies full Markdown.
+     * Extracts image/video markdown and sends as actual Telegram media.
      */
     async sendStreamEnd(handle: StreamHandle, finalContent: string): Promise<void> {
         const chatId = handle.chatContext.chatId as number;
@@ -434,10 +509,14 @@ export class TelegramAdapter extends BaseChannelAdapter {
         // Stop typing
         this.stopTyping(chatId);
 
-        // If content is short enough, just edit the existing message
-        // (editMessageText doesn't need message_thread_id — it targets by message_id)
-        const sanitizedFinal = this.sanitizeForTelegram(finalContent);
-        if (sanitizedFinal.length <= 4000) {
+        // Extract embedded media from markdown before sending text
+        const { textContent, mediaFiles } = this.extractMediaFromMarkdown(finalContent);
+
+        // Send the text content (with media markdown stripped)
+        const contentToSend = textContent || finalContent;
+        const sanitizedFinal = this.sanitizeForTelegram(contentToSend);
+
+        if (sanitizedFinal.length <= 4000 && sanitizedFinal.trim()) {
             try {
                 await this.api('editMessageText', {
                     chat_id: chatId,
@@ -452,35 +531,40 @@ export class TelegramAdapter extends BaseChannelAdapter {
                     await this.api('editMessageText', {
                         chat_id: chatId,
                         message_id: Number(handle.messageId),
-                        text: finalContent,
+                        text: contentToSend,
                     });
                 } catch {
                     /* best effort */
                 }
             }
-            return;
+        } else if (sanitizedFinal.trim()) {
+            // Content too long — delete streaming msg and send as chunks
+            try {
+                await this.api('deleteMessage', {
+                    chat_id: chatId,
+                    message_id: Number(handle.messageId),
+                });
+            } catch { /* ignore */ }
+
+            await this.sendToChat(
+                chatId,
+                { conversationId: '', content: contentToSend, options: { markdown: true } },
+                threadId,
+            );
+        } else {
+            // No text content — delete the "Thinking..." placeholder
+            try {
+                await this.api('deleteMessage', {
+                    chat_id: chatId,
+                    message_id: Number(handle.messageId),
+                });
+            } catch { /* ignore */ }
         }
 
-        // Content too long for a single message — delete the streaming
-        // message and send as chunked messages instead
-        try {
-            await this.api('deleteMessage', {
-                chat_id: chatId,
-                message_id: Number(handle.messageId),
-            });
-        } catch {
-            /* ignore */
+        // Send media files as separate Telegram messages
+        for (const media of mediaFiles) {
+            await this.sendMediaFile(chatId, media, threadId);
         }
-
-        await this.sendToChat(
-            chatId,
-            {
-                conversationId: '',
-                content: finalContent,
-                options: { markdown: true },
-            },
-            threadId,
-        );
     }
 
     /**
@@ -619,12 +703,12 @@ export class TelegramAdapter extends BaseChannelAdapter {
         if (threadId !== undefined) params.message_thread_id = threadId;
 
         // Send immediately
-        this.api('sendChatAction', params).catch(() => {});
+        this.api('sendChatAction', params).catch(() => { });
 
         // Refresh every 4 seconds
         if (!this.typingIntervals.has(chatId)) {
             const interval = setInterval(() => {
-                this.api('sendChatAction', params).catch(() => {});
+                this.api('sendChatAction', params).catch(() => { });
             }, 4000);
             this.typingIntervals.set(chatId, interval);
         }

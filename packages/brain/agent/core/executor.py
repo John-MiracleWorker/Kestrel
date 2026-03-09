@@ -715,6 +715,38 @@ class TaskExecutor:
             progress=self._progress_callback(task),
         )
 
+        # ── Auto-inject display_markdown for media gen tools ─────────
+        # If the tool result contains display_markdown (e.g. image URLs),
+        # inject it directly into the response stream so the user sees the
+        # image without relying on the LLM to include it.
+        if result.success and tool_name in ("vram_generate_image", "generate_media"):
+            try:
+                result_data = json.loads(result.output) if isinstance(result.output, str) else result.output
+                display_md = result_data.get("display_markdown", "") if isinstance(result_data, dict) else ""
+                if display_md:
+                    yield TaskEvent(
+                        type=TaskEventType.STEP_COMPLETE,
+                        task_id=task.id,
+                        step_id=step.id,
+                        content=f"\n\n{display_md}\n",
+                        progress=self._progress_callback(task),
+                    )
+                    # Auto-complete the step so the LLM doesn't try to
+                    # do another round (which would use the cloud fallback)
+                    step.status = StepStatus.COMPLETE
+                    step.result = display_md
+                    step.completed_at = datetime.now(timezone.utc)
+                    # Mark remaining steps as done
+                    for remaining in task.plan.steps:
+                        if remaining.status in (StepStatus.PENDING, StepStatus.IN_PROGRESS) and remaining.id != step.id:
+                            remaining.status = StepStatus.SKIPPED
+                            remaining.result = "Skipped — media delivered"
+                            remaining.completed_at = datetime.now(timezone.utc)
+                    await self._persistence.update_task(task)
+                    return
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                pass  # Non-JSON result, continue normally
+
         if tool_name == "task_complete":
             if self._verifier:
                 summary = tool_args.get("summary", result.output)
