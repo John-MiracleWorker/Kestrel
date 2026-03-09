@@ -454,6 +454,8 @@ export class TelegramAdapter extends BaseChannelAdapter {
     /**
      * Send a media file to Telegram via multipart form upload.
      * Falls back gracefully if the file doesn't exist.
+     * Uses sendDocument for images (to avoid Telegram's photo compression)
+     * and sendVideo for videos.
      */
     private async sendMediaFile(
         chatId: number,
@@ -465,8 +467,10 @@ export class TelegramAdapter extends BaseChannelAdapter {
             return;
         }
 
-        const method = media.type === 'video' ? 'sendVideo' : 'sendPhoto';
-        const fieldName = media.type === 'video' ? 'video' : 'photo';
+        // Use sendDocument for images to preserve full resolution (sendPhoto compresses heavily).
+        // Use sendVideo for videos so Telegram can show an inline player.
+        const method = media.type === 'video' ? 'sendVideo' : 'sendDocument';
+        const fieldName = media.type === 'video' ? 'video' : 'document';
         const url = `${this.apiBase}/${method}`;
 
         try {
@@ -490,7 +494,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
             const res = await fetch(url, { method: 'POST', body: formData });
             const data = await res.json() as { ok: boolean; description?: string };
             if (!data.ok) {
-                logger.warn('Telegram sendPhoto/sendVideo failed', { error: data.description, path: media.filePath });
+                logger.warn('Telegram media upload failed', { error: data.description, path: media.filePath });
             }
         } catch (err) {
             logger.warn('Failed to send media to Telegram', { error: (err as Error).message, path: media.filePath });
