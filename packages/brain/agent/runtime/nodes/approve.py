@@ -4,8 +4,20 @@ Approve node — human-in-the-loop approval gate.
 Uses LangGraph's interrupt() to pause the graph and wait for
 human approval. Bridges to Kestrel's existing approval system.
 
-When USE_LANGGRAPH_INTERRUPT=true, uses native LangGraph interrupt().
+When USE_LANGGRAPH_INTERRUPT=true (default), uses native LangGraph interrupt().
 Otherwise, falls back to Kestrel's polling-based approval mechanism.
+
+Canonical approval contract
+───────────────────────────
+Both modes MUST produce identical state outcomes so callers can reason
+about them uniformly:
+
+  Approved  → approval_granted=True,  status=EXECUTING
+  Denied    → approval_granted=False, status=CANCELLED
+
+Using CANCELLED (not FAILED) for denial: the task was explicitly rejected
+by the user, not broken by an error.  This distinction matters for metrics,
+retry logic, and UI display.
 """
 
 from __future__ import annotations
@@ -32,26 +44,36 @@ async def approve_node(
 
     Uses LangGraph interrupt() when available, otherwise falls back
     to Kestrel's existing approval polling mechanism.
+
+    Both paths share a single canonical outcome contract:
+      approved → approval_granted=True,  status=EXECUTING
+      denied   → approval_granted=False, status=CANCELLED
     """
     task = state["task"]
     plan = state.get("plan") or task.plan
     council_verdict = state.get("council_verdict", {})
+    simulation_warning = state.get("simulation_warning")
     updates: dict[str, Any] = {}
 
     use_interrupt = os.getenv("USE_LANGGRAPH_INTERRUPT", "true").lower() == "true"
+
+    # Build approval payload (shared by both modes)
+    approval_payload: dict[str, Any] = {
+        "type": "plan_approval",
+        "task_id": task.id,
+        "plan": plan.to_dict() if plan else {},
+        "council_verdict": council_verdict,
+        "risk_level": task.config.auto_approve_risk.value,
+    }
+    if simulation_warning:
+        approval_payload["simulation_warning"] = simulation_warning
 
     if use_interrupt:
         # ── LangGraph native interrupt ───────────────────────────
         try:
             from langgraph.types import interrupt
 
-            approval_data = interrupt({
-                "type": "plan_approval",
-                "task_id": task.id,
-                "plan": plan.to_dict() if plan else {},
-                "council_verdict": council_verdict,
-                "risk_level": task.config.auto_approve_risk.value,
-            })
+            approval_data = interrupt(approval_payload)
 
             if approval_data.get("approved", False):
                 updates["approval_granted"] = True
@@ -70,11 +92,14 @@ async def approve_node(
         if event_callback:
             reason = council_verdict.get("review_reason", "Plan requires approval")
             concerns = council_verdict.get("concerns", [])
-            await event_callback("approval_needed", {
+            payload = {
                 "task_id": task.id,
                 "reason": reason,
                 "concerns": concerns,
-            })
+            }
+            if simulation_warning:
+                payload["simulation_warning"] = simulation_warning
+            await event_callback("approval_needed", payload)
 
         task.status = TaskStatus.WAITING_APPROVAL
         if persistence:
@@ -90,7 +115,8 @@ async def approve_node(
             updates["status"] = TaskStatus.EXECUTING.value
         else:
             updates["approval_granted"] = False
-            updates["status"] = TaskStatus.FAILED.value
+            # Canonical: user denial → CANCELLED (not FAILED)
+            updates["status"] = TaskStatus.CANCELLED.value
             task.error = "User denied plan after review."
 
         if persistence:

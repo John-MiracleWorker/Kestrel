@@ -4,9 +4,14 @@ Complete node — final phase of the agent loop.
 Builds the task result summary, persists final state, emits
 completion events, and triggers post-task learning.
 
+Also handles memory graph entity extraction and persona observation,
+which must happen after task.result is fully assembled.
+
 Wraps existing components:
   - TaskLearner.extract_lessons()
   - MetricsCollector
+  - MemoryGraph.extract_and_store()
+  - PersonaLearner.observe_communication()
 """
 
 from __future__ import annotations
@@ -28,6 +33,11 @@ async def complete_node(
     learner=None,
     metrics=None,
     evidence_chain=None,
+    memory_graph=None,
+    persona_learner=None,
+    provider=None,
+    model: str = "",
+    api_key: str = "",
     event_callback=None,
 ) -> dict[str, Any]:
     """Finalize the task: build result, persist, learn, emit events."""
@@ -37,11 +47,11 @@ async def complete_node(
 
     # ── Handle cancelled/denied tasks ────────────────────────────
     if state.get("approval_granted") is False:
-        task.status = TaskStatus.FAILED
+        task.status = TaskStatus.CANCELLED
         task.error = task.error or "Task denied by user."
         if persistence:
             await persistence.update_task(task)
-        updates["status"] = TaskStatus.FAILED.value
+        updates["status"] = TaskStatus.CANCELLED.value
         return updates
 
     # ── Build final result summary ───────────────────────────────
@@ -86,6 +96,45 @@ async def complete_node(
                     for d in evidence_chain._decisions[:5]
                 ],
             })
+
+    # ── Update memory graph with task entities ───────────────────
+    # Runs here (not in reflect_node) so task.result is guaranteed to be set.
+    if memory_graph and task.result and provider:
+        try:
+            from agent.core.memory_graph import extract_entities_llm
+            _entities, _relations = await extract_entities_llm(
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                user_message=task.goal,
+                assistant_response=task.result,
+            )
+            if _entities:
+                await memory_graph.extract_and_store(
+                    conversation_id=task.id,
+                    workspace_id=task.workspace_id,
+                    entities=_entities,
+                    relations=_relations,
+                )
+                logger.info(
+                    f"Memory graph: stored {len(_entities)} entities, "
+                    f"{len(_relations)} relations from task {task.id}"
+                )
+        except Exception as e:
+            logger.warning(f"Memory graph update failed: {e}")
+
+    # ── Observe persona signals ──────────────────────────────────
+    # Runs here so task.result is available for observation.
+    if persona_learner and task.result:
+        try:
+            await persona_learner.observe_communication(
+                user_id=task.user_id,
+                user_message=task.goal,
+                agent_response=task.result[:500],
+            )
+            await persona_learner.observe_session_timing(task.user_id)
+        except Exception as e:
+            logger.warning(f"Persona observation failed: {e}")
 
     # ── Post-task learning ───────────────────────────────────────
     if learner:

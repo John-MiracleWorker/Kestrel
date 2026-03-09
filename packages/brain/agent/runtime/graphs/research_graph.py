@@ -1,8 +1,18 @@
 """
 Research subgraph — DeerFlow-style deep research with parallel fan-out.
 
-Decomposes a research topic into angles, fans out to isolated sub-agents,
-cross-references findings, and synthesizes a unified report.
+**STATUS: BETA — Not production-ready.**
+
+Known limitations:
+  - decompose_topic() uses hardcoded template angles instead of an LLM call.
+    A real LLM-driven decomposition is planned but not yet implemented.
+  - analyze_findings() does not perform true cross-reference; it is a
+    structural aggregation only.
+  - synthesize_report() does not call an LLM to produce a synthesized
+    narrative; it concatenates raw per-angle findings.
+
+Do not expose this subgraph as a production feature until the placeholder
+stages are replaced with real LLM-backed implementations.
 
 Graph topology:
   START → decompose → fan_out → analyze → synthesize → END
@@ -22,13 +32,18 @@ logger = logging.getLogger("brain.agent.runtime.graphs.research")
 async def decompose_topic(state: ResearchState) -> dict[str, Any]:
     """Break a research topic into distinct investigation angles.
 
-    Uses LLM to identify 3-8 complementary research angles that,
-    together, would provide comprehensive coverage of the topic.
+    BETA: Currently uses hardcoded template angles.
+    TODO: Replace with an LLM call that produces topic-specific angles.
     """
     topic = state["topic"]
     max_agents = state.get("max_agents", 5)
 
-    # Default decomposition — will be enhanced with LLM call
+    logger.warning(
+        "BETA: decompose_topic() is using hardcoded template angles. "
+        "LLM-based decomposition is not yet implemented."
+    )
+
+    # Placeholder decomposition — replace with LLM call
     angles = [
         f"Overview and fundamentals of {topic}",
         f"Recent developments and breakthroughs in {topic}",
@@ -117,10 +132,8 @@ async def parallel_research(
 async def analyze_findings(state: ResearchState) -> dict[str, Any]:
     """Cross-reference and validate findings across angles.
 
-    Identifies:
-    - Consensus points (confirmed by multiple angles)
-    - Contradictions requiring resolution
-    - Knowledge gaps needing further research
+    BETA: Currently performs structural aggregation only.
+    TODO: Use an LLM to identify consensus, contradictions, and gaps.
     """
     findings = state.get("findings", [])
 
@@ -140,7 +153,11 @@ async def analyze_findings(state: ResearchState) -> dict[str, Any]:
 
 
 async def synthesize_report(state: ResearchState) -> dict[str, Any]:
-    """Synthesize all findings into a structured report."""
+    """Synthesize all findings into a structured report.
+
+    BETA: Currently concatenates per-angle findings without LLM synthesis.
+    TODO: Use an LLM to produce a coherent, deduplicated narrative.
+    """
     topic = state["topic"]
     analysis = state.get("analysis", "")
     findings = state.get("findings", [])

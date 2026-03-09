@@ -8,6 +8,22 @@ Wraps existing components:
   - TaskPlanner.create_plan()
   - ReflectionEngine.reflect() (plan red-teaming)
   - OutcomeSimulator.simulate() (pre-flight simulation)
+
+Council gating
+──────────────
+Mirrors the legacy _should_skip_council() semantics exactly:
+  - Skip council if complexity < 8.5 AND no HIGH-risk tools AND
+    no security-sensitive keywords in step descriptions.
+  - 8.5–9.0 → deliberate_lite (3 members, no debate)
+  - > 9.0   → full deliberate (all members + optional debate)
+
+Simulation gate
+───────────────
+When a simulation recommends aborting, we preserve the legacy behavior:
+  1. Emit a SIMULATION_COMPLETE event with the simulation summary.
+  2. Emit an APPROVAL_NEEDED event asking the user to explicitly override.
+  3. Store the simulation warning in state so the approve node can surface it.
+  4. Route to approve (not silently to council) so the user sees the warning.
 """
 
 from __future__ import annotations
@@ -18,8 +34,8 @@ import os
 from typing import Any
 
 from agent.types import (
+    RiskLevel,
     StepStatus,
-    TaskEvent,
     TaskEventType,
     TaskPlan,
     TaskStatus,
@@ -28,6 +44,51 @@ from agent.types import (
 from agent.runtime.state import KestrelState
 
 logger = logging.getLogger("brain.agent.runtime.nodes.plan")
+
+
+def _should_skip_council(
+    task,
+    plan_complexity: float,
+    tool_registry,
+) -> bool:
+    """Decide whether council deliberation can be skipped for a plan.
+
+    Mirrors AgentLoop._should_skip_council() exactly so LangGraph and
+    legacy paths apply the same policy.
+
+    A plan is routine when ALL of the following hold:
+    - Complexity is below 8.5
+    - No plan steps involve HIGH-risk tools
+    - No steps mention security-sensitive operations
+    """
+    if plan_complexity >= 8.5:
+        return False
+
+    if not task.plan or not task.plan.steps:
+        return False
+
+    for step in task.plan.steps:
+        # Only HIGH-risk tools trigger council; MEDIUM-risk tools are routine
+        for tc in step.tool_calls:
+            tool_name = tc.get("tool", tc.get("function", {}).get("name", ""))
+            if tool_name and tool_registry:
+                risk = tool_registry.get_risk_level(tool_name)
+                if risk == RiskLevel.HIGH:
+                    return False
+
+        # Security-sensitive keywords in step descriptions also trigger council
+        desc_lower = step.description.lower()
+        if any(kw in desc_lower for kw in (
+            "delete", "deploy", "credential", "secret", "admin",
+            "sudo", "production", "database migration",
+        )):
+            return False
+
+    logger.debug(
+        f"Council skip: no HIGH-risk tools in {len(task.plan.steps)} steps "
+        f"(complexity={plan_complexity:.1f})"
+    )
+    return True
 
 
 async def plan_node(
@@ -125,6 +186,8 @@ async def plan_node(
         )
 
     updates["plan"] = plan
+    # Keep task.plan in sync so _should_skip_council can inspect steps
+    task.plan = plan
 
     # ── Compute complexity score ─────────────────────────────────
     plan_complexity = float(len(plan.steps))
@@ -136,8 +199,13 @@ async def plan_node(
         pass
     updates["plan_complexity"] = plan_complexity
 
-    # Council threshold: >= 7.0 complexity AND has HIGH-risk tools
-    updates["needs_council"] = plan_complexity >= 7.0
+    # ── Council gating — mirrors legacy _should_skip_council() ───
+    # Threshold: complexity >= 7.0 AND not skippable (no HIGH-risk tools,
+    # no security-sensitive keywords).  Complexity < 7.0 always skips.
+    if plan_complexity >= 7.0 and not _should_skip_council(task, plan_complexity, tool_registry):
+        updates["needs_council"] = True
+    else:
+        updates["needs_council"] = False
 
     if event_callback:
         await event_callback("plan_created", {
@@ -175,10 +243,25 @@ async def plan_node(
                     reasoning=reflection.confidence_justification[:200],
                     confidence=reflection.confidence_score,
                 )
+            if not reflection.should_proceed and event_callback:
+                await event_callback("thinking", {
+                    "content": (
+                        f"⚠ Reflection flagged critical issues "
+                        f"(confidence={reflection.confidence_score:.2f}). "
+                        f"Proceeding with caution.\n" +
+                        "\n".join(
+                            f"- [{c.severity}] {c.description}"
+                            for c in reflection.critique_points[:3]
+                        )
+                    ),
+                })
         except Exception as e:
             logger.warning(f"Reflection engine failed: {e}")
 
     # ── Pre-flight simulation ────────────────────────────────────
+    # When simulation recommends aborting, we preserve legacy semantics:
+    # surface SIMULATION_COMPLETE + APPROVAL_NEEDED events and require the
+    # user to explicitly override, rather than silently routing to council.
     if simulator and len(plan.steps) > 1:
         try:
             sim_result = await simulator.simulate(
@@ -191,8 +274,27 @@ async def plan_node(
                     reasoning=sim_result.summary(),
                     confidence=0.8 if sim_result.should_proceed else 0.3,
                 )
+
+            if event_callback:
+                await event_callback("simulation_complete", {
+                    "content": sim_result.summary(),
+                    "should_proceed": sim_result.should_proceed,
+                    "recommendation": sim_result.recommendation,
+                })
+
             if not sim_result.should_proceed:
-                updates["needs_council"] = True  # Force council/approval
+                # Store warning in state so approve_node can surface it
+                updates["simulation_warning"] = sim_result.summary()
+                # Require explicit user approval (overrides complexity-based routing)
+                updates["needs_council"] = True
+                if event_callback:
+                    await event_callback("approval_needed", {
+                        "content": (
+                            "Simulation recommends aborting this plan. "
+                            "Proceed anyway?"
+                        ),
+                        "simulation_warning": sim_result.summary(),
+                    })
         except Exception as e:
             logger.warning(f"Simulation gate failed: {e}")
 

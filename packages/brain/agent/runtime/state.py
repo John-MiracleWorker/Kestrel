@@ -50,6 +50,10 @@ class KestrelState(TypedDict, total=False):
     needs_council: bool                    # Whether council review is needed
     approval_granted: Optional[bool]       # Result of human-in-the-loop
 
+    # ── Supervisor routing ────────────────────────────────────────
+    supervisor_route: Optional[str]        # "plan" | "research" | "content"
+    simulation_warning: Optional[str]      # Summary from failed simulation gate
+
 
 class ResearchState(TypedDict, total=False):
     """State for the deep research subgraph."""
@@ -101,4 +105,6 @@ def create_initial_state(task: AgentTask) -> KestrelState:
         plan_complexity=0.0,
         needs_council=False,
         approval_granted=None,
+        supervisor_route=None,
+        simulation_warning=None,
     )
