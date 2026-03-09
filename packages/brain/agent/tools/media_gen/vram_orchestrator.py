@@ -49,7 +49,7 @@ SWARM_DEFAULT_MODEL = os.getenv(
 # Default SwarmUI video model — used for video generation
 SWARM_DEFAULT_VIDEO_MODEL = os.getenv(
     "KESTREL_SWARM_VIDEO_MODEL",
-    "Wan/wan2.2_fun_480p_bf16.safetensors",
+    "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors",
 )
 
 # Drop in your exact LM Studio model identifier here, e.g.:
@@ -332,10 +332,10 @@ def generate_image_swarmui(
     prompt: str,
     negative_prompt: str = "",
     images: int = 1,
-    steps: int = 20,
+    steps: int = 30,
     width: int = 1024,
     height: int = 1024,
-    cfg_scale: float = 7.0,
+    cfg_scale: float = 1.0,
     seed: int = -1,
     model: str = "",
     base_url: str = None,
@@ -598,10 +598,10 @@ def generate_image(
     prompt: str,
     negative_prompt: str = "",
     images: int = 1,
-    steps: int = 20,
+    steps: int = 30,
     width: int = 1024,
     height: int = 1024,
-    cfg_scale: float = 7.0,
+    cfg_scale: float = 1.0,
     seed: int = -1,
     swarm_model: str = "",
     send_telegram: bool = False,

@@ -157,7 +157,7 @@ async def _generate_media_handler(
 async def _vram_generate_image_handler(
     prompt: str = "",
     negative_prompt: str = "",
-    steps: int = 20,
+    steps: int = 30,
     width: int = 1024,
     height: int = 1024,
     send_telegram: bool = False,
