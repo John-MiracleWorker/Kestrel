@@ -7,6 +7,7 @@ but delegates to a LangGraph compiled graph under the hood.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, AsyncIterator, Optional
@@ -20,6 +21,9 @@ from agent.types import (
 from agent.runtime.state import KestrelState, create_initial_state
 
 logger = logging.getLogger("brain.agent.runtime.engine")
+
+# Sentinel used to signal the event queue that streaming has ended
+_QUEUE_DONE = object()
 
 
 class LangGraphEngine:
@@ -166,12 +170,75 @@ class LangGraphEngine:
 
         Yields TaskEvent objects, maintaining the same interface as
         the legacy AgentLoop.run() method.
+
+        All node-level events (thinking, tool calls, simulation, approval, etc.)
+        are bridged from the event_callback into this generator via an asyncio
+        Queue, giving streaming parity with the legacy loop.
         """
         if self._graph is None:
             self._build_graph()
 
         initial_state = create_initial_state(task)
-        start_time = time.monotonic()
+
+        # ── Event bridge: callback → AsyncIterator ───────────────
+        # Nodes fire events via event_callback(event_type, payload).
+        # We bridge those into TaskEvent objects so callers get the same
+        # rich stream as the legacy loop, without changing node interfaces.
+        event_queue: asyncio.Queue[TaskEvent | object] = asyncio.Queue()
+
+        _callback_to_event_type = {
+            "plan_created": TaskEventType.PLAN_CREATED,
+            "thinking": TaskEventType.THINKING,
+            "tool_called": TaskEventType.TOOL_CALLED,
+            "tool_result": TaskEventType.TOOL_RESULT,
+            "simulation_complete": TaskEventType.SIMULATION_COMPLETE,
+            "approval_needed": TaskEventType.APPROVAL_NEEDED,
+            "task_complete": TaskEventType.TASK_COMPLETE,
+            "task_failed": TaskEventType.TASK_FAILED,
+        }
+
+        async def _bridging_callback(event_type: str, payload: dict) -> None:
+            """Forward event_callback calls as TaskEvents into the queue."""
+            # Always call the original outer callback if one was configured
+            if self._event_callback:
+                try:
+                    await self._event_callback(event_type, payload)
+                except Exception as e:
+                    logger.warning(f"Outer event_callback error: {e}")
+
+            mapped_type = _callback_to_event_type.get(event_type)
+            if mapped_type is None:
+                return
+
+            import json
+            content = payload.get("content") or payload.get("result") or ""
+            if not content:
+                try:
+                    content = json.dumps(payload)
+                except Exception:
+                    content = str(payload)
+
+            await event_queue.put(TaskEvent(
+                type=mapped_type,
+                task_id=task.id,
+                content=content,
+                progress=self._progress(task),
+            ))
+
+        # Rebuild the graph with the bridging callback bound to nodes
+        # (only if the caller didn't already inject an event_callback directly
+        # into the constructor — in that case we still wrap it above)
+        if self._event_callback is not _bridging_callback:
+            _original_callback = self._event_callback
+            # Temporarily swap in the bridge; restore on exit
+            self._event_callback = _bridging_callback
+            # Re-bind the callback on already-built components
+            if self._council:
+                self._council._event_callback = _bridging_callback
+            if self._executor:
+                self._executor._event_callback = _bridging_callback
+            if self._step_scheduler:
+                self._step_scheduler._event_callback = _bridging_callback
 
         try:
             # Wire multi-agent coordinator
@@ -190,58 +257,85 @@ class LangGraphEngine:
 
             config = {"configurable": {"thread_id": task.id}}
 
-            async for event in self._graph.astream(initial_state, config=config):
-                # LangGraph yields dicts keyed by node name
-                for node_name, node_output in event.items():
-                    if not isinstance(node_output, dict):
-                        continue
+            async def _run_graph():
+                """Run the graph and signal the queue when done."""
+                try:
+                    async for event in self._graph.astream(initial_state, config=config):
+                        # LangGraph yields dicts keyed by node name
+                        for node_name, node_output in event.items():
+                            if not isinstance(node_output, dict):
+                                continue
 
-                    # Convert node outputs to TaskEvents for backward compatibility
-                    status = node_output.get("status")
-                    if status == TaskStatus.COMPLETE.value:
-                        yield TaskEvent(
-                            type=TaskEventType.TASK_COMPLETE,
-                            task_id=task.id,
-                            content=task.result or "Task completed.",
-                            progress=self._progress(task),
-                        )
-                    elif status == TaskStatus.FAILED.value:
-                        yield TaskEvent(
-                            type=TaskEventType.TASK_FAILED,
-                            task_id=task.id,
-                            content=task.error or "Task failed.",
-                            progress=self._progress(task),
-                        )
+                            # Convert terminal node outputs to TaskEvents
+                            status = node_output.get("status")
+                            if status == TaskStatus.COMPLETE.value:
+                                await event_queue.put(TaskEvent(
+                                    type=TaskEventType.TASK_COMPLETE,
+                                    task_id=task.id,
+                                    content=task.result or "Task completed.",
+                                    progress=self._progress(task),
+                                ))
+                            elif status == TaskStatus.FAILED.value:
+                                await event_queue.put(TaskEvent(
+                                    type=TaskEventType.TASK_FAILED,
+                                    task_id=task.id,
+                                    content=task.error or "Task failed.",
+                                    progress=self._progress(task),
+                                ))
 
-                    # Emit plan_created when plan node produces a plan
-                    plan = node_output.get("plan")
-                    if plan and node_name == "plan":
-                        import json
-                        yield TaskEvent(
-                            type=TaskEventType.PLAN_CREATED,
-                            task_id=task.id,
-                            content=json.dumps(plan.to_dict()),
-                            progress=self._progress(task),
-                        )
+                            # Emit plan_created when plan node produces a plan
+                            plan = node_output.get("plan")
+                            if plan and node_name == "plan":
+                                import json
+                                await event_queue.put(TaskEvent(
+                                    type=TaskEventType.PLAN_CREATED,
+                                    task_id=task.id,
+                                    content=json.dumps(plan.to_dict()),
+                                    progress=self._progress(task),
+                                ))
 
-        except Exception as e:
-            import traceback
-            tb = traceback.format_exc()
-            logger.error(f"LangGraph engine error: {e}", exc_info=True)
+                except Exception as e:
+                    import traceback
+                    tb = traceback.format_exc()
+                    logger.error(f"LangGraph engine error: {e}", exc_info=True)
 
-            task.status = TaskStatus.FAILED
-            task.error = str(e)
-            try:
-                await self._persistence.update_task(task)
-            except Exception:
-                pass
+                    task.status = TaskStatus.FAILED
+                    task.error = str(e)
+                    try:
+                        await self._persistence.update_task(task)
+                    except Exception:
+                        pass
 
-            yield TaskEvent(
-                type=TaskEventType.TASK_FAILED,
-                task_id=task.id,
-                content=f"Fatal Error: {e}\n\n```python\n{tb}\n```",
-                progress=self._progress(task),
-            )
+                    await event_queue.put(TaskEvent(
+                        type=TaskEventType.TASK_FAILED,
+                        task_id=task.id,
+                        content=f"Fatal Error: {e}\n\n```python\n{tb}\n```",
+                        progress=self._progress(task),
+                    ))
+                finally:
+                    await event_queue.put(_QUEUE_DONE)
+
+            # Run graph concurrently, draining the event queue as events arrive
+            graph_task = asyncio.create_task(_run_graph())
+
+            while True:
+                item = await event_queue.get()
+                if item is _QUEUE_DONE:
+                    break
+                yield item
+
+            # Ensure the graph task is awaited so exceptions propagate
+            await graph_task
+
+        finally:
+            # Restore original callback on all components
+            self._event_callback = _original_callback
+            if self._council:
+                self._council._event_callback = _original_callback
+            if self._executor:
+                self._executor._event_callback = _original_callback
+            if self._step_scheduler:
+                self._step_scheduler._event_callback = _original_callback
 
     def _progress(self, task: AgentTask) -> dict:
         """Build progress snapshot (same as legacy loop)."""

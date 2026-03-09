@@ -6,8 +6,11 @@ whether to continue execution, replan, or complete.
 
 Wraps existing components:
   - EvidenceChain verification
-  - Memory graph entity extraction and storage
-  - PersonaLearner observation
+
+Note: Memory graph entity extraction and persona observation have been
+intentionally moved to complete_node, which runs after task.result is
+assembled. This guarantees those side-effects always see the real final
+answer rather than a potentially empty task.result.
 """
 
 from __future__ import annotations
@@ -25,8 +28,6 @@ async def reflect_node(
     state: KestrelState,
     *,
     evidence_chain=None,
-    memory_graph=None,
-    persona_learner=None,
     provider=None,
     model: str = "",
     api_key: str = "",
@@ -56,42 +57,8 @@ async def reflect_node(
             except Exception as e:
                 logger.warning(f"Evidence chain persistence failed: {e}")
 
-        # ── Update memory graph with task entities ───────────────
-        if memory_graph and task.result and provider:
-            try:
-                from agent.core.memory_graph import extract_entities_llm
-                _entities, _relations = await extract_entities_llm(
-                    provider=provider,
-                    model=model,
-                    api_key=api_key,
-                    user_message=task.goal,
-                    assistant_response=task.result,
-                )
-                if _entities:
-                    await memory_graph.extract_and_store(
-                        conversation_id=task.id,
-                        workspace_id=task.workspace_id,
-                        entities=_entities,
-                        relations=_relations,
-                    )
-                    logger.info(
-                        f"Memory graph: stored {len(_entities)} entities, "
-                        f"{len(_relations)} relations from task {task.id}"
-                    )
-            except Exception as e:
-                logger.warning(f"Memory graph update failed: {e}")
-
-        # ── Observe persona signals ──────────────────────────────
-        if persona_learner and task.result:
-            try:
-                await persona_learner.observe_communication(
-                    user_id=task.user_id,
-                    user_message=task.goal,
-                    agent_response=task.result[:500],
-                )
-                await persona_learner.observe_session_timing(task.user_id)
-            except Exception as e:
-                logger.warning(f"Persona observation failed: {e}")
+        # NOTE: Memory graph entity extraction and persona observation are
+        # handled in complete_node, after task.result is fully assembled.
 
     elif plan and not plan.is_complete:
         # Check if we should replan based on drift

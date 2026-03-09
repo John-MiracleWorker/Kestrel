@@ -1,8 +1,18 @@
 """
 Content generation subgraph — AIGC pipeline for slides, web pages, PDFs.
 
-Takes source text (e.g., a research report) and transforms it into
-the requested output format through an outline → draft → format → review pipeline.
+**STATUS: BETA — Not production-ready.**
+
+Known limitations:
+  - generate_outline() returns a hardcoded structural template; it does not
+    use an LLM to derive an outline from the source text.
+  - draft_content() distributes source text chunks across outline sections
+    instead of using an LLM to write section-specific content.
+  - review_content() checks only file existence and byte size; it does not
+    perform any qualitative content review.
+
+Do not expose this subgraph as a production feature until the placeholder
+stages are replaced with real LLM-backed implementations.
 
 Graph topology:
   START → outline → draft → format → review → END
@@ -22,11 +32,18 @@ logger = logging.getLogger("brain.agent.runtime.graphs.content")
 async def generate_outline(state: ContentState) -> dict[str, Any]:
     """Generate a content outline from source text.
 
+    BETA: Returns a hardcoded structural template.
+    TODO: Use an LLM to derive a topic-specific outline from source_text.
+
     Creates a structured outline appropriate for the target format:
     - slides: title slide + 8-12 content slides + summary
     - webpage: header, sections, footer
     - pdf: title page, TOC, chapters, conclusion
     """
+    logger.warning(
+        "BETA: generate_outline() is using a hardcoded template. "
+        "LLM-based outline generation is not yet implemented."
+    )
     content_type = state.get("content_type", "slides")
     source_text = state.get("source_text", "")
 
@@ -59,12 +76,16 @@ async def generate_outline(state: ContentState) -> dict[str, Any]:
 
 
 async def draft_content(state: ContentState) -> dict[str, Any]:
-    """Generate draft content for each outline section."""
+    """Generate draft content for each outline section.
+
+    BETA: Distributes source text chunks across sections verbatim.
+    TODO: Use an LLM to write section-specific content from the outline.
+    """
     outline = state.get("outline", [])
     source_text = state.get("source_text", "")
 
-    # In production, this would use LLM to generate content
-    # For now, distribute source text across sections
+    # Placeholder: chunk source text across sections
+    # In production, replace with an LLM call per section
     sections = source_text.split("\n\n") if source_text else [""]
     draft_parts = []
 
@@ -153,7 +174,11 @@ async def format_output(state: ContentState) -> dict[str, Any]:
 
 
 async def review_content(state: ContentState) -> dict[str, Any]:
-    """Review generated content for quality."""
+    """Review generated content for quality.
+
+    BETA: Checks file existence and byte size only — no qualitative review.
+    TODO: Use an LLM to review content accuracy, completeness, and tone.
+    """
     output_path = state.get("formatted_output", "")
     content_type = state.get("content_type", "")
 
