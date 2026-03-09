@@ -597,8 +597,8 @@ class AgentLoop:
                     return
 
             # ── Phase 3: Verification + Completion ────────────────
-            # Transition through VERIFYING state before marking COMPLETE
-            await self._transition(task, TaskStatus.VERIFYING)
+            # Transition through REFLECTING state before marking COMPLETE
+            await self._transition(task, TaskStatus.REFLECTING)
             # (Verification itself is handled by the executor's task_complete handler)
             await self._transition(task, TaskStatus.COMPLETE)
             task.completed_at = datetime.now(timezone.utc)

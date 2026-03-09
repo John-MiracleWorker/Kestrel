@@ -1,4 +1,3 @@
-from typing import Optional
 """
 Gemini Computer Use — Desktop control via Gemini's Computer Use model.
 
@@ -36,12 +35,22 @@ import base64
 import json
 import logging
 import os
+import sys
 import time
+import uuid
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 
+from agent.runtime import get_active_runtime
 from agent.types import RiskLevel, ToolDefinition
+
+_SHARED_PATH = Path(__file__).resolve().parents[3] / "shared"
+if str(_SHARED_PATH) not in sys.path:
+    sys.path.append(str(_SHARED_PATH))
+
+from action_event_schema import build_action_event, stable_hash
 
 logger = logging.getLogger("brain.agent.tools.computer_use")
 
@@ -97,6 +106,8 @@ async def _resolve_computer_use_model() -> str:
 
 # Host-side screen agent URL (runs natively on the Mac)
 SCREEN_AGENT_URL = os.getenv("SCREEN_AGENT_URL", "http://host.docker.internal:9800")
+ACTION_VERIFY_RETRIES = int(os.getenv("COMPUTER_USE_ACTION_VERIFY_RETRIES", "2"))
+ACTION_RETRY_DELAY_SECONDS = float(os.getenv("COMPUTER_USE_ACTION_RETRY_DELAY_SECONDS", "1.0"))
 
 # Actions the model can request
 SUPPORTED_ACTIONS = {
@@ -145,28 +156,64 @@ async def _capture_screenshot() -> bytes:
         raise RuntimeError("Screen agent timed out capturing screenshot")
 
 
-async def _execute_action(action_name: str, args: dict) -> str:
-    """
-    Send an action to the host-side screen agent for execution.
-    Returns a human-readable description of what was done.
-    """
+async def _post_screen_agent(path: str, payload: Optional[dict] = None, timeout: float = 30.0) -> dict:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(f"{SCREEN_AGENT_URL}{path}", json=payload or {})
+        if resp.status_code != 200:
+            raise RuntimeError(f"Screen agent {path} failed ({resp.status_code}): {resp.text[:200]}")
+        return resp.json()
+
+
+def _expected_state_from_action(action_name: str, args: dict) -> dict[str, str]:
+    expected: dict[str, str] = {}
+    if action_name in {"navigate", "open_url"} and args.get("url"):
+        expected["url_contains"] = str(args["url"])
+    if action_name == "type_text_at" and args.get("text"):
+        expected["text_contains"] = str(args["text"])[:80]
+    if args.get("expect_app"):
+        expected["app"] = str(args["expect_app"])
+    if args.get("expect_window"):
+        expected["window_title"] = str(args["expect_window"])
+    if args.get("expect_url_contains"):
+        expected["url_contains"] = str(args["expect_url_contains"])
+    if args.get("expect_text"):
+        expected["text_contains"] = str(args["expect_text"])
+    return expected
+
+
+async def _verify_expected_state(expected: dict[str, str]) -> dict[str, Any]:
+    if not expected:
+        return {"passed": True, "checks": {}, "context": {}, "reason": "no_expectations"}
+
+    validation = await _post_screen_agent("/validate", payload=expected, timeout=45.0)
+    if validation.get("success"):
+        return {
+            "passed": validation.get("passed", False),
+            "checks": validation.get("checks", {}),
+            "context": validation.get("context", {}),
+        }
+    return {"passed": False, "checks": {}, "context": {}, "reason": "validation_call_failed"}
+
+
+async def _execute_action(action_name: str, args: dict, idempotency_key: str) -> dict[str, Any]:
+    payload = {"action": action_name, "args": args, "idempotency_key": idempotency_key}
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{SCREEN_AGENT_URL}/action",
-                json={"action": action_name, "args": args},
-            )
-            if resp.status_code != 200:
-                return f"Screen agent error ({resp.status_code}): {resp.text[:200]}"
-            data = resp.json()
-            if data.get("success"):
-                return data.get("result", "Action completed")
-            else:
-                return f"Action failed: {data.get('error', 'unknown')}"
+        data = await _post_screen_agent("/action", payload=payload, timeout=40.0)
     except httpx.ConnectError:
-        return "ERROR: Cannot connect to screen agent"
+        return {"success": False, "result": "", "error": "ERROR: Cannot connect to screen agent"}
     except httpx.TimeoutException:
-        return "ERROR: Screen agent timed out"
+        return {"success": False, "result": "", "error": "ERROR: Screen agent timed out"}
+    except Exception as exc:
+        return {"success": False, "result": "", "error": str(exc)}
+
+    return {
+        "success": data.get("success", False),
+        "result": data.get("result", ""),
+        "error": data.get("error", ""),
+        "action_id": data.get("action_id", ""),
+        "replayed": data.get("replayed", False),
+        "validation": data.get("validation", {}),
+    }
 
 
 # ── Gemini API Interaction ───────────────────────────────────────────
@@ -378,6 +425,8 @@ async def run_computer_use(
     default_system = (
         "You are controlling a desktop computer to accomplish the user's goal. "
         "Observe the screenshot carefully. Take one action at a time. "
+        "When useful, include expectation hints in function args using "
+        "expect_app, expect_window, expect_url_contains, expect_text so actions can be verified. "
         "When the goal is accomplished, respond with text only (no function calls) "
         "summarizing what you did."
     )
@@ -484,51 +533,123 @@ async def run_computer_use(
 
         # Execute each action via the screen agent
         function_responses = []
+        before_screenshot_hash = stable_hash(screenshot_b64)
         for action in actions:
             action_name = action["name"]
             action_args = action["args"]
+            expected_state = _expected_state_from_action(action_name, action_args)
+            command_hash = stable_hash(json.dumps({"action": action_name, "args": action_args}, sort_keys=True))
+            policy_decision = "auto_approved" if not action.get("needs_confirmation") else "confirmation_required"
+            attempt_records: list[dict[str, Any]] = []
 
             if action_name not in SUPPORTED_ACTIONS:
                 result_text = f"Unsupported action: {action_name}"
+                verification = {"passed": False, "reason": "unsupported_action"}
                 logger.warning(result_text)
+                status = "unsupported"
             else:
-                try:
-                    result_text = await _execute_action(action_name, action_args)
-                    logger.info(f"Executed: {result_text}")
-                except Exception as e:
-                    result_text = f"Action failed: {e}"
-                    logger.error(result_text, exc_info=True)
+                verification = {"passed": True, "reason": "not_checked"}
+                result_text = ""
+                status = "success"
+                for attempt in range(ACTION_VERIFY_RETRIES + 1):
+                    action_key = f"turn-{turn + 1}:{action_name}:{uuid.uuid4()}"
+                    execution = await _execute_action(action_name, action_args, action_key)
+                    attempt_record = {
+                        "attempt": attempt + 1,
+                        "execution": execution,
+                    }
+
+                    if not execution.get("success"):
+                        result_text = f"Action failed: {execution.get('error', 'unknown')}"
+                        status = "failed"
+                        attempt_record["verification"] = {
+                            "passed": False,
+                            "reason": "execution_error",
+                        }
+                        attempt_records.append(attempt_record)
+                    else:
+                        result_text = execution.get("result", "Action completed")
+                        logger.info(f"Executed: {result_text}")
+                        status = "success"
+                        await asyncio.sleep(0.35)
+                        verification = await _verify_expected_state(expected_state)
+                        attempt_record["verification"] = verification
+                        attempt_records.append(attempt_record)
+                        if verification.get("passed"):
+                            break
+                        if attempt < ACTION_VERIFY_RETRIES:
+                            await asyncio.sleep(ACTION_RETRY_DELAY_SECONDS)
+                            continue
+                        result_text = (
+                            f"Action completed but verification failed: {verification.get('checks', {})}"
+                        )
+                    if attempt < ACTION_VERIFY_RETRIES:
+                        await asyncio.sleep(ACTION_RETRY_DELAY_SECONDS)
+                if expected_state and not verification.get("passed"):
+                    logger.warning(
+                        "UI transition appears stale after retries for %s; expected=%s",
+                        action_name,
+                        expected_state,
+                    )
+
+            # Capture post-action screenshot for reversible action history
+            try:
+                screenshot_bytes = await _capture_screenshot()
+                screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+                after_screenshot_hash = stable_hash(screenshot_b64)
+            except RuntimeError as e:
+                return {
+                    "success": False,
+                    "error": f"Screenshot failed after action '{action_name}': {e}",
+                    "turns": turn + 1,
+                    "actions_taken": actions_taken,
+                    "model_commentary": "\n".join(commentary),
+                }
+
+            action_event = build_action_event(
+                source="brain.computer_use",
+                action_type=action_name,
+                status=status,
+                before_state={
+                    "screenshot_hash": before_screenshot_hash,
+                    "window_title": str(action_args.get("window_title", "")),
+                    "command_hash": command_hash,
+                    "policy_decision": policy_decision,
+                },
+                after_state={
+                    "screenshot_hash": after_screenshot_hash,
+                    "window_title": str(action_args.get("window_title", "")),
+                    "command_hash": command_hash,
+                    "policy_decision": "executed" if status == "success" else status,
+                },
+                metadata={"args": action_args, "turn": turn + 1, "result": result_text[:500]},
+            )
+            before_screenshot_hash = after_screenshot_hash
 
             actions_taken.append({
                 "action": action_name,
                 "args": action_args,
                 "result": result_text,
+                "expected_state": expected_state,
+                "verification": verification,
+                "attempts": attempt_records,
                 "turn": turn + 1,
+                "action_event": action_event,
             })
 
             function_responses.append({
                 "functionResponse": {
                     "name": action_name,
-                    "response": {"result": result_text},
+                    "response": {
+                        "result": result_text,
+                        "expected_state": expected_state,
+                        "verification": verification,
+                    },
                 }
             })
 
         # Short pause for the UI to settle after actions
         await asyncio.sleep(0.5)
-
-        # Capture fresh screenshot after actions
-        try:
-            screenshot_bytes = await _capture_screenshot()
-        except RuntimeError as e:
-            return {
-                "success": False,
-                "error": f"Screenshot failed after actions: {e}",
-                "turns": turn + 1,
-                "actions_taken": actions_taken,
-                "model_commentary": "\n".join(commentary),
-            }
-
-        screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
 
         # Send function responses + new screenshot back to the model
         user_parts = function_responses + [
@@ -607,12 +728,27 @@ def register_computer_use_tools(registry) -> None:
         excluded_actions: Optional[list[str]] = None,
     ) -> dict:
         """Handle computer_use tool calls from the agent loop."""
-        return await run_computer_use(
+        active_runtime = get_active_runtime()
+        if not active_runtime:
+            return {"success": False, "error": "Runtime policy is not initialized."}
+
+        capabilities = active_runtime.capabilities
+        if not capabilities.supports_computer_use:
+            return {
+                "success": False,
+                "error": f"computer_use is disabled in runtime mode '{capabilities.mode.value}'.",
+                "capabilities": capabilities.as_dict(),
+            }
+
+        result = await run_computer_use(
             goal=goal,
             max_turns=max_turns,
             excluded_actions=excluded_actions,
             require_confirmation=True,
         )
+        if isinstance(result, dict):
+            result.setdefault("capabilities", capabilities.as_dict())
+        return result
 
     registry.register(definition=COMPUTER_USE_TOOL, handler=computer_use_handler)
     logger.info("Computer Use tool registered")

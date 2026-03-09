@@ -23,7 +23,6 @@ class TaskStatus(str, Enum):
     EXECUTING = "executing"
     OBSERVING = "observing"
     REFLECTING = "reflecting"
-    VERIFYING = "verifying"
     WAITING_APPROVAL = "waiting_approval"
     PAUSED = "paused"
     COMPLETE = "complete"

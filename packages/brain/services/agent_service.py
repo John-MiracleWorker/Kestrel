@@ -74,8 +74,7 @@ class AgentServicerMixin(BaseServicerMixin):
             if provider_name in ("ollama", "local") and _ws_settings.get("ollama_host"):
                 _host = _ws_settings["ollama_host"].rstrip("/")
                 logger.info(f"Task using workspace Ollama host: {_host}")
-                task_provider._base_url = _host
-                task_provider._explicit_url = _host
+                task_provider.set_explicit_url(_host)
                 # Invalidate stale health cache so is_ready() re-checks the new URL
                 from providers.ollama import _health_cache
                 _health_cache["checked_at"] = 0
@@ -96,7 +95,7 @@ class AgentServicerMixin(BaseServicerMixin):
         task_model = ws_config.get("model", "") if ws_config else ""
         task_api_key = ws_config.get("api_key", "") if ws_config else ""
 
-        task_tool_registry = build_tool_registry(hands_client=runtime.hands_client, pool=pool)
+        task_tool_registry = build_tool_registry(hands_client=runtime.hands_client, pool=pool, runtime_policy=runtime.execution_runtime)
         evidence_chain = EvidenceChain(task_id=task.id, pool=pool)
 
         task_working_memory = WorkingMemory(
@@ -408,7 +407,7 @@ class AgentServicerMixin(BaseServicerMixin):
 
         task_model = ws_config.get("model", "") if ws_config else ""
         task_api_key = ws_config.get("api_key", "") if ws_config else ""
-        task_tool_registry = build_tool_registry(hands_client=runtime.hands_client, pool=pool)
+        task_tool_registry = build_tool_registry(hands_client=runtime.hands_client, pool=pool, runtime_policy=runtime.execution_runtime)
         evidence_chain = EvidenceChain(task_id=task.id, pool=pool)
 
         task_working_memory = WorkingMemory(redis_client=None, vector_store=runtime.vector_store)

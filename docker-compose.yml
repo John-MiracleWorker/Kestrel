@@ -74,6 +74,8 @@ services:
         condition: service_healthy
       brain:
         condition: service_healthy
+    volumes:
+      - generated_media:/app/generated_media
 
   # ── Brain Service (Python gRPC) ─────────────────────────────
   brain:
@@ -118,6 +120,11 @@ services:
       OLLAMA_DEFAULT_MODEL: ${OLLAMA_DEFAULT_MODEL:-qwen3.5:4b}
       ROUTER_OLLAMA_MODEL: ${ROUTER_OLLAMA_MODEL:-qwen3.5:4b}
       ROUTER_OLLAMA_LARGE_MODEL: ${ROUTER_OLLAMA_LARGE_MODEL:-qwen3.5:4b}
+      KESTREL_GLM_MODEL_ID: ${KESTREL_GLM_MODEL_ID:-zai-org/glm-4.7-flash}
+      LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://192.168.1.19:1234}
+      SWARMUI_BASE_URL: ${SWARMUI_BASE_URL:-http://192.168.1.19:7801}
+      SWARM_HOST_IP: ${SWARM_HOST_IP:-192.168.1.19}
+      SWARM_PORT: ${SWARM_PORT:-7822}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       HOST_MOUNT_ROOT: ${HOST_MOUNT_ROOT:-/Users}
       HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT:-}
@@ -126,6 +133,7 @@ services:
       - .:/project # Mount project root for self-improvement git operations
       - ${HOST_MOUNT_ROOT:-/Users}:/host_fs # Host filesystem (tool-level security + human approval for writes)
       - /var/run/docker.sock:/var/run/docker.sock # Docker socket for container_control tool
+      - generated_media:/app/generated_media # Shared volume for generated images
     depends_on:
       postgres:
         condition: service_healthy
@@ -174,3 +182,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  generated_media:

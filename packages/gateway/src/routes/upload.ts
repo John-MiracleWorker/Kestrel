@@ -94,4 +94,13 @@ export default async function uploadRoutes(app: FastifyInstance) {
         prefix: '/uploads/',
         decorateReply: false,
     });
+
+    // ── Static file serving for AI-generated media ──────────────────
+    const MEDIA_DIR = process.env.MEDIA_DIR || '/app/generated_media';
+    fs.mkdirSync(MEDIA_DIR, { recursive: true });
+    app.register(import('@fastify/static'), {
+        root: MEDIA_DIR,
+        prefix: '/media/',
+        decorateReply: false,
+    });
 }

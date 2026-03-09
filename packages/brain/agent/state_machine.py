@@ -36,7 +36,6 @@ LEGAL_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     },
     TaskStatus.EXECUTING: {
         TaskStatus.REFLECTING,
-        TaskStatus.VERIFYING,
         TaskStatus.WAITING_APPROVAL,
         TaskStatus.COMPLETE,
         TaskStatus.FAILED,
@@ -46,11 +45,7 @@ LEGAL_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.REFLECTING: {
         TaskStatus.EXECUTING,
         TaskStatus.PLANNING,  # Replan
-        TaskStatus.FAILED,
-    },
-    TaskStatus.VERIFYING: {
-        TaskStatus.COMPLETE,
-        TaskStatus.EXECUTING,  # Verification failed → repair loop
+        TaskStatus.COMPLETE,  # Verification passed
         TaskStatus.FAILED,
     },
     TaskStatus.WAITING_APPROVAL: {

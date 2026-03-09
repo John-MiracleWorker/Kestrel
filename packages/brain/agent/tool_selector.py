@@ -17,6 +17,7 @@ Fallback:
 """
 
 import logging
+import os
 import re
 from typing import Optional, Any
 
@@ -84,6 +85,12 @@ _CATEGORY_KEYWORDS: dict[str, list[str]] = {
         "computer", "screen", "screenshot", "click", "type",
         "browser", "automation", "ui",
     ],
+    "media": [
+        "image", "picture", "photo", "draw", "generate", "art",
+        "video", "animate", "animation", "render", "diffusion",
+        "illustrate", "painting", "sketch", "visual", "create image",
+        "create video", "ballerina", "portrait", "landscape",
+    ],
 }
 
 # ── Tool name → category overrides ──────────────────────────────────
@@ -118,12 +125,42 @@ _TOOL_CATEGORY_MAP: dict[str, str] = {
     "delegate_task": "delegation",
     "delegate_parallel": "delegation",
     "computer_use": "computer",
+    "generate_media": "media",
+    "vram_generate_image": "media",
+    "check_media_host": "media",
     "ask_human": "control",
     "task_complete": "control",
 }
 
 MAX_LOCAL_TOOLS = 20
 MAX_CLOUD_TOOLS = 45
+
+_DESKTOP_TASK_KEYWORDS = {
+    "desktop", "gui", "screen", "window", "finder", "spotlight",
+    "dock", "click", "drag", "type", "native app", "open app",
+}
+_RISKY_NATIVE_TOOLS = {"host_shell", "host_python", "host_exec"}
+_NATIVE_MODE_PREFERRED = (
+    "computer_use",
+    "host_tree",
+    "host_find",
+    "host_search",
+    "host_batch_read",
+    "host_read",
+    "host_list",
+    "host_write",
+    "file_list",
+    "file_read",
+    "file_write",
+)
+_APPROVED_STATES = {"approved", "auto_approved", "granted", "confirmed"}
+_HIGH_RISK_INTENT_TAGS = {
+    "allow_high_risk_tools",
+    "allow_host_execution",
+    "host_execution",
+    "intent_host_shell",
+    "intent_host_python",
+}
 
 # ── Compact catalog for Stage 1 ─────────────────────────────────────
 # One-line description per tool, ~40 chars each.
@@ -167,6 +204,75 @@ class ToolSelector:
             cat = _TOOL_CATEGORY_MAP.get(name, tool.category)
             self._category_index.setdefault(cat, set()).add(name)
 
+    def _resolve_runtime_mode(self, runtime_mode: Optional[str]) -> str:
+        mode = (runtime_mode or os.getenv("KESTREL_RUNTIME_MODE", "docker")).strip().lower()
+        if mode not in {"native", "hybrid", "docker", "container"}:
+            return "docker"
+        if mode == "container":
+            return "docker"
+        return mode
+
+    def _extract_intent_tags(self, step_description: str, intent_tags: Optional[list[str]]) -> set[str]:
+        provided = {t.strip().lower() for t in (intent_tags or []) if t and t.strip()}
+        inline = set(re.findall(r"(?:#|\[)intent:([a-zA-Z0-9_\-]+)", step_description.lower()))
+        return provided | inline
+
+    def _is_desktop_task(self, step_description: str) -> bool:
+        text = step_description.lower()
+        return any(keyword in text for keyword in _DESKTOP_TASK_KEYWORDS)
+
+    def _risky_tool_allowed(self, tool_name: str, approval_state: str, intent_tags: set[str]) -> bool:
+        if tool_name not in _RISKY_NATIVE_TOOLS:
+            return True
+        if (approval_state or "").strip().lower() in _APPROVED_STATES:
+            return True
+        return bool(_HIGH_RISK_INTENT_TAGS.intersection(intent_tags))
+
+    def _apply_runtime_scoring(
+        self,
+        selected: dict[str, ToolDefinition],
+        step_description: str,
+        limit: int,
+        runtime_mode: str,
+    ) -> None:
+        if runtime_mode not in {"native", "hybrid"} or not self._is_desktop_task(step_description):
+            return
+
+        for name in _NATIVE_MODE_PREFERRED:
+            if len(selected) >= limit:
+                break
+            if name in self._tools and name not in selected:
+                selected[name] = self._tools[name]
+
+        for name in sorted(self._tools):
+            if len(selected) >= limit:
+                break
+            if name in selected:
+                continue
+            if name == "computer_use" or name.startswith("host_") or name.startswith("file_"):
+                selected[name] = self._tools[name]
+
+    def _apply_risk_guardrails(
+        self,
+        selected: dict[str, ToolDefinition],
+        step_description: str,
+        intent_tags: Optional[list[str]],
+        approval_state: str,
+    ) -> None:
+        tags = self._extract_intent_tags(step_description, intent_tags)
+        blocked = [
+            name for name in selected
+            if not self._risky_tool_allowed(name, approval_state=approval_state, intent_tags=tags)
+        ]
+        for name in blocked:
+            selected.pop(name, None)
+            logger.info(
+                "Tool selector guardrail blocked risky tool '%s' (approval_state=%s, tags=%s)",
+                name,
+                approval_state,
+                sorted(tags),
+            )
+
     async def select_with_llm(
         self,
         step_description: str,
@@ -174,6 +280,9 @@ class ToolSelector:
         model: str = "",
         api_key: str = "",
         expected_tools: Optional[list[str]] = None,
+        runtime_mode: Optional[str] = None,
+        intent_tags: Optional[list[str]] = None,
+        approval_state: str = "pending",
     ) -> list[ToolDefinition]:
         """
         Stage 1: Ask the LLM to pick relevant tools from the catalog.
@@ -244,6 +353,19 @@ class ToolSelector:
                 if tool_name in self._tools:
                     selected[tool_name] = self._tools[tool_name]
 
+            self._apply_runtime_scoring(
+                selected=selected,
+                step_description=step_description,
+                limit=MAX_CLOUD_TOOLS,
+                runtime_mode=self._resolve_runtime_mode(runtime_mode),
+            )
+            self._apply_risk_guardrails(
+                selected=selected,
+                step_description=step_description,
+                intent_tags=intent_tags,
+                approval_state=approval_state,
+            )
+
             if len(selected) > len(_ALWAYS_AVAILABLE):
                 logger.info(
                     f"Tool selector (LLM): picked {list(selected.keys())} "
@@ -264,6 +386,9 @@ class ToolSelector:
             step_description=step_description,
             expected_tools=expected_tools,
             provider_name="lmstudio",
+            runtime_mode=runtime_mode,
+            intent_tags=intent_tags,
+            approval_state=approval_state,
         )
 
     def select(
@@ -272,6 +397,9 @@ class ToolSelector:
         expected_tools: Optional[list[str]] = None,
         provider: str = "google",
         max_tools: Optional[int] = None,
+        runtime_mode: Optional[str] = None,
+        intent_tags: Optional[list[str]] = None,
+        approval_state: str = "pending",
     ) -> list[ToolDefinition]:
         """Synchronous keyword-based fallback (legacy)."""
         return self._select_by_keywords(
@@ -279,6 +407,9 @@ class ToolSelector:
             expected_tools=expected_tools,
             provider_name=provider,
             max_tools=max_tools,
+            runtime_mode=runtime_mode,
+            intent_tags=intent_tags,
+            approval_state=approval_state,
         )
 
     def _select_by_keywords(
@@ -287,6 +418,9 @@ class ToolSelector:
         expected_tools: Optional[list[str]] = None,
         provider_name: str = "google",
         max_tools: Optional[int] = None,
+        runtime_mode: Optional[str] = None,
+        intent_tags: Optional[list[str]] = None,
+        approval_state: str = "pending",
     ) -> list[ToolDefinition]:
         """Keyword-based tool selection (fallback)."""
         is_local = provider_name in ("ollama", "local", "lmstudio")
@@ -325,6 +459,19 @@ class ToolSelector:
                 name_parts = name.replace("_", " ").split()
                 if any(part in desc_lower for part in name_parts if len(part) > 2):
                     selected[name] = tool
+
+        self._apply_runtime_scoring(
+            selected=selected,
+            step_description=step_description,
+            limit=limit,
+            runtime_mode=self._resolve_runtime_mode(runtime_mode),
+        )
+        self._apply_risk_guardrails(
+            selected=selected,
+            step_description=step_description,
+            intent_tags=intent_tags,
+            approval_state=approval_state,
+        )
 
         tools_list = list(selected.values())
         logger.info(

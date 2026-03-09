@@ -10,17 +10,24 @@ import logging
 import os
 import json
 import uuid
+import sys
+from pathlib import Path
 from concurrent import futures
 
 import grpc
 from grpc import aio as grpc_aio
 from dotenv import load_dotenv
 from grpc_tools import protoc
-import sys
 
 from executor import DockerExecutor
 from security.allowlist import PermissionChecker
 from security.audit import AuditLogger
+
+_SHARED_PATH = Path(__file__).resolve().parents[1] / "shared"
+if str(_SHARED_PATH) not in sys.path:
+    sys.path.append(str(_SHARED_PATH))
+
+from action_event_schema import build_action_event, dumps_action_event, stable_hash
 
 load_dotenv()
 logger = logging.getLogger("hands")
@@ -137,9 +144,18 @@ class HandsServicer:
                              function_name, arguments)
 
         # Yield RUNNING status
+        running_event = build_action_event(
+            source="hands.service",
+            action_type=f"{skill_name}.{function_name}",
+            status="running",
+            before_state={"command_hash": stable_hash(arguments), "policy_decision": "admitted"},
+            after_state={"command_hash": stable_hash(arguments), "policy_decision": "running"},
+            metadata={"exec_id": exec_id},
+        )
         yield hands_pb2.SkillExecutionResponse(
             status=hands_pb2.SkillExecutionResponse.Status.RUNNING,
             output=f"Executing {skill_name}.{function_name}...",
+            action_event_json=dumps_action_event(running_event),
         )
 
         try:
@@ -162,11 +178,24 @@ class HandsServicer:
             )
 
             audit_data = result.get("audit_log", {}) or {}
+            success_event = build_action_event(
+                source="hands.service",
+                action_type=f"{skill_name}.{function_name}",
+                status="success",
+                before_state={"command_hash": stable_hash(arguments), "policy_decision": "running"},
+                after_state={"command_hash": stable_hash(arguments), "policy_decision": "success"},
+                metadata={
+                    "exec_id": exec_id,
+                    "execution_time_ms": result.get("execution_time_ms", 0),
+                    "memory_used_mb": result.get("memory_used_mb", 0),
+                },
+            )
             yield hands_pb2.SkillExecutionResponse(
                 status=hands_pb2.SkillExecutionResponse.Status.SUCCESS,
                 output=result.get("output", ""),
                 execution_time_ms=result.get("execution_time_ms", 0),
                 memory_used_mb=result.get("memory_used_mb", 0),
+                action_event_json=dumps_action_event(success_event),
                 audit_log=hands_pb2.AuditLog(
                     network_requests=audit_data.get("network_requests", []),
                     file_accesses=audit_data.get("file_accesses", []),
@@ -177,16 +206,34 @@ class HandsServicer:
 
         except asyncio.TimeoutError:
             self.audit.log_complete(exec_id, status="timeout")
+            timeout_event = build_action_event(
+                source="hands.service",
+                action_type=f"{skill_name}.{function_name}",
+                status="timeout",
+                before_state={"command_hash": stable_hash(arguments), "policy_decision": "running"},
+                after_state={"command_hash": stable_hash(arguments), "policy_decision": "timeout"},
+                metadata={"exec_id": exec_id},
+            )
             yield hands_pb2.SkillExecutionResponse(
                 status=hands_pb2.SkillExecutionResponse.Status.TIMEOUT,
                 error=f"Skill execution timed out after {limits['timeout']}s",
+                action_event_json=dumps_action_event(timeout_event),
             )
 
         except Exception as e:
             self.audit.log_complete(exec_id, status="error", error=str(e))
+            error_event = build_action_event(
+                source="hands.service",
+                action_type=f"{skill_name}.{function_name}",
+                status="error",
+                before_state={"command_hash": stable_hash(arguments), "policy_decision": "running"},
+                after_state={"command_hash": stable_hash(arguments), "policy_decision": "error"},
+                metadata={"exec_id": exec_id, "error": str(e)},
+            )
             yield hands_pb2.SkillExecutionResponse(
                 status=hands_pb2.SkillExecutionResponse.Status.ERROR,
                 error=str(e),
+                action_event_json=dumps_action_event(error_event),
             )
 
     async def ListSkills(self, request, context):

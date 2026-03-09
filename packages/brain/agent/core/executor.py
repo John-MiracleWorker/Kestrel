@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -714,6 +715,38 @@ class TaskExecutor:
             progress=self._progress_callback(task),
         )
 
+        # ── Auto-inject display_markdown for media gen tools ─────────
+        # If the tool result contains display_markdown (e.g. image URLs),
+        # inject it directly into the response stream so the user sees the
+        # image without relying on the LLM to include it.
+        if result.success and tool_name in ("vram_generate_image", "generate_media"):
+            try:
+                result_data = json.loads(result.output) if isinstance(result.output, str) else result.output
+                display_md = result_data.get("display_markdown", "") if isinstance(result_data, dict) else ""
+                if display_md:
+                    yield TaskEvent(
+                        type=TaskEventType.STEP_COMPLETE,
+                        task_id=task.id,
+                        step_id=step.id,
+                        content=f"\n\n{display_md}\n",
+                        progress=self._progress_callback(task),
+                    )
+                    # Auto-complete the step so the LLM doesn't try to
+                    # do another round (which would use the cloud fallback)
+                    step.status = StepStatus.COMPLETE
+                    step.result = display_md
+                    step.completed_at = datetime.now(timezone.utc)
+                    # Mark remaining steps as done
+                    for remaining in task.plan.steps:
+                        if remaining.status in (StepStatus.PENDING, StepStatus.IN_PROGRESS) and remaining.id != step.id:
+                            remaining.status = StepStatus.SKIPPED
+                            remaining.result = "Skipped — media delivered"
+                            remaining.completed_at = datetime.now(timezone.utc)
+                    await self._persistence.update_task(task)
+                    return
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                pass  # Non-JSON result, continue normally
+
         if tool_name == "task_complete":
             if self._verifier:
                 summary = tool_args.get("summary", result.output)
@@ -1284,6 +1317,13 @@ class TaskExecutor:
             from agent.tool_selector import ToolSelector
             selector = ToolSelector(self._tools.list_tools())
             is_local = route.provider in ("ollama", "local", "lmstudio")
+            runtime_mode = os.getenv("KESTREL_RUNTIME_MODE", "docker")
+            intent_tags: list[str] = []
+            approval_state = (
+                task.pending_approval.status.value
+                if task.pending_approval and getattr(task.pending_approval, "status", None)
+                else "pending"
+            )
 
             if is_local:
                 # Local models: use instant keyword matching (no extra LLM call)
@@ -1291,6 +1331,9 @@ class TaskExecutor:
                     step_description=step.description,
                     expected_tools=step_expected,
                     provider=route.provider,
+                    runtime_mode=runtime_mode,
+                    intent_tags=intent_tags,
+                    approval_state=approval_state,
                 )
             else:
                 # Cloud models: use LLM picker to save token cost
@@ -1301,6 +1344,9 @@ class TaskExecutor:
                         model=routed_model,
                         api_key=self._api_key,
                         expected_tools=step_expected,
+                        runtime_mode=runtime_mode,
+                        intent_tags=intent_tags,
+                        approval_state=approval_state,
                     )
                 except Exception as e:
                     logger.warning(f"LLM tool selection failed: {e}, using keyword fallback")
@@ -1308,6 +1354,9 @@ class TaskExecutor:
                         step_description=step.description,
                         expected_tools=step_expected,
                         provider=route.provider,
+                        runtime_mode=runtime_mode,
+                        intent_tags=intent_tags,
+                        approval_state=approval_state,
                     )
 
             tool_schemas = [t.to_openai_schema() for t in selected_tools]
@@ -1447,6 +1496,9 @@ class TaskExecutor:
                                 step_description=step.description,
                                 expected_tools=step_expected,
                                 provider=cloud_name,
+                                runtime_mode=runtime_mode,
+                                intent_tags=intent_tags,
+                                approval_state=approval_state,
                             )
                             cloud_schemas = [t.to_openai_schema() for t in cloud_tools]
                         except Exception:

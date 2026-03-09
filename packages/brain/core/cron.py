@@ -39,6 +39,7 @@ async def _run_automation_task(task: AgentTask, source: str = "automation", mode
                 hands_client=runtime.hands_client,
                 vector_store=runtime.vector_store,
                 pool=pool,
+                runtime_policy=runtime.execution_runtime,
             ),
             guardrails=Guardrails(),
             persistence=runtime.agent_persistence,

@@ -16,11 +16,19 @@ No other agent provides this level of decision transparency.
 
 import json
 import logging
+import sys
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any, Optional
+
+_SHARED_PATH = Path(__file__).resolve().parents[2] / "shared"
+if str(_SHARED_PATH) not in sys.path:
+    sys.path.append(str(_SHARED_PATH))
+
+from action_event_schema import normalize_action_event
 
 logger = logging.getLogger("brain.agent.evidence")
 
@@ -37,6 +45,7 @@ class EvidenceType(str, Enum):
     WEB_SEARCH = "web_search"           # From web search results
     PRIOR_DECISION = "prior_decision"   # Reference to an earlier decision
     HEURISTIC = "heuristic"             # Built-in rule or best practice
+    ACTION_EVENT = "action_event"       # Shared action/event payload references
 
 
 class DecisionType(str, Enum):
@@ -169,15 +178,37 @@ class EvidenceChain:
         alternatives: list[str] = None,
     ) -> DecisionRecord:
         """Convenience method for tool selection decisions."""
+        evidence_entries = [{
+            "type": "heuristic",
+            "content": f"Tool args: {json.dumps(args)[:300]}",
+            "source": "tool_registry",
+        }]
+
+        raw_events = []
+        if isinstance(args.get("action_event"), dict):
+            raw_events.append(args["action_event"])
+        if isinstance(args.get("action_events"), list):
+            raw_events.extend([e for e in args["action_events"] if isinstance(e, dict)])
+
+        for payload in raw_events:
+            event = normalize_action_event(payload)
+            refs = {
+                "before": event.get("before_state", {}),
+                "after": event.get("after_state", {}),
+                "status": event.get("status", ""),
+            }
+            evidence_entries.append({
+                "type": "action_event",
+                "content": json.dumps(refs)[:500],
+                "source": event.get("source", tool_name),
+                "relevance": 0.95,
+            })
+
         return self.record_decision(
             decision_type=DecisionType.TOOL_SELECTION,
             description=f"Selected tool: {tool_name}",
             reasoning=reasoning,
-            evidence=[{
-                "type": "heuristic",
-                "content": f"Tool args: {json.dumps(args)[:300]}",
-                "source": "tool_registry",
-            }],
+            evidence=evidence_entries,
             alternatives=[
                 {"tool": t, "reason_rejected": "Less suitable for current context"}
                 for t in (alternatives or [])

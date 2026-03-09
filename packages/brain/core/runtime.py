@@ -31,6 +31,7 @@ class Runtime:
     running_tasks: Dict[str, Any] = field(default_factory=dict)
 
     hands_client: Any = None
+    execution_runtime: Any = None
     cron_scheduler: Any = None
     webhook_handler: Any = None
     memory_graph: Any = None

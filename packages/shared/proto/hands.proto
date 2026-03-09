@@ -57,6 +57,7 @@ message SkillExecutionResponse {
   int32 execution_time_ms = 4;
   int32 memory_used_mb = 5;
   AuditLog audit_log = 6;
+  string action_event_json = 7; // shared action/event schema payload
 }
 
 // Audit log for skill execution
