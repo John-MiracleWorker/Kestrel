@@ -57,6 +57,9 @@ from agent.state_machine import TaskStateMachine
 
 logger = logging.getLogger("brain.agent.loop")
 
+# Feature flag: set USE_LANGGRAPH=true to use the new LangGraph-based engine
+_USE_LANGGRAPH = os.getenv("USE_LANGGRAPH", "false").lower() == "true"
+
 
 def _council_debate_enabled() -> bool:
     """Whether to run the council cross-critique debate round."""
@@ -236,8 +239,49 @@ class AgentLoop:
         """
         Execute an agent task, yielding events as they occur.
 
-        This is the main entry point. It runs the full planning → execution
-        → reflection loop until the task is complete, fails, or is paused.
+        This is the main entry point. When USE_LANGGRAPH=true, delegates
+        to the LangGraph engine. Otherwise, runs the legacy loop.
+        """
+        if _USE_LANGGRAPH:
+            async for event in self._run_langgraph(task):
+                yield event
+            return
+
+        async for event in self._run_legacy(task):
+            yield event
+
+    async def _run_langgraph(self, task: AgentTask) -> AsyncIterator[TaskEvent]:
+        """Execute via the LangGraph state graph engine."""
+        from agent.runtime.engine import LangGraphEngine
+
+        engine = LangGraphEngine(
+            provider=self._provider,
+            tool_registry=self._tools,
+            guardrails=self._guardrails,
+            persistence=self._persistence,
+            model=self._model,
+            api_key=self._api_key,
+            learner=self._learner,
+            checkpoint_manager=self._checkpoints,
+            memory_graph=self._memory_graph,
+            evidence_chain=self._evidence_chain,
+            event_callback=self._event_callback,
+            reflection_engine=self._reflection_engine,
+            model_router=self._model_router,
+            provider_resolver=self._provider_resolver,
+            approval_memory=self._approval_memory,
+            simulator=self._simulator,
+            persona_learner=self._persona_learner,
+            verifier=getattr(self._executor, '_verifier', None),
+        )
+        async for event in engine.run(task):
+            yield event
+
+    async def _run_legacy(self, task: AgentTask) -> AsyncIterator[TaskEvent]:
+        """
+        Legacy execution path — the original ReAct loop.
+
+        Preserved as fallback when USE_LANGGRAPH=false.
         """
         start_time = time.monotonic()
 

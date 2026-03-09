@@ -1,0 +1,13 @@
+{
+    "name": "webpage",
+    "display_name": "Web Page Generator",
+    "description": "Generate self-contained HTML web pages with embedded CSS styling from content or reports",
+    "version": "1.0.0",
+    "author": "Kestrel DeerFlow Integration",
+    "icon": "🌐",
+    "category": "content",
+    "load_on_demand": true,
+    "trigger_keywords": ["webpage", "web page", "html", "website", "landing page"],
+    "context_cost": "low",
+    "dependencies": []
+}

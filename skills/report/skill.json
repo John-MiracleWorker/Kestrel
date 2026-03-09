@@ -1,0 +1,13 @@
+{
+    "name": "report",
+    "display_name": "Report Generator",
+    "description": "Generate structured research reports in markdown format with executive summaries, findings, and source citations",
+    "version": "1.0.0",
+    "author": "Kestrel DeerFlow Integration",
+    "icon": "📊",
+    "category": "content",
+    "load_on_demand": true,
+    "trigger_keywords": ["report", "research report", "summary", "synthesize", "findings"],
+    "context_cost": "medium",
+    "dependencies": []
+}

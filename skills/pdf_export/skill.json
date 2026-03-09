@@ -1,0 +1,13 @@
+{
+    "name": "pdf_export",
+    "display_name": "PDF Export",
+    "description": "Export reports and documents to PDF format using weasyprint for professional document rendering",
+    "version": "1.0.0",
+    "author": "Kestrel DeerFlow Integration",
+    "icon": "📄",
+    "category": "content",
+    "load_on_demand": true,
+    "trigger_keywords": ["pdf", "export pdf", "document", "print"],
+    "context_cost": "low",
+    "dependencies": ["weasyprint"]
+}

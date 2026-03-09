@@ -1,0 +1,13 @@
+{
+    "name": "slides",
+    "display_name": "Slide Deck Generator",
+    "description": "Generate PowerPoint slide decks from research content or structured text using python-pptx",
+    "version": "1.0.0",
+    "author": "Kestrel DeerFlow Integration",
+    "icon": "📽️",
+    "category": "content",
+    "load_on_demand": true,
+    "trigger_keywords": ["slides", "presentation", "powerpoint", "slide deck", "pptx"],
+    "context_cost": "medium",
+    "dependencies": ["python-pptx"]
+}

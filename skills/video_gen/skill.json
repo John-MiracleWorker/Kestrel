@@ -1,0 +1,13 @@
+{
+    "name": "video_gen",
+    "display_name": "Video Generator",
+    "description": "Generate videos from text descriptions, scripts, or images using AI video generation APIs",
+    "version": "1.0.0",
+    "author": "Kestrel DeerFlow Integration",
+    "icon": "🎬",
+    "category": "content",
+    "load_on_demand": true,
+    "trigger_keywords": ["video", "generate video", "create video", "animation"],
+    "context_cost": "high",
+    "dependencies": []
+}
