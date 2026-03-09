@@ -461,7 +461,7 @@ def generate_image_swarmui(
         logger.error(detail)
         return {"success": False, "images": [], "detail": detail}
     except requests.Timeout:
-        detail = f"SwarmUI request timed out after {IMAGE_GEN_TIMEOUT}s."
+        detail = f"SwarmUI request timed out after {timeout}s."
         logger.error(detail)
         return {"success": False, "images": [], "detail": detail}
     except requests.RequestException as exc:
@@ -725,6 +725,11 @@ def generate_image(
             model=swarm_model,
         )
         if is_video:
+            # Wan 2.2 14B is too heavy at 1024x1024 for RTX 4070.
+            # Override to 480p (848x480) which is the model's native resolution.
+            gen_kwargs["width"] = 848
+            gen_kwargs["height"] = 480
+            gen_kwargs["steps"] = video_steps  # Use video-specific steps, not image steps
             gen_kwargs.update(
                 video_model=SWARM_DEFAULT_VIDEO_MODEL,
                 video_frames=video_frames,

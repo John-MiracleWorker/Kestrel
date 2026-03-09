@@ -66,8 +66,8 @@ VRAM_GENERATE_IMAGE_TOOL = ToolDefinition(
         "Generate an AI image or video using the local dual-GPU setup with automatic VRAM "
         "orchestration. This tool unloads the active LLM from VRAM, generates the "
         "media via SwarmUI, then reloads the LLM — preventing out-of-memory crashes. "
-        "For videos, set media_type='video'. Videos are generated as image-to-video "
-        "(the tool first generates a base image, then animates it). "
+        "IMPORTANT: If the user asks for a video, animation, clip, or any moving/animated content, "
+        "you MUST set media_type='video'. Default is 'image' for still pictures. "
         "Set send_telegram=true to also deliver the result to Telegram."
     ),
     parameters={
