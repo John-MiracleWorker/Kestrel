@@ -156,7 +156,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
             },
         );
 
-        const data = await resp.json();
+        const data = await resp.json() as any;
         return {
             messageId: data?.data?.message_id || '',
             chatContext: { userId, conversationId: meta.conversationId },
@@ -221,7 +221,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
             },
         );
 
-        const data = await resp.json();
+        const data = await resp.json() as any;
         if (data.code !== 0) {
             throw new Error(`Feishu auth failed: ${data.msg}`);
         }
@@ -277,7 +277,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
             },
         };
 
-        this.emitMessage(incoming);
+        this.emit('message', incoming);
     }
 
     private scheduleReconnect(): void {
