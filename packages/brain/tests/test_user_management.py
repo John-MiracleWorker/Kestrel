@@ -4,10 +4,8 @@ These test the standalone functions (create_user, authenticate_user)
 with a mocked asyncpg pool.
 """
 
-import hashlib
-import secrets
 import uuid
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 import pytest
 
 
@@ -26,10 +24,10 @@ async def test_create_user_returns_user_dict():
     mock_pool = AsyncMock()
     mock_pool.execute = AsyncMock()
 
-    with patch("server.get_pool", return_value=mock_pool), \
-         patch("server.uuid.uuid4", return_value=uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")):
+    with patch("users.get_pool", return_value=mock_pool), \
+         patch("users.uuid.uuid4", return_value=uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")):
 
-        from server import create_user
+        from users import create_user
         result = await create_user("alice@example.com", "hunter2", "Alice")
 
         assert result["email"] == "alice@example.com"
@@ -44,8 +42,8 @@ async def test_create_user_uses_email_prefix_as_default_name():
     mock_pool = AsyncMock()
     mock_pool.execute = AsyncMock()
 
-    with patch("server.get_pool", return_value=mock_pool):
-        from server import create_user
+    with patch("users.get_pool", return_value=mock_pool):
+        from users import create_user
         result = await create_user("bob@work.co", "secret", "")
 
         # The default display name should be the email prefix
@@ -79,8 +77,8 @@ async def test_authenticate_user_success():
     mock_pool.fetchrow = AsyncMock(return_value=user_row)
     mock_pool.fetch = AsyncMock(return_value=membership_rows)
 
-    with patch("server.get_pool", return_value=mock_pool):
-        from server import authenticate_user
+    with patch("users.get_pool", return_value=mock_pool):
+        from users import authenticate_user
         result = await authenticate_user("alice@example.com", "correct-password")
 
     assert result["id"] == "user-42"
@@ -106,8 +104,8 @@ async def test_authenticate_user_wrong_password():
     mock_pool = AsyncMock()
     mock_pool.fetchrow = AsyncMock(return_value=user_row)
 
-    with patch("server.get_pool", return_value=mock_pool):
-        from server import authenticate_user
+    with patch("users.get_pool", return_value=mock_pool):
+        from users import authenticate_user
         with pytest.raises(ValueError, match="Invalid password"):
             await authenticate_user("test@test.com", "wrong-password")
 
@@ -118,7 +116,7 @@ async def test_authenticate_user_not_found():
     mock_pool = AsyncMock()
     mock_pool.fetchrow = AsyncMock(return_value=None)
 
-    with patch("server.get_pool", return_value=mock_pool):
-        from server import authenticate_user
+    with patch("users.get_pool", return_value=mock_pool):
+        from users import authenticate_user
         with pytest.raises(ValueError, match="User not found"):
             await authenticate_user("nobody@example.com", "any")

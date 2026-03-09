@@ -63,6 +63,7 @@ services:
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       DEFAULT_WORKSPACE_ID: ${DEFAULT_WORKSPACE_ID:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      HOST_MOUNT_ROOT: ${HOST_MOUNT_ROOT:-/Users}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-kestrel}
@@ -118,6 +119,7 @@ services:
       ROUTER_OLLAMA_MODEL: ${ROUTER_OLLAMA_MODEL:-qwen3.5:4b}
       ROUTER_OLLAMA_LARGE_MODEL: ${ROUTER_OLLAMA_LARGE_MODEL:-qwen3.5:4b}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      HOST_MOUNT_ROOT: ${HOST_MOUNT_ROOT:-/Users}
       HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT:-}
     volumes:
       - ${LOCAL_MODEL_DIR:-./models}:/models:ro
@@ -152,6 +154,7 @@ services:
       # This is needed for Docker-in-Docker volume mounts to resolve correctly.
       HOST_SKILLS_DIR: ${HOST_SKILLS_DIR:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      HOST_MOUNT_ROOT: ${HOST_MOUNT_ROOT:-/Users}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${SKILLS_DIR:-./skills}:/skills:ro

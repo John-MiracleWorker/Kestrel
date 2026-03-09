@@ -409,6 +409,16 @@ class Coordinator:
 
         # Build a child loop with filtered tools
         from agent.loop import AgentLoop
+        from agent.core.memory import WorkingMemory
+        
+        # Explicit Context Isolation (Deerflow 2.0 Style)
+        # We give the child loop a completely fresh scratchpad memory
+        # rather than inheriting or sharing the parent's WorkingMemory context.
+        child_memory = WorkingMemory(
+            redis_client=self._loop._memory_graph._redis if hasattr(self._loop, "_memory_graph") and self._loop._memory_graph else None,
+            vector_store=self._loop._memory_graph._vector_store if hasattr(self._loop, "_memory_graph") and self._loop._memory_graph else None,
+        )
+        
         child_loop = AgentLoop(
             provider=self._loop._provider,
             tool_registry=filtered_registry,
@@ -416,6 +426,7 @@ class Coordinator:
             persistence=self._persistence,
             model=self._loop._model,
             learner=self._loop._learner,
+            memory_graph=child_memory,
         )
 
         # Execute child and collect result

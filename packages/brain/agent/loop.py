@@ -719,16 +719,44 @@ class AgentLoop:
             )
 
         except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
             logger.error(f"Agent loop error: {e}", exc_info=True)
+            
             task.status = TaskStatus.FAILED
             task.error = str(e)
-            await self._persistence.update_task(task)
+            try:
+                await self._persistence.update_task(task)
+            except Exception as persist_error:
+                logger.error(f"Failed to persist task FAILED state: {persist_error}")
+                
             yield TaskEvent(
                 type=TaskEventType.TASK_FAILED,
                 task_id=task.id,
-                content=str(e),
+                content=f"Fatal Error: {e}\n\n```python\n{tb}\n```",
                 progress=self._progress(task),
             )
+
+            # ── Auto-Recovery ────────────────────────────────────────────────
+            # If this is not already a recovery task, spawn a coding specialist
+            # to investigate and fix the crash.
+            if "[Auto-Recovery]" not in task.goal and hasattr(self._tools, "_coordinator") and self._tools._coordinator:
+                logger.info(f"Initiating auto-recovery for task {task.id} crash...")
+                recovery_goal = (
+                    f"[Auto-Recovery] The agent loop crashed with an unhandled exception.\n"
+                    f"Please investigate the codebase to find and fix the root cause.\n"
+                    f"Do not ask for human approval unless strictly necessary to test the fix.\n\n"
+                    f"Exception: {e}\n\n"
+                    f"Traceback:\n```python\n{tb}\n```"
+                )
+                asyncio.create_task(
+                    self._tools._coordinator.delegate(
+                        parent_task=task,
+                        goal=recovery_goal,
+                        specialist_type="coder",
+                        max_tokens_override=32000,
+                    )
+                )
 
     async def _transition(self, task: AgentTask, new_status: TaskStatus) -> None:
         """Safely transition task status through the state machine."""

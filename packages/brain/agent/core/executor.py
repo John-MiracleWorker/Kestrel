@@ -851,10 +851,30 @@ class TaskExecutor:
         task: AgentTask,
         step: Any,
     ) -> AsyncIterator[TaskEvent]:
-        observations = "\n".join(
-            f"[{tc.get('tool', '?')}] → {tc.get('result', '?')}"
-            for tc in step.tool_calls
-        ) or "(none yet)"
+        # ── Deerflow 2.0 Aggressive Context Summarization ────────────────
+        if task.iterations > 10 and hasattr(self._tools, "_loop") and hasattr(self._tools._loop, "_reflection"):
+            # If we're deep into a complex task, summarize the observation trace
+            # to prevent blowing out the context window.
+            raw_obs = "\n".join(
+                f"[{tc.get('tool', '?')}] → {tc.get('result', '?')}"
+                for tc in step.tool_calls
+            ) or "(none yet)"
+            
+            try:
+                summary = await self._tools._loop._reflection.reflect(
+                    goal=task.goal,
+                    observations=raw_obs,
+                    plan=json.dumps(task.plan.to_dict()) if task.plan else "",
+                )
+                observations = f"Aggressive Summary (Iter {task.iterations}):\n{summary}"
+            except Exception as e:
+                logger.warning(f"Failed to aggressively summarize context: {e}")
+                observations = raw_obs
+        else:
+            observations = "\n".join(
+                f"[{tc.get('tool', '?')}] → {tc.get('result', '?')}"
+                for tc in step.tool_calls
+            ) or "(none yet)"
 
         done, total = task.plan.progress
 

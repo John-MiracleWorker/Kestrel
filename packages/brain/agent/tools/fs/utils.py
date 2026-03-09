@@ -62,15 +62,20 @@ BLOCKED_EXTENSIONS = {
     ".pem", ".key", ".p12", ".pfx", ".jks",
     ".keystore", ".cert", ".crt",
 }
+def _normalize_path(p: str) -> str:
+    p = str(p).replace('\\', '/')
+    if len(p) >= 2 and p[1] == ':' and p[0].isalpha():
+        p = '/' + p[0] + p[2:]
+    return p
 
 def _get_host_mounts() -> list[str]:
     """Get configured host mount paths from environment."""
     raw = os.getenv("AGENT_HOST_MOUNTS", "")
     if not raw:
         return []
-    return [p.strip() for p in raw.split(",") if p.strip()]
+    return [_normalize_path(p.strip()) for p in raw.split(",") if p.strip()]
 
-_HOST_MOUNT_ROOT = os.getenv("HOST_MOUNT_ROOT", "/Users")
+_HOST_MOUNT_ROOT = _normalize_path(os.getenv("HOST_MOUNT_ROOT", "/Users"))
 
 _CONTAINER_MOUNT_POINT = "/host_fs"
 
@@ -83,6 +88,7 @@ def _host_to_container_path(host_path: str) -> Path:
 
     Example: /Users/tiuni/projects → /host_fs/tiuni/projects
     """
+    host_path = _normalize_path(host_path)
     p = Path(host_path)
     try:
         relative = p.relative_to(_HOST_MOUNT_ROOT)
@@ -129,6 +135,7 @@ def _resolve_host_path(path: str, mounts: list[str]) -> Path:
     Raises ValueError if the path escapes all mount roots.
     Returns the container-internal path (under /host_fs or a builtin path).
     """
+    path = _normalize_path(path)
     target = Path(path).expanduser()
 
     # Allow container-internal paths (e.g. /project volume mount)
