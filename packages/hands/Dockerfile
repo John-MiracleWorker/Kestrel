@@ -9,8 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY packages/hands/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy shared proto files
+# Copy shared proto files and action event schema
 COPY packages/shared/proto/ ../shared/proto/
+COPY packages/shared/action_event_schema.py ../shared/action_event_schema.py
 
 # Copy hands source
 COPY packages/hands/ .

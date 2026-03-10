@@ -1073,7 +1073,10 @@ class TaskExecutor:
         _is_simple_chat = (
             task.messages
             and not step.tool_calls
-            and step.description.startswith("Respond to the user")
+            and (
+                step.description.startswith("Respond to the user")
+                or step.description.startswith("Ask the user")
+            )
         )
 
         if _is_simple_chat:

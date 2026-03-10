@@ -457,7 +457,7 @@ class ToolSelector:
                 if len(selected) >= limit:
                     break
                 name_parts = name.replace("_", " ").split()
-                if any(part in desc_lower for part in name_parts if len(part) > 2):
+                if any(part in desc_lower for part in name_parts if len(part) > 3):
                     selected[name] = tool
 
         self._apply_runtime_scoring(

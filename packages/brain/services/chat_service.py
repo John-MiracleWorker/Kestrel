@@ -226,26 +226,6 @@ class ChatServicerMixin(BaseServicerMixin):
             except Exception as e:
                 logger.warning(f"Failed to read workspace guardrails, using defaults: {e}")
 
-            # Build a task with user-configured guardrails (or sensible defaults)
-            chat_task = AgentTask(
-                user_id=request.user_id,
-                workspace_id=workspace_id,
-                conversation_id=conversation_id,
-                goal=user_content,
-                config=GCfg(
-                    max_iterations=ws_guardrails.get("maxIterations", 40),
-                    max_tool_calls=ws_guardrails.get("maxToolCalls", 80),
-                    max_tokens=ws_guardrails.get("maxTokens", 100_000),
-                    max_wall_time_seconds=ws_guardrails.get("maxWallTime", 600),
-                    auto_approve_risk=_RL(
-                        ws_guardrails.get("autoApproveRisk", "medium")
-                    ),
-                    autonomy_level=_AL(
-                        ws_guardrails.get("autonomyLevel", "balanced")
-                    ),
-                ),
-            )
-
             # Classify request complexity — complex tasks get full planning,
             # simple conversational messages get a single-step shortcut.
             #
@@ -269,6 +249,52 @@ class ChatServicerMixin(BaseServicerMixin):
             is_simple = (
                 word_count <= 6
                 and any(user_lower.startswith(p) or user_lower == p for p in _SIMPLE_PATTERNS)
+            )
+
+            # ── Enrich goal with conversation context ──────────────
+            # The planner only sees `goal` — not the full message history.
+            # For follow-up messages in a thread, prepend a compact summary
+            # of recent conversation turns so the planner understands the
+            # context (e.g., which company was already being discussed).
+            planner_goal = user_content
+            if not is_simple:
+                # Collect recent user/assistant turns from history (excluding
+                # the current message which is already in user_content)
+                history_turns = [
+                    m for m in messages
+                    if m.get("role") in ("user", "assistant")
+                    and m.get("content") != user_content
+                ]
+                # Take the last few turns — enough context without overwhelming
+                recent = history_turns[-6:]
+                if recent:
+                    history_block = "\n".join(
+                        f"{'User' if m['role'] == 'user' else 'Kestrel'}: {m['content'][:300]}"
+                        for m in recent
+                    )
+                    planner_goal = (
+                        f"[Recent conversation context]\n{history_block}\n\n"
+                        f"[Current message]\n{user_content}"
+                    )
+
+            # Build a task with user-configured guardrails (or sensible defaults)
+            chat_task = AgentTask(
+                user_id=request.user_id,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+                goal=planner_goal,
+                config=GCfg(
+                    max_iterations=ws_guardrails.get("maxIterations", 40),
+                    max_tool_calls=ws_guardrails.get("maxToolCalls", 80),
+                    max_tokens=ws_guardrails.get("maxTokens", 100_000),
+                    max_wall_time_seconds=ws_guardrails.get("maxWallTime", 600),
+                    auto_approve_risk=_RL(
+                        ws_guardrails.get("autoApproveRisk", "medium")
+                    ),
+                    autonomy_level=_AL(
+                        ws_guardrails.get("autonomyLevel", "balanced")
+                    ),
+                ),
             )
 
             if is_simple:
