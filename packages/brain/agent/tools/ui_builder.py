@@ -46,6 +46,7 @@ CREATE_UI_TOOL = ToolDefinition(
     risk_level=RiskLevel.LOW,
     timeout_seconds=15,
     category="ui",
+    availability_requirements=("ui_artifact_manager",),
 )
 
 UPDATE_UI_TOOL = ToolDefinition(
@@ -72,6 +73,7 @@ UPDATE_UI_TOOL = ToolDefinition(
     risk_level=RiskLevel.LOW,
     timeout_seconds=15,
     category="ui",
+    availability_requirements=("ui_artifact_manager",),
 )
 
 LIST_UI_TOOL = ToolDefinition(
@@ -81,6 +83,7 @@ LIST_UI_TOOL = ToolDefinition(
     risk_level=RiskLevel.LOW,
     timeout_seconds=10,
     category="ui",
+    availability_requirements=("ui_artifact_manager",),
 )
 
 

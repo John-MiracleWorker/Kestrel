@@ -1,4 +1,4 @@
-"""Tests that tool registration respects feature mode boundaries."""
+"""Tests for dynamic built-in tool registration and preset metadata."""
 
 from unittest.mock import patch, MagicMock
 
@@ -67,20 +67,19 @@ def _build_patchers():
     return patchers
 
 
-def test_core_mode_skips_ops_and_labs_imports():
-    """In CORE mode, only core registration functions are called."""
+def test_core_mode_still_registers_all_builtin_tiers():
+    """Soft presets must not hide built-in tool families."""
     with patch("agent.tools._register_core_tools") as core_mock, \
          patch("agent.tools._register_ops_tools") as ops_mock, \
          patch("agent.tools._register_labs_tools") as labs_mock, \
          patch("agent.tools.set_active_runtime"):
         build_tool_registry(feature_mode="core")
         core_mock.assert_called_once()
-        ops_mock.assert_not_called()
-        labs_mock.assert_not_called()
+        ops_mock.assert_called_once()
+        labs_mock.assert_called_once()
 
 
-def test_ops_mode_registers_core_and_ops():
-    """In OPS mode, core and ops are registered but not labs."""
+def test_ops_mode_still_registers_all_builtin_tiers():
     with patch("agent.tools._register_core_tools") as core_mock, \
          patch("agent.tools._register_ops_tools") as ops_mock, \
          patch("agent.tools._register_labs_tools") as labs_mock, \
@@ -88,7 +87,7 @@ def test_ops_mode_registers_core_and_ops():
         build_tool_registry(feature_mode="ops")
         core_mock.assert_called_once()
         ops_mock.assert_called_once()
-        labs_mock.assert_not_called()
+        labs_mock.assert_called_once()
 
 
 def test_labs_mode_registers_all_tiers():
@@ -103,15 +102,18 @@ def test_labs_mode_registers_all_tiers():
         labs_mock.assert_called_once()
 
 
-def test_bundle_filtering_preserved_after_mode_registration():
-    """Bundle filtering still works on top of mode-based registration."""
+def test_bundle_metadata_preserved_after_full_registration():
+    """Task-profile metadata is still carried on the registry."""
     with patch("agent.tools._register_core_tools") as core_mock, \
+         patch("agent.tools._register_ops_tools") as ops_mock, \
+         patch("agent.tools._register_labs_tools") as labs_mock, \
          patch("agent.tools.set_active_runtime"):
-        # Even with bundles, the core registration should still be called
         registry = build_tool_registry(
             feature_mode="core",
             enabled_bundles=("chat",),
         )
         core_mock.assert_called_once()
+        ops_mock.assert_called_once()
+        labs_mock.assert_called_once()
         assert registry._enabled_bundles == ("chat",)
         assert registry._feature_mode == "core"

@@ -6,7 +6,7 @@ Shared task runtime factory for queued and direct task execution.
 
 from dataclasses import dataclass
 
-from core.feature_mode import enabled_bundles_for_mode, parse_feature_mode
+from core.feature_mode import parse_feature_mode
 from provider_config import ProviderConfig
 from providers_registry import get_provider, resolve_provider
 
@@ -64,14 +64,20 @@ async def build_task_runtime_bundle(
         vector_store=runtime_ctx.vector_store,
         pool=pool,
         runtime_policy=runtime_ctx.execution_runtime,
-        enabled_bundles=tuple(
-            getattr(runtime_ctx, "enabled_tool_bundles", [])
-            or enabled_bundles_for_mode(feature_mode)
-        ),
+        enabled_bundles=tuple(getattr(runtime_ctx, "enabled_tool_bundles", [])),
         feature_mode=feature_mode.value,
     )
     task_tool_registry = filter_registry_for_profile(task_tool_registry, task_profile, feature_mode)
     evidence_chain = EvidenceChain(task_id=task.id, pool=pool)
+
+    bootstrapper = getattr(runtime_ctx, "subsystem_bootstrapper", None)
+    if bootstrapper:
+        skill_manager = await bootstrapper.ensure("skill_manager")
+        if skill_manager:
+            try:
+                await skill_manager.load_workspace_skills(task.workspace_id)
+            except Exception:
+                pass
 
     task_working_memory = WorkingMemory(
         redis_client=None,
@@ -82,15 +88,15 @@ async def build_task_runtime_bundle(
         model=task_model,
         working_memory=task_working_memory,
     )
-    task_reflection = None
-    if feature_mode.value != "core":
-        task_reflection = ReflectionEngine(
-            llm_provider=task_provider,
-            model=task_model,
-        )
+    task_reflection = ReflectionEngine(
+        llm_provider=task_provider,
+        model=task_model,
+    )
 
     task_simulator = None
-    if feature_mode.value == "labs":
+    if bootstrapper:
+        task_simulator = await bootstrapper.ensure("simulation")
+    if task_simulator is None:
         task_simulator = OutcomeSimulator(
             llm_provider=task_provider,
             model=task_model,

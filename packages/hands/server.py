@@ -284,7 +284,7 @@ class HandsServicer:
         active = self.executor.active_sandboxes
         capacity = self.executor.max_concurrent - active
         return hands_pb2.HealthCheckResponse(
-            healthy=True,
+            healthy=self.executor.sandbox_ready,
             version="0.1.0",
             active_sandboxes=active,
             available_capacity=capacity,
@@ -296,6 +296,10 @@ class HandsServicer:
 async def serve():
     # Initialize components
     executor = DockerExecutor()
+    try:
+        await executor.ensure_sandbox_image()
+    except Exception as e:
+        logger.warning(f"Sandbox image bootstrap failed (service will stay degraded): {e}")
     permissions = PermissionChecker()
     audit = AuditLogger()
 

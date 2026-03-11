@@ -38,33 +38,36 @@ def _make_registry() -> ToolRegistry:
     return registry
 
 
-def test_infer_task_profile_clamps_ops_in_core_mode():
-    assert infer_task_profile("set up a cron automation", FeatureMode.CORE) == TaskProfile.CODING
+def test_infer_task_profile_uses_goal_not_mode_gates():
+    assert infer_task_profile("set up a cron automation", FeatureMode.CORE) == TaskProfile.OPS
 
 
-def test_core_chat_profile_uses_small_safe_bundle():
+def test_chat_profile_marks_registry_but_does_not_hide_tools():
     registry = _make_registry()
     filtered = filter_registry_for_profile(registry, TaskProfile.CHAT, FeatureMode.CORE)
     names = {tool.name for tool in filtered.list_tools()}
 
-    assert names == {"ask_human", "task_complete", "memory_search", "system_health"}
+    assert names == {tool.name for tool in registry.list_tools()}
+    assert filtered._task_profile == TaskProfile.CHAT.value
+    assert filtered._enabled_bundles == ("chat",)
 
 
-def test_core_ops_profile_never_leaks_automation_tools():
+def test_ops_profile_preserves_ops_metadata_in_core_preset():
     registry = _make_registry()
     filtered = filter_registry_for_profile(registry, TaskProfile.OPS, FeatureMode.CORE)
     names = {tool.name for tool in filtered.list_tools()}
 
-    assert "code_execute" in names
-    assert "schedule_manage" not in names
-    assert "self_improve" not in names
+    assert "schedule_manage" in names
+    assert "self_improve" in names
+    assert filtered._enabled_bundles == ("chat", "coding", "ops")
 
 
-def test_labs_self_repair_profile_allows_repair_tools():
+def test_self_repair_profile_keeps_repair_bundle_metadata():
     registry = _make_registry()
     filtered = filter_registry_for_profile(registry, TaskProfile.SELF_REPAIR, FeatureMode.LABS)
     names = {tool.name for tool in filtered.list_tools()}
 
     assert "self_improve" in names
     assert "host_read" in names
-    assert "generate_media" not in names
+    assert "generate_media" in names
+    assert filtered._enabled_bundles == ("chat", "coding", "self_repair")

@@ -14,14 +14,18 @@ class SystemServicerMixin(BaseServicerMixin):
         execution_runtime = getattr(runtime, "execution_runtime", None)
         feature_mode = getattr(runtime, "feature_mode", "core")
         enabled_bundles = getattr(runtime, "enabled_tool_bundles", [])
+        catalog = runtime.tool_registry.catalog() if getattr(runtime, "tool_registry", None) else None
+        kernel_registry = getattr(runtime, "kernel_node_registry", None)
+        subsystem_bootstrapper = getattr(runtime, "subsystem_bootstrapper", None)
+        subsystem_health = subsystem_bootstrapper.snapshot() if subsystem_bootstrapper else {}
 
         caps.append(brain_pb2.CapabilityItem(
-            name="Feature Mode",
-            description="Active product-layer runtime mode that determines whether Core, Ops, or Labs systems are initialized.",
+            name="Kernel Preset",
+            description="Active soft preset that seeds adaptive kernel thresholds and routing preferences.",
             status="active",
             category="runtime",
             icon="🧭",
-            stats={"mode": str(feature_mode)},
+            stats={"preset": str(feature_mode)},
         ))
         caps.append(brain_pb2.CapabilityItem(
             name="Execution Runtime",
@@ -35,14 +39,34 @@ class SystemServicerMixin(BaseServicerMixin):
             },
         ))
         caps.append(brain_pb2.CapabilityItem(
-            name="Tool Bundles",
-            description="Allowed tool bundles exposed to the active runtime mode.",
+            name="Capability Catalog",
+            description="Live catalog generated from the active tool registry and subsystem availability.",
             status="active",
             category="runtime",
             icon="🧰",
             stats={
                 "bundles": ", ".join(enabled_bundles) if enabled_bundles else "none",
                 "tool_count": str(len(runtime.tool_registry.list_tools())) if runtime.tool_registry else "0",
+                "catalog_path": getattr(catalog, "markdown_path", ""),
+            },
+        ))
+        caps.append(brain_pb2.CapabilityItem(
+            name="Subsystem Health",
+            description="Lazy subsystem bootstrap status used by adaptive kernel policy and tool selection.",
+            status="active",
+            category="runtime",
+            icon="âš¡",
+            stats=subsystem_health or {"status": "none"},
+        ))
+        caps.append(brain_pb2.CapabilityItem(
+            name="Kernel Playbook",
+            description="Live adaptive-kernel node catalog describing orchestration nodes and activation signals.",
+            status="active" if kernel_registry else "disabled",
+            category="runtime",
+            icon="kernel_playbook",
+            stats={
+                "node_count": str(len(kernel_registry.list_nodes())) if kernel_registry else "0",
+                "playbook_path": getattr(kernel_registry, "markdown_path", ""),
             },
         ))
 

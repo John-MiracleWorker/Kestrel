@@ -45,6 +45,7 @@ async def execute_node(
     """
     task = state["task"]
     plan = state.get("plan") or task.plan
+    kernel_policy = state.get("kernel_policy", {})
     updates: dict[str, Any] = {}
 
     if plan is None:
@@ -76,6 +77,17 @@ async def execute_node(
     # The step scheduler is an async generator that yields TaskEvents.
     # We collect them and forward via event_callback.
     if step_scheduler:
+        try:
+            from agent.model_router import RoutingStrategy
+
+            executor = getattr(step_scheduler, "_executor", None)
+            router = getattr(executor, "_model_router", None) if executor else None
+            strategy_name = kernel_policy.get("routing_strategy", "")
+            if router and strategy_name:
+                router.set_strategy(RoutingStrategy(strategy_name))
+        except Exception:
+            pass
+
         def _should_replan(t):
             """Drift-based replanning check."""
             if not t.plan or t.plan.revision_count >= 3:

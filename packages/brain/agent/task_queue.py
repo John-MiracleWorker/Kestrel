@@ -70,23 +70,49 @@ class WorkspaceAgentStore:
     ) -> WorkspaceAgentProfile:
         memory_namespace = f"workspace:{workspace_id}"
         async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO workspace_agents
-                    (workspace_id, default_mode, autonomy_policy, memory_namespace, tool_policy_bundle, persona_version, runtime_defaults)
-                VALUES ($1, $2, $3, $4, $5::jsonb, 1, '{}'::jsonb)
-                ON CONFLICT (workspace_id) DO UPDATE SET
-                    default_mode = EXCLUDED.default_mode,
-                    autonomy_policy = EXCLUDED.autonomy_policy,
-                    updated_at = now()
-                RETURNING *
-                """,
-                workspace_id,
-                default_mode,
-                autonomy_policy,
-                memory_namespace,
-                json.dumps(["chat", "research", "coding", "ops"]),
-            )
+            try:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO workspace_agents
+                        (
+                            workspace_id,
+                            default_mode,
+                            kernel_preset,
+                            autonomy_policy,
+                            memory_namespace,
+                            tool_policy_bundle,
+                            persona_version,
+                            runtime_defaults,
+                            kernel_policy_json
+                        )
+                    VALUES ($1, $2, $3, $4, $5, $6::jsonb, 1, '{}'::jsonb, '{}'::jsonb)
+                    ON CONFLICT (workspace_id) DO UPDATE SET
+                        updated_at = now()
+                    RETURNING *
+                    """,
+                    workspace_id,
+                    default_mode,
+                    default_mode,
+                    autonomy_policy,
+                    memory_namespace,
+                    json.dumps(["chat", "research", "coding", "ops"]),
+                )
+            except Exception:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO workspace_agents
+                        (workspace_id, default_mode, autonomy_policy, memory_namespace, tool_policy_bundle, persona_version, runtime_defaults)
+                    VALUES ($1, $2, $3, $4, $5::jsonb, 1, '{}'::jsonb)
+                    ON CONFLICT (workspace_id) DO UPDATE SET
+                        updated_at = now()
+                    RETURNING *
+                    """,
+                    workspace_id,
+                    default_mode,
+                    autonomy_policy,
+                    memory_namespace,
+                    json.dumps(["chat", "research", "coding", "ops"]),
+                )
         return WorkspaceAgentProfile.from_record(dict(row))
 
     async def get_by_workspace(self, workspace_id: str) -> Optional[WorkspaceAgentProfile]:
@@ -444,6 +470,7 @@ class JobRunner:
             budgets=task.config.to_dict(),
             permissions={"tool_policy_bundle": list(profile.tool_policy_bundle)},
             autonomy_policy=profile.autonomy_policy,
+            kernel_preset=profile.kernel_preset,
             services={
                 "cron_scheduler": getattr(self.runtime_ctx, "cron_scheduler", None),
                 "automation_builder": getattr(self.runtime_ctx, "automation_builder", None),
@@ -451,6 +478,7 @@ class JobRunner:
                 "policy_engine": getattr(self.runtime_ctx, "policy_engine", None),
                 "ui_manager": getattr(self.runtime_ctx, "ui_artifact_manager", None),
                 "ui_artifact_manager": getattr(self.runtime_ctx, "ui_artifact_manager", None),
+                "subsystem_bootstrapper": getattr(self.runtime_ctx, "subsystem_bootstrapper", None),
             },
         )
         task.execution_context = execution_context

@@ -40,6 +40,7 @@ async def council_node(
     task = state["task"]
     plan = state.get("plan") or task.plan
     plan_complexity = state.get("plan_complexity", 5.0)
+    kernel_policy = state.get("kernel_policy", {})
     updates: dict[str, Any] = {}
 
     if not council or not plan:
@@ -47,7 +48,12 @@ async def council_node(
         return updates
 
     # ── Check if council can be skipped ──────────────────────────
-    if plan_complexity < 7.0:
+    if not kernel_policy.get("use_council", True):
+        updates["needs_council"] = False
+        updates["approval_granted"] = True
+        return updates
+
+    if plan_complexity < float(kernel_policy.get("council_threshold", 7.0)):
         updates["needs_council"] = False
         return updates
 

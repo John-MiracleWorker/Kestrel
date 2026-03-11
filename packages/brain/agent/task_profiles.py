@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from core.feature_mode import FeatureMode, enabled_bundles_for_mode, mode_supports_labs, mode_supports_ops
+from core.feature_mode import FeatureMode
 
 if TYPE_CHECKING:
     from agent.tools import ToolRegistry
@@ -121,20 +121,16 @@ _PROFILE_KEYWORDS: tuple[tuple[TaskProfile, tuple[str, ...]], ...] = (
 
 
 def infer_task_profile(goal: str, feature_mode: FeatureMode) -> TaskProfile:
+    del feature_mode
     text = (goal or "").strip().lower()
     for profile, keywords in _PROFILE_KEYWORDS:
         if any(keyword in text for keyword in keywords):
-            return _clamp_profile(profile, feature_mode)
+            return profile
     return TaskProfile.CHAT
 
 
 def _clamp_profile(profile: TaskProfile, feature_mode: FeatureMode) -> TaskProfile:
-    if profile == TaskProfile.MEDIA and not mode_supports_labs(feature_mode):
-        return TaskProfile.RESEARCH
-    if profile == TaskProfile.SELF_REPAIR and not mode_supports_labs(feature_mode):
-        return TaskProfile.CODING
-    if profile == TaskProfile.OPS and not mode_supports_ops(feature_mode):
-        return TaskProfile.CODING
+    del feature_mode
     return profile
 
 
@@ -152,8 +148,7 @@ def bundles_for_profile(profile: TaskProfile, feature_mode: FeatureMode) -> tupl
         bundles = ("chat", "coding", "self_repair")
     else:
         bundles = ("chat",)
-    mode_bundles = set(enabled_bundles_for_mode(feature_mode))
-    return tuple(bundle for bundle in bundles if bundle in mode_bundles)
+    return bundles
 
 
 def allowed_tool_names_for_bundles(
@@ -185,11 +180,10 @@ def filter_registry_for_profile(
     profile: TaskProfile,
     feature_mode: FeatureMode,
 ) -> "ToolRegistry":
-    filtered = registry.filter(allowed_tool_names_for_profile(registry, profile, feature_mode))
-    filtered._task_profile = profile.value
-    filtered._enabled_bundles = bundles_for_profile(profile, feature_mode)
-    filtered._feature_mode = feature_mode.value
-    return filtered
+    registry._task_profile = profile.value
+    registry._enabled_bundles = bundles_for_profile(profile, feature_mode)
+    registry._feature_mode = feature_mode.value
+    return registry
 
 
 def _tool_allowed_in_bundles(tool: "ToolDefinition", bundle_names: tuple[str, ...] | list[str]) -> bool:

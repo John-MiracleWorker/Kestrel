@@ -58,6 +58,8 @@ GENERATE_MEDIA_TOOL = ToolDefinition(
     risk_level=RiskLevel.LOW,
     timeout_seconds=960,  # 16 min ceiling (video can take 15 min)
     category="media",
+    availability_requirements=("media",),
+    use_cases=("generate images", "generate videos", "render visual concepts"),
 )
 
 VRAM_GENERATE_IMAGE_TOOL = ToolDefinition(
@@ -115,6 +117,8 @@ VRAM_GENERATE_IMAGE_TOOL = ToolDefinition(
     risk_level=RiskLevel.LOW,
     timeout_seconds=960,  # 16 min ceiling (video can take 15 min)
     category="media",
+    availability_requirements=("media",),
+    use_cases=("generate images", "generate videos", "use local VRAM orchestration"),
 )
 
 CHECK_MEDIA_HOST_TOOL = ToolDefinition(
@@ -131,6 +135,7 @@ CHECK_MEDIA_HOST_TOOL = ToolDefinition(
     risk_level=RiskLevel.LOW,
     timeout_seconds=15,
     category="media",
+    use_cases=("check media host health", "inspect GPU queue status"),
 )
 
 
@@ -202,7 +207,11 @@ async def _vram_generate_image_handler(
     # Handle Telegram delivery asynchronously (the sync caller can't await)
     if send_telegram and result.get("file_paths"):
         for fpath in result["file_paths"]:
-            sent = await _send_to_telegram(fpath, prompt)
+            sent = await _send_to_telegram(
+                fpath,
+                prompt,
+                media_type=media_type,
+            )
             if sent:
                 result["telegram_sent"] = True
 
@@ -220,10 +229,15 @@ async def _check_host_handler(**kwargs) -> dict:
 
 def register_media_gen_tools(registry) -> None:
     """Register media generation tools in the agent tool registry."""
-    # Only register vram_generate_image (SwarmUI on port 7801).
-    # generate_media and check_media_host use raw ComfyUI (port 7822)
-    # which is not needed since SwarmUI wraps ComfyUI.
+    registry.register(
+        definition=GENERATE_MEDIA_TOOL,
+        handler=_generate_media_handler,
+    )
     registry.register(
         definition=VRAM_GENERATE_IMAGE_TOOL,
         handler=_vram_generate_image_handler,
+    )
+    registry.register(
+        definition=CHECK_MEDIA_HOST_TOOL,
+        handler=_check_host_handler,
     )

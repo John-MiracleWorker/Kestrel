@@ -39,6 +39,7 @@ BUILD_AUTOMATION_TOOL = ToolDefinition(
     requires_approval=False,
     timeout_seconds=30,
     category="automation",
+    availability_requirements=("automation_builder", "cron_scheduler"),
 )
 
 

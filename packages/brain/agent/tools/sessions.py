@@ -31,6 +31,7 @@ SESSIONS_LIST_TOOL = ToolDefinition(
     requires_approval=False,
     timeout_seconds=10,
     category="sessions",
+    availability_requirements=("session_manager",),
 )
 
 
@@ -72,6 +73,7 @@ SESSIONS_SEND_TOOL = ToolDefinition(
     requires_approval=False,
     timeout_seconds=10,
     category="sessions",
+    availability_requirements=("session_manager",),
 )
 
 
@@ -103,6 +105,7 @@ SESSIONS_HISTORY_TOOL = ToolDefinition(
     requires_approval=False,
     timeout_seconds=10,
     category="sessions",
+    availability_requirements=("session_manager",),
 )
 
 
@@ -127,6 +130,7 @@ SESSIONS_INBOX_TOOL = ToolDefinition(
     requires_approval=False,
     timeout_seconds=10,
     category="sessions",
+    availability_requirements=("session_manager",),
 )
 
 SESSION_TOOLS = [
@@ -180,3 +184,20 @@ async def execute_session_tool(tool_name: str, args: dict, context: dict) -> dic
         return {"success": True, "output": messages}
 
     return {"success": False, "error": f"Unknown session tool: {tool_name}"}
+
+
+def register_sessions_tools(registry) -> None:
+    async def _wrap(tool_name: str, **kwargs) -> dict:
+        return await execute_session_tool(
+            tool_name,
+            kwargs,
+            {
+                "session_manager": kwargs.get("session_manager"),
+                "current_task": kwargs.get("current_task") or getattr(registry, "_current_task", None),
+            },
+        )
+
+    registry.register(SESSIONS_LIST_TOOL, lambda **kwargs: _wrap("sessions_list", **kwargs))
+    registry.register(SESSIONS_SEND_TOOL, lambda **kwargs: _wrap("sessions_send", **kwargs))
+    registry.register(SESSIONS_HISTORY_TOOL, lambda **kwargs: _wrap("sessions_history", **kwargs))
+    registry.register(SESSIONS_INBOX_TOOL, lambda **kwargs: _wrap("sessions_inbox", **kwargs))

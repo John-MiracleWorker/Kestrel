@@ -145,10 +145,13 @@ async def _init_hands_client() -> InitializerResult:
 
 
 async def _init_agent_core(feature_mode: FeatureMode) -> InitializerResult:
+    from agent.automation import CronScheduler
     from agent.checkpoints import CheckpointManager
     from agent.commands import CommandParser
     from agent.core.memory_graph import MemoryGraph
     from agent.guardrails import Guardrails
+    from agent.kernel_policy import KernelPolicyService
+    from agent.kernel_registry import KernelNodeRegistry
     from agent.loop import AgentLoop
     from agent.model_router import ModelRouter
     from agent.observability import MetricsCollector
@@ -156,7 +159,15 @@ async def _init_agent_core(feature_mode: FeatureMode) -> InitializerResult:
     from agent.policy_engine import PolicyEngine
     from agent.persona import PersonaLearner
     from agent.runtime import build_runtime_policy
+    from agent.subsystems import SubsystemBootstrapper
     from agent.sandbox import SandboxManager
+    from agent.simulation import OutcomeSimulator
+    from agent.skills import SkillManager
+    from agent.ui_artifacts import UIArtifactManager
+    from agent.sessions import SessionManager
+    from agent.predictions import TaskPredictor
+    from agent.nl_automation import AutomationBuilder
+    from agent.daemon import DaemonManager
     from agent.task_queue import (
         JobRunner,
         OpportunityEngine,
@@ -185,6 +196,9 @@ async def _init_agent_core(feature_mode: FeatureMode) -> InitializerResult:
     runtime.metrics_collector = MetricsCollector()
     runtime.sandbox_manager = SandboxManager()
     runtime.checkpoint_manager = CheckpointManager(pool=pool)
+    runtime.kernel_policy_service = KernelPolicyService()
+    runtime.kernel_node_registry = KernelNodeRegistry()
+    runtime.subsystem_bootstrapper = SubsystemBootstrapper()
     runtime.workspace_agent_store = WorkspaceAgentStore(pool=pool)
     runtime.task_enqueuer = TaskEnqueuer(pool=pool, workspace_agent_store=runtime.workspace_agent_store)
     runtime.policy_engine = PolicyEngine()
@@ -202,6 +216,68 @@ async def _init_agent_core(feature_mode: FeatureMode) -> InitializerResult:
         lease_seconds=int(os.getenv("TASK_DISPATCHER_LEASE_SECONDS", "300")),
     )
     await runtime.task_dispatcher.start()
+
+    runtime.subsystem_bootstrapper.register(
+        "skill_manager",
+        lambda: SkillManager(pool=pool, tool_registry=runtime.tool_registry),
+    )
+    runtime.subsystem_bootstrapper.register(
+        "simulation",
+        lambda: OutcomeSimulator(provider_resolver=_resolve_default_cloud_provider),
+    )
+    media_available = bool(os.getenv("SWARMUI_BASE_URL") or os.getenv("MEDIA_HOST_URL"))
+    runtime.subsystem_bootstrapper.register(
+        "media",
+        lambda: {"status": "ready"} if media_available else None,
+        eager_instance={"status": "ready"} if media_available else None,
+    )
+    if not media_available:
+        runtime.subsystem_bootstrapper.set_status(
+            "media",
+            "unavailable",
+            error="Media host is not configured",
+        )
+    runtime.subsystem_bootstrapper.register(
+        "session_manager",
+        lambda: SessionManager(pool=pool),
+    )
+    runtime.subsystem_bootstrapper.register(
+        "ui_artifact_manager",
+        lambda: UIArtifactManager(pool=pool),
+    )
+    runtime.subsystem_bootstrapper.register(
+        "task_predictor",
+        lambda: TaskPredictor(
+            pool=pool,
+            memory_graph=runtime.memory_graph,
+            persona_learner=runtime.persona_learner,
+        ),
+    )
+    runtime.subsystem_bootstrapper.register(
+        "automation_builder",
+        lambda: AutomationBuilder(provider_resolver=_resolve_default_cloud_provider),
+    )
+    async def _build_cron_scheduler():
+        scheduler = CronScheduler(pool=pool)
+        await scheduler.start()
+        return scheduler
+
+    runtime.subsystem_bootstrapper.register(
+        "cron_scheduler",
+        _build_cron_scheduler,
+    )
+    runtime.subsystem_bootstrapper.register(
+        "daemon_manager",
+        lambda: DaemonManager(
+            pool=pool,
+            notification_router=getattr(runtime, "notification_router", None),
+            task_launcher=None,
+        ),
+    )
+    runtime.subsystem_bootstrapper.register(
+        "proactive_engine",
+        lambda: None,
+    )
 
     async def _stop_dispatcher() -> None:
         if runtime.task_dispatcher:
@@ -328,6 +404,16 @@ async def _init_labs() -> InitializerResult:
         llm_provider=_resolve_default_cloud_provider(),
         model=os.getenv("PROACTIVE_MODEL", "gemini-2.0-flash"),
     )
+
+    if getattr(runtime, "subsystem_bootstrapper", None):
+        runtime.subsystem_bootstrapper.register("task_predictor", lambda: runtime.task_predictor, eager_instance=runtime.task_predictor)
+        runtime.subsystem_bootstrapper.register("skill_manager", lambda: runtime.skill_manager, eager_instance=runtime.skill_manager)
+        runtime.subsystem_bootstrapper.register("session_manager", lambda: runtime.session_manager, eager_instance=runtime.session_manager)
+        runtime.subsystem_bootstrapper.register("simulation", lambda: runtime.outcome_simulator, eager_instance=runtime.outcome_simulator)
+        runtime.subsystem_bootstrapper.register("ui_artifact_manager", lambda: runtime.ui_artifact_manager, eager_instance=runtime.ui_artifact_manager)
+        runtime.subsystem_bootstrapper.register("automation_builder", lambda: runtime.automation_builder, eager_instance=runtime.automation_builder)
+        runtime.subsystem_bootstrapper.register("daemon_manager", lambda: runtime.daemon_manager, eager_instance=runtime.daemon_manager)
+        runtime.subsystem_bootstrapper.register("proactive_engine", lambda: runtime.proactive_engine, eager_instance=runtime.proactive_engine)
 
     try:
         await runtime.proactive_engine.start()

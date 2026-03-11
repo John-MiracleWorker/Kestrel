@@ -82,6 +82,7 @@ async def run_chat_stream(
     model: str,
     api_key: str,
     full_response_parts: list[str],
+    channel_name: str = "web",
 ) -> AsyncGenerator:
     """Run the agent loop in background and yield response chunks.
 
@@ -121,7 +122,7 @@ async def run_chat_stream(
             await output_queue.put(_SENTINEL)
 
     agent_task_bg = asyncio.create_task(_run_agent_loop())
-    thinking_shown = [False]
+    thinking_shown = {"shown": [False], "channel": channel_name}
 
     try:
         while True:

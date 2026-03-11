@@ -4,6 +4,7 @@ from core.grpc_setup import brain_pb2
 from .base import BaseServicerMixin
 from providers_registry import list_provider_configs, set_provider_config, delete_provider_config
 from core.config import load_tool_catalog, logger
+from core import runtime
 
 class ProviderServicerMixin(BaseServicerMixin):
     async def ListProviderConfigs(self, request, context):
@@ -63,15 +64,18 @@ class ProviderServicerMixin(BaseServicerMixin):
 
     async def ListTools(self, request, context):
         try:
-            tools = load_tool_catalog()
+            if runtime.tool_registry:
+                tools = runtime.tool_registry.catalog().to_dict()
+            else:
+                tools = load_tool_catalog()
             return brain_pb2.ListToolsResponse(
                 tools=[
                     brain_pb2.ToolMetadata(
                         name=tool.get("name", ""),
                         description=tool.get("description", ""),
                         category=tool.get("category", ""),
-                        risk_level=tool.get("riskLevel", "low"),
-                        enabled=bool(tool.get("enabled", True)),
+                        risk_level=tool.get("risk_level", tool.get("riskLevel", "low")),
+                        enabled=bool(tool.get("available", tool.get("enabled", True))),
                     )
                     for tool in tools
                 ]

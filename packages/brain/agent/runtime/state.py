@@ -49,6 +49,8 @@ class KestrelState(TypedDict, total=False):
     plan_complexity: float                 # Complexity score from model_router
     needs_council: bool                    # Whether council review is needed
     approval_granted: Optional[bool]       # Result of human-in-the-loop
+    kernel_policy: dict[str, Any]
+    subsystem_health: dict[str, str]
 
     # ── Supervisor routing ────────────────────────────────────────
     supervisor_route: Optional[str]        # "plan" | "research" | "content"
@@ -105,6 +107,8 @@ def create_initial_state(task: AgentTask) -> KestrelState:
         plan_complexity=0.0,
         needs_council=False,
         approval_granted=None,
+        kernel_policy={},
+        subsystem_health={},
         supervisor_route=None,
         simulation_warning=None,
     )

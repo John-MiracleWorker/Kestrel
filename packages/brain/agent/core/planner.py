@@ -16,6 +16,7 @@ import json
 import logging
 from typing import Optional
 
+from agent.tool_catalog import ToolCatalogIndex
 from agent.types import (
     TaskPlan,
     TaskStep,
@@ -42,8 +43,8 @@ Rules:
    depends_on arrays so they can execute concurrently. Only add a dependency
    when the output of one step is genuinely needed as input for another.
 
-Available tools:
-{tool_descriptions}
+Available capability families:
+{capability_summary}
 
 Output your plan as JSON with this exact schema:
 {{
@@ -86,8 +87,8 @@ Revise the remaining steps. You may add, remove, or modify steps.
 Keep completed step IDs stable. Output the FULL revised plan (including completed steps).
 Use the same JSON schema as before.
 
-Available tools:
-{tool_descriptions}
+Available capability families:
+{capability_summary}
 
 Output ONLY valid JSON."""
 
@@ -118,10 +119,8 @@ class TaskPlanner:
             available_tools: Tools the agent can use
             context: Optional additional context (workspace info, history)
         """
-        tool_descriptions = self._format_tool_descriptions(available_tools)
-
         system_prompt = PLAN_SYSTEM_PROMPT.format(
-            tool_descriptions=tool_descriptions,
+            capability_summary=self._format_tool_descriptions(available_tools),
         )
 
         user_message = f"Goal: {goal}"
@@ -177,7 +176,7 @@ class TaskPlanner:
             completed_steps="\n".join(completed) or "(none)",
             remaining_steps="\n".join(remaining) or "(none)",
             observations=observations,
-            tool_descriptions=self._format_tool_descriptions(available_tools),
+            capability_summary=self._format_tool_descriptions(available_tools),
         )
 
         messages = [
@@ -315,14 +314,6 @@ class TaskPlanner:
         return groups
 
     def _format_tool_descriptions(self, tools: list[ToolDefinition]) -> str:
-        """Format tool list for the planning prompt.
-
-        Uses a compact format (name: short description) to keep the prompt
-        small for local models that reason slowly with large contexts.
-        """
-        lines = []
-        for tool in tools:
-            # Truncate description to keep prompt lean
-            desc = tool.description[:80].rstrip('.')
-            lines.append(f"- {tool.name}: {desc}")
-        return "\n".join(lines)
+        """Return a compact capability-family summary for planning prompts."""
+        catalog = ToolCatalogIndex(tools)
+        return catalog.prompt_capability_summary(limit=12)

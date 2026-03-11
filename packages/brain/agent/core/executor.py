@@ -1368,7 +1368,7 @@ class TaskExecutor:
 
         try:
             from agent.tool_selector import ToolSelector
-            selector = ToolSelector(self._tools.list_tools())
+            selector = ToolSelector(self._tools)
             is_local = route.provider in ("ollama", "local", "lmstudio")
             runtime_mode = os.getenv("KESTREL_RUNTIME_MODE", "docker")
             intent_tags: list[str] = []
@@ -1379,7 +1379,7 @@ class TaskExecutor:
             )
 
             if is_local:
-                # Local models: use instant keyword matching (no extra LLM call)
+                # Local models: use instant local ranking.
                 selected_tools = selector.select(
                     step_description=step.description,
                     expected_tools=step_expected,
@@ -1389,7 +1389,7 @@ class TaskExecutor:
                     approval_state=approval_state,
                 )
             else:
-                # Cloud models: use LLM picker to save token cost
+                # Cloud models use the same local ranking to avoid a second model call.
                 try:
                     selected_tools = await selector.select_with_llm(
                         step_description=step.description,
@@ -1544,7 +1544,7 @@ class TaskExecutor:
                         # Re-select tools with cloud limits (can handle more)
                         try:
                             from agent.tool_selector import ToolSelector
-                            selector = ToolSelector(self._tools.list_tools())
+                            selector = ToolSelector(self._tools)
                             cloud_tools = selector.select(
                                 step_description=step.description,
                                 expected_tools=step_expected,

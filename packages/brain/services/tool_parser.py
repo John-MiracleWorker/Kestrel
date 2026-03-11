@@ -1,6 +1,6 @@
-
 import json
 import logging
+
 from core.grpc_setup import brain_pb2
 
 logger = logging.getLogger("brain.services.tool_parser")
@@ -34,7 +34,7 @@ def _format_tool_result_preview(tool_result: str) -> str:
         items = []
         for key in list(parsed.keys())[:4]:
             if key in ("display_markdown", "instruction"):
-                continue  # Exclude media markdown to prevent duplicate rendering
+                continue
             value = str(parsed[key]).replace("\n", " ")
             items.append(f"{key}={value[:60]}")
         return ", ".join(items)[:200]
@@ -57,8 +57,31 @@ def _build_failure_note(reason: str) -> str:
 
     return f"*(Note: Task stopped before completion: {normalized[:160]})*"
 
-async def parse_agent_event(item, full_response_parts, tool_results_gathered, provider, model, api_key, make_response_fn, thinking_shown=None):
+
+def _extract_channel_and_flag(thinking_shown):
+    """Support both legacy list state and channel-aware dict state."""
+    channel = ""
+    shown_flag = thinking_shown
+    if isinstance(thinking_shown, dict):
+        channel = str(thinking_shown.get("channel", "")).strip().lower()
+        raw_flag = thinking_shown.get("shown")
+        shown_flag = raw_flag if isinstance(raw_flag, list) else None
+    return channel, shown_flag
+
+
+async def parse_agent_event(
+    item,
+    full_response_parts,
+    tool_results_gathered,
+    provider,
+    model,
+    api_key,
+    make_response_fn,
+    thinking_shown=None,
+):
     msg_type, payload = item
+    channel, shown_flag = _extract_channel_and_flag(thinking_shown)
+    verbose_channel = channel != "telegram"
 
     if msg_type == "error":
         yield make_response_fn(chunk_type=3, error_message=payload or "Agent task failed")
@@ -76,14 +99,16 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
             metadata={"agent_status": "thinking", "thinking": event.content[:500]},
         )
         thinking_text = (event.content or "").strip()
-        already_shown = thinking_shown and thinking_shown[0]
-        if thinking_text and not already_shown:
-            # Show full thinking in a collapsible details block
-            formatted = f"\n\n<details><summary>💭 Thinking...</summary>\n\n{thinking_text}\n\n</details>\n\n"
+        already_shown = shown_flag and shown_flag[0]
+        if verbose_channel and thinking_text and not already_shown:
+            formatted = (
+                "\n\n<details><summary>\U0001f4ad Thinking...</summary>\n\n"
+                f"{thinking_text}\n\n</details>\n\n"
+            )
             yield make_response_fn(chunk_type=0, content_delta=formatted)
             full_response_parts.append(formatted)
-            if thinking_shown is not None:
-                thinking_shown[0] = True
+            if shown_flag is not None:
+                shown_flag[0] = True
 
     elif event_type == "tool_called":
         yield make_response_fn(
@@ -94,20 +119,29 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
                 "tool_args": (event.tool_args or "")[:200],
             },
         )
-        tool_display = event.tool_name or "tool"
-        tool_text = f"⚡ Using **{tool_display}**..."
-        if event.tool_args and len(event.tool_args) < 100:
-            try:
-                args_preview = json.loads(event.tool_args)
-                if isinstance(args_preview, dict):
-                    for key in ("goal", "query", "content", "command", "server_name", "url", "specialist"):
-                        if key in args_preview:
-                            tool_text += f" `{args_preview[key][:80]}`"
-                            break
-            except (json.JSONDecodeError, TypeError):
-                pass
-        tool_text += "\n"
-        yield make_response_fn(chunk_type=0, content_delta=tool_text)
+        if verbose_channel:
+            tool_display = event.tool_name or "tool"
+            tool_text = f"\u26a1 Using **{tool_display}**..."
+            if event.tool_args and len(event.tool_args) < 100:
+                try:
+                    args_preview = json.loads(event.tool_args)
+                    if isinstance(args_preview, dict):
+                        for key in (
+                            "goal",
+                            "query",
+                            "content",
+                            "command",
+                            "server_name",
+                            "url",
+                            "specialist",
+                        ):
+                            if key in args_preview:
+                                tool_text += f" `{args_preview[key][:80]}`"
+                                break
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            tool_text += "\n"
+            yield make_response_fn(chunk_type=0, content_delta=tool_text)
 
     elif event_type == "tool_result":
         result_preview = (event.tool_result or "")[:300]
@@ -120,34 +154,39 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
             },
         )
         result_snippet = _format_tool_result_preview(event.tool_result or "")
-        if result_snippet:
-            result_text = f"✓ {event.tool_name}: {result_snippet}\n\n"
+        if verbose_channel and result_snippet:
+            result_text = f"\u2713 {event.tool_name}: {result_snippet}\n\n"
             yield make_response_fn(chunk_type=0, content_delta=result_text)
         if event.tool_result and len(event.tool_result) > 10:
             tool_results_gathered.append(f"**{event.tool_name}**: {event.tool_result[:500]}")
 
     elif event_type == "step_complete":
         if event.content:
-            # Yield the content delta directly — may be a single token
-            # from streaming or a larger chunk from non-streaming paths.
             yield make_response_fn(chunk_type=0, content_delta=event.content)
             full_response_parts.append(event.content)
 
     elif event_type == "approval_needed":
         question = event.content or "The agent needs your input."
-        
+
         if not event.approval_id:
-            # Conversational ask_human
-            approval_text = f"\n\n🤔 **I need your input:**\n\n{question}\n\n*Reply in the chat to continue.*"
+            approval_text = (
+                "\n\n\U0001f914 **I need your input:**\n\n"
+                f"{question}\n\n*Reply in the chat to continue.*"
+            )
+        elif channel == "telegram":
+            approval_text = ""
         else:
-            # Security approval (host_write, mcp_connect, etc.)
-            approval_text = f"\n\n🛡️ **Security Approval Required:**\n\n{question}\n\n*Please use the Approve/Deny buttons in the Task Panel to proceed.*"
-            
-        words = approval_text.split(' ')
-        for i, word in enumerate(words):
-            chunk = word if i == 0 else ' ' + word
-            yield make_response_fn(chunk_type=0, content_delta=chunk)
-        full_response_parts.append(approval_text)
+            approval_text = (
+                "\n\n\U0001f6e1\ufe0f **Security Approval Required:**\n\n"
+                f"{question}\n\n*Please use the Approve/Deny buttons in the Task Panel to proceed.*"
+            )
+
+        if approval_text:
+            words = approval_text.split(" ")
+            for i, word in enumerate(words):
+                chunk = word if i == 0 else " " + word
+                yield make_response_fn(chunk_type=0, content_delta=chunk)
+            full_response_parts.append(approval_text)
         yield make_response_fn(
             chunk_type=0,
             metadata={
@@ -159,22 +198,22 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
         )
 
     elif event_type == "task_complete":
-        joined_response = ''.join(full_response_parts)
+        joined_response = "".join(full_response_parts)
         if event.content and event.content not in joined_response:
-            words = event.content.split(' ')
+            words = event.content.split(" ")
             for i, word in enumerate(words):
-                chunk = word if i == 0 else ' ' + word
+                chunk = word if i == 0 else " " + word
                 yield make_response_fn(chunk_type=0, content_delta=chunk)
             full_response_parts.append(event.content)
 
     elif event_type == "task_failed":
         failure_note = _build_failure_note(event.content or "")
         if full_response_parts:
-            combined = ''.join(full_response_parts)
+            combined = "".join(full_response_parts)
             combined += f"\n\n{failure_note}"
-            words = combined.split(' ')
+            words = combined.split(" ")
             for i, word in enumerate(words):
-                chunk = word if i == 0 else ' ' + word
+                chunk = word if i == 0 else " " + word
                 yield make_response_fn(chunk_type=0, content_delta=chunk)
         elif tool_results_gathered:
             try:
@@ -197,8 +236,6 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
                     yield make_response_fn(chunk_type=0, content_delta=f"\n\n{failure_note}")
                     full_response_parts.append(summary_text)
                 else:
-                    # Send failure as content so user sees an explanation
-                    # instead of a generic "something went wrong" error
                     yield make_response_fn(chunk_type=0, content_delta=failure_note)
                     full_response_parts.append(failure_note)
             except Exception as summary_err:
@@ -206,9 +243,6 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
                 yield make_response_fn(chunk_type=0, content_delta=failure_note)
                 full_response_parts.append(failure_note)
         else:
-            # No prior content and no tool results — send the failure
-            # reason as visible content instead of an ERROR chunk so the
-            # user gets a meaningful message in Telegram / web chat.
             yield make_response_fn(chunk_type=0, content_delta=failure_note)
             full_response_parts.append(failure_note)
 

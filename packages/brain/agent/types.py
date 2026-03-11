@@ -83,6 +83,13 @@ class ToolDefinition:
     timeout_seconds: int = 30
     category: str = "general"        # code, web, file, data, memory, control
     cache_ttl_seconds: int = 0       # 0 = no cache, > 0 = seconds to cache result
+    aliases: tuple[str, ...] = ()
+    use_cases: tuple[str, ...] = ()
+    availability_requirements: tuple[str, ...] = ()
+    source: str = "builtin"          # builtin, skill, generated, mcp
+    scope: str = "global"            # global, workspace, session
+    lifecycle_state: str = "approved"  # draft, approved, disabled, rejected
+    health_check: str = ""           # subsystem or dependency key used for availability checks
 
     def to_openai_schema(self) -> dict:
         """Convert to OpenAI function-calling format."""

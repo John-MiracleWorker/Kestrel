@@ -249,6 +249,8 @@ def build_agent_graph(
     supervisor=None,
     research_graph=None,
     content_graph=None,
+    kernel_policy_service=None,
+    subsystem_bootstrapper=None,
 ):
     """Build the complete agent state graph.
 
@@ -263,6 +265,7 @@ def build_agent_graph(
     from langgraph.graph import END, START, StateGraph
 
     from agent.runtime.nodes.initialize import initialize_node
+    from agent.runtime.nodes.policy import policy_node
     from agent.runtime.nodes.plan import plan_node
     from agent.runtime.nodes.execute import execute_node
     from agent.runtime.nodes.reflect import reflect_node
@@ -279,6 +282,12 @@ def build_agent_graph(
         memory_graph=memory_graph,
         persona_learner=persona_learner,
         event_callback=event_callback,
+    ))
+
+    graph.add_node("policy", functools.partial(
+        policy_node,
+        kernel_policy_service=kernel_policy_service,
+        subsystem_bootstrapper=subsystem_bootstrapper,
     ))
 
     graph.add_node("supervisor", functools.partial(
@@ -354,7 +363,8 @@ def build_agent_graph(
 
     # ── Wire edges ───────────────────────────────────────────────
     graph.add_edge(START, "initialize")
-    graph.add_edge("initialize", "supervisor")
+    graph.add_edge("initialize", "policy")
+    graph.add_edge("policy", "supervisor")
 
     graph.add_conditional_edges("supervisor", _route_after_supervisor, {
         "plan": "plan",

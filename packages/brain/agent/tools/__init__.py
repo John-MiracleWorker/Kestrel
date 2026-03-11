@@ -12,18 +12,27 @@ import logging
 import os
 import re
 import time
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from agent.runtime import set_active_runtime
+from agent.tool_catalog import ToolCatalogIndex
 from agent.types import (
     RiskLevel,
     ToolCall,
     ToolDefinition,
     ToolResult,
 )
-from agent.task_profiles import allowed_tool_names_for_bundles
 
 logger = logging.getLogger("brain.agent.tools")
+
+_SUBSYSTEM_PARAM_ALIASES: dict[str, tuple[str, ...]] = {
+    "automation_builder": ("automation_builder",),
+    "cron_scheduler": ("cron_scheduler",),
+    "daemon_manager": ("daemon_manager",),
+    "session_manager": ("session_manager",),
+    "skill_manager": ("skill_manager",),
+    "ui_artifact_manager": ("ui_artifact_manager", "ui_manager"),
+}
 
 
 class ToolRegistry:
@@ -41,6 +50,7 @@ class ToolRegistry:
         self._feature_mode: str = "core"
         self._enabled_bundles: tuple[str, ...] = ()
         self._task_profile: str | None = None
+        self._catalog: ToolCatalogIndex | None = None
 
     def register(
         self,
@@ -50,7 +60,40 @@ class ToolRegistry:
         """Register a tool with its definition and async handler."""
         self._definitions[definition.name] = definition
         self._handlers[definition.name] = handler
+        self._catalog = None
         logger.info(f"Tool registered: {definition.name} [{definition.risk_level.value}]")
+
+    def register_dynamic(
+        self,
+        definition: ToolDefinition,
+        handler_or_manager: Any,
+    ) -> None:
+        """Register a dynamic skill or generated tool into the live registry."""
+        if callable(handler_or_manager):
+            handler = handler_or_manager
+        elif hasattr(handler_or_manager, "execute_skill"):
+            async def _dynamic_handler(**kwargs):
+                workspace_id = kwargs.get("workspace_id", "")
+                skill_name = definition.name.removeprefix("skill_")
+                result = await handler_or_manager.execute_skill(
+                    skill_name=skill_name,
+                    args=kwargs,
+                    workspace_id=workspace_id,
+                )
+                if hasattr(result, "to_dict"):
+                    return result.to_dict()
+                return {
+                    "success": getattr(result, "success", True),
+                    "output": getattr(result, "output", str(result)),
+                    "error": getattr(result, "error", ""),
+                    "execution_time_ms": getattr(result, "execution_time_ms", 0),
+                }
+
+            handler = _dynamic_handler
+        else:
+            raise TypeError("register_dynamic requires a callable or manager with execute_skill()")
+
+        self.register(definition=definition, handler=handler)
 
     @staticmethod
     def _normalize_tool_name(name: str) -> str:
@@ -73,7 +116,13 @@ class ToolRegistry:
         matches = [
             registered_name
             for registered_name in self._definitions
-            if self._normalize_tool_name(registered_name) == normalized_target
+            if (
+                self._normalize_tool_name(registered_name) == normalized_target
+                or normalized_target in {
+                    self._normalize_tool_name(alias)
+                    for alias in self._definitions[registered_name].aliases
+                }
+            )
         ]
         if len(matches) == 1:
             logger.info("Resolved tool alias '%s' -> '%s'", name, matches[0])
@@ -105,7 +154,48 @@ class ToolRegistry:
         filtered._feature_mode = self._feature_mode
         filtered._enabled_bundles = self._enabled_bundles
         filtered._task_profile = self._task_profile
+        filtered._catalog = None
         return filtered
+
+    def availability_for_tool(self, tool: ToolDefinition) -> tuple[bool, str]:
+        if tool.lifecycle_state != "approved":
+            return False, f"Tool state is {tool.lifecycle_state}"
+
+        requirements = tuple(tool.availability_requirements) + (
+            (tool.health_check,) if tool.health_check else ()
+        )
+        if not requirements:
+            return True, "Available"
+
+        try:
+            from core import runtime as runtime_module
+
+            runtime = runtime_module
+            bootstrapper = getattr(runtime, "subsystem_bootstrapper", None)
+            if bootstrapper:
+                snapshot = bootstrapper.snapshot()
+                for requirement in requirements:
+                    status = bootstrapper.status(requirement)
+                    if status in {"ready", "active", "registered", "initializing"}:
+                        continue
+                    if status == "degraded":
+                        return False, f"{requirement} is degraded"
+                    if status != "unavailable":
+                        return False, f"{requirement} is {status}"
+                    if requirement in snapshot:
+                        return False, f"{requirement} is {status}"
+        except Exception:
+            pass
+
+        return True, "Available"
+
+    def catalog(self) -> ToolCatalogIndex:
+        if self._catalog is None:
+            self._catalog = ToolCatalogIndex(
+                self.list_tools(),
+                availability_resolver=self.availability_for_tool,
+            )
+        return self._catalog
 
     async def execute(self, tool_call: ToolCall, context: dict = None) -> ToolResult:
         """
@@ -131,12 +221,34 @@ class ToolRegistry:
 
         # Merge context into args if handler accepts those kwargs
         merged_args = dict(tool_call.arguments)
+        import inspect
+        sig = inspect.signature(handler)
+        accepts_var_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in sig.parameters.values()
+        )
         if context:
-            import inspect
-            sig = inspect.signature(handler)
             for key, value in context.items():
-                if key in sig.parameters and key not in merged_args:
+                if (key in sig.parameters or accepts_var_kwargs) and key not in merged_args:
                     merged_args[key] = value
+
+        current_task = getattr(self, "_current_task", None)
+        if (
+            current_task is not None
+            and ("current_task" in sig.parameters or accepts_var_kwargs)
+            and "current_task" not in merged_args
+        ):
+            merged_args["current_task"] = current_task
+
+        bootstrapper = merged_args.get("subsystem_bootstrapper")
+        if bootstrapper:
+            for requirement in definition.availability_requirements:
+                service = await bootstrapper.ensure(requirement)
+                if service is None:
+                    continue
+                for param_name in _SUBSYSTEM_PARAM_ALIASES.get(requirement, (requirement,)):
+                    if (param_name in sig.parameters or accepts_var_kwargs) and param_name not in merged_args:
+                        merged_args[param_name] = service
 
         try:
             import asyncio
@@ -250,6 +362,7 @@ class ToolRegistry:
 
 def _register_core_tools(registry, vector_store, native_write_enabled):
     """Register baseline tools available in all modes."""
+    from agent.tools.catalog import register_catalog_tools
     from agent.tools.code import register_code_tools
     from agent.tools.web import register_web_tools
     from agent.tools.files import register_file_tools
@@ -261,6 +374,7 @@ def _register_core_tools(registry, vector_store, native_write_enabled):
     from agent.tools.host_execution import register_host_execution_tools
 
     register_code_tools(registry)
+    register_catalog_tools(registry)
     register_web_tools(registry)
     register_file_tools(registry)
     register_host_file_tools(registry, vector_store=vector_store, enable_write=native_write_enabled)
@@ -275,6 +389,7 @@ def _register_ops_tools(registry, pool):
     """Register OPS-tier tools (automation, integrations, notifications)."""
     from agent.tools.moltbook import register_moltbook_tools
     from agent.tools.moltbook_autonomous import register_moltbook_autonomous_tools
+    from agent.tools.sessions import register_sessions_tools
     from agent.tools.schedule import register_schedule_tools
     from agent.tools.model_swap import register_model_swap_tools
     from agent.tools.telegram_notify import register_telegram_tools
@@ -288,10 +403,12 @@ def _register_ops_tools(registry, pool):
     register_telegram_tools(registry)
     register_mcp_tools(registry, pool=pool)
     register_container_tools(registry)
+    register_sessions_tools(registry)
 
 
 def _register_labs_tools(registry):
     """Register LABS-tier tools (experimental, advanced automation, delegation)."""
+    from agent.tools.create_skill import register_create_skill_tools
     from agent.tools.git import register_git_tools
     from agent.tools.self_improve import register_self_improve_tools
     from agent.tools.scanner import register_scanner_tools
@@ -307,6 +424,7 @@ def _register_labs_tools(registry):
     register_scanner_tools(registry)
     register_computer_use_tools(registry)
     register_media_gen_tools(registry)
+    register_create_skill_tools(registry)
     register_build_automation_tools(registry)
     register_daemon_tools(registry)
     register_time_travel_tools(registry)
@@ -478,11 +596,10 @@ def build_tool_registry(
     feature_mode: str = "core",
 ) -> ToolRegistry:
     """
-    Build the default tool registry with mode-appropriate tools.
+    Build the live tool registry.
 
-    Only imports and registers tool modules that belong to the active
-    feature mode tier (core, ops, labs).  Bundle and task-profile
-    filtering is applied afterward.
+    Feature mode remains as a soft preset label for compatibility. It no longer
+    hides built-in tool families from the runtime.
 
     Args:
         hands_client: Optional Hands gRPC client for sandboxed code execution.
@@ -497,26 +614,14 @@ def build_tool_registry(
 
     native_write_enabled = os.getenv("KESTREL_ENABLE_HOST_WRITE", "false").lower() in {"1", "true", "yes", "on"}
 
-    # Always register core tools
+    # Register the full built-in tool universe. Presets and task profiles are
+    # applied later as ranking hints, not hard visibility gates.
     _register_core_tools(registry, vector_store, native_write_enabled)
-
-    # OPS-tier: automation, integrations, notifications
-    if feature_mode in ("ops", "labs"):
-        _register_ops_tools(registry, pool)
-
-    # LABS-tier: experimental, advanced automation, delegation
-    if feature_mode == "labs":
-        _register_labs_tools(registry)
+    _register_ops_tools(registry, pool)
+    _register_labs_tools(registry)
 
     registry._enabled_bundles = tuple(enabled_bundles or ())
     registry._task_profile = task_profile
-
-    if enabled_bundles:
-        bundle_allowed = allowed_tool_names_for_bundles(registry, tuple(enabled_bundles))
-        registry = registry.filter(bundle_allowed)
-        registry._enabled_bundles = tuple(enabled_bundles)
-        registry._task_profile = task_profile
-        registry._feature_mode = feature_mode
 
     if allowed_tool_names is not None:
         registry = registry.filter(allowed_tool_names)

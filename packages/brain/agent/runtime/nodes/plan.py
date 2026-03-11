@@ -107,6 +107,7 @@ async def plan_node(
     """
     task = state["task"]
     updates: dict[str, Any] = {}
+    kernel_policy = state.get("kernel_policy", {})
 
     logger.info(
         f"plan_node entry: task.messages={len(task.messages) if task.messages else 'None/empty'}, "
@@ -205,7 +206,12 @@ async def plan_node(
     # ── Council gating — mirrors legacy _should_skip_council() ───
     # Threshold: complexity >= 7.0 AND not skippable (no HIGH-risk tools,
     # no security-sensitive keywords).  Complexity < 7.0 always skips.
-    if plan_complexity >= 7.0 and not _should_skip_council(task, plan_complexity, tool_registry):
+    council_threshold = float(kernel_policy.get("council_threshold", 7.0))
+    if (
+        kernel_policy.get("use_council", True)
+        and plan_complexity >= council_threshold
+        and not _should_skip_council(task, plan_complexity, tool_registry)
+    ):
         updates["needs_council"] = True
     else:
         updates["needs_council"] = False
@@ -228,7 +234,8 @@ async def plan_node(
         )
 
     # ── Red-team reflection ──────────────────────────────────────
-    if reflection_engine and len(plan.steps) > 2:
+    reflection_min_steps = int(kernel_policy.get("reflection_min_steps", 3))
+    if reflection_engine and kernel_policy.get("use_reflection", True) and len(plan.steps) >= reflection_min_steps:
         try:
             plan_text = json.dumps(plan.to_dict())
             reflection = await reflection_engine.reflect(
@@ -265,7 +272,13 @@ async def plan_node(
     # When simulation recommends aborting, we preserve legacy semantics:
     # surface SIMULATION_COMPLETE + APPROVAL_NEEDED events and require the
     # user to explicitly override, rather than silently routing to council.
-    if simulator and len(plan.steps) > 1:
+    simulation_threshold = float(kernel_policy.get("simulation_threshold", 7.0))
+    if (
+        simulator
+        and kernel_policy.get("use_simulation", False)
+        and plan_complexity >= simulation_threshold
+        and len(plan.steps) > 1
+    ):
         try:
             sim_result = await simulator.simulate(
                 plan=plan,

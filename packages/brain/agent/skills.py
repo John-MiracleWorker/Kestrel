@@ -54,7 +54,7 @@ SAFE_GLOBALS = {
 class Skill:
     """A user-created tool backed by Python code."""
     id: str
-    workspace_id: str
+    workspace_id: str | None
     name: str
     description: str
     python_code: str
@@ -62,6 +62,8 @@ class Skill:
     risk_level: RiskLevel = RiskLevel.MEDIUM
     created_by: str = ""
     enabled: bool = True
+    scope: str = "global"
+    state: str = "approved"
     usage_count: int = 0
     created_at: str = ""
 
@@ -75,6 +77,10 @@ class Skill:
             requires_approval=self.risk_level == RiskLevel.HIGH,
             timeout_seconds=30,
             category="skill",
+            source="skill",
+            scope=self.scope,
+            lifecycle_state=self.state,
+            use_cases=("extend Kestrel with a custom capability",),
         )
 
 
@@ -91,14 +97,22 @@ class SkillManager:
         self._registry = tool_registry
         self._loaded_skills: dict[str, Skill] = {}
 
+    @staticmethod
+    def _skill_key(workspace_id: str | None, name: str, scope: str) -> str:
+        scope_key = "global" if scope == "global" or not workspace_id else workspace_id
+        return f"{scope_key}:{name}"
+
     async def create_skill(
         self,
-        workspace_id: str,
+        workspace_id: str | None,
         name: str,
         description: str,
         python_code: str,
         parameters: dict,
         created_by: str,
+        *,
+        scope: str = "global",
+        state: str = "approved",
     ) -> tuple[bool, str]:
         """
         Create and register a new skill.
@@ -123,43 +137,66 @@ class SkillManager:
         skill_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
+        workspace_ref = None if scope == "global" else workspace_id
+
         try:
             async with self._pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO agent_skills (id, workspace_id, name, description,
-                        python_code, parameters, risk_level, created_by, created_at)
-                    VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
-                    ON CONFLICT (workspace_id, name) DO UPDATE SET
-                        description = EXCLUDED.description,
-                        python_code = EXCLUDED.python_code,
-                        parameters = EXCLUDED.parameters,
-                        updated_at = now()
-                    """,
-                    skill_id, workspace_id, name, description,
-                    python_code, json.dumps(parameters),
-                    RiskLevel.MEDIUM.value, created_by, now,
-                )
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO agent_skills (id, workspace_id, name, description,
+                            python_code, parameters, risk_level, created_by, created_at, scope, state)
+                        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11)
+                        ON CONFLICT (workspace_id, name) DO UPDATE SET
+                            description = EXCLUDED.description,
+                            python_code = EXCLUDED.python_code,
+                            parameters = EXCLUDED.parameters,
+                            scope = EXCLUDED.scope,
+                            state = EXCLUDED.state,
+                            updated_at = now()
+                        """,
+                        skill_id, workspace_ref, name, description,
+                        python_code, json.dumps(parameters),
+                        RiskLevel.MEDIUM.value, created_by, now, scope, state,
+                    )
+                except Exception:
+                    await conn.execute(
+                        """
+                        INSERT INTO agent_skills (id, workspace_id, name, description,
+                            python_code, parameters, risk_level, created_by, created_at)
+                        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
+                        ON CONFLICT (workspace_id, name) DO UPDATE SET
+                            description = EXCLUDED.description,
+                            python_code = EXCLUDED.python_code,
+                            parameters = EXCLUDED.parameters,
+                            updated_at = now()
+                        """,
+                        skill_id, workspace_id, name, description,
+                        python_code, json.dumps(parameters),
+                        RiskLevel.MEDIUM.value, created_by, now,
+                    )
         except Exception as e:
             return False, f"Failed to persist skill: {e}"
 
         # 5. Register in the tool registry
         skill = Skill(
             id=skill_id,
-            workspace_id=workspace_id,
+            workspace_id=workspace_ref,
             name=name,
             description=description,
             python_code=python_code,
             parameters=parameters,
             created_by=created_by,
+            scope=scope,
+            state=state,
             created_at=now,
         )
-        self._loaded_skills[f"{workspace_id}:{name}"] = skill
+        self._loaded_skills[self._skill_key(workspace_ref, name, scope)] = skill
 
         if self._registry:
             self._registry.register_dynamic(skill.to_tool_definition(), self)
 
-        logger.info(f"Skill created: {name} in workspace {workspace_id}")
+        logger.info("Skill created: %s (scope=%s, workspace=%s)", name, scope, workspace_ref or "global")
         return True, f"Skill '{name}' created and registered successfully."
 
     async def execute_skill(
@@ -169,8 +206,10 @@ class SkillManager:
         workspace_id: str,
     ) -> ToolResult:
         """Execute a skill in a sandboxed environment."""
-        key = f"{workspace_id}:{skill_name}"
-        skill = self._loaded_skills.get(key)
+        skill = (
+            self._loaded_skills.get(self._skill_key(workspace_id, skill_name, "workspace"))
+            or self._loaded_skills.get(self._skill_key(None, skill_name, "global"))
+        )
 
         if not skill or not skill.enabled:
             return ToolResult(
@@ -231,10 +270,22 @@ class SkillManager:
         """Load all skills for a workspace from the database."""
         try:
             async with self._pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT * FROM agent_skills WHERE workspace_id = $1 AND enabled = true",
-                    workspace_id,
-                )
+                try:
+                    rows = await conn.fetch(
+                        """
+                        SELECT *
+                        FROM agent_skills
+                        WHERE enabled = true
+                          AND state = 'approved'
+                          AND (workspace_id = $1 OR workspace_id IS NULL)
+                        """,
+                        workspace_id,
+                    )
+                except Exception:
+                    rows = await conn.fetch(
+                        "SELECT * FROM agent_skills WHERE workspace_id = $1 AND enabled = true",
+                        workspace_id,
+                    )
 
             count = 0
             for row in rows:
@@ -248,9 +299,11 @@ class SkillManager:
                     created_by=row["created_by"],
                     usage_count=row["usage_count"],
                     enabled=row["enabled"],
+                    scope=(row["scope"] if "scope" in row.keys() else ("global" if row["workspace_id"] is None else "workspace")),
+                    state=(row["state"] if "state" in row.keys() else "approved"),
                     created_at=str(row["created_at"]),
                 )
-                self._loaded_skills[f"{workspace_id}:{skill.name}"] = skill
+                self._loaded_skills[self._skill_key(skill.workspace_id, skill.name, skill.scope)] = skill
 
                 if self._registry:
                     self._registry.register_dynamic(skill.to_tool_definition(), self)
@@ -266,9 +319,9 @@ class SkillManager:
     async def list_skills(self, workspace_id: str) -> list[dict]:
         """List all skills for a workspace."""
         return [
-            {"name": s.name, "description": s.description, "usage_count": s.usage_count}
+            {"name": s.name, "description": s.description, "usage_count": s.usage_count, "scope": s.scope, "state": s.state}
             for key, s in self._loaded_skills.items()
-            if key.startswith(f"{workspace_id}:")
+            if key.startswith(f"{workspace_id}:") or key.startswith("global:")
         ]
 
     def _validate_code(self, code: str) -> tuple[bool, str]:

@@ -25,6 +25,16 @@ MAX_QUEUE_SIZE = int(os.getenv("SANDBOX_MAX_QUEUE_SIZE", "50"))
 # Set HOST_SKILLS_DIR to the host-side absolute path so volume mounts work.
 HOST_SKILLS_DIR = os.getenv("HOST_SKILLS_DIR", "")
 CONTAINER_SKILLS_DIR = os.getenv("SKILLS_DIR", "/skills")
+SANDBOX_BUILD_CONTEXT = os.getenv(
+    "SANDBOX_BUILD_CONTEXT",
+    os.path.join(os.path.dirname(__file__), "sandbox"),
+)
+SANDBOX_AUTO_BUILD = os.getenv("SANDBOX_AUTO_BUILD", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 # ── Resource Profiles ─────────────────────────────────────────────────
@@ -68,6 +78,9 @@ class DockerExecutor:
         self._warm_pool_lock = asyncio.Lock()
         # Track workspace volumes
         self._workspace_volumes: set[str] = set()
+        self._sandbox_image_lock = asyncio.Lock()
+        self._sandbox_image_ready = False
+        self._sandbox_image_error: Optional[str] = None
 
     @property
     def active_sandboxes(self) -> int:
@@ -81,6 +94,14 @@ class DockerExecutor:
     def max_concurrent(self) -> int:
         return self._max_concurrent
 
+    @property
+    def sandbox_ready(self) -> bool:
+        return self._sandbox_image_ready
+
+    @property
+    def sandbox_error(self) -> Optional[str]:
+        return self._sandbox_image_error
+
     def _get_client(self):
         """Lazy-load Docker client."""
         if self._docker is None:
@@ -93,6 +114,72 @@ class DockerExecutor:
                 raise RuntimeError("Docker is required for sandboxed execution")
         return self._docker
 
+    async def ensure_sandbox_image(self) -> None:
+        """Ensure the configured sandbox image exists locally."""
+        if self._sandbox_image_ready:
+            return
+
+        async with self._sandbox_image_lock:
+            if self._sandbox_image_ready:
+                return
+
+            client = self._get_client()
+            loop = asyncio.get_event_loop()
+            try:
+                await loop.run_in_executor(None, lambda: self._ensure_sandbox_image_sync(client))
+                self._sandbox_image_ready = True
+                self._sandbox_image_error = None
+            except Exception as exc:
+                self._sandbox_image_error = str(exc)
+                raise
+
+    def _ensure_sandbox_image_sync(self, client) -> None:
+        """Build the sandbox image from the local Dockerfile if it is missing."""
+        try:
+            existing = client.images.list(name=SANDBOX_IMAGE)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to query Docker images for '{SANDBOX_IMAGE}': {exc}") from exc
+
+        if existing:
+            logger.info("Sandbox image ready: %s", SANDBOX_IMAGE)
+            return
+
+        if not SANDBOX_AUTO_BUILD:
+            raise RuntimeError(
+                f"Sandbox image '{SANDBOX_IMAGE}' is missing and auto-build is disabled."
+            )
+
+        if not os.path.isdir(SANDBOX_BUILD_CONTEXT):
+            raise RuntimeError(
+                f"Sandbox image '{SANDBOX_IMAGE}' is missing and build context "
+                f"'{SANDBOX_BUILD_CONTEXT}' does not exist."
+            )
+
+        logger.info(
+            "Sandbox image '%s' not found locally; building from %s",
+            SANDBOX_IMAGE,
+            SANDBOX_BUILD_CONTEXT,
+        )
+        try:
+            image, _build_logs = client.images.build(
+                path=SANDBOX_BUILD_CONTEXT,
+                dockerfile="Dockerfile",
+                tag=SANDBOX_IMAGE,
+                rm=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to build sandbox image '{SANDBOX_IMAGE}' from "
+                f"'{SANDBOX_BUILD_CONTEXT}': {exc}"
+            ) from exc
+
+        image_id = getattr(image, "id", "") or ""
+        logger.info(
+            "Built sandbox image '%s'%s",
+            SANDBOX_IMAGE,
+            f" ({image_id[:12]})" if image_id else "",
+        )
+
     # ── Warm Container Pool ──────────────────────────────────────────
 
     async def initialize_warm_pool(self):
@@ -100,6 +187,7 @@ class DockerExecutor:
         if WARM_POOL_SIZE <= 0:
             return
         try:
+            await self.ensure_sandbox_image()
             client = self._get_client()
             loop = asyncio.get_event_loop()
             for _ in range(WARM_POOL_SIZE):
@@ -259,6 +347,7 @@ class DockerExecutor:
                 start_time = time.time()
 
                 try:
+                    await self.ensure_sandbox_image()
                     client = self._get_client()
                     loop = asyncio.get_event_loop()
 

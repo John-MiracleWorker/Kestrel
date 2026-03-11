@@ -44,11 +44,13 @@ class WorkspaceAgentProfile:
     id: str
     workspace_id: str
     default_mode: str = "ops"
+    kernel_preset: str = "ops"
     autonomy_policy: str = "moderate"
     memory_namespace: str = ""
     tool_policy_bundle: tuple[str, ...] = ()
     persona_version: int = 1
     runtime_defaults: dict[str, Any] = field(default_factory=dict)
+    kernel_policy_json: dict[str, Any] = field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""
 
@@ -56,17 +58,30 @@ class WorkspaceAgentProfile:
     def from_record(cls, row: Any) -> "WorkspaceAgentProfile":
         bundle = row.get("tool_policy_bundle") if isinstance(row, dict) else row["tool_policy_bundle"]
         defaults = row.get("runtime_defaults") if isinstance(row, dict) else row["runtime_defaults"]
+        kernel_policy = (
+            row.get("kernel_policy_json")
+            if isinstance(row, dict)
+            else (row["kernel_policy_json"] if "kernel_policy_json" in row.keys() else None)
+        )
         created_at = row.get("created_at") if isinstance(row, dict) else row["created_at"]
         updated_at = row.get("updated_at") if isinstance(row, dict) else row["updated_at"]
+        default_mode = row.get("default_mode") if isinstance(row, dict) else row["default_mode"]
+        kernel_preset = (
+            row.get("kernel_preset")
+            if isinstance(row, dict)
+            else (row["kernel_preset"] if "kernel_preset" in row.keys() else None)
+        )
         return cls(
             id=str(row["id"]),
             workspace_id=str(row["workspace_id"]),
-            default_mode=row["default_mode"] or "ops",
+            default_mode=default_mode or "ops",
+            kernel_preset=kernel_preset or default_mode or "ops",
             autonomy_policy=row["autonomy_policy"] or "moderate",
             memory_namespace=row["memory_namespace"] or f"workspace:{row['workspace_id']}",
             tool_policy_bundle=tuple(bundle or ()),
             persona_version=int(row["persona_version"] or 1),
             runtime_defaults=_coerce_dict(defaults),
+            kernel_policy_json=_coerce_dict(kernel_policy),
             created_at=_coerce_timestamp(created_at),
             updated_at=_coerce_timestamp(updated_at),
         )
@@ -209,6 +224,7 @@ class ExecutionContext:
     budgets: dict[str, Any] = field(default_factory=dict)
     permissions: dict[str, Any] = field(default_factory=dict)
     autonomy_policy: str = "moderate"
+    kernel_preset: str = "ops"
     cancellation_token: str = ""
     approval_mode: str = "policy"
     services: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
@@ -227,6 +243,7 @@ class ExecutionContext:
         budgets: Optional[dict[str, Any]] = None,
         permissions: Optional[dict[str, Any]] = None,
         autonomy_policy: str = "moderate",
+        kernel_preset: str = "ops",
         cancellation_token: str = "",
         approval_mode: str = "policy",
         services: Optional[dict[str, Any]] = None,
@@ -243,6 +260,7 @@ class ExecutionContext:
             budgets=dict(budgets or {}),
             permissions=dict(permissions or {}),
             autonomy_policy=autonomy_policy,
+            kernel_preset=kernel_preset,
             cancellation_token=cancellation_token,
             approval_mode=approval_mode,
             services=dict(services or {}),

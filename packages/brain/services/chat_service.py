@@ -113,11 +113,9 @@ class ChatServicerMixin(BaseServicerMixin):
 
             # ── 2. Save user message before streaming ──────────────
             if conversation_id:
-                params = dict(request.parameters) if hasattr(request, 'parameters') else {}
-                channel_name = params.get('channel', '') or 'web'
                 await ensure_conversation(
                     conversation_id, workspace_id,
-                    channel=channel_name,
+                    channel=ctx.channel_name,
                 )
                 if ctx.user_content:
                     await save_message(conversation_id, "user", ctx.user_content)
@@ -170,9 +168,15 @@ class ChatServicerMixin(BaseServicerMixin):
             _activity_callback = make_activity_callback(output_queue, self._make_response)
 
             # Load workspace-specific dynamic skills
-            if runtime.skill_manager:
+            skill_manager = getattr(runtime, "skill_manager", None)
+            bootstrapper = getattr(runtime, "subsystem_bootstrapper", None)
+            if skill_manager is None and bootstrapper:
+                skill_manager = await bootstrapper.ensure("skill_manager")
+                if skill_manager is not None:
+                    runtime.skill_manager = skill_manager
+            if skill_manager:
                 try:
-                    skill_count = await runtime.skill_manager.load_workspace_skills(workspace_id)
+                    skill_count = await skill_manager.load_workspace_skills(workspace_id)
                     if skill_count:
                         logger.info(f"Loaded {skill_count} custom skills for workspace")
                         await _activity_callback("skill_activated", {
@@ -201,7 +205,25 @@ class ChatServicerMixin(BaseServicerMixin):
             _provider_resolver = workspace_resolve_provider(ctx.provider_settings)
 
             from agent.loop import AgentLoop
+            from agent.core.reflection import ReflectionEngine
             from agent.guardrails import Guardrails
+            from agent.simulation import OutcomeSimulator
+
+            task_reflection = ReflectionEngine(
+                llm_provider=ctx.provider,
+                model=ctx.model,
+                event_callback=_activity_callback,
+            )
+            task_simulator = None
+            if bootstrapper:
+                task_simulator = await bootstrapper.ensure("simulation")
+            if task_simulator is None:
+                task_simulator = OutcomeSimulator(
+                    llm_provider=ctx.provider,
+                    model=ctx.model,
+                    event_callback=_activity_callback,
+                )
+
             agent_loop = AgentLoop(
                 provider=ctx.provider,
                 tool_registry=tool_registry,
@@ -217,6 +239,9 @@ class ChatServicerMixin(BaseServicerMixin):
                 provider_resolver=_provider_resolver,
                 model_router=chat_model_router,
                 approval_memory=_approval_memory,
+                reflection_engine=task_reflection,
+                simulator=task_simulator,
+                persona_learner=runtime.persona_learner,
             )
 
             # Inject persona context into the system prompt if available
@@ -280,6 +305,7 @@ class ChatServicerMixin(BaseServicerMixin):
             async for chunk in run_chat_stream(
                 agent_loop, chat_task, output_queue, self._make_response,
                 ctx.provider, ctx.model, ctx.api_key, full_response_parts,
+                channel_name=ctx.channel_name,
             ):
                 yield chunk
 

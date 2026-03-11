@@ -1,0 +1,87 @@
+[
+  {
+    "name": "ask_human",
+    "aliases": [],
+    "category": "control",
+    "risk_level": "low",
+    "description": "ask_human",
+    "use_cases": [
+      "ask the user",
+      "finish the task",
+      "pause for approval"
+    ],
+    "source": "builtin",
+    "scope": "global",
+    "state": "approved",
+    "available": true,
+    "availability_reason": "Available"
+  },
+  {
+    "name": "generate_media",
+    "aliases": [],
+    "category": "media",
+    "risk_level": "low",
+    "description": "generate_media",
+    "use_cases": [
+      "generate images",
+      "generate videos",
+      "render visuals"
+    ],
+    "source": "builtin",
+    "scope": "global",
+    "state": "approved",
+    "available": false,
+    "availability_reason": "media is unavailable"
+  },
+  {
+    "name": "search_tool_catalog",
+    "aliases": [],
+    "category": "control",
+    "risk_level": "low",
+    "description": "search_tool_catalog",
+    "use_cases": [
+      "ask the user",
+      "finish the task",
+      "pause for approval"
+    ],
+    "source": "builtin",
+    "scope": "global",
+    "state": "approved",
+    "available": true,
+    "availability_reason": "Available"
+  },
+  {
+    "name": "task_complete",
+    "aliases": [],
+    "category": "control",
+    "risk_level": "low",
+    "description": "task_complete",
+    "use_cases": [
+      "ask the user",
+      "finish the task",
+      "pause for approval"
+    ],
+    "source": "builtin",
+    "scope": "global",
+    "state": "approved",
+    "available": true,
+    "availability_reason": "Available"
+  },
+  {
+    "name": "web_search",
+    "aliases": [],
+    "category": "web",
+    "risk_level": "low",
+    "description": "web_search",
+    "use_cases": [
+      "search the web",
+      "browse pages",
+      "fetch online content"
+    ],
+    "source": "builtin",
+    "scope": "global",
+    "state": "approved",
+    "available": true,
+    "availability_reason": "Available"
+  }
+]

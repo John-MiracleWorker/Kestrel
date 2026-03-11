@@ -47,6 +47,7 @@ import {
  */
 export class TelegramAdapter extends BaseChannelAdapter {
     readonly channelType: ChannelType = 'telegram';
+    private readonly mediaDir = process.env.MEDIA_DIR || '/app/generated_media';
 
     public readonly apiBase: string;
     public pollingActive = false;
@@ -59,6 +60,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
 
     // Active typing indicators per chat
     public typingIntervals = new Map<number, NodeJS.Timeout>();
+    public lastHeartbeatAt = new Map<number, number>();
 
     // Per-chat conversation mode
     public chatModes = new Map<number, 'chat' | 'task'>();
@@ -375,6 +377,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
         if (!chatId) throw new Error(`No chat ID mapped for user ${userId}`);
 
         const threadId = this.userThreadMap.get(userId);
+        this.lastHeartbeatAt.delete(chatId);
 
         // Send placeholder
         const params: Record<string, any> = { chat_id: chatId, text: '🤔 Thinking...' };
@@ -396,8 +399,16 @@ export class TelegramAdapter extends BaseChannelAdapter {
      */
     async sendStreamUpdate(handle: StreamHandle, accumulatedContent: string): Promise<void> {
         const chatId = handle.chatContext.chatId as number;
+        const { textContent, mediaFiles } = this.extractMediaFromMarkdown(accumulatedContent);
+        if (mediaFiles.length > 0 && !textContent.trim()) {
+            return;
+        }
+        const contentToRender = textContent.trim() ? textContent : accumulatedContent;
+        if (!contentToRender.trim()) {
+            return;
+        }
         // Append a blinking cursor to show it's still generating
-        const sanitized = this.sanitizeForTelegram(accumulatedContent);
+        const sanitized = this.sanitizeForTelegram(contentToRender);
         const display = sanitized.length > 4000 ? sanitized.slice(-4000) + '▌' : sanitized + ' ▌';
         try {
             await this.api('editMessageText', {
@@ -439,9 +450,10 @@ export class TelegramAdapter extends BaseChannelAdapter {
         // Match ![alt](/media/filename)
         const mediaRegex = /!\[([^\]]*)\]\((\/media\/[^)]+)\)/g;
         const textContent = content.replace(mediaRegex, (_match, alt: string, url: string) => {
-            // Map /media/filename to the Docker volume path
-            const filename = url.replace('/media/', '');
-            const filePath = path.join('/app/generated_media', filename);
+            // Map /media/filename to the configured shared media directory.
+            const encodedName = url.replace('/media/', '');
+            const filename = path.basename(decodeURIComponent(encodedName));
+            const filePath = path.join(this.mediaDir, filename);
             const ext = path.extname(filename).toLowerCase();
             const type = videoExts.includes(ext) ? 'video' : 'photo';
             mediaFiles.push({ alt: alt || 'Generated media', filePath, type });
@@ -509,6 +521,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
     async sendStreamEnd(handle: StreamHandle, finalContent: string): Promise<void> {
         const chatId = handle.chatContext.chatId as number;
         const threadId = handle.chatContext.threadId as number | undefined;
+        this.lastHeartbeatAt.delete(chatId);
 
         // Stop typing
         this.stopTyping(chatId);
@@ -516,8 +529,8 @@ export class TelegramAdapter extends BaseChannelAdapter {
         // Extract embedded media from markdown before sending text
         const { textContent, mediaFiles } = this.extractMediaFromMarkdown(finalContent);
 
-        // Send the text content (with media markdown stripped)
-        const contentToSend = textContent || finalContent;
+        // Send the text content only; media markdown is uploaded separately.
+        const contentToSend = textContent;
         const sanitizedFinal = this.sanitizeForTelegram(contentToSend);
 
         if (sanitizedFinal.length <= 4000 && sanitizedFinal.trim()) {
@@ -583,59 +596,29 @@ export class TelegramAdapter extends BaseChannelAdapter {
         const chatId = handle.chatContext.chatId as number;
         const threadId = handle.chatContext.threadId as number | undefined;
 
-        let emoji = '⚡';
-        let text = '';
-
-        switch (activity.status) {
-            case 'tool_start':
-                emoji = '🔧';
-                text = `Using **${activity.toolName}**...`;
-                break;
-            case 'tool_end':
-                // Skip end events to avoid spam
-                return;
-            case 'thinking':
-                emoji = '💭';
-                text = activity.thinking
-                    ? `${activity.thinking.slice(0, 120)}${activity.thinking.length > 120 ? '...' : ''}`
-                    : 'Thinking...';
-                break;
-            case 'waiting_approval':
-            case 'waiting_for_human':
-                emoji = '⏳';
-                text = `Needs approval: **${activity.toolName || 'tool action'}**`;
-                break;
-            case 'planning':
-                emoji = '📋';
-                text = 'Planning your request...';
-                break;
-            case 'step_started':
-                emoji = '▶️';
-                text = activity.thinking
-                    ? `${activity.toolName}: ${activity.thinking.slice(0, 100)}`
-                    : activity.toolName || 'Starting next step...';
-                break;
-            case 'calling':
-                emoji = '⚡';
-                text = `Using **${activity.toolName}**...`;
-                break;
-            case 'result':
-                // Skip individual result events to avoid spam — step_complete covers it
-                return;
-            case 'delegation':
-            case 'agent_activity':
-                emoji = '🤝';
-                text = activity.toolName || 'Coordinating...';
-                break;
-            default:
-                // Suppress unknown/internal statuses rather than leaking raw strings
-                return;
+        // Telegram already has a streaming placeholder plus a dedicated
+        // approval message path. Emitting every internal status as a
+        // standalone message creates noisy transcripts, so only keep a
+        // minimal heartbeat when a request has been quiet for a while.
+        if (activity.status !== 'thinking') {
+            return;
         }
+
+        const thinkingText = activity.thinking || '';
+        if (!thinkingText.startsWith('Still working...')) {
+            return;
+        }
+        const now = Date.now();
+        const lastHeartbeat = this.lastHeartbeatAt.get(chatId) || 0;
+        if (now - lastHeartbeat < 60000) {
+            return;
+        }
+        this.lastHeartbeatAt.set(chatId, now);
 
         try {
             const params: Record<string, any> = {
                 chat_id: chatId,
-                text: `${emoji} ${text}`,
+                text: `⏳ ${thinkingText}`,
                 parse_mode: 'Markdown',
                 disable_notification: true,
             };

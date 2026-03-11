@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable, Optional
 
 from core.feature_mode import get_feature_mode, mode_supports_labs, mode_supports_ops
+from core import runtime as runtime_module
 from agent.types import (
     AgentTask,
     ApprovalRequest,
@@ -287,6 +288,8 @@ class AgentLoop:
             simulator=self._simulator,
             persona_learner=self._persona_learner,
             verifier=getattr(self._executor, '_verifier', None),
+            kernel_policy_service=getattr(runtime_module, "kernel_policy_service", None),
+            subsystem_bootstrapper=getattr(runtime_module, "subsystem_bootstrapper", None),
         )
         async for event in engine.run(task):
             yield event

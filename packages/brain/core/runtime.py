@@ -56,6 +56,9 @@ class RuntimeContext:
     sandbox_manager: Any = None
     branch_manager: Any = None
     ui_artifact_manager: Any = None
+    subsystem_bootstrapper: Any = None
+    kernel_policy_service: Any = None
+    kernel_node_registry: Any = None
     feature_mode: str = "core"
     enabled_tool_bundles: list[str] = field(default_factory=list)
     startup_initializers: list[str] = field(default_factory=list)

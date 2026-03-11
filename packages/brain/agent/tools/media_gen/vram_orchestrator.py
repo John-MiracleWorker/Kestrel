@@ -557,9 +557,18 @@ def _save_images(images_data: list, prompt: str, base_url: str = None) -> list[d
 # ── Telegram Delivery ────────────────────────────────────────────────────────
 
 
-async def _send_to_telegram(file_path: str, caption: str) -> bool:
+def _infer_media_type(file_path: str) -> str:
+    ext = Path(file_path).suffix.lower()
+    return "video" if ext in {".mp4", ".webm", ".mov"} else "image"
+
+
+async def _send_to_telegram(
+    file_path: str,
+    caption: str,
+    media_type: Optional[str] = None,
+) -> bool:
     """
-    Send a generated image to Telegram via python-telegram-bot.
+    Send generated media to Telegram via python-telegram-bot.
 
     Returns True on success, False on failure (non-fatal).
     """
@@ -572,15 +581,23 @@ async def _send_to_telegram(file_path: str, caption: str) -> bool:
 
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
         truncated_caption = caption[:1024] if len(caption) > 1024 else caption
+        resolved_media_type = (media_type or _infer_media_type(file_path)).strip().lower()
 
         with open(file_path, "rb") as f:
-            await bot.send_photo(
-                chat_id=int(TELEGRAM_CHAT_ID),
-                photo=f,
-                caption=truncated_caption,
-            )
+            if resolved_media_type == "video":
+                await bot.send_video(
+                    chat_id=int(TELEGRAM_CHAT_ID),
+                    video=f,
+                    caption=truncated_caption,
+                )
+            else:
+                await bot.send_photo(
+                    chat_id=int(TELEGRAM_CHAT_ID),
+                    photo=f,
+                    caption=truncated_caption,
+                )
 
-        logger.info(f"Sent image to Telegram chat {TELEGRAM_CHAT_ID}")
+        logger.info(f"Sent {resolved_media_type} to Telegram chat {TELEGRAM_CHAT_ID}")
         return True
 
     except ImportError:

@@ -57,6 +57,7 @@ DAEMON_CREATE_TOOL = ToolDefinition(
     requires_approval=False,
     timeout_seconds=15,
     category="automation",
+    availability_requirements=("daemon_manager",),
 )
 
 DAEMON_LIST_TOOL = ToolDefinition(
@@ -67,6 +68,7 @@ DAEMON_LIST_TOOL = ToolDefinition(
     requires_approval=False,
     timeout_seconds=10,
     category="automation",
+    availability_requirements=("daemon_manager",),
 )
 
 DAEMON_STOP_TOOL = ToolDefinition(
@@ -86,6 +88,7 @@ DAEMON_STOP_TOOL = ToolDefinition(
     requires_approval=False,
     timeout_seconds=10,
     category="automation",
+    availability_requirements=("daemon_manager",),
 )
 
 

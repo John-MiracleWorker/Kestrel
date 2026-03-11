@@ -42,6 +42,12 @@ CREATE_SKILL_TOOL = ToolDefinition(
                 "type": "object",
                 "description": "JSON Schema describing the expected arguments",
             },
+            "scope": {
+                "type": "string",
+                "enum": ["global", "workspace"],
+                "description": "Where the skill should be available after approval.",
+                "default": "global",
+            },
         },
         "required": ["name", "description", "python_code"],
     },
@@ -49,6 +55,8 @@ CREATE_SKILL_TOOL = ToolDefinition(
     requires_approval=True,
     timeout_seconds=30,
     category="skill",
+    availability_requirements=("skill_manager",),
+    use_cases=("create a new reusable tool", "persist a custom skill", "close a capability gap"),
 )
 
 
@@ -64,14 +72,45 @@ async def execute_create_skill(args: dict, context: dict) -> dict:
     description = args.get("description", "")
     python_code = args.get("python_code", "")
     parameters = args.get("parameters_schema", {"type": "object", "properties": {}})
+    scope = args.get("scope", "global")
 
     success, message = await skill_manager.create_skill(
-        workspace_id=current_task.workspace_id,
+        workspace_id=current_task.workspace_id if scope != "global" else None,
         name=name,
         description=description,
         python_code=python_code,
         parameters=parameters,
         created_by=current_task.user_id,
+        scope=scope,
     )
 
     return {"success": success, "output" if success else "error": message}
+
+
+def register_create_skill_tools(registry) -> None:
+    async def create_skill_handler(
+        name: str,
+        description: str,
+        python_code: str,
+        parameters_schema: dict | None = None,
+        scope: str = "global",
+        skill_manager=None,
+        current_task=None,
+        **kwargs,
+    ) -> dict:
+        context = {
+            "skill_manager": skill_manager,
+            "current_task": current_task or getattr(registry, "_current_task", None),
+        }
+        return await execute_create_skill(
+            {
+                "name": name,
+                "description": description,
+                "python_code": python_code,
+                "parameters_schema": parameters_schema or {"type": "object", "properties": {}},
+                "scope": scope,
+            },
+            context,
+        )
+
+    registry.register(CREATE_SKILL_TOOL, create_skill_handler)

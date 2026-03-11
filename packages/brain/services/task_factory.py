@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from core.config import logger
-from core.feature_mode import FeatureMode, enabled_bundles_for_mode, parse_feature_mode
+from core.feature_mode import FeatureMode, parse_feature_mode
 from core import runtime
 
 from agent.execution_context import ExecutionContext
@@ -134,7 +134,7 @@ async def create_chat_task(request, ctx, workspace_id: str) -> AgentTask:
         vector_store=runtime.vector_store,
         pool=pool,
         runtime_policy=runtime.execution_runtime,
-        enabled_bundles=tuple(getattr(runtime, "enabled_tool_bundles", []) or enabled_bundles_for_mode(feature_mode)),
+        enabled_bundles=tuple(getattr(runtime, "enabled_tool_bundles", [])),
         feature_mode=feature_mode.value,
     )
     tool_registry = filter_registry_for_profile(tool_registry, task_profile, feature_mode)
@@ -151,6 +151,7 @@ async def create_chat_task(request, ctx, workspace_id: str) -> AgentTask:
         budgets=chat_task.config.to_dict(),
         permissions={"tool_policy_bundle": list(agent_profile.tool_policy_bundle)},
         autonomy_policy=agent_profile.autonomy_policy,
+        kernel_preset=agent_profile.kernel_preset,
         services={
             "cron_scheduler": runtime.cron_scheduler,
             "automation_builder": getattr(runtime, "automation_builder", None),
@@ -158,6 +159,7 @@ async def create_chat_task(request, ctx, workspace_id: str) -> AgentTask:
             "policy_engine": getattr(runtime, "policy_engine", None),
             "ui_manager": getattr(runtime, "ui_artifact_manager", None),
             "ui_artifact_manager": getattr(runtime, "ui_artifact_manager", None),
+            "subsystem_bootstrapper": getattr(runtime, "subsystem_bootstrapper", None),
         },
     )
 

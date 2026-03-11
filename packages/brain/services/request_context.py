@@ -24,6 +24,7 @@ class ChatRequestContext:
     provider_settings: dict
     messages: list[dict]
     user_content: str
+    channel_name: str
 
 
 async def build_request_context(request, workspace_id: str) -> ChatRequestContext:
@@ -31,6 +32,8 @@ async def build_request_context(request, workspace_id: str) -> ChatRequestContex
     pool = await get_pool()
     r = await get_redis()
     ws_config = await ProviderConfig(pool).get_config(workspace_id)
+    params = dict(request.parameters) if hasattr(request, "parameters") else {}
+    channel_name = params.get("channel", "") or "web"
     provider_name = request.provider or ws_config["provider"]
     model = request.model or ws_config["model"]
 
@@ -85,4 +88,5 @@ async def build_request_context(request, workspace_id: str) -> ChatRequestContex
         provider_settings=provider_settings,
         messages=messages,
         user_content=user_content,
+        channel_name=channel_name,
     )

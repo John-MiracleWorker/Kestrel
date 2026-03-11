@@ -55,6 +55,8 @@ class LangGraphEngine:
         simulator=None,
         persona_learner=None,
         verifier=None,
+        kernel_policy_service=None,
+        subsystem_bootstrapper=None,
     ):
         self._provider = provider
         self._tool_registry = tool_registry
@@ -74,6 +76,8 @@ class LangGraphEngine:
         self._simulator = simulator
         self._persona_learner = persona_learner
         self._verifier = verifier
+        self._kernel_policy_service = kernel_policy_service
+        self._subsystem_bootstrapper = subsystem_bootstrapper
 
         # Lazy-build these on first run
         self._graph = None
@@ -164,6 +168,8 @@ class LangGraphEngine:
             executor=self._executor,
             step_scheduler=self._step_scheduler,
             planner=self._planner,
+            kernel_policy_service=self._kernel_policy_service,
+            subsystem_bootstrapper=self._subsystem_bootstrapper,
             checkpointer=checkpointer,
         )
 
