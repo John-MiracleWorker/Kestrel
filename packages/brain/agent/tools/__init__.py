@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from typing import Callable, Dict, Optional
 
@@ -51,17 +52,47 @@ class ToolRegistry:
         self._handlers[definition.name] = handler
         logger.info(f"Tool registered: {definition.name} [{definition.risk_level.value}]")
 
+    @staticmethod
+    def _normalize_tool_name(name: str) -> str:
+        """Normalize a tool name for resilient lookup across minor format variants."""
+        return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+    def _resolve_tool_name(self, name: str) -> str | None:
+        """Resolve incoming tool names to registered canonical names.
+
+        Prefers exact matches, then falls back to normalized matching
+        (e.g. mcp_call -> mcpcall, system_health -> systemhealth).
+        """
+        if name in self._definitions:
+            return name
+
+        normalized_target = self._normalize_tool_name(name)
+        if not normalized_target:
+            return None
+
+        matches = [
+            registered_name
+            for registered_name in self._definitions
+            if self._normalize_tool_name(registered_name) == normalized_target
+        ]
+        if len(matches) == 1:
+            logger.info("Resolved tool alias '%s' -> '%s'", name, matches[0])
+            return matches[0]
+        return None
+
     def list_tools(self) -> list[ToolDefinition]:
         """Return all registered tool definitions."""
         return list(self._definitions.values())
 
     def get_tool(self, name: str) -> Optional[ToolDefinition]:
         """Get a tool definition by name."""
-        return self._definitions.get(name)
+        resolved_name = self._resolve_tool_name(name)
+        return self._definitions.get(resolved_name) if resolved_name else None
 
     def get_risk_level(self, name: str) -> RiskLevel:
         """Get the risk level for a tool."""
-        tool = self._definitions.get(name)
+        resolved_name = self._resolve_tool_name(name)
+        tool = self._definitions.get(resolved_name) if resolved_name else None
         return tool.risk_level if tool else RiskLevel.HIGH  # Unknown = HIGH
 
     def filter(self, allowed_names: list[str]) -> "ToolRegistry":
@@ -86,7 +117,8 @@ class ToolRegistry:
             context: Optional context dict (e.g. workspace_id) to inject
                      into the handler kwargs if the handler accepts them.
         """
-        handler = self._handlers.get(tool_call.name)
+        resolved_name = self._resolve_tool_name(tool_call.name)
+        handler = self._handlers.get(resolved_name) if resolved_name else None
         if not handler:
             return ToolResult(
                 tool_call_id=tool_call.id,
@@ -94,7 +126,7 @@ class ToolRegistry:
                 error=f"Unknown tool: {tool_call.name}",
             )
 
-        definition = self._definitions[tool_call.name]
+        definition = self._definitions[resolved_name]
         start = time.monotonic()
 
         # Merge context into args if handler accepts those kwargs
@@ -121,12 +153,12 @@ class ToolRegistry:
                     # Create deterministic cache key (workspace-scoped to prevent cross-workspace leaks)
                     args_json = json.dumps(merged_args, sort_keys=True)
                     ws_id = merged_args.get("workspace_id", "global")
-                    key_base = f"{tool_call.name}:{ws_id}:{args_json}"
+                    key_base = f"{resolved_name}:{ws_id}:{args_json}"
                     cache_key = f"tool_cache:{hashlib.sha256(key_base.encode()).hexdigest()}"
                     
                     cached_data = await redis_client.get(cache_key)
                     if cached_data:
-                        logger.debug(f"Cache hit for tool {tool_call.name}")
+                        logger.debug(f"Cache hit for tool {resolved_name}")
                         parsed = json.loads(cached_data)
                         return ToolResult(
                             tool_call_id=tool_call.id,
@@ -136,7 +168,7 @@ class ToolRegistry:
                             execution_time_ms=0,
                         )
                 except Exception as e:
-                    logger.warning(f"Failed to check tool cache for {tool_call.name}: {e}")
+                    logger.warning(f"Failed to check tool cache for {resolved_name}: {e}")
             # -------------------
 
             result = await asyncio.wait_for(
@@ -190,14 +222,14 @@ class ToolRegistry:
                         json.dumps(cache_payload)
                     )
                 except Exception as e:
-                    logger.warning(f"Failed to set tool cache for {tool_call.name}: {e}")
+                    logger.warning(f"Failed to set tool cache for {resolved_name}: {e}")
             # -------------------
             
             return tool_result
 
         except asyncio.TimeoutError:
             elapsed_ms = int((time.monotonic() - start) * 1000)
-            logger.warning(f"Tool {tool_call.name} timed out after {definition.timeout_seconds}s")
+            logger.warning(f"Tool {resolved_name} timed out after {definition.timeout_seconds}s")
             return ToolResult(
                 tool_call_id=tool_call.id,
                 success=False,
@@ -207,7 +239,7 @@ class ToolRegistry:
 
         except Exception as e:
             elapsed_ms = int((time.monotonic() - start) * 1000)
-            logger.error(f"Tool {tool_call.name} error: {e}", exc_info=True)
+            logger.error(f"Tool {resolved_name} error: {e}", exc_info=True)
             return ToolResult(
                 tool_call_id=tool_call.id,
                 success=False,
