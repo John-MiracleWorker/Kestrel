@@ -14,6 +14,33 @@ from agent.runtime.native_runtime import NativeRuntime
 logger = logging.getLogger("brain.agent.runtime.policy")
 
 
+def _should_fallback_to_native(*, language: Any, docker_result: dict[str, Any]) -> bool:
+    """Return True when hybrid mode should retry code execution on native runtime.
+
+    This is intentionally narrow: only fallback for supported languages when the
+    Docker execution path failed due to sandbox/container availability issues.
+    """
+    if language not in {"python", "javascript", "shell"}:
+        return False
+
+    if docker_result.get("success") is True:
+        return False
+
+    error_text = str(docker_result.get("error", "")).lower()
+    if not error_text:
+        return False
+
+    fallback_signals = (
+        "pull access denied",
+        "image",
+        "not found",
+        "hands service is not connected",
+        "no such container",
+        "manifest unknown",
+    )
+    return any(signal in error_text for signal in fallback_signals)
+
+
 @dataclass
 class HybridRuntime:
     """Hybrid runtime that can route requests to docker or native backends."""
@@ -42,7 +69,21 @@ class HybridRuntime:
         if tool_name == "code_execute":
             language = payload.get("language")
             if self.docker.capabilities.supports_docker_execution:
-                return await self.docker.execute(tool_name=tool_name, payload=payload)
+                docker_result = await self.docker.execute(tool_name=tool_name, payload=payload)
+                if _should_fallback_to_native(language=language, docker_result=docker_result):
+                    logger.warning(
+                        "Docker code execution failed with sandbox/runtime error; "
+                        "falling back to native execution for language=%s",
+                        language,
+                    )
+                    native_result = await self.native.execute(tool_name=tool_name, payload=payload)
+                    native_result.setdefault("warnings", [])
+                    native_result["warnings"].append(
+                        "Docker runtime unavailable; executed via native runtime fallback."
+                    )
+                    native_result.setdefault("docker_error", docker_result.get("error", ""))
+                    return native_result
+                return docker_result
             if language in {"python", "javascript", "shell"}:
                 return await self.native.execute(tool_name=tool_name, payload=payload)
 
