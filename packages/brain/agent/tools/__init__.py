@@ -216,34 +216,8 @@ class ToolRegistry:
             )
 
 
-def build_tool_registry(
-    hands_client=None,
-    vector_store=None,
-    pool=None,
-    runtime_policy=None,
-    *,
-    enabled_bundles: tuple[str, ...] | list[str] | None = None,
-    allowed_tool_names: list[str] | None = None,
-    task_profile: str | None = None,
-    feature_mode: str = "core",
-) -> ToolRegistry:
-    """
-    Build the default tool registry with all built-in tools.
-    Called during server startup.
-
-    Args:
-        hands_client: Optional Hands gRPC client for sandboxed code execution.
-            If provided, code execution routes through the Hands service.
-            If None, code execution will fail safely with an error message.
-        vector_store: Optional VectorStore for memory tools.
-        runtime_policy: Active runtime policy used by execution-oriented tools.
-    """
-    registry = ToolRegistry()
-    registry._feature_mode = feature_mode
-
-    set_active_runtime(runtime_policy)
-
-    # Import and register all built-in tools
+def _register_core_tools(registry, vector_store, native_write_enabled):
+    """Register baseline tools available in all modes."""
     from agent.tools.code import register_code_tools
     from agent.tools.web import register_web_tools
     from agent.tools.files import register_file_tools
@@ -251,14 +225,8 @@ def build_tool_registry(
     from agent.tools.data import register_data_tools
     from agent.tools.memory import register_memory_tools
     from agent.tools.human import register_human_tools
-    from agent.tools.moltbook import register_moltbook_tools
-    from agent.tools.moltbook_autonomous import register_moltbook_autonomous_tools
-    from agent.tools.schedule import register_schedule_tools
     from agent.tools.system_tools import register_system_tools
     from agent.tools.host_execution import register_host_execution_tools
-
-    native_write_enabled = os.getenv("KESTREL_ENABLE_HOST_WRITE", "false").lower() in {"1", "true", "yes", "on"}
-    native_exec_enabled = os.getenv("KESTREL_ENABLE_HOST_EXEC", "false").lower() in {"1", "true", "yes", "on"}
 
     register_code_tools(registry)
     register_web_tools(registry)
@@ -267,51 +235,46 @@ def build_tool_registry(
     register_data_tools(registry)
     register_memory_tools(registry, vector_store=vector_store)
     register_human_tools(registry)
-    register_moltbook_tools(registry)
-    register_moltbook_autonomous_tools(registry)
-    register_schedule_tools(registry)
     register_system_tools(registry)
     register_host_execution_tools(registry)
 
-    # Model swap (search + switch models across Ollama & cloud providers)
+
+def _register_ops_tools(registry, pool):
+    """Register OPS-tier tools (automation, integrations, notifications)."""
+    from agent.tools.moltbook import register_moltbook_tools
+    from agent.tools.moltbook_autonomous import register_moltbook_autonomous_tools
+    from agent.tools.schedule import register_schedule_tools
     from agent.tools.model_swap import register_model_swap_tools
-    register_model_swap_tools(registry)
-
-    # Telegram direct messaging (used by cron jobs and agent tasks)
     from agent.tools.telegram_notify import register_telegram_tools
-    register_telegram_tools(registry)
-
-    # MCP discovery + management tools
     from agent.tools.mcp import register_mcp_tools
-    register_mcp_tools(registry, pool=pool)
-
-    # Self-improvement + git tools
-    from agent.tools.git import register_git_tools
-    from agent.tools.self_improve import register_self_improve_tools
-    register_git_tools(registry)
-    register_self_improve_tools(registry)
-
-    # Sub-agent codebase scanner (LLM-powered deep analysis)
-    from agent.tools.scanner import register_scanner_tools
-    register_scanner_tools(registry)
-
-    # Container control (inspect and manage Compose services)
     from agent.tools.container_control import register_container_tools
+
+    register_moltbook_tools(registry)
+    register_moltbook_autonomous_tools(registry)
+    register_schedule_tools(registry)
+    register_model_swap_tools(registry)
+    register_telegram_tools(registry)
+    register_mcp_tools(registry, pool=pool)
     register_container_tools(registry)
 
-    # Computer Use (Gemini desktop control)
+
+def _register_labs_tools(registry):
+    """Register LABS-tier tools (experimental, advanced automation, delegation)."""
+    from agent.tools.git import register_git_tools
+    from agent.tools.self_improve import register_self_improve_tools
+    from agent.tools.scanner import register_scanner_tools
     from agent.tools.computer_use import register_computer_use_tools
-    register_computer_use_tools(registry)
-
-    # Remote media generation (SwarmUI/ComfyUI on LAN GPU host)
     from agent.tools.media_gen import register_media_gen_tools
-    register_media_gen_tools(registry)
-
-    # Labs-grade automation and UI authoring
     from agent.tools.build_automation import register_build_automation_tools
     from agent.tools.daemon_control import register_daemon_tools
     from agent.tools.time_travel import register_time_travel_tools
     from agent.tools.ui_builder import register_ui_builder_tools
+
+    register_git_tools(registry)
+    register_self_improve_tools(registry)
+    register_scanner_tools(registry)
+    register_computer_use_tools(registry)
+    register_media_gen_tools(registry)
     register_build_automation_tools(registry)
     register_daemon_tools(registry)
     register_time_travel_tools(registry)
@@ -325,7 +288,6 @@ def build_tool_registry(
         LIST_SPECIALISTS_TOOL,
         REMOVE_SPECIALIST_TOOL,
     )
-    from agent.coordinator import Coordinator
 
     # Coordinator is lazily initialized — needs the agent loop reference
     # which is set after the registry is built
@@ -470,6 +432,49 @@ def build_tool_registry(
         return coordinator.remove_specialist(type_key=type_key)
 
     registry.register(definition=REMOVE_SPECIALIST_TOOL, handler=remove_specialist_handler)
+
+
+def build_tool_registry(
+    hands_client=None,
+    vector_store=None,
+    pool=None,
+    runtime_policy=None,
+    *,
+    enabled_bundles: tuple[str, ...] | list[str] | None = None,
+    allowed_tool_names: list[str] | None = None,
+    task_profile: str | None = None,
+    feature_mode: str = "core",
+) -> ToolRegistry:
+    """
+    Build the default tool registry with mode-appropriate tools.
+
+    Only imports and registers tool modules that belong to the active
+    feature mode tier (core, ops, labs).  Bundle and task-profile
+    filtering is applied afterward.
+
+    Args:
+        hands_client: Optional Hands gRPC client for sandboxed code execution.
+        vector_store: Optional VectorStore for memory tools.
+        runtime_policy: Active runtime policy used by execution-oriented tools.
+        feature_mode: One of "core", "ops", "labs".
+    """
+    registry = ToolRegistry()
+    registry._feature_mode = feature_mode
+
+    set_active_runtime(runtime_policy)
+
+    native_write_enabled = os.getenv("KESTREL_ENABLE_HOST_WRITE", "false").lower() in {"1", "true", "yes", "on"}
+
+    # Always register core tools
+    _register_core_tools(registry, vector_store, native_write_enabled)
+
+    # OPS-tier: automation, integrations, notifications
+    if feature_mode in ("ops", "labs"):
+        _register_ops_tools(registry, pool)
+
+    # LABS-tier: experimental, advanced automation, delegation
+    if feature_mode == "labs":
+        _register_labs_tools(registry)
 
     registry._enabled_bundles = tuple(enabled_bundles or ())
     registry._task_profile = task_profile
