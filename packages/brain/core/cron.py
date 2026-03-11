@@ -1,10 +1,12 @@
 import asyncio
 from typing import Any
 from .config import logger
+from .feature_mode import enabled_bundles_for_mode, parse_feature_mode
 from . import runtime
 from providers_registry import get_provider, resolve_provider
 from provider_config import ProviderConfig
 from agent.loop import AgentLoop
+from agent.task_profiles import TaskProfile, filter_registry_for_profile
 from agent.tools import build_tool_registry
 from agent.types import AgentTask, GuardrailConfig as GCfg
 from agent.guardrails import Guardrails
@@ -17,6 +19,7 @@ async def launch_task_from_automation(workspace_id: str, user_id: str, goal: str
         goal=goal,
         config=GCfg(),
     )
+    task.task_profile = TaskProfile.OPS.value
     if runtime.agent_persistence:
         await runtime.agent_persistence.save_task(task)
     logger.info(f"Automation task started: {task.id} — {goal} (source: {source})")
@@ -31,16 +34,21 @@ async def _run_automation_task(task: AgentTask, source: str = "automation", mode
         ws_config = await ProviderConfig(pool).get_config(task.workspace_id)
         provider_name = ws_config.get("provider", "local")
         task_provider = get_provider(provider_name)
+        feature_mode = parse_feature_mode(getattr(runtime, "feature_mode", "core"))
+        task_tool_registry = build_tool_registry(
+            hands_client=runtime.hands_client,
+            vector_store=runtime.vector_store,
+            pool=pool,
+            runtime_policy=runtime.execution_runtime,
+            enabled_bundles=tuple(getattr(runtime, "enabled_tool_bundles", []) or enabled_bundles_for_mode(feature_mode)),
+            feature_mode=feature_mode.value,
+        )
+        task_tool_registry = filter_registry_for_profile(task_tool_registry, TaskProfile.OPS, feature_mode)
         
         task_loop = AgentLoop(
             provider=task_provider,
             model=model_override or ws_config.get("model", ""),
-            tool_registry=build_tool_registry(
-                hands_client=runtime.hands_client,
-                vector_store=runtime.vector_store,
-                pool=pool,
-                runtime_policy=runtime.execution_runtime,
-            ),
+            tool_registry=task_tool_registry,
             guardrails=Guardrails(),
             persistence=runtime.agent_persistence,
             memory_graph=runtime.memory_graph,
@@ -237,4 +245,3 @@ async def bootstrap_moltbook_cron(pool: Any) -> None:
             logger.info(f"Bootstrapped Moltbook autonomous cron job for {created} workspace(s)")
     except Exception as e:
         logger.warning(f"Moltbook cron bootstrap failed (non-fatal): {e}")
-

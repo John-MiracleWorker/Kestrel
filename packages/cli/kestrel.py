@@ -71,7 +71,7 @@ def c(text: str, color: str) -> str:
 # ── Configuration ────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
-    "api_url": "http://localhost:3000",
+    "api_url": "http://localhost:8741",
     "api_key": "",
     "workspace_id": "",
     "model": "gpt-4o",

@@ -6,6 +6,8 @@ function schemas. The registry handles execution dispatch, timeout enforcement,
 and result formatting.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import time
@@ -18,6 +20,7 @@ from agent.types import (
     ToolDefinition,
     ToolResult,
 )
+from agent.task_profiles import allowed_tool_names_for_bundles
 
 logger = logging.getLogger("brain.agent.tools")
 
@@ -34,6 +37,9 @@ class ToolRegistry:
     def __init__(self):
         self._definitions: Dict[str, ToolDefinition] = {}
         self._handlers: Dict[str, Callable] = {}
+        self._feature_mode: str = "core"
+        self._enabled_bundles: tuple[str, ...] = ()
+        self._task_profile: str | None = None
 
     def register(
         self,
@@ -65,6 +71,9 @@ class ToolRegistry:
             if name in self._definitions:
                 filtered._definitions[name] = self._definitions[name]
                 filtered._handlers[name] = self._handlers[name]
+        filtered._feature_mode = self._feature_mode
+        filtered._enabled_bundles = self._enabled_bundles
+        filtered._task_profile = self._task_profile
         return filtered
 
     async def execute(self, tool_call: ToolCall, context: dict = None) -> ToolResult:
@@ -207,7 +216,17 @@ class ToolRegistry:
             )
 
 
-def build_tool_registry(hands_client=None, vector_store=None, pool=None, runtime_policy=None) -> ToolRegistry:
+def build_tool_registry(
+    hands_client=None,
+    vector_store=None,
+    pool=None,
+    runtime_policy=None,
+    *,
+    enabled_bundles: tuple[str, ...] | list[str] | None = None,
+    allowed_tool_names: list[str] | None = None,
+    task_profile: str | None = None,
+    feature_mode: str = "core",
+) -> ToolRegistry:
     """
     Build the default tool registry with all built-in tools.
     Called during server startup.
@@ -220,6 +239,7 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None, runtime
         runtime_policy: Active runtime policy used by execution-oriented tools.
     """
     registry = ToolRegistry()
+    registry._feature_mode = feature_mode
 
     set_active_runtime(runtime_policy)
 
@@ -286,6 +306,16 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None, runtime
     # Remote media generation (SwarmUI/ComfyUI on LAN GPU host)
     from agent.tools.media_gen import register_media_gen_tools
     register_media_gen_tools(registry)
+
+    # Labs-grade automation and UI authoring
+    from agent.tools.build_automation import register_build_automation_tools
+    from agent.tools.daemon_control import register_daemon_tools
+    from agent.tools.time_travel import register_time_travel_tools
+    from agent.tools.ui_builder import register_ui_builder_tools
+    register_build_automation_tools(registry)
+    register_daemon_tools(registry)
+    register_time_travel_tools(registry)
+    register_ui_builder_tools(registry)
 
     # Multi-agent delegation tools (including dynamic specialist management)
     from agent.tools.delegate import (
@@ -440,6 +470,22 @@ def build_tool_registry(hands_client=None, vector_store=None, pool=None, runtime
         return coordinator.remove_specialist(type_key=type_key)
 
     registry.register(definition=REMOVE_SPECIALIST_TOOL, handler=remove_specialist_handler)
+
+    registry._enabled_bundles = tuple(enabled_bundles or ())
+    registry._task_profile = task_profile
+
+    if enabled_bundles:
+        bundle_allowed = allowed_tool_names_for_bundles(registry, tuple(enabled_bundles))
+        registry = registry.filter(bundle_allowed)
+        registry._enabled_bundles = tuple(enabled_bundles)
+        registry._task_profile = task_profile
+        registry._feature_mode = feature_mode
+
+    if allowed_tool_names is not None:
+        registry = registry.filter(allowed_tool_names)
+        registry._enabled_bundles = tuple(enabled_bundles or ())
+        registry._task_profile = task_profile
+        registry._feature_mode = feature_mode
 
     logger.info(f"Tool registry built: {len(registry._definitions)} tools")
     return registry

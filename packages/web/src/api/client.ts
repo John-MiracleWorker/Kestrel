@@ -4,9 +4,8 @@
 
 import { isTauri } from '@tauri-apps/api/core';
 
-// In Tauri, the app runs on a custom protocol (tauri://) and there is no /api proxy,
-// so we must send requests directly to the Gateway's host-exposed port (3000).
-const BASE_URL = isTauri() ? 'http://localhost:3000/api' : '/api';
+const GATEWAY_ORIGIN = 'http://localhost:8741';
+const BASE_URL = isTauri() ? `${GATEWAY_ORIGIN}/api` : '/api';
 
 type RequestOptions = {
     method?: string;
@@ -395,7 +394,7 @@ export const webhooks = {
 // ── WebSocket ───────────────────────────────────────────────────────
 export function createChatSocket(): WebSocket {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = isTauri() ? 'ws://localhost:3000/ws' : `${protocol}//${window.location.host}/ws`;
+    const wsUrl = isTauri() ? 'ws://localhost:8741/ws' : `${protocol}//${window.location.host}/ws`;
     const ws = new WebSocket(wsUrl);
     ws.addEventListener('open', () => {
         ws.send(JSON.stringify({ type: 'auth', token: accessToken }));

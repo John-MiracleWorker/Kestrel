@@ -3,10 +3,14 @@ import json
 import logging
 import grpc
 from core.grpc_setup import brain_pb2
+from core.feature_mode import enabled_bundles_for_mode, parse_feature_mode
 from .base import BaseServicerMixin
 from core import runtime
+from agent.task_profiles import TaskProfile, filter_registry_for_profile, infer_task_profile
 from db import get_pool, get_redis
 from providers_registry import get_provider, resolve_provider
+
+logger = logging.getLogger("brain.services.agent")
 
 class AgentServicerMixin(BaseServicerMixin):
     async def StartTask(self, request, context):
@@ -50,6 +54,9 @@ class AgentServicerMixin(BaseServicerMixin):
             conversation_id=request.conversation_id or None,
             config=config,
         )
+        feature_mode = parse_feature_mode(getattr(runtime, "feature_mode", "core"))
+        task_profile = infer_task_profile(goal, feature_mode)
+        task.task_profile = task_profile.value
 
         # Save to DB
         await runtime.agent_persistence.save_task(task)
@@ -95,7 +102,14 @@ class AgentServicerMixin(BaseServicerMixin):
         task_model = ws_config.get("model", "") if ws_config else ""
         task_api_key = ws_config.get("api_key", "") if ws_config else ""
 
-        task_tool_registry = build_tool_registry(hands_client=runtime.hands_client, pool=pool, runtime_policy=runtime.execution_runtime)
+        task_tool_registry = build_tool_registry(
+            hands_client=runtime.hands_client,
+            pool=pool,
+            runtime_policy=runtime.execution_runtime,
+            enabled_bundles=tuple(getattr(runtime, "enabled_tool_bundles", []) or enabled_bundles_for_mode(feature_mode)),
+            feature_mode=feature_mode.value,
+        )
+        task_tool_registry = filter_registry_for_profile(task_tool_registry, task_profile, feature_mode)
         evidence_chain = EvidenceChain(task_id=task.id, pool=pool)
 
         task_working_memory = WorkingMemory(
@@ -107,16 +121,20 @@ class AgentServicerMixin(BaseServicerMixin):
             model=task_model,
             working_memory=task_working_memory,
         )
-        task_reflection = ReflectionEngine(
-            llm_provider=task_provider,
-            model=task_model,
-        )
+        task_reflection = None
+        if feature_mode.value != "core":
+            task_reflection = ReflectionEngine(
+                llm_provider=task_provider,
+                model=task_model,
+            )
 
         # Build simulation gate and verifier engine
-        task_simulator = OutcomeSimulator(
-            llm_provider=task_provider,
-            model=task_model,
-        )
+        task_simulator = None
+        if feature_mode.value == "labs":
+            task_simulator = OutcomeSimulator(
+                llm_provider=task_provider,
+                model=task_model,
+            )
         task_verifier = VerifierEngine(
             provider=task_provider,
             model=task_model,
@@ -379,6 +397,8 @@ class AgentServicerMixin(BaseServicerMixin):
             conversation_id=None,
             config=config,
         )
+        feature_mode = parse_feature_mode(getattr(runtime, "feature_mode", "core"))
+        task.task_profile = TaskProfile.OPS.value
 
         await runtime.agent_persistence.save_task(task)
         logger.info(f"Headless task started: {task.id} — {goal[:50]}...")
@@ -407,13 +427,20 @@ class AgentServicerMixin(BaseServicerMixin):
 
         task_model = ws_config.get("model", "") if ws_config else ""
         task_api_key = ws_config.get("api_key", "") if ws_config else ""
-        task_tool_registry = build_tool_registry(hands_client=runtime.hands_client, pool=pool, runtime_policy=runtime.execution_runtime)
+        task_tool_registry = build_tool_registry(
+            hands_client=runtime.hands_client,
+            pool=pool,
+            runtime_policy=runtime.execution_runtime,
+            enabled_bundles=tuple(getattr(runtime, "enabled_tool_bundles", []) or enabled_bundles_for_mode(feature_mode)),
+            feature_mode=feature_mode.value,
+        )
+        task_tool_registry = filter_registry_for_profile(task_tool_registry, TaskProfile.OPS, feature_mode)
         evidence_chain = EvidenceChain(task_id=task.id, pool=pool)
 
         task_working_memory = WorkingMemory(redis_client=None, vector_store=runtime.vector_store)
         task_learner = TaskLearner(provider=task_provider, model=task_model, working_memory=task_working_memory)
-        task_reflection = ReflectionEngine(llm_provider=task_provider, model=task_model)
-        task_simulator = OutcomeSimulator(llm_provider=task_provider, model=task_model)
+        task_reflection = None if feature_mode.value == "core" else ReflectionEngine(llm_provider=task_provider, model=task_model)
+        task_simulator = OutcomeSimulator(llm_provider=task_provider, model=task_model) if feature_mode.value == "labs" else None
         task_verifier = VerifierEngine(provider=task_provider, model=task_model)
 
         def custom_provider_checker(name: str) -> bool:
@@ -492,4 +519,3 @@ class AgentServicerMixin(BaseServicerMixin):
             error=error_msg,
             iterations=iterations
         )
-

@@ -8,6 +8,7 @@
         "build": "tsc && vite build",
         "lint": "echo 'No JavaScript files to lint in web; run typecheck/build for TypeScript validation.'",
         "preview": "vite preview",
+        "typecheck": "tsc --noEmit",
         "test:e2e": "playwright test"
     },
     "dependencies": {

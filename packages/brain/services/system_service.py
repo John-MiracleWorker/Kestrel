@@ -11,6 +11,41 @@ class SystemServicerMixin(BaseServicerMixin):
         """Return status of all agent subsystems for the UI."""
         caps = []
 
+        execution_runtime = getattr(runtime, "execution_runtime", None)
+        feature_mode = getattr(runtime, "feature_mode", "core")
+        enabled_bundles = getattr(runtime, "enabled_tool_bundles", [])
+
+        caps.append(brain_pb2.CapabilityItem(
+            name="Feature Mode",
+            description="Active product-layer runtime mode that determines whether Core, Ops, or Labs systems are initialized.",
+            status="active",
+            category="runtime",
+            icon="🧭",
+            stats={"mode": str(feature_mode)},
+        ))
+        caps.append(brain_pb2.CapabilityItem(
+            name="Execution Runtime",
+            description="Active execution backend used by code and host tools.",
+            status="active" if execution_runtime else "disabled",
+            category="runtime",
+            icon="⚙️",
+            stats={
+                key: str(value)
+                for key, value in (execution_runtime.capabilities.as_dict() if execution_runtime else {}).items()
+            },
+        ))
+        caps.append(brain_pb2.CapabilityItem(
+            name="Tool Bundles",
+            description="Allowed tool bundles exposed to the active runtime mode.",
+            status="active",
+            category="runtime",
+            icon="🧰",
+            stats={
+                "bundles": ", ".join(enabled_bundles) if enabled_bundles else "none",
+                "tool_count": str(len(runtime.tool_registry.list_tools())) if runtime.tool_registry else "0",
+            },
+        ))
+
         # Intelligence subsystems
         caps.append(brain_pb2.CapabilityItem(
             name="Memory Graph",
@@ -246,4 +281,3 @@ class SystemServicerMixin(BaseServicerMixin):
             version="0.1.0",
             status=status,
         )
-

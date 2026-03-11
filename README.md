@@ -96,6 +96,8 @@ cd Kestrel
 # 2. Set up your secrets (Don't skip this or Kestrel gets cranky)
 cp .env.example .env
 code .env # Add your API keys and secure passwords
+# Default recovery profile keeps the product layer in Core mode.
+# Change KESTREL_FEATURE_MODE only when you explicitly want Ops or Labs features.
 
 # 3. Fire it all up
 docker compose up -d --build
@@ -141,6 +143,7 @@ cp config/startup/native-hybrid.env.example config/startup/native-hybrid.env
 
 - `screen-agent` is enabled by default.
 - Native runtime is selected.
+- Feature mode defaults to `core`.
 - Docker-heavy subsystems are optional.
 - Native write/exec tools are disabled by default until policy is configured.
 

@@ -27,6 +27,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable, Optional
 
+from core.feature_mode import get_feature_mode, mode_supports_labs, mode_supports_ops
 from agent.types import (
     AgentTask,
     ApprovalRequest,
@@ -64,6 +65,18 @@ _USE_LANGGRAPH = os.getenv("USE_LANGGRAPH", "false").lower() == "true"
 def _council_debate_enabled() -> bool:
     """Whether to run the council cross-critique debate round."""
     return os.getenv("COUNCIL_INCLUDE_DEBATE", "false").lower() == "true"
+
+
+def _feature_mode_allows_reflection() -> bool:
+    return mode_supports_ops(get_feature_mode())
+
+
+def _feature_mode_allows_simulation() -> bool:
+    return mode_supports_labs(get_feature_mode())
+
+
+def _feature_mode_allows_council() -> bool:
+    return mode_supports_labs(get_feature_mode())
 
 
 class AgentLoop:
@@ -455,7 +468,7 @@ class AgentLoop:
                 )
 
                 # ── Reflection: Red-team the plan before execution ──
-                if self._reflection_engine and len(task.plan.steps) > 2:
+                if _feature_mode_allows_reflection() and self._reflection_engine and len(task.plan.steps) > 2:
                     try:
                         plan_text = json.dumps(task.plan.to_dict())
                         reflection = await self._reflection_engine.reflect(
@@ -486,7 +499,7 @@ class AgentLoop:
                         logger.warning(f"Reflection engine failed: {e}")
 
                 # ── Simulation Gate: Pre-flight outcome simulation ─────
-                if self._simulator and len(task.plan.steps) > 1:
+                if _feature_mode_allows_simulation() and self._simulator and len(task.plan.steps) > 1:
                     try:
                         sim_result = await self._simulator.simulate(
                             plan=task.plan,
@@ -550,6 +563,8 @@ class AgentLoop:
                 #   7.0–9.0 — deliberate_lite(): 3 most relevant members, no debate (~40% cheaper)
                 #   > 9.0  — full deliberate(): all 5 members + optional debate round
                 if (
+                    _feature_mode_allows_council()
+                    and
                     hasattr(self, "_council") and self._council
                     and plan_complexity > 7.0
                     and not self._should_skip_council(task, plan_complexity)

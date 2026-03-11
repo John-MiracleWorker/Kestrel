@@ -11,7 +11,7 @@ async def test_council():
         
         # Stream the chat
         timeout = 60.0
-        async with client.stream("POST", "http://localhost:3000/api/chat", json=payload, timeout=timeout) as response:
+        async with client.stream("POST", "http://localhost:8741/api/chat", json=payload, timeout=timeout) as response:
             async for line in response.aiter_lines():
                 if line:
                     if "council" in line.lower() or "verdict" in line.lower():

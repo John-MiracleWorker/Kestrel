@@ -13,13 +13,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 logger = logging.getLogger("brain.runtime")
 
 
 @dataclass
-class Runtime:
+class RuntimeContext:
     """Typed container for all runtime service dependencies."""
 
     retrieval: Any = None
@@ -45,10 +45,16 @@ class Runtime:
     skill_manager: Any = None
     session_manager: Any = None
     sandbox_manager: Any = None
+    feature_mode: str = "core"
+    enabled_tool_bundles: list[str] = field(default_factory=list)
+    startup_initializers: list[str] = field(default_factory=list)
+    startup_readiness: Dict[str, str] = field(default_factory=dict)
 
     # God-tier feature references
     outcome_simulator: Any = None
     proactive_engine: Any = None
+    fs_watcher: Any = None
+    heartbeat_engine: Any = None
 
     def validate_required(self) -> list[str]:
         """Return names of critical services that are still None."""
@@ -61,10 +67,14 @@ class Runtime:
         return [name for name in required if getattr(self, name) is None]
 
 
+# Backwards-compatible alias while new code adopts RuntimeContext explicitly.
+Runtime = RuntimeContext
+
+
 # Module-level singleton — used by services that import `from core.runtime import *`
 # During the transition period, attribute access on the module is proxied to this
 # instance so that existing `runtime.foo` imports continue to work.
-_instance = Runtime()
+_instance = RuntimeContext()
 
 
 def __getattr__(name: str) -> Any:
@@ -79,6 +89,6 @@ def __setattr__(name: str, value: Any) -> None:
     setattr(_instance, name, value)
 
 
-def get_runtime() -> Runtime:
+def get_runtime() -> RuntimeContext:
     """Return the global Runtime instance (for explicit DI)."""
     return _instance

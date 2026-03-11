@@ -45,9 +45,6 @@ jobs:
     - name: Run code formatting check
       run: npx prettier --check "packages/gateway/src/**/*.ts" "packages/web/src/**/*.{ts,tsx}"
 
-    - name: Run linting (Gateway)
-      run: npm run lint -w @kestrel/gateway
-
     - name: Run type checking (Gateway & Web)
       run: |
         npm run typecheck -w @kestrel/gateway

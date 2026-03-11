@@ -20,7 +20,7 @@
             }
         ],
         "security": {
-            "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://localhost:3000 http://localhost:5173 http://localhost:3000 ws://localhost:3000 https://fonts.googleapis.com; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com"
+            "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://localhost:8741 http://localhost:5173 ws://localhost:8741 https://fonts.googleapis.com; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com"
         }
     },
     "bundle": {

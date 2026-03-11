@@ -4,9 +4,11 @@ import asyncio
 from .base import BaseServicerMixin
 from core.grpc_setup import brain_pb2
 from core.config import logger
+from core.feature_mode import enabled_bundles_for_mode, parse_feature_mode
 from core.prompts import KESTREL_DEFAULT_SYSTEM_PROMPT
 from core import runtime
 
+from agent.task_profiles import filter_registry_for_profile, infer_task_profile
 from db import get_pool, get_redis
 from providers_registry import get_provider, CloudProvider, list_provider_configs, resolve_provider
 from provider_config import ProviderConfig
@@ -311,9 +313,20 @@ class ChatServicerMixin(BaseServicerMixin):
                 # Let the agent loop's TaskPlanner decompose this into
                 # a multi-step plan (plan=None triggers planning phase)
                 chat_task.plan = None
+            feature_mode = parse_feature_mode(getattr(runtime, "feature_mode", "core"))
+            task_profile = infer_task_profile(planner_goal, feature_mode)
+            chat_task.task_profile = task_profile.value
 
             # Build tool registry and agent loop
-            tool_registry = build_tool_registry(hands_client=runtime.hands_client, vector_store=runtime.vector_store, pool=pool, runtime_policy=runtime.execution_runtime)
+            tool_registry = build_tool_registry(
+                hands_client=runtime.hands_client,
+                vector_store=runtime.vector_store,
+                pool=pool,
+                runtime_policy=runtime.execution_runtime,
+                enabled_bundles=tuple(getattr(runtime, "enabled_tool_bundles", []) or enabled_bundles_for_mode(feature_mode)),
+                feature_mode=feature_mode.value,
+            )
+            tool_registry = filter_registry_for_profile(tool_registry, task_profile, feature_mode)
 
             # Set workspace context for Moltbook activity logging
             import agent.tools.moltbook as _moltbook_mod
