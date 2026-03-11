@@ -9,13 +9,6 @@ from agent.types import ToolDefinition, RiskLevel
 
 logger = logging.getLogger("brain.agent.tools.build_automation")
 
-# Module-level refs set during initialization
-_automation_builder = None
-_cron_scheduler = None
-_current_workspace_id = None
-_current_user_id = None
-
-
 BUILD_AUTOMATION_TOOL = ToolDefinition(
     name="build_automation",
     description=(
@@ -49,17 +42,30 @@ BUILD_AUTOMATION_TOOL = ToolDefinition(
 )
 
 
-async def handle_build_automation(description: str, confirm: bool = False) -> dict:
+async def handle_build_automation(
+    description: str,
+    confirm: bool = False,
+    execution_context=None,
+    automation_builder=None,
+    cron_scheduler=None,
+    workspace_id: str = "",
+    user_id: str = "",
+) -> dict:
     """Handle the build_automation tool call."""
-    if not _automation_builder:
+    builder = automation_builder
+    scheduler = cron_scheduler
+    ws_id = workspace_id or getattr(execution_context, "workspace_id", None)
+    actor_id = user_id or getattr(execution_context, "user_id", None)
+
+    if not builder:
         return {"error": "Automation builder not initialized"}
 
     try:
         # Parse the NL description into an AutomationSpec
-        spec = await _automation_builder.build(description)
+        spec = await builder.build(description)
 
         # Validate
-        issues = await _automation_builder.validate(spec)
+        issues = await builder.validate(spec)
         if issues:
             return {
                 "success": False,
@@ -69,7 +75,7 @@ async def handle_build_automation(description: str, confirm: bool = False) -> di
             }
 
         # Preview
-        preview = await _automation_builder.preview(spec)
+        preview = await builder.preview(spec)
 
         if not confirm:
             return {
@@ -83,12 +89,12 @@ async def handle_build_automation(description: str, confirm: bool = False) -> di
             }
 
         # Save to cron scheduler
-        if not _cron_scheduler:
+        if not scheduler:
             return {"error": "Cron scheduler not available"}
 
-        job = await _cron_scheduler.create_job(
-            workspace_id=_current_workspace_id or "default",
-            user_id=_current_user_id or "system",
+        job = await scheduler.create_job(
+            workspace_id=ws_id or "default",
+            user_id=actor_id or "system",
             name=spec.name,
             description=spec.description,
             cron_expression=spec.cron_expression,

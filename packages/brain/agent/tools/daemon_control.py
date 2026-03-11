@@ -9,12 +9,6 @@ from agent.types import ToolDefinition, RiskLevel
 
 logger = logging.getLogger("brain.agent.tools.daemon_control")
 
-# Module-level ref set during initialization
-_daemon_manager = None
-_current_workspace_id = None
-_current_user_id = None
-
-
 DAEMON_CREATE_TOOL = ToolDefinition(
     name="daemon_create",
     description=(
@@ -102,13 +96,20 @@ async def handle_daemon_create(
     watch_target: str = "",
     poll_interval_minutes: int = 5,
     sensitivity: str = "medium",
+    execution_context=None,
+    daemon_manager=None,
+    workspace_id: str = "",
+    user_id: str = "",
 ) -> dict:
-    if not _daemon_manager:
+    manager = daemon_manager
+    ws_id = workspace_id or getattr(execution_context, "workspace_id", None)
+    actor_id = user_id or getattr(execution_context, "user_id", None)
+    if not manager:
         return {"error": "Daemon manager not initialized"}
     try:
-        config = await _daemon_manager.create_daemon(
-            workspace_id=_current_workspace_id or "default",
-            user_id=_current_user_id or "system",
+        config = await manager.create_daemon(
+            workspace_id=ws_id or "default",
+            user_id=actor_id or "system",
             name=name,
             description=description,
             daemon_type=daemon_type,
@@ -121,17 +122,20 @@ async def handle_daemon_create(
         return {"success": False, "error": str(e)}
 
 
-async def handle_daemon_list() -> dict:
-    if not _daemon_manager:
+async def handle_daemon_list(execution_context=None, daemon_manager=None, workspace_id: str = "") -> dict:
+    manager = daemon_manager
+    ws_id = workspace_id or getattr(execution_context, "workspace_id", None)
+    if not manager:
         return {"error": "Daemon manager not initialized"}
-    daemons = _daemon_manager.list_daemons(_current_workspace_id or "")
+    daemons = manager.list_daemons(ws_id or "")
     return {"success": True, "daemons": daemons, "count": len(daemons)}
 
 
-async def handle_daemon_stop(daemon_id: str) -> dict:
-    if not _daemon_manager:
+async def handle_daemon_stop(daemon_id: str, daemon_manager=None) -> dict:
+    manager = daemon_manager
+    if not manager:
         return {"error": "Daemon manager not initialized"}
-    ok = await _daemon_manager.stop_daemon(daemon_id)
+    ok = await manager.stop_daemon(daemon_id)
     return {"success": ok}
 
 

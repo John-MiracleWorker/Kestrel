@@ -1,26 +1,69 @@
-from provider_config import ProviderConfig
+import asyncio
 import json
 import logging
+import time
 import grpc
 from core.grpc_setup import brain_pb2
-from core.feature_mode import enabled_bundles_for_mode, parse_feature_mode
+from core.feature_mode import parse_feature_mode
 from .base import BaseServicerMixin
 from core import runtime
-from agent.task_profiles import TaskProfile, filter_registry_for_profile, infer_task_profile
+from agent.task_events import is_task_terminal, load_task_event_history
+from agent.task_profiles import TaskProfile, infer_task_profile
 from db import get_pool, get_redis
-from providers_registry import get_provider, resolve_provider
 
 logger = logging.getLogger("brain.services.agent")
 
 class AgentServicerMixin(BaseServicerMixin):
+    async def _stream_task_event_feed(self, task_id: str, context):
+        """Replay durable history, then stream live pubsub until the task is terminal."""
+        seen_event_keys: set[str] = set()
+
+        def _event_key(payload: dict) -> str:
+            return json.dumps(payload, sort_keys=True, default=str)
+
+        history = await load_task_event_history(task_id)
+        for payload in history:
+            key = _event_key(payload)
+            if key in seen_event_keys:
+                continue
+            seen_event_keys.add(key)
+            yield self._task_event_from_json(payload)
+
+        redis_client = await get_redis()
+        channel = f"kestrel:task_events:{task_id}:channel"
+        pubsub = redis_client.pubsub()
+        await pubsub.subscribe(channel)
+        try:
+            while True:
+                if context.cancelled():
+                    break
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if message and message.get("data"):
+                    try:
+                        raw = message["data"]
+                        payload = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw)
+                        key = _event_key(payload)
+                        if key in seen_event_keys:
+                            continue
+                        seen_event_keys.add(key)
+                        yield self._task_event_from_json(payload)
+                    except Exception as stream_err:
+                        logger.warning(f"Failed to parse streamed task event for {task_id}: {stream_err}")
+                elif await is_task_terminal(task_id):
+                    break
+        finally:
+            try:
+                await pubsub.unsubscribe(channel)
+                await pubsub.close()
+            except Exception:
+                pass
+
     async def StartTask(self, request, context):
         """Start an autonomous agent task and stream events."""
-        import json
         from agent.types import (
             AgentTask,
             GuardrailConfig as GCfg,
             RiskLevel,
-            TaskStatus,
         )
 
         user_id = request.user_id
@@ -61,209 +104,44 @@ class AgentServicerMixin(BaseServicerMixin):
         # Save to DB
         await runtime.agent_persistence.save_task(task)
         logger.info(f"Agent task started: {task.id} — {goal}")
-
-        # Store the running task handle
-        runtime.running_tasks[task.id] = task
-
-        # Dynamically resolve provider from workspace config instead of
-        # using the hardcoded "local" provider from the global _agent_loop.
-        ws_config = {}
-        provider_name = "local"
-        try:
-            pool = await get_pool()
-            ws_config = await ProviderConfig(pool).get_config(workspace_id)
-            provider_name = ws_config.get("provider", "local")
-            task_provider = get_provider(provider_name)
-
-            # If workspace config specifies an explicit Ollama server URL,
-            # override the provider's base URL to connect to that host.
-            _ws_settings = ws_config.get("settings") or {}
-            if provider_name in ("ollama", "local") and _ws_settings.get("ollama_host"):
-                _host = _ws_settings["ollama_host"].rstrip("/")
-                logger.info(f"Task using workspace Ollama host: {_host}")
-                task_provider.set_explicit_url(_host)
-                # Invalidate stale health cache so is_ready() re-checks the new URL
-                from providers.ollama import _health_cache
-                _health_cache["checked_at"] = 0
-        except Exception as e:
-            logger.warning(f"Failed to resolve workspace provider for task, using local: {e}")
-            task_provider = get_provider("local")
-
-        from agent.tools import build_tool_registry
-        from agent.guardrails import Guardrails
-        from agent.loop import AgentLoop
-        from agent.evidence import EvidenceChain
-        from agent.learner import TaskLearner
-        from agent.core.memory import WorkingMemory
-        from agent.core.reflection import ReflectionEngine
-        from agent.simulation import OutcomeSimulator
-        from agent.core.verifier import VerifierEngine
-
-        task_model = ws_config.get("model", "") if ws_config else ""
-        task_api_key = ws_config.get("api_key", "") if ws_config else ""
-
-        task_tool_registry = build_tool_registry(
-            hands_client=runtime.hands_client,
-            pool=pool,
-            runtime_policy=runtime.execution_runtime,
-            enabled_bundles=tuple(getattr(runtime, "enabled_tool_bundles", []) or enabled_bundles_for_mode(feature_mode)),
-            feature_mode=feature_mode.value,
-        )
-        task_tool_registry = filter_registry_for_profile(task_tool_registry, task_profile, feature_mode)
-        evidence_chain = EvidenceChain(task_id=task.id, pool=pool)
-
-        task_working_memory = WorkingMemory(
-            redis_client=None,
-            vector_store=runtime.vector_store,
-        )
-        task_learner = TaskLearner(
-            provider=task_provider,
-            model=task_model,
-            working_memory=task_working_memory,
-        )
-        task_reflection = None
-        if feature_mode.value != "core":
-            task_reflection = ReflectionEngine(
-                llm_provider=task_provider,
-                model=task_model,
-            )
-
-        # Build simulation gate and verifier engine
-        task_simulator = None
-        if feature_mode.value == "labs":
-            task_simulator = OutcomeSimulator(
-                llm_provider=task_provider,
-                model=task_model,
-            )
-        task_verifier = VerifierEngine(
-            provider=task_provider,
-            model=task_model,
+        queue_job = await runtime.task_enqueuer.enqueue(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            goal=goal,
+            source="user",
+            priority=7,
+            agent_task_id=task.id,
+            payload_json={
+                "conversation_id": request.conversation_id or "",
+                "task_profile": task_profile.value,
+            },
+            trigger_kind="interactive",
         )
 
-        from agent.model_router import ModelRouter
-
-        def custom_provider_checker(name: str) -> bool:
-            if name == provider_name and getattr(task_provider, "is_ready", lambda: False)():
-                return True
-            try:
-                return get_provider(name).is_ready()
-            except Exception:
-                return False
-
-        task_model_router = ModelRouter(
-            provider_checker=custom_provider_checker,
-            workspace_provider=provider_name,
-            workspace_model=task_model,
+        queued_event = brain_pb2.TaskEvent(
+            type=brain_pb2.TaskEvent.EventType.THINKING,
+            task_id=task.id,
+            content=f"Task queued for execution ({queue_job.id}).",
+            progress={"queue_id": queue_job.id, "status": "queued"},
+        )
+        await self._persist_task_event(
+            queued_event,
+            workspace_id=workspace_id,
+            user_id=user_id,
         )
 
-        task_loop = AgentLoop(
-            provider=task_provider,
-            tool_registry=task_tool_registry,
-            guardrails=Guardrails(),
-            persistence=runtime.agent_persistence,
-            model=task_model,
-            api_key=task_api_key,
-            memory_graph=runtime.memory_graph,
-            evidence_chain=evidence_chain,
-            learner=task_learner,
-            reflection_engine=task_reflection,
-            provider_resolver=resolve_provider,
-            model_router=task_model_router,
-            simulator=task_simulator,
-            verifier=task_verifier,
-            persona_learner=runtime.persona_learner,
-        )
-
-        # Register this task as an active session
-        if runtime.session_manager:
-            try:
-                await runtime.session_manager.register_session(
-                    session_id=task.id,
-                    task_id=task.id,
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    agent_type="task",
-                    model=task_model,
-                    goal=goal,
-                )
-            except Exception as e:
-                logger.warning(f"Session registration failed: {e}")
-
-        # Run the task-specific agent loop and stream events
-        try:
-            async for event in task_loop.run(task):
-                event_type_value = event.type.value if hasattr(event.type, "value") else str(event.type)
-                task_event = brain_pb2.TaskEvent(
-                    type=self._event_type_to_proto(event_type_value),
-                    task_id=event.task_id,
-                    step_id=event.step_id or "",
-                    content=event.content,
-                    tool_name=event.tool_name or "",
-                    tool_args=event.tool_args or "",
-                    tool_result=event.tool_result or "",
-                    approval_id=event.approval_id or "",
-                    progress={k: str(v) for k, v in (event.progress or {}).items()},
-                )
-                await self._persist_task_event(task_event)
-                yield task_event
-        except Exception as e:
-            logger.error(f"StartTask error for task {task.id}: {e}", exc_info=True)
-            failed_event = brain_pb2.TaskEvent(
-                type=brain_pb2.TaskEvent.EventType.TASK_FAILED,
-                task_id=task.id,
-                content=str(e),
-            )
-            await self._persist_task_event(failed_event)
-            yield failed_event
-        finally:
-            runtime.running_tasks.pop(task.id, None)
-            if runtime.session_manager:
-                try:
-                    await runtime.session_manager.deregister_session(task.id)
-                except Exception as e:
-                    logger.warning(f"Session deregistration failed: {e}")
+        async for event in self._stream_task_event_feed(task.id, context):
+            yield event
 
     async def StreamTaskEvents(self, request, context):
         """Reconnect to an already-running task's event stream."""
         task_id = request.task_id
-        redis_client = await get_redis()
-        history_key = f"kestrel:task_events:{task_id}"
-        channel = f"kestrel:task_events:{task_id}:channel"
-
-        history = await redis_client.lrange(history_key, 0, -1)
-        for raw in history:
-            try:
-                payload = json.loads(raw)
-                yield self._task_event_from_json(payload)
-            except Exception as replay_err:
-                logger.warning(f"Failed to replay task event for {task_id}: {replay_err}")
-
-        if task_id not in runtime.running_tasks and not history:
+        history = await load_task_event_history(task_id)
+        if not history and not await is_task_terminal(task_id):
             context.abort(grpc.StatusCode.NOT_FOUND, f"Task {task_id} is not running")
             return
-
-        pubsub = redis_client.pubsub()
-        await pubsub.subscribe(channel)
-        try:
-            while True:
-                if context.cancelled():
-                    break
-                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-                if message and message.get("data"):
-                    try:
-                        payload = json.loads(message["data"])
-                        yield self._task_event_from_json(payload)
-                    except Exception as stream_err:
-                        logger.warning(f"Failed to parse streamed task event for {task_id}: {stream_err}")
-
-                if task_id not in runtime.running_tasks and not message:
-                    break
-        finally:
-            try:
-                await pubsub.unsubscribe(channel)
-                await pubsub.close()
-            except Exception:
-                pass
+        async for event in self._stream_task_event_feed(task_id, context):
+            yield event
 
     async def ApproveAction(self, request, context):
         """Approve or deny a pending agent action."""
@@ -309,20 +187,37 @@ class AgentServicerMixin(BaseServicerMixin):
     async def CancelTask(self, request, context):
         """Cancel a running agent task."""
         task_id = request.task_id
+        queue_job = None
+        if getattr(runtime, "task_enqueuer", None):
+            queue_job = await runtime.task_enqueuer.get_latest_for_task(task_id)
 
         if task_id in runtime.running_tasks:
             task = runtime.running_tasks[task_id]
             task.status = "cancelled"
             await runtime.agent_persistence.update_task(task)
             runtime.running_tasks.pop(task_id, None)
+            if queue_job:
+                await runtime.task_enqueuer.cancel(
+                    queue_job.id,
+                    error="Cancelled by user",
+                    terminal_task_id=task_id,
+                )
+                if getattr(runtime, "task_dispatcher", None):
+                    await runtime.task_dispatcher.cancel_job(queue_job.id)
             return brain_pb2.CancelTaskResponse(success=True)
 
         # Try updating DB directly
         pool = await get_pool()
         await pool.execute(
-            "UPDATE agent_tasks SET status = 'cancelled' WHERE id = $1",
+            "UPDATE agent_tasks SET status = 'cancelled', completed_at = now() WHERE id = $1",
             task_id,
         )
+        if queue_job:
+            await runtime.task_enqueuer.cancel(
+                queue_job.id,
+                error="Cancelled by user",
+                terminal_task_id=task_id,
+            )
         return brain_pb2.CancelTaskResponse(success=True)
 
     async def ListTasks(self, request, context):
@@ -397,96 +292,75 @@ class AgentServicerMixin(BaseServicerMixin):
             conversation_id=None,
             config=config,
         )
-        feature_mode = parse_feature_mode(getattr(runtime, "feature_mode", "core"))
         task.task_profile = TaskProfile.OPS.value
 
         await runtime.agent_persistence.save_task(task)
-        logger.info(f"Headless task started: {task.id} — {goal[:50]}...")
-        runtime.running_tasks[task.id] = task
+        logger.info(f"Headless task queued: {task.id} — {goal[:50]}...")
 
-        provider_name = "local"
-        try:
-            pool = await get_pool()
-            ws_config = await ProviderConfig(pool).get_config(workspace_id)
-            provider_name = ws_config.get("provider", "local")
-            task_provider = get_provider(provider_name)
-        except Exception as e:
-            logger.warning(f"Failed to resolve workspace provider for headless task, using local: {e}")
-            task_provider = get_provider("local")
-
-        from agent.tools import build_tool_registry
-        from agent.guardrails import Guardrails
-        from agent.loop import AgentLoop
-        from agent.evidence import EvidenceChain
-        from agent.learner import TaskLearner
-        from agent.core.memory import WorkingMemory
-        from agent.core.reflection import ReflectionEngine
-        from agent.simulation import OutcomeSimulator
-        from agent.core.verifier import VerifierEngine
-        from agent.model_router import ModelRouter
-
-        task_model = ws_config.get("model", "") if ws_config else ""
-        task_api_key = ws_config.get("api_key", "") if ws_config else ""
-        task_tool_registry = build_tool_registry(
-            hands_client=runtime.hands_client,
-            pool=pool,
-            runtime_policy=runtime.execution_runtime,
-            enabled_bundles=tuple(getattr(runtime, "enabled_tool_bundles", []) or enabled_bundles_for_mode(feature_mode)),
-            feature_mode=feature_mode.value,
-        )
-        task_tool_registry = filter_registry_for_profile(task_tool_registry, TaskProfile.OPS, feature_mode)
-        evidence_chain = EvidenceChain(task_id=task.id, pool=pool)
-
-        task_working_memory = WorkingMemory(redis_client=None, vector_store=runtime.vector_store)
-        task_learner = TaskLearner(provider=task_provider, model=task_model, working_memory=task_working_memory)
-        task_reflection = None if feature_mode.value == "core" else ReflectionEngine(llm_provider=task_provider, model=task_model)
-        task_simulator = OutcomeSimulator(llm_provider=task_provider, model=task_model) if feature_mode.value == "labs" else None
-        task_verifier = VerifierEngine(provider=task_provider, model=task_model)
-
-        def custom_provider_checker(name: str) -> bool:
-            if name == provider_name and getattr(task_provider, "is_ready", lambda: False)(): return True
-            try: return get_provider(name).is_ready()
-            except Exception: return False
-
-        task_model_router = ModelRouter(
-            provider_checker=custom_provider_checker,
-            workspace_provider=provider_name,
-            workspace_model=task_model,
+        queue_job = await runtime.task_enqueuer.enqueue(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            goal=headless_goal,
+            source="user",
+            priority=8,
+            agent_task_id=task.id,
+            payload_json={
+                "task_profile": TaskProfile.OPS.value,
+                "headless": True,
+                "expected_schema_json": schema_json or "",
+            },
+            trigger_kind="headless",
         )
 
-        task_loop = AgentLoop(
-            provider=task_provider,
-            tool_registry=task_tool_registry,
-            guardrails=Guardrails(),
-            persistence=runtime.agent_persistence,
-            model=task_model,
-            api_key=task_api_key,
-            memory_graph=runtime.memory_graph,
-            evidence_chain=evidence_chain,
-            learner=task_learner,
-            reflection_engine=task_reflection,
-            provider_resolver=resolve_provider,
-            model_router=task_model_router,
-            simulator=task_simulator,
-            verifier=task_verifier,
-            persona_learner=runtime.persona_learner,
-        )
+        timeout_seconds = max(task.config.max_wall_time_seconds, 30) + 30
+        deadline = time.monotonic() + timeout_seconds
+        final_task = task
+        while time.monotonic() < deadline:
+            if context.cancelled():
+                await runtime.task_enqueuer.cancel(
+                    queue_job.id,
+                    error="Headless caller cancelled the request.",
+                    terminal_task_id=task.id,
+                )
+                if getattr(runtime, "task_dispatcher", None):
+                    await runtime.task_dispatcher.cancel_job(queue_job.id)
+                return brain_pb2.RunHeadlessTaskResponse(
+                    success=False,
+                    result_json="",
+                    error="Headless caller cancelled the request.",
+                    iterations=final_task.iterations,
+                )
 
-        iterations = 0
-        final_result = ""
-        error_msg = ""
-        try:
-            async for event in task_loop.run(task):
-                iterations += 1
-                if str(event.type) == "EventType.TASK_COMPLETE" or str(event.type) == "TASK_COMPLETE":
-                    final_result = event.content or event.tool_result or ""
-                elif str(event.type) == "EventType.TASK_FAILED" or str(event.type) == "TASK_FAILED":
-                    error_msg = event.content or "Task failed without explicit error"
-        except Exception as e:
-            logger.error(f"Headless task error {task.id}: {e}", exc_info=True)
-            error_msg = str(e)
-        finally:
-            runtime.running_tasks.pop(task.id, None)
+            latest_task = await runtime.agent_persistence.get_task(task.id)
+            if latest_task:
+                final_task = latest_task
+                if latest_task.status in {
+                    TaskStatus.COMPLETE,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                }:
+                    break
+            await asyncio.sleep(0.5)
+        else:
+            await runtime.task_enqueuer.cancel(
+                queue_job.id,
+                error="Headless task timed out waiting for queued completion.",
+                terminal_task_id=task.id,
+            )
+            if getattr(runtime, "task_dispatcher", None):
+                await runtime.task_dispatcher.cancel_job(queue_job.id)
+            latest_task = await runtime.agent_persistence.get_task(task.id)
+            if latest_task:
+                final_task = latest_task
+            final_task.status = TaskStatus.FAILED
+            final_task.error = "Headless task timed out waiting for queued completion."
+            await runtime.agent_persistence.update_task(final_task)
+
+        iterations = final_task.iterations
+        final_result = final_task.result or ""
+        error_msg = final_task.error or ""
+        if final_task.status == TaskStatus.CANCELLED and not error_msg:
+            error_msg = "Task was cancelled."
 
         if not final_result and task.result:
             final_result = task.result

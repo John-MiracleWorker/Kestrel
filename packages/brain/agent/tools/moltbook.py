@@ -15,12 +15,9 @@ from typing import Optional
 import httpx
 
 from agent.types import RiskLevel, ToolDefinition
+from db import get_pool
 
 logger = logging.getLogger("brain.agent.tools.moltbook")
-
-# Module-level context — set before execution by the tool registry / automation runner
-_current_workspace_id: Optional[str] = None
-_current_user_id: Optional[str] = None
 
 BASE_URL = "https://www.moltbook.com/api/v1"
 CREDS_PATH = os.path.expanduser("~/.config/moltbook/credentials.json")
@@ -29,6 +26,20 @@ CREDS_PATH = os.path.expanduser("~/.config/moltbook/credentials.json")
 _last_api_call: float = 0.0
 _rate_limit_until: float = 0.0
 _MIN_CALL_INTERVAL = 2.0  # seconds between API calls
+
+
+def _resolve_workspace_id(
+    workspace_id: str = "",
+    execution_context=None,
+) -> str:
+    return workspace_id or getattr(execution_context, "workspace_id", "") or ""
+
+
+def _resolve_user_id(
+    user_id: str = "",
+    execution_context=None,
+) -> str:
+    return user_id or getattr(execution_context, "user_id", "") or ""
 
 
 def _rate_check() -> Optional[dict]:
@@ -101,6 +112,7 @@ def _headers(api_key: str = "") -> dict:
 
 
 async def _log_activity(
+    workspace_id: str,
     action: str,
     title: str = "",
     content: str = "",
@@ -110,15 +122,15 @@ async def _log_activity(
     result: dict = None,
 ) -> None:
     """Log Moltbook activity to the database for the UI feed."""
+    if not workspace_id:
+        return
     try:
-        # Import the brain's DB pool
-        import server as _server
-        pool = await _server.get_pool()
+        pool = await get_pool()
         await pool.execute(
             """INSERT INTO moltbook_activity
                (workspace_id, action, title, content, submolt, post_id, url, result)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
-            _current_workspace_id,
+            workspace_id,
             action,
             title[:500] if title else None,
             content[:1000] if content else None,
@@ -211,8 +223,13 @@ async def moltbook_action(
     sort: str = "hot",
     limit: int = 10,
     name: str = "Kestrel",
+    execution_context=None,
+    workspace_id: str = "",
+    user_id: str = "",
 ) -> dict:
     """Route to the appropriate Moltbook action."""
+    resolved_workspace_id = _resolve_workspace_id(workspace_id, execution_context)
+    resolved_user_id = _resolve_user_id(user_id, execution_context)
     actions = {
         "register": _register,
         "status": _check_status,
@@ -247,11 +264,13 @@ async def moltbook_action(
         result = await handler(
             submolt=submolt, title=title, content=content,
             post_id=post_id, query=query, sort=sort, limit=limit,
-            name=name,
+            name=name, execution_context=execution_context,
+            workspace_id=resolved_workspace_id, user_id=resolved_user_id,
         )
 
         # Log activity for the UI feed
         await _log_activity(
+            workspace_id=resolved_workspace_id,
             action=action,
             title=title,
             content=content,

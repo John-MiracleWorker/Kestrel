@@ -16,6 +16,12 @@ from typing import Optional
 logger = logging.getLogger("brain.agent.checkpoints")
 
 
+def _state_json_text(value) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value or {})
+
+
 @dataclass
 class Checkpoint:
     """Snapshot of agent task state at a point in time."""
@@ -48,6 +54,37 @@ class CheckpointManager:
         """pool is an asyncpg connection pool."""
         self._pool = pool
 
+    async def create_checkpoint(
+        self,
+        *,
+        task_id: str,
+        step_index: int,
+        label: str,
+        state_json: str,
+        created_at: str = "",
+    ) -> str:
+        checkpoint_id = str(uuid.uuid4())
+        now = created_at or datetime.now(timezone.utc).isoformat()
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO agent_checkpoints (id, task_id, step_index, label, state_json, created_at)
+                    VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+                    """,
+                    checkpoint_id,
+                    task_id,
+                    step_index,
+                    label,
+                    state_json,
+                    now,
+                )
+            logger.info(f"Checkpoint saved: {checkpoint_id} for task {task_id}")
+            return checkpoint_id
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {e}")
+            return ""
+
     async def save_checkpoint(
         self,
         task,
@@ -57,7 +94,6 @@ class CheckpointManager:
         Save a checkpoint of the current task state.
         Returns the checkpoint ID.
         """
-        checkpoint_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
         # Determine step index
@@ -82,24 +118,41 @@ class CheckpointManager:
         }
 
         state_json = json.dumps(state)
+        return await self.create_checkpoint(
+            task_id=task.id,
+            step_index=step_index,
+            label=label,
+            state_json=state_json,
+            created_at=now,
+        )
 
+    async def get_latest_checkpoint(self, task_id: str) -> Optional[Checkpoint]:
+        """Return the most recent checkpoint for a task."""
         try:
             async with self._pool.acquire() as conn:
-                await conn.execute(
+                row = await conn.fetchrow(
                     """
-                    INSERT INTO agent_checkpoints (id, task_id, step_index, label, state_json, created_at)
-                    VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+                    SELECT id, task_id, step_index, label, state_json, created_at
+                    FROM agent_checkpoints
+                    WHERE task_id = $1
+                    ORDER BY created_at DESC
+                    LIMIT 1
                     """,
-                    checkpoint_id, task.id, step_index, label,
-                    state_json, now,
+                    task_id,
                 )
-
-            logger.info(f"Checkpoint saved: {checkpoint_id} for task {task.id}")
-            return checkpoint_id
-
+            if not row:
+                return None
+            return Checkpoint(
+                id=str(row["id"]),
+                task_id=str(row["task_id"]),
+                step_index=row["step_index"],
+                label=row["label"],
+                state_json=_state_json_text(row["state_json"]),
+                created_at=row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else str(row["created_at"]),
+            )
         except Exception as e:
-            logger.error(f"Failed to save checkpoint: {e}")
-            return ""
+            logger.error(f"Failed to load latest checkpoint: {e}")
+            return None
 
     async def restore_checkpoint(
         self,
@@ -121,7 +174,7 @@ class CheckpointManager:
                 logger.warning(f"Checkpoint {checkpoint_id} not found")
                 return False
 
-            state = json.loads(row["state_json"])
+            state = json.loads(_state_json_text(row["state_json"]))
 
             # Restore task fields
             from agent.types import TaskStatus, TaskPlan
@@ -147,7 +200,7 @@ class CheckpointManager:
             async with self._pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
-                    SELECT id, task_id, step_index, label, created_at
+                    SELECT id, task_id, step_index, label, state_json, created_at
                     FROM agent_checkpoints
                     WHERE task_id = $1
                     ORDER BY created_at ASC
@@ -157,12 +210,12 @@ class CheckpointManager:
 
             return [
                 Checkpoint(
-                    id=row["id"],
-                    task_id=row["task_id"],
+                    id=str(row["id"]),
+                    task_id=str(row["task_id"]),
                     step_index=row["step_index"],
                     label=row["label"],
-                    state_json="",  # Don't load full state for listing
-                    created_at=row["created_at"],
+                    state_json=_state_json_text(row["state_json"]),
+                    created_at=row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else str(row["created_at"]),
                 )
                 for row in rows
             ]

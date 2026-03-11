@@ -306,10 +306,12 @@ class AgentTask:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: Optional[datetime] = None
+    task_profile: str = ""
 
     # Runtime state (not persisted to DB)
     pending_approval: Optional[ApprovalRequest] = None
     messages: list[dict[str, Any]] = field(default_factory=list)  # Conversation history
+    execution_context: Any = field(default=None, repr=False, compare=False)
 
     # Multi-agent delegation
     parent_task_id: Optional[str] = None

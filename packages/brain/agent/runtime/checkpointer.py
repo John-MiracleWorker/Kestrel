@@ -16,6 +16,14 @@ from typing import Any, Optional
 logger = logging.getLogger("brain.agent.runtime.checkpointer")
 
 
+def _decode_state(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    return json.loads(value)
+
+
 class PostgresCheckpointer:
     """
     LangGraph-compatible checkpointer backed by Kestrel's PostgreSQL
@@ -42,15 +50,13 @@ class PostgresCheckpointer:
             return None
 
         try:
-            checkpoints = await self._manager.list_checkpoints(task_id=thread_id)
-            if not checkpoints:
+            latest = await self._manager.get_latest_checkpoint(task_id=thread_id)
+            if not latest:
                 return None
-            # Return the most recent checkpoint
-            latest = checkpoints[-1]
             return {
                 "id": latest.id,
                 "ts": latest.created_at,
-                "channel_values": json.loads(latest.state_json),
+                "channel_values": _decode_state(latest.state_json),
             }
         except Exception as e:
             logger.warning(f"Checkpoint retrieval failed for {thread_id}: {e}")
@@ -98,7 +104,7 @@ class PostgresCheckpointer:
                 yield {
                     "id": cp.id,
                     "ts": cp.created_at,
-                    "channel_values": json.loads(cp.state_json),
+                    "channel_values": _decode_state(cp.state_json),
                 }
         except Exception as e:
             logger.warning(f"Checkpoint listing failed for {thread_id}: {e}")

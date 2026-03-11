@@ -9,9 +9,6 @@ from agent.types import ToolDefinition, RiskLevel
 
 logger = logging.getLogger("brain.agent.tools.ui_builder")
 
-_ui_manager = None
-_current_workspace_id = None
-
 
 CREATE_UI_TOOL = ToolDefinition(
     name="create_ui_artifact",
@@ -92,16 +89,25 @@ async def handle_create_ui(
     component_code: str,
     description: str = "",
     component_type: str = "react",
+    execution_context=None,
+    ui_manager=None,
+    ui_artifact_manager=None,
+    workspace_id: str = "",
+    user_id: str = "",
 ) -> dict:
-    if not _ui_manager:
+    manager = ui_manager or ui_artifact_manager
+    resolved_workspace_id = workspace_id or getattr(execution_context, "workspace_id", "") or "default"
+    resolved_user_id = user_id or getattr(execution_context, "user_id", "") or "agent"
+    if not manager:
         return {"error": "UI artifact manager not initialized"}
     try:
-        artifact = await _ui_manager.create(
-            workspace_id=_current_workspace_id or "default",
+        artifact = await manager.create(
+            workspace_id=resolved_workspace_id,
             title=title,
             component_code=component_code,
             description=description,
             component_type=component_type,
+            created_by=resolved_user_id,
         )
         return {"success": True, "artifact": artifact.to_dict()}
     except Exception as e:
@@ -112,11 +118,15 @@ async def handle_update_ui(
     artifact_id: str,
     component_code: str,
     change_description: str = "",
+    execution_context=None,
+    ui_manager=None,
+    ui_artifact_manager=None,
 ) -> dict:
-    if not _ui_manager:
+    manager = ui_manager or ui_artifact_manager
+    if not manager:
         return {"error": "UI artifact manager not initialized"}
     try:
-        artifact = await _ui_manager.update(
+        artifact = await manager.update(
             artifact_id, component_code, change_description
         )
         if not artifact:
@@ -126,10 +136,17 @@ async def handle_update_ui(
         return {"success": False, "error": str(e)}
 
 
-async def handle_list_ui() -> dict:
-    if not _ui_manager:
+async def handle_list_ui(
+    execution_context=None,
+    ui_manager=None,
+    ui_artifact_manager=None,
+    workspace_id: str = "",
+) -> dict:
+    manager = ui_manager or ui_artifact_manager
+    resolved_workspace_id = workspace_id or getattr(execution_context, "workspace_id", "") or "default"
+    if not manager:
         return {"error": "UI artifact manager not initialized"}
-    artifacts = await _ui_manager.list(_current_workspace_id or "default")
+    artifacts = await manager.list(resolved_workspace_id)
     return {"success": True, "artifacts": artifacts, "count": len(artifacts)}
 
 

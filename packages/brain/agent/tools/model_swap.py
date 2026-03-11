@@ -20,10 +20,6 @@ from agent.types import RiskLevel, ToolDefinition
 
 logger = logging.getLogger("brain.agent.tools.model_swap")
 
-# Module-level workspace context (set per-request by chat_service / cron)
-_current_workspace_id: str = ""
-_current_user_id: str = ""
-
 
 # ── Fuzzy matching helpers ─────────────────────────────────────────
 
@@ -218,6 +214,7 @@ async def model_swap_handler(
     model_id: str = "",
     provider: str = "",
     workspace_id: str = "",
+    execution_context=None,
     **kwargs,
 ) -> dict:
     """
@@ -228,7 +225,7 @@ async def model_swap_handler(
       - swap: Switch to a specific model (requires model_id + provider)
       - list: List all available models grouped by provider
     """
-    ws_id = workspace_id or _current_workspace_id
+    ws_id = workspace_id or getattr(execution_context, "workspace_id", "")
 
     if action == "list":
         all_models = await _list_all_models()

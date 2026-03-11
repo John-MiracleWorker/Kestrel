@@ -99,6 +99,9 @@ class SessionManager:
         agent_type: str = "main",
         model: str = "",
         goal: str = "",
+        agent_profile_id: str | None = None,
+        channel: str = "task",
+        prunable_after: str | None = None,
     ) -> None:
         """Register a new active session."""
         now = datetime.now(timezone.utc).isoformat()
@@ -122,13 +125,17 @@ class SessionManager:
                 await conn.execute(
                     """
                     INSERT INTO agent_sessions (id, task_id, workspace_id, user_id,
-                        agent_type, status, model, current_goal, started_at, last_activity)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+                        agent_type, status, model, current_goal, started_at, last_activity,
+                        agent_profile_id, channel, prunable_after)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, NULLIF($10, '')::uuid, $11, NULLIF($12, '')::timestamptz)
                     ON CONFLICT (id) DO UPDATE SET
-                        status = 'active', last_activity = $9, current_goal = $8
+                        status = 'active', last_activity = $9, current_goal = $8,
+                        agent_profile_id = NULLIF($10, '')::uuid, channel = $11,
+                        prunable_after = NULLIF($12, '')::timestamptz
                     """,
                     session_id, task_id, workspace_id, user_id,
                     agent_type, "active", model, goal, now,
+                    agent_profile_id or "", channel, prunable_after or "",
                 )
         except Exception as e:
             logger.error(f"Failed to persist session: {e}")
@@ -169,6 +176,8 @@ class SessionManager:
                         "task_id": row["task_id"],
                         "agent_type": row["agent_type"],
                         "status": row["status"],
+                        "agent_profile_id": str(row["agent_profile_id"]) if row["agent_profile_id"] else "",
+                        "channel": row["channel"] or "",
                         "model": row["model"],
                         "current_goal": (row["current_goal"] or "")[:200],
                         "started_at": str(row["started_at"]),
@@ -179,6 +188,53 @@ class SessionManager:
         except Exception as e:
             logger.error(f"Failed to list sessions: {e}")
             return list(self._sessions.values())
+
+    async def prune_inactive_sessions(self, limit: int = 100) -> dict[str, Any]:
+        """
+        Mark expired inactive sessions as completed once their task is terminal.
+
+        This keeps session discovery focused on live work while preserving the
+        durable task, memory, and audit history behind each session.
+        """
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    WITH prunable AS (
+                        SELECT s.id
+                        FROM agent_sessions AS s
+                        LEFT JOIN agent_tasks AS t ON t.id = s.task_id
+                        WHERE s.status IN ('active', 'idle', 'paused')
+                          AND s.prunable_after IS NOT NULL
+                          AND s.prunable_after <= now()
+                          AND (
+                              s.task_id IS NULL
+                              OR t.status IN ('complete', 'failed', 'cancelled')
+                          )
+                        ORDER BY s.prunable_after ASC
+                        LIMIT $1
+                    )
+                    UPDATE agent_sessions AS s
+                    SET status = 'completed',
+                        last_activity = now()
+                    FROM prunable
+                    WHERE s.id = prunable.id
+                    RETURNING s.id, s.task_id, s.workspace_id
+                    """,
+                    limit,
+                )
+        except Exception as e:
+            logger.error(f"Failed to prune inactive sessions: {e}")
+            return {"pruned_count": 0, "session_ids": []}
+
+        session_ids = [str(row["id"]) for row in rows]
+        for session_id in session_ids:
+            if session_id in self._sessions:
+                self._sessions[session_id].status = "completed"
+
+        if session_ids:
+            logger.info(f"Pruned {len(session_ids)} inactive session(s)")
+        return {"pruned_count": len(session_ids), "session_ids": session_ids}
 
     async def send_message(
         self,

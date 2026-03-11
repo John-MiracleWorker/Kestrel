@@ -28,7 +28,7 @@ def parse_feature_mode(raw_mode: str | None) -> FeatureMode:
 
 
 def get_feature_mode() -> FeatureMode:
-    return parse_feature_mode(os.getenv("KESTREL_FEATURE_MODE", FeatureMode.CORE.value))
+    return parse_feature_mode(os.getenv("KESTREL_FEATURE_MODE", FeatureMode.OPS.value))
 
 
 def mode_at_least(current: FeatureMode, required: FeatureMode) -> bool:

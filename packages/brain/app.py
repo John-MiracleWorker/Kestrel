@@ -153,12 +153,21 @@ async def _init_agent_core(feature_mode: FeatureMode) -> InitializerResult:
     from agent.model_router import ModelRouter
     from agent.observability import MetricsCollector
     from agent.persistence import PostgresTaskPersistence
+    from agent.policy_engine import PolicyEngine
     from agent.persona import PersonaLearner
     from agent.runtime import build_runtime_policy
     from agent.sandbox import SandboxManager
+    from agent.task_queue import (
+        JobRunner,
+        OpportunityEngine,
+        TaskDispatcher,
+        TaskEnqueuer,
+        WorkspaceAgentStore,
+    )
     from agent.tools import build_tool_registry
 
     pool = await get_pool()
+    shutdown_hooks: list[ShutdownHook] = []
     runtime.execution_runtime = build_runtime_policy(hands_client=runtime.hands_client)
     runtime.feature_mode = feature_mode.value
     runtime.enabled_tool_bundles = list(enabled_bundles_for_mode(feature_mode))
@@ -176,6 +185,29 @@ async def _init_agent_core(feature_mode: FeatureMode) -> InitializerResult:
     runtime.metrics_collector = MetricsCollector()
     runtime.sandbox_manager = SandboxManager()
     runtime.checkpoint_manager = CheckpointManager(pool=pool)
+    runtime.workspace_agent_store = WorkspaceAgentStore(pool=pool)
+    runtime.task_enqueuer = TaskEnqueuer(pool=pool, workspace_agent_store=runtime.workspace_agent_store)
+    runtime.policy_engine = PolicyEngine()
+    runtime.opportunity_engine = OpportunityEngine(
+        pool=pool,
+        workspace_agent_store=runtime.workspace_agent_store,
+        task_enqueuer=runtime.task_enqueuer,
+    )
+    runtime.job_runner = JobRunner(runtime_ctx=runtime, pool=pool)
+    runtime.task_dispatcher = TaskDispatcher(
+        enqueuer=runtime.task_enqueuer,
+        runner=runtime.job_runner,
+        concurrency=int(os.getenv("TASK_DISPATCHER_CONCURRENCY", "2")),
+        poll_interval_seconds=float(os.getenv("TASK_DISPATCHER_POLL_SECONDS", "1.0")),
+        lease_seconds=int(os.getenv("TASK_DISPATCHER_LEASE_SECONDS", "300")),
+    )
+    await runtime.task_dispatcher.start()
+
+    async def _stop_dispatcher() -> None:
+        if runtime.task_dispatcher:
+            await runtime.task_dispatcher.stop()
+
+    shutdown_hooks.append(_stop_dispatcher)
 
     available = get_available_providers()
     logger.info("Available providers: %s", available)
@@ -196,7 +228,7 @@ async def _init_agent_core(feature_mode: FeatureMode) -> InitializerResult:
         len(runtime.tool_registry._definitions),
     )
     _record_initializer("init_agent_core", "ready")
-    return InitializerResult(name="init_agent_core")
+    return InitializerResult(name="init_agent_core", shutdown_hooks=shutdown_hooks)
 
 
 async def _init_ops() -> InitializerResult:
@@ -288,6 +320,8 @@ async def _init_labs() -> InitializerResult:
         notification_router=runtime.notification_router,
         task_launcher=None,
     )
+    runtime.automation_builder = automation_builder
+    runtime.daemon_manager = daemon_manager
     runtime.proactive_engine = ProactiveEngine(
         notification_router=runtime.notification_router,
         task_launcher=None,
@@ -320,6 +354,8 @@ async def _init_labs() -> InitializerResult:
         pool=pool,
         task_launcher=launch_task_from_automation,
         interval_seconds=3600,
+        opportunity_engine=runtime.opportunity_engine,
+        session_manager=runtime.session_manager,
     )
     try:
         await runtime.heartbeat_engine.start()
@@ -337,16 +373,6 @@ async def _init_labs() -> InitializerResult:
         runtime.proactive_engine._task_launcher = launch_task_from_automation
     except Exception:
         pass
-
-    try:
-        import agent.tools.build_automation as _build_automation_mod
-        import agent.tools.daemon_control as _daemon_control_mod
-
-        _build_automation_mod._automation_builder = automation_builder
-        _build_automation_mod._cron_scheduler = runtime.cron_scheduler
-        _daemon_control_mod._daemon_manager = daemon_manager
-    except Exception as exc:
-        logger.warning("Labs tool module wiring failed (non-fatal): %s", exc)
 
     try:
         await bootstrap_moltbook_cron(pool)

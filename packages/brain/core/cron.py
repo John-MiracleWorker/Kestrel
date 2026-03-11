@@ -1,15 +1,9 @@
-import asyncio
 from typing import Any
 from .config import logger
-from .feature_mode import enabled_bundles_for_mode, parse_feature_mode
 from . import runtime
-from providers_registry import get_provider, resolve_provider
-from provider_config import ProviderConfig
-from agent.loop import AgentLoop
-from agent.task_profiles import TaskProfile, filter_registry_for_profile
-from agent.tools import build_tool_registry
+from agent.task_events import persist_task_event_payload
+from agent.task_profiles import TaskProfile
 from agent.types import AgentTask, GuardrailConfig as GCfg
-from agent.guardrails import Guardrails
 
 async def launch_task_from_automation(workspace_id: str, user_id: str, goal: str, source: str = "automation", model_override: str = None):
     """Task launcher callback for cron/webhook automation."""
@@ -22,66 +16,36 @@ async def launch_task_from_automation(workspace_id: str, user_id: str, goal: str
     task.task_profile = TaskProfile.OPS.value
     if runtime.agent_persistence:
         await runtime.agent_persistence.save_task(task)
-    logger.info(f"Automation task started: {task.id} — {goal} (source: {source})")
-    # Run in background
-    asyncio.create_task(_run_automation_task(task, source, model_override))
-
-async def _run_automation_task(task: AgentTask, source: str = "automation", model_override: str = None):
-    """Run an automation-triggered task in the background."""
-    from db import get_pool # Late import to avoid cycles
-    try:
-        pool = await get_pool()
-        ws_config = await ProviderConfig(pool).get_config(task.workspace_id)
-        provider_name = ws_config.get("provider", "local")
-        task_provider = get_provider(provider_name)
-        feature_mode = parse_feature_mode(getattr(runtime, "feature_mode", "core"))
-        task_tool_registry = build_tool_registry(
-            hands_client=runtime.hands_client,
-            vector_store=runtime.vector_store,
-            pool=pool,
-            runtime_policy=runtime.execution_runtime,
-            enabled_bundles=tuple(getattr(runtime, "enabled_tool_bundles", []) or enabled_bundles_for_mode(feature_mode)),
-            feature_mode=feature_mode.value,
-        )
-        task_tool_registry = filter_registry_for_profile(task_tool_registry, TaskProfile.OPS, feature_mode)
-        
-        task_loop = AgentLoop(
-            provider=task_provider,
-            model=model_override or ws_config.get("model", ""),
-            tool_registry=task_tool_registry,
-            guardrails=Guardrails(),
-            persistence=runtime.agent_persistence,
-            memory_graph=runtime.memory_graph,
-            provider_resolver=resolve_provider,
-        )
-        
-        # Set context for tools used in automated tasks
-        import agent.tools.moltbook as _moltbook_mod
-        _moltbook_mod._current_workspace_id = task.workspace_id
-        _moltbook_mod._current_user_id = task.user_id
-        
-        import agent.tools.schedule as _schedule_mod
-        _schedule_mod._cron_scheduler = runtime.cron_scheduler
-        _schedule_mod._current_workspace_id = task.workspace_id
-        _schedule_mod._current_user_id = task.user_id
-
-        import agent.tools.build_automation as _ba_mod
-        _ba_mod._current_workspace_id = task.workspace_id
-        _ba_mod._current_user_id = task.user_id
-
-        import agent.tools.daemon_control as _dc_mod
-        _dc_mod._current_workspace_id = task.workspace_id
-        _dc_mod._current_user_id = task.user_id
-
-        # Set context for model swap tool (if used in automation)
-        import agent.tools.model_swap as _ms_mod
-        _ms_mod._current_workspace_id = task.workspace_id
-        _ms_mod._current_user_id = task.user_id
-
-        async for event in task_loop.run(task):
-            logger.debug(f"Automation task {task.id}: {event.type}")
-    except Exception as e:
-        logger.error(f"Automation task {task.id} failed: {e}")
+    queue_job = await runtime.task_enqueuer.enqueue(
+        workspace_id=workspace_id,
+        user_id=user_id,
+        goal=goal,
+        source=source,
+        priority=6,
+        agent_task_id=task.id,
+        payload_json={
+            "task_profile": TaskProfile.OPS.value,
+            "model_override": model_override or "",
+        },
+        trigger_kind="automation",
+    )
+    await persist_task_event_payload(
+        {
+            "type": "thinking",
+            "event_type": "task_queued",
+            "task_id": task.id,
+            "step_id": "",
+            "content": f"Task queued from {source}.",
+            "tool_name": "",
+            "tool_args": "",
+            "tool_result": "",
+            "approval_id": "",
+            "progress": {"queue_id": queue_job.id, "status": "queued"},
+        },
+        workspace_id=workspace_id,
+        user_id=user_id,
+    )
+    logger.info(f"Automation task queued: {task.id} — {goal} (source: {source}, queue: {queue_job.id})")
 
 async def _bootstrap_cron_job(
     pool: Any,

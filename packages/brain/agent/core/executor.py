@@ -168,6 +168,49 @@ class TaskExecutor:
         self._text_only_streak: dict[str, int] = {}  # step_id → consecutive text-only responses
         self._text_only_total: dict[str, int] = {}   # step_id → total text-only responses (never resets)
 
+    def _build_tool_context(self, task: AgentTask) -> dict[str, Any]:
+        exec_ctx = getattr(task, "execution_context", None)
+        if exec_ctx:
+            return exec_ctx.to_tool_context()
+
+        context: dict[str, Any] = {}
+        if task.workspace_id:
+            context["workspace_id"] = task.workspace_id
+        if task.user_id:
+            context["user_id"] = task.user_id
+        return context
+
+    def _resolve_tool_tier(
+        self,
+        task: AgentTask,
+        tool_name: str,
+        tool_args: dict[str, Any],
+    ) -> tuple[ApprovalTier, str]:
+        tier, tier_reason = self._guardrails.check_tool(
+            tool_name, tool_args, task.config,
+            tool_registry=self._tools,
+        )
+
+        exec_ctx = getattr(task, "execution_context", None)
+        if not exec_ctx:
+            return tier, tier_reason
+
+        policy_engine = getattr(exec_ctx, "services", {}).get("policy_engine")
+        if not policy_engine:
+            return tier, tier_reason
+
+        decision = policy_engine.decide(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            tool_definition=self._tools.get_tool(tool_name),
+            execution_context=exec_ctx,
+        )
+        if not decision.allowed:
+            return ApprovalTier.BLOCK, decision.rationale
+        if decision.approval_required and tier != ApprovalTier.BLOCK:
+            return ApprovalTier.CONFIRM, decision.rationale
+        return tier, tier_reason or decision.rationale
+
     def _get_tracker(self, step_id: str) -> DiagnosticTracker:
         """Get or create a DiagnosticTracker for a step."""
         if step_id not in self._step_diagnostics:
@@ -380,9 +423,10 @@ class TaskExecutor:
             seen_signatures.add(sig)
 
             is_control = tool_name in ("task_complete", "ask_human")
-            tier, _reason = self._guardrails.check_tool(
-                tool_name, tool_args, task.config,
-                tool_registry=self._tools,
+            tier, _reason = self._resolve_tool_tier(
+                task,
+                tool_name,
+                tool_args,
             )
 
             if is_control or tier in (ApprovalTier.CONFIRM, ApprovalTier.BLOCK):
@@ -413,7 +457,7 @@ class TaskExecutor:
                         name=tool_name,
                         arguments=tool_args,
                     )
-                    tool_context = {"workspace_id": task.workspace_id} if task.workspace_id else {}
+                    tool_context = self._build_tool_context(task)
                     result = await self._execute_tool_with_retry(tool_call, tool_context)
                     return tc_data, tool_call, result
 
@@ -529,9 +573,10 @@ class TaskExecutor:
             arguments=tool_args,
         )
 
-        tier, tier_reason = self._guardrails.check_tool(
-            tool_name, tool_args, task.config,
-            tool_registry=self._tools,
+        tier, tier_reason = self._resolve_tool_tier(
+            task,
+            tool_name,
+            tool_args,
         )
 
         if tier == ApprovalTier.BLOCK:
@@ -664,7 +709,7 @@ class TaskExecutor:
                 reasoning=f"LLM selected {tool_name} for step: {step.description[:80]}",
             )
 
-        tool_context = {"workspace_id": task.workspace_id} if task.workspace_id else {}
+        tool_context = self._build_tool_context(task)
         result = await self._execute_tool_with_retry(tool_call, tool_context)
         task.tool_calls_count += 1
 

@@ -365,10 +365,12 @@ class HeartbeatEngine:
     Wakes up the agent periodically to assess state, run sweeps, execute
     routine maintenance, and continue background tasks without user prompting.
     """
-    def __init__(self, pool, task_launcher, interval_seconds: int = 3600):
+    def __init__(self, pool, task_launcher, interval_seconds: int = 3600, opportunity_engine=None, session_manager=None):
         self._pool = pool
         self._task_launcher = task_launcher
         self._interval = interval_seconds
+        self._opportunity_engine = opportunity_engine
+        self._session_manager = session_manager
         self._running = False
         self._task: Optional[asyncio.Task] = None
 
@@ -400,8 +402,8 @@ class HeartbeatEngine:
                 logger.error(f"Heartbeat loop error: {e}")
 
     async def _run_sweeps(self) -> None:
-        """Query DB for active workspaces and run maintenance tasks for each."""
-        if not self._task_launcher:
+        """Query DB for active workspaces and enqueue the best opportunities."""
+        if not self._opportunity_engine:
             return
 
         # Quiet hours and idle detection
@@ -436,23 +438,31 @@ class HeartbeatEngine:
             from agent.core.heartbeat_parser import HeartbeatParser
             parser = HeartbeatParser()
             heartbeat_tasks = parser.parse()
-            user_goals = "\n".join(f"- {t.description}" for t in heartbeat_tasks)
         except Exception as e:
             logger.warning(f"Failed to parse Heartbeat tasks: {e}")
-            user_goals = ""
+            heartbeat_tasks = []
 
         try:
+            if self._session_manager:
+                pruned = await self._session_manager.prune_inactive_sessions(limit=50)
+                if pruned.get("pruned_count"):
+                    logger.info(f"Heartbeat pruned {pruned['pruned_count']} inactive session(s)")
+
             async with self._pool.acquire() as conn:
-                # Target workspaces that have memory graph nodes
-                rows = await conn.fetch("SELECT DISTINCT workspace_id FROM memory_graph_nodes LIMIT 50")
-                
-                # We need a user ID for the task launcher, default to a system or admin user UUID if possible
-                user_row = await conn.fetchrow("SELECT id FROM auth_users LIMIT 1")
-                user_id = str(user_row["id"]) if user_row else "00000000-0000-0000-0000-000000000000"
+                rows = await conn.fetch(
+                    """
+                    SELECT DISTINCT wm.workspace_id, wm.user_id
+                    FROM workspace_members wm
+                    WHERE wm.role = 'owner'
+                    ORDER BY wm.workspace_id
+                    LIMIT 50
+                    """
+                )
 
             for row in rows:
                 ws_id = str(row["workspace_id"])
-                
+                user_id = str(row["user_id"])
+
                 # Bi-directional memory sync: ingest manual edits from markdown
                 try:
                     from agent.core.markdown_memory import LocalMarkdownMemoryManager
@@ -462,25 +472,72 @@ class HeartbeatEngine:
                     await mm.ingest_from_disk(ws_id)
                 except Exception as e:
                     logger.warning(f"Failed to ingest markdown memory during heartbeat: {e}")
-                
-                goal = (
-                    "Background Heartbeat Sweep: Assess current state, check for stalled tasks, "
-                    "compress memory, and prepare next steps."
-                )
-                if user_goals:
-                    goal += f"\n\nUser-defined autonomous tasks:\n{user_goals}"
-                goal += "\n\nIf nothing to do, safely exit."
-                
-                # Launch the background sweep task
-                # Passing a cheaper model for routine sweeps to optimize costs
-                await self._task_launcher(
+
+                async with self._pool.acquire() as conn:
+                    stale_count = await conn.fetchval(
+                        """
+                        SELECT COUNT(*)
+                        FROM task_queue
+                        WHERE workspace_id = $1
+                          AND (
+                              (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= now())
+                              OR (status = 'queued' AND created_at < now() - interval '6 hours')
+                          )
+                        """,
+                        ws_id,
+                    )
+
+                if stale_count:
+                    stale_bucket = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+                    await self._opportunity_engine.record_opportunity(
+                        workspace_id=ws_id,
+                        source="heartbeat",
+                        title="Recover stalled queued work",
+                        goal_template=(
+                            f"Review {stale_count} stalled queued or running tasks in this workspace, "
+                            "recover resumable work, cancel dead runs, and queue any necessary follow-up."
+                        ),
+                        score=0.95,
+                        severity="warning",
+                        dedupe_key=f"heartbeat:stalled:{ws_id}:{stale_bucket}",
+                        payload_json={"stale_count": int(stale_count), "bucket": stale_bucket},
+                    )
+
+                now = datetime.now(timezone.utc)
+                for heartbeat_task in heartbeat_tasks:
+                    bucket = now.strftime("%Y-%m-%d")
+                    score = 0.7
+                    if heartbeat_task.frequency == "hourly":
+                        bucket = now.strftime("%Y-%m-%dT%H")
+                        score = 0.8
+                    elif heartbeat_task.frequency == "every":
+                        bucket = now.strftime("%Y-%m-%dT%H")
+                        score = 0.85
+
+                    fingerprint = hashlib.md5(
+                        f"{ws_id}:{heartbeat_task.frequency}:{heartbeat_task.description}:{bucket}".encode()
+                    ).hexdigest()[:12]
+                    await self._opportunity_engine.record_opportunity(
+                        workspace_id=ws_id,
+                        source="heartbeat",
+                        title=heartbeat_task.description[:120],
+                        goal_template=heartbeat_task.description,
+                        score=score,
+                        severity="info",
+                        dedupe_key=f"heartbeat:{heartbeat_task.frequency}:{fingerprint}",
+                        payload_json={
+                            "frequency": heartbeat_task.frequency,
+                            "bucket": bucket,
+                        },
+                    )
+
+                queued = await self._opportunity_engine.enqueue_best(
                     workspace_id=ws_id,
                     user_id=user_id,
-                    goal=goal,
-                    source="heartbeat_engine",
-                    model_override="gemini-2.5-flash"
+                    limit=1,
                 )
-                logger.debug(f"Triggered heartbeat sweep for workspace {ws_id}")
+                if queued:
+                    logger.debug(f"Queued {len(queued)} heartbeat opportunity for workspace {ws_id}")
 
         except Exception as e:
             logger.error(f"Failed to run heartbeat sweeps: {e}")

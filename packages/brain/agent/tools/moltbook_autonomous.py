@@ -334,12 +334,14 @@ async def moltbook_session(
     submolts: Optional[list] = None,
     sort: str = "hot",
     limit_per_submolt: int = 8,
+    execution_context=None,
+    workspace_id: str = "",
 ) -> dict:
     """
     Scan subscribed submolts, filter for relevance, deduplicate, and return
     a curated engagement plan the agent loop uses to compose and post responses.
     """
-    from agent.tools.moltbook import _load_api_key, _get_feed, _current_workspace_id
+    from agent.tools.moltbook import _get_feed, _load_api_key, _resolve_workspace_id
 
     api_key = _load_api_key()
     if not api_key:
@@ -348,7 +350,7 @@ async def moltbook_session(
             "action_needed": "register",
         }
 
-    workspace_id = _current_workspace_id
+    resolved_workspace_id = _resolve_workspace_id(workspace_id, execution_context)
     subscribed = submolts or DEFAULT_SUBSCRIBED_SUBMOLTS
     limit_per_submolt = min(limit_per_submolt, 20)
 
@@ -382,8 +384,8 @@ async def moltbook_session(
 
     # ── 2. Deduplicate against recent activity ────────────────────────
     seen_ids: set[str] = set()
-    if workspace_id:
-        seen_ids = await get_recently_engaged_post_ids(workspace_id)
+    if resolved_workspace_id:
+        seen_ids = await get_recently_engaged_post_ids(resolved_workspace_id)
 
     # ── 3. Score and filter ───────────────────────────────────────────
     scored: list[dict] = []
@@ -407,12 +409,12 @@ async def moltbook_session(
 
     # ── 4. Query memory graph for evolving context ────────────────────
     memory_context = ""
-    if workspace_id:
-        memory_context = await get_memory_context(workspace_id)
+    if resolved_workspace_id:
+        memory_context = await get_memory_context(resolved_workspace_id)
 
     # ── 5. Write what we scanned to the memory graph ──────────────────
-    if top_posts and workspace_id:
-        await record_session_in_memory_graph(workspace_id, top_posts)
+    if top_posts and resolved_workspace_id:
+        await record_session_in_memory_graph(resolved_workspace_id, top_posts)
 
     # ── 6. Return engagement plan ──────────────────────────────────────
     return {

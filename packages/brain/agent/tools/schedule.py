@@ -12,12 +12,6 @@ from agent.types import RiskLevel, ToolDefinition
 
 logger = logging.getLogger("brain.agent.tools.schedule")
 
-# Set by server.py before tool execution
-_cron_scheduler = None
-_current_workspace_id: Optional[str] = None
-_current_user_id: Optional[str] = None
-
-
 def register_schedule_tools(registry) -> None:
     """Register the schedule tool."""
 
@@ -87,25 +81,42 @@ async def schedule_action(
     goal: str = "",
     max_runs: int = None,
     job_id: str = "",
+    execution_context=None,
+    cron_scheduler=None,
+    workspace_id: str = "",
+    user_id: str = "",
 ) -> dict:
     """Route to the appropriate schedule action."""
-    if not _cron_scheduler:
+    scheduler = cron_scheduler
+    ws_id = workspace_id or getattr(execution_context, "workspace_id", None)
+    actor_id = user_id or getattr(execution_context, "user_id", None)
+
+    if not scheduler:
         return {
             "error": "Scheduler not available",
             "hint": "The cron scheduler hasn't been initialized yet.",
         }
 
     if action == "create":
-        return await _create_job(name, description, cron, goal, max_runs)
+        return await _create_job(name, description, cron, goal, max_runs, scheduler, ws_id, actor_id)
     elif action == "list":
-        return await _list_jobs()
+        return await _list_jobs(scheduler, ws_id)
     elif action == "delete":
-        return await _delete_job(job_id)
+        return await _delete_job(job_id, scheduler)
     else:
         return {"error": f"Unknown action: {action}. Use 'create', 'list', or 'delete'."}
 
 
-async def _create_job(name: str, description: str, cron: str, goal: str, max_runs: int = None) -> dict:
+async def _create_job(
+    name: str,
+    description: str,
+    cron: str,
+    goal: str,
+    max_runs: int = None,
+    scheduler=None,
+    workspace_id: str = "",
+    user_id: str = "",
+) -> dict:
     """Create a new scheduled task."""
     if not name:
         return {"error": "A name is required for the scheduled task."}
@@ -127,14 +138,11 @@ async def _create_job(name: str, description: str, cron: str, goal: str, max_run
             },
         }
 
-    workspace_id = _current_workspace_id
-    user_id = _current_user_id
-
     if not workspace_id or not user_id:
         return {"error": "Cannot determine workspace/user context for scheduling."}
 
     try:
-        job, was_created = await _cron_scheduler.create_job(
+        job, was_created = await scheduler.create_job(
             workspace_id=workspace_id,
             user_id=user_id,
             name=name,
@@ -174,14 +182,13 @@ async def _create_job(name: str, description: str, cron: str, goal: str, max_run
         return {"error": f"Failed to create scheduled task: {e}"}
 
 
-async def _list_jobs() -> dict:
+async def _list_jobs(scheduler=None, workspace_id: str = "") -> dict:
     """List all scheduled tasks for the current workspace."""
-    workspace_id = _current_workspace_id
     if not workspace_id:
         return {"error": "Cannot determine workspace context."}
 
     try:
-        jobs = await _cron_scheduler.list_jobs(workspace_id)
+        jobs = await scheduler.list_jobs(workspace_id)
         if not jobs:
             return {
                 "status": "empty",
@@ -198,13 +205,13 @@ async def _list_jobs() -> dict:
         return {"error": f"Failed to list scheduled tasks: {e}"}
 
 
-async def _delete_job(job_id: str) -> dict:
+async def _delete_job(job_id: str, scheduler=None) -> dict:
     """Delete a scheduled task."""
     if not job_id:
         return {"error": "A job_id is required. Use action='list' to see active jobs."}
 
     try:
-        deleted = await _cron_scheduler.delete_job(job_id)
+        deleted = await scheduler.delete_job(job_id)
         if deleted:
             return {
                 "status": "deleted",

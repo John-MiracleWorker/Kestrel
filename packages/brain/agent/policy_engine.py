@@ -1,0 +1,114 @@
+from __future__ import annotations
+
+"""
+Central autonomy policy evaluation for tool side effects.
+"""
+
+from agent.execution_context import ExecutionContext, PolicyDecision
+from agent.types import RiskLevel, ToolDefinition
+
+
+class PolicyEngine:
+    """Evaluate whether a tool action is allowed, gated, or blocked."""
+
+    _INTERNAL_AUTONOMOUS_TOOLS = {
+        "memory_store",
+        "schedule",
+        "build_automation",
+        "daemon_create",
+        "daemon_stop",
+        "telegram_notify",
+        "model_swap",
+    }
+    _READONLY_GIT_ACTIONS = {"status", "diff", "log", "branch", "show"}
+
+    def decide(
+        self,
+        *,
+        tool_name: str,
+        tool_args: dict,
+        tool_definition: ToolDefinition | None,
+        execution_context: ExecutionContext | None,
+    ) -> PolicyDecision:
+        policy_name = (
+            execution_context.autonomy_policy
+            if execution_context else "moderate"
+        ).lower()
+
+        if policy_name not in {"moderate", "conservative", "full"}:
+            policy_name = "moderate"
+
+        if tool_name == "task_complete" or tool_name == "ask_human":
+            return PolicyDecision(True, False, "low", "control", "Control tool")
+
+        if tool_name == "git":
+            action = str(tool_args.get("action", "")).lower()
+            if action in self._READONLY_GIT_ACTIONS:
+                return PolicyDecision(True, False, "low", "workspace", "Read-only git action")
+            return PolicyDecision(
+                True,
+                policy_name != "full",
+                "high",
+                "workspace",
+                "Git writes remain approval-gated under the active autonomy policy.",
+            )
+
+        if tool_name == "mcp_install":
+            return PolicyDecision(
+                True,
+                True,
+                "high",
+                "workspace",
+                "Tool installation always requires approval.",
+            )
+
+        if tool_name in self._INTERNAL_AUTONOMOUS_TOOLS:
+            return PolicyDecision(
+                True,
+                False,
+                "medium",
+                "internal",
+                "Allowed internal autonomy action.",
+            )
+
+        risk = (tool_definition.risk_level if tool_definition else RiskLevel.HIGH).value
+        lowered_name = tool_name.lower()
+        mutating_hint = any(
+            keyword in lowered_name
+            for keyword in ("write", "install", "deploy", "delete", "mutate", "commit", "push")
+        )
+
+        if risk == RiskLevel.HIGH.value or mutating_hint:
+            return PolicyDecision(
+                True,
+                policy_name != "full",
+                risk,
+                "workspace",
+                "Mutating or high-risk action requires approval.",
+            )
+
+        if tool_definition and tool_definition.requires_approval:
+            return PolicyDecision(
+                True,
+                True,
+                risk,
+                "workspace",
+                "Tool definition requires approval.",
+            )
+
+        if policy_name == "conservative" and risk != "low":
+            return PolicyDecision(
+                True,
+                True,
+                risk,
+                "workspace",
+                "Conservative autonomy gates medium-risk actions.",
+            )
+
+        return PolicyDecision(
+            True,
+            False,
+            risk,
+            "workspace",
+            "Allowed by the active autonomy policy.",
+        )

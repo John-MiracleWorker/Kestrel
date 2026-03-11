@@ -37,7 +37,16 @@ class RuntimeContext:
     memory_graph: Any = None
     tool_registry: Any = None
     persona_learner: Any = None
+    checkpoint_manager: Any = None
     task_predictor: Any = None
+    workspace_agent_store: Any = None
+    task_enqueuer: Any = None
+    task_dispatcher: Any = None
+    job_runner: Any = None
+    policy_engine: Any = None
+    opportunity_engine: Any = None
+    automation_builder: Any = None
+    daemon_manager: Any = None
     command_parser: Any = None
     metrics_collector: Any = None
     notification_router: Any = None
@@ -45,6 +54,8 @@ class RuntimeContext:
     skill_manager: Any = None
     session_manager: Any = None
     sandbox_manager: Any = None
+    branch_manager: Any = None
+    ui_artifact_manager: Any = None
     feature_mode: str = "core"
     enabled_tool_bundles: list[str] = field(default_factory=list)
     startup_initializers: list[str] = field(default_factory=list)

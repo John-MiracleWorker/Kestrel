@@ -1,7 +1,6 @@
-import json
 from core.grpc_setup import brain_pb2
-from core.config import logger, TASK_EVENT_HISTORY_MAX, TASK_EVENT_TTL_SECONDS
-from db import get_redis
+from core.config import logger
+from agent.task_events import persist_task_event_payload
 
 class BaseServicerMixin:
     """Provides common utilities for all BrainServicer mixins."""
@@ -21,12 +20,34 @@ class BaseServicerMixin:
             "task_paused": brain_pb2.TaskEvent.EventType.TASK_PAUSED,
         }.get(event_type_value, brain_pb2.TaskEvent.EventType.THINKING)
 
-    async def _persist_task_event(self, task_event: "brain_pb2.TaskEvent") -> None:
+    @staticmethod
+    def _proto_event_type_name(event_type_value: int) -> str:
+        return {
+            brain_pb2.TaskEvent.EventType.PLAN_CREATED: "plan_created",
+            brain_pb2.TaskEvent.EventType.STEP_STARTED: "step_started",
+            brain_pb2.TaskEvent.EventType.TOOL_CALLED: "tool_called",
+            brain_pb2.TaskEvent.EventType.TOOL_RESULT: "tool_result",
+            brain_pb2.TaskEvent.EventType.STEP_COMPLETE: "step_complete",
+            brain_pb2.TaskEvent.EventType.APPROVAL_NEEDED: "approval_needed",
+            brain_pb2.TaskEvent.EventType.THINKING: "thinking",
+            brain_pb2.TaskEvent.EventType.TASK_COMPLETE: "task_complete",
+            brain_pb2.TaskEvent.EventType.TASK_FAILED: "task_failed",
+            brain_pb2.TaskEvent.EventType.TASK_PAUSED: "task_paused",
+        }.get(int(event_type_value), "thinking")
+
+    async def _persist_task_event(
+        self,
+        task_event: "brain_pb2.TaskEvent",
+        *,
+        workspace_id: str = "",
+        user_id: str = "",
+    ) -> None:
         """Persist and publish task events for reconnectable streams."""
         try:
-            redis_client = await get_redis()
-            event_json = json.dumps({
-                "type": int(task_event.type),
+            event_type_name = self._proto_event_type_name(task_event.type)
+            payload = {
+                "type": event_type_name,
+                "event_type": event_type_name,
                 "task_id": task_event.task_id,
                 "step_id": task_event.step_id,
                 "content": task_event.content,
@@ -35,21 +56,25 @@ class BaseServicerMixin:
                 "tool_result": task_event.tool_result,
                 "approval_id": task_event.approval_id,
                 "progress": dict(task_event.progress),
-            }, default=str)
-            key = f"kestrel:task_events:{task_event.task_id}"
-            channel = f"kestrel:task_events:{task_event.task_id}:channel"
-            await redis_client.rpush(key, event_json)
-            await redis_client.ltrim(key, -TASK_EVENT_HISTORY_MAX, -1)
-            await redis_client.expire(key, TASK_EVENT_TTL_SECONDS)
-            await redis_client.publish(channel, event_json)
+            }
+            await persist_task_event_payload(
+                payload,
+                workspace_id=workspace_id,
+                user_id=user_id,
+            )
         except Exception as event_err:
             logger.warning(f"Failed to persist task event: {event_err}")
 
     @staticmethod
     def _task_event_from_json(payload: dict) -> "brain_pb2.TaskEvent":
         progress = payload.get("progress") or {}
+        raw_type = payload.get("type", payload.get("event_type", "thinking"))
+        try:
+            event_type = int(raw_type)
+        except (TypeError, ValueError):
+            event_type = BaseServicerMixin._event_type_to_proto(str(raw_type))
         return brain_pb2.TaskEvent(
-            type=int(payload.get("type", brain_pb2.TaskEvent.EventType.THINKING)),
+            type=event_type,
             task_id=str(payload.get("task_id", "")),
             step_id=str(payload.get("step_id", "")),
             content=str(payload.get("content", "")),

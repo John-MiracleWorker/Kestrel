@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Tuple
 
 logger = logging.getLogger("brain.agent.core.verifier")
@@ -35,6 +36,14 @@ class VerifierEngine:
     def __init__(self, provider, model: str):
         self._provider = provider
         self._model = model
+
+    @staticmethod
+    def _is_critical_claim(goal: str, summary: str) -> bool:
+        text = f"{goal}\n{summary}".lower()
+        return bool(re.search(
+            r"\b(write|modified?|created?|deleted?|deploy(?:ed)?|install(?:ed)?|mcp|push(?:ed)?|commit(?:ted)?|sent|emailed?)\b",
+            text,
+        ))
 
     async def verify(self, goal: str, summary: str, evidence_chain) -> Tuple[bool, str]:
         if not self._provider:
@@ -91,5 +100,9 @@ class VerifierEngine:
             
         except Exception as e:
             logger.error(f"Verifier Engine error: {e}")
-            # Fail open to avoid deadlocking tasks on verification bugs
+            if self._is_critical_claim(goal, summary):
+                return False, (
+                    "Verifier Engine failed during a critical side-effect claim. "
+                    f"Completion is blocked until verification succeeds: {e}"
+                )
             return True, f"Verifier Engine skipped due to internal error: {e}"

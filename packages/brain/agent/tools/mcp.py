@@ -20,9 +20,6 @@ from agent.types import RiskLevel, ToolDefinition
 
 logger = logging.getLogger("brain.agent.tools.mcp")
 
-# Module-level workspace context — set by chat_service before each task
-_current_workspace_id: Optional[str] = None
-
 # ── Known MCP Server Registries ───────────────────────────────────────
 # These are public sources of MCP server metadata.
 MCP_REGISTRIES = [
@@ -142,13 +139,13 @@ BUILTIN_CATALOG = [
 def register_mcp_tools(registry, pool=None) -> None:
     """Register MCP discovery and management tools."""
 
-    async def mcp_search(query: str, category: str = "") -> dict:
+    async def mcp_search(query: str, category: str = "", execution_context=None) -> dict:
         """Search for MCP servers matching a query."""
         query_lower = query.lower()
 
         # 0. Merge workspace-installed servers into the search catalog
         workspace_servers: list[dict] = []
-        ws_id = _current_workspace_id or ""
+        ws_id = getattr(execution_context, "workspace_id", "") or ""
         if pool and ws_id:
             try:
                 async with pool.acquire() as conn:
@@ -238,9 +235,10 @@ def register_mcp_tools(registry, pool=None) -> None:
         transport: str = "stdio",
         description: str = "",
         env_vars: str = "",
+        execution_context=None,
     ) -> dict:
         """Install/register an MCP server for this workspace."""
-        workspace_id = workspace_id or _current_workspace_id or ""
+        workspace_id = workspace_id or getattr(execution_context, "workspace_id", "") or ""
         if not pool:
             return {"success": False, "error": "No database connection available"}
         if not workspace_id:
@@ -289,9 +287,9 @@ def register_mcp_tools(registry, pool=None) -> None:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    async def mcp_list(workspace_id: str = "") -> dict:
+    async def mcp_list(workspace_id: str = "", execution_context=None) -> dict:
         """List all installed MCP servers for a workspace."""
-        workspace_id = workspace_id or _current_workspace_id or ""
+        workspace_id = workspace_id or getattr(execution_context, "workspace_id", "") or ""
         if not pool:
             return {"installed": [], "error": "No database connection"}
         if not workspace_id:
@@ -325,9 +323,9 @@ def register_mcp_tools(registry, pool=None) -> None:
         except Exception as e:
             return {"installed": [], "error": str(e)}
 
-    async def mcp_uninstall(name: str, workspace_id: str = "") -> dict:
+    async def mcp_uninstall(name: str, workspace_id: str = "", execution_context=None) -> dict:
         """Uninstall/remove an MCP server from the workspace."""
-        workspace_id = workspace_id or _current_workspace_id or ""
+        workspace_id = workspace_id or getattr(execution_context, "workspace_id", "") or ""
         if not pool:
             return {"success": False, "error": "No database connection"}
         if not workspace_id:
@@ -488,6 +486,7 @@ def register_mcp_tools(registry, pool=None) -> None:
         command: str = "",
         env_vars: str = "",
         workspace_id: str = "",
+        execution_context=None,
     ) -> dict:
         """Connect to an MCP server and discover its tools."""
         # If no command given, try to find from catalog or installed DB
@@ -502,7 +501,7 @@ def register_mcp_tools(registry, pool=None) -> None:
         # but always load stored env vars (e.g. API keys saved via mcp_install).
         stored_env = {}
         if pool:
-            ws_id = workspace_id or _current_workspace_id or ""
+            ws_id = workspace_id or getattr(execution_context, "workspace_id", "") or ""
             if ws_id:
                 try:
                     async with pool.acquire() as conn:

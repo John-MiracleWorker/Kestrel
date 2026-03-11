@@ -8,6 +8,7 @@ from core.feature_mode import enabled_bundles_for_mode, parse_feature_mode
 from core.prompts import KESTREL_DEFAULT_SYSTEM_PROMPT
 from core import runtime
 
+from agent.execution_context import ExecutionContext
 from agent.task_profiles import filter_registry_for_profile, infer_task_profile
 from db import get_pool, get_redis
 from providers_registry import get_provider, CloudProvider, list_provider_configs, resolve_provider
@@ -328,34 +329,27 @@ class ChatServicerMixin(BaseServicerMixin):
             )
             tool_registry = filter_registry_for_profile(tool_registry, task_profile, feature_mode)
 
-            # Set workspace context for Moltbook activity logging
-            import agent.tools.moltbook as _moltbook_mod
-            _moltbook_mod._current_workspace_id = workspace_id
-            _moltbook_mod._current_user_id = request.user_id
-
-            # Set workspace context for MCP tools
-            import agent.tools.mcp as _mcp_mod
-            _mcp_mod._current_workspace_id = workspace_id
-
-            # Set context for schedule tool (cron jobs)
-            import agent.tools.schedule as _schedule_mod
-            _schedule_mod._cron_scheduler = runtime.cron_scheduler
-            _schedule_mod._current_workspace_id = workspace_id
-            _schedule_mod._current_user_id = request.user_id
-
-            # Set per-request context for build_automation and daemon_control tools
-            import agent.tools.build_automation as _ba_mod
-            _ba_mod._current_workspace_id = workspace_id
-            _ba_mod._current_user_id = request.user_id
-
-            import agent.tools.daemon_control as _dc_mod
-            _dc_mod._current_workspace_id = workspace_id
-            _dc_mod._current_user_id = request.user_id
-
-            # Set context for model swap tool
-            import agent.tools.model_swap as _ms_mod
-            _ms_mod._current_workspace_id = workspace_id
-            _ms_mod._current_user_id = request.user_id
+            agent_profile = await runtime.workspace_agent_store.ensure_profile(workspace_id)
+            chat_task.execution_context = ExecutionContext.create(
+                task_id=chat_task.id,
+                queue_id=chat_task.id,
+                agent_profile_id=agent_profile.id,
+                workspace_id=workspace_id,
+                user_id=request.user_id,
+                session_id=conversation_id or chat_task.id,
+                source="chat",
+                budgets=chat_task.config.to_dict(),
+                permissions={"tool_policy_bundle": list(agent_profile.tool_policy_bundle)},
+                autonomy_policy=agent_profile.autonomy_policy,
+                services={
+                    "cron_scheduler": runtime.cron_scheduler,
+                    "automation_builder": getattr(runtime, "automation_builder", None),
+                    "daemon_manager": getattr(runtime, "daemon_manager", None),
+                    "policy_engine": getattr(runtime, "policy_engine", None),
+                    "ui_manager": getattr(runtime, "ui_artifact_manager", None),
+                    "ui_artifact_manager": getattr(runtime, "ui_artifact_manager", None),
+                },
+            )
 
             # Create per-task evidence chain for auditable decision trail
             from agent.evidence import EvidenceChain

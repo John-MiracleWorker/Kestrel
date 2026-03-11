@@ -58,8 +58,8 @@ from agent.state_machine import TaskStateMachine
 
 logger = logging.getLogger("brain.agent.loop")
 
-# Feature flag: set USE_LANGGRAPH=true to use the new LangGraph-based engine
-_USE_LANGGRAPH = os.getenv("USE_LANGGRAPH", "false").lower() == "true"
+# Emergency rollback flag: keep the legacy loop available only as a fallback.
+_ENABLE_LEGACY_LOOP = os.getenv("KESTREL_ENABLE_LEGACY_LOOP", "false").lower() == "true"
 
 
 def _council_debate_enabled() -> bool:
@@ -252,15 +252,16 @@ class AgentLoop:
         """
         Execute an agent task, yielding events as they occur.
 
-        This is the main entry point. When USE_LANGGRAPH=true, delegates
-        to the LangGraph engine. Otherwise, runs the legacy loop.
+        This is the main entry point. LangGraph is the default execution
+        engine. The legacy loop remains available only as an emergency
+        rollback path via KESTREL_ENABLE_LEGACY_LOOP=true.
         """
-        if _USE_LANGGRAPH:
-            async for event in self._run_langgraph(task):
+        if _ENABLE_LEGACY_LOOP:
+            async for event in self._run_legacy(task):
                 yield event
             return
 
-        async for event in self._run_legacy(task):
+        async for event in self._run_langgraph(task):
             yield event
 
     async def _run_langgraph(self, task: AgentTask) -> AsyncIterator[TaskEvent]:

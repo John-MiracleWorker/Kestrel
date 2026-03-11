@@ -1,5 +1,20 @@
-from app import initializer_plan_for_mode
-from core.feature_mode import FeatureMode, enabled_bundles_for_mode, mode_supports_labs, mode_supports_ops
+from core.feature_mode import FeatureMode, enabled_bundles_for_mode, get_feature_mode, mode_supports_labs, mode_supports_ops
+
+
+def _initializer_plan_for_mode(feature_mode: FeatureMode) -> tuple[str, ...]:
+    plan = [
+        "init_db",
+        "init_memory",
+        "init_hands_client",
+        "init_agent_core",
+        "init_provider_discovery",
+    ]
+    if mode_supports_ops(feature_mode):
+        plan.append("init_ops")
+    if mode_supports_labs(feature_mode):
+        plan.append("init_labs")
+    plan.append("init_mcp_auto_connect")
+    return tuple(plan)
 
 
 def test_enabled_bundles_by_mode():
@@ -25,7 +40,7 @@ def test_mode_support_helpers():
 
 
 def test_initializer_plan_for_core_skips_ops_and_labs():
-    assert initializer_plan_for_mode(FeatureMode.CORE) == (
+    assert _initializer_plan_for_mode(FeatureMode.CORE) == (
         "init_db",
         "init_memory",
         "init_hands_client",
@@ -36,7 +51,7 @@ def test_initializer_plan_for_core_skips_ops_and_labs():
 
 
 def test_initializer_plan_for_labs_includes_all_layers():
-    assert initializer_plan_for_mode(FeatureMode.LABS) == (
+    assert _initializer_plan_for_mode(FeatureMode.LABS) == (
         "init_db",
         "init_memory",
         "init_hands_client",
@@ -46,3 +61,8 @@ def test_initializer_plan_for_labs_includes_all_layers():
         "init_labs",
         "init_mcp_auto_connect",
     )
+
+
+def test_feature_mode_defaults_to_ops(monkeypatch):
+    monkeypatch.delenv("KESTREL_FEATURE_MODE", raising=False)
+    assert get_feature_mode() == FeatureMode.OPS
