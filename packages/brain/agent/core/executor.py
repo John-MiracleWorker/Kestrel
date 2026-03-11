@@ -277,6 +277,11 @@ class TaskExecutor:
                             logger.warning("Failed to record approval pattern: %s", e)
                     return approved
             await asyncio.sleep(2.0)
+        logger.warning(
+            f"Approval timed out after {timeout_s}s for task {task.id} "
+            f"(tool: {task.pending_approval.tool_name if task.pending_approval else 'unknown'}). "
+            f"No response received — treating as denied."
+        )
         return False
 
     async def run_step(self, task: AgentTask, step: Any) -> AsyncIterator[TaskEvent]:

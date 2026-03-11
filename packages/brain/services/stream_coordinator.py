@@ -18,6 +18,21 @@ def make_activity_callback(output_queue: asyncio.Queue, make_response: Callable)
 
     async def _activity_callback(activity_type: str, data: dict):
         """Push activity events directly to the output stream."""
+        # Events that flow through the tool_parser (via the LangGraph
+        # event bridge) should NOT be duplicated here as generic
+        # "agent_activity" metadata — doing so causes Telegram to
+        # spam "Coordinating..." for every streamed token.
+        _TOOL_PARSER_EVENTS = frozenset({
+            "step_complete", "step_started", "task_complete",
+            "task_failed", "plan_created", "thinking",
+            "tool_called", "tool_result", "approval_needed",
+            "simulation_complete", "token_usage", "evidence_summary",
+            "text_delta", "lessons_loaded", "memory_recalled",
+            "persona_loaded",
+        })
+        if activity_type in _TOOL_PARSER_EVENTS:
+            return
+
         if activity_type in (
             "delegation_started", "delegation_progress",
             "delegation_complete", "parallel_delegation_started",

@@ -134,20 +134,12 @@ class LangGraphEngine:
 
         from agent.runtime.agent_graph import build_agent_graph
 
+        # NOTE: LangGraph's MemorySaver uses msgpack serialization, which
+        # cannot handle complex Python objects like AgentTask, TaskPlan, etc.
+        # that live in KestrelState.  Kestrel already persists task state to
+        # PostgreSQL via TaskPersistence, so the LangGraph checkpointer is
+        # redundant and disabled to avoid serialization errors.
         checkpointer = None
-        if self._checkpoint_manager:
-            try:
-                from langgraph.checkpoint.memory import MemorySaver
-                checkpointer = MemorySaver()
-            except ImportError as e:
-                logger.error(f"ImportError setting up LangGraph checkpointer: {e}")
-                from agent.runtime.checkpointer import PostgresCheckpointer
-                checkpointer = PostgresCheckpointer(self._checkpoint_manager)
-            except Exception as e:
-                import traceback
-                logger.error(f"Failed to setup LangGraph checkpointer: {e}\n{traceback.format_exc()}")
-                from agent.runtime.checkpointer import PostgresCheckpointer
-                checkpointer = PostgresCheckpointer(self._checkpoint_manager)
 
         self._graph = build_agent_graph(
             provider=self._provider,

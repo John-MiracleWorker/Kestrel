@@ -7,10 +7,26 @@ These types intentionally stay small and JSON-friendly so they can be used
 across persistence, runtime orchestration, and tool execution.
 """
 
+import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
+
+
+def _coerce_dict(value: Any) -> dict:
+    """Safely coerce a DB value (could be dict, JSON string, or None) to a dict."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    return dict(value)
 
 
 def _utcnow_iso() -> str:
@@ -50,7 +66,7 @@ class WorkspaceAgentProfile:
             memory_namespace=row["memory_namespace"] or f"workspace:{row['workspace_id']}",
             tool_policy_bundle=tuple(bundle or ()),
             persona_version=int(row["persona_version"] or 1),
-            runtime_defaults=dict(defaults or {}),
+            runtime_defaults=_coerce_dict(defaults),
             created_at=_coerce_timestamp(created_at),
             updated_at=_coerce_timestamp(updated_at),
         )
@@ -117,8 +133,8 @@ class QueuedTaskRecord:
             source=row["source"],
             agent_task_id=str(row["agent_task_id"]) if row["agent_task_id"] else None,
             agent_profile_id=str(row["agent_profile_id"]) if row["agent_profile_id"] else None,
-            payload_json=dict(payload_json or {}),
-            checkpoint_json=dict(checkpoint_json or {}),
+            payload_json=_coerce_dict(payload_json),
+            checkpoint_json=_coerce_dict(checkpoint_json),
             dedupe_key=row["dedupe_key"] or "",
             lease_owner=row["lease_owner"] or "",
             lease_expires_at=_ts("lease_expires_at"),
