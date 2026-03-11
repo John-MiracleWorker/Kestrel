@@ -42,21 +42,25 @@ def is_simple_message(user_content: str) -> bool:
 
 
 def enrich_goal(user_content: str, messages: list[dict]) -> str:
-    """Prepend conversation context for complex messages."""
+    """Prepend conversation context for complex messages.
+
+    The current message is placed FIRST so the planner treats it as the
+    primary instruction.  Recent conversation history follows as context.
+    """
     history_turns = [
         m for m in messages
         if m.get("role") in ("user", "assistant")
         and m.get("content") != user_content
     ]
-    recent = history_turns[-6:]
+    recent = history_turns[-4:]  # Fewer turns to keep focus on current msg
     if recent:
         history_block = "\n".join(
-            f"{'User' if m['role'] == 'user' else 'Kestrel'}: {m['content'][:300]}"
+            f"{'User' if m['role'] == 'user' else 'Kestrel'}: {m['content'][:200]}"
             for m in recent
         )
         return (
-            f"[Recent conversation context]\n{history_block}\n\n"
-            f"[Current message]\n{user_content}"
+            f"{user_content}\n\n"
+            f"[Recent conversation context for reference]\n{history_block}"
         )
     return user_content
 

@@ -449,16 +449,19 @@ export class TelegramAdapter extends BaseChannelAdapter {
 
         // Match ![alt](/media/filename)
         const mediaRegex = /!\[([^\]]*)\]\((\/media\/[^)]+)\)/g;
-        const textContent = content.replace(mediaRegex, (_match, alt: string, url: string) => {
-            // Map /media/filename to the configured shared media directory.
-            const encodedName = url.replace('/media/', '');
-            const filename = path.basename(decodeURIComponent(encodedName));
-            const filePath = path.join(this.mediaDir, filename);
-            const ext = path.extname(filename).toLowerCase();
-            const type = videoExts.includes(ext) ? 'video' : 'photo';
-            mediaFiles.push({ alt: alt || 'Generated media', filePath, type });
-            return ''; // Strip the markdown from the text
-        }).replace(/\n{3,}/g, '\n\n').trim(); // Clean up leftover whitespace
+        const textContent = content
+            .replace(mediaRegex, (_match, alt: string, url: string) => {
+                // Map /media/filename to the configured shared media directory.
+                const encodedName = url.replace('/media/', '');
+                const filename = path.basename(decodeURIComponent(encodedName));
+                const filePath = path.join(this.mediaDir, filename);
+                const ext = path.extname(filename).toLowerCase();
+                const type = videoExts.includes(ext) ? 'video' : 'photo';
+                mediaFiles.push({ alt: alt || 'Generated media', filePath, type });
+                return ''; // Strip the markdown from the text
+            })
+            .replace(/\n{3,}/g, '\n\n')
+            .trim(); // Clean up leftover whitespace
 
         return { textContent, mediaFiles };
     }
@@ -469,6 +472,11 @@ export class TelegramAdapter extends BaseChannelAdapter {
      * Uses sendDocument for images (to avoid Telegram's photo compression)
      * and sendVideo for videos.
      */
+    // Media files already sent for the current stream — prevents the same
+    // image/video from being sent multiple times when both the brain and
+    // gateway streaming pipeline independently deliver the file.
+    private sentMedia = new Set<string>();
+
     private async sendMediaFile(
         chatId: number,
         media: { alt: string; filePath: string; type: 'photo' | 'video' },
@@ -478,6 +486,14 @@ export class TelegramAdapter extends BaseChannelAdapter {
             logger.warn('Media file not found for Telegram upload', { path: media.filePath });
             return;
         }
+
+        // Deduplicate — skip if already sent in this stream lifecycle
+        const dedupeKey = `${chatId}:${media.filePath}`;
+        if (this.sentMedia.has(dedupeKey)) {
+            logger.info('Media already sent, skipping duplicate', { path: media.filePath });
+            return;
+        }
+        this.sentMedia.add(dedupeKey);
 
         // Use sendDocument for images to preserve full resolution (sendPhoto compresses heavily).
         // Use sendVideo for videos so Telegram can show an inline player.
@@ -492,9 +508,14 @@ export class TelegramAdapter extends BaseChannelAdapter {
             const fileBuffer = readFileSync(media.filePath);
             const ext = path.extname(media.filePath).toLowerCase();
             const mimeMap: Record<string, string> = {
-                '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-                '.webp': 'image/webp', '.gif': 'image/gif',
-                '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime',
+                '.png': 'image/png',
+                '.jpg': 'image/jpeg',
+                '.jpeg': 'image/jpeg',
+                '.webp': 'image/webp',
+                '.gif': 'image/gif',
+                '.mp4': 'video/mp4',
+                '.webm': 'video/webm',
+                '.mov': 'video/quicktime',
             };
             const mime = mimeMap[ext] || 'application/octet-stream';
             const blob = new Blob([fileBuffer], { type: mime });
@@ -504,12 +525,18 @@ export class TelegramAdapter extends BaseChannelAdapter {
             if (threadId !== undefined) formData.append('message_thread_id', String(threadId));
 
             const res = await fetch(url, { method: 'POST', body: formData });
-            const data = await res.json() as { ok: boolean; description?: string };
+            const data = (await res.json()) as { ok: boolean; description?: string };
             if (!data.ok) {
-                logger.warn('Telegram media upload failed', { error: data.description, path: media.filePath });
+                logger.warn('Telegram media upload failed', {
+                    error: data.description,
+                    path: media.filePath,
+                });
             }
         } catch (err) {
-            logger.warn('Failed to send media to Telegram', { error: (err as Error).message, path: media.filePath });
+            logger.warn('Failed to send media to Telegram', {
+                error: (err as Error).message,
+                path: media.filePath,
+            });
         }
     }
 
@@ -561,7 +588,9 @@ export class TelegramAdapter extends BaseChannelAdapter {
                     chat_id: chatId,
                     message_id: Number(handle.messageId),
                 });
-            } catch { /* ignore */ }
+            } catch {
+                /* ignore */
+            }
 
             await this.sendToChat(
                 chatId,
@@ -575,7 +604,9 @@ export class TelegramAdapter extends BaseChannelAdapter {
                     chat_id: chatId,
                     message_id: Number(handle.messageId),
                 });
-            } catch { /* ignore */ }
+            } catch {
+                /* ignore */
+            }
         }
 
         // Send media files as separate Telegram messages
@@ -690,12 +721,12 @@ export class TelegramAdapter extends BaseChannelAdapter {
         if (threadId !== undefined) params.message_thread_id = threadId;
 
         // Send immediately
-        this.api('sendChatAction', params).catch(() => { });
+        this.api('sendChatAction', params).catch(() => {});
 
         // Refresh every 4 seconds
         if (!this.typingIntervals.has(chatId)) {
             const interval = setInterval(() => {
-                this.api('sendChatAction', params).catch(() => { });
+                this.api('sendChatAction', params).catch(() => {});
             }, 4000);
             this.typingIntervals.set(chatId, interval);
         }

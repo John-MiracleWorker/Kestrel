@@ -41,12 +41,19 @@ def _tokenize(text: str) -> set[str]:
 
 
 def _default_catalog_dir() -> Path:
-    return Path(
-        os.getenv(
-            "KESTREL_CATALOG_DIR",
-            str(Path(__file__).resolve().parents[3] / ".kestrel"),
-        )
-    )
+    env = os.getenv("KESTREL_CATALOG_DIR")
+    if env:
+        return Path(env)
+    # Walk up from this file looking for a sensible project root.
+    # Inside Docker __file__ is /app/agent/tool_catalog.py — parents[1] = /app.
+    # On the host it may be deeper, e.g. .../packages/brain/agent/tool_catalog.py.
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / ".kestrel").is_dir() or (parent / "agent").is_dir():
+            return parent / ".kestrel"
+        if str(parent) == "/app":
+            return parent / ".kestrel"
+    return Path("/tmp/.kestrel")
 
 
 @dataclass(frozen=True)

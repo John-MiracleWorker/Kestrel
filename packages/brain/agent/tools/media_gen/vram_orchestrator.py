@@ -837,7 +837,52 @@ def generate_image(
     reload_result = load_llm()
     result["llm_reloaded"] = reload_result["success"]
 
-    if not reload_result["success"]:
+    if reload_result["success"]:
+        # Verify the model is truly loaded and ready, not just accepted.
+        # LM Studio returns 200 on the load endpoint immediately, but
+        # a 19GB model takes 30-60s to fully load into VRAM.
+        model_id = GLM_MODEL_ID
+        lm_base = (LMSTUDIO_BASE_URL or "").rstrip("/")
+        verify_timeout = 120  # max seconds to wait for the model to appear
+        poll_interval = 5
+        elapsed = 0
+        model_ready = False
+        logger.info(
+            f"Phase 6/6: Load accepted. Verifying model is ready "
+            f"(polling every {poll_interval}s, timeout {verify_timeout}s)..."
+        )
+        while elapsed < verify_timeout:
+            try:
+                resp = requests.get(f"{lm_base}/v1/models", timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json().get("data", [])
+                    loaded_ids = [m.get("id", "") for m in data]
+                    if any(model_id in mid for mid in loaded_ids):
+                        model_ready = True
+                        logger.info(
+                            f"Phase 6/6: Model confirmed loaded after {elapsed}s. "
+                            f"Loaded models: {loaded_ids}"
+                        )
+                        break
+            except requests.RequestException:
+                pass
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+        if not model_ready:
+            reload_warning = (
+                f"WARNING: LLM load was accepted but model failed to appear "
+                f"in /v1/models after {verify_timeout}s. The model may still be "
+                f"loading — check LM Studio manually."
+            )
+            logger.warning(reload_warning)
+            if result["error"]:
+                result["error"] += f" | {reload_warning}"
+            else:
+                result["error"] = reload_warning
+        else:
+            logger.info("Phase 6/6: LLM reloaded and verified. Kestrel is ready to chat.")
+    else:
         reload_warning = (
             f"WARNING: LLM failed to reload! Reason: {reload_result['detail']}. "
             f"Kestrel will not be able to chat until the model is manually loaded "
@@ -849,8 +894,6 @@ def generate_image(
             result["error"] += f" | {reload_warning}"
         else:
             result["error"] = reload_warning
-    else:
-        logger.info("Phase 6/6: LLM reloaded successfully. Kestrel is ready to chat.")
 
     logger.info("=" * 60)
     logger.info(

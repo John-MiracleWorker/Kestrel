@@ -97,7 +97,7 @@ services:
       POSTGRES_POOL_MIN: ${POSTGRES_POOL_MIN:-2}
       POSTGRES_POOL_MAX: ${POSTGRES_POOL_MAX:-10}
       DEFAULT_LLM_PROVIDER: ${DEFAULT_LLM_PROVIDER:-google}
-      KESTREL_FEATURE_MODE: ${KESTREL_FEATURE_MODE:-core}
+      KESTREL_FEATURE_MODE: ${KESTREL_FEATURE_MODE:-labs}
       LOCAL_MODEL_PATH: /models/llama-3-8b.gguf
       LOCAL_MODEL_N_CTX: ${LOCAL_MODEL_N_CTX:-4096}
       LOCAL_MODEL_N_GPU_LAYERS: ${LOCAL_MODEL_N_GPU_LAYERS:-35}
@@ -129,6 +129,11 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       HOST_MOUNT_ROOT: ${HOST_MOUNT_ROOT:-/Users}
       HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT:-}
+      KESTREL_ENABLE_HOST_WRITE: "true"
+      AGENT_FILE_ROOT: /host_fs/tiuni/Documents/Kestrel
+      COUNCIL_INCLUDE_DEBATE: "true"
+      USE_SUPERVISOR_ROUTING: "true"
+      NATIVE_APPROVAL_INTERACTIVE: "true"
       USE_LANGGRAPH: "true"
     volumes:
       - ${LOCAL_MODEL_DIR:-./models}:/models:ro

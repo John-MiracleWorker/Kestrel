@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -30,6 +31,19 @@ from agent.tool_cache import ToolCache
 from agent.mcp_expansion import MCPExpansionEngine
 
 logger = logging.getLogger("brain.agent.core.executor")
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_THINK_UNCLOSED_RE = re.compile(r"<think>.*$", re.DOTALL)
+
+
+def _strip_think(text: str) -> str:
+    """Remove <think>…</think> and unclosed <think> blocks from LLM output."""
+    if not text or "<think>" not in text:
+        return text or ""
+    cleaned = _THINK_RE.sub("", text)
+    cleaned = _THINK_UNCLOSED_RE.sub("", cleaned)
+    return cleaned.strip()
+
 
 # ── Constants ────────────────────────────────────────────────────────
 MAX_PARALLEL_TOOLS = 5       # Max concurrent tool executions per turn (default fallback)
@@ -851,7 +865,7 @@ class TaskExecutor:
                 )
 
             step.status = StepStatus.COMPLETE
-            step.result = tool_args.get("summary", result.output)
+            step.result = _strip_think(tool_args.get("summary", result.output))
             step.completed_at = datetime.now(timezone.utc)
 
             # At this point, pending_steps is guaranteed to be empty because we 
@@ -1338,7 +1352,7 @@ class TaskExecutor:
                 f"preview={text[:100]!r}"
             )
             step.status = StepStatus.COMPLETE
-            step.result = text
+            step.result = _strip_think(text)
             step.completed_at = datetime.now(timezone.utc)
             await self._persistence.update_task(task)
             return
@@ -1657,7 +1671,7 @@ class TaskExecutor:
             # This ensures step.result has meaningful content even if
             # task_complete is never explicitly called.
             if response.get("content") and not step.result:
-                step.result = response["content"]
+                step.result = _strip_think(response["content"])
 
             if len(tool_calls) > 1:
                 logger.info(f"LLM returned {len(tool_calls)} tool calls — dispatching in parallel")
@@ -1734,7 +1748,7 @@ class TaskExecutor:
             # the step complete yet, the text may contain useful output
             # and ensures the deadlock detector treats partial work as
             # complete rather than failed.
-            step.result = text
+            step.result = _strip_think(text)
 
             if is_simple_chat or has_done_work or is_done_phrase or has_high_streak or has_excessive_text:
                 step.status = StepStatus.COMPLETE
