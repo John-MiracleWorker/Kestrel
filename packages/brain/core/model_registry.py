@@ -96,17 +96,34 @@ def _classify_ollama(model_id: str) -> str:
 
 
 def _classify_lmstudio(model_id: str) -> str:
-    """Classify an LM Studio model by parameter count in the model path.
+    """Classify an LM Studio model by parameter count or known model family.
     
     LM Studio model IDs are like:
       'lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF'
       'bartowski/Qwen2.5-Coder-32B-Instruct-GGUF'
+      'zai-org/glm-4.7-flash'
+      'deepseek-coder-v2-lite-instruct'
     """
     mid = model_id.lower()
+
+    # Skip embedding models — never select these for chat
+    if "embed" in mid or "embedding" in mid:
+        return "other"
+
+    # Explicit parameter count (e.g. "32B", "8B")
     m = re.search(r'(\d+)b', mid)
     if m:
         params_b = int(m.group(1))
         return "power" if params_b >= 20 else "fast"
+
+    # Known large model families without explicit param tag
+    # GLM 4.x series: ~9B params, strong multilingual model
+    if "glm" in mid:
+        return "power"
+    # DeepSeek Coder v2: capable coding model
+    if "deepseek" in mid and "lite" not in mid:
+        return "power"
+
     return "fast"
 
 
@@ -324,11 +341,16 @@ class ModelRegistry:
     async def _fetch_lmstudio(self):
         """Fetch loaded models from the best available LM Studio instance."""
         import aiohttp
-        try:
-            from providers.lmstudio_discovery import lmstudio_discovery
-            host = await lmstudio_discovery.get_best_host()
-        except Exception:
-            host = os.getenv("LMSTUDIO_HOST", f"http://host.docker.internal:{os.getenv('LMSTUDIO_PORT', '1234')}")
+        # Prefer explicit env vars (docker-compose sets LMSTUDIO_BASE_URL)
+        explicit_host = os.getenv("LMSTUDIO_BASE_URL", "") or os.getenv("LMSTUDIO_HOST", "")
+        if explicit_host:
+            host = explicit_host.rstrip("/")
+        else:
+            try:
+                from providers.lmstudio_discovery import lmstudio_discovery
+                host = await lmstudio_discovery.get_best_host()
+            except Exception:
+                host = f"http://host.docker.internal:{os.getenv('LMSTUDIO_PORT', '1234')}"
         url = f"{host}/v1/models"
         try:
             async with aiohttp.ClientSession() as session:
@@ -339,6 +361,7 @@ class ModelRegistry:
             models = [
                 {"id": m["id"], "name": m["id"]}
                 for m in data.get("data", [])
+                if "embed" not in m.get("id", "").lower()
             ]
             models.sort(key=lambda m: _version_key(m["id"]))
             self._cache["lmstudio"] = models

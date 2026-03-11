@@ -363,7 +363,7 @@
             ]
         },
         "packages/brain/core/model_registry.py": {
-            "sig": "1772751203679520265:15983",
+            "sig": "1773271419237917808:16823",
             "issues": [
                 {
                     "type": "dead_import",
@@ -456,14 +456,14 @@
             ]
         },
         "packages/brain/providers/lmstudio.py": {
-            "sig": "1772929820017375443:17087",
+            "sig": "1773271345534968328:17207",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/providers/lmstudio.py",
-                    "line": 275,
+                    "line": 276,
                     "description": "Function `generate_with_tools` is 130 lines long \u2014 consider refactoring",
                     "suggestion": "Break `generate_with_tools` into smaller helper functions"
                 },
@@ -2747,7 +2747,7 @@
             ]
         },
         "packages/brain/agent/tools/media_gen/vram_orchestrator.py": {
-            "sig": "1773266114927239725:36170",
+            "sig": "1773270022068871011:38074",
             "issues": [
                 {
                     "type": "complexity",
@@ -2782,7 +2782,7 @@
                     "package": "brain",
                     "file": "packages/brain/agent/tools/media_gen/vram_orchestrator.py",
                     "line": 614,
-                    "description": "Function `generate_image` is 249 lines long \u2014 consider refactoring",
+                    "description": "Function `generate_image` is 292 lines long \u2014 consider refactoring",
                     "suggestion": "Break `generate_image` into smaller helper functions"
                 },
                 {
@@ -4955,14 +4955,14 @@
             ]
         },
         "packages/brain/services/task_factory.py": {
-            "sig": "1773266114933083346:6302",
+            "sig": "1773269516900651598:6493",
             "issues": [
                 {
                     "type": "complexity",
                     "severity": "medium",
                     "package": "brain",
                     "file": "packages/brain/services/task_factory.py",
-                    "line": 64,
+                    "line": 68,
                     "description": "Function `create_chat_task` is 108 lines long \u2014 consider refactoring",
                     "suggestion": "Break `create_chat_task` into smaller helper functions"
                 },
@@ -5294,7 +5294,7 @@
             "issues": []
         },
         "packages/gateway/src/channels/telegram/index.ts": {
-            "sig": "1773266114935799260:31656",
+            "sig": "1773270294740781926:32568",
             "issues": []
         },
         "packages/gateway/src/session/manager.ts": {

@@ -30,7 +30,8 @@ class LMStudioUnavailableError(Exception):
 
 
 # Configurable base URL — if set, skips network scanning
-_EXPLICIT_LMSTUDIO_HOST = os.getenv("LMSTUDIO_HOST", "")
+# Check both LMSTUDIO_HOST and LMSTUDIO_BASE_URL (docker-compose uses the latter)
+_EXPLICIT_LMSTUDIO_HOST = os.getenv("LMSTUDIO_HOST", "") or os.getenv("LMSTUDIO_BASE_URL", "")
 _LMSTUDIO_PORT = int(os.getenv("LMSTUDIO_PORT", "1234"))
 
 # Default fallback URL
