@@ -1,19 +1,21 @@
-import os
-import json
 import asyncio
+import json
 from .base import BaseServicerMixin
 from core.grpc_setup import brain_pb2
 from core.config import logger
-from core.feature_mode import enabled_bundles_for_mode, parse_feature_mode
-from core.prompts import KESTREL_DEFAULT_SYSTEM_PROMPT
 from core import runtime
 
-from agent.execution_context import ExecutionContext
-from agent.task_profiles import filter_registry_for_profile, infer_task_profile
 from db import get_pool, get_redis
-from providers_registry import get_provider, CloudProvider, list_provider_configs, resolve_provider
+from providers_registry import get_provider, CloudProvider, list_provider_configs
 from provider_config import ProviderConfig
-from crud import get_messages, ensure_conversation, save_message
+from crud import ensure_conversation, save_message
+
+from services.request_context import build_request_context
+from services.task_factory import create_chat_task
+from services.model_resolution import build_model_router, workspace_resolve_provider
+from services.stream_coordinator import make_activity_callback, run_chat_stream
+from services.post_response_hooks import run_post_response_hooks
+
 
 class ChatServicerMixin(BaseServicerMixin):
     async def ListModels(self, request, context):
@@ -40,7 +42,7 @@ class ChatServicerMixin(BaseServicerMixin):
                     logger.warning(f"Failed to query Ollama models: {e}")
                 # Fallback if Ollama unavailable
                 return brain_pb2.ListModelsResponse(models=[])
-            
+
             provider = get_provider(request.provider)
             if not isinstance(provider, CloudProvider):
                     logger.error(f"Provider {request.provider} is not a CloudProvider")
@@ -53,21 +55,9 @@ class ChatServicerMixin(BaseServicerMixin):
                 try:
                     pool = await get_pool()
                     ws_config = await ProviderConfig(pool).get_config(request.workspace_id)
-                    # Check if this config is for the requested provider?
-                    # ProviderConfig.get_config returns *resolved* config (merged with default)
-                    # But we specifically want the key for the requested provider if it matches
-                    # Actually get_config returns configuration for the *active* provider?
-                    # No, let's look at provider_config.py...
-                    # It seems get_config fetches "effective" config.
-                    
-                    # Better approach: Fetch specifically for this provider
-                    # We can use list_provider_configs helper or check Redis
-                    # Let's check list_provider_configs in server.py
                     configs = await list_provider_configs(request.workspace_id)
-                    # configs is a list of records
                     for c in configs:
                         if c["provider"] == request.provider:
-                            # Found config for this provider
                             encrypted = c.get("api_key_encrypted")
                             if encrypted and encrypted.startswith("provider_key:"):
                                 r = await get_redis()
@@ -83,7 +73,7 @@ class ChatServicerMixin(BaseServicerMixin):
 
             # 3. Fetch models
             model_list = await provider.list_models(api_key=api_key)
-            
+
             models = []
             for m in model_list:
                 models.append({
@@ -118,244 +108,51 @@ class ChatServicerMixin(BaseServicerMixin):
         )
 
         try:
-            # ── 1 & 2. Load context, history, and RAG ───────────────
-            pool = await get_pool()
-            r = await get_redis()
-            ws_config = await ProviderConfig(pool).get_config(workspace_id)
-            provider_name = request.provider or ws_config["provider"]
-            model = request.model or ws_config["model"]
-            
-            # Resolve API Key from Redis if it's a reference
-            api_key = ws_config.get("api_key", "")
-            if api_key and api_key.startswith("provider_key:"):
-                try:
-                    real_key = await r.get(api_key)
-                    api_key = real_key.decode("utf-8") if real_key else ""
-                except Exception:
-                    api_key = ""
-            
-            provider = get_provider(provider_name)
+            # ── 1. Resolve request context ─────────────────────────
+            ctx = await build_request_context(request, workspace_id)
 
-            # If the workspace selected a specific Ollama server, override the
-            # provider's base URL so it talks to that host instead of the
-            # default (localhost / host.docker.internal).
-            provider_settings = ws_config.get("settings") or {}
-            if provider_name in ("ollama", "local") and provider_settings.get("ollama_host"):
-                ollama_host_url = provider_settings["ollama_host"].rstrip("/")
-                logger.info(f"Using workspace Ollama host: {ollama_host_url}")
-                provider.set_explicit_url(ollama_host_url)
-                # Invalidate stale health cache so is_ready() re-checks the new URL
-                from providers.ollama import _health_cache
-                _health_cache["checked_at"] = 0
-
-            if provider_name == "lmstudio" and provider_settings.get("lmstudio_host"):
-                lmstudio_host_url = provider_settings["lmstudio_host"].rstrip("/")
-                logger.info(f"Using workspace LM Studio host: {lmstudio_host_url}")
-                provider.set_explicit_url(lmstudio_host_url)
-                from providers.lmstudio import _health_cache as _lm_health_cache
-                _lm_health_cache["checked_at"] = 0
-            
-            from services.context_builder import build_chat_context
-            messages = await build_chat_context(
-                request, workspace_id, pool, r, runtime, provider_name, model, ws_config, api_key
-            )
-            
-            user_content = next(
-                (m["content"] for m in reversed(messages) if m["role"] == "user"),
-                "",
-            )
-            # ── 3. Save user message before streaming ───────────────
+            # ── 2. Save user message before streaming ──────────────
             if conversation_id:
-                # Ensure conversation row exists (external channels like
-                # Telegram generate deterministic IDs without creating rows).
-                # Channel is passed in gRPC parameters map by registry.ts
                 params = dict(request.parameters) if hasattr(request, 'parameters') else {}
                 channel_name = params.get('channel', '') or 'web'
                 await ensure_conversation(
                     conversation_id, workspace_id,
                     channel=channel_name,
                 )
+                if ctx.user_content:
+                    await save_message(conversation_id, "user", ctx.user_content)
 
-                if user_content:
-                    await save_message(conversation_id, "user", user_content)
-
-            # ── 4. Route through Agent Loop ──────────────────────────
-            # Every chat message goes through the full agent loop so
-            # Kestrel can autonomously plan, use tools, and reflect.
-            from agent.loop import AgentLoop
-            from agent.tools import build_tool_registry
-            from agent.guardrails import Guardrails
-            from agent.types import (
-                AgentTask, GuardrailConfig as GCfg, TaskEventType, TaskStatus,
-                TaskPlan, TaskStep, StepStatus, RiskLevel as _RL,
-                AutonomyLevel as _AL,
-            )
-
-            # ── 4a. Intercept /slash commands ───────────────────────
-            if runtime.command_parser and runtime.command_parser.is_command(user_content):
+            # ── 3. Intercept /slash commands ───────────────────────
+            from agent.types import TaskStatus
+            if runtime.command_parser and runtime.command_parser.is_command(ctx.user_content):
                 cmd_context = {
-                    "model": model,
+                    "model": ctx.model,
                     "total_tokens": 0,
                     "cost_usd": 0,
                     "task_status": "idle",
                     "session_type": "main",
                 }
-                cmd_result = runtime.command_parser.parse(user_content, cmd_context)
+                cmd_result = runtime.command_parser.parse(ctx.user_content, cmd_context)
                 if cmd_result and cmd_result.handled:
-                    # Send the command response directly (no agent needed)
                     yield self._make_response(
-                        chunk_type=0,  # CONTENT_DELTA
+                        chunk_type=0,
                         content_delta=cmd_result.response,
                     )
-                    yield self._make_response(
-                        chunk_type=2,  # DONE
-                    )
+                    yield self._make_response(chunk_type=2)
                     if conversation_id and cmd_result.response:
-                        await save_message(conversation_id, "user", user_content)
+                        await save_message(conversation_id, "user", ctx.user_content)
                         await save_message(conversation_id, "assistant", cmd_result.response)
                     return
 
-            # Read workspace guardrail settings from DB (user-configured via Settings UI)
-            ws_guardrails = {}
-            try:
-                ws_row = await pool.fetchrow(
-                    "SELECT settings FROM workspaces WHERE id = $1",
-                    workspace_id,
-                )
-                if ws_row and ws_row["settings"]:
-                    import json as _json
-                    ws_settings = ws_row["settings"] if isinstance(ws_row["settings"], dict) else _json.loads(ws_row["settings"])
-                    ws_guardrails = ws_settings.get("guardrails", {})
-            except Exception as e:
-                logger.warning(f"Failed to read workspace guardrails, using defaults: {e}")
+            # ── 4. Build task and agent loop ────────────────────────
+            chat_task = await create_chat_task(request, ctx, workspace_id)
+            tool_registry = chat_task._tool_registry
 
-            # Classify request complexity — complex tasks get full planning,
-            # simple conversational messages get a single-step shortcut.
-            #
-            # INVERTED LOGIC: detect simple messages (greetings, short Qs),
-            # default everything else to the full agent loop with tools.
-            # This prevents Kestrel from giving text walkthroughs instead
-            # of actually using tools for action requests.
-            _SIMPLE_PATTERNS = [
-                "hello", "hey", "hi", "yo", "sup", "howdy",
-                "good morning", "good afternoon", "good evening",
-                "thanks", "thank you", "thx", "ty",
-                "ok", "okay", "cool", "nice", "great", "awesome",
-                "yes", "no", "yeah", "nah", "yep", "nope",
-                "bye", "goodbye", "see you", "later",
-                "what's up", "how are you", "what are you",
-                "who are you", "what can you do",
-            ]
-            user_lower = user_content.lower().strip()
-            word_count = len(user_content.split())
-
-            is_simple = (
-                word_count <= 6
-                and any(user_lower.startswith(p) or user_lower == p for p in _SIMPLE_PATTERNS)
-            )
-
-            # ── Enrich goal with conversation context ──────────────
-            # The planner only sees `goal` — not the full message history.
-            # For follow-up messages in a thread, prepend a compact summary
-            # of recent conversation turns so the planner understands the
-            # context (e.g., which company was already being discussed).
-            planner_goal = user_content
-            if not is_simple:
-                # Collect recent user/assistant turns from history (excluding
-                # the current message which is already in user_content)
-                history_turns = [
-                    m for m in messages
-                    if m.get("role") in ("user", "assistant")
-                    and m.get("content") != user_content
-                ]
-                # Take the last few turns — enough context without overwhelming
-                recent = history_turns[-6:]
-                if recent:
-                    history_block = "\n".join(
-                        f"{'User' if m['role'] == 'user' else 'Kestrel'}: {m['content'][:300]}"
-                        for m in recent
-                    )
-                    planner_goal = (
-                        f"[Recent conversation context]\n{history_block}\n\n"
-                        f"[Current message]\n{user_content}"
-                    )
-
-            # Build a task with user-configured guardrails (or sensible defaults)
-            chat_task = AgentTask(
-                user_id=request.user_id,
-                workspace_id=workspace_id,
-                conversation_id=conversation_id,
-                goal=planner_goal,
-                config=GCfg(
-                    max_iterations=ws_guardrails.get("maxIterations", 40),
-                    max_tool_calls=ws_guardrails.get("maxToolCalls", 80),
-                    max_tokens=ws_guardrails.get("maxTokens", 100_000),
-                    max_wall_time_seconds=ws_guardrails.get("maxWallTime", 600),
-                    auto_approve_risk=_RL(
-                        ws_guardrails.get("autoApproveRisk", "medium")
-                    ),
-                    autonomy_level=_AL(
-                        ws_guardrails.get("autonomyLevel", "balanced")
-                    ),
-                ),
-            )
-
-            if is_simple:
-                # Simple conversational message — single step, fast response
-                chat_task.plan = TaskPlan(
-                    goal=user_content,
-                    steps=[TaskStep(
-                        index=0,
-                        description=f"Respond to the user: {user_content[:100]}",
-                        status=StepStatus.PENDING,
-                    )],
-                )
-            else:
-                # Let the agent loop's TaskPlanner decompose this into
-                # a multi-step plan (plan=None triggers planning phase)
-                chat_task.plan = None
-            feature_mode = parse_feature_mode(getattr(runtime, "feature_mode", "core"))
-            task_profile = infer_task_profile(planner_goal, feature_mode)
-            chat_task.task_profile = task_profile.value
-
-            # Build tool registry and agent loop
-            tool_registry = build_tool_registry(
-                hands_client=runtime.hands_client,
-                vector_store=runtime.vector_store,
-                pool=pool,
-                runtime_policy=runtime.execution_runtime,
-                enabled_bundles=tuple(getattr(runtime, "enabled_tool_bundles", []) or enabled_bundles_for_mode(feature_mode)),
-                feature_mode=feature_mode.value,
-            )
-            tool_registry = filter_registry_for_profile(tool_registry, task_profile, feature_mode)
-
-            agent_profile = await runtime.workspace_agent_store.ensure_profile(workspace_id)
-            chat_task.execution_context = ExecutionContext.create(
-                task_id=chat_task.id,
-                queue_id=chat_task.id,
-                agent_profile_id=agent_profile.id,
-                workspace_id=workspace_id,
-                user_id=request.user_id,
-                session_id=conversation_id or chat_task.id,
-                source="chat",
-                budgets=chat_task.config.to_dict(),
-                permissions={"tool_policy_bundle": list(agent_profile.tool_policy_bundle)},
-                autonomy_policy=agent_profile.autonomy_policy,
-                services={
-                    "cron_scheduler": runtime.cron_scheduler,
-                    "automation_builder": getattr(runtime, "automation_builder", None),
-                    "daemon_manager": getattr(runtime, "daemon_manager", None),
-                    "policy_engine": getattr(runtime, "policy_engine", None),
-                    "ui_manager": getattr(runtime, "ui_artifact_manager", None),
-                    "ui_artifact_manager": getattr(runtime, "ui_artifact_manager", None),
-                },
-            )
-
-            # Create per-task evidence chain for auditable decision trail
+            # Per-task evidence chain for auditable decision trail
             from agent.evidence import EvidenceChain
-            evidence_chain = EvidenceChain(task_id=chat_task.id, pool=pool)
+            evidence_chain = EvidenceChain(task_id=chat_task.id, pool=ctx.pool)
 
-            # Create per-task learner for post-task lesson extraction
+            # Per-task learner for post-task lesson extraction
             from agent.learner import TaskLearner
             from agent.core.memory import WorkingMemory
             task_working_memory = WorkingMemory(
@@ -363,67 +160,16 @@ class ChatServicerMixin(BaseServicerMixin):
                 vector_store=runtime.vector_store,
             )
             task_learner = TaskLearner(
-                provider=provider,
-                model=model,
+                provider=ctx.provider,
+                model=ctx.model,
                 working_memory=task_working_memory,
             )
 
-            # ── Agent activity event queue ──────────────────────────
-            # Council, Coordinator, and Reflection modules push events
-            # here via callbacks. We now push directly to the output stream
-            # so sub-agent events (e.g. delegate_task) appear in real-time.
-            import asyncio as _asyncio
-            output_queue = _asyncio.Queue()  # Unified output queue for ALL events
-            _SENTINEL = object()  # Marks end of stream
+            # Output queue and activity callback
+            output_queue = asyncio.Queue()
+            _activity_callback = make_activity_callback(output_queue, self._make_response)
 
-            async def _activity_callback(activity_type: str, data: dict):
-                """Push activity events directly to the output stream."""
-                # Format as a visible chunk so it appears in chat immediately
-                specialist = data.get("specialist", "")
-                status = data.get("status", "")
-                prefix = f"[{specialist}] " if specialist else ""
-
-                if activity_type in (
-                    "delegation_started", "delegation_progress",
-                    "delegation_complete", "parallel_delegation_started",
-                    "parallel_delegation_complete",
-                    "council_started", "council_opinion",
-                    "council_debate", "council_verdict",
-                ):
-                    # Send as structured metadata for the AgentDebatePanel
-                    await output_queue.put(self._make_response(
-                        chunk_type=0,
-                        metadata={
-                            "agent_status": "delegation",
-                            "delegation_type": activity_type,
-                            "delegation": json.dumps(data),
-                        },
-                    ))
-                elif activity_type == "routing_info":
-                    # Forward model routing info to the frontend
-                    await output_queue.put(self._make_response(
-                        chunk_type=0,
-                        metadata={
-                            "agent_status": "routing_info",
-                            "provider": data.get("provider", ""),
-                            "model": data.get("model", ""),
-                            "was_escalated": str(data.get("was_escalated", False)).lower(),
-                            "complexity": str(data.get("complexity", 0)),
-                        },
-                    ))
-                else:
-                    # Generic activity — send as metadata
-                    await output_queue.put(self._make_response(
-                        chunk_type=0,
-                        metadata={
-                            "agent_status": "agent_activity",
-                            "activity": json.dumps({
-                                "activity_type": activity_type, **data
-                            }),
-                        },
-                    ))
-
-            # Load workspace-specific dynamic skills into the tool registry
+            # Load workspace-specific dynamic skills
             if runtime.skill_manager:
                 try:
                     skill_count = await runtime.skill_manager.load_workspace_skills(workspace_id)
@@ -436,98 +182,39 @@ class ChatServicerMixin(BaseServicerMixin):
                 except Exception as e:
                     logger.warning(f"Failed to load workspace skills: {e}")
 
-            # Create per-request checkpoint manager
+            # Checkpoint manager and model router
             from agent.checkpoints import CheckpointManager
-            checkpoint_mgr = CheckpointManager(pool=pool)
+            checkpoint_mgr = CheckpointManager(pool=ctx.pool)
 
-            from agent.model_router import ModelRouter
-
-            # ── Probe cache: avoid re-probing on every request ──────
-            import time as _time
-            _probe_cache: dict[str, tuple[bool, float]] = {}
-            _PROBE_TTL = 60  # seconds
-
-            def custom_provider_checker(name: str) -> bool:
-                # Check cache first
-                cached = _probe_cache.get(name)
-                if cached and (_time.time() - cached[1]) < _PROBE_TTL:
-                    return cached[0]
-
-                result = False
-
-                # For ollama/local with a workspace-configured host, probe
-                # that specific URL directly — bypasses stale health caches
-                if name in ("ollama", "local") and provider_settings.get("ollama_host"):
-                    try:
-                        import httpx as _httpx
-                        _probe_url = provider_settings["ollama_host"].rstrip("/")
-                        resp = _httpx.get(f"{_probe_url}/api/tags", timeout=3)
-                        result = resp.status_code == 200
-                        logger.info(f"Ollama probe {_probe_url}: {'OK' if result else resp.status_code}")
-                    except Exception as _e:
-                        logger.warning(f"Ollama probe failed for {provider_settings['ollama_host']}: {_e}")
-                        result = False
-                    _probe_cache[name] = (result, _time.time())
-                    return result
-
-                if name == "lmstudio" and provider_settings.get("lmstudio_host"):
-                    try:
-                        import httpx as _httpx
-                        _probe_url = provider_settings["lmstudio_host"].rstrip("/")
-                        resp = _httpx.get(f"{_probe_url}/v1/models", timeout=15)
-                        result = resp.status_code == 200
-                        logger.info(f"LM Studio probe {_probe_url}: {'OK' if result else resp.status_code}")
-                    except Exception as _e:
-                        logger.warning(f"LM Studio probe failed for {provider_settings['lmstudio_host']}: {_e}")
-                        result = False
-                    _probe_cache[name] = (result, _time.time())
-                    return result
-
-                if name == provider_name and getattr(provider, "is_ready", lambda: False)():
-                    return True
-                try:
-                    return get_provider(name).is_ready()
-                except Exception:
-                    return False
-
-            chat_model_router = ModelRouter(
-                provider_checker=custom_provider_checker,
-                workspace_provider=provider_name,
-                workspace_model=model,
+            chat_model_router = build_model_router(
+                ctx.provider_name, ctx.provider, ctx.provider_settings, ctx.model,
             )
 
-            # Initialize approval memory for pattern learning
+            # Approval memory for pattern learning
             from agent.approval_memory import ApprovalMemory
-            _approval_memory = ApprovalMemory(pool=pool)
+            _approval_memory = ApprovalMemory(pool=ctx.pool)
             try:
                 await _approval_memory.load_workspace_cache(workspace_id)
             except Exception as e:
                 logger.warning("Failed to load approval memory cache: %s", e)
 
-            # Wrap resolve_provider to inject workspace-specific URLs
-            def _workspace_resolve_provider(name: str):
-                p = resolve_provider(name)
-                if name == "ollama" and provider_settings.get("ollama_host"):
-                    _host = provider_settings["ollama_host"].rstrip("/")
-                    p.set_explicit_url(_host)
-                if name == "lmstudio" and provider_settings.get("lmstudio_host"):
-                    _host = provider_settings["lmstudio_host"].rstrip("/")
-                    p.set_explicit_url(_host)
-                return p
+            _provider_resolver = workspace_resolve_provider(ctx.provider_settings)
 
+            from agent.loop import AgentLoop
+            from agent.guardrails import Guardrails
             agent_loop = AgentLoop(
-                provider=provider,
+                provider=ctx.provider,
                 tool_registry=tool_registry,
                 guardrails=Guardrails(),
                 persistence=runtime.agent_persistence,
-                model=model,
-                api_key=api_key,
+                model=ctx.model,
+                api_key=ctx.api_key,
                 memory_graph=runtime.memory_graph,
                 learner=task_learner,
                 evidence_chain=evidence_chain,
                 checkpoint_manager=checkpoint_mgr,
                 event_callback=_activity_callback,
-                provider_resolver=_workspace_resolve_provider,
+                provider_resolver=_provider_resolver,
                 model_router=chat_model_router,
                 approval_memory=_approval_memory,
             )
@@ -538,21 +225,19 @@ class ChatServicerMixin(BaseServicerMixin):
                     prefs = await runtime.persona_learner.load_persona(request.user_id)
                     if prefs:
                         persona_block = runtime.persona_learner.format_for_prompt(prefs)
-                        if persona_block and messages:
-                            # Find the system message and append persona context
-                            for msg in messages:
+                        if persona_block and ctx.messages:
+                            for msg in ctx.messages:
                                 if not isinstance(msg, dict):
-                                    continue  # Only inject into dict messages
+                                    continue
                                 if msg.get("role") in ("system", 2):
                                     msg["content"] += "\n\n" + persona_block
                                     break
                 except Exception as e:
                     logger.warning(f"Failed to inject persona context: {e}")
 
-            # Inject installed MCP servers into the system prompt so the
-            # planner knows about available external tools (GitHub, etc.)
+            # Inject installed MCP servers into the system prompt
             try:
-                mcp_rows = await pool.fetch(
+                mcp_rows = await ctx.pool.fetch(
                     """SELECT name, description, server_url
                        FROM installed_tools
                        WHERE workspace_id = $1 AND enabled = true""",
@@ -565,35 +250,24 @@ class ChatServicerMixin(BaseServicerMixin):
                     for r in mcp_rows:
                         mcp_block += f"\n- **{r['name']}**: {r['description'] or 'No description'} (command: `{r['server_url']}`)"
                     mcp_block += "\n\nFor GitHub repos, use `mcp_call` with the github server instead of trying to git clone (sandbox has no git/internet)."
-                    if messages:
-                        for msg in messages:
+                    if ctx.messages:
+                        for msg in ctx.messages:
                             if not isinstance(msg, dict):
-                                continue  # Only inject into dict messages
+                                continue
                             if msg.get("role") in ("system", 2):
                                 msg["content"] += mcp_block
                                 break
             except Exception as e:
                 logger.warning(f"Failed to inject MCP server context: {e}")
 
-            # Override the agent's system prompt with our chat system prompt
-            # by injecting messages into the task
-            chat_task.messages = messages
+            chat_task.messages = ctx.messages
 
-            # Only skip planning for simple messages (we already set a plan).
-            # Complex messages keep PLANNING status so the TaskPlanner runs.
             if chat_task.plan is not None:
                 chat_task.status = TaskStatus.EXECUTING
 
-            # Persist the chat task to the DB so FK constraints
-            # (e.g. agent_approvals.task_id) are satisfied.
             await runtime.agent_persistence.save_task(chat_task)
 
-            full_response_parts = []
-            tool_results_gathered = []  # Accumulate tool results for task_failed fallback
-
-            # ── Attach activity callback to agent sub-modules ──────
-
-            # Attach callback to modules if available
+            # Attach activity callback to agent sub-modules
             if hasattr(agent_loop, '_council') and agent_loop._council:
                 agent_loop._council._event_callback = _activity_callback
             if hasattr(agent_loop, '_coordinator') and agent_loop._coordinator:
@@ -601,107 +275,37 @@ class ChatServicerMixin(BaseServicerMixin):
             if hasattr(agent_loop, '_reflection') and agent_loop._reflection:
                 agent_loop._reflection._event_callback = _activity_callback
 
-            async def _run_agent_loop():
-                """Run agent loop in background, pushing events to output_queue."""
-                try:
-                    async for event in agent_loop.run(chat_task):
-                        await output_queue.put(("agent_event", event))
-                except Exception as e:
-                    logger.error(f"Agent loop error in background: {e}", exc_info=True)
-                    await output_queue.put(("error", str(e)))
-                finally:
-                    await output_queue.put(_SENTINEL)
+            # ── 5. Stream agent loop output ────────────────────────
+            full_response_parts: list[str] = []
+            async for chunk in run_chat_stream(
+                agent_loop, chat_task, output_queue, self._make_response,
+                ctx.provider, ctx.model, ctx.api_key, full_response_parts,
+            ):
+                yield chunk
 
-            # Start the agent loop as a background task so activity callbacks
-            # can push to the same queue concurrently
-            agent_task_bg = _asyncio.create_task(_run_agent_loop())
-            thinking_shown = [False]  # Mutable flag to limit 💭 output to first thinking event
-
-            while True:
-                item = await output_queue.get()
-
-                # End of stream sentinel
-                if item is _SENTINEL:
-                    break
-
-                # Direct response chunks from activity callbacks (_make_response returns ChatResponse)
-                if isinstance(item, brain_pb2.ChatResponse):
-                    yield item
-                    continue
-
-                # Tuple from the agent loop background task
-                if isinstance(item, tuple):
-                    from services.tool_parser import parse_agent_event
-                    async for response_chunk in parse_agent_event(
-                        item, full_response_parts, tool_results_gathered,
-                        provider, model, api_key, self._make_response,
-                        thinking_shown=thinking_shown,
-                    ):
-                        yield response_chunk
-
-            # Ensure background task is cleaned up
-            if not agent_task_bg.done():
-                agent_task_bg.cancel()
-
-            # ── 5. Save response + auto-embed + persona observation ──
-            full_response = "".join(full_response_parts) if full_response_parts else ""
-            if conversation_id and full_response:
-                await save_message(conversation_id, "assistant", full_response)
-
-                # Auto-embed the Q&A pair for future RAG
-                if ws_config["rag_enabled"] and runtime.embedding_pipeline:
-                    await runtime.embedding_pipeline.embed_conversation_turn(
-                        workspace_id=workspace_id,
-                        conversation_id=conversation_id,
-                        user_message=user_content,
-                        assistant_response=full_response,
-                    )
-
-                # Observe communication patterns for persona learning
-                if runtime.persona_learner and full_response:
-                    try:
-                        await runtime.persona_learner.observe_communication(
-                            user_id=request.user_id,
-                            user_message=user_content,
-                            agent_response=full_response,
-                        )
-                        await runtime.persona_learner.observe_session_timing(
-                            user_id=request.user_id,
-                        )
-                    except Exception as e:
-                        logger.warning(f"Persona observation failed: {e}")
-
-                # Update memory graph with conversation context (LLM extraction)
-                if runtime.memory_graph and full_response:
-                    try:
-                        from agent.core.memory_graph import extract_entities_llm
-                        _entities, _relations = await extract_entities_llm(
-                            provider=provider,
-                            model=model,
-                            api_key=api_key,
-                            user_message=user_content,
-                            assistant_response=full_response,
-                        )
-                        if _entities:
-                            await runtime.memory_graph.extract_and_store(
-                                conversation_id=conversation_id,
-                                workspace_id=workspace_id,
-                                entities=_entities,
-                                relations=_relations,
-                            )
-                            logger.info(f"Memory graph: stored {len(_entities)} entities, {len(_relations)} relations")
-                    except Exception as e:
-                        logger.warning(f"Memory graph update failed: {e}")
+            # ── 6. Post-response hooks ─────────────────────────────
+            full_response = "".join(full_response_parts)
+            await run_post_response_hooks(
+                conversation_id=conversation_id,
+                workspace_id=workspace_id,
+                user_content=ctx.user_content,
+                full_response=full_response,
+                ws_config=ctx.ws_config,
+                provider=ctx.provider,
+                model=ctx.model,
+                api_key=ctx.api_key,
+                user_id=request.user_id,
+            )
 
             # Send DONE
             yield self._make_response(
-                chunk_type=2,  # DONE
-                metadata={"provider": provider_name, "model": model},
+                chunk_type=2,
+                metadata={"provider": ctx.provider_name, "model": ctx.model},
             )
 
         except Exception as e:
             logger.error(f"StreamChat error: {e}", exc_info=True)
             yield self._make_response(
-                chunk_type=3,  # ERROR
+                chunk_type=3,
                 error_message=str(e),
             )
