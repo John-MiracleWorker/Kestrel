@@ -227,10 +227,19 @@ class LangGraphEngine:
                 except Exception:
                     content = str(payload)
 
+            logger.info(
+                f"_bridging_callback: event_type={event_type}, "
+                f"mapped={mapped_type}, content_len={len(content) if isinstance(content, str) else '?'}"
+            )
             await event_queue.put(TaskEvent(
                 type=mapped_type,
                 task_id=task.id,
                 content=content,
+                step_id=payload.get("step_id"),
+                tool_name=payload.get("tool_name"),
+                tool_args=payload.get("tool_args"),
+                tool_result=payload.get("tool_result"),
+                approval_id=payload.get("approval_id"),
                 progress=self._progress(task),
             ))
 
@@ -268,9 +277,11 @@ class LangGraphEngine:
             async def _run_graph():
                 """Run the graph and signal the queue when done."""
                 try:
+                    logger.info(f"LangGraph _run_graph starting for task {task.id}")
                     async for event in self._graph.astream(initial_state, config=config):
                         # LangGraph yields dicts keyed by node name
                         for node_name, node_output in event.items():
+                            logger.info(f"LangGraph node '{node_name}' yielded keys={list(node_output.keys()) if isinstance(node_output, dict) else type(node_output).__name__}")
                             if not isinstance(node_output, dict):
                                 continue
 
@@ -302,6 +313,7 @@ class LangGraphEngine:
                                     progress=self._progress(task),
                                 ))
 
+                    logger.info(f"LangGraph _run_graph completed normally for task {task.id}")
                 except Exception as e:
                     import traceback
                     tb = traceback.format_exc()
@@ -329,7 +341,12 @@ class LangGraphEngine:
             while True:
                 item = await event_queue.get()
                 if item is _QUEUE_DONE:
+                    logger.info("engine.run: event_queue DONE sentinel received")
                     break
+                logger.info(
+                    f"engine.run: yielding event type={item.type.value if hasattr(item, 'type') else '?'}, "
+                    f"content_len={len(item.content) if hasattr(item, 'content') and isinstance(item.content, str) else '?'}"
+                )
                 yield item
 
             # Ensure the graph task is awaited so exceptions propagate

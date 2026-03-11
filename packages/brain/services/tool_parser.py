@@ -90,8 +90,8 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
             chunk_type=0,
             metadata={
                 "agent_status": "calling",
-                "tool_name": event.tool_name,
-                "tool_args": event.tool_args[:200] if event.tool_args else "",
+                "tool_name": event.tool_name or "",
+                "tool_args": (event.tool_args or "")[:200],
             },
         )
         tool_display = event.tool_name or "tool"
@@ -115,7 +115,7 @@ async def parse_agent_event(item, full_response_parts, tool_results_gathered, pr
             chunk_type=0,
             metadata={
                 "agent_status": "result",
-                "tool_name": event.tool_name,
+                "tool_name": event.tool_name or "",
                 "tool_result": result_preview,
             },
         )

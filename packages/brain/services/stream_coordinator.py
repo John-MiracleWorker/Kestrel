@@ -103,8 +103,17 @@ async def run_chat_stream(
     async def _run_agent_loop():
         """Run agent loop in background, pushing events to output_queue."""
         try:
+            event_count = 0
             async for event in agent_loop.run(chat_task):
+                event_count += 1
+                event_type = event.type.value if hasattr(event, 'type') and hasattr(event.type, 'value') else '?'
+                content_len = len(event.content) if hasattr(event, 'content') and isinstance(event.content, str) else '?'
+                logger.info(
+                    f"_run_agent_loop: event #{event_count} type={event_type}, "
+                    f"content_len={content_len}"
+                )
                 await output_queue.put(("agent_event", event))
+            logger.info(f"_run_agent_loop: agent loop finished, total events={event_count}")
         except Exception as e:
             logger.error(f"Agent loop error in background: {e}", exc_info=True)
             await output_queue.put(("error", str(e)))

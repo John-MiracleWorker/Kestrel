@@ -108,6 +108,16 @@ async def execute_node(
                 "tool_calls": t.tool_calls_count,
             }
 
+        # Use the dynamically-updated callback from step_scheduler if available,
+        # because the event_callback captured by functools.partial at graph build
+        # time may be stale (it points to _activity_callback which filters out
+        # step_complete events).  engine.run() later rebinds step_scheduler's
+        # callback to _bridging_callback which correctly bridges events into the
+        # event_queue for gRPC streaming.
+        _live_callback = (
+            getattr(step_scheduler, '_event_callback', None) or event_callback
+        )
+
         async for event in step_scheduler.execute_plan(
             task=task,
             start_time=_start,
@@ -115,8 +125,8 @@ async def execute_node(
             progress_fn=_progress,
         ):
             collected_events.append(event)
-            if event_callback:
-                await event_callback(event.type.value, event.to_dict())
+            if _live_callback:
+                await _live_callback(event.type.value, event.to_dict())
             if event.type == TaskEventType.TASK_FAILED:
                 task_failed = True
                 break

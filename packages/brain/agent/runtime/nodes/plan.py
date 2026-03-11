@@ -108,6 +108,12 @@ async def plan_node(
     task = state["task"]
     updates: dict[str, Any] = {}
 
+    logger.info(
+        f"plan_node entry: task.messages={len(task.messages) if task.messages else 'None/empty'}, "
+        f"task.plan={'SET (steps=' + str(len(task.plan.steps)) + ')' if task.plan else 'None'}, "
+        f"goal='{task.goal[:80]}'"
+    )
+
     # ── Fast-path for simple chat tasks ─────────────────────────
     # chat_service.py pre-classifies messages:
     #   - Simple (greetings, short Q&A) → task.plan is already set

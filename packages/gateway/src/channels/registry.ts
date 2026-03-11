@@ -16,7 +16,10 @@ export class ChannelRegistry {
     private knownConversations = new Map<string, string>(); // channelKey → conversationId
     private activeStreams = new Map<string, AbortController>(); // userId → active stream controller
 
-    constructor(private brain: BrainClient, private deduplicator?: Deduplicator) { }
+    constructor(
+        private brain: BrainClient,
+        private deduplicator?: Deduplicator,
+    ) {}
 
     /**
      * Cancel the active streaming response for a user (e.g. from /stop).
@@ -150,7 +153,7 @@ export class ChannelRegistry {
         // Process attachments through the adapter's handler
         if (msg.attachments?.length) {
             msg.attachments = await Promise.all(
-                msg.attachments.map((a) => adapter.handleAttachment(a))
+                msg.attachments.map((a) => adapter.handleAttachment(a)),
             );
         }
 
@@ -180,17 +183,31 @@ export class ChannelRegistry {
                 workspaceId: msg.workspaceId,
                 conversationId: useConversationId,
                 messages: [{ role: 0, content: msg.content }], // USER = 0
-                provider: '',   // Use workspace default
-                model: '',      // Use workspace default
+                provider: '', // Use workspace default
+                model: '', // Use workspace default
                 parameters,
             });
 
             // ── Streaming path (Telegram, Discord, etc.) ─────────────
             if (adapter.supportsStreaming) {
-                await this.routeWithStreaming(adapter, msg, stream, conversationKey, useConversationId, controller.signal);
+                await this.routeWithStreaming(
+                    adapter,
+                    msg,
+                    stream,
+                    conversationKey,
+                    useConversationId,
+                    controller.signal,
+                );
             } else {
                 // ── Accumulate path (legacy adapters) ────────────────
-                await this.routeWithAccumulate(adapter, msg, stream, conversationKey, useConversationId, controller.signal);
+                await this.routeWithAccumulate(
+                    adapter,
+                    msg,
+                    stream,
+                    conversationKey,
+                    useConversationId,
+                    controller.signal,
+                );
             }
         } catch (err) {
             logger.error('Failed to route message through Brain', {
@@ -201,7 +218,7 @@ export class ChannelRegistry {
 
             await adapter.send(msg.userId, {
                 conversationId: msg.conversationId || '',
-                content: 'Sorry, I couldn\'t process your message. Please try again later.',
+                content: "Sorry, I couldn't process your message. Please try again later.",
             });
         } finally {
             // Clean up the abort controller once the stream finishes or errors
@@ -227,8 +244,15 @@ export class ChannelRegistry {
         const HEARTBEAT_INTERVAL_MS = 25000; // Send "still working" after 25s silence
 
         // Start streaming — sends "Thinking..." placeholder
+        logger.info('routeWithStreaming: starting stream', {
+            userId: msg.userId,
+            channel: adapter.channelType,
+        });
         const handle = await adapter.sendStreamStart!(msg.userId, {
             conversationId: msg.conversationId || '',
+        });
+        logger.info('routeWithStreaming: stream started, handle obtained', {
+            messageId: handle.messageId,
         });
 
         let fullContent = '';
@@ -253,7 +277,9 @@ export class ChannelRegistry {
                         toolName: '',
                         thinking: `Still working... (${Math.round(silenceMs / 1000)}s)`,
                     });
-                } catch { /* best effort */ }
+                } catch {
+                    /* best effort */
+                }
             }
         }, HEARTBEAT_INTERVAL_MS);
 
@@ -275,31 +301,56 @@ export class ChannelRegistry {
 
         // gRPC protobuf enum map
         const enumMap: Record<string, number> = {
-            'CONTENT_DELTA': 0, 'TOOL_CALL': 1, 'DONE': 2, 'ERROR': 3,
+            CONTENT_DELTA: 0,
+            TOOL_CALL: 1,
+            DONE: 2,
+            ERROR: 3,
         };
 
+        let chunkCount = 0;
         for await (const chunk of stream) {
+            chunkCount++;
             lastActivityAt = Date.now();
+            if (chunkCount <= 3 || chunk.type === 2) {
+                logger.info('routeWithStreaming: chunk received', {
+                    chunkNum: chunkCount,
+                    type: chunk.type,
+                    hasContentDelta: !!chunk.content_delta,
+                    contentDeltaLen: chunk.content_delta?.length || 0,
+                    hasMetadata: !!chunk.metadata,
+                    agentStatus: chunk.metadata?.agent_status,
+                });
+            }
 
             // Honour cancellation (e.g. user sent /stop)
             if (signal?.aborted) {
-                if (flushTimer) { clearTimeout(flushTimer); flushTimer = undefined; }
+                if (flushTimer) {
+                    clearTimeout(flushTimer);
+                    flushTimer = undefined;
+                }
                 clearInterval(heartbeatInterval);
                 await flushPromise;
                 if (fullContent) {
-                    try { await adapter.sendStreamEnd!(handle, fullContent); } catch { /* ignore */ }
+                    try {
+                        await adapter.sendStreamEnd!(handle, fullContent);
+                    } catch {
+                        /* ignore */
+                    }
                 }
                 return;
             }
 
-            const chunkType = typeof chunk.type === 'number' ? chunk.type :
-                (enumMap[chunk.type as string] ?? -1);
+            const chunkType =
+                typeof chunk.type === 'number' ? chunk.type : (enumMap[chunk.type as string] ?? -1);
 
             switch (chunkType) {
                 case 0: // CONTENT_DELTA
                     if (chunk.metadata?.agent_status && !chunk.content_delta) {
                         // Forward tool activity as a separate notification
-                        if (adapter.sendToolActivity && chunk.metadata.agent_status !== 'routing_info') {
+                        if (
+                            adapter.sendToolActivity &&
+                            chunk.metadata.agent_status !== 'routing_info'
+                        ) {
                             try {
                                 await adapter.sendToolActivity(msg.userId, handle, {
                                     status: chunk.metadata.agent_status,
@@ -311,11 +362,16 @@ export class ChannelRegistry {
                                     question: chunk.metadata.question || '',
                                 });
                             } catch (err) {
-                                logger.debug('Tool activity send failed', { error: (err as Error).message });
+                                logger.debug('Tool activity send failed', {
+                                    error: (err as Error).message,
+                                });
                             }
                         }
 
-                        if (chunk.metadata.agent_status === 'waiting_for_human' && chunk.metadata.approval_id) {
+                        if (
+                            chunk.metadata.agent_status === 'waiting_for_human' &&
+                            chunk.metadata.approval_id
+                        ) {
                             const approvalId = chunk.metadata.approval_id;
                             try {
                                 logger.info('Dispatching approval request for user', {
@@ -330,7 +386,8 @@ export class ChannelRegistry {
                                         adapter,
                                         msg.userId,
                                         approvalId,
-                                        chunk.metadata.question || 'The agent needs your approval to continue.',
+                                        chunk.metadata.question ||
+                                            'The agent needs your approval to continue.',
                                         chunk.metadata.task_id || '',
                                     );
                                 }
@@ -345,11 +402,24 @@ export class ChannelRegistry {
                         }
                     } else if (chunk.content_delta) {
                         fullContent += chunk.content_delta;
+                        if (
+                            fullContent.length <= 50 ||
+                            fullContent.length % 100 < chunk.content_delta.length
+                        ) {
+                            logger.info('routeWithStreaming: content accumulated', {
+                                totalLen: fullContent.length,
+                            });
+                        }
                         scheduleFlush();
                     }
                     break;
 
-                case 2: { // DONE
+                case 2: {
+                    // DONE
+                    logger.info('routeWithStreaming: DONE received', {
+                        fullContentLen: fullContent.length,
+                        chunkCount,
+                    });
                     doneReceived = true;
                     clearInterval(heartbeatInterval);
 
@@ -373,7 +443,9 @@ export class ChannelRegistry {
                             await adapter.sendStreamEnd!(handle, fullContent);
                         } catch (err) {
                             // Fallback: send as regular message if edit fails
-                            logger.warn('Stream end failed, sending regular message', { error: (err as Error).message });
+                            logger.warn('Stream end failed, sending regular message', {
+                                error: (err as Error).message,
+                            });
                             await adapter.send(msg.userId, {
                                 conversationId: msg.conversationId || '',
                                 content: fullContent,
@@ -426,14 +498,21 @@ export class ChannelRegistry {
                         content: fullContent,
                         options: { markdown: true },
                     });
-                } catch { /* best effort */ }
+                } catch {
+                    /* best effort */
+                }
             }
         } else if (!doneReceived && !fullContent) {
             // Nothing at all was produced — send a generic failure so the user
             // knows something went wrong rather than seeing a frozen "Thinking..." bubble.
             try {
-                await adapter.sendStreamEnd!(handle, '⚠️ The request timed out or was interrupted. Please try again.');
-            } catch { /* best effort */ }
+                await adapter.sendStreamEnd!(
+                    handle,
+                    '⚠️ The request timed out or was interrupted. Please try again.',
+                );
+            } catch {
+                /* best effort */
+            }
         }
     }
 
@@ -498,7 +577,11 @@ export class ChannelRegistry {
     /**
      * Send a message to a user on a specific channel.
      */
-    async sendToChannel(type: ChannelType, userId: string, message: OutgoingMessage): Promise<void> {
+    async sendToChannel(
+        type: ChannelType,
+        userId: string,
+        message: OutgoingMessage,
+    ): Promise<void> {
         const adapter = this.adapters.get(type);
         if (!adapter) {
             logger.warn(`Cannot send — channel ${type} not registered`);
@@ -512,7 +595,11 @@ export class ChannelRegistry {
     /**
      * Broadcast a message to all channels where a user is active.
      */
-    async broadcastToUser(userId: string, message: OutgoingMessage, excludeChannel?: ChannelType): Promise<void> {
+    async broadcastToUser(
+        userId: string,
+        message: OutgoingMessage,
+        excludeChannel?: ChannelType,
+    ): Promise<void> {
         const channels = this.userChannels.get(userId);
         if (!channels) return;
 
