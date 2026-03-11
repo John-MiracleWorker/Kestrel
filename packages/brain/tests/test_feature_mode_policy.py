@@ -1,4 +1,4 @@
-from core.feature_mode import FeatureMode, enabled_bundles_for_mode, get_feature_mode, mode_supports_labs, mode_supports_ops
+from core.feature_mode import FeatureMode, enabled_bundles_for_mode, get_feature_mode, parse_feature_mode, mode_supports_labs, mode_supports_ops
 
 
 def _initializer_plan_for_mode(feature_mode: FeatureMode) -> tuple[str, ...]:
@@ -63,6 +63,24 @@ def test_initializer_plan_for_labs_includes_all_layers():
     )
 
 
-def test_feature_mode_defaults_to_ops(monkeypatch):
+def test_feature_mode_defaults_to_core(monkeypatch):
     monkeypatch.delenv("KESTREL_FEATURE_MODE", raising=False)
-    assert get_feature_mode() == FeatureMode.OPS
+    assert get_feature_mode() == FeatureMode.CORE
+
+
+def test_parse_feature_mode_invalid_returns_core():
+    assert parse_feature_mode("bogus") == FeatureMode.CORE
+    assert parse_feature_mode("") == FeatureMode.CORE
+
+
+def test_parse_feature_mode_explicit_values():
+    assert parse_feature_mode("core") == FeatureMode.CORE
+    assert parse_feature_mode("ops") == FeatureMode.OPS
+    assert parse_feature_mode("labs") == FeatureMode.LABS
+    assert parse_feature_mode("CORE") == FeatureMode.CORE
+    assert parse_feature_mode("  ops  ") == FeatureMode.OPS
+
+
+def test_get_feature_mode_explicit_env(monkeypatch):
+    monkeypatch.setenv("KESTREL_FEATURE_MODE", "labs")
+    assert get_feature_mode() == FeatureMode.LABS
