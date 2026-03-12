@@ -85,13 +85,13 @@ def test_list_skills_maps_skill_json_fields():
         import asyncio
         response = asyncio.run(servicer.ListSkills(type("Req", (), {"workspace_id": "ws-1"})(), None))
 
-        assert len(response["skills"]) == 1
-        skill = response["skills"][0]
-        assert skill["description"] == manifest["description"]
-        assert skill["version"] == manifest["version"]
-        assert skill["functions"][0]["name"] == "do_it"
-        assert skill["requires_network"] is True
-        assert skill["requires_filesystem"] is True
+        assert len(response.skills) == 1
+        skill = response.skills[0]
+        assert skill.description == manifest["description"]
+        assert skill.version == manifest["version"]
+        assert skill.functions[0].name == "do_it"
+        assert skill.requires_network is True
+        assert skill.requires_filesystem is True
 
 
 def test_load_skills_falls_back_to_manifest_json_when_missing_skill_json():
