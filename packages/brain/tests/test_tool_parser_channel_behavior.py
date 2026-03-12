@@ -90,3 +90,29 @@ async def test_telegram_ask_human_still_emits_reply_prompt():
 
     combined = "".join(chunk.get("content_delta") or "" for chunk in chunks)
     assert "Reply in the chat to continue." in combined
+
+
+@pytest.mark.asyncio
+async def test_telegram_suppresses_step_complete_content():
+    """Telegram should not stream step_complete tokens (internal commentary).
+
+    The final response for Telegram is delivered via task_complete instead.
+    """
+    chunks = await _collect(
+        _make_event("step_complete", content="commentary to=host find code{}"),
+        channel="telegram",
+    )
+
+    assert not any(chunk.get("content_delta") for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_web_channel_streams_step_complete_content():
+    """Non-Telegram channels should receive step_complete content for streaming."""
+    chunks = await _collect(
+        _make_event("step_complete", content="Here is the result..."),
+        channel="web",
+    )
+
+    combined = "".join(chunk.get("content_delta") or "" for chunk in chunks)
+    assert "Here is the result..." in combined
