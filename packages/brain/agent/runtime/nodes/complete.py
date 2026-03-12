@@ -16,7 +16,9 @@ Wraps existing components:
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -24,6 +26,56 @@ from agent.types import StepStatus, TaskEventType, TaskStatus
 from agent.runtime.state import KestrelState
 
 logger = logging.getLogger("brain.agent.runtime.nodes.complete")
+
+# Matches ```json ... ``` fenced blocks
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?\s*```", re.DOTALL)
+
+
+def _extract_human_text(raw: str) -> str:
+    """Extract human-readable text from a step result that may contain raw JSON tool calls.
+
+    When the LLM outputs a tool call (like task_complete) as a text/JSON block
+    instead of a proper function call, the raw JSON ends up in step.result.
+    This function detects that pattern and extracts the summary field.
+    """
+    if not raw or not raw.strip():
+        return raw or ""
+
+    stripped = raw.strip()
+
+    # Try to parse directly as JSON (no fencing)
+    for candidate in [stripped]:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                # Pattern: {"name": "task_complete", "arguments": {"summary": "..."}}
+                if parsed.get("name") == "task_complete":
+                    args = parsed.get("arguments") or parsed.get("args") or {}
+                    summary = args.get("summary", "")
+                    if summary:
+                        return summary
+                # Pattern: {"summary": "..."}
+                if "summary" in parsed and len(parsed) <= 3:
+                    return parsed["summary"]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Try to extract from ```json ... ``` fenced blocks
+    for match in _JSON_FENCE_RE.finditer(stripped):
+        try:
+            parsed = json.loads(match.group(1))
+            if isinstance(parsed, dict):
+                if parsed.get("name") == "task_complete":
+                    args = parsed.get("arguments") or parsed.get("args") or {}
+                    summary = args.get("summary", "")
+                    if summary:
+                        return summary
+                if "summary" in parsed and len(parsed) <= 3:
+                    return parsed["summary"]
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    return raw
 
 
 async def complete_node(
@@ -65,10 +117,11 @@ async def complete_node(
         results = []
         for s in plan.steps:
             if s.result:
+                cleaned = _extract_human_text(s.result)
                 if task.messages:
-                    results.append(s.result)
+                    results.append(cleaned)
                 else:
-                    results.append(f"**{s.description}**: {s.result}")
+                    results.append(f"**{s.description}**: {cleaned}")
         task.result = "\n".join(results) if results else "Task completed successfully."
     else:
         task.result = "Task completed successfully."
