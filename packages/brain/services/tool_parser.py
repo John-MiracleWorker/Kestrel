@@ -206,7 +206,7 @@ async def parse_agent_event(
             tool_results_gathered.append(f"**{event.tool_name}**: {event.tool_result[:500]}")
 
     elif event_type == "step_complete":
-        if event.content:
+        if event.content and verbose_channel:
             yield make_response_fn(chunk_type=0, content_delta=event.content)
             full_response_parts.append(event.content)
 
