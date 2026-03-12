@@ -34,6 +34,50 @@ _SUBSYSTEM_PARAM_ALIASES: dict[str, tuple[str, ...]] = {
     "ui_artifact_manager": ("ui_artifact_manager", "ui_manager"),
 }
 
+_EXECUTION_RESULT_KEYS: tuple[str, ...] = (
+    "runtime_class",
+    "risk_class",
+    "fallback_used",
+    "fallback_from",
+    "fallback_to",
+    "action_event_json",
+    "action_events",
+    "attempted_action_events",
+    "audit_log",
+    "memory_used_mb",
+    "exit_code",
+    "returncode",
+    "policy_reason",
+    "approval_reason",
+)
+
+
+def _extract_tool_result_metadata(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {}
+
+    metadata: dict[str, Any] = {}
+    execution = {
+        key: result[key]
+        for key in _EXECUTION_RESULT_KEYS
+        if key in result and result[key] not in (None, "", [], {})
+    }
+    if execution:
+        metadata["execution"] = execution
+
+    capabilities = result.get("capabilities")
+    if isinstance(capabilities, dict) and capabilities:
+        metadata["capabilities"] = capabilities
+
+    nested_metadata = result.get("metadata")
+    if isinstance(nested_metadata, dict) and nested_metadata:
+        metadata["tool_metadata"] = nested_metadata
+
+    if result.get("display_markdown"):
+        metadata["display_markdown"] = result["display_markdown"]
+
+    return metadata
+
 
 class ToolRegistry:
     """
@@ -278,6 +322,7 @@ class ToolRegistry:
                             output=parsed.get("output", ""),
                             error=parsed.get("error", ""),
                             execution_time_ms=0,
+                            metadata=parsed.get("metadata") or {},
                         )
                 except Exception as e:
                     logger.warning(f"Failed to check tool cache for {resolved_name}: {e}")
@@ -291,9 +336,15 @@ class ToolRegistry:
             elapsed_ms = int((time.monotonic() - start) * 1000)
 
             # Normalize result to string
+            result_metadata = _extract_tool_result_metadata(result)
+            success = True
+            error = ""
             if isinstance(result, dict):
                 import json
                 output = json.dumps(result, indent=2, default=str)
+                success = bool(result.get("success", True))
+                if not success:
+                    error = str(result.get("error") or output)
             elif isinstance(result, (list, tuple)):
                 import json
                 output = json.dumps(result, indent=2, default=str)
@@ -314,19 +365,22 @@ class ToolRegistry:
 
             tool_result = ToolResult(
                 tool_call_id=tool_call.id,
-                success=True,
+                success=success,
                 output=output,
+                error=error,
                 execution_time_ms=elapsed_ms,
+                metadata=result_metadata,
             )
             
             # --- CACHE STORE ---
-            if cache_key and definition.cache_ttl_seconds > 0:
+            if cache_key and definition.cache_ttl_seconds > 0 and tool_result.success:
                 try:
                     import json
                     cache_payload = {
-                        "success": True,
+                        "success": tool_result.success,
                         "output": output,
-                        "error": "",
+                        "error": tool_result.error,
+                        "metadata": tool_result.metadata,
                     }
                     await redis_client.setex(
                         cache_key,

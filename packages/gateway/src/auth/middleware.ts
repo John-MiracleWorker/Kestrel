@@ -7,7 +7,7 @@ import { logger } from '../utils/logger';
 // ── Types ────────────────────────────────────────────────────────────
 
 export interface JWTPayload {
-    sub: string;        // user_id (UUID)
+    sub: string; // user_id (UUID)
     email: string;
     workspaces: Array<{
         id: string;
@@ -20,6 +20,18 @@ export interface JWTPayload {
 
 export type Role = 'owner' | 'admin' | 'member' | 'guest';
 
+export interface AuthenticatedUser {
+    id: string;
+    email: string;
+    workspaces: Array<{
+        id: string;
+        role: Role;
+    }>;
+    authType?: 'jwt' | 'api_key';
+    apiKeyId?: string;
+    actorUserId?: string;
+}
+
 // Role hierarchy: owner > admin > member > guest
 const ROLE_HIERARCHY: Record<Role, number> = {
     owner: 40,
@@ -27,6 +39,12 @@ const ROLE_HIERARCHY: Record<Role, number> = {
     member: 20,
     guest: 10,
 };
+
+export function hasRole(role: Role | undefined, minRole: Role): boolean {
+    const userLevel = ROLE_HIERARCHY[role || 'guest'] || 0;
+    const requiredLevel = ROLE_HIERARCHY[minRole] || 0;
+    return userLevel >= requiredLevel;
+}
 
 // ── Configuration ────────────────────────────────────────────────────
 
@@ -41,7 +59,8 @@ let _apiKeyRedis: Redis | null = null;
 
 function getApiKeyRedis(): Redis {
     if (!_apiKeyRedis) {
-        const redisUrl = process.env.REDIS_URL ||
+        const redisUrl =
+            process.env.REDIS_URL ||
             `redis://${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || '6379'}`;
         _apiKeyRedis = new Redis(redisUrl, {
             lazyConnect: true,
@@ -49,7 +68,7 @@ function getApiKeyRedis(): Redis {
             enableReadyCheck: true,
         });
         _apiKeyRedis.on('error', (err) =>
-            logger.error('API key Redis connection error', { error: err.message })
+            logger.error('API key Redis connection error', { error: err.message }),
         );
     }
     return _apiKeyRedis;
@@ -124,6 +143,9 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
             id: validated.userId,
             email: validated.email,
             workspaces: validated.workspaces as any,
+            authType: 'api_key',
+            apiKeyId: validated.apiKeyId,
+            actorUserId: validated.actorUserId,
         };
         return;
     }
@@ -143,6 +165,7 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
         id: payload.sub,
         email: payload.email,
         workspaces: payload.workspaces as any,
+        authType: 'jwt',
     };
 }
 
@@ -150,7 +173,13 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
  * Validate a Kestrel API key (ksk_{keyId}_{secret}) against Redis.
  * Uses the shared Redis connection instead of creating one per request.
  */
-async function validateApiKey(fullKey: string): Promise<{ userId: string; email: string; workspaces: any[] } | null> {
+async function validateApiKey(fullKey: string): Promise<{
+    apiKeyId: string;
+    actorUserId: string;
+    userId: string;
+    email: string;
+    workspaces: Array<{ id: string; role: Role }>;
+} | null> {
     try {
         // ksk_{keyId}_{secret} — extract keyId
         const parts = fullKey.split('_');
@@ -162,10 +191,17 @@ async function validateApiKey(fullKey: string): Promise<{ userId: string; email:
         if (!raw) return null;
 
         const data = JSON.parse(raw);
+        if (!data.workspaceId || !data.role || !data.userId || !data.email) {
+            logger.warn('API key missing workspace scope metadata', { keyId });
+            return null;
+        }
+
         return {
+            apiKeyId: keyId,
+            actorUserId: data.actorUserId || data.userId,
             userId: data.userId,
             email: data.email,
-            workspaces: [],  // API keys don't carry workspace memberships
+            workspaces: [{ id: data.workspaceId, role: data.role as Role }],
         };
     } catch (err) {
         logger.error('API key validation error', { error: (err as Error).message });
@@ -208,10 +244,7 @@ export function requireRole(minRole: Role) {
             return reply.status(403).send({ error: 'Workspace context required' });
         }
 
-        const userLevel = ROLE_HIERARCHY[ObjectWorkspace.role as Role] || 0;
-        const requiredLevel = ROLE_HIERARCHY[minRole] || 0;
-
-        if (userLevel < requiredLevel) {
+        if (!hasRole(ObjectWorkspace.role as Role, minRole)) {
             return reply.status(403).send({
                 error: `Requires ${minRole} role or higher`,
             });

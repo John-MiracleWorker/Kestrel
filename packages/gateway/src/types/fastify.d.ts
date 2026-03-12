@@ -9,6 +9,9 @@ declare module 'fastify' {
                 id: string;
                 role: Role;
             }>;
+            authType?: 'jwt' | 'api_key';
+            apiKeyId?: string;
+            actorUserId?: string;
         };
         workspace?: {
             id: string;

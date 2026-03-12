@@ -1,0 +1,28 @@
+# Platform Capabilities
+
+This file is the current source of truth for what the repo supports today.
+
+## Status levels
+
+- `Production-ready`: broadly complete and intended as a primary surface.
+- `Usable but experimental`: real and testable, but still needs hardening or clearer contracts.
+- `Partially implemented`: present in code, but incomplete or narrowly scoped.
+- `Planned only`: documented target state without a complete implementation yet.
+
+| Capability                                                               | Status                  | Notes                                                                                                                                                                                                       |
+| ------------------------------------------------------------------------ | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Docker Compose stack for Gateway, Brain, Hands, Postgres, Redis, and web | Usable but experimental | Core services boot together and are wired in `docker-compose.yml`, but operational defaults and maturity still vary by startup profile.                                                                     |
+| JWT auth, refresh, logout, and current-user APIs                         | Usable but experimental | Routes exist and have tests, but a full authorization audit is still pending.                                                                                                                               |
+| Workspaces, memberships, invitations, and conversation CRUD              | Usable but experimental | Multi-user and workspace-aware flows are real, but scope and RBAC cleanup are still planned.                                                                                                                |
+| Web chat over WebSocket                                                  | Usable but experimental | This is the strongest live chat surface and now uses the canonical ingress contract on the Gateway web path.                                                                                                |
+| Autonomous task start, list, approve, and cancel                         | Usable but experimental | Gateway and Brain APIs exist; operator-grade inspection is still missing.                                                                                                                                   |
+| Task event persistence and replay                                        | Usable but experimental | Task events persist through Redis and audit-event fallback and now carry structured execution metadata such as runtime class, risk class, and fallback path. Richer task detail APIs are still planned.     |
+| Checkpoints and queue-backed task execution                              | Usable but experimental | Real Brain-side primitives exist, but recovery and operator tooling are incomplete.                                                                                                                         |
+| Hands sandboxed execution                                                | Usable but experimental | Docker isolation, allowlists, and canonical `action_event_json` traces exist. Hybrid and native boundaries are clearer now, but the broader execution policy registry and operator views are still pending. |
+| Native host execution                                                    | Usable but experimental | Supported today for desktop and hybrid flows with explicit runtime and risk classification plus shared action-event audit records. It remains higher-risk and still needs clearer UI and policy controls.   |
+| Telegram, Discord, and WhatsApp adapters                                 | Usable but experimental | Each adapter is wired, emits real traffic, and now normalizes ingress at the adapter boundary. Shared orchestration and approval/task extraction are still pending.                                         |
+| Mobile push registration and sync helpers                                | Partially implemented   | Gateway routes and Brain RPCs exist, but there is no complete mobile ingress, offline, or artifact model yet.                                                                                               |
+| Memory graph inspection from the web UI                                  | Partially implemented   | A Gateway route exists, but it still reads the database directly instead of going through a Brain-owned API.                                                                                                |
+| Provider configuration and model selection                               | Usable but experimental | Workspace provider APIs exist, but routing truth and fallback visibility still need cleanup.                                                                                                                |
+| Runtime profile inspector and operator dashboard                         | Planned only            | This is part of the next observability and platform-legibility phases.                                                                                                                                      |
+| Per-channel maturity scorecards and full platform e2e harness            | Planned only            | The repo has tests today, but not the full platform-heavy coverage target yet.                                                                                                                              |

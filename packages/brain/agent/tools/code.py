@@ -59,6 +59,9 @@ async def execute_code(
     language: str,
     code: str,
     timeout: int = 30,
+    workspace_id: str = "",
+    user_id: str = "",
+    conversation_id: str = "",
 ) -> dict:
     """
     Execute code through the active runtime backend selected at startup.
@@ -83,7 +86,14 @@ async def execute_code(
     try:
         result = await active_runtime.execute(
             tool_name="code_execute",
-            payload={"language": language, "code": code, "timeout": timeout},
+            payload={
+                "language": language,
+                "code": code,
+                "timeout": timeout,
+                "workspace_id": workspace_id,
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+            },
         )
         if "capabilities" not in result:
             result["capabilities"] = capabilities.as_dict()

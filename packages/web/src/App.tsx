@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { Navigate, Route, Routes, matchPath, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from './hooks/useAuth';
 import { LoginPage } from './components/Auth/LoginPage';
 import { Sidebar } from './components/Sidebar/Sidebar';
@@ -11,11 +12,22 @@ import { MemoryPalace } from './components/MemoryPalace/MemoryPalace';
 import { DocsPanel } from './components/Docs/DocsPanel';
 import { ScreenShare } from './components/ScreenShare/ScreenShare';
 import { PRReview } from './components/PRReview/PRReview';
+import { OperationsPage } from './components/Operations/OperationsPage';
 import { useChat } from './hooks/useChat';
-import { conversations, type Workspace, type Conversation, type Message } from './api/client';
+import {
+    conversations,
+    workspaces,
+    type Workspace,
+    type Conversation,
+    type Message,
+} from './api/client';
 
 export default function App() {
     const { user, isLoading, isAuthenticated, logout } = useAuth();
+    const location = useLocation();
+    const navigate = useNavigate();
+
+    const [workspaceList, setWorkspaceList] = useState<Workspace[]>([]);
     const [currentWorkspace, setCurrentWorkspace] = useState<Workspace | null>(null);
     const [currentConversation, setCurrentConversation] = useState<Conversation | null>(null);
     const [initialMessages, setInitialMessages] = useState<Message[]>([]);
@@ -26,36 +38,85 @@ export default function App() {
     const [showScreenShare, setShowScreenShare] = useState(false);
     const [showPRReview, setShowPRReview] = useState(false);
     const [showCommandPalette, setShowCommandPalette] = useState(false);
-    const autoCreateAttempted = useRef<string | null>(null);
     const [showCanvas, setShowCanvas] = useState(true);
+    const autoCreateAttempted = useRef<string | null>(null);
 
-    const { messages, streamingMessage, sendMessage, isConnected, pendingApproval, handleApproval } = useChat(
-        currentWorkspace?.id || null,
-        currentConversation?.id || null,
-        initialMessages,
-    );
+    const routeWorkspaceMatch =
+        matchPath('/workspaces/:workspaceId/operations', location.pathname) ||
+        matchPath('/workspaces/:workspaceId', location.pathname);
+    const routeWorkspaceId = routeWorkspaceMatch?.params.workspaceId || null;
+    const activeSurface: 'chat' | 'operations' = location.pathname.endsWith('/operations')
+        ? 'operations'
+        : 'chat';
 
-    // Load messages when conversation changes
+    const {
+        messages,
+        streamingMessage,
+        sendMessage,
+        isConnected,
+        pendingApproval,
+        handleApproval,
+    } = useChat(currentWorkspace?.id || null, currentConversation?.id || null, initialMessages);
+
     useEffect(() => {
-        if (!currentWorkspace || !currentConversation) return;
+        if (!isAuthenticated) return;
+        workspaces
+            .list()
+            .then((res) => setWorkspaceList(res.workspaces || []))
+            .catch(() => setWorkspaceList([]));
+    }, [isAuthenticated]);
+
+    useEffect(() => {
+        if (!workspaceList.length) {
+            setCurrentWorkspace(null);
+            return;
+        }
+
+        const routedWorkspace = routeWorkspaceId
+            ? workspaceList.find((workspace) => workspace.id === routeWorkspaceId) || null
+            : null;
+        const nextWorkspace = routedWorkspace || currentWorkspace || workspaceList[0];
+
+        if (nextWorkspace && nextWorkspace.id !== currentWorkspace?.id) {
+            setCurrentWorkspace(nextWorkspace);
+            setCurrentConversation(null);
+            setInitialMessages([]);
+        }
+
+        if (!routeWorkspaceId && nextWorkspace) {
+            navigate(`/workspaces/${nextWorkspace.id}`, { replace: true });
+        }
+
+        if (routeWorkspaceId && !routedWorkspace && workspaceList[0]) {
+            navigate(`/workspaces/${workspaceList[0].id}`, { replace: true });
+        }
+    }, [workspaceList, routeWorkspaceId, currentWorkspace, navigate]);
+
+    useEffect(() => {
+        if (!currentWorkspace || !currentConversation || activeSurface !== 'chat') return;
         conversations
             .messages(currentWorkspace.id, currentConversation.id)
             .then((res: { messages: Message[] }) => setInitialMessages(res.messages || []))
             .catch(console.error);
-    }, [currentWorkspace, currentConversation]);
+    }, [currentWorkspace, currentConversation, activeSurface]);
 
-    // Auto-create conversation if none exists (only attempt once per workspace)
     useEffect(() => {
-        if (currentWorkspace && !currentConversation && autoCreateAttempted.current !== currentWorkspace.id) {
+        if (activeSurface !== 'chat') return;
+        if (
+            currentWorkspace &&
+            !currentConversation &&
+            autoCreateAttempted.current !== currentWorkspace.id
+        ) {
             autoCreateAttempted.current = currentWorkspace.id;
-            conversations.create(currentWorkspace.id)
+            conversations
+                .create(currentWorkspace.id)
                 .then((conv: Conversation) => {
                     setCurrentConversation(conv);
                     setInitialMessages([]);
                 })
                 .catch((err: Error) => console.error('Failed to auto-create conversation:', err));
         }
-    }, [currentWorkspace, currentConversation]);
+    }, [currentWorkspace, currentConversation, activeSurface]);
 
     const handleNewConversation = useCallback(async () => {
         if (!currentWorkspace) return;
@@ -63,19 +124,48 @@ export default function App() {
             const conv = await conversations.create(currentWorkspace.id);
             setCurrentConversation(conv);
             setInitialMessages([]);
+            navigate(`/workspaces/${currentWorkspace.id}`);
         } catch (err) {
             console.error('Failed to create conversation:', err);
         }
-    }, [currentWorkspace]);
+    }, [currentWorkspace, navigate]);
 
-    // Listen for global events from slash commands
+    const handleSelectWorkspace = useCallback(
+        (workspace: Workspace) => {
+            setCurrentWorkspace(workspace);
+            setCurrentConversation(null);
+            setInitialMessages([]);
+            autoCreateAttempted.current = null;
+            navigate(
+                `/workspaces/${workspace.id}${activeSurface === 'operations' ? '/operations' : ''}`,
+            );
+        },
+        [activeSurface, navigate],
+    );
+
+    const handleSelectConversation = useCallback(
+        (conversation: Conversation) => {
+            setCurrentConversation(conversation);
+            if (currentWorkspace) {
+                navigate(`/workspaces/${currentWorkspace.id}`);
+            }
+        },
+        [currentWorkspace, navigate],
+    );
+
+    const handleOpenOperations = useCallback(() => {
+        if (currentWorkspace) {
+            navigate(`/workspaces/${currentWorkspace.id}/operations`);
+        }
+    }, [currentWorkspace, navigate]);
+
     useEffect(() => {
         const onNewConv = () => handleNewConversation();
         const onSettings = () => setShowSettings(true);
         const onCmdK = (e: KeyboardEvent) => {
             if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
                 e.preventDefault();
-                setShowCommandPalette(prev => !prev);
+                setShowCommandPalette((prev) => !prev);
             }
         };
         window.addEventListener('new-conversation', onNewConv);
@@ -88,36 +178,97 @@ export default function App() {
         };
     }, [handleNewConversation]);
 
-    // Command palette actions
-    const paletteActions = useMemo(() => [
-        { id: 'new-chat', label: 'New Conversation', category: 'Navigation', icon: '✨', shortcut: '⌘N', action: handleNewConversation },
-        { id: 'toggle-canvas', label: 'Toggle Live HUD', category: 'Navigation', icon: '📺', shortcut: '⌘\\', action: () => setShowCanvas(c => !c) },
-        { id: 'settings', label: 'Open Settings', category: 'Navigation', icon: '⚙️', shortcut: '⌘,', action: () => setShowSettings(true) },
-        { id: 'memory', label: 'Memory Palace', category: 'Panels', icon: '🧠', action: () => setShowMemoryPalace(true) },
-        { id: 'moltbook', label: 'Moltbook', category: 'Panels', icon: '📘', action: () => setShowMoltbook(true) },
-        { id: 'docs', label: 'Documentation', category: 'Panels', icon: '📖', action: () => setShowDocs(true) },
-        { id: 'screen', label: 'Screen Share', category: 'Panels', icon: '🖥️', action: () => setShowScreenShare(true) },
-        { id: 'pr-review', label: 'PR Review', category: 'Panels', icon: '🔍', action: () => setShowPRReview(true) },
-    ], [handleNewConversation]);
+    const paletteActions = useMemo(
+        () => [
+            {
+                id: 'new-chat',
+                label: 'New Conversation',
+                category: 'Navigation',
+                icon: '✨',
+                shortcut: '⌘N',
+                action: handleNewConversation,
+            },
+            {
+                id: 'operations',
+                label: 'Open Operations',
+                category: 'Navigation',
+                icon: '◇',
+                shortcut: '⌘O',
+                action: handleOpenOperations,
+            },
+            {
+                id: 'toggle-canvas',
+                label: 'Toggle Live HUD',
+                category: 'Navigation',
+                icon: '📺',
+                shortcut: '⌘\\',
+                action: () => setShowCanvas((c) => !c),
+            },
+            {
+                id: 'settings',
+                label: 'Open Settings',
+                category: 'Navigation',
+                icon: '⚙️',
+                shortcut: '⌘,',
+                action: () => setShowSettings(true),
+            },
+            {
+                id: 'memory',
+                label: 'Memory Palace',
+                category: 'Panels',
+                icon: '🧠',
+                action: () => setShowMemoryPalace(true),
+            },
+            {
+                id: 'moltbook',
+                label: 'Moltbook',
+                category: 'Panels',
+                icon: '📘',
+                action: () => setShowMoltbook(true),
+            },
+            {
+                id: 'docs',
+                label: 'Documentation',
+                category: 'Panels',
+                icon: '📖',
+                action: () => setShowDocs(true),
+            },
+            {
+                id: 'screen',
+                label: 'Screen Share',
+                category: 'Panels',
+                icon: '🖥️',
+                action: () => setShowScreenShare(true),
+            },
+            {
+                id: 'pr-review',
+                label: 'PR Review',
+                category: 'Panels',
+                icon: '🔍',
+                action: () => setShowPRReview(true),
+            },
+        ],
+        [handleNewConversation, handleOpenOperations],
+    );
 
-    // Loading state
     if (isLoading) {
         return (
-            <div style={{
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                height: '100vh',
-                background: 'var(--bg-terminal)',
-                color: 'var(--accent-cyan)',
-                fontFamily: 'var(--font-mono)'
-            }}>
+            <div
+                style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    height: '100vh',
+                    background: 'var(--bg-terminal)',
+                    color: 'var(--accent-cyan)',
+                    fontFamily: 'var(--font-mono)',
+                }}
+            >
                 <div className="animate-flicker">INITIALIZING_SYSTEM...</div>
             </div>
         );
     }
 
-    // Auth gate
     if (!isAuthenticated) {
         return <LoginPage />;
     }
@@ -127,9 +278,11 @@ export default function App() {
             <Sidebar
                 currentWorkspace={currentWorkspace}
                 currentConversation={currentConversation}
-                onSelectWorkspace={setCurrentWorkspace}
-                onSelectConversation={setCurrentConversation}
+                activeSurface={activeSurface}
+                onSelectWorkspace={handleSelectWorkspace}
+                onSelectConversation={handleSelectConversation}
                 onNewConversation={handleNewConversation}
+                onOpenOperations={handleOpenOperations}
                 onOpenSettings={() => setShowSettings(true)}
                 onOpenMoltbook={() => setShowMoltbook(true)}
                 onOpenMemoryPalace={() => setShowMemoryPalace(true)}
@@ -139,23 +292,54 @@ export default function App() {
                 onLogout={logout}
             />
 
-            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative' }}>
-                <ChatView
-                    workspaceId={currentWorkspace?.id || null}
-                    messages={messages}
-                    streamingMessage={streamingMessage}
-                    onSendMessage={sendMessage}
-                    isConnected={isConnected}
-                    conversationTitle={currentConversation?.title}
-                    onToggleCanvas={() => setShowCanvas(!showCanvas)}
-                    pendingApproval={pendingApproval}
-                    onApproval={handleApproval}
-                />
+            <div
+                style={{
+                    flex: 1,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    position: 'relative',
+                    minWidth: 0,
+                }}
+            >
+                <Routes>
+                    <Route
+                        path="/workspaces/:workspaceId/operations"
+                        element={<OperationsPage workspaceId={currentWorkspace?.id || ''} />}
+                    />
+                    <Route
+                        path="/workspaces/:workspaceId"
+                        element={
+                            <ChatView
+                                workspaceId={currentWorkspace?.id || null}
+                                messages={messages}
+                                streamingMessage={streamingMessage}
+                                onSendMessage={sendMessage}
+                                isConnected={isConnected}
+                                conversationTitle={currentConversation?.title}
+                                onToggleCanvas={() => setShowCanvas(!showCanvas)}
+                                pendingApproval={pendingApproval}
+                                onApproval={handleApproval}
+                            />
+                        }
+                    />
+                    <Route
+                        path="*"
+                        element={
+                            currentWorkspace ? (
+                                <Navigate to={`/workspaces/${currentWorkspace.id}`} replace />
+                            ) : (
+                                <div style={{ padding: '24px', color: 'var(--text-dim)' }}>
+                                    Loading workspace…
+                                </div>
+                            )
+                        }
+                    />
+                </Routes>
             </div>
 
             <LiveCanvas
-                isVisible={showCanvas}
-                activeTask={streamingMessage ? "PROCESSING_USER_QUERY" : "SYSTEM_READY"}
+                isVisible={showCanvas && activeSurface === 'chat'}
+                activeTask={streamingMessage ? 'PROCESSING_USER_QUERY' : 'SYSTEM_READY'}
                 isStreaming={!!streamingMessage}
                 content={streamingMessage?.content}
                 toolActivity={streamingMessage?.toolActivity}

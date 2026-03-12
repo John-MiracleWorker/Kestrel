@@ -5,7 +5,7 @@ import warnings
 
 import brain_pb2 as brain__pb2
 
-GRPC_GENERATED_VERSION = '1.78.0'
+GRPC_GENERATED_VERSION = '1.71.2'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in brain_pb2_grpc.py depends on'
+        + f' but the generated code in brain_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -160,6 +160,36 @@ class BrainServiceStub(object):
                 request_serializer=brain__pb2.ListTasksRequest.SerializeToString,
                 response_deserializer=brain__pb2.ListTasksResponse.FromString,
                 _registered_method=True)
+        self.GetTaskDetail = channel.unary_unary(
+                '/kestrel.brain.BrainService/GetTaskDetail',
+                request_serializer=brain__pb2.GetTaskDetailRequest.SerializeToString,
+                response_deserializer=brain__pb2.GetTaskDetailResponse.FromString,
+                _registered_method=True)
+        self.ListTaskTimeline = channel.unary_unary(
+                '/kestrel.brain.BrainService/ListTaskTimeline',
+                request_serializer=brain__pb2.ListTaskTimelineRequest.SerializeToString,
+                response_deserializer=brain__pb2.ListTaskTimelineResponse.FromString,
+                _registered_method=True)
+        self.ListTaskCheckpoints = channel.unary_unary(
+                '/kestrel.brain.BrainService/ListTaskCheckpoints',
+                request_serializer=brain__pb2.ListTaskCheckpointsRequest.SerializeToString,
+                response_deserializer=brain__pb2.ListTaskCheckpointsResponse.FromString,
+                _registered_method=True)
+        self.ListTaskArtifacts = channel.unary_unary(
+                '/kestrel.brain.BrainService/ListTaskArtifacts',
+                request_serializer=brain__pb2.ListTaskArtifactsRequest.SerializeToString,
+                response_deserializer=brain__pb2.ListTaskArtifactsResponse.FromString,
+                _registered_method=True)
+        self.GetApprovalAudit = channel.unary_unary(
+                '/kestrel.brain.BrainService/GetApprovalAudit',
+                request_serializer=brain__pb2.GetApprovalAuditRequest.SerializeToString,
+                response_deserializer=brain__pb2.GetApprovalAuditResponse.FromString,
+                _registered_method=True)
+        self.ListOperatorTasks = channel.unary_unary(
+                '/kestrel.brain.BrainService/ListOperatorTasks',
+                request_serializer=brain__pb2.ListOperatorTasksRequest.SerializeToString,
+                response_deserializer=brain__pb2.ListOperatorTasksResponse.FromString,
+                _registered_method=True)
         self.LaunchWorkflow = channel.unary_stream(
                 '/kestrel.brain.BrainService/LaunchWorkflow',
                 request_serializer=brain__pb2.LaunchWorkflowRequest.SerializeToString,
@@ -179,6 +209,16 @@ class BrainServiceStub(object):
                 '/kestrel.brain.BrainService/GetCapabilities',
                 request_serializer=brain__pb2.GetCapabilitiesRequest.SerializeToString,
                 response_deserializer=brain__pb2.GetCapabilitiesResponse.FromString,
+                _registered_method=True)
+        self.GetMemoryGraph = channel.unary_unary(
+                '/kestrel.brain.BrainService/GetMemoryGraph',
+                request_serializer=brain__pb2.GetMemoryGraphRequest.SerializeToString,
+                response_deserializer=brain__pb2.GetMemoryGraphResponse.FromString,
+                _registered_method=True)
+        self.GetRuntimeProfile = channel.unary_unary(
+                '/kestrel.brain.BrainService/GetRuntimeProfile',
+                request_serializer=brain__pb2.GetRuntimeProfileRequest.SerializeToString,
+                response_deserializer=brain__pb2.GetRuntimeProfileResponse.FromString,
                 _registered_method=True)
         self.GetMoltbookActivity = channel.unary_unary(
                 '/kestrel.brain.BrainService/GetMoltbookActivity',
@@ -359,6 +399,42 @@ class BrainServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetTaskDetail(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListTaskTimeline(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListTaskCheckpoints(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListTaskArtifacts(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetApprovalAudit(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListOperatorTasks(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def LaunchWorkflow(self, request, context):
         """── Workflows ──────────────────────────────────────────────
         """
@@ -381,6 +457,18 @@ class BrainServiceServicer(object):
     def GetCapabilities(self, request, context):
         """── Capabilities ───────────────────────────────────────────
         """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetMemoryGraph(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetRuntimeProfile(self, request, context):
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -533,6 +621,36 @@ def add_BrainServiceServicer_to_server(servicer, server):
                     request_deserializer=brain__pb2.ListTasksRequest.FromString,
                     response_serializer=brain__pb2.ListTasksResponse.SerializeToString,
             ),
+            'GetTaskDetail': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetTaskDetail,
+                    request_deserializer=brain__pb2.GetTaskDetailRequest.FromString,
+                    response_serializer=brain__pb2.GetTaskDetailResponse.SerializeToString,
+            ),
+            'ListTaskTimeline': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListTaskTimeline,
+                    request_deserializer=brain__pb2.ListTaskTimelineRequest.FromString,
+                    response_serializer=brain__pb2.ListTaskTimelineResponse.SerializeToString,
+            ),
+            'ListTaskCheckpoints': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListTaskCheckpoints,
+                    request_deserializer=brain__pb2.ListTaskCheckpointsRequest.FromString,
+                    response_serializer=brain__pb2.ListTaskCheckpointsResponse.SerializeToString,
+            ),
+            'ListTaskArtifacts': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListTaskArtifacts,
+                    request_deserializer=brain__pb2.ListTaskArtifactsRequest.FromString,
+                    response_serializer=brain__pb2.ListTaskArtifactsResponse.SerializeToString,
+            ),
+            'GetApprovalAudit': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetApprovalAudit,
+                    request_deserializer=brain__pb2.GetApprovalAuditRequest.FromString,
+                    response_serializer=brain__pb2.GetApprovalAuditResponse.SerializeToString,
+            ),
+            'ListOperatorTasks': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListOperatorTasks,
+                    request_deserializer=brain__pb2.ListOperatorTasksRequest.FromString,
+                    response_serializer=brain__pb2.ListOperatorTasksResponse.SerializeToString,
+            ),
             'LaunchWorkflow': grpc.unary_stream_rpc_method_handler(
                     servicer.LaunchWorkflow,
                     request_deserializer=brain__pb2.LaunchWorkflowRequest.FromString,
@@ -552,6 +670,16 @@ def add_BrainServiceServicer_to_server(servicer, server):
                     servicer.GetCapabilities,
                     request_deserializer=brain__pb2.GetCapabilitiesRequest.FromString,
                     response_serializer=brain__pb2.GetCapabilitiesResponse.SerializeToString,
+            ),
+            'GetMemoryGraph': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetMemoryGraph,
+                    request_deserializer=brain__pb2.GetMemoryGraphRequest.FromString,
+                    response_serializer=brain__pb2.GetMemoryGraphResponse.SerializeToString,
+            ),
+            'GetRuntimeProfile': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetRuntimeProfile,
+                    request_deserializer=brain__pb2.GetRuntimeProfileRequest.FromString,
+                    response_serializer=brain__pb2.GetRuntimeProfileResponse.SerializeToString,
             ),
             'GetMoltbookActivity': grpc.unary_unary_rpc_method_handler(
                     servicer.GetMoltbookActivity,
@@ -1256,6 +1384,168 @@ class BrainService(object):
             _registered_method=True)
 
     @staticmethod
+    def GetTaskDetail(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/GetTaskDetail',
+            brain__pb2.GetTaskDetailRequest.SerializeToString,
+            brain__pb2.GetTaskDetailResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListTaskTimeline(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/ListTaskTimeline',
+            brain__pb2.ListTaskTimelineRequest.SerializeToString,
+            brain__pb2.ListTaskTimelineResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListTaskCheckpoints(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/ListTaskCheckpoints',
+            brain__pb2.ListTaskCheckpointsRequest.SerializeToString,
+            brain__pb2.ListTaskCheckpointsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListTaskArtifacts(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/ListTaskArtifacts',
+            brain__pb2.ListTaskArtifactsRequest.SerializeToString,
+            brain__pb2.ListTaskArtifactsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetApprovalAudit(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/GetApprovalAudit',
+            brain__pb2.GetApprovalAuditRequest.SerializeToString,
+            brain__pb2.GetApprovalAuditResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListOperatorTasks(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/ListOperatorTasks',
+            brain__pb2.ListOperatorTasksRequest.SerializeToString,
+            brain__pb2.ListOperatorTasksResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def LaunchWorkflow(request,
             target,
             options=(),
@@ -1353,6 +1643,60 @@ class BrainService(object):
             '/kestrel.brain.BrainService/GetCapabilities',
             brain__pb2.GetCapabilitiesRequest.SerializeToString,
             brain__pb2.GetCapabilitiesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetMemoryGraph(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/GetMemoryGraph',
+            brain__pb2.GetMemoryGraphRequest.SerializeToString,
+            brain__pb2.GetMemoryGraphResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetRuntimeProfile(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kestrel.brain.BrainService/GetRuntimeProfile',
+            brain__pb2.GetRuntimeProfileRequest.SerializeToString,
+            brain__pb2.GetRuntimeProfileResponse.FromString,
             options,
             channel_credentials,
             insecure,

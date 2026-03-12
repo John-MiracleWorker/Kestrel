@@ -5,7 +5,14 @@ SHARED_PATH = Path(__file__).resolve().parents[2] / "shared"
 if str(SHARED_PATH) not in sys.path:
     sys.path.append(str(SHARED_PATH))
 
-from action_event_schema import build_action_event, normalize_action_event, stable_hash
+from action_event_schema import (
+    build_action_event,
+    build_execution_action_event,
+    classify_risk_class,
+    classify_runtime_class,
+    normalize_action_event,
+    stable_hash,
+)
 
 
 def test_action_event_contains_reversible_state_references():
@@ -22,3 +29,19 @@ def test_action_event_contains_reversible_state_references():
     assert normalized["before_state"]["screenshot_hash"]
     assert normalized["before_state"]["command_hash"]
     assert normalized["after_state"]["policy_decision"] == "success"
+
+
+def test_execution_action_event_carries_runtime_and_risk_classes():
+    event = build_execution_action_event(
+        source="hands.test",
+        action_type="python_executor.run",
+        status="success",
+        runtime_class=classify_runtime_class("docker"),
+        risk_class=classify_risk_class(action_type="python_executor"),
+        before_state={"command_hash": stable_hash("cmd"), "policy_decision": "running"},
+        after_state={"command_hash": stable_hash("cmd"), "policy_decision": "success"},
+    )
+
+    normalized = normalize_action_event(event)
+    assert normalized["metadata"]["runtime_class"] == "sandboxed_docker"
+    assert normalized["metadata"]["risk_class"] == "medium"

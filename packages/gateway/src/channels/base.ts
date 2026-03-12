@@ -1,7 +1,14 @@
 /**
  * Supported channel types.
  */
-export type ChannelType = 'web' | 'whatsapp' | 'telegram' | 'discord' | 'mobile' | 'moltbook' | 'feishu';
+export type ChannelType =
+    | 'web'
+    | 'whatsapp'
+    | 'telegram'
+    | 'discord'
+    | 'mobile'
+    | 'moltbook'
+    | 'feishu';
 
 /**
  * Adapter connection state.
@@ -51,7 +58,11 @@ export interface ToolActivity {
 }
 
 /**
- * Incoming message from any channel — normalized format.
+ * Incoming message from any channel.
+ *
+ * @deprecated Use `NormalizedIngressEvent` from `./ingress` as the canonical
+ * Gateway ingress contract. Legacy adapters may still emit this shape while
+ * the registry upgrades them.
  */
 export interface IncomingMessage {
     id: string;
@@ -62,7 +73,7 @@ export interface IncomingMessage {
     content: string;
     attachments?: Attachment[];
     metadata: {
-        channelUserId: string;   // Original platform user ID
+        channelUserId: string; // Original platform user ID
         channelMessageId: string;
         timestamp: Date;
         [key: string]: any;
@@ -108,7 +119,7 @@ export abstract class BaseChannelAdapter {
 
     protected setStatus(status: AdapterStatus) {
         this._status = status;
-        this.statusHandlers.forEach(h => h(status));
+        this.statusHandlers.forEach((h) => h(status));
     }
 
     /** Whether this adapter supports streaming responses. */
@@ -177,8 +188,8 @@ export abstract class BaseChannelAdapter {
     protected emit(event: 'error', err: Error): void;
     protected emit(event: 'status', status: AdapterStatus): void;
     protected emit(event: string, data: any): void {
-        if (event === 'message') this.messageHandlers.forEach(h => h(data));
-        if (event === 'error') this.errorHandlers.forEach(h => h(data));
-        if (event === 'status') this.statusHandlers.forEach(h => h(data));
+        if (event === 'message') this.messageHandlers.forEach((h) => h(data));
+        if (event === 'error') this.errorHandlers.forEach((h) => h(data));
+        if (event === 'status') this.statusHandlers.forEach((h) => h(data));
     }
 }

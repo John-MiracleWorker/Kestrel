@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef } from 'react';
-import { tasks, type TaskEvent, type StartTaskOptions } from '../api/client';
+import { getAccessToken, tasks, type TaskEvent, type StartTaskOptions } from '../api/client';
 
 export type AgentStatus = 'idle' | 'running' | 'waiting_approval' | 'complete' | 'failed';
 
@@ -50,7 +50,7 @@ export function useAgent(): UseAgentReturn {
         abortRef.current = abort;
 
         // POST with SSE response
-        const token = localStorage.getItem('kestrel_access');
+        const token = getAccessToken();
         fetch(`/api/workspaces/${workspaceId}/tasks`, {
             method: 'POST',
             headers: {

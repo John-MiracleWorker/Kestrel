@@ -1,12 +1,7 @@
 import { createHmac } from 'crypto';
-import { randomUUID } from 'crypto';
-import {
-    BaseChannelAdapter,
-    ChannelType,
-    IncomingMessage,
-    OutgoingMessage,
-    Attachment,
-} from './base';
+import { BaseChannelAdapter, ChannelType, OutgoingMessage, Attachment } from './base';
+import { createNormalizedIngressEvent, type NormalizedIngressPayloadKind } from './ingress';
+import { parseTaskRequest } from './orchestration/intents';
 import { logger } from '../utils/logger';
 
 // ── Configuration ──────────────────────────────────────────────────
@@ -14,10 +9,10 @@ import { logger } from '../utils/logger';
 export interface WhatsAppConfig {
     accountSid: string;
     authToken: string;
-    fromNumber: string;            // e.g. "whatsapp:+14155238886"
+    fromNumber: string; // e.g. "whatsapp:+14155238886"
     defaultWorkspaceId: string;
-    webhookUrl?: string;           // For signature validation
-    allowedNumbers?: string[];     // Optional: restrict to these phone numbers
+    webhookUrl?: string; // For signature validation
+    allowedNumbers?: string[]; // Optional: restrict to these phone numbers
 }
 
 // ── WhatsApp Adapter ───────────────────────────────────────────────
@@ -44,17 +39,16 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
     private readonly authHeader: string;
 
     // Phone → userId mapping
-    private phoneMap = new Map<string, string>();    // kestrelUserId → phone
-    private userIdMap = new Map<string, string>();    // phone → kestrelUserId
+    private phoneMap = new Map<string, string>(); // kestrelUserId → phone
+    private userIdMap = new Map<string, string>(); // phone → kestrelUserId
 
     // Delivery status tracking
     private pendingMessages = new Map<string, { phone: string; sentAt: Date }>();
 
     constructor(private config: WhatsAppConfig) {
         super();
-        this.authHeader = 'Basic ' + Buffer.from(
-            `${config.accountSid}:${config.authToken}`
-        ).toString('base64');
+        this.authHeader =
+            'Basic ' + Buffer.from(`${config.accountSid}:${config.authToken}`).toString('base64');
     }
 
     // ── Lifecycle ──────────────────────────────────────────────────
@@ -72,8 +66,10 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
             throw new Error(`Twilio credentials validation failed: ${res.status}`);
         }
 
-        const account = await res.json() as { friendly_name: string; status: string };
-        logger.info(`WhatsApp adapter connected via Twilio: ${account.friendly_name} (${account.status})`);
+        const account = (await res.json()) as { friendly_name: string; status: string };
+        logger.info(
+            `WhatsApp adapter connected via Twilio: ${account.friendly_name} (${account.status})`,
+        );
         this.setStatus('connected');
     }
 
@@ -154,11 +150,21 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
      */
     private stripMarkdown(text: string): string {
         return text
-            .replace(/#{1,6}\s+/g, '')                    // Headers → plain text
-            .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')      // Links → text only
-            .replace(/```[\s\S]*?```/g, (m) =>            // Code blocks → indented
-                m.replace(/```\w*\n?/, '').replace(/```/, '').split('\n').map(l => '  ' + l).join('\n'))
-            .replace(/`([^`]+)`/g, '$1');                  // Inline code → plain
+            .replace(/#{1,6}\s+/g, '') // Headers → plain text
+            .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1') // Links → text only
+            .replace(
+                /```[\s\S]*?```/g,
+                (
+                    m, // Code blocks → indented
+                ) =>
+                    m
+                        .replace(/```\w*\n?/, '')
+                        .replace(/```/, '')
+                        .split('\n')
+                        .map((l) => '  ' + l)
+                        .join('\n'),
+            )
+            .replace(/`([^`]+)`/g, '$1'); // Inline code → plain
     }
 
     private async sendTwilioMessage(to: string, body: string, mediaUrl?: string): Promise<void> {
@@ -190,14 +196,14 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
         }
 
         // Track for delivery receipts
-        const data = await res.json() as { sid: string };
+        const data = (await res.json()) as { sid: string };
         this.pendingMessages.set(data.sid, { phone: to, sentAt: new Date() });
     }
 
     // ── Formatting ─────────────────────────────────────────────────
 
     formatOutgoing(message: OutgoingMessage): OutgoingMessage {
-        return message;  // Chunking and stripping handled in sendToPhone
+        return message; // Chunking and stripping handled in sendToPhone
     }
 
     // ── Progress Updates ──────────────────────────────────────────
@@ -206,16 +212,18 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
      * Send a progress update for an active task (silent, short message).
      */
     async sendTaskProgress(phone: string, step: string, detail: string = ''): Promise<void> {
-        const text = detail
-            ? `🔧 *${step}*\n${detail}`
-            : `🔧 ${step}`;
+        const text = detail ? `🔧 *${step}*\n${detail}` : `🔧 ${step}`;
         await this.sendTwilioMessage(phone, text);
     }
 
     /**
      * Send an approval request via WhatsApp.
      */
-    async sendApprovalRequest(phone: string, approvalId: string, description: string): Promise<void> {
+    async sendApprovalRequest(
+        phone: string,
+        approvalId: string,
+        description: string,
+    ): Promise<void> {
         const text =
             `⚠️ *Approval Required*\n\n` +
             `${description}\n\n` +
@@ -223,6 +231,43 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
             `  /approve ${approvalId}\n` +
             `  /reject ${approvalId}`;
         await this.sendTwilioMessage(phone, text);
+    }
+
+    private emitIngressEvent(input: {
+        userId: string;
+        phone: string;
+        content: string;
+        conversationId: string;
+        channelMessageId?: string;
+        attachments?: Attachment[];
+        payloadKind?: NormalizedIngressPayloadKind;
+        metadata?: Record<string, unknown>;
+    }): void {
+        const event = createNormalizedIngressEvent({
+            channel: 'whatsapp',
+            userId: input.userId,
+            workspaceId: this.config.defaultWorkspaceId,
+            conversationId: input.conversationId,
+            content: input.content,
+            attachments: input.attachments,
+            metadata: {
+                channelUserId: input.phone,
+                channelMessageId: input.channelMessageId,
+                timestamp: new Date(),
+                phoneNumber: input.phone,
+                ...input.metadata,
+            },
+            externalUserId: input.phone,
+            externalConversationId: input.phone,
+            authContext: {
+                transport: 'whatsapp_webhook',
+                authenticatedUserId: input.userId,
+                isProvisionalUser: false,
+            },
+            payloadKind: input.payloadKind,
+        });
+
+        this.emit('message', event);
     }
 
     // ── Webhook Processing ─────────────────────────────────────────
@@ -237,9 +282,7 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
             data += key + body[key];
         }
 
-        const computed = createHmac('sha1', this.config.authToken)
-            .update(data)
-            .digest('base64');
+        const computed = createHmac('sha1', this.config.authToken).update(data).digest('base64');
 
         return computed === signature;
     }
@@ -260,7 +303,10 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
 
         // Access control
         if (!this.isAllowed(from)) {
-            await this.sendTwilioMessage(from, '🔒 Access denied. You are not authorized to use this bot.');
+            await this.sendTwilioMessage(
+                from,
+                '🔒 Access denied. You are not authorized to use this bot.',
+            );
             return;
         }
 
@@ -271,12 +317,10 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
         }
 
         // Handle task mode (!goal prefix)
-        if (messageBody.startsWith('!')) {
-            const goal = messageBody.substring(1).trim();
-            if (goal) {
-                await this.handleTaskRequest(from, goal, messageSid);
-                return;
-            }
+        const taskGoal = parseTaskRequest(messageBody);
+        if (taskGoal) {
+            await this.handleTaskRequest(from, taskGoal, messageSid);
+            return;
         }
 
         // Map phone → user
@@ -302,53 +346,43 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
             }
         }
 
-        const incoming: IncomingMessage = {
-            id: randomUUID(),
-            channel: 'whatsapp',
+        this.emitIngressEvent({
             userId,
-            workspaceId: this.config.defaultWorkspaceId,
+            phone: from,
             conversationId: `wa-${from}`,
             content: messageBody,
             attachments: attachments.length ? attachments : undefined,
-            metadata: {
-                channelUserId: from,
-                channelMessageId: messageSid,
-                timestamp: new Date(),
-                phoneNumber: from,
-            },
-        };
-
-        this.emit('message', incoming);
+            channelMessageId: messageSid || undefined,
+        });
     }
 
     // ── Task Mode ─────────────────────────────────────────────────
 
-    private async handleTaskRequest(phone: string, goal: string, messageSid: string): Promise<void> {
+    private async handleTaskRequest(
+        phone: string,
+        goal: string,
+        messageSid: string,
+    ): Promise<void> {
         const userId = this.resolveUserId(phone);
 
-        await this.sendTwilioMessage(phone,
+        await this.sendTwilioMessage(
+            phone,
             `🦅 *Starting autonomous task...*\n\n` +
-            `📋 *Goal:* ${goal}\n\n` +
-            `_I'll work on this and send you updates._`
+                `📋 *Goal:* ${goal}\n\n` +
+                `_I'll work on this and send you updates._`,
         );
 
-        const incoming: IncomingMessage = {
-            id: randomUUID(),
-            channel: 'whatsapp',
+        this.emitIngressEvent({
             userId,
-            workspaceId: this.config.defaultWorkspaceId,
+            phone,
             conversationId: `wa-task-${phone}-${Date.now()}`,
             content: goal,
+            channelMessageId: messageSid || undefined,
+            payloadKind: 'task',
             metadata: {
-                channelUserId: phone,
-                channelMessageId: messageSid,
-                timestamp: new Date(),
-                phoneNumber: phone,
                 isTaskRequest: true,
             },
-        };
-
-        this.emit('message', incoming);
+        });
     }
 
     // ── Commands ───────────────────────────────────────────────────
@@ -361,32 +395,34 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
         switch (command) {
             case '/start':
             case '/help':
-                await this.sendTwilioMessage(phone,
+                await this.sendTwilioMessage(
+                    phone,
                     `🦅 *Kestrel on WhatsApp*\n\n` +
-                    `*💬 Chat Mode*\n` +
-                    `Just send a message to chat with your AI agent.\n\n` +
-                    `*🤖 Task Mode*\n` +
-                    `Start with ! to launch an autonomous task:\n` +
-                    `  !review the auth module\n\n` +
-                    `*Commands:*\n` +
-                    `  /help — This help\n` +
-                    `  /task <goal> — Start a task\n` +
-                    `  /tasks — List active tasks\n` +
-                    `  /status — System status\n` +
-                    `  /cancel <id> — Cancel a task\n` +
-                    `  /approve <id> — Approve action\n` +
-                    `  /reject <id> — Reject action\n` +
-                    `  /model <name> — Switch AI model\n` +
-                    `  /new — New conversation`
+                        `*💬 Chat Mode*\n` +
+                        `Just send a message to chat with your AI agent.\n\n` +
+                        `*🤖 Task Mode*\n` +
+                        `Start with ! to launch an autonomous task:\n` +
+                        `  !review the auth module\n\n` +
+                        `*Commands:*\n` +
+                        `  /help — This help\n` +
+                        `  /task <goal> — Start a task\n` +
+                        `  /tasks — List active tasks\n` +
+                        `  /status — System status\n` +
+                        `  /cancel <id> — Cancel a task\n` +
+                        `  /approve <id> — Approve action\n` +
+                        `  /reject <id> — Reject action\n` +
+                        `  /model <name> — Switch AI model\n` +
+                        `  /new — New conversation`,
                 );
                 break;
 
             case '/task': {
                 const goal = args.join(' ').trim();
                 if (!goal) {
-                    await this.sendTwilioMessage(phone,
+                    await this.sendTwilioMessage(
+                        phone,
                         `❓ Usage: /task <your goal>\n\n` +
-                        `Example: /task review the database schema`
+                            `Example: /task review the database schema`,
                     );
                     return;
                 }
@@ -395,20 +431,22 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
             }
 
             case '/tasks':
-                await this.sendTwilioMessage(phone,
+                await this.sendTwilioMessage(
+                    phone,
                     `📋 *Your Tasks*\n\n` +
-                    `Task listing available via the CLI:\n` +
-                    `  kestrel tasks`
+                        `Task listing available via the CLI:\n` +
+                        `  kestrel tasks`,
                 );
                 break;
 
             case '/status':
-                await this.sendTwilioMessage(phone,
+                await this.sendTwilioMessage(
+                    phone,
                     `🦅 *Kestrel Status*\n\n` +
-                    `✅ Bot: Online\n` +
-                    `📱 Channel: WhatsApp\n` +
-                    `🏢 Workspace: ${this.config.defaultWorkspaceId}\n` +
-                    `📞 Your number: ${phone}`
+                        `✅ Bot: Online\n` +
+                        `📱 Channel: WhatsApp\n` +
+                        `🏢 Workspace: ${this.config.defaultWorkspaceId}\n` +
+                        `📞 Your number: ${phone}`,
                 );
                 break;
 
@@ -419,17 +457,13 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
                     return;
                 }
                 const userId = this.resolveUserId(phone);
-                this.emit('message', {
-                    id: randomUUID(),
-                    channel: 'whatsapp',
+                this.emitIngressEvent({
                     userId,
-                    workspaceId: this.config.defaultWorkspaceId,
+                    phone,
                     conversationId: `wa-${phone}`,
                     content: `/cancel ${taskId}`,
+                    payloadKind: 'command',
                     metadata: {
-                        channelUserId: phone,
-                        channelMessageId: '',
-                        timestamp: new Date(),
                         isCommand: true,
                     },
                 });
@@ -460,19 +494,26 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
                 if (args[0]) {
                     await this.sendTwilioMessage(phone, `🔄 Model switched to ${args[0]}`);
                 } else {
-                    await this.sendTwilioMessage(phone,
+                    await this.sendTwilioMessage(
+                        phone,
                         `❓ Usage: /model <model_name>\n\n` +
-                        `Examples:\n  /model gpt-4o\n  /model claude-sonnet-4-20250514\n  /model gemini-2.5-pro`
+                            `Examples:\n  /model gpt-4o\n  /model claude-sonnet-4-20250514\n  /model gemini-2.5-pro`,
                     );
                 }
                 break;
 
             case '/new':
-                await this.sendTwilioMessage(phone, `✨ New conversation started! Send your first message.`);
+                await this.sendTwilioMessage(
+                    phone,
+                    `✨ New conversation started! Send your first message.`,
+                );
                 break;
 
             default:
-                await this.sendTwilioMessage(phone, `Unknown command: ${command}. Send /help for available commands.`);
+                await this.sendTwilioMessage(
+                    phone,
+                    `Unknown command: ${command}. Send /help for available commands.`,
+                );
         }
     }
 
@@ -485,7 +526,12 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
         const messageSid = body.MessageSid;
         const status = body.MessageStatus;
 
-        if (status === 'delivered' || status === 'read' || status === 'failed' || status === 'undelivered') {
+        if (
+            status === 'delivered' ||
+            status === 'read' ||
+            status === 'failed' ||
+            status === 'undelivered'
+        ) {
             this.pendingMessages.delete(messageSid);
         }
 

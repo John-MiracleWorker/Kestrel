@@ -5,6 +5,76 @@ import { logger } from '../utils/logger';
 
 const PROTO_PATH = path.resolve(__dirname, '../../../shared/proto/brain.proto');
 
+function streamToAsyncIterable(stream: any): AsyncIterable<any> {
+    const queue: any[] = [];
+    const waiters: Array<{
+        resolve: (value: IteratorResult<any>) => void;
+        reject: (reason?: any) => void;
+    }> = [];
+    let ended = false;
+    let streamError: any = null;
+
+    const settleWaiters = () => {
+        while (waiters.length > 0) {
+            const waiter = waiters.shift();
+            if (!waiter) continue;
+
+            if (queue.length > 0) {
+                waiter.resolve({ value: queue.shift(), done: false });
+                continue;
+            }
+
+            if (streamError) {
+                waiter.reject(streamError);
+                continue;
+            }
+
+            if (ended) {
+                waiter.resolve({ value: undefined, done: true });
+            }
+        }
+    };
+
+    stream.on('data', (data: any) => {
+        queue.push(data);
+        settleWaiters();
+    });
+
+    stream.on('end', () => {
+        ended = true;
+        settleWaiters();
+    });
+
+    stream.on('error', (err: any) => {
+        streamError = err;
+        settleWaiters();
+    });
+
+    return {
+        [Symbol.asyncIterator]() {
+            return {
+                next(): Promise<IteratorResult<any>> {
+                    if (queue.length > 0) {
+                        return Promise.resolve({ value: queue.shift(), done: false });
+                    }
+
+                    if (streamError) {
+                        return Promise.reject(streamError);
+                    }
+
+                    if (ended) {
+                        return Promise.resolve({ value: undefined, done: true });
+                    }
+
+                    return new Promise((resolve, reject) => {
+                        waiters.push({ resolve, reject });
+                    });
+                },
+            };
+        },
+    };
+}
+
 /**
  * gRPC client for the Brain service.
  * Wraps brain.proto BrainService with typed methods.
@@ -13,7 +83,7 @@ export class BrainClient {
     private client: any;
     private connected = false;
 
-    constructor(private address: string) { }
+    constructor(private address: string) {}
 
     async connect(maxRetries = 10): Promise<void> {
         const packageDef = protoLoader.loadSync(PROTO_PATH, {
@@ -26,10 +96,7 @@ export class BrainClient {
         const proto = grpc.loadPackageDefinition(packageDef) as any;
         const BrainService = proto.kestrel.brain.BrainService;
 
-        this.client = new BrainService(
-            this.address,
-            grpc.credentials.createInsecure()
-        );
+        this.client = new BrainService(this.address, grpc.credentials.createInsecure());
 
         // Retry connection with exponential backoff
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -46,15 +113,20 @@ export class BrainClient {
                 return;
             } catch (err: any) {
                 const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
-                logger.warn(`Brain gRPC not ready (attempt ${attempt}/${maxRetries}), retrying in ${delay}ms...`, {
-                    address: this.address,
-                    error: err.message,
-                });
+                logger.warn(
+                    `Brain gRPC not ready (attempt ${attempt}/${maxRetries}), retrying in ${delay}ms...`,
+                    {
+                        address: this.address,
+                        error: err.message,
+                    },
+                );
                 if (attempt === maxRetries) {
                     this.connected = false;
-                    throw new Error(`Failed to connect to Brain gRPC at ${this.address} after ${maxRetries} attempts`);
+                    throw new Error(
+                        `Failed to connect to Brain gRPC at ${this.address} after ${maxRetries} attempts`,
+                    );
                 }
-                await new Promise(r => setTimeout(r, delay));
+                await new Promise((r) => setTimeout(r, delay));
             }
         }
     }
@@ -132,80 +204,89 @@ export class BrainClient {
                 (err: any, response: any) => {
                     if (err) reject(new Error(err.details || err.message));
                     else resolve(response);
-                }
+                },
             );
         });
     }
 
     async authenticateUser(email: string, password: string): Promise<any> {
         return new Promise((resolve, reject) => {
-            this.client.AuthenticateUser(
-                { email, password },
-                (err: any, response: any) => {
-                    if (err) reject(new Error(err.details || err.message));
-                    else resolve(response);
-                }
-            );
+            this.client.AuthenticateUser({ email, password }, (err: any, response: any) => {
+                if (err) reject(new Error(err.details || err.message));
+                else resolve(response);
+            });
         });
     }
 
     async listWorkspaces(userId: string): Promise<any> {
         return new Promise((resolve, reject) => {
-            this.client.ListWorkspaces(
-                { user_id: userId },
-                (err: any, response: any) => {
-                    if (err) reject(new Error(err.details || err.message));
-                    else resolve(response?.workspaces || []);
-                }
-            );
+            this.client.ListWorkspaces({ user_id: userId }, (err: any, response: any) => {
+                if (err) reject(new Error(err.details || err.message));
+                else resolve(response?.workspaces || []);
+            });
         });
     }
 
-    async deleteConversation(userId: string, workspaceId: string, conversationId: string): Promise<boolean> {
+    async deleteConversation(
+        userId: string,
+        workspaceId: string,
+        conversationId: string,
+    ): Promise<boolean> {
         return new Promise((resolve, reject) => {
             this.client.DeleteConversation(
                 { user_id: userId, workspace_id: workspaceId, conversation_id: conversationId },
                 (err: any, response: any) => {
                     if (err) reject(new Error(err.details || err.message));
                     else resolve(response.success);
-                }
+                },
             );
         });
     }
 
-    async updateConversation(userId: string, workspaceId: string, conversationId: string, title: string): Promise<any> {
+    async updateConversation(
+        userId: string,
+        workspaceId: string,
+        conversationId: string,
+        title: string,
+    ): Promise<any> {
         return new Promise((resolve, reject) => {
             this.client.UpdateConversation(
-                { user_id: userId, workspace_id: workspaceId, conversation_id: conversationId, title },
+                {
+                    user_id: userId,
+                    workspace_id: workspaceId,
+                    conversation_id: conversationId,
+                    title,
+                },
                 (err: any, response: any) => {
                     if (err) reject(new Error(err.details || err.message));
                     else resolve(response);
-                }
+                },
             );
         });
     }
 
-    async generateTitle(userId: string, workspaceId: string, conversationId: string): Promise<string> {
+    async generateTitle(
+        userId: string,
+        workspaceId: string,
+        conversationId: string,
+    ): Promise<string> {
         return new Promise((resolve, reject) => {
             this.client.GenerateTitle(
                 { user_id: userId, workspace_id: workspaceId, conversation_id: conversationId },
                 (err: any, response: any) => {
                     if (err) reject(new Error(err.details || err.message));
                     else resolve(response.title);
-                }
+                },
             );
         });
     }
 
     async createWorkspace(userId: string, name: string): Promise<any> {
         return new Promise((resolve, reject) => {
-            this.client.CreateWorkspace(
-                { user_id: userId, name },
-                (err: any, response: any) => {
-                    if (err) reject(new Error(err.details || err.message));
-                    else resolve(response);
-                }
-            );
+            this.client.CreateWorkspace({ user_id: userId, name }, (err: any, response: any) => {
+                if (err) reject(new Error(err.details || err.message));
+                else resolve(response);
+            });
         });
     }
 
@@ -216,7 +297,7 @@ export class BrainClient {
                 (err: any, response: any) => {
                     if (err) reject(new Error(err.details || err.message));
                     else resolve(response?.conversations || []);
-                }
+                },
             );
         });
     }
@@ -228,7 +309,7 @@ export class BrainClient {
                 (err: any, response: any) => {
                     if (err) reject(new Error(err.details || err.message));
                     else resolve(response);
-                }
+                },
             );
         });
     }
@@ -240,7 +321,7 @@ export class BrainClient {
                 (err: any, response: any) => {
                     if (err) reject(new Error(err.details || err.message));
                     else resolve(response?.messages || []);
-                }
+                },
             );
         });
     }
@@ -252,7 +333,7 @@ export class BrainClient {
                 (err: any, response: any) => {
                     if (err) reject(new Error(err.details || err.message));
                     else resolve(response || { success: true });
-                }
+                },
             );
         });
     }
@@ -264,24 +345,24 @@ export class BrainClient {
                 (err: any, response: any) => {
                     if (err) reject(new Error(err.details || err.message));
                     else resolve(response || { messages: [], conversations: [] });
-                }
+                },
             );
         });
     }
 
-    async updateWorkspace(workspaceId: string, data: { name?: string; description?: string; settings?: any }): Promise<any> {
+    async updateWorkspace(
+        workspaceId: string,
+        data: { name?: string; description?: string; settings?: any },
+    ): Promise<any> {
         return this.call('UpdateWorkspace', { workspace_id: workspaceId, ...data });
     }
 
     async deleteWorkspace(workspaceId: string): Promise<void> {
         return new Promise((resolve, reject) => {
-            this.client.DeleteWorkspace(
-                { workspace_id: workspaceId },
-                (err: any) => {
-                    if (err) reject(new Error(err.details || err.message));
-                    else resolve();
-                }
-            );
+            this.client.DeleteWorkspace({ workspace_id: workspaceId }, (err: any) => {
+                if (err) reject(new Error(err.details || err.message));
+                else resolve();
+            });
         });
     }
 
@@ -292,7 +373,7 @@ export class BrainClient {
                 (err: any, response: any) => {
                     if (err) reject(new Error(err.details || err.message));
                     else resolve(response);
-                }
+                },
             );
         });
     }
@@ -324,84 +405,25 @@ export class BrainClient {
             conversation_id: request.conversationId || '',
             guardrails: request.guardrails
                 ? {
-                    max_iterations: request.guardrails.maxIterations || 0,
-                    max_tool_calls: request.guardrails.maxToolCalls || 0,
-                    max_tokens: request.guardrails.maxTokens || 0,
-                    max_wall_time_seconds: request.guardrails.maxWallTimeSeconds || 0,
-                    auto_approve_risk: request.guardrails.autoApproveRisk || '',
-                    blocked_patterns: request.guardrails.blockedPatterns || [],
-                    require_approval_tools: request.guardrails.requireApprovalTools || [],
-                }
+                      max_iterations: request.guardrails.maxIterations || 0,
+                      max_tool_calls: request.guardrails.maxToolCalls || 0,
+                      max_tokens: request.guardrails.maxTokens || 0,
+                      max_wall_time_seconds: request.guardrails.maxWallTimeSeconds || 0,
+                      auto_approve_risk: request.guardrails.autoApproveRisk || '',
+                      blocked_patterns: request.guardrails.blockedPatterns || [],
+                      require_approval_tools: request.guardrails.requireApprovalTools || [],
+                  }
                 : undefined,
         });
+        return streamToAsyncIterable(stream);
+    }
 
-        const queue: any[] = [];
-        const waiters: Array<{
-            resolve: (value: IteratorResult<any>) => void;
-            reject: (reason?: any) => void;
-        }> = [];
-        let ended = false;
-        let streamError: any = null;
-
-        const settleWaiters = () => {
-            while (waiters.length > 0) {
-                const waiter = waiters.shift();
-                if (!waiter) continue;
-
-                if (queue.length > 0) {
-                    waiter.resolve({ value: queue.shift(), done: false });
-                    continue;
-                }
-
-                if (streamError) {
-                    waiter.reject(streamError);
-                    continue;
-                }
-
-                if (ended) {
-                    waiter.resolve({ value: undefined, done: true });
-                }
-            }
-        };
-
-        stream.on('data', (data: any) => {
-            queue.push(data);
-            settleWaiters();
+    streamTaskEvents(taskId: string, userId: string): AsyncIterable<any> {
+        const stream = this.client.StreamTaskEvents({
+            task_id: taskId,
+            user_id: userId,
         });
-
-        stream.on('end', () => {
-            ended = true;
-            settleWaiters();
-        });
-
-        stream.on('error', (err: any) => {
-            streamError = err;
-            settleWaiters();
-        });
-
-        return {
-            [Symbol.asyncIterator]() {
-                return {
-                    next(): Promise<IteratorResult<any>> {
-                        if (queue.length > 0) {
-                            return Promise.resolve({ value: queue.shift(), done: false });
-                        }
-
-                        if (streamError) {
-                            return Promise.reject(streamError);
-                        }
-
-                        if (ended) {
-                            return Promise.resolve({ value: undefined, done: true });
-                        }
-
-                        return new Promise((resolve, reject) => {
-                            waiters.push({ resolve, reject });
-                        });
-                    },
-                };
-            },
-        };
+        return streamToAsyncIterable(stream);
     }
 
     /**
@@ -414,7 +436,7 @@ export class BrainClient {
                 (err: any, response: any) => {
                     if (err) reject(new Error(err.details || err.message));
                     else resolve(response);
-                }
+                },
             );
         });
     }
@@ -430,12 +452,16 @@ export class BrainClient {
                 { user_id: userId, workspace_id: workspaceId || '' },
                 (err: any, response: any) => {
                     if (err) {
-                        logger.warn('ListPendingApprovals failed', { error: err.message, userId, workspaceId });
+                        logger.warn('ListPendingApprovals failed', {
+                            error: err.message,
+                            userId,
+                            workspaceId,
+                        });
                         resolve([]);
                     } else {
                         resolve(response?.approvals || []);
                     }
-                }
+                },
             );
         });
     }
@@ -450,7 +476,7 @@ export class BrainClient {
                 (err: any, response: any) => {
                     if (err) reject(new Error(err.details || err.message));
                     else resolve(response);
-                }
+                },
             );
         });
     }
@@ -458,19 +484,68 @@ export class BrainClient {
     /**
      * List agent tasks for a user.
      */
-    async listTasks(
-        userId: string,
-        workspaceId?: string,
-        status?: string,
-    ): Promise<any> {
+    async listTasks(userId: string, workspaceId?: string, status?: string): Promise<any> {
         return new Promise((resolve, reject) => {
             this.client.ListTasks(
                 { user_id: userId, workspace_id: workspaceId || '', status: status || '' },
                 (err: any, response: any) => {
                     if (err) reject(new Error(err.details || err.message));
                     else resolve(response);
-                }
+                },
             );
+        });
+    }
+
+    async getTaskDetail(workspaceId: string, userId: string, taskId: string): Promise<any> {
+        return this.call('GetTaskDetail', {
+            workspace_id: workspaceId,
+            user_id: userId,
+            task_id: taskId,
+        });
+    }
+
+    async listTaskTimeline(workspaceId: string, userId: string, taskId: string): Promise<any> {
+        return this.call('ListTaskTimeline', {
+            workspace_id: workspaceId,
+            user_id: userId,
+            task_id: taskId,
+        });
+    }
+
+    async listTaskCheckpoints(workspaceId: string, userId: string, taskId: string): Promise<any> {
+        return this.call('ListTaskCheckpoints', {
+            workspace_id: workspaceId,
+            user_id: userId,
+            task_id: taskId,
+        });
+    }
+
+    async listTaskArtifacts(workspaceId: string, userId: string, taskId = ''): Promise<any> {
+        return this.call('ListTaskArtifacts', {
+            workspace_id: workspaceId,
+            user_id: userId,
+            task_id: taskId,
+        });
+    }
+
+    async getApprovalAudit(
+        workspaceId: string,
+        userId: string,
+        options: { taskId?: string; status?: string } = {},
+    ): Promise<any> {
+        return this.call('GetApprovalAudit', {
+            workspace_id: workspaceId,
+            user_id: userId,
+            task_id: options.taskId || '',
+            status: options.status || '',
+        });
+    }
+
+    async listOperatorTasks(workspaceId: string, userId: string, status?: string): Promise<any> {
+        return this.call('ListOperatorTasks', {
+            workspace_id: workspaceId,
+            user_id: userId,
+            status: status || '',
         });
     }
 
@@ -491,7 +566,7 @@ export class BrainClient {
                     } else {
                         resolve(response.models || []);
                     }
-                }
+                },
             );
         });
     }
@@ -534,11 +609,11 @@ export class BrainClient {
         return this.call('GetWorkflow', { workflow_id: workflowId });
     }
 
-    async * launchWorkflow(data: any): AsyncIterable<any> {
+    async *launchWorkflow(data: any): AsyncIterable<any> {
         // Workflows are streamed, so we need a stream method
         if (!this.connected) throw new Error('Brain service not connected');
 
-        // If method doesn't exist, we can't really stream. 
+        // If method doesn't exist, we can't really stream.
         // We'll throw or return empty stream.
         if (typeof this.client?.LaunchWorkflow !== 'function') {
             logger.warn('Brain RPC method LaunchWorkflow not available');
@@ -553,6 +628,22 @@ export class BrainClient {
 
     async getCapabilities(workspaceId: string): Promise<any> {
         return this.call('GetCapabilities', { workspace_id: workspaceId });
+    }
+
+    async getMemoryGraph(workspaceId: string, userId: string): Promise<any> {
+        return this.call('GetMemoryGraph', { workspace_id: workspaceId, user_id: userId });
+    }
+
+    async getRuntimeProfile(
+        workspaceId: string,
+        userId: string,
+        includeSensitive = false,
+    ): Promise<any> {
+        return this.call('GetRuntimeProfile', {
+            workspace_id: workspaceId,
+            user_id: userId,
+            include_sensitive: includeSensitive,
+        });
     }
 
     async parseCronJob(workspaceId: string, prompt: string): Promise<any> {

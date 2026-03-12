@@ -282,12 +282,12 @@ export function useChat(
                         toolActivity: isAgentActivity
                             ? (prev?.toolActivity ?? null)
                             : {
-                                status: data.status || 'thinking',
-                                toolName: data.toolName,
-                                toolArgs: data.toolArgs,
-                                toolResult: data.toolResult,
-                                thinking: data.thinking,
-                            },
+                                  status: data.status || 'thinking',
+                                  toolName: data.toolName,
+                                  toolArgs: data.toolArgs,
+                                  toolResult: data.toolResult,
+                                  thinking: data.thinking,
+                              },
                         agentActivities: [...activitiesRef.current],
                         delegationEvents: [...delegationEventsRef.current],
                         routingInfo: prev?.routingInfo ?? routingInfoRef.current,
@@ -481,8 +481,9 @@ export function useChat(
                 return;
             }
 
+            const clientMessageId = generateId();
             const userMessage: Message = {
-                id: generateId(),
+                id: clientMessageId,
                 role: 'user',
                 content,
                 createdAt: new Date().toISOString(),
@@ -498,6 +499,8 @@ export function useChat(
             wsRef.current.send(
                 JSON.stringify({
                     type: 'chat',
+                    clientMessageId,
+                    correlationId: clientMessageId,
                     workspaceId,
                     conversationId,
                     content,
@@ -521,5 +524,12 @@ export function useChat(
         [pendingApproval],
     );
 
-    return { messages, streamingMessage, sendMessage, isConnected, pendingApproval, handleApproval };
+    return {
+        messages,
+        streamingMessage,
+        sendMessage,
+        isConnected,
+        pendingApproval,
+        handleApproval,
+    };
 }

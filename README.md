@@ -28,12 +28,12 @@ Because typical chatbots are boring. Kestrel has agency.
 - � **Multi-Phase Cognitive Loop:** It doesn't just guess an answer. It accesses persistent memory, generates a multi-step plan, uses sandboxed tools, and reflects on whether it messed up.
 - 🏛️ **The Council:** Got a highly complex prompt? Kestrel convenes a literal _Multi-Agent Debate_. The Architect, the Security Expert, the Implementer, and the Devil's Advocate will argue in real-time until they reach a consensus.
 - �️ **See Everything:** The _KestrelProcessBar_ in the UI streams the agent's internal monologue, memory recalls, and council votes. Zero black boxes.
-- 📦 **Sandboxed Toolkit:** 30+ built-in skills (web scraping, shell execution, GitHub manipulating, smart-home toggling) that run securely in isolated Docker containers via the `Hands` service.
-- 📱 **Omnipresent:** Chat via the gorgeous Web UI, native macOS app, Telegram, Discord, or WhatsApp. It's the exact same persistent brain everywhere.
+- 📦 **Sandboxed Toolkit:** A large built-in toolset (web, code, Git, browser, memory, automation) that can route risky work through the `Hands` sandbox.
+- 📱 **Multi-channel, with uneven maturity:** Web is the strongest live surface today. Telegram, Discord, and WhatsApp are real but still being normalized. Mobile currently exposes push and sync helpers, not a complete channel surface.
 
 ---
 
-## 🏗️ Architecture (We actually refactored this recently!)
+## 🏗️ Architecture
 
 Kestrel is built like a tank, split into clean, modular microservices (because monolithic "God objects" give us nightmares).
 
@@ -59,10 +59,22 @@ graph TD
 
 ### The Core Microservices:
 
-1. **The Brain (Python / gRPC):** The absolute core. Orchestrates the Plan → Execute → Reflect loop, coordinates the Council, accesses persistent Vector Memory (Chroma / pgvector), and manages 30+ tools. Recently heavily modularized into clean `core`, `memory`, and `services` namespaces!
-2. **The Hands (Python / gRPC):** The executing muscles. Spawns secure, transient Docker containers to run risky code, fetch URLs, and manipulate files without nuking your host machine.
-3. **The Gateway (Node.js / TS):** The fast, lightweight router that handles JWT auth, WebSockets, rate limiting, and normalizes inputs from Telegram, Discord, and Web clients.
-4. **The Frontend (React / Vite):** A beautiful, glassmorphism-heavy UI with real-time streaming updates of what the Brain is currently plotting.
+1. **The Brain (Python / gRPC):** Orchestrates planning, memory, approvals, task execution, provider routing, and background automation.
+2. **The Hands (Python / gRPC):** Runs risky actions inside Docker sandboxes and returns execution audit data.
+3. **The Gateway (Node.js / TS):** Handles auth, rate limits, WebSockets, webhook ingress, and channel normalization.
+4. **The Frontend (React / Vite):** Primary human-facing web UI for chat, tasks, settings, and workspace management.
+
+## 📋 Capability Status
+
+- Current source-of-truth docs:
+  [`docs/platform-capabilities.md`](docs/platform-capabilities.md),
+  [`docs/service-ownership.md`](docs/service-ownership.md),
+  [`docs/channel-support-matrix.md`](docs/channel-support-matrix.md),
+  [`docs/runtime-flags.md`](docs/runtime-flags.md),
+  [`docs/gateway-ingress-contract.md`](docs/gateway-ingress-contract.md)
+- Strongest paths today: web chat, auth, workspaces, provider settings, and task start/list/approve/cancel.
+- Real but still hardening: Hands sandbox execution, Telegram, Discord, WhatsApp, desktop native or hybrid startup.
+- Experimental or partial: mobile push and sync helpers, operator dashboards, runtime profile inspection, and full per-channel maturity parity.
 
 ---
 
@@ -153,7 +165,7 @@ See the full migration guide and OS compatibility matrix in `docs/desktop-first-
 
 ## 🛡️ Security Note
 
-Kestrel is _powerful_. It can run code and access your filesystem. We use Row-Level Security in Postgres, Docker sandboxing, and strict JWT auth to keep you safe, but **please do not expose the Gateway port (8741) to the public internet** without putting it behind a reverse proxy (like Nginx or Caddy) with proper TLS enabled.
+Kestrel is _powerful_. It can run code and access your filesystem. The repo includes Row-Level Security migrations for workspace tables, Docker sandboxing for Hands, and JWT-based Gateway auth, but **please do not expose the Gateway port (8741) to the public internet** without a reverse proxy and TLS.
 
 ---
 

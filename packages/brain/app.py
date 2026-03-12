@@ -31,6 +31,7 @@ from services.agent_service import AgentServicerMixin
 from services.auth_service import AuthServicerMixin
 from services.chat_service import ChatServicerMixin
 from services.conversation_service import ConversationServicerMixin
+from services.operator_service import OperatorServicerMixin
 from services.provider_service import ProviderServicerMixin
 from services.system_service import SystemServicerMixin
 from services.workflow_service import WorkflowServicerMixin
@@ -46,6 +47,7 @@ class BrainServicer(
     ChatServicerMixin,
     ConversationServicerMixin,
     AgentServicerMixin,
+    OperatorServicerMixin,
     WorkflowServicerMixin,
     SystemServicerMixin,
     ProviderServicerMixin,

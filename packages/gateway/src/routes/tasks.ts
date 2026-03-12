@@ -9,6 +9,20 @@ interface TaskDeps {
     brainClient: BrainClient;
 }
 
+function parseStructuredEventJson(raw: unknown): Record<string, unknown> {
+    if (typeof raw !== 'string' || !raw.trim()) {
+        return {};
+    }
+    try {
+        const parsed = JSON.parse(raw) as unknown;
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? (parsed as Record<string, unknown>)
+            : {};
+    } catch {
+        return {};
+    }
+}
+
 /**
  * Agent task management routes.
  *
@@ -23,134 +37,205 @@ export default async function taskRoutes(app: FastifyInstance, deps: TaskDeps) {
     const typedApp = app.withTypeProvider<ZodTypeProvider>();
 
     const workspaceParamsSchema = z.object({
-        workspaceId: z.string()
+        workspaceId: z.string(),
     });
     type WorkspaceParams = z.infer<typeof workspaceParamsSchema>;
 
     const startTaskBodySchema = z.object({
         goal: z.string().min(3, 'Goal must be at least 3 characters'),
         conversationId: z.string().optional(),
-        guardrails: z.record(z.string(), z.any()).optional()
+        guardrails: z.record(z.string(), z.any()).optional(),
     });
     type StartTaskBody = z.infer<typeof startTaskBodySchema>;
 
     // ── POST /api/workspaces/:workspaceId/tasks ─────────────────
     // Start a new autonomous agent task and stream events via SSE.
-    typedApp.post('/api/workspaces/:workspaceId/tasks', {
-        preHandler: [requireAuth, requireWorkspace],
-        schema: { params: workspaceParamsSchema, body: startTaskBodySchema }
-    }, async (req, reply) => {
-        const user = req.user!;
-        const { workspaceId } = req.params as WorkspaceParams;
-        const { goal, conversationId, guardrails } = req.body as StartTaskBody;
+    typedApp.post(
+        '/api/workspaces/:workspaceId/tasks',
+        {
+            preHandler: [requireAuth, requireWorkspace],
+            schema: { params: workspaceParamsSchema, body: startTaskBodySchema },
+        },
+        async (req, reply) => {
+            const user = req.user!;
+            const { workspaceId } = req.params as WorkspaceParams;
+            const { goal, conversationId, guardrails } = req.body as StartTaskBody;
 
-
-        // Set up SSE headers
-        reply.raw.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'X-Accel-Buffering': 'no',
-        });
-
-        try {
-            const stream = brainClient.startTask({
-                userId: user.id,
-                workspaceId,
-                goal: goal.trim(),
-                conversationId,
-                guardrails,
+            // Set up SSE headers
+            reply.raw.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                Connection: 'keep-alive',
+                'X-Accel-Buffering': 'no',
             });
 
-            for await (const event of stream) {
-                const sseData = JSON.stringify({
-                    type: event.type,
-                    taskId: event.task_id,
-                    stepId: event.step_id,
-                    content: event.content,
-                    toolName: event.tool_name,
-                    toolArgs: event.tool_args,
-                    toolResult: event.tool_result,
-                    approvalId: event.approval_id,
-                    progress: event.progress,
+            try {
+                const stream = brainClient.startTask({
+                    userId: user.id,
+                    workspaceId,
+                    goal: goal.trim(),
+                    conversationId,
+                    guardrails,
                 });
 
-                reply.raw.write(`event: task\ndata: ${sseData}\n\n`);
-            }
+                for await (const event of stream) {
+                    const sseData = JSON.stringify({
+                        type: event.type,
+                        taskId: event.task_id,
+                        stepId: event.step_id,
+                        content: event.content,
+                        toolName: event.tool_name,
+                        toolArgs: event.tool_args,
+                        toolResult: event.tool_result,
+                        approvalId: event.approval_id,
+                        progress: event.progress,
+                        metadata: parseStructuredEventJson(event.event_metadata_json),
+                        metrics: parseStructuredEventJson(event.metrics_json),
+                    });
 
-            reply.raw.write('event: done\ndata: {}\n\n');
-        } catch (err: any) {
-            logger.error('Task stream failed', { error: err.message });
-            reply.raw.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
-        } finally {
-            reply.raw.end();
-        }
-    });
+                    reply.raw.write(`event: task\ndata: ${sseData}\n\n`);
+                }
+
+                reply.raw.write('event: done\ndata: {}\n\n');
+            } catch (err: any) {
+                logger.error('Task stream failed', { error: err.message });
+                reply.raw.write(
+                    `event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`,
+                );
+            } finally {
+                reply.raw.end();
+            }
+        },
+    );
 
     const listTasksQuerySchema = z.object({
-        status: z.string().optional()
+        status: z.string().optional(),
     });
     type ListTasksQuery = z.infer<typeof listTasksQuerySchema>;
 
-    // ── GET /api/workspaces/:workspaceId/tasks ──────────────────
-    // List agent tasks for the current user in a workspace.
-    typedApp.get('/api/workspaces/:workspaceId/tasks', {
-        preHandler: [requireAuth, requireWorkspace],
-        schema: { params: workspaceParamsSchema, querystring: listTasksQuerySchema }
-    }, async (req) => {
-        const user = req.user!;
-        const { workspaceId } = req.params as WorkspaceParams;
-        const { status } = req.query as ListTasksQuery;
-
-        const result = await brainClient.listTasks(user.id, workspaceId, status);
-        return { tasks: result.tasks || [] };
-    });
-
     const taskParamsSchema = z.object({
-        taskId: z.string()
+        taskId: z.string(),
     });
     type TaskParams = z.infer<typeof taskParamsSchema>;
 
+    // ── GET /api/workspaces/:workspaceId/tasks ──────────────────
+    // List agent tasks for the current user in a workspace.
+    typedApp.get(
+        '/api/workspaces/:workspaceId/tasks',
+        {
+            preHandler: [requireAuth, requireWorkspace],
+            schema: { params: workspaceParamsSchema, querystring: listTasksQuerySchema },
+        },
+        async (req) => {
+            const user = req.user!;
+            const { workspaceId } = req.params as WorkspaceParams;
+            const { status } = req.query as ListTasksQuery;
+
+            const result = await brainClient.listTasks(user.id, workspaceId, status);
+            return { tasks: result.tasks || [] };
+        },
+    );
+
+    // ── GET /api/workspaces/:workspaceId/tasks/:taskId/events ──────
+    // Reconnect to a running task event feed for live operator updates.
+    typedApp.get(
+        '/api/workspaces/:workspaceId/tasks/:taskId/events',
+        {
+            preHandler: [requireAuth, requireWorkspace],
+            schema: { params: workspaceParamsSchema.extend(taskParamsSchema.shape) },
+        },
+        async (req, reply) => {
+            const user = req.user!;
+            const { taskId } = req.params as WorkspaceParams & TaskParams;
+
+            reply.raw.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                Connection: 'keep-alive',
+                'X-Accel-Buffering': 'no',
+            });
+
+            try {
+                const stream = brainClient.streamTaskEvents(taskId, user.id);
+
+                for await (const event of stream) {
+                    const sseData = JSON.stringify({
+                        type: event.type,
+                        taskId: event.task_id,
+                        stepId: event.step_id,
+                        content: event.content,
+                        toolName: event.tool_name,
+                        toolArgs: event.tool_args,
+                        toolResult: event.tool_result,
+                        approvalId: event.approval_id,
+                        progress: event.progress,
+                        metadata: parseStructuredEventJson(event.event_metadata_json),
+                        metrics: parseStructuredEventJson(event.metrics_json),
+                    });
+
+                    reply.raw.write(`event: task\ndata: ${sseData}\n\n`);
+                }
+
+                reply.raw.write('event: done\ndata: {}\n\n');
+            } catch (err: any) {
+                logger.error('Task event reconnect failed', { error: err.message, taskId });
+                reply.raw.write(
+                    `event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`,
+                );
+            } finally {
+                reply.raw.end();
+            }
+        },
+    );
+
     const approveActionBodySchema = z.object({
         approvalId: z.string(),
-        approved: z.boolean()
+        approved: z.boolean(),
     });
     type ApproveActionBody = z.infer<typeof approveActionBodySchema>;
 
     // ── POST /api/tasks/:taskId/approve ─────────────────────────
     // Approve or deny a pending agent action.
-    typedApp.post('/api/tasks/:taskId/approve', {
-        preHandler: [requireAuth],
-        schema: { params: taskParamsSchema, body: approveActionBodySchema }
-    }, async (req, reply) => {
-        const user = req.user!;
-        const { taskId } = req.params as TaskParams;
-        const { approvalId, approved } = req.body as ApproveActionBody;
+    typedApp.post(
+        '/api/tasks/:taskId/approve',
+        {
+            preHandler: [requireAuth],
+            schema: { params: taskParamsSchema, body: approveActionBodySchema },
+        },
+        async (req, reply) => {
+            const user = req.user!;
+            const { taskId } = req.params as TaskParams;
+            const { approvalId, approved } = req.body as ApproveActionBody;
 
-        try {
-            const result = await brainClient.approveAction(approvalId, user.id, approved);
-            return result;
-        } catch (err: any) {
-            logger.error('Approve action failed', { error: err.message, taskId });
-            return reply.status(500).send({ error: err.message });
-        }
-    });
+            try {
+                const result = await brainClient.approveAction(approvalId, user.id, approved);
+                return result;
+            } catch (err: any) {
+                logger.error('Approve action failed', { error: err.message, taskId });
+                return reply.status(500).send({ error: err.message });
+            }
+        },
+    );
 
     // ── POST /api/tasks/:taskId/cancel ──────────────────────────
     // Cancel a running agent task.
-    typedApp.post('/api/tasks/:taskId/cancel', {
-        preHandler: [requireAuth],
-        schema: { params: taskParamsSchema }
-    }, async (req, reply) => {
-        const user = req.user!;
-        const { taskId } = req.params as TaskParams;
+    typedApp.post(
+        '/api/tasks/:taskId/cancel',
+        {
+            preHandler: [requireAuth],
+            schema: { params: taskParamsSchema },
+        },
+        async (req, reply) => {
+            const user = req.user!;
+            const { taskId } = req.params as TaskParams;
 
-        try {
-            const result = await brainClient.cancelTask(taskId, user.id);
-            return result;
-        } catch (err: any) {
-            logger.error('Cancel task failed', { error: err.message, taskId });
-            return reply.status(500).send({ error: err.message });
-        }
-    });
+            try {
+                const result = await brainClient.cancelTask(taskId, user.id);
+                return result;
+            } catch (err: any) {
+                logger.error('Cancel task failed', { error: err.message, taskId });
+                return reply.status(500).send({ error: err.message });
+            }
+        },
+    );
 }

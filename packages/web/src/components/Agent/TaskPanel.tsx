@@ -77,9 +77,7 @@ export function TaskPanel({ workspaceId, conversationId }: TaskPanelProps) {
         }
     };
 
-    const planEvent = events.find(
-        (e) => e.type === 'PLAN_CREATED' || e.type === '0',
-    );
+    const planEvent = events.find((e) => e.type === 'PLAN_CREATED' || e.type === '0');
 
     return (
         <div className="task-panel">
@@ -89,10 +87,7 @@ export function TaskPanel({ workspaceId, conversationId }: TaskPanelProps) {
                     <span className="task-panel__icon">🤖</span>
                     <span>Agent</span>
                 </div>
-                <div
-                    className="task-panel__status"
-                    style={{ color: STATUS_COLORS[status] }}
-                >
+                <div className="task-panel__status" style={{ color: STATUS_COLORS[status] }}>
                     <span className={`task-panel__dot ${status}`} />
                     {STATUS_LABELS[status]}
                 </div>
@@ -108,10 +103,11 @@ export function TaskPanel({ workspaceId, conversationId }: TaskPanelProps) {
                         <div
                             className="task-panel__progress-fill"
                             style={{
-                                width: `${((parseInt(progress.current_step) || 0) /
+                                width: `${
+                                    ((parseInt(progress.current_step) || 0) /
                                         (parseInt(progress.total_steps) || 1)) *
                                     100
-                                    }%`,
+                                }%`,
                             }}
                         />
                     </div>
@@ -128,16 +124,11 @@ export function TaskPanel({ workspaceId, conversationId }: TaskPanelProps) {
 
             {/* ── Plan Toggle ─────────────────────────────── */}
             {planEvent && (
-                <button
-                    className="task-panel__plan-toggle"
-                    onClick={() => setShowPlan(!showPlan)}
-                >
+                <button className="task-panel__plan-toggle" onClick={() => setShowPlan(!showPlan)}>
                     📋 {showPlan ? 'Hide Plan' : 'View Plan'}
                 </button>
             )}
-            {showPlan && planEvent && (
-                <PlanView planJson={planEvent.content} progress={progress} />
-            )}
+            {showPlan && planEvent && <PlanView planJson={planEvent.content} progress={progress} />}
 
             {/* ── Event Stream ────────────────────────────── */}
             <div className="task-panel__events">
@@ -197,6 +188,45 @@ export function TaskPanel({ workspaceId, conversationId }: TaskPanelProps) {
     );
 }
 
+function getExecutionMetadata(event: TaskEvent): Record<string, unknown> | null {
+    const raw = event.metadata?.execution;
+    return raw && typeof raw === 'object' && !Array.isArray(raw)
+        ? (raw as Record<string, unknown>)
+        : null;
+}
+
+function formatExecutionSummary(event: TaskEvent): string {
+    const execution = getExecutionMetadata(event);
+    if (!execution) {
+        return event.metadata?.cached === true ? 'cached result' : '';
+    }
+
+    const runtimeClass =
+        typeof execution.runtime_class === 'string'
+            ? execution.runtime_class.replace(/_/g, ' ')
+            : '';
+    const riskClass =
+        typeof execution.risk_class === 'string' ? execution.risk_class.replace(/_/g, ' ') : '';
+    const fallbackUsed = execution.fallback_used === true || execution.fallback_used === 'true';
+    const fallbackFrom =
+        typeof execution.fallback_from === 'string'
+            ? execution.fallback_from.replace(/_/g, ' ')
+            : '';
+    const fallbackTo =
+        typeof execution.fallback_to === 'string' ? execution.fallback_to.replace(/_/g, ' ') : '';
+
+    const parts: string[] = [];
+    if (runtimeClass) parts.push(`runtime: ${runtimeClass}`);
+    if (riskClass) parts.push(`risk: ${riskClass}`);
+    if (fallbackUsed && (fallbackFrom || fallbackTo)) {
+        parts.push(`fallback: ${fallbackFrom || 'unknown'} -> ${fallbackTo || 'unknown'}`);
+    }
+    if (event.metadata?.cached === true) {
+        parts.push('cached');
+    }
+    return parts.join(' | ');
+}
+
 /** Single event row in the stream. */
 function EventRow({ event }: { event: TaskEvent }) {
     const icon = EVENT_ICONS[event.type] || '•';
@@ -216,10 +246,16 @@ function EventRow({ event }: { event: TaskEvent }) {
             }
         }
         if (event.toolResult) {
-            detail = event.toolResult.length > 200
-                ? event.toolResult.slice(0, 200) + '…'
-                : event.toolResult;
+            detail =
+                event.toolResult.length > 200
+                    ? event.toolResult.slice(0, 200) + '…'
+                    : event.toolResult;
         }
+    }
+
+    const executionSummary = formatExecutionSummary(event);
+    if (executionSummary) {
+        detail = detail ? `${detail} | ${executionSummary}` : executionSummary;
     }
 
     return (

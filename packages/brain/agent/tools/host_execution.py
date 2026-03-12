@@ -12,17 +12,30 @@ import sys
 import tempfile
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 from agent.security.native_policy import (
     NativeExecutionRequest,
     DEFAULT_NATIVE_POLICY_EVALUATOR,
     make_default_approval_provider,
 )
+from agent.runtime.execution_trace import attach_execution_trace, write_execution_audit_entry
 from agent.types import RiskLevel, ToolDefinition
 
 logger = logging.getLogger("brain.agent.tools.host_execution")
 
 _POLICY_EVALUATOR = DEFAULT_NATIVE_POLICY_EVALUATOR
+
+_SHARED_PATH = Path(__file__).resolve().parents[2] / "shared"
+if str(_SHARED_PATH) not in sys.path:
+    sys.path.append(str(_SHARED_PATH))
+
+from action_event_schema import (
+    build_execution_action_event,
+    classify_risk_class,
+    classify_runtime_class,
+    stable_hash,
+)
 
 
 def _audit_log(
@@ -38,47 +51,82 @@ def _audit_log(
     approval_provider: str,
     approval_reason: str,
     started_at: datetime,
+    runtime_class: str,
+    risk_class: str,
     error: str = "",
     exit_code: int | None = None,
 ):
     """Write native execution audit entries using hands-compatible schema concepts."""
-    audit_dir = os.path.expanduser("~/.kestrel/audit")
-    os.makedirs(audit_dir, exist_ok=True)
-    log_file = os.path.join(audit_dir, f"audit-{datetime.utcnow().strftime('%Y-%m-%d')}.jsonl")
-
     elapsed_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
-
-    entry = {
-        "exec_id": exec_id,
-        "user_id": user_id,
-        "workspace_id": workspace_id,
-        "skill_name": tool_name,
-        "function_name": function_name,
-        "arguments_hash": hash(arguments),
-        "started_at": started_at.isoformat(),
-        "completed_at": datetime.utcnow().isoformat(),
-        "status": status,
-        "execution_time_ms": elapsed_ms,
-        "native_policy": {
+    command_hash = stable_hash(arguments)
+    start_event = build_execution_action_event(
+        source="brain.tools.host_execution",
+        action_type=f"{tool_name}.{function_name}",
+        status="running",
+        runtime_class=runtime_class,
+        risk_class=risk_class,
+        before_state={"command_hash": command_hash, "policy_decision": "admitted"},
+        after_state={"command_hash": command_hash, "policy_decision": "running"},
+        metadata={
+            "exec_id": exec_id,
             "policy_reason": policy_reason,
             "approval_provider": approval_provider,
             "approval_reason": approval_reason,
         },
-    }
-    if error:
-        entry["error"] = error
-    if exit_code is not None:
-        entry["exit_code"] = exit_code
+    )
+    final_event = build_execution_action_event(
+        source="brain.tools.host_execution",
+        action_type=f"{tool_name}.{function_name}",
+        status=status,
+        runtime_class=runtime_class,
+        risk_class=risk_class,
+        before_state={"command_hash": command_hash, "policy_decision": "running"},
+        after_state={"command_hash": command_hash, "policy_decision": status},
+        metadata={
+            "exec_id": exec_id,
+            "policy_reason": policy_reason,
+            "approval_provider": approval_provider,
+            "approval_reason": approval_reason,
+            "error": error,
+            "exit_code": exit_code,
+            "execution_time_ms": elapsed_ms,
+        },
+    )
 
     try:
-        with open(log_file, "a", encoding="utf-8") as file_handle:
-            file_handle.write(json.dumps(entry) + "\n")
+        write_execution_audit_entry(
+            exec_id=exec_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            tool_name=tool_name,
+            function_name=function_name,
+            arguments=arguments,
+            status=status,
+            runtime_class=runtime_class,
+            risk_class=risk_class,
+            action_events=[start_event, final_event],
+            execution_time_ms=elapsed_ms,
+            error=error,
+            exit_code=exit_code,
+            metadata={
+                "native_policy": {
+                    "policy_reason": policy_reason,
+                    "approval_provider": approval_provider,
+                    "approval_reason": approval_reason,
+                },
+            },
+        )
     except Exception as exc:  # pragma: no cover - file system issues are env-specific
         logger.error("Failed to write audit log: %s", exc)
 
+    return [start_event, final_event]
 
-async def _authorize_native_execution(tool_name: str, command: str) -> tuple[bool, str, str, str]:
-    workspace_id = os.getenv("KESTREL_WORKSPACE_ID", "default")
+
+async def _authorize_native_execution(
+    tool_name: str,
+    command: str,
+    workspace_id: str,
+) -> tuple[bool, str, str, str]:
     interactive = os.getenv("NATIVE_APPROVAL_INTERACTIVE", "false").lower() == "true"
 
     request = NativeExecutionRequest(
@@ -102,19 +150,22 @@ async def _authorize_native_execution(tool_name: str, command: str) -> tuple[boo
     return approval.approved, decision.reason, approval.provider, approval.reason
 
 
-async def execute_host_shell(command: str) -> dict:
+async def execute_host_shell(command: str, workspace_id: str = "", user_id: str = "") -> dict:
     """Execute a shell command directly on the host OS."""
     started_at = datetime.utcnow()
     exec_id = str(uuid.uuid4())
-    workspace_id = os.getenv("KESTREL_WORKSPACE_ID", "default")
-    user_id = os.getenv("KESTREL_USER_ID", "agent")
+    workspace_id = workspace_id or os.getenv("KESTREL_WORKSPACE_ID", "default")
+    user_id = user_id or os.getenv("KESTREL_USER_ID", "agent")
+    runtime_class = classify_runtime_class("native")
+    risk_class = classify_risk_class(action_type="host_shell")
 
     approved, policy_reason, approval_provider, approval_reason = await _authorize_native_execution(
         "host_shell",
         command,
+        workspace_id,
     )
     if not approved:
-        _audit_log(
+        action_events = _audit_log(
             exec_id=exec_id,
             workspace_id=workspace_id,
             user_id=user_id,
@@ -126,15 +177,22 @@ async def execute_host_shell(command: str) -> dict:
             approval_provider=approval_provider,
             approval_reason=approval_reason,
             started_at=started_at,
+            runtime_class=runtime_class,
+            risk_class=risk_class,
             error="Native shell execution denied by policy/approval",
         )
-        return {
-            "success": False,
-            "error": "Native shell execution denied by policy/approval.",
-            "output": "",
-            "policy_reason": policy_reason,
-            "approval_reason": approval_reason,
-        }
+        return attach_execution_trace(
+            {
+                "success": False,
+                "error": "Native shell execution denied by policy/approval.",
+                "output": "",
+                "policy_reason": policy_reason,
+                "approval_reason": approval_reason,
+            },
+            runtime_class=runtime_class,
+            risk_class=risk_class,
+            action_events=action_events,
+        )
 
     try:
         proc = await asyncio.create_subprocess_shell(
@@ -144,7 +202,7 @@ async def execute_host_shell(command: str) -> dict:
         )
         stdout, stderr = await proc.communicate()
         status = "success" if proc.returncode == 0 else "error"
-        _audit_log(
+        action_events = _audit_log(
             exec_id=exec_id,
             workspace_id=workspace_id,
             user_id=user_id,
@@ -156,19 +214,26 @@ async def execute_host_shell(command: str) -> dict:
             approval_provider=approval_provider,
             approval_reason=approval_reason,
             started_at=started_at,
+            runtime_class=runtime_class,
+            risk_class=risk_class,
             error=stderr.decode() if proc.returncode != 0 else "",
             exit_code=proc.returncode,
         )
-        return {
-            "success": proc.returncode == 0,
-            "output": stdout.decode(),
-            "error": stderr.decode(),
-            "exit_code": proc.returncode,
-            "policy_reason": policy_reason,
-            "approval_reason": approval_reason,
-        }
+        return attach_execution_trace(
+            {
+                "success": proc.returncode == 0,
+                "output": stdout.decode(),
+                "error": stderr.decode(),
+                "exit_code": proc.returncode,
+                "policy_reason": policy_reason,
+                "approval_reason": approval_reason,
+            },
+            runtime_class=runtime_class,
+            risk_class=risk_class,
+            action_events=action_events,
+        )
     except Exception as exc:
-        _audit_log(
+        action_events = _audit_log(
             exec_id=exec_id,
             workspace_id=workspace_id,
             user_id=user_id,
@@ -180,31 +245,41 @@ async def execute_host_shell(command: str) -> dict:
             approval_provider=approval_provider,
             approval_reason=approval_reason,
             started_at=started_at,
+            runtime_class=runtime_class,
+            risk_class=risk_class,
             error=str(exc),
         )
-        return {
-            "success": False,
-            "error": str(exc),
-            "output": "",
-            "policy_reason": policy_reason,
-            "approval_reason": approval_reason,
-        }
+        return attach_execution_trace(
+            {
+                "success": False,
+                "error": str(exc),
+                "output": "",
+                "policy_reason": policy_reason,
+                "approval_reason": approval_reason,
+            },
+            runtime_class=runtime_class,
+            risk_class=risk_class,
+            action_events=action_events,
+        )
 
 
-async def execute_host_python(code: str) -> dict:
+async def execute_host_python(code: str, workspace_id: str = "", user_id: str = "") -> dict:
     """Execute python code directly on the host OS."""
     started_at = datetime.utcnow()
     exec_id = str(uuid.uuid4())
-    workspace_id = os.getenv("KESTREL_WORKSPACE_ID", "default")
-    user_id = os.getenv("KESTREL_USER_ID", "agent")
+    workspace_id = workspace_id or os.getenv("KESTREL_WORKSPACE_ID", "default")
+    user_id = user_id or os.getenv("KESTREL_USER_ID", "agent")
+    runtime_class = classify_runtime_class("native")
+    risk_class = classify_risk_class(action_type="host_python")
 
     command_preview = f"python(script_length={len(code)})"
     approved, policy_reason, approval_provider, approval_reason = await _authorize_native_execution(
         "host_python",
         command_preview,
+        workspace_id,
     )
     if not approved:
-        _audit_log(
+        action_events = _audit_log(
             exec_id=exec_id,
             workspace_id=workspace_id,
             user_id=user_id,
@@ -216,15 +291,22 @@ async def execute_host_python(code: str) -> dict:
             approval_provider=approval_provider,
             approval_reason=approval_reason,
             started_at=started_at,
+            runtime_class=runtime_class,
+            risk_class=risk_class,
             error="Native python execution denied by policy/approval",
         )
-        return {
-            "success": False,
-            "error": "Native python execution denied by policy/approval.",
-            "output": "",
-            "policy_reason": policy_reason,
-            "approval_reason": approval_reason,
-        }
+        return attach_execution_trace(
+            {
+                "success": False,
+                "error": "Native python execution denied by policy/approval.",
+                "output": "",
+                "policy_reason": policy_reason,
+                "approval_reason": approval_reason,
+            },
+            runtime_class=runtime_class,
+            risk_class=risk_class,
+            action_events=action_events,
+        )
 
     tmp_path = None
     try:
@@ -240,7 +322,7 @@ async def execute_host_python(code: str) -> dict:
         )
         stdout, stderr = await proc.communicate()
         status = "success" if proc.returncode == 0 else "error"
-        _audit_log(
+        action_events = _audit_log(
             exec_id=exec_id,
             workspace_id=workspace_id,
             user_id=user_id,
@@ -252,19 +334,26 @@ async def execute_host_python(code: str) -> dict:
             approval_provider=approval_provider,
             approval_reason=approval_reason,
             started_at=started_at,
+            runtime_class=runtime_class,
+            risk_class=risk_class,
             error=stderr.decode() if proc.returncode != 0 else "",
             exit_code=proc.returncode,
         )
-        return {
-            "success": proc.returncode == 0,
-            "output": stdout.decode(),
-            "error": stderr.decode(),
-            "exit_code": proc.returncode,
-            "policy_reason": policy_reason,
-            "approval_reason": approval_reason,
-        }
+        return attach_execution_trace(
+            {
+                "success": proc.returncode == 0,
+                "output": stdout.decode(),
+                "error": stderr.decode(),
+                "exit_code": proc.returncode,
+                "policy_reason": policy_reason,
+                "approval_reason": approval_reason,
+            },
+            runtime_class=runtime_class,
+            risk_class=risk_class,
+            action_events=action_events,
+        )
     except Exception as exc:
-        _audit_log(
+        action_events = _audit_log(
             exec_id=exec_id,
             workspace_id=workspace_id,
             user_id=user_id,
@@ -276,15 +365,22 @@ async def execute_host_python(code: str) -> dict:
             approval_provider=approval_provider,
             approval_reason=approval_reason,
             started_at=started_at,
+            runtime_class=runtime_class,
+            risk_class=risk_class,
             error=str(exc),
         )
-        return {
-            "success": False,
-            "error": str(exc),
-            "output": "",
-            "policy_reason": policy_reason,
-            "approval_reason": approval_reason,
-        }
+        return attach_execution_trace(
+            {
+                "success": False,
+                "error": str(exc),
+                "output": "",
+                "policy_reason": policy_reason,
+                "approval_reason": approval_reason,
+            },
+            runtime_class=runtime_class,
+            risk_class=risk_class,
+            action_events=action_events,
+        )
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:

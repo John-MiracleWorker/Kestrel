@@ -1,235 +1,277 @@
-import { randomUUID } from 'crypto';
-import { IncomingMessage, Attachment } from '../base';
+import { Attachment } from '../base';
+import { createNormalizedIngressEvent, type NormalizedIngressPayloadKind } from '../ingress';
 import { TelegramAdapter } from './index';
 import { TelegramUpdate, TelegramMessage, TelegramUser } from './types';
+import { parseApprovalDecision, parseTaskRequest } from '../orchestration/intents';
 import { logger } from '../../utils/logger';
 
 // ── Webhook Handler ────────────────────────────────────────────
 
-    /**
-     * Process an incoming Telegram update (called by the webhook route).
-     */
-    export async function processUpdate(adapter: TelegramAdapter, update: TelegramUpdate): Promise<void> {
-        if (update.callback_query) {
-            await handleCallbackQuery(adapter, update.callback_query);
-            return;
-        }
+type TelegramIngressSeed = {
+    userId: string;
+    from: TelegramUser;
+    chatId: number;
+    content: string;
+    conversationId: string;
+    timestamp: Date;
+    threadId?: number;
+    channelMessageId?: string;
+    attachments?: Attachment[];
+    payloadKind?: NormalizedIngressPayloadKind;
+    metadata?: Record<string, unknown>;
+};
 
-        if (!update.message) return;
+function emitTelegramIngress(adapter: TelegramAdapter, seed: TelegramIngressSeed): void {
+    const event = createNormalizedIngressEvent({
+        channel: 'telegram',
+        userId: seed.userId,
+        workspaceId: adapter.config.defaultWorkspaceId,
+        conversationId: seed.conversationId,
+        content: seed.content,
+        attachments: seed.attachments,
+        metadata: {
+            channelUserId: String(seed.from.id),
+            channelMessageId: seed.channelMessageId,
+            timestamp: seed.timestamp,
+            telegramChatId: seed.chatId,
+            telegramThreadId: seed.threadId,
+            telegramUsername: seed.from.username,
+            ...seed.metadata,
+        },
+        externalUserId: String(seed.from.id),
+        externalConversationId: String(seed.chatId),
+        externalThreadId: seed.threadId !== undefined ? String(seed.threadId) : undefined,
+        authContext: {
+            transport: adapter.config.mode === 'webhook' ? 'telegram_webhook' : 'telegram_polling',
+            authenticatedUserId: seed.userId,
+            isProvisionalUser: false,
+        },
+        payloadKind: seed.payloadKind,
+    });
 
-        const msg = update.message;
-        const from = msg.from;
-        if (!from) return;
+    (adapter as any).emit('message', event);
+}
 
-        // Access control check
-        if (!adapter.isAllowed(from.id)) {
-            await adapter.api('sendMessage', {
-                chat_id: msg.chat.id,
-                text: '🔒 Access denied. You are not authorized to use this bot.',
-            });
-            return;
-        }
+/**
+ * Process an incoming Telegram update (called by the webhook route).
+ */
+export async function processUpdate(
+    adapter: TelegramAdapter,
+    update: TelegramUpdate,
+): Promise<void> {
+    if (update.callback_query) {
+        await handleCallbackQuery(adapter, update.callback_query);
+        return;
+    }
 
-        const text = msg.text || msg.caption || '';
+    if (!update.message) return;
 
-        // Handle Telegram-specific commands
-        if (text.startsWith('/')) {
-            await handleCommand(adapter, msg, text);
-            return;
-        }
+    const msg = update.message;
+    const from = msg.from;
+    if (!from) return;
 
-        // Handle task mode (!goal prefix)
-        if (text.startsWith('!')) {
-            const goal = text.substring(1).trim();
-            if (goal) {
-                await handleTaskRequest(adapter, msg, from, goal);
+    // Access control check
+    if (!adapter.isAllowed(from.id)) {
+        await adapter.api('sendMessage', {
+            chat_id: msg.chat.id,
+            text: '🔒 Access denied. You are not authorized to use this bot.',
+        });
+        return;
+    }
+
+    const text = msg.text || msg.caption || '';
+
+    // Handle Telegram-specific commands
+    if (text.startsWith('/')) {
+        await handleCommand(adapter, msg, text);
+        return;
+    }
+
+    // Handle task mode (!goal prefix)
+    const taskGoal = parseTaskRequest(text);
+    if (taskGoal) {
+        await handleTaskRequest(adapter, msg, from, taskGoal);
+        return;
+    }
+
+    // ── Check for pending approval text response ────────────────
+    // When a user types "I approve" / "yes" / "reject" etc. while
+    // there is a pending approval for their chat, resolve it instead
+    // of creating a brand-new agent task.
+    {
+        const pendingForChat = [...adapter.pendingApprovals.entries()].filter(
+            ([, v]) => v.chatId === msg.chat.id,
+        );
+
+        // Only intercept text-based approvals when there are actually
+        // pending approvals for this chat. Otherwise let the message
+        // flow through as a normal chat message.
+        if (pendingForChat.length > 0) {
+            const approvalDecision = parseApprovalDecision(text);
+            if (approvalDecision !== null) {
+                const resolvedUser = adapter.resolveUserId(from, msg.chat.id);
+                const threadId = msg.message_thread_id;
+                const [approvalId] = pendingForChat[pendingForChat.length - 1];
+                await handleApproval(
+                    adapter,
+                    msg.chat.id,
+                    approvalId,
+                    approvalDecision,
+                    resolvedUser,
+                    threadId,
+                );
                 return;
             }
         }
-
-        // ── Check for pending approval text response ────────────────
-        // When a user types "I approve" / "yes" / "reject" etc. while
-        // there is a pending approval for their chat, resolve it instead
-        // of creating a brand-new agent task.
-        {
-            const pendingForChat = [...adapter.pendingApprovals.entries()]
-                .filter(([, v]) => v.chatId === msg.chat.id);
-
-            // Only intercept text-based approvals when there are actually
-            // pending approvals for this chat. Otherwise let the message
-            // flow through as a normal chat message.
-            if (pendingForChat.length > 0) {
-                const APPROVE_KEYWORDS = ['approve', 'approved', 'yes', 'go ahead', 'do it', 'proceed', 'confirm', 'i approve'];
-                const DENY_KEYWORDS = ['deny', 'denied', 'reject', 'no', 'cancel', 'stop', 'abort'];
-                const textLower = text.toLowerCase().trim();
-
-                // Use word-boundary matching to avoid false positives
-                // (e.g. "yesterday" should not match "yes")
-                const matchesKeyword = (kw: string) => new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(textLower);
-                const isApproval = APPROVE_KEYWORDS.some(matchesKeyword);
-                const isDenial = DENY_KEYWORDS.some(matchesKeyword);
-
-                if (isApproval || isDenial) {
-                    const resolvedUser = adapter.resolveUserId(from, msg.chat.id);
-                    const threadId = msg.message_thread_id;
-                    const [approvalId] = pendingForChat[pendingForChat.length - 1];
-                    await handleApproval(adapter, msg.chat.id, approvalId, isApproval, resolvedUser, threadId);
-                    return;
-                }
-            }
-        }
-
-        const threadId = msg.message_thread_id;
-
-        // Start typing indicator
-        adapter.startTyping(msg.chat.id, threadId);
-
-        // Map Telegram user → Kestrel user
-        const userId = adapter.resolveUserId(from, msg.chat.id);
-
-        // Record the thread this user is currently active in
-        adapter.userThreadMap.set(userId, threadId);
-
-        // Build attachments
-        const attachments: Attachment[] = [];
-        if (msg.photo?.length) {
-            const largest = msg.photo[msg.photo.length - 1];
-            attachments.push({
-                type: 'image',
-                url: `tg://${largest.file_id}`,
-                mimeType: 'image/jpeg',
-                size: largest.file_size,
-            });
-        }
-        if (msg.document) {
-            attachments.push({
-                type: 'file',
-                url: `tg://${msg.document.file_id}`,
-                filename: msg.document.file_name,
-                mimeType: msg.document.mime_type,
-                size: msg.document.file_size,
-            });
-        }
-        if (msg.voice) {
-            attachments.push({
-                type: 'audio',
-                url: `tg://${msg.voice.file_id}`,
-                mimeType: msg.voice.mime_type,
-                size: msg.voice.file_size,
-            });
-        }
-        if (msg.audio) {
-            attachments.push({
-                type: 'audio',
-                url: `tg://${msg.audio.file_id}`,
-                filename: msg.audio.file_name,
-                mimeType: msg.audio.mime_type,
-                size: msg.audio.file_size,
-            });
-        }
-        if (msg.video) {
-            attachments.push({
-                type: 'video',
-                url: `tg://${msg.video.file_id}`,
-                mimeType: msg.video.mime_type,
-                size: msg.video.file_size,
-            });
-        }
-
-        // Emit normalized message
-        const incoming: IncomingMessage = {
-            id: randomUUID(),
-            channel: 'telegram',
-            userId,
-            workspaceId: adapter.config.defaultWorkspaceId,
-            conversationId: adapter.resolveConversationId(msg.chat.id, undefined, threadId),
-            content: text,
-            attachments: attachments.length ? attachments : undefined,
-            metadata: {
-                channelUserId: String(from.id),
-                channelMessageId: String(msg.message_id),
-                timestamp: new Date(msg.date * 1000),
-                telegramChatId: msg.chat.id,
-                telegramThreadId: threadId,
-                telegramUsername: from.username,
-            },
-        };
-
-        (adapter as any).emit('message', incoming);
     }
 
-    // ── Task Mode ─────────────────────────────────────────────────
+    const threadId = msg.message_thread_id;
 
-    /**
-     * Handle a task request (message starting with !).
-     * Sends the goal to the agent as an autonomous task and streams
-     * progress updates back to the Telegram chat.
-     */
-    export async function handleTaskRequest(adapter: TelegramAdapter, msg: TelegramMessage, from: TelegramUser, goal: string): Promise<void> {
-        const chatId = msg.chat.id;
-        const threadId = msg.message_thread_id;
-        const userId = adapter.resolveUserId(from, chatId);
+    // Start typing indicator
+    adapter.startTyping(msg.chat.id, threadId);
 
-        // Record the thread this user is currently active in
-        adapter.userThreadMap.set(userId, threadId);
+    // Map Telegram user → Kestrel user
+    const userId = adapter.resolveUserId(from, msg.chat.id);
 
-        const confirmParams: Record<string, any> = {
-            chat_id: chatId,
-            text:
-                '🦅 *Starting autonomous task...*\n\n' +
-                `📋 *Goal:* ${adapter.escapeMarkdown(goal)}\n\n` +
-                '_I\'ll work on this and send you updates._',
-            parse_mode: 'Markdown',
-        };
-        if (threadId !== undefined) confirmParams.message_thread_id = threadId;
-        await adapter.api('sendMessage', confirmParams);
+    // Record the thread this user is currently active in
+    adapter.userThreadMap.set(userId, threadId);
 
-        adapter.startTyping(chatId, threadId);
-
-        // Emit as a task-type message
-        const incoming: IncomingMessage = {
-            id: randomUUID(),
-            channel: 'telegram',
-            userId,
-            workspaceId: adapter.config.defaultWorkspaceId,
-            conversationId: adapter.resolveConversationId(msg.chat.id, `task-${Date.now()}`, threadId),
-            content: goal,
-            metadata: {
-                channelUserId: String(from.id),
-                channelMessageId: String(msg.message_id),
-                timestamp: new Date(msg.date * 1000),
-                telegramChatId: chatId,
-                telegramThreadId: threadId,
-                telegramUsername: from.username,
-                isTaskRequest: true,
-            },
-        };
-
-        (adapter as any).emit('message', incoming);
+    // Build attachments
+    const attachments: Attachment[] = [];
+    if (msg.photo?.length) {
+        const largest = msg.photo[msg.photo.length - 1];
+        attachments.push({
+            type: 'image',
+            url: `tg://${largest.file_id}`,
+            mimeType: 'image/jpeg',
+            size: largest.file_size,
+        });
+    }
+    if (msg.document) {
+        attachments.push({
+            type: 'file',
+            url: `tg://${msg.document.file_id}`,
+            filename: msg.document.file_name,
+            mimeType: msg.document.mime_type,
+            size: msg.document.file_size,
+        });
+    }
+    if (msg.voice) {
+        attachments.push({
+            type: 'audio',
+            url: `tg://${msg.voice.file_id}`,
+            mimeType: msg.voice.mime_type,
+            size: msg.voice.file_size,
+        });
+    }
+    if (msg.audio) {
+        attachments.push({
+            type: 'audio',
+            url: `tg://${msg.audio.file_id}`,
+            filename: msg.audio.file_name,
+            mimeType: msg.audio.mime_type,
+            size: msg.audio.file_size,
+        });
+    }
+    if (msg.video) {
+        attachments.push({
+            type: 'video',
+            url: `tg://${msg.video.file_id}`,
+            mimeType: msg.video.mime_type,
+            size: msg.video.file_size,
+        });
     }
 
-    // ── Commands ───────────────────────────────────────────────────
+    emitTelegramIngress(adapter, {
+        userId,
+        from,
+        chatId: msg.chat.id,
+        conversationId: adapter.resolveConversationId(msg.chat.id, undefined, threadId),
+        content: text,
+        attachments: attachments.length ? attachments : undefined,
+        threadId,
+        channelMessageId: String(msg.message_id),
+        timestamp: new Date(msg.date * 1000),
+    });
+}
 
-    export async function handleCommand(adapter: TelegramAdapter, msg: TelegramMessage, text: string): Promise<void> {
-        const chatId = msg.chat.id;
-        const threadId = msg.message_thread_id;
-        const parts = text.split(/\s+/);
-        const command = parts[0].replace(/@\w+$/, ''); // Strip @botname
-        const args = parts.slice(1);
+// ── Task Mode ─────────────────────────────────────────────────
 
-        // Helper to inject message_thread_id into sendMessage params for forum topics
-        const withThread = (params: Record<string, any>): Record<string, any> => {
-            if (threadId !== undefined) params.message_thread_id = threadId;
-            return params;
-        };
+/**
+ * Handle a task request (message starting with !).
+ * Sends the goal to the agent as an autonomous task and streams
+ * progress updates back to the Telegram chat.
+ */
+export async function handleTaskRequest(
+    adapter: TelegramAdapter,
+    msg: TelegramMessage,
+    from: TelegramUser,
+    goal: string,
+): Promise<void> {
+    const chatId = msg.chat.id;
+    const threadId = msg.message_thread_id;
+    const userId = adapter.resolveUserId(from, chatId);
 
-        switch (command) {
-            case '/start':
-                await adapter.api('sendMessage', withThread({
+    // Record the thread this user is currently active in
+    adapter.userThreadMap.set(userId, threadId);
+
+    const confirmParams: Record<string, any> = {
+        chat_id: chatId,
+        text:
+            '🦅 *Starting autonomous task...*\n\n' +
+            `📋 *Goal:* ${adapter.escapeMarkdown(goal)}\n\n` +
+            "_I'll work on this and send you updates._",
+        parse_mode: 'Markdown',
+    };
+    if (threadId !== undefined) confirmParams.message_thread_id = threadId;
+    await adapter.api('sendMessage', confirmParams);
+
+    adapter.startTyping(chatId, threadId);
+
+    emitTelegramIngress(adapter, {
+        userId,
+        from,
+        chatId,
+        conversationId: adapter.resolveConversationId(msg.chat.id, `task-${Date.now()}`, threadId),
+        content: goal,
+        threadId,
+        channelMessageId: String(msg.message_id),
+        timestamp: new Date(msg.date * 1000),
+        payloadKind: 'task',
+        metadata: {
+            isTaskRequest: true,
+        },
+    });
+}
+
+// ── Commands ───────────────────────────────────────────────────
+
+export async function handleCommand(
+    adapter: TelegramAdapter,
+    msg: TelegramMessage,
+    text: string,
+): Promise<void> {
+    const chatId = msg.chat.id;
+    const threadId = msg.message_thread_id;
+    const parts = text.split(/\s+/);
+    const command = parts[0].replace(/@\w+$/, ''); // Strip @botname
+    const args = parts.slice(1);
+
+    // Helper to inject message_thread_id into sendMessage params for forum topics
+    const withThread = (params: Record<string, any>): Record<string, any> => {
+        if (threadId !== undefined) params.message_thread_id = threadId;
+        return params;
+    };
+
+    switch (command) {
+        case '/start':
+            await adapter.api(
+                'sendMessage',
+                withThread({
                     chat_id: chatId,
                     text:
                         '🦅 *Welcome to Kestrel\\!*\n\n' +
-                        'I\'m your autonomous AI agent\\. Here\'s what I can do:\n\n' +
+                        "I'm your autonomous AI agent\\. Here's what I can do:\n\n" +
                         '*💬 Chat Mode*\n' +
                         'Just send me a message to chat\\.\n\n' +
                         '*🤖 Task Mode*\n' +
@@ -245,11 +287,14 @@ import { logger } from '../../utils/logger';
                         '/new — Start a new conversation\n' +
                         '/newthread \\[name\\] — Start a new topic thread',
                     parse_mode: 'MarkdownV2',
-                }));
-                break;
+                }),
+            );
+            break;
 
-            case '/help':
-                await adapter.api('sendMessage', withThread({
+        case '/help':
+            await adapter.api(
+                'sendMessage',
+                withThread({
                     chat_id: chatId,
                     text:
                         '*🦅 Kestrel Commands*\n\n' +
@@ -269,38 +314,47 @@ import { logger } from '../../utils/logger';
                         '  /newthread `[name]` — Start a new topic thread\n' +
                         '  /stop — Stop current response and typing indicator\n',
                     parse_mode: 'Markdown',
-                }));
-                break;
+                }),
+            );
+            break;
 
-            case '/task': {
-                const goal = args.join(' ').trim();
-                if (!goal) {
-                    await adapter.api('sendMessage', withThread({
+        case '/task': {
+            const goal = args.join(' ').trim();
+            if (!goal) {
+                await adapter.api(
+                    'sendMessage',
+                    withThread({
                         chat_id: chatId,
                         text: '❓ Usage: `/task <your goal>`\n\nExample: `/task review the database schema for performance issues`',
                         parse_mode: 'Markdown',
-                    }));
-                    return;
-                }
-                if (msg.from) {
-                    await handleTaskRequest(adapter, msg, msg.from, goal);
-                }
-                break;
+                    }),
+                );
+                return;
             }
+            if (msg.from) {
+                await handleTaskRequest(adapter, msg, msg.from, goal);
+            }
+            break;
+        }
 
-            case '/tasks':
-                await adapter.api('sendMessage', withThread({
+        case '/tasks':
+            await adapter.api(
+                'sendMessage',
+                withThread({
                     chat_id: chatId,
                     text:
                         '📋 *Your Tasks*\n\n' +
                         '_Task listing requires the web dashboard or CLI._\n' +
                         '_Use_ `kestrel tasks` _in the CLI to view all tasks._',
                     parse_mode: 'Markdown',
-                }));
-                break;
+                }),
+            );
+            break;
 
-            case '/status':
-                await adapter.api('sendMessage', withThread({
+        case '/status':
+            await adapter.api(
+                'sendMessage',
+                withThread({
                     chat_id: chatId,
                     text:
                         '🦅 *Kestrel Status*\n\n' +
@@ -310,586 +364,645 @@ import { logger } from '../../utils/logger';
                         `👤 Your ID: \`${msg.from?.id || 'unknown'}\`\n` +
                         `💬 Chat: \`${chatId}\``,
                     parse_mode: 'Markdown',
-                }));
-                break;
+                }),
+            );
+            break;
 
-            case '/cancel': {
-                const taskId = args[0];
-                if (!taskId) {
-                    await adapter.api('sendMessage', withThread({
+        case '/cancel': {
+            const taskId = args[0];
+            if (!taskId) {
+                await adapter.api(
+                    'sendMessage',
+                    withThread({
                         chat_id: chatId,
                         text: '❓ Usage: `/cancel <task_id>`',
                         parse_mode: 'Markdown',
-                    }));
-                    return;
-                }
-                // Emit as a cancel command
+                    }),
+                );
+                return;
+            }
+            // Emit as a cancel command
+            if (msg.from) {
+                const userId = adapter.resolveUserId(msg.from, chatId);
+                emitTelegramIngress(adapter, {
+                    userId,
+                    from: msg.from,
+                    chatId,
+                    conversationId: adapter.resolveConversationId(chatId, undefined, threadId),
+                    content: `/cancel ${taskId}`,
+                    threadId,
+                    channelMessageId: String(msg.message_id),
+                    timestamp: new Date(msg.date * 1000),
+                    payloadKind: 'command',
+                    metadata: {
+                        isCommand: true,
+                    },
+                });
+            }
+            break;
+        }
+
+        case '/approve': {
+            const approvalId = args[0];
+            if (!approvalId) {
+                await adapter.api(
+                    'sendMessage',
+                    withThread({
+                        chat_id: chatId,
+                        text: '❓ Usage: `/approve <approval_id>`',
+                        parse_mode: 'Markdown',
+                    }),
+                );
+                return;
+            }
+            const actorUserId = msg.from ? adapter.resolveUserId(msg.from, chatId) : undefined;
+            await handleApproval(adapter, chatId, approvalId, true, actorUserId, threadId);
+            break;
+        }
+
+        case '/reject': {
+            const rejectId = args[0];
+            if (!rejectId) {
+                await adapter.api(
+                    'sendMessage',
+                    withThread({
+                        chat_id: chatId,
+                        text: '❓ Usage: `/reject <approval_id>`',
+                        parse_mode: 'Markdown',
+                    }),
+                );
+                return;
+            }
+            const actorUserId = msg.from ? adapter.resolveUserId(msg.from, chatId) : undefined;
+            await handleApproval(adapter, chatId, rejectId, false, actorUserId, threadId);
+            break;
+        }
+
+        case '/model': {
+            const modelQuery = args.join(' ').trim();
+            if (modelQuery) {
+                // Send a confirmation that we're searching
+                await adapter.api(
+                    'sendMessage',
+                    withThread({
+                        chat_id: chatId,
+                        text: `🔍 Searching for model \`${modelQuery}\`...`,
+                        parse_mode: 'Markdown',
+                    }),
+                );
+                adapter.startTyping(chatId, threadId);
+
+                // Emit as a chat message so the agent uses the model_swap tool
                 if (msg.from) {
                     const userId = adapter.resolveUserId(msg.from, chatId);
-                    (adapter as any).emit('message', {
-                        id: randomUUID(),
-                        channel: 'telegram',
+                    adapter.userThreadMap.set(userId, threadId);
+                    emitTelegramIngress(adapter, {
                         userId,
-                        workspaceId: adapter.config.defaultWorkspaceId,
+                        from: msg.from,
+                        chatId,
                         conversationId: adapter.resolveConversationId(chatId, undefined, threadId),
-                        content: `/cancel ${taskId}`,
+                        content: `Search all available Ollama and cloud models for "${modelQuery}" and switch to the best match. Use the model_swap tool with action="swap" and query="${modelQuery}".`,
+                        threadId,
+                        channelMessageId: String(msg.message_id),
+                        timestamp: new Date(msg.date * 1000),
+                        payloadKind: 'command',
                         metadata: {
-                            channelUserId: String(msg.from.id),
-                            channelMessageId: String(msg.message_id),
-                            timestamp: new Date(msg.date * 1000),
-                            telegramThreadId: threadId,
                             isCommand: true,
                         },
                     });
                 }
-                break;
+            } else {
+                // No model specified — fetch Ollama models directly and show inline keyboard
+                await fetchAndShowOllamaModels(adapter, chatId, threadId, withThread);
             }
+            break;
+        }
 
-            case '/approve': {
-                const approvalId = args[0];
-                if (!approvalId) {
-                    await adapter.api('sendMessage', withThread({
-                        chat_id: chatId,
-                        text: '❓ Usage: `/approve <approval_id>`',
-                        parse_mode: 'Markdown',
-                    }));
-                    return;
-                }
-                const actorUserId = msg.from ? adapter.resolveUserId(msg.from, chatId) : undefined;
-                await handleApproval(adapter, chatId, approvalId, true, actorUserId, threadId);
-                break;
-            }
-
-            case '/reject': {
-                const rejectId = args[0];
-                if (!rejectId) {
-                    await adapter.api('sendMessage', withThread({
-                        chat_id: chatId,
-                        text: '❓ Usage: `/reject <approval_id>`',
-                        parse_mode: 'Markdown',
-                    }));
-                    return;
-                }
-                const actorUserId = msg.from ? adapter.resolveUserId(msg.from, chatId) : undefined;
-                await handleApproval(adapter, chatId, rejectId, false, actorUserId, threadId);
-                break;
-            }
-
-            case '/model': {
-                const modelQuery = args.join(' ').trim();
-                if (modelQuery) {
-                    // Send a confirmation that we're searching
-                    await adapter.api('sendMessage', withThread({
-                        chat_id: chatId,
-                        text: `🔍 Searching for model \`${modelQuery}\`...`,
-                        parse_mode: 'Markdown',
-                    }));
-                    adapter.startTyping(chatId, threadId);
-
-                    // Emit as a chat message so the agent uses the model_swap tool
-                    if (msg.from) {
-                        const userId = adapter.resolveUserId(msg.from, chatId);
-                        adapter.userThreadMap.set(userId, threadId);
-                        const incoming: IncomingMessage = {
-                            id: randomUUID(),
-                            channel: 'telegram',
-                            userId,
-                            workspaceId: adapter.config.defaultWorkspaceId,
-                            conversationId: adapter.resolveConversationId(chatId, undefined, threadId),
-                            content: `Search all available Ollama and cloud models for "${modelQuery}" and switch to the best match. Use the model_swap tool with action="swap" and query="${modelQuery}".`,
-                            metadata: {
-                                channelUserId: String(msg.from.id),
-                                channelMessageId: String(msg.message_id),
-                                timestamp: new Date(msg.date * 1000),
-                                telegramChatId: chatId,
-                                telegramThreadId: threadId,
-                                telegramUsername: msg.from.username,
-                            },
-                        };
-                        (adapter as any).emit('message', incoming);
-                    }
-                } else {
-                    // No model specified — fetch Ollama models directly and show inline keyboard
-                    await fetchAndShowOllamaModels(adapter, chatId, threadId, withThread);
-                }
-                break;
-            }
-
-            case '/workspace':
-                await adapter.api('sendMessage', withThread({
+        case '/workspace':
+            await adapter.api(
+                'sendMessage',
+                withThread({
                     chat_id: chatId,
                     text: `🏢 Current workspace: \`${adapter.config.defaultWorkspaceId}\``,
                     parse_mode: 'Markdown',
-                }));
-                break;
+                }),
+            );
+            break;
 
-            case '/new': {
-                // In forum supergroups, create a new topic; otherwise just acknowledge
-                if (msg.chat.type === 'supergroup' && threadId !== undefined) {
-                    try {
-                        const topic = await adapter.api('createForumTopic', {
-                            chat_id: chatId,
-                            name: 'New Conversation',
-                        });
-                        if (msg.from) {
-                            const userId = adapter.resolveUserId(msg.from, chatId);
-                            adapter.userThreadMap.set(userId, topic.message_thread_id);
-                        }
-                        await adapter.api('sendMessage', {
-                            chat_id: chatId,
-                            message_thread_id: topic.message_thread_id,
-                            text: '✨ New thread started! Send your first message here.',
-                        });
-                    } catch {
-                        await adapter.api('sendMessage', withThread({
+        case '/new': {
+            // In forum supergroups, create a new topic; otherwise just acknowledge
+            if (msg.chat.type === 'supergroup' && threadId !== undefined) {
+                try {
+                    const topic = await adapter.api('createForumTopic', {
+                        chat_id: chatId,
+                        name: 'New Conversation',
+                    });
+                    if (msg.from) {
+                        const userId = adapter.resolveUserId(msg.from, chatId);
+                        adapter.userThreadMap.set(userId, topic.message_thread_id);
+                    }
+                    await adapter.api('sendMessage', {
+                        chat_id: chatId,
+                        message_thread_id: topic.message_thread_id,
+                        text: '✨ New thread started! Send your first message here.',
+                    });
+                } catch {
+                    await adapter.api(
+                        'sendMessage',
+                        withThread({
                             chat_id: chatId,
                             text: '✨ New conversation started! Send your first message.',
-                        }));
-                    }
-                } else {
-                    await adapter.api('sendMessage', withThread({
+                        }),
+                    );
+                }
+            } else {
+                await adapter.api(
+                    'sendMessage',
+                    withThread({
                         chat_id: chatId,
                         text: '✨ New conversation started! Send your first message.',
                         parse_mode: 'Markdown',
-                    }));
-                }
-                break;
+                    }),
+                );
             }
+            break;
+        }
 
-            case '/newthread': {
-                const topicName = (args.join(' ').trim() || 'New Conversation').substring(0, 128);
-                if (msg.chat.type === 'supergroup') {
-                    try {
-                        const topic = await adapter.api('createForumTopic', {
-                            chat_id: chatId,
-                            name: topicName,
-                        });
-                        if (msg.from) {
-                            const userId = adapter.resolveUserId(msg.from, chatId);
-                            adapter.userThreadMap.set(userId, topic.message_thread_id);
-                        }
-                        await adapter.api('sendMessage', {
-                            chat_id: chatId,
-                            message_thread_id: topic.message_thread_id,
-                            text: `✨ *New thread started:* ${adapter.escapeMarkdown(topicName)}\n\nSend your first message here.`,
-                            parse_mode: 'Markdown',
-                        });
-                    } catch {
-                        await adapter.api('sendMessage', withThread({
-                            chat_id: chatId,
-                            text: '✨ New conversation started! Send your first message.',
-                        }));
+        case '/newthread': {
+            const topicName = (args.join(' ').trim() || 'New Conversation').substring(0, 128);
+            if (msg.chat.type === 'supergroup') {
+                try {
+                    const topic = await adapter.api('createForumTopic', {
+                        chat_id: chatId,
+                        name: topicName,
+                    });
+                    if (msg.from) {
+                        const userId = adapter.resolveUserId(msg.from, chatId);
+                        adapter.userThreadMap.set(userId, topic.message_thread_id);
                     }
-                } else {
                     await adapter.api('sendMessage', {
                         chat_id: chatId,
-                        text: '✨ New conversation started! Send your first message.',
+                        message_thread_id: topic.message_thread_id,
+                        text: `✨ *New thread started:* ${adapter.escapeMarkdown(topicName)}\n\nSend your first message here.`,
+                        parse_mode: 'Markdown',
                     });
+                } catch {
+                    await adapter.api(
+                        'sendMessage',
+                        withThread({
+                            chat_id: chatId,
+                            text: '✨ New conversation started! Send your first message.',
+                        }),
+                    );
                 }
-                break;
+            } else {
+                await adapter.api('sendMessage', {
+                    chat_id: chatId,
+                    text: '✨ New conversation started! Send your first message.',
+                });
             }
+            break;
+        }
 
-            case '/stop':
-                adapter.stopTyping(chatId);
-                if (msg.from) {
-                    const userId = adapter.resolveUserId(msg.from, chatId);
-                    adapter.cancelActiveStream(userId);
-                }
-                await adapter.api('sendMessage', withThread({
+        case '/stop':
+            adapter.stopTyping(chatId);
+            if (msg.from) {
+                const userId = adapter.resolveUserId(msg.from, chatId);
+                adapter.cancelActiveStream(userId);
+            }
+            await adapter.api(
+                'sendMessage',
+                withThread({
                     chat_id: chatId,
                     text: '⏹ Stopped.',
-                }));
-                break;
+                }),
+            );
+            break;
 
-            default:
-                await adapter.api('sendMessage', withThread({
+        default:
+            await adapter.api(
+                'sendMessage',
+                withThread({
                     chat_id: chatId,
                     text: `Unknown command: ${command}. Use /help for available commands.`,
-                }));
-        }
+                }),
+            );
     }
+}
 
-    // ── Approval Handling ──────────────────────────────────────────
+// ── Approval Handling ──────────────────────────────────────────
 
-    export async function handleApproval(adapter: TelegramAdapter, chatId: number, approvalId: string, approved: boolean, actorUserId?: string, threadId?: number): Promise<void> {
-        const icon = approved ? '✅' : '❌';
-        const action = approved ? 'Approved' : 'Rejected';
+export async function handleApproval(
+    adapter: TelegramAdapter,
+    chatId: number,
+    approvalId: string,
+    approved: boolean,
+    actorUserId?: string,
+    threadId?: number,
+): Promise<void> {
+    const icon = approved ? '✅' : '❌';
+    const action = approved ? 'Approved' : 'Rejected';
 
-        const result = await adapter.resolvePendingApproval(approvalId, approved, actorUserId);
-        if (!result.success) {
-            const errParams: Record<string, any> = {
-                chat_id: chatId,
-                text: `⚠️ Could not process approval \`${approvalId}\`: ${adapter.escapeMarkdown(result.error || 'unknown error')}`,
-                parse_mode: 'Markdown',
-            };
-            if (threadId !== undefined) errParams.message_thread_id = threadId;
-            await adapter.api('sendMessage', errParams);
-            return;
-        }
-
-        const params: Record<string, any> = {
+    const result = await adapter.resolvePendingApproval(approvalId, approved, actorUserId);
+    if (!result.success) {
+        const errParams: Record<string, any> = {
             chat_id: chatId,
-            text: `${icon} *${action}* approval \`${approvalId}\``,
+            text: `⚠️ Could not process approval \`${approvalId}\`: ${adapter.escapeMarkdown(result.error || 'unknown error')}`,
             parse_mode: 'Markdown',
         };
-        if (threadId !== undefined) params.message_thread_id = threadId;
-        await adapter.api('sendMessage', params);
+        if (threadId !== undefined) errParams.message_thread_id = threadId;
+        await adapter.api('sendMessage', errParams);
+        return;
     }
 
-    /**
-     * Send an approval request to a Telegram chat with inline buttons.
-     */
-    export async function sendApprovalRequest(adapter: TelegramAdapter, chatId: number, approvalId: string, description: string, taskId: string, userId: string, threadId?: number): Promise<void> {
-        adapter.pendingApprovals.set(approvalId, { taskId, chatId, userId, threadId });
+    const params: Record<string, any> = {
+        chat_id: chatId,
+        text: `${icon} *${action}* approval \`${approvalId}\``,
+        parse_mode: 'Markdown',
+    };
+    if (threadId !== undefined) params.message_thread_id = threadId;
+    await adapter.api('sendMessage', params);
+}
 
-        const escapedDescription = adapter.escapeMarkdown(description);
-        const escapedApprovalId = adapter.escapeMarkdown(approvalId);
-        const replyMarkup = JSON.stringify({
-            inline_keyboard: [[
+/**
+ * Send an approval request to a Telegram chat with inline buttons.
+ */
+export async function sendApprovalRequest(
+    adapter: TelegramAdapter,
+    chatId: number,
+    approvalId: string,
+    description: string,
+    taskId: string,
+    userId: string,
+    threadId?: number,
+): Promise<void> {
+    adapter.pendingApprovals.set(approvalId, { taskId, chatId, userId, threadId });
+
+    const escapedDescription = adapter.escapeMarkdown(description);
+    const escapedApprovalId = adapter.escapeMarkdown(approvalId);
+    const replyMarkup = JSON.stringify({
+        inline_keyboard: [
+            [
                 { text: '✅ Approve', callback_data: `approve:${approvalId}` },
                 { text: '❌ Reject', callback_data: `reject:${approvalId}` },
-            ]],
+            ],
+        ],
+    });
+
+    const params: Record<string, any> = {
+        chat_id: chatId,
+        text:
+            '⚠️ *Approval Required*\n\n' + `${escapedDescription}\n\n` + `ID: ${escapedApprovalId}`,
+        parse_mode: 'Markdown',
+        reply_markup: replyMarkup,
+    };
+    if (threadId !== undefined) params.message_thread_id = threadId;
+
+    try {
+        await adapter.api('sendMessage', params);
+    } catch (err) {
+        logger.error('Telegram sendMessage failed for approval request', {
+            method: 'sendMessage',
+            approvalId,
+            chatId,
+            error: err,
         });
 
-        const params: Record<string, any> = {
+        const fallbackParams: Record<string, any> = {
             chat_id: chatId,
-            text:
-                '⚠️ *Approval Required*\n\n' +
-                `${escapedDescription}\n\n` +
-                `ID: ${escapedApprovalId}`,
-            parse_mode: 'Markdown',
+            text: '⚠️ Approval Required\n\n' + `${description}\n\n` + `ID: ${approvalId}`,
             reply_markup: replyMarkup,
         };
-        if (threadId !== undefined) params.message_thread_id = threadId;
+        if (threadId !== undefined) fallbackParams.message_thread_id = threadId;
 
         try {
-            await adapter.api('sendMessage', params);
-        } catch (err) {
-            logger.error('Telegram sendMessage failed for approval request', {
+            await adapter.api('sendMessage', fallbackParams);
+        } catch (fallbackErr) {
+            logger.error('Telegram fallback sendMessage failed for approval request', {
                 method: 'sendMessage',
                 approvalId,
                 chatId,
-                error: err,
+                error: fallbackErr,
             });
+            throw fallbackErr;
+        }
+    }
+}
 
-            const fallbackParams: Record<string, any> = {
-                chat_id: chatId,
-                text:
-                    '⚠️ Approval Required\n\n' +
-                    `${description}\n\n` +
-                    `ID: ${approvalId}`,
-                reply_markup: replyMarkup,
-            };
-            if (threadId !== undefined) fallbackParams.message_thread_id = threadId;
+/**
+ * Send a progress update for an active task.
+ */
+export async function sendTaskProgress(
+    adapter: TelegramAdapter,
+    chatId: number,
+    step: string,
+    detail: string = '',
+    threadId?: number,
+): Promise<void> {
+    const text = detail
+        ? `🔧 *${adapter.escapeMarkdown(step)}*\n${adapter.escapeMarkdown(detail)}`
+        : `🔧 ${adapter.escapeMarkdown(step)}`;
 
-            try {
-                await adapter.api('sendMessage', fallbackParams);
-            } catch (fallbackErr) {
-                logger.error('Telegram fallback sendMessage failed for approval request', {
-                    method: 'sendMessage',
-                    approvalId,
-                    chatId,
-                    error: fallbackErr,
-                });
-                throw fallbackErr;
-            }
+    const params: Record<string, any> = {
+        chat_id: chatId,
+        text,
+        parse_mode: 'Markdown',
+        disable_notification: true, // Silent for progress updates
+    };
+    if (threadId !== undefined) params.message_thread_id = threadId;
+    await adapter.api('sendMessage', params);
+}
+
+// ── Ollama Model Picker ──────────────────────────────────────────
+
+const OLLAMA_PORT = 11434;
+
+interface OllamaModelInfo {
+    name: string;
+    parameterSize: string;
+    family: string;
+    host: string; // which server this model lives on
+}
+
+/**
+ * Build the list of Ollama hosts to probe.
+ * - OLLAMA_HOST (explicit, highest priority)
+ * - OLLAMA_REMOTE_HOSTS (comma-separated list of extra servers)
+ * - Standard Docker/localhost fallbacks
+ */
+function getOllamaHosts(): string[] {
+    const hosts: string[] = [];
+    const seen = new Set<string>();
+
+    const add = (h: string) => {
+        const normalized = h.replace(/\/$/, '');
+        const url = normalized.startsWith('http')
+            ? normalized
+            : `http://${normalized}:${OLLAMA_PORT}`;
+        if (!seen.has(url)) {
+            seen.add(url);
+            hosts.push(url);
+        }
+    };
+
+    // Explicit host — top priority
+    if (process.env.OLLAMA_HOST) add(process.env.OLLAMA_HOST);
+
+    // Additional remote hosts (comma-separated)
+    if (process.env.OLLAMA_REMOTE_HOSTS) {
+        for (const h of process.env.OLLAMA_REMOTE_HOSTS.split(',')) {
+            const trimmed = h.trim();
+            if (trimmed) add(trimmed);
         }
     }
 
-    /**
-     * Send a progress update for an active task.
-     */
-    export async function sendTaskProgress(adapter: TelegramAdapter, chatId: number, step: string, detail: string = '', threadId?: number): Promise<void> {
-        const text = detail
-            ? `🔧 *${adapter.escapeMarkdown(step)}*\n${adapter.escapeMarkdown(detail)}`
-            : `🔧 ${adapter.escapeMarkdown(step)}`;
+    // Standard fallbacks
+    add('host.docker.internal');
+    add('172.17.0.1');
+    add('127.0.0.1');
 
-        const params: Record<string, any> = {
-            chat_id: chatId,
-            text,
-            parse_mode: 'Markdown',
-            disable_notification: true,  // Silent for progress updates
-        };
-        if (threadId !== undefined) params.message_thread_id = threadId;
-        await adapter.api('sendMessage', params);
+    return hosts;
+}
+
+async function probeOllamaHost(baseUrl: string): Promise<OllamaModelInfo[]> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+        const resp = await fetch(`${baseUrl}/api/tags`, { signal: controller.signal });
+        clearTimeout(timer);
+        if (!resp.ok) return [];
+        const data = (await resp.json()) as { models?: any[] };
+        return (data.models || []).map((m: any) => ({
+            name: m.name as string,
+            parameterSize: (m.details?.parameter_size || '') as string,
+            family: (m.details?.family || '') as string,
+            host: baseUrl,
+        }));
+    } catch {
+        clearTimeout(timer);
+        return [];
     }
+}
 
-    // ── Ollama Model Picker ──────────────────────────────────────────
+async function fetchAllOllamaModels(): Promise<OllamaModelInfo[]> {
+    const hosts = getOllamaHosts();
+    const results = await Promise.allSettled(hosts.map((h) => probeOllamaHost(h)));
 
-    const OLLAMA_PORT = 11434;
-
-    interface OllamaModelInfo {
-        name: string;
-        parameterSize: string;
-        family: string;
-        host: string;        // which server this model lives on
-    }
-
-    /**
-     * Build the list of Ollama hosts to probe.
-     * - OLLAMA_HOST (explicit, highest priority)
-     * - OLLAMA_REMOTE_HOSTS (comma-separated list of extra servers)
-     * - Standard Docker/localhost fallbacks
-     */
-    function getOllamaHosts(): string[] {
-        const hosts: string[] = [];
-        const seen = new Set<string>();
-
-        const add = (h: string) => {
-            const normalized = h.replace(/\/$/, '');
-            const url = normalized.startsWith('http') ? normalized : `http://${normalized}:${OLLAMA_PORT}`;
-            if (!seen.has(url)) {
-                seen.add(url);
-                hosts.push(url);
-            }
-        };
-
-        // Explicit host — top priority
-        if (process.env.OLLAMA_HOST) add(process.env.OLLAMA_HOST);
-
-        // Additional remote hosts (comma-separated)
-        if (process.env.OLLAMA_REMOTE_HOSTS) {
-            for (const h of process.env.OLLAMA_REMOTE_HOSTS.split(',')) {
-                const trimmed = h.trim();
-                if (trimmed) add(trimmed);
+    // Collect models, deduplicating by name (keep from first/highest-priority host)
+    const seen = new Set<string>();
+    const models: OllamaModelInfo[] = [];
+    for (const r of results) {
+        if (r.status !== 'fulfilled') continue;
+        for (const m of r.value) {
+            if (!seen.has(m.name)) {
+                seen.add(m.name);
+                models.push(m);
             }
         }
-
-        // Standard fallbacks
-        add('host.docker.internal');
-        add('172.17.0.1');
-        add('127.0.0.1');
-
-        return hosts;
     }
+    return models;
+}
 
-    async function probeOllamaHost(baseUrl: string): Promise<OllamaModelInfo[]> {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 5000);
-        try {
-            const resp = await fetch(`${baseUrl}/api/tags`, { signal: controller.signal });
-            clearTimeout(timer);
-            if (!resp.ok) return [];
-            const data = (await resp.json()) as { models?: any[] };
-            return (data.models || []).map((m: any) => ({
-                name: m.name as string,
-                parameterSize: (m.details?.parameter_size || '') as string,
-                family: (m.details?.family || '') as string,
-                host: baseUrl,
-            }));
-        } catch {
-            clearTimeout(timer);
-            return [];
-        }
-    }
+async function fetchAndShowOllamaModels(
+    adapter: TelegramAdapter,
+    chatId: number,
+    threadId: number | undefined,
+    withThread: (params: Record<string, any>) => Record<string, any>,
+): Promise<void> {
+    const models = await fetchAllOllamaModels();
 
-    async function fetchAllOllamaModels(): Promise<OllamaModelInfo[]> {
-        const hosts = getOllamaHosts();
-        const results = await Promise.allSettled(hosts.map((h) => probeOllamaHost(h)));
-
-        // Collect models, deduplicating by name (keep from first/highest-priority host)
-        const seen = new Set<string>();
-        const models: OllamaModelInfo[] = [];
-        for (const r of results) {
-            if (r.status !== 'fulfilled') continue;
-            for (const m of r.value) {
-                if (!seen.has(m.name)) {
-                    seen.add(m.name);
-                    models.push(m);
-                }
-            }
-        }
-        return models;
-    }
-
-    async function fetchAndShowOllamaModels(
-        adapter: TelegramAdapter,
-        chatId: number,
-        threadId: number | undefined,
-        withThread: (params: Record<string, any>) => Record<string, any>,
-    ): Promise<void> {
-        const models = await fetchAllOllamaModels();
-
-        if (models.length === 0) {
-            await adapter.api('sendMessage', withThread({
+    if (models.length === 0) {
+        await adapter.api(
+            'sendMessage',
+            withThread({
                 chat_id: chatId,
                 text: '⚠️ No Ollama models found. Make sure Ollama is running and has models installed.\n\nTip: Set OLLAMA_HOST or OLLAMA_REMOTE_HOSTS to connect to remote servers.',
-            }));
-            return;
-        }
+            }),
+        );
+        return;
+    }
 
-        // Check if models come from multiple hosts
-        const uniqueHosts = new Set(models.map((m) => m.host));
-        const multiHost = uniqueHosts.size > 1;
+    // Check if models come from multiple hosts
+    const uniqueHosts = new Set(models.map((m) => m.host));
+    const multiHost = uniqueHosts.size > 1;
 
-        // Build inline keyboard — 2 models per row
-        const buttons = models.map((m) => {
-            let label = m.parameterSize ? `${m.name} (${m.parameterSize})` : m.name;
-            // If multiple hosts, add a short host indicator
-            if (multiHost) {
-                try {
-                    const hostname = new URL(m.host).hostname;
-                    // Only annotate non-local hosts
-                    if (!['host.docker.internal', '172.17.0.1', '127.0.0.1', 'localhost'].includes(hostname)) {
-                        label += ` @${hostname}`;
-                    }
-                } catch { /* ignore */ }
+    // Build inline keyboard — 2 models per row
+    const buttons = models.map((m) => {
+        let label = m.parameterSize ? `${m.name} (${m.parameterSize})` : m.name;
+        // If multiple hosts, add a short host indicator
+        if (multiHost) {
+            try {
+                const hostname = new URL(m.host).hostname;
+                // Only annotate non-local hosts
+                if (
+                    !['host.docker.internal', '172.17.0.1', '127.0.0.1', 'localhost'].includes(
+                        hostname,
+                    )
+                ) {
+                    label += ` @${hostname}`;
+                }
+            } catch {
+                /* ignore */
             }
-            return { text: label, callback_data: `model:${m.name}` };
-        });
-
-        const keyboard: { text: string; callback_data: string }[][] = [];
-        for (let i = 0; i < buttons.length; i += 2) {
-            keyboard.push(buttons.slice(i, i + 2));
         }
+        return { text: label, callback_data: `model:${m.name}` };
+    });
 
-        const headerParts = [`🤖 *Available Ollama Models* (${models.length})`];
-        if (multiHost) headerParts.push(`from ${uniqueHosts.size} servers`);
-        headerParts.push('\nTap a model to switch:');
+    const keyboard: { text: string; callback_data: string }[][] = [];
+    for (let i = 0; i < buttons.length; i += 2) {
+        keyboard.push(buttons.slice(i, i + 2));
+    }
 
-        await adapter.api('sendMessage', withThread({
+    const headerParts = [`🤖 *Available Ollama Models* (${models.length})`];
+    if (multiHost) headerParts.push(`from ${uniqueHosts.size} servers`);
+    headerParts.push('\nTap a model to switch:');
+
+    await adapter.api(
+        'sendMessage',
+        withThread({
             chat_id: chatId,
             text: headerParts.join(' '),
             parse_mode: 'Markdown',
             reply_markup: JSON.stringify({ inline_keyboard: keyboard }),
-        }));
-    }
+        }),
+    );
+}
 
-    // ── Callback Queries ───────────────────────────────────────────
+// ── Callback Queries ───────────────────────────────────────────
 
-    export async function handleCallbackQuery(adapter: TelegramAdapter, query: {
+export async function handleCallbackQuery(
+    adapter: TelegramAdapter,
+    query: {
         id: string;
         from: TelegramUser;
         message?: TelegramMessage;
         data?: string;
-    }): Promise<void> {
-        // Acknowledge the callback
-        await adapter.api('answerCallbackQuery', { callback_query_id: query.id });
+    },
+): Promise<void> {
+    // Acknowledge the callback
+    await adapter.api('answerCallbackQuery', { callback_query_id: query.id });
 
-        if (!query.data || !query.message) return;
-        const chatId = query.message.chat.id;
-        // Extract thread context from the button's parent message
-        const threadId = query.message.message_thread_id;
+    if (!query.data || !query.message) return;
+    const chatId = query.message.chat.id;
+    // Extract thread context from the button's parent message
+    const threadId = query.message.message_thread_id;
 
-        // Handle model selection from /model inline keyboard
-        if (query.data.startsWith('model:')) {
-            const modelName = query.data.substring('model:'.length);
-            const userId = adapter.resolveUserId(query.from, chatId);
-            adapter.userThreadMap.set(userId, threadId);
+    // Handle model selection from /model inline keyboard
+    if (query.data.startsWith('model:')) {
+        const modelName = query.data.substring('model:'.length);
+        const userId = adapter.resolveUserId(query.from, chatId);
+        adapter.userThreadMap.set(userId, threadId);
 
-            const confirmParams: Record<string, any> = {
-                chat_id: chatId,
-                text: `🔄 Switching to \`${modelName}\`...`,
-                parse_mode: 'Markdown',
-            };
-            if (threadId !== undefined) confirmParams.message_thread_id = threadId;
-            await adapter.api('sendMessage', confirmParams);
+        const confirmParams: Record<string, any> = {
+            chat_id: chatId,
+            text: `🔄 Switching to \`${modelName}\`...`,
+            parse_mode: 'Markdown',
+        };
+        if (threadId !== undefined) confirmParams.message_thread_id = threadId;
+        await adapter.api('sendMessage', confirmParams);
 
-            // Emit as a message so the agent performs the swap via model_swap tool
-            const incoming: IncomingMessage = {
-                id: randomUUID(),
-                channel: 'telegram',
-                userId,
-                workspaceId: adapter.config.defaultWorkspaceId,
-                conversationId: adapter.resolveConversationId(chatId, undefined, threadId),
-                content: `Switch to model "${modelName}" on Ollama. Use the model_swap tool with action="swap", model_id="${modelName}", provider="ollama".`,
-                metadata: {
-                    channelUserId: String(query.from.id),
-                    channelMessageId: String(query.message.message_id),
-                    timestamp: new Date(),
-                    telegramChatId: chatId,
-                    telegramThreadId: threadId,
-                    isCallbackQuery: true,
-                },
-            };
-            (adapter as any).emit('message', incoming);
-            return;
-        }
+        // Emit as a message so the agent performs the swap via model_swap tool
+        emitTelegramIngress(adapter, {
+            userId,
+            from: query.from,
+            chatId,
+            conversationId: adapter.resolveConversationId(chatId, undefined, threadId),
+            content: `Switch to model "${modelName}" on Ollama. Use the model_swap tool with action="swap", model_id="${modelName}", provider="ollama".`,
+            threadId,
+            channelMessageId: String(query.message.message_id),
+            timestamp: new Date(),
+            payloadKind: 'command',
+            metadata: {
+                isCallbackQuery: true,
+                isCommand: true,
+            },
+        });
+        return;
+    }
 
-        // Handle self-improvement callbacks (si_approve / si_deny)
-        if (query.data.startsWith('si_approve:') || query.data.startsWith('si_deny:')) {
-            const isApprove = query.data.startsWith('si_approve:');
-            const proposalId = query.data.substring(query.data.indexOf(':') + 1);
-            const action = isApprove ? 'approve' : 'deny';
-            const icon = isApprove ? '✅' : '❌';
+    // Handle self-improvement callbacks (si_approve / si_deny)
+    if (query.data.startsWith('si_approve:') || query.data.startsWith('si_deny:')) {
+        const isApprove = query.data.startsWith('si_approve:');
+        const proposalId = query.data.substring(query.data.indexOf(':') + 1);
+        const action = isApprove ? 'approve' : 'deny';
+        const icon = isApprove ? '✅' : '❌';
 
-            const processingParams: Record<string, any> = {
-                chat_id: chatId,
-                text: `${icon} Processing ${action} for proposal \`${proposalId.substring(0, 8)}...\``,
-                parse_mode: 'Markdown',
-            };
-            if (threadId !== undefined) processingParams.message_thread_id = threadId;
-            await adapter.api('sendMessage', processingParams);
+        const processingParams: Record<string, any> = {
+            chat_id: chatId,
+            text: `${icon} Processing ${action} for proposal \`${proposalId.substring(0, 8)}...\``,
+            parse_mode: 'Markdown',
+        };
+        if (threadId !== undefined) processingParams.message_thread_id = threadId;
+        await adapter.api('sendMessage', processingParams);
 
-            try {
-                // Call brain's self_improve handler via docker exec
-                const { execSync } = await import('child_process');
-                const cmd = `docker exec littlebirdalt-brain-1 python3 -c "
+        try {
+            // Call brain's self_improve handler via docker exec
+            const { execSync } = await import('child_process');
+            const cmd = `docker exec littlebirdalt-brain-1 python3 -c "
 import sys, json
 sys.path.insert(0, '/app')
 from agent.tools.self_improve import _handle_approval
 result = _handle_approval('${proposalId}', approved=${isApprove ? 'True' : 'False'})
 print(json.dumps(result))
 "`;
-                const output = execSync(cmd, { timeout: 15000, encoding: 'utf-8' }).trim();
-                const result = JSON.parse(output);
+            const output = execSync(cmd, { timeout: 15000, encoding: 'utf-8' }).trim();
+            const result = JSON.parse(output);
 
-                if (result.error) {
-                    const errParams: Record<string, any> = { chat_id: chatId, text: `⚠️ ${result.error}` };
-                    if (threadId !== undefined) errParams.message_thread_id = threadId;
-                    await adapter.api('sendMessage', errParams);
-                } else {
-                    const resultParams: Record<string, any> = {
-                        chat_id: chatId,
-                        text: `${icon} *${result.status === 'approved' ? 'Approved' : 'Denied'}*\n${result.message || ''}`,
-                        parse_mode: 'Markdown',
-                    };
-                    if (threadId !== undefined) resultParams.message_thread_id = threadId;
-                    await adapter.api('sendMessage', resultParams);
-                }
-            } catch (err) {
-                logger.error('Self-improve callback failed', { error: (err as Error).message });
-                const failParams: Record<string, any> = {
+            if (result.error) {
+                const errParams: Record<string, any> = {
                     chat_id: chatId,
-                    text: `⚠️ Failed to process: ${(err as Error).message?.substring(0, 200)}`,
+                    text: `⚠️ ${result.error}`,
                 };
-                if (threadId !== undefined) failParams.message_thread_id = threadId;
-                await adapter.api('sendMessage', failParams);
+                if (threadId !== undefined) errParams.message_thread_id = threadId;
+                await adapter.api('sendMessage', errParams);
+            } else {
+                const resultParams: Record<string, any> = {
+                    chat_id: chatId,
+                    text: `${icon} *${result.status === 'approved' ? 'Approved' : 'Denied'}*\n${result.message || ''}`,
+                    parse_mode: 'Markdown',
+                };
+                if (threadId !== undefined) resultParams.message_thread_id = threadId;
+                await adapter.api('sendMessage', resultParams);
             }
-            return;
+        } catch (err) {
+            logger.error('Self-improve callback failed', { error: (err as Error).message });
+            const failParams: Record<string, any> = {
+                chat_id: chatId,
+                text: `⚠️ Failed to process: ${(err as Error).message?.substring(0, 200)}`,
+            };
+            if (threadId !== undefined) failParams.message_thread_id = threadId;
+            await adapter.api('sendMessage', failParams);
         }
-
-        // Handle approval callbacks
-        if (query.data.startsWith('approve:')) {
-            const approvalId = query.data.substring('approve:'.length);
-            const actorUserId = adapter.resolveUserId(query.from, chatId);
-            await handleApproval(adapter, chatId, approvalId, true, actorUserId, threadId);
-            return;
-        }
-        if (query.data.startsWith('reject:')) {
-            const approvalId = query.data.substring('reject:'.length);
-            const actorUserId = adapter.resolveUserId(query.from, chatId);
-            await handleApproval(adapter, chatId, approvalId, false, actorUserId, threadId);
-            return;
-        }
-
-        // Treat other callback data as a message
-        const userId = adapter.resolveUserId(query.from, chatId);
-        const incoming: IncomingMessage = {
-            id: randomUUID(),
-            channel: 'telegram',
-            userId,
-            workspaceId: adapter.config.defaultWorkspaceId,
-            conversationId: adapter.resolveConversationId(chatId, undefined, threadId),
-            content: query.data,
-            metadata: {
-                channelUserId: String(query.from.id),
-                channelMessageId: String(query.message.message_id),
-                timestamp: new Date(),
-                telegramThreadId: threadId,
-                isCallbackQuery: true,
-            },
-        };
-
-        (adapter as any).emit('message', incoming);
+        return;
     }
+
+    // Handle approval callbacks
+    if (query.data.startsWith('approve:')) {
+        const approvalId = query.data.substring('approve:'.length);
+        const actorUserId = adapter.resolveUserId(query.from, chatId);
+        await handleApproval(adapter, chatId, approvalId, true, actorUserId, threadId);
+        return;
+    }
+    if (query.data.startsWith('reject:')) {
+        const approvalId = query.data.substring('reject:'.length);
+        const actorUserId = adapter.resolveUserId(query.from, chatId);
+        await handleApproval(adapter, chatId, approvalId, false, actorUserId, threadId);
+        return;
+    }
+
+    // Treat other callback data as a message
+    const userId = adapter.resolveUserId(query.from, chatId);
+    emitTelegramIngress(adapter, {
+        userId,
+        from: query.from,
+        chatId,
+        conversationId: adapter.resolveConversationId(chatId, undefined, threadId),
+        content: query.data,
+        threadId,
+        channelMessageId: String(query.message.message_id),
+        timestamp: new Date(),
+        metadata: {
+            isCallbackQuery: true,
+        },
+    });
+}

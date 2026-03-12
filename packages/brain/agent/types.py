@@ -376,6 +376,7 @@ class TaskEvent:
     tool_result: Optional[str] = None
     approval_id: Optional[str] = None
     progress: Optional[dict] = None  # {current_step, total_steps, iterations, ...}
+    metadata: Optional[dict[str, Any]] = None  # Structured execution metadata
     metrics: Optional[dict] = None   # {tokens, cost_usd, elapsed_ms, ...}
 
     def to_dict(self) -> dict:
@@ -389,5 +390,6 @@ class TaskEvent:
             "tool_result": self.tool_result,
             "approval_id": self.approval_id,
             "progress": self.progress,
+            "metadata": self.metadata,
             "metrics": self.metrics,
         }

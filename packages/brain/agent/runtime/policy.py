@@ -76,16 +76,59 @@ class HybridRuntime:
                         "falling back to native execution for language=%s",
                         language,
                     )
-                    native_result = await self.native.execute(tool_name=tool_name, payload=payload)
+                    native_payload = dict(payload)
+                    native_payload["_fallback_from"] = docker_result.get(
+                        "runtime_class",
+                        "sandboxed_docker",
+                    )
+                    native_payload["_fallback_reason"] = docker_result.get("error", "")
+                    native_result = await self.native.execute(
+                        tool_name=tool_name,
+                        payload=native_payload,
+                    )
                     native_result.setdefault("warnings", [])
                     native_result["warnings"].append(
                         "Docker runtime unavailable; executed via native runtime fallback."
                     )
                     native_result.setdefault("docker_error", docker_result.get("error", ""))
+                    native_result.setdefault("fallback_used", True)
+                    native_result.setdefault(
+                        "fallback_from",
+                        docker_result.get("runtime_class", "sandboxed_docker"),
+                    )
+                    native_result.setdefault(
+                        "fallback_to",
+                        native_result.get("runtime_class", "hybrid_native_fallback"),
+                    )
+                    if docker_result.get("action_events"):
+                        native_result.setdefault(
+                            "attempted_action_events",
+                            docker_result.get("action_events", []),
+                        )
                     return native_result
                 return docker_result
             if language in {"python", "javascript", "shell"}:
-                return await self.native.execute(tool_name=tool_name, payload=payload)
+                native_payload = dict(payload)
+                native_payload["_fallback_from"] = "sandboxed_docker"
+                native_payload["_fallback_reason"] = (
+                    "Hybrid runtime selected native execution because Docker sandbox execution "
+                    "is not available."
+                )
+                native_result = await self.native.execute(
+                    tool_name=tool_name,
+                    payload=native_payload,
+                )
+                native_result.setdefault("warnings", [])
+                native_result["warnings"].append(
+                    "Docker sandbox unavailable in hybrid mode; executed via native runtime."
+                )
+                native_result.setdefault("fallback_used", True)
+                native_result.setdefault("fallback_from", "sandboxed_docker")
+                native_result.setdefault(
+                    "fallback_to",
+                    native_result.get("runtime_class", "hybrid_native_fallback"),
+                )
+                return native_result
 
         return await self.docker.execute(tool_name=tool_name, payload=payload)
 

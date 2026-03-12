@@ -31,6 +31,7 @@ import uploadRoutes from './routes/upload';
 import { featureRoutes } from './routes/features';
 import visionRoutes from './routes/vision';
 import { memoryRoutes } from './routes/memory';
+import operationsRoutes from './routes/operations';
 import { docsRoutes } from './routes/docs';
 import { prRoutes } from './routes/pr';
 import workspaceWebhookRoutes from './routes/workspace-webhooks';
@@ -223,7 +224,8 @@ async function start() {
         await uploadRoutes(app);
         await featureRoutes(app, { brainClient });
         await visionRoutes(app, { brainClient });
-        await memoryRoutes(app);
+        await memoryRoutes(app, { brainClient });
+        await operationsRoutes(app, { brainClient });
         await docsRoutes(app);
         await prRoutes(app);
         await workspaceWebhookRoutes(app);

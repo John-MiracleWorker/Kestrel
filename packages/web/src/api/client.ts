@@ -36,6 +36,10 @@ export function clearTokens() {
     localStorage.removeItem('kestrel_refresh');
 }
 
+export function getAccessToken(): string | null {
+    return accessToken;
+}
+
 export function setOnAuthExpired(callback: () => void) {
     onAuthExpired = callback;
 }
@@ -316,13 +320,30 @@ export const providers = {
 
 // ── API Keys ────────────────────────────────────────────────────────
 export const apiKeys = {
-    list: () => request<{ keys: ApiKey[] }>('/api-keys'),
-    create: (name: string, expiresInDays?: number) =>
-        request<{ id: string; name: string; key: string; expiresAt: string }>('/api-keys', {
+    list: (workspaceId: string) =>
+        request<{ keys: ApiKey[] }>(`/workspaces/${workspaceId}/api-keys`),
+    create: (
+        workspaceId: string,
+        name: string,
+        options: { expiresInDays?: number; role?: ApiKey['role'] } = {},
+    ) =>
+        request<{
+            id: string;
+            name: string;
+            role: ApiKey['role'];
+            workspaceId: string;
+            key: string;
+            expiresAt: string;
+        }>(`/workspaces/${workspaceId}/api-keys`, {
             method: 'POST',
-            body: { name, expiresInDays },
+            body: {
+                name,
+                expiresInDays: options.expiresInDays,
+                role: options.role || 'member',
+            },
         }),
-    revoke: (id: string) => request(`/api-keys/${id}`, { method: 'DELETE' }),
+    revoke: (workspaceId: string, id: string) =>
+        request(`/workspaces/${workspaceId}/api-keys/${id}`, { method: 'DELETE' }),
 };
 
 // ── Tools ───────────────────────────────────────────────────────────
@@ -443,6 +464,8 @@ export interface ProviderInfo {
 export interface ApiKey {
     id: string;
     name: string;
+    role: 'admin' | 'member' | 'guest';
+    workspaceId: string;
     createdAt: string;
     expiresAt: string;
 }
@@ -459,6 +482,8 @@ export interface TaskEvent {
     toolResult: string;
     approvalId: string;
     progress: Record<string, string>;
+    metadata?: Record<string, unknown>;
+    metrics?: Record<string, unknown>;
 }
 
 export interface TaskSummary {
@@ -471,6 +496,203 @@ export interface TaskSummary {
     error: string;
     createdAt: string;
     completedAt: string;
+}
+
+export interface OperatorTaskItem {
+    summary: TaskSummary;
+    pendingApprovalCount: number;
+    stale: boolean;
+    orphaned: boolean;
+    currentStep: string;
+    totalSteps: string;
+    leaseExpiresAt: string;
+    queueStatus: string;
+    conversationId: string;
+}
+
+export interface ExecutionTraceSummary {
+    runtimeClass: string;
+    riskClass: string;
+    fallbackSummary: string;
+    recentTools: string[];
+    lastEventAt: string;
+}
+
+export interface TaskArtifactRef {
+    id: string;
+    title: string;
+    componentType: string;
+    version: number;
+    updatedAt: string;
+    dataSource: string;
+}
+
+export interface RecoveryHint {
+    code: string;
+    title: string;
+    description: string;
+}
+
+export interface TaskDetail {
+    id: string;
+    goal: string;
+    status: string;
+    iterations: number;
+    toolCalls: number;
+    result: string;
+    error: string;
+    createdAt: string;
+    completedAt: string;
+    workspaceId: string;
+    userId: string;
+    conversationId: string;
+    currentStep: string;
+    totalSteps: string;
+    pendingApprovalId: string;
+    pendingApprovalTool: string;
+    lastCheckpointId: string;
+    lastCheckpointLabel: string;
+    lastCheckpointAt: string;
+    execution: ExecutionTraceSummary;
+    artifactRefs: TaskArtifactRef[];
+    stale: boolean;
+    orphaned: boolean;
+    recoveryHints: RecoveryHint[];
+}
+
+export interface TaskTimelineItem {
+    type: string;
+    taskId: string;
+    stepId: string;
+    content: string;
+    toolName: string;
+    toolArgs: string;
+    toolResult: string;
+    approvalId: string;
+    progress: Record<string, string>;
+    eventMetadataJson: string;
+    metricsJson: string;
+    createdAt: string;
+}
+
+export interface TaskCheckpointItem {
+    id: string;
+    stepIndex: number;
+    label: string;
+    createdAt: string;
+}
+
+export interface TaskArtifactItem {
+    id: string;
+    title: string;
+    description: string;
+    componentType: string;
+    version: number;
+    updatedAt: string;
+    createdBy: string;
+    dataSource: string;
+}
+
+export interface ApprovalAuditItem {
+    approvalId: string;
+    taskId: string;
+    stepId: string;
+    toolName: string;
+    reason: string;
+    riskLevel: string;
+    status: string;
+    decidedBy: string;
+    decidedAt: string;
+    createdAt: string;
+    toolArgsJson: string;
+}
+
+export interface RuntimeProfile {
+    runtimeMode: string;
+    policyName: string;
+    policyVersion: string;
+    dockerEnabled: boolean;
+    nativeEnabled: boolean;
+    hybridFallbackVisible: boolean;
+    hostMounts: Array<{ path: string; mode: string }>;
+    subsystems: Array<{ name: string; status: string; detail: string }>;
+    providerRoutes: Array<{ provider: string; model: string; isDefault: boolean; source: string }>;
+    runtimeCapabilities: Record<string, string>;
+}
+
+function mapTaskSummary(raw: any): TaskSummary {
+    return {
+        id: raw?.id || '',
+        goal: raw?.goal || '',
+        status: raw?.status || '',
+        iterations: Number(raw?.iterations || 0),
+        toolCalls: Number(raw?.tool_calls ?? raw?.toolCalls ?? 0),
+        result: raw?.result || '',
+        error: raw?.error || '',
+        createdAt: raw?.created_at ?? raw?.createdAt ?? '',
+        completedAt: raw?.completed_at ?? raw?.completedAt ?? '',
+    };
+}
+
+function mapOperatorTaskItem(raw: any): OperatorTaskItem {
+    return {
+        summary: mapTaskSummary(raw?.summary || {}),
+        pendingApprovalCount: Number(raw?.pending_approval_count ?? raw?.pendingApprovalCount ?? 0),
+        stale: Boolean(raw?.stale),
+        orphaned: Boolean(raw?.orphaned),
+        currentStep: raw?.current_step ?? raw?.currentStep ?? '',
+        totalSteps: raw?.total_steps ?? raw?.totalSteps ?? '',
+        leaseExpiresAt: raw?.lease_expires_at ?? raw?.leaseExpiresAt ?? '',
+        queueStatus: raw?.queue_status ?? raw?.queueStatus ?? '',
+        conversationId: raw?.conversation_id ?? raw?.conversationId ?? '',
+    };
+}
+
+function mapTaskDetail(raw: any): TaskDetail {
+    return {
+        id: raw?.id || '',
+        goal: raw?.goal || '',
+        status: raw?.status || '',
+        iterations: Number(raw?.iterations || 0),
+        toolCalls: Number(raw?.tool_calls ?? raw?.toolCalls ?? 0),
+        result: raw?.result || '',
+        error: raw?.error || '',
+        createdAt: raw?.created_at ?? raw?.createdAt ?? '',
+        completedAt: raw?.completed_at ?? raw?.completedAt ?? '',
+        workspaceId: raw?.workspace_id ?? raw?.workspaceId ?? '',
+        userId: raw?.user_id ?? raw?.userId ?? '',
+        conversationId: raw?.conversation_id ?? raw?.conversationId ?? '',
+        currentStep: raw?.current_step ?? raw?.currentStep ?? '',
+        totalSteps: raw?.total_steps ?? raw?.totalSteps ?? '',
+        pendingApprovalId: raw?.pending_approval_id ?? raw?.pendingApprovalId ?? '',
+        pendingApprovalTool: raw?.pending_approval_tool ?? raw?.pendingApprovalTool ?? '',
+        lastCheckpointId: raw?.last_checkpoint_id ?? raw?.lastCheckpointId ?? '',
+        lastCheckpointLabel: raw?.last_checkpoint_label ?? raw?.lastCheckpointLabel ?? '',
+        lastCheckpointAt: raw?.last_checkpoint_at ?? raw?.lastCheckpointAt ?? '',
+        execution: {
+            runtimeClass: raw?.execution?.runtime_class ?? raw?.execution?.runtimeClass ?? '',
+            riskClass: raw?.execution?.risk_class ?? raw?.execution?.riskClass ?? '',
+            fallbackSummary:
+                raw?.execution?.fallback_summary ?? raw?.execution?.fallbackSummary ?? '',
+            recentTools: raw?.execution?.recent_tools ?? raw?.execution?.recentTools ?? [],
+            lastEventAt: raw?.execution?.last_event_at ?? raw?.execution?.lastEventAt ?? '',
+        },
+        artifactRefs: (raw?.artifact_refs ?? raw?.artifactRefs ?? []).map((artifact: any) => ({
+            id: artifact?.id || '',
+            title: artifact?.title || '',
+            componentType: artifact?.component_type ?? artifact?.componentType ?? '',
+            version: Number(artifact?.version || 0),
+            updatedAt: artifact?.updated_at ?? artifact?.updatedAt ?? '',
+            dataSource: artifact?.data_source ?? artifact?.dataSource ?? '',
+        })),
+        stale: Boolean(raw?.stale),
+        orphaned: Boolean(raw?.orphaned),
+        recoveryHints: (raw?.recovery_hints ?? raw?.recoveryHints ?? []).map((hint: any) => ({
+            code: hint?.code || '',
+            title: hint?.title || '',
+            description: hint?.description || '',
+        })),
+    };
 }
 
 export interface StartTaskOptions {
@@ -489,7 +711,7 @@ export const tasks = {
     list: (workspaceId: string, status?: string) =>
         request<{ tasks: TaskSummary[] }>(
             `/workspaces/${workspaceId}/tasks${status ? `?status=${status}` : ''}`,
-        ),
+        ).then((res) => (res.tasks || []).map(mapTaskSummary)),
 
     /**
      * Start a task via SSE — returns an EventSource that emits TaskEvent objects.
@@ -511,6 +733,123 @@ export const tasks = {
         request<{ success: boolean }>(`/tasks/${taskId}/cancel`, {
             method: 'POST',
         }),
+};
+
+export const operations = {
+    listTasks: (workspaceId: string, status?: string) =>
+        request<{ tasks: OperatorTaskItem[] }>(
+            `/workspaces/${workspaceId}/operations/tasks${status ? `?status=${encodeURIComponent(status)}` : ''}`,
+        ).then((res) => (res.tasks || []).map(mapOperatorTaskItem)),
+    getTaskDetail: (workspaceId: string, taskId: string) =>
+        request<{ task: TaskDetail }>(`/workspaces/${workspaceId}/operations/tasks/${taskId}`).then(
+            (res) => mapTaskDetail(res.task),
+        ),
+    listTimeline: (workspaceId: string, taskId: string) =>
+        request<{ events: TaskTimelineItem[] }>(
+            `/workspaces/${workspaceId}/operations/tasks/${taskId}/timeline`,
+        ).then((res) =>
+            (res.events || []).map((event: any) => ({
+                type: event?.type || '',
+                taskId: event?.task_id ?? event?.taskId ?? '',
+                stepId: event?.step_id ?? event?.stepId ?? '',
+                content: event?.content || '',
+                toolName: event?.tool_name ?? event?.toolName ?? '',
+                toolArgs: event?.tool_args ?? event?.toolArgs ?? '',
+                toolResult: event?.tool_result ?? event?.toolResult ?? '',
+                approvalId: event?.approval_id ?? event?.approvalId ?? '',
+                progress: event?.progress || {},
+                eventMetadataJson: event?.event_metadata_json ?? event?.eventMetadataJson ?? '',
+                metricsJson: event?.metrics_json ?? event?.metricsJson ?? '',
+                createdAt: event?.created_at ?? event?.createdAt ?? '',
+            })),
+        ),
+    listCheckpoints: (workspaceId: string, taskId: string) =>
+        request<{ checkpoints: TaskCheckpointItem[] }>(
+            `/workspaces/${workspaceId}/operations/tasks/${taskId}/checkpoints`,
+        ).then((res) =>
+            (res.checkpoints || []).map((checkpoint: any) => ({
+                id: checkpoint?.id || '',
+                stepIndex: Number(checkpoint?.step_index ?? checkpoint?.stepIndex ?? 0),
+                label: checkpoint?.label || '',
+                createdAt: checkpoint?.created_at ?? checkpoint?.createdAt ?? '',
+            })),
+        ),
+    listArtifacts: (workspaceId: string, taskId?: string) =>
+        request<{ artifacts: TaskArtifactItem[] }>(
+            taskId
+                ? `/workspaces/${workspaceId}/operations/tasks/${taskId}/artifacts`
+                : `/workspaces/${workspaceId}/operations/artifacts`,
+        ).then((res) =>
+            (res.artifacts || []).map((artifact: any) => ({
+                id: artifact?.id || '',
+                title: artifact?.title || '',
+                description: artifact?.description || '',
+                componentType: artifact?.component_type ?? artifact?.componentType ?? '',
+                version: Number(artifact?.version || 0),
+                updatedAt: artifact?.updated_at ?? artifact?.updatedAt ?? '',
+                createdBy: artifact?.created_by ?? artifact?.createdBy ?? '',
+                dataSource: artifact?.data_source ?? artifact?.dataSource ?? '',
+            })),
+        ),
+    listApprovals: (workspaceId: string, options: { taskId?: string; status?: string } = {}) => {
+        const search = new URLSearchParams();
+        if (options.taskId) search.set('taskId', options.taskId);
+        if (options.status) search.set('status', options.status);
+        const suffix = search.toString() ? `?${search.toString()}` : '';
+        return request<{ approvals: ApprovalAuditItem[] }>(
+            `/workspaces/${workspaceId}/operations/approvals${suffix}`,
+        ).then((res) =>
+            (res.approvals || []).map((approval: any) => ({
+                approvalId: approval?.approval_id ?? approval?.approvalId ?? '',
+                taskId: approval?.task_id ?? approval?.taskId ?? '',
+                stepId: approval?.step_id ?? approval?.stepId ?? '',
+                toolName: approval?.tool_name ?? approval?.toolName ?? '',
+                reason: approval?.reason || '',
+                riskLevel: approval?.risk_level ?? approval?.riskLevel ?? '',
+                status: approval?.status || '',
+                decidedBy: approval?.decided_by ?? approval?.decidedBy ?? '',
+                decidedAt: approval?.decided_at ?? approval?.decidedAt ?? '',
+                createdAt: approval?.created_at ?? approval?.createdAt ?? '',
+                toolArgsJson: approval?.tool_args_json ?? approval?.toolArgsJson ?? '',
+            })),
+        );
+    },
+    getRuntimeProfile: (workspaceId: string) =>
+        request<{ profile: any }>(`/workspaces/${workspaceId}/operations/runtime-profile`).then(
+            (res) => ({
+                runtimeMode: res.profile?.runtime_mode ?? res.profile?.runtimeMode ?? '',
+                policyName: res.profile?.policy_name ?? res.profile?.policyName ?? '',
+                policyVersion: res.profile?.policy_version ?? res.profile?.policyVersion ?? '',
+                dockerEnabled: Boolean(res.profile?.docker_enabled ?? res.profile?.dockerEnabled),
+                nativeEnabled: Boolean(res.profile?.native_enabled ?? res.profile?.nativeEnabled),
+                hybridFallbackVisible: Boolean(
+                    res.profile?.hybrid_fallback_visible ?? res.profile?.hybridFallbackVisible,
+                ),
+                hostMounts: (res.profile?.host_mounts ?? res.profile?.hostMounts ?? []).map(
+                    (mount: any) => ({
+                        path: mount?.path || '',
+                        mode: mount?.mode || '',
+                    }),
+                ),
+                subsystems: (res.profile?.subsystems || []).map((subsystem: any) => ({
+                    name: subsystem?.name || '',
+                    status: subsystem?.status || '',
+                    detail: subsystem?.detail || '',
+                })),
+                providerRoutes: (
+                    res.profile?.provider_routes ??
+                    res.profile?.providerRoutes ??
+                    []
+                ).map((route: any) => ({
+                    provider: route?.provider || '',
+                    model: route?.model || '',
+                    isDefault: Boolean(route?.is_default ?? route?.isDefault),
+                    source: route?.source || '',
+                })),
+                runtimeCapabilities:
+                    res.profile?.runtime_capabilities ?? res.profile?.runtimeCapabilities ?? {},
+            }),
+        ),
 };
 
 // ── UI Artifacts ────────────────────────────────────────────────────

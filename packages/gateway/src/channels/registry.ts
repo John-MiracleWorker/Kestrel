@@ -2,6 +2,11 @@ import { BaseChannelAdapter, ChannelType, IncomingMessage, OutgoingMessage } fro
 import { BrainClient } from '../brain/client';
 import { Deduplicator } from '../sync/deduplicator';
 import { logger } from '../utils/logger';
+import {
+    NormalizedIngressEvent,
+    buildBrainStreamChatRequest,
+    normalizeIngressEvent,
+} from './ingress';
 
 /**
  * Channel Registry — manages adapter lifecycle and message routing.
@@ -129,70 +134,74 @@ export class ChannelRegistry {
      * tokens are forwarded progressively. Otherwise, the response
      * is accumulated and sent as a single final message.
      */
-    private async routeMessage(adapter: BaseChannelAdapter, msg: IncomingMessage): Promise<void> {
+    private async routeMessage(
+        adapter: BaseChannelAdapter,
+        msg: IncomingMessage | NormalizedIngressEvent,
+    ): Promise<void> {
+        const event = normalizeIngressEvent(msg);
         const channel = adapter.channelType;
-        logger.info('Routing message', {
+        logger.info('Routing ingress event', {
             channel,
-            userId: msg.userId,
-            workspaceId: msg.workspaceId,
-            hasAttachments: !!msg.attachments?.length,
+            userId: event.userId,
+            workspaceId: event.workspaceId,
+            ingressKind: event.payload.kind,
+            correlationId: event.correlationId,
+            dedupeKey: event.dedupeKey,
+            hasAttachments: !!event.attachments?.length,
         });
 
         // Track user on this channel
-        this.trackUserChannel(msg.userId, channel);
+        this.trackUserChannel(event.userId, channel);
 
         // Deduplicate: skip if this message was already seen within the dedup window
         if (this.deduplicator) {
-            const isDup = await this.deduplicator.isDuplicate(msg.userId, msg.content, channel);
+            const isDup = await this.deduplicator.isDuplicate(
+                event.userId,
+                event.payload.content,
+                channel,
+            );
             if (isDup) {
-                logger.info('Duplicate message suppressed', { channel, userId: msg.userId });
+                logger.info('Duplicate ingress event suppressed', {
+                    channel,
+                    userId: event.userId,
+                    dedupeKey: event.dedupeKey,
+                });
                 return;
             }
         }
 
         // Process attachments through the adapter's handler
-        if (msg.attachments?.length) {
-            msg.attachments = await Promise.all(
-                msg.attachments.map((a) => adapter.handleAttachment(a)),
+        if (event.attachments?.length) {
+            event.attachments = await Promise.all(
+                event.attachments.map((a) => adapter.handleAttachment(a)),
             );
+            event.payload.attachments = event.attachments;
         }
 
         // Use the channel-provided conversation ID (e.g. deterministic UUID from
         // Telegram chat ID) so Brain can load and save history across messages.
         // Fall back to a cached ID from a previous Brain response if available.
-        const conversationKey = `${channel}:${msg.userId}:${msg.conversationId}`;
+        const conversationKey = `${channel}:${event.userId}:${event.externalConversationId || event.conversationId || ''}`;
         const knownConvId = this.knownConversations.get(conversationKey);
-        const useConversationId = knownConvId || msg.conversationId || '';
-
-        // Build parameters — forward attachments so Brain can process images/files
-        const parameters: Record<string, string> = {};
-        if (msg.attachments?.length) {
-            parameters.attachments = JSON.stringify(msg.attachments);
-        }
-        // Pass channel type so Brain can tag conversations correctly
-        parameters.channel = channel;
+        const useConversationId = knownConvId || event.conversationId || '';
 
         // Track active stream so it can be cancelled (e.g. /stop)
         const controller = new AbortController();
-        this.activeStreams.set(msg.userId, controller);
+        this.activeStreams.set(event.userId, controller);
 
         // Stream response from Brain
         try {
-            const stream = this.brain.streamChat({
-                userId: msg.userId,
-                workspaceId: msg.workspaceId,
-                conversationId: useConversationId,
-                messages: [{ role: 0, content: msg.content }], // USER = 0
-                provider: '', // Use workspace default
-                model: '', // Use workspace default
-                parameters,
-            });
+            const stream = this.brain.streamChat(
+                buildBrainStreamChatRequest(event, {
+                    conversationId: useConversationId,
+                }),
+            );
 
             // ── Streaming path (Telegram, Discord, etc.) ─────────────
             if (adapter.supportsStreaming) {
                 await this.routeWithStreaming(
                     adapter,
-                    msg,
+                    event,
                     stream,
                     conversationKey,
                     useConversationId,
@@ -202,7 +211,7 @@ export class ChannelRegistry {
                 // ── Accumulate path (legacy adapters) ────────────────
                 await this.routeWithAccumulate(
                     adapter,
-                    msg,
+                    event,
                     stream,
                     conversationKey,
                     useConversationId,
@@ -212,18 +221,19 @@ export class ChannelRegistry {
         } catch (err) {
             logger.error('Failed to route message through Brain', {
                 channel,
-                userId: msg.userId,
+                userId: event.userId,
+                correlationId: event.correlationId,
                 error: (err as Error).message,
             });
 
-            await adapter.send(msg.userId, {
-                conversationId: msg.conversationId || '',
+            await adapter.send(event.userId, {
+                conversationId: event.conversationId || '',
                 content: "Sorry, I couldn't process your message. Please try again later.",
             });
         } finally {
             // Clean up the abort controller once the stream finishes or errors
-            if (this.activeStreams.get(msg.userId) === controller) {
-                this.activeStreams.delete(msg.userId);
+            if (this.activeStreams.get(event.userId) === controller) {
+                this.activeStreams.delete(event.userId);
             }
         }
     }
@@ -234,7 +244,7 @@ export class ChannelRegistry {
      */
     private async routeWithStreaming(
         adapter: BaseChannelAdapter,
-        msg: IncomingMessage,
+        msg: NormalizedIngressEvent,
         stream: AsyncIterable<any>,
         conversationKey: string,
         useConversationId: string,
@@ -433,7 +443,7 @@ export class ChannelRegistry {
 
                     const returnedConvId = chunk.conversation_id || chunk.metadata?.conversation_id;
                     const finalConvId = returnedConvId || useConversationId;
-                    if (finalConvId && msg.conversationId) {
+                    if (finalConvId && (msg.externalConversationId || msg.conversationId)) {
                         this.knownConversations.set(conversationKey, finalConvId);
                     }
 
@@ -521,27 +531,36 @@ export class ChannelRegistry {
      */
     private async routeWithAccumulate(
         adapter: BaseChannelAdapter,
-        msg: IncomingMessage,
+        msg: NormalizedIngressEvent,
         stream: AsyncIterable<any>,
         conversationKey: string,
         useConversationId: string,
         signal?: AbortSignal,
     ): Promise<void> {
         let fullContent = '';
+        const enumMap: Record<string, number> = {
+            CONTENT_DELTA: 0,
+            TOOL_CALL: 1,
+            DONE: 2,
+            ERROR: 3,
+        };
 
         for await (const chunk of stream) {
             if (signal?.aborted) {
                 return;
             }
-            switch (chunk.type) {
-                case 'CONTENT_DELTA':
+            const chunkType =
+                typeof chunk.type === 'number' ? chunk.type : (enumMap[chunk.type as string] ?? -1);
+
+            switch (chunkType) {
+                case 0:
                     fullContent += chunk.content_delta || '';
                     break;
 
-                case 'DONE': {
+                case 2: {
                     const returnedConvId = chunk.conversation_id || chunk.metadata?.conversation_id;
                     const finalConvId = returnedConvId || useConversationId;
-                    if (finalConvId && msg.conversationId) {
+                    if (finalConvId && (msg.externalConversationId || msg.conversationId)) {
                         this.knownConversations.set(conversationKey, finalConvId);
                     }
 
@@ -557,7 +576,7 @@ export class ChannelRegistry {
                     break;
                 }
 
-                case 'ERROR':
+                case 3:
                     logger.error('Brain error during routing', {
                         channel: adapter.channelType,
                         userId: msg.userId,

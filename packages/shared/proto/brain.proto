@@ -43,6 +43,12 @@ service BrainService {
   rpc ListPendingApprovals(ListPendingApprovalsRequest) returns (ListPendingApprovalsResponse);
   rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
   rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+  rpc GetTaskDetail(GetTaskDetailRequest) returns (GetTaskDetailResponse);
+  rpc ListTaskTimeline(ListTaskTimelineRequest) returns (ListTaskTimelineResponse);
+  rpc ListTaskCheckpoints(ListTaskCheckpointsRequest) returns (ListTaskCheckpointsResponse);
+  rpc ListTaskArtifacts(ListTaskArtifactsRequest) returns (ListTaskArtifactsResponse);
+  rpc GetApprovalAudit(GetApprovalAuditRequest) returns (GetApprovalAuditResponse);
+  rpc ListOperatorTasks(ListOperatorTasksRequest) returns (ListOperatorTasksResponse);
 
   // ── Workflows ──────────────────────────────────────────────
   rpc LaunchWorkflow(LaunchWorkflowRequest) returns (stream TaskEvent);
@@ -51,6 +57,8 @@ service BrainService {
 
   // ── Capabilities ───────────────────────────────────────────
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+  rpc GetMemoryGraph(GetMemoryGraphRequest) returns (GetMemoryGraphResponse);
+  rpc GetRuntimeProfile(GetRuntimeProfileRequest) returns (GetRuntimeProfileResponse);
 
   // ── Moltbook Activity ─────────────────────────────────────
   rpc GetMoltbookActivity(GetMoltbookActivityRequest) returns (GetMoltbookActivityResponse);
@@ -411,6 +419,8 @@ message TaskEvent {
   string tool_result = 7;
   string approval_id = 8;
   map<string, string> progress = 9; // current_step, total_steps, etc.
+  string event_metadata_json = 10;  // Structured execution/task metadata as JSON
+  string metrics_json = 11;         // Structured metrics payload as JSON
 }
 
 message StreamTaskEventsRequest {
@@ -475,6 +485,176 @@ message TaskSummary {
 
 message ListTasksResponse {
   repeated TaskSummary tasks = 1;
+}
+
+message GetTaskDetailRequest {
+  string workspace_id = 1;
+  string user_id = 2;
+  string task_id = 3;
+}
+
+message ExecutionTraceSummary {
+  string runtime_class = 1;
+  string risk_class = 2;
+  string fallback_summary = 3;
+  repeated string recent_tools = 4;
+  string last_event_at = 5;
+}
+
+message TaskArtifactReference {
+  string id = 1;
+  string title = 2;
+  string component_type = 3;
+  int32 version = 4;
+  string updated_at = 5;
+  string data_source = 6;
+}
+
+message RecoveryHint {
+  string code = 1;
+  string title = 2;
+  string description = 3;
+}
+
+message TaskDetail {
+  string id = 1;
+  string goal = 2;
+  string status = 3;
+  int32 iterations = 4;
+  int32 tool_calls = 5;
+  string result = 6;
+  string error = 7;
+  string created_at = 8;
+  string completed_at = 9;
+  string workspace_id = 10;
+  string user_id = 11;
+  string conversation_id = 12;
+  string current_step = 13;
+  string total_steps = 14;
+  string pending_approval_id = 15;
+  string pending_approval_tool = 16;
+  string last_checkpoint_id = 17;
+  string last_checkpoint_label = 18;
+  string last_checkpoint_at = 19;
+  ExecutionTraceSummary execution = 20;
+  repeated TaskArtifactReference artifact_refs = 21;
+  bool stale = 22;
+  bool orphaned = 23;
+  repeated RecoveryHint recovery_hints = 24;
+}
+
+message GetTaskDetailResponse {
+  TaskDetail task = 1;
+}
+
+message ListTaskTimelineRequest {
+  string workspace_id = 1;
+  string user_id = 2;
+  string task_id = 3;
+}
+
+message TaskTimelineItem {
+  string type = 1;
+  string task_id = 2;
+  string step_id = 3;
+  string content = 4;
+  string tool_name = 5;
+  string tool_args = 6;
+  string tool_result = 7;
+  string approval_id = 8;
+  map<string, string> progress = 9;
+  string event_metadata_json = 10;
+  string metrics_json = 11;
+  string created_at = 12;
+}
+
+message ListTaskTimelineResponse {
+  repeated TaskTimelineItem events = 1;
+}
+
+message ListTaskCheckpointsRequest {
+  string workspace_id = 1;
+  string user_id = 2;
+  string task_id = 3;
+}
+
+message TaskCheckpointItem {
+  string id = 1;
+  int32 step_index = 2;
+  string label = 3;
+  string created_at = 4;
+}
+
+message ListTaskCheckpointsResponse {
+  repeated TaskCheckpointItem checkpoints = 1;
+}
+
+message ListTaskArtifactsRequest {
+  string workspace_id = 1;
+  string user_id = 2;
+  string task_id = 3;
+}
+
+message TaskArtifactItem {
+  string id = 1;
+  string title = 2;
+  string description = 3;
+  string component_type = 4;
+  int32 version = 5;
+  string updated_at = 6;
+  string created_by = 7;
+  string data_source = 8;
+}
+
+message ListTaskArtifactsResponse {
+  repeated TaskArtifactItem artifacts = 1;
+}
+
+message GetApprovalAuditRequest {
+  string workspace_id = 1;
+  string user_id = 2;
+  string task_id = 3;
+  string status = 4;
+}
+
+message ApprovalAuditItem {
+  string approval_id = 1;
+  string task_id = 2;
+  string step_id = 3;
+  string tool_name = 4;
+  string reason = 5;
+  string risk_level = 6;
+  string status = 7;
+  string decided_by = 8;
+  string decided_at = 9;
+  string created_at = 10;
+  string tool_args_json = 11;
+}
+
+message GetApprovalAuditResponse {
+  repeated ApprovalAuditItem approvals = 1;
+}
+
+message ListOperatorTasksRequest {
+  string workspace_id = 1;
+  string user_id = 2;
+  string status = 3;
+}
+
+message OperatorTaskItem {
+  TaskSummary summary = 1;
+  int32 pending_approval_count = 2;
+  bool stale = 3;
+  bool orphaned = 4;
+  string current_step = 5;
+  string total_steps = 6;
+  string lease_expires_at = 7;
+  string queue_status = 8;
+  string conversation_id = 9;
+}
+
+message ListOperatorTasksResponse {
+  repeated OperatorTaskItem tasks = 1;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -566,6 +746,75 @@ message CapabilityItem {
 
 message GetCapabilitiesResponse {
   repeated CapabilityItem capabilities = 1;
+}
+
+message GetMemoryGraphRequest {
+  string workspace_id = 1;
+  string user_id = 2;
+}
+
+message MemoryGraphNode {
+  string id = 1;
+  string label = 2;
+  string entity_type = 3;
+  string description = 4;
+  int32 weight = 5;
+  int32 mentions = 6;
+  string last_seen = 7;
+  double x = 8;
+  double y = 9;
+}
+
+message MemoryGraphLink {
+  string source = 1;
+  string target = 2;
+  string relation = 3;
+}
+
+message GetMemoryGraphResponse {
+  repeated MemoryGraphNode nodes = 1;
+  repeated MemoryGraphLink links = 2;
+}
+
+message GetRuntimeProfileRequest {
+  string workspace_id = 1;
+  string user_id = 2;
+  bool include_sensitive = 3;
+}
+
+message RuntimeMount {
+  string path = 1;
+  string mode = 2;
+}
+
+message RuntimeSubsystem {
+  string name = 1;
+  string status = 2;
+  string detail = 3;
+}
+
+message ProviderRoutingItem {
+  string provider = 1;
+  string model = 2;
+  bool is_default = 3;
+  string source = 4;
+}
+
+message RuntimeProfile {
+  string runtime_mode = 1;
+  string policy_name = 2;
+  string policy_version = 3;
+  bool docker_enabled = 4;
+  bool native_enabled = 5;
+  bool hybrid_fallback_visible = 6;
+  repeated RuntimeMount host_mounts = 7;
+  repeated RuntimeSubsystem subsystems = 8;
+  repeated ProviderRoutingItem provider_routes = 9;
+  map<string, string> runtime_capabilities = 10;
+}
+
+message GetRuntimeProfileResponse {
+  RuntimeProfile profile = 1;
 }
 
 // ── Automation ─────────────────────────────────────────────────────

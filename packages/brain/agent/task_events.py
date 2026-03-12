@@ -23,6 +23,28 @@ _AUDIT_TYPE_MAP = {
 }
 
 
+def loads_task_event_json(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", errors="ignore")
+    if not raw or not isinstance(raw, str):
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def dumps_task_event_json(value: Any) -> str:
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, sort_keys=True, default=str)
+
+
 def task_event_payload_from_proto(task_event: Any) -> dict[str, Any]:
     return {
         "type": int(task_event.type),
@@ -34,6 +56,8 @@ def task_event_payload_from_proto(task_event: Any) -> dict[str, Any]:
         "tool_result": task_event.tool_result,
         "approval_id": task_event.approval_id,
         "progress": dict(task_event.progress),
+        "metadata": loads_task_event_json(getattr(task_event, "event_metadata_json", "")),
+        "metrics": loads_task_event_json(getattr(task_event, "metrics_json", "")),
     }
 
 
@@ -43,10 +67,14 @@ async def persist_task_event_payload(
     workspace_id: str = "",
     user_id: str = "",
 ) -> None:
+    normalized_payload = dict(payload)
+    normalized_payload["metadata"] = loads_task_event_json(normalized_payload.get("metadata"))
+    normalized_payload["metrics"] = loads_task_event_json(normalized_payload.get("metrics"))
+
     redis_client = await get_redis()
-    key = f"kestrel:task_events:{payload['task_id']}"
-    channel = f"kestrel:task_events:{payload['task_id']}:channel"
-    event_json = json.dumps(payload, default=str)
+    key = f"kestrel:task_events:{normalized_payload['task_id']}"
+    channel = f"kestrel:task_events:{normalized_payload['task_id']}:channel"
+    event_json = json.dumps(normalized_payload, default=str)
 
     await redis_client.rpush(key, event_json)
     await redis_client.ltrim(key, -TASK_EVENT_HISTORY_MAX, -1)
@@ -66,10 +94,10 @@ async def persist_task_event_payload(
             """,
             workspace_id,
             user_id,
-            payload.get("task_id"),
+            normalized_payload.get("task_id"),
             audit_event_type,
-            payload.get("tool_name", ""),
-            json.dumps({"task_event": payload}),
+            normalized_payload.get("tool_name", ""),
+            json.dumps({"task_event": normalized_payload}),
         )
 
 

@@ -247,6 +247,8 @@ class LangGraphEngine:
                 tool_result=payload.get("tool_result"),
                 approval_id=payload.get("approval_id"),
                 progress=self._progress(task),
+                metadata=payload.get("metadata"),
+                metrics=payload.get("metrics"),
             ))
 
         # Rebuild the graph with the bridging callback bound to nodes

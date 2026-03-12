@@ -1,6 +1,10 @@
 from core.grpc_setup import brain_pb2
 from core.config import logger
-from agent.task_events import persist_task_event_payload
+from agent.task_events import (
+    dumps_task_event_json,
+    loads_task_event_json,
+    persist_task_event_payload,
+)
 
 class BaseServicerMixin:
     """Provides common utilities for all BrainServicer mixins."""
@@ -45,6 +49,8 @@ class BaseServicerMixin:
         """Persist and publish task events for reconnectable streams."""
         try:
             event_type_name = self._proto_event_type_name(task_event.type)
+            metadata = loads_task_event_json(getattr(task_event, "event_metadata_json", ""))
+            metrics = loads_task_event_json(getattr(task_event, "metrics_json", ""))
             payload = {
                 "type": event_type_name,
                 "event_type": event_type_name,
@@ -56,6 +62,8 @@ class BaseServicerMixin:
                 "tool_result": task_event.tool_result,
                 "approval_id": task_event.approval_id,
                 "progress": dict(task_event.progress),
+                "metadata": metadata,
+                "metrics": metrics,
             }
             await persist_task_event_payload(
                 payload,
@@ -68,6 +76,14 @@ class BaseServicerMixin:
     @staticmethod
     def _task_event_from_json(payload: dict) -> "brain_pb2.TaskEvent":
         progress = payload.get("progress") or {}
+        raw_metadata = payload.get("metadata")
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else loads_task_event_json(
+            raw_metadata or payload.get("event_metadata_json", "")
+        )
+        raw_metrics = payload.get("metrics")
+        metrics = raw_metrics if isinstance(raw_metrics, dict) else loads_task_event_json(
+            raw_metrics or payload.get("metrics_json", "")
+        )
         raw_type = payload.get("type", payload.get("event_type", "thinking"))
         try:
             event_type = int(raw_type)
@@ -83,6 +99,8 @@ class BaseServicerMixin:
             tool_result=str(payload.get("tool_result", "")),
             approval_id=str(payload.get("approval_id", "")),
             progress={str(k): str(v) for k, v in progress.items()},
+            event_metadata_json=dumps_task_event_json(metadata),
+            metrics_json=dumps_task_event_json(metrics),
         )
 
     def _make_response(self, chunk_type: int, content_delta: str = "",

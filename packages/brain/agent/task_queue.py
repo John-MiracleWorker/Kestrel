@@ -538,6 +538,8 @@ class JobRunner:
                 "tool_result": payload.get("tool_result") or payload.get("result", ""),
                 "approval_id": payload.get("approval_id", ""),
                 "progress": payload.get("progress") or {},
+                "metadata": payload.get("metadata") or {},
+                "metrics": payload.get("metrics") or {},
             }
             await persist_task_event_payload(
                 serialized,
@@ -567,6 +569,8 @@ class JobRunner:
                     "tool_result": event.tool_result or "",
                     "approval_id": event.approval_id or "",
                     "progress": event.progress or {},
+                    "metadata": event.metadata or {},
+                    "metrics": event.metrics or {},
                 }
                 await persist_task_event_payload(
                     payload,

@@ -123,7 +123,11 @@ class ToolCache:
                         output=result_data.get("output", ""),
                         error=result_data.get("error", ""),
                         execution_time_ms=0,
-                        metadata={"cached": True, "original_time_ms": result_data.get("execution_time_ms", 0)},
+                        metadata={
+                            **(result_data.get("metadata") or {}),
+                            "cached": True,
+                            "original_time_ms": result_data.get("execution_time_ms", 0),
+                        },
                     )
             except Exception as e:
                 logger.debug(f"Redis cache read failed: {e}")
@@ -145,7 +149,10 @@ class ToolCache:
                     output=result_data.get("output", ""),
                     error=result_data.get("error", ""),
                     execution_time_ms=0,
-                    metadata={"cached": True},
+                    metadata={
+                        **(result_data.get("metadata") or {}),
+                        "cached": True,
+                    },
                 )
             else:
                 del self._local_cache[key]
@@ -178,6 +185,7 @@ class ToolCache:
             "error": result.error,
             "execution_time_ms": result.execution_time_ms,
             "tool_call_id": result.tool_call_id,
+            "metadata": result.metadata,
         })
 
         # Try Redis

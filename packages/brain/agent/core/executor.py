@@ -182,6 +182,13 @@ class TaskExecutor:
         self._text_only_streak: dict[str, int] = {}  # step_id → consecutive text-only responses
         self._text_only_total: dict[str, int] = {}   # step_id → total text-only responses (never resets)
 
+    @staticmethod
+    def _tool_result_event_metadata(result: ToolResult) -> dict[str, Any]:
+        metadata = dict(result.metadata or {})
+        metadata.setdefault("success", result.success)
+        metadata.setdefault("execution_time_ms", result.execution_time_ms)
+        return metadata
+
     def _build_tool_context(self, task: AgentTask) -> dict[str, Any]:
         exec_ctx = getattr(task, "execution_context", None)
         if exec_ctx:
@@ -519,6 +526,7 @@ class TaskExecutor:
                     "result": result.output if result.success else result.error,
                     "success": result.success,
                     "time_ms": result.execution_time_ms,
+                    "metadata": result.metadata,
                     "turn_id": turn_id,
                     **({"_gemini_raw_part": tc_data["_gemini_raw_part"]} if "_gemini_raw_part" in tc_data else {}),
                 })
@@ -548,6 +556,7 @@ class TaskExecutor:
                     tool_name=tool_name,
                     tool_result=result.output if result.success else result.error,
                     progress=self._progress_callback(task),
+                    metadata=self._tool_result_event_metadata(result),
                 )
 
                 if not result.success:
@@ -746,6 +755,7 @@ class TaskExecutor:
                 tool_name=tool_name,
                 tool_result=result.output if result.success else result.error,
                 progress=self._progress_callback(task),
+                metadata=self._tool_result_event_metadata(result),
             )
             return
 
@@ -756,6 +766,7 @@ class TaskExecutor:
             "result": result.output if result.success else result.error,
             "success": result.success,
             "time_ms": result.execution_time_ms,
+            "metadata": result.metadata,
             "turn_id": tc_data.get("turn_id", str(uuid.uuid4())),
             **({"_gemini_raw_part": tc_data["_gemini_raw_part"]} if "_gemini_raw_part" in tc_data else {}),
         })
@@ -777,6 +788,7 @@ class TaskExecutor:
             tool_name=tool_name,
             tool_result=result.output if result.success else result.error,
             progress=self._progress_callback(task),
+            metadata=self._tool_result_event_metadata(result),
         )
 
         # ── Auto-inject display_markdown for media gen tools ─────────
