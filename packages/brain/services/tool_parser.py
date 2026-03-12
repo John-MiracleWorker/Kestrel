@@ -1,9 +1,54 @@
 import json
 import logging
+import re
 
 from core.grpc_setup import brain_pb2
 
 logger = logging.getLogger("brain.services.tool_parser")
+
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?\s*```", re.DOTALL)
+
+
+def _extract_human_text_from_json(raw: str) -> str:
+    """Extract human-readable text from content that may contain raw JSON tool calls.
+
+    When the LLM outputs a tool call as text instead of a proper function call,
+    the raw JSON ends up being sent to the user. This detects that and extracts
+    just the summary field.
+    """
+    if not raw or not raw.strip():
+        return raw or ""
+
+    stripped = raw.strip()
+
+    # Try direct JSON parse
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict):
+            if parsed.get("name") == "task_complete":
+                args = parsed.get("arguments") or parsed.get("args") or {}
+                if args.get("summary"):
+                    return args["summary"]
+            if "summary" in parsed and len(parsed) <= 3:
+                return parsed["summary"]
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Try fenced JSON blocks
+    for match in _JSON_FENCE_RE.finditer(stripped):
+        try:
+            parsed = json.loads(match.group(1))
+            if isinstance(parsed, dict):
+                if parsed.get("name") == "task_complete":
+                    args = parsed.get("arguments") or parsed.get("args") or {}
+                    if args.get("summary"):
+                        return args["summary"]
+                if "summary" in parsed and len(parsed) <= 3:
+                    return parsed["summary"]
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    return raw
 
 
 def _format_tool_result_preview(tool_result: str) -> str:
@@ -204,11 +249,12 @@ async def parse_agent_event(
         # and we must NOT re-emit the same text.
         joined_response = "".join(full_response_parts)
         if not joined_response and event.content:
-            words = event.content.split(" ")
+            content = _extract_human_text_from_json(event.content)
+            words = content.split(" ")
             for i, word in enumerate(words):
                 chunk = word if i == 0 else " " + word
                 yield make_response_fn(chunk_type=0, content_delta=chunk)
-            full_response_parts.append(event.content)
+            full_response_parts.append(content)
 
     elif event_type == "task_failed":
         failure_note = _build_failure_note(event.content or "")
