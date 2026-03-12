@@ -117,6 +117,12 @@ def _classify_lmstudio(model_id: str) -> str:
         return "power" if params_b >= 20 else "fast"
 
     # Known large model families without explicit param tag
+    # Nemotron: NVIDIA's strong instruction-following model
+    if "nemotron" in mid:
+        return "power"
+    # Qwen 3.x / 2.5: top-tier tool calling and agentic performance
+    if "qwen" in mid:
+        return "power"
     # GLM 4.x series: ~9B params, strong multilingual model
     if "glm" in mid:
         return "power"

@@ -602,8 +602,18 @@ def register_mcp_tools(registry, pool=None) -> None:
         # Merge any extra keyword arguments (e.g. 'limit') into the tool
         # arguments dict.  LLMs sometimes pass tool parameters as top-level
         # kwargs to mcp_call instead of embedding them in the JSON string.
+        # Filter out system-injected kwargs that are not tool arguments.
+        _SYSTEM_KWARGS = {"execution_context", "context", "task_context"}
         if kwargs:
-            args.update(kwargs)
+            for k, v in kwargs.items():
+                if k in _SYSTEM_KWARGS:
+                    continue
+                # Only merge JSON-serializable values
+                try:
+                    json.dumps(v)
+                    args[k] = v
+                except (TypeError, ValueError):
+                    logger.debug(f"mcp_call: skipping non-serializable kwarg '{k}'")
 
         return await client.call_tool(tool_name, args)
 

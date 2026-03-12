@@ -194,6 +194,18 @@ class MCPClient:
         self._tools = result.get("result", {}).get("tools", [])
         return self._tools
 
+    @staticmethod
+    def _safe_serialize(obj: Any) -> Any:
+        """Recursively convert non-JSON-serializable values to strings."""
+        if obj is None or isinstance(obj, (bool, int, float, str)):
+            return obj
+        if isinstance(obj, dict):
+            return {k: MCPClient._safe_serialize(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [MCPClient._safe_serialize(v) for v in obj]
+        # Fallback: convert to string representation
+        return str(obj)
+
     async def call_tool(self, tool_name: str, arguments: dict = None) -> dict:
         """Call a tool on the connected MCP server.
 
@@ -258,11 +270,11 @@ class MCPClient:
                 elif item.get("type") == "resource":
                     output_parts.append(f"[Resource: {item.get('uri', '')}]")
 
-            return {
+            return self._safe_serialize({
                 "success": not tool_result.get("isError", False),
                 "output": "\n".join(output_parts) if output_parts else str(tool_result),
                 "raw": tool_result,
-            }
+            })
 
         return {"error": "MCP call_tool failed after reconnect attempt"}
 

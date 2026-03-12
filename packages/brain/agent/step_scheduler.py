@@ -333,11 +333,15 @@ class StepScheduler:
 
         # Step completed check after the executor finishes
         if step.status == StepStatus.COMPLETE:
+            # Emit step_complete as a *signal only* — use empty content because
+            # the executor already streamed the response text token-by-token
+            # via individual step_complete events.  Re-emitting step.result
+            # here would duplicate the text in the user's chat.
             yield TaskEvent(
                 type=TaskEventType.STEP_COMPLETE,
                 task_id=task.id,
                 step_id=step.id,
-                content=step.result or "",
+                content="",
                 progress=progress_fn(task),
             )
             # Capture recovery pattern for online learning

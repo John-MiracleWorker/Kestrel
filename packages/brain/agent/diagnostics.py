@@ -72,7 +72,10 @@ def classify_error(error_text: str) -> tuple[ErrorCategory, str]:
 
 def _fingerprint(tool_name: str, args: dict) -> str:
     """Create a compact fingerprint for a tool call to detect repetition."""
-    raw = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
+    try:
+        raw = f"{tool_name}:{json.dumps(args, sort_keys=True, default=str)}"
+    except (TypeError, ValueError):
+        raw = f"{tool_name}:{str(args)}"
     return hashlib.md5(raw.encode()).hexdigest()[:10]
 
 

@@ -198,8 +198,12 @@ async def parse_agent_event(
         )
 
     elif event_type == "task_complete":
+        # Only emit task_complete content if nothing was streamed yet.
+        # When the response was already streamed token-by-token via
+        # step_complete events, full_response_parts will be non-empty
+        # and we must NOT re-emit the same text.
         joined_response = "".join(full_response_parts)
-        if event.content and event.content not in joined_response:
+        if not joined_response and event.content:
             words = event.content.split(" ")
             for i, word in enumerate(words):
                 chunk = word if i == 0 else " " + word
