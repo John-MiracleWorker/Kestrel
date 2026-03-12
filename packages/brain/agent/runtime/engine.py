@@ -225,13 +225,7 @@ class LangGraphEngine:
             if mapped_type is None:
                 return
 
-            import json
             content = payload.get("content") or payload.get("result") or ""
-            if not content:
-                try:
-                    content = json.dumps(payload)
-                except Exception:
-                    content = str(payload)
 
             logger.info(
                 f"_bridging_callback: event_type={event_type}, "
