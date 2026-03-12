@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any
 
 from core.config import logger
@@ -25,6 +26,8 @@ class ChatRequestContext:
     messages: list[dict]
     user_content: str
     channel_name: str
+    request_metadata: dict[str, str]
+    return_route: dict[str, str]
 
 
 async def build_request_context(request, workspace_id: str) -> ChatRequestContext:
@@ -34,6 +37,19 @@ async def build_request_context(request, workspace_id: str) -> ChatRequestContex
     ws_config = await ProviderConfig(pool).get_config(workspace_id)
     params = dict(request.parameters) if hasattr(request, "parameters") else {}
     channel_name = params.get("channel", "") or "web"
+    request_metadata = {
+        str(key): str(value)
+        for key, value in params.items()
+        if value not in (None, "")
+    }
+    return_route = {}
+    if params.get("return_route"):
+        try:
+            parsed = json.loads(params["return_route"])
+            if isinstance(parsed, dict):
+                return_route = {str(key): str(value) for key, value in parsed.items()}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return_route = {}
     provider_name = request.provider or ws_config["provider"]
     model = request.model or ws_config["model"]
 
@@ -89,4 +105,6 @@ async def build_request_context(request, workspace_id: str) -> ChatRequestContex
         messages=messages,
         user_content=user_content,
         channel_name=channel_name,
+        request_metadata=request_metadata,
+        return_route=return_route,
     )

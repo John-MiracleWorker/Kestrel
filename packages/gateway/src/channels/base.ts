@@ -58,27 +58,9 @@ export interface ToolActivity {
 }
 
 /**
- * Incoming message from any channel.
- *
- * @deprecated Use `NormalizedIngressEvent` from `./ingress` as the canonical
- * Gateway ingress contract. Legacy adapters may still emit this shape while
- * the registry upgrades them.
+ * Canonical ingress envelope from any channel.
  */
-export interface IncomingMessage {
-    id: string;
-    channel: ChannelType;
-    userId: string;
-    workspaceId: string;
-    conversationId?: string;
-    content: string;
-    attachments?: Attachment[];
-    metadata: {
-        channelUserId: string; // Original platform user ID
-        channelMessageId: string;
-        timestamp: Date;
-        [key: string]: any;
-    };
-}
+export type IncomingMessage = import('./ingress').IngressEnvelope;
 
 /**
  * Outgoing message to any channel.

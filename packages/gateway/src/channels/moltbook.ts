@@ -1,12 +1,7 @@
 import { randomUUID } from 'crypto';
-import {
-    BaseChannelAdapter,
-    ChannelType,
-    IncomingMessage,
-    OutgoingMessage,
-    Attachment,
-} from './base';
+import { BaseChannelAdapter, ChannelType, OutgoingMessage, Attachment } from './base';
 import { logger } from '../utils/logger';
+import { createIngressEnvelope } from './ingress';
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -60,17 +55,17 @@ interface MoltbookSubmolt {
 // ── Configuration ──────────────────────────────────────────────────
 
 export interface MoltbookConfig {
-    apiKey: string;                 // Agent's Moltbook API key
-    agentName: string;              // Display name on Moltbook
-    agentBio?: string;              // Agent's bio/description
+    apiKey: string; // Agent's Moltbook API key
+    agentName: string; // Display name on Moltbook
+    agentBio?: string; // Agent's bio/description
     defaultWorkspaceId: string;
-    baseUrl?: string;               // API base (default: https://moltbook.com/api/v1)
-    pollingIntervalMs?: number;     // How often to check for new interactions (default: 30s)
-    autoPost?: boolean;             // Whether agent autonomously creates posts
-    autoReply?: boolean;            // Whether agent autonomously replies to comments
-    subscribedSubmolts?: string[];  // Submolts to monitor
-    maxPostsPerHour?: number;       // Rate limit for posts (default: 3)
-    maxCommentsPerHour?: number;    // Rate limit for comments (default: 10)
+    baseUrl?: string; // API base (default: https://moltbook.com/api/v1)
+    pollingIntervalMs?: number; // How often to check for new interactions (default: 30s)
+    autoPost?: boolean; // Whether agent autonomously creates posts
+    autoReply?: boolean; // Whether agent autonomously replies to comments
+    subscribedSubmolts?: string[]; // Submolts to monitor
+    maxPostsPerHour?: number; // Rate limit for posts (default: 3)
+    maxCommentsPerHour?: number; // Rate limit for comments (default: 10)
 }
 
 // ── Moltbook Adapter ──────────────────────────────────────────────
@@ -131,17 +126,25 @@ export class MoltbookAdapter extends BaseChannelAdapter {
         // Verify API key and get agent profile
         try {
             this.agentProfile = await this.api('GET', '/agents/me');
-            logger.info(`Moltbook agent connected: @${this.agentProfile!.username} (karma: ${this.agentProfile!.karma})`);
+            logger.info(
+                `Moltbook agent connected: @${this.agentProfile!.username} (karma: ${this.agentProfile!.karma})`,
+            );
         } catch (err: any) {
             const status = err?.response?.status ?? err?.status;
             if (status === 401 || status === 404) {
                 // Agent genuinely not registered — register now
-                logger.info('Moltbook agent not found (HTTP %d), attempting registration...', status);
+                logger.info(
+                    'Moltbook agent not found (HTTP %d), attempting registration...',
+                    status,
+                );
                 this.agentProfile = await this.registerAgent();
                 logger.info(`Moltbook agent registered: @${this.agentProfile.username}`);
             } else {
                 // Network/server error — do NOT re-register, just log and rethrow
-                logger.error('Moltbook connect failed (not a registration issue):', err?.message ?? err);
+                logger.error(
+                    'Moltbook connect failed (not a registration issue):',
+                    err?.message ?? err,
+                );
                 throw err;
             }
         }
@@ -170,15 +173,11 @@ export class MoltbookAdapter extends BaseChannelAdapter {
     private async registerAgent(): Promise<MoltbookAgent> {
         return await this.api('POST', '/agents/register', {
             name: this.config.agentName,
-            bio: this.config.agentBio || `🦅 Kestrel AI Agent — autonomous, reflective, and always learning.`,
+            bio:
+                this.config.agentBio ||
+                `🦅 Kestrel AI Agent — autonomous, reflective, and always learning.`,
             platform: 'kestrel',
-            capabilities: [
-                'conversation',
-                'task_execution',
-                'code_review',
-                'research',
-                'planning',
-            ],
+            capabilities: ['conversation', 'task_execution', 'code_review', 'research', 'planning'],
         });
     }
 
@@ -219,7 +218,12 @@ export class MoltbookAdapter extends BaseChannelAdapter {
     /**
      * Create a new post on a submolt.
      */
-    async createPost(submolt: string, title: string, content: string, linkUrl?: string): Promise<MoltbookPost> {
+    async createPost(
+        submolt: string,
+        title: string,
+        content: string,
+        linkUrl?: string,
+    ): Promise<MoltbookPost> {
         if (!this.canPost()) {
             throw new Error(`Rate limited: max ${this.maxPostsPerHour} posts/hour`);
         }
@@ -235,7 +239,7 @@ export class MoltbookAdapter extends BaseChannelAdapter {
             body.url = linkUrl;
         }
 
-        const post = await this.api('POST', '/posts', body) as MoltbookPost;
+        const post = (await this.api('POST', '/posts', body)) as MoltbookPost;
         this.ourPostIds.add(post.id);
         this.postTimestamps.push(new Date());
 
@@ -251,7 +255,11 @@ export class MoltbookAdapter extends BaseChannelAdapter {
     /**
      * Comment on a post.
      */
-    async commentOnPost(postId: string, content: string, parentCommentId?: string): Promise<MoltbookComment> {
+    async commentOnPost(
+        postId: string,
+        content: string,
+        parentCommentId?: string,
+    ): Promise<MoltbookComment> {
         if (!this.canComment()) {
             throw new Error(`Rate limited: max ${this.maxCommentsPerHour} comments/hour`);
         }
@@ -261,7 +269,11 @@ export class MoltbookAdapter extends BaseChannelAdapter {
             body.parent_id = parentCommentId;
         }
 
-        const comment = await this.api('POST', `/posts/${postId}/comments`, body) as MoltbookComment;
+        const comment = (await this.api(
+            'POST',
+            `/posts/${postId}/comments`,
+            body,
+        )) as MoltbookComment;
         this.ourCommentIds.add(comment.id);
         this.commentTimestamps.push(new Date());
 
@@ -279,7 +291,7 @@ export class MoltbookAdapter extends BaseChannelAdapter {
      */
     async replyToComment(commentId: string, content: string): Promise<MoltbookComment> {
         // Need to find the post ID for this comment
-        const comment = await this.api('GET', `/comments/${commentId}`) as MoltbookComment;
+        const comment = (await this.api('GET', `/comments/${commentId}`)) as MoltbookComment;
         return this.commentOnPost(comment.post_id, content, commentId);
     }
 
@@ -306,8 +318,15 @@ export class MoltbookAdapter extends BaseChannelAdapter {
     /**
      * Get the feed for a submolt.
      */
-    async getFeed(submolt: string, sort: 'hot' | 'new' | 'top' = 'hot', limit: number = 25): Promise<MoltbookPost[]> {
-        const posts = await this.api('GET', `/submolts/${submolt}/posts?sort=${sort}&limit=${limit}`) as MoltbookPost[];
+    async getFeed(
+        submolt: string,
+        sort: 'hot' | 'new' | 'top' = 'hot',
+        limit: number = 25,
+    ): Promise<MoltbookPost[]> {
+        const posts = (await this.api(
+            'GET',
+            `/submolts/${submolt}/posts?sort=${sort}&limit=${limit}`,
+        )) as MoltbookPost[];
         return posts;
     }
 
@@ -315,30 +334,43 @@ export class MoltbookAdapter extends BaseChannelAdapter {
      * Get the agent's personalized feed.
      */
     async getPersonalizedFeed(limit: number = 25): Promise<MoltbookFeedItem[]> {
-        return await this.api('GET', `/feed?limit=${limit}`) as MoltbookFeedItem[];
+        return (await this.api('GET', `/feed?limit=${limit}`)) as MoltbookFeedItem[];
     }
 
     /**
      * Get comments on a post.
      */
-    async getPostComments(postId: string, sort: 'best' | 'new' | 'old' = 'best'): Promise<MoltbookComment[]> {
-        return await this.api('GET', `/posts/${postId}/comments?sort=${sort}`) as MoltbookComment[];
+    async getPostComments(
+        postId: string,
+        sort: 'best' | 'new' | 'old' = 'best',
+    ): Promise<MoltbookComment[]> {
+        return (await this.api(
+            'GET',
+            `/posts/${postId}/comments?sort=${sort}`,
+        )) as MoltbookComment[];
     }
 
     /**
      * Search for posts across Moltbook.
      */
-    async searchPosts(query: string, submolt?: string, limit: number = 10): Promise<MoltbookPost[]> {
+    async searchPosts(
+        query: string,
+        submolt?: string,
+        limit: number = 10,
+    ): Promise<MoltbookPost[]> {
         let url = `/search/posts?q=${encodeURIComponent(query)}&limit=${limit}`;
         if (submolt) url += `&submolt=${encodeURIComponent(submolt)}`;
-        return await this.api('GET', url) as MoltbookPost[];
+        return (await this.api('GET', url)) as MoltbookPost[];
     }
 
     /**
      * Discover submolts.
      */
     async discoverSubmolts(limit: number = 20): Promise<MoltbookSubmolt[]> {
-        return await this.api('GET', `/submolts?sort=popular&limit=${limit}`) as MoltbookSubmolt[];
+        return (await this.api(
+            'GET',
+            `/submolts?sort=popular&limit=${limit}`,
+        )) as MoltbookSubmolt[];
     }
 
     /**
@@ -354,15 +386,24 @@ export class MoltbookAdapter extends BaseChannelAdapter {
     /**
      * Update the agent's profile.
      */
-    async updateProfile(updates: { name?: string; bio?: string; avatar_url?: string }): Promise<MoltbookAgent> {
-        this.agentProfile = await this.api('PATCH', '/agents/me', updates) as MoltbookAgent;
+    async updateProfile(updates: {
+        name?: string;
+        bio?: string;
+        avatar_url?: string;
+    }): Promise<MoltbookAgent> {
+        this.agentProfile = (await this.api('PATCH', '/agents/me', updates)) as MoltbookAgent;
         return this.agentProfile;
     }
 
     /**
      * Get the agent's current karma and stats.
      */
-    async getStats(): Promise<{ karma: number; posts: number; comments: number; followers: number }> {
+    async getStats(): Promise<{
+        karma: number;
+        posts: number;
+        comments: number;
+        followers: number;
+    }> {
         return await this.api('GET', '/agents/me/stats');
     }
 
@@ -393,10 +434,7 @@ export class MoltbookAdapter extends BaseChannelAdapter {
 
     private async poll(): Promise<void> {
         try {
-            await Promise.all([
-                this.pollNotifications(),
-                this.pollSubscribedFeeds(),
-            ]);
+            await Promise.all([this.pollNotifications(), this.pollSubscribedFeeds()]);
         } catch (err) {
             logger.error('Moltbook polling error', { error: (err as Error).message });
         }
@@ -414,9 +452,9 @@ export class MoltbookAdapter extends BaseChannelAdapter {
                 this.seenNotificationIds.add(notif.id);
 
                 // Route notification as an incoming message so Kestrel can respond
-                const incoming: IncomingMessage = {
+                const incoming = createIngressEnvelope({
                     id: randomUUID(),
-                    channel: 'web',
+                    channel: 'moltbook',
                     userId: `mb-${notif.from_agent?.id || 'unknown'}`,
                     workspaceId: this.config.defaultWorkspaceId,
                     conversationId: notif.comment_id
@@ -434,7 +472,24 @@ export class MoltbookAdapter extends BaseChannelAdapter {
                         submolt: notif.submolt,
                         fromAgent: notif.from_agent?.username,
                     },
-                };
+                    externalUserId: String(notif.from_agent?.id || 'unknown'),
+                    externalConversationId: notif.comment_id
+                        ? `mb-comment-${notif.comment_id}`
+                        : `mb-post-${notif.post_id}`,
+                    authContext: {
+                        transport: 'moltbook_polling',
+                        authenticatedUserId: `mb-${notif.from_agent?.id || 'unknown'}`,
+                        isProvisionalUser: false,
+                    },
+                    rawMetadata: {
+                        platform: 'moltbook',
+                        notificationType: notif.type,
+                        postId: notif.post_id,
+                        commentId: notif.comment_id,
+                        submolt: notif.submolt,
+                        fromAgent: notif.from_agent?.username,
+                    },
+                });
 
                 this.emit('message', incoming);
             }
@@ -465,9 +520,9 @@ export class MoltbookAdapter extends BaseChannelAdapter {
                     if (this.ourPostIds.has(post.id)) continue;
 
                     // Emit as incoming message for Kestrel's brain to decide whether to engage
-                    const incoming: IncomingMessage = {
+                    const incoming = createIngressEnvelope({
                         id: randomUUID(),
-                        channel: 'web',
+                        channel: 'moltbook',
                         userId: `mb-${post.author.id}`,
                         workspaceId: this.config.defaultWorkspaceId,
                         conversationId: `mb-post-${post.id}`,
@@ -484,12 +539,30 @@ export class MoltbookAdapter extends BaseChannelAdapter {
                             score: post.score,
                             commentCount: post.comment_count,
                         },
-                    };
+                        externalUserId: String(post.author.id),
+                        externalConversationId: `mb-post-${post.id}`,
+                        authContext: {
+                            transport: 'moltbook_polling',
+                            authenticatedUserId: `mb-${post.author.id}`,
+                            isProvisionalUser: false,
+                        },
+                        rawMetadata: {
+                            platform: 'moltbook',
+                            contentType: 'feed_post',
+                            postId: post.id,
+                            submolt: post.submolt,
+                            fromAgent: post.author.username,
+                            score: post.score,
+                            commentCount: post.comment_count,
+                        },
+                    });
 
                     this.emit('message', incoming);
                 }
             } catch (err) {
-                logger.error(`Moltbook feed poll failed for s/${submolt}`, { error: (err as Error).message });
+                logger.error(`Moltbook feed poll failed for s/${submolt}`, {
+                    error: (err as Error).message,
+                });
             }
         }
     }
@@ -529,7 +602,7 @@ export class MoltbookAdapter extends BaseChannelAdapter {
         const url = `${this.apiBase}${path}`;
 
         const headers: Record<string, string> = {
-            'Authorization': `Bearer ${this.config.apiKey}`,
+            Authorization: `Bearer ${this.config.apiKey}`,
             'Content-Type': 'application/json',
             'User-Agent': 'Kestrel/1.0 (Autonomous AI Agent)',
         };
@@ -542,7 +615,7 @@ export class MoltbookAdapter extends BaseChannelAdapter {
 
         if (res.status === 204) return null;
 
-        const data = await res.json() as any;
+        const data = (await res.json()) as any;
 
         if (!res.ok) {
             const errorMsg = data?.error || data?.message || `HTTP ${res.status}`;

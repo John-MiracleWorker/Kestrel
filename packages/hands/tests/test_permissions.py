@@ -34,3 +34,63 @@ def test_allowlist_workspace_block_mode():
     
     assert checker.check("ws-1", "good_skill") is True
     assert checker.check("ws-1", "bad_skill") is False
+
+
+def test_mutating_action_requires_explicit_grant():
+    checker = PermissionChecker()
+
+    decision = checker.evaluate_action(
+        workspace_id="ws-1",
+        action_name="python_executor",
+        function_name="run",
+        grants=[],
+        mutating=True,
+    )
+
+    assert decision["allowed"] is False
+    assert decision["failure_class"] == "escalation_required"
+
+
+def test_matching_grant_allows_mutating_action():
+    checker = PermissionChecker()
+
+    decision = checker.evaluate_action(
+        workspace_id="ws-1",
+        action_name="python_executor",
+        function_name="run",
+        grants=[
+            {
+                "grant_id": "grant-1",
+                "workspace_id": "ws-1",
+                "action_selector": "python_executor.run",
+                "approval_state": "approved",
+            }
+        ],
+        mutating=True,
+    )
+
+    assert decision["allowed"] is True
+    assert decision["failure_class"] == "none"
+    assert decision["matched_grants"][0]["grant_id"] == "grant-1"
+
+
+def test_pending_grant_requires_approval():
+    checker = PermissionChecker()
+
+    decision = checker.evaluate_action(
+        workspace_id="ws-1",
+        action_name="python_executor",
+        function_name="run",
+        grants=[
+            {
+                "grant_id": "grant-2",
+                "workspace_id": "ws-1",
+                "action_selector": "*",
+                "approval_state": "pending",
+            }
+        ],
+        mutating=True,
+    )
+
+    assert decision["allowed"] is False
+    assert decision["failure_class"] == "escalation_required"

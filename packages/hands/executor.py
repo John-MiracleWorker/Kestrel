@@ -368,12 +368,18 @@ class DockerExecutor:
 
                     return {
                         "output": result.get("output", ""),
+                        "artifact_manifest": result.get("artifact_manifest", []),
+                        "partial_output": result.get("partial_output", False),
                         "execution_time_ms": elapsed_ms,
                         "memory_used_mb": result.get("memory_used_mb", 0),
+                        "exit_code": result.get("exit_code", 0),
+                        "stdout_pointer": result.get("stdout_pointer", ""),
+                        "stderr_pointer": result.get("stderr_pointer", ""),
+                        "logs_pointer": result.get("logs_pointer", ""),
                         "audit_log": {
                             "network_requests": result.get("network_requests", []),
-                            "file_accesses": [],
-                            "system_calls": [],
+                            "file_accesses": result.get("file_accesses", []),
+                            "system_calls": result.get("system_calls", []),
                             "sandbox_id": result.get("container_id", ""),
                         },
                     }
@@ -438,19 +444,31 @@ class DockerExecutor:
         container = None
         try:
             container = client.containers.run(**config)
-            container.wait(timeout=timeout)
+            wait_result = container.wait(timeout=timeout)
+            exit_code = int(wait_result.get("StatusCode", 0) if isinstance(wait_result, dict) else 0)
 
+            stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")
+            stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="replace")
             logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")
 
             # Parse structured output (JSON on last line)
-            lines = logs.strip().split("\n")
-            output = logs
+            lines = stdout.strip().split("\n")
+            output = stdout or logs
+            artifact_manifest = []
+            partial_output = False
 
             try:
                 # Try to parse last line as JSON result
                 result_line = lines[-1] if lines else "{}"
                 parsed = json.loads(result_line)
-                output = json.dumps(parsed)
+                if isinstance(parsed, dict):
+                    output = json.dumps(parsed)
+                    raw_artifacts = parsed.get("artifact_manifest") or parsed.get("artifacts") or []
+                    if isinstance(raw_artifacts, list):
+                        artifact_manifest = raw_artifacts
+                    partial_output = bool(parsed.get("partial_output"))
+                else:
+                    output = json.dumps(parsed)
             except (json.JSONDecodeError, IndexError):
                 pass
 
@@ -466,11 +484,24 @@ class DockerExecutor:
                 if rx > 0 or tx > 0:
                     network_requests.append(f"{iface}: rx={rx}B tx={tx}B")
 
+            stdout_pointer = f"hands://sandbox/{container.id[:12]}/stdout"
+            stderr_pointer = f"hands://sandbox/{container.id[:12]}/stderr"
+            logs_pointer = f"hands://sandbox/{container.id[:12]}/logs"
+
             return {
                 "output": output,
                 "container_id": container.id[:12],
                 "memory_used_mb": memory_used // (1024 * 1024),
                 "network_requests": network_requests,
+                "file_accesses": list(config.get("volumes", {}).keys()),
+                "system_calls": [],
+                "artifact_manifest": artifact_manifest,
+                "partial_output": partial_output,
+                "exit_code": exit_code,
+                "stdout_pointer": stdout_pointer,
+                "stderr_pointer": stderr_pointer,
+                "logs_pointer": logs_pointer,
+                "stderr": stderr,
             }
 
         except Exception as e:

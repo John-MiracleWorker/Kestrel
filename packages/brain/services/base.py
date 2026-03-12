@@ -22,6 +22,13 @@ class BaseServicerMixin:
             "task_complete": brain_pb2.TaskEvent.EventType.TASK_COMPLETE,
             "task_failed": brain_pb2.TaskEvent.EventType.TASK_FAILED,
             "task_paused": brain_pb2.TaskEvent.EventType.TASK_PAUSED,
+            "tool_auto_approved": brain_pb2.TaskEvent.EventType.TOOL_AUTO_APPROVED,
+            "verifier_started": brain_pb2.TaskEvent.EventType.VERIFIER_STARTED,
+            "verifier_passed": brain_pb2.TaskEvent.EventType.VERIFIER_PASSED,
+            "verifier_failed": brain_pb2.TaskEvent.EventType.VERIFIER_FAILED,
+            "checkpoint_saved": brain_pb2.TaskEvent.EventType.CHECKPOINT_SAVED,
+            "simulation_complete": brain_pb2.TaskEvent.EventType.SIMULATION_COMPLETE,
+            "model_routed": brain_pb2.TaskEvent.EventType.MODEL_ROUTED,
         }.get(event_type_value, brain_pb2.TaskEvent.EventType.THINKING)
 
     @staticmethod
@@ -37,6 +44,13 @@ class BaseServicerMixin:
             brain_pb2.TaskEvent.EventType.TASK_COMPLETE: "task_complete",
             brain_pb2.TaskEvent.EventType.TASK_FAILED: "task_failed",
             brain_pb2.TaskEvent.EventType.TASK_PAUSED: "task_paused",
+            brain_pb2.TaskEvent.EventType.TOOL_AUTO_APPROVED: "tool_auto_approved",
+            brain_pb2.TaskEvent.EventType.VERIFIER_STARTED: "verifier_started",
+            brain_pb2.TaskEvent.EventType.VERIFIER_PASSED: "verifier_passed",
+            brain_pb2.TaskEvent.EventType.VERIFIER_FAILED: "verifier_failed",
+            brain_pb2.TaskEvent.EventType.CHECKPOINT_SAVED: "checkpoint_saved",
+            brain_pb2.TaskEvent.EventType.SIMULATION_COMPLETE: "simulation_complete",
+            brain_pb2.TaskEvent.EventType.MODEL_ROUTED: "model_routed",
         }.get(int(event_type_value), "thinking")
 
     async def _persist_task_event(

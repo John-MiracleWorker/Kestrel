@@ -10,6 +10,25 @@ export interface SessionData {
     connectedAt: string;
     workspaceId?: string;
     metadata?: Record<string, any>;
+    conversationId?: string;
+    externalConversationId?: string;
+    externalThreadId?: string;
+    returnRoute?: Record<string, any>;
+    correlationId?: string;
+}
+
+export interface SessionRouteData {
+    sessionId: string;
+    conversationId?: string;
+    externalConversationId?: string;
+    externalThreadId?: string;
+    channel: string;
+    userId: string;
+    workspaceId: string;
+    returnRoute?: Record<string, any>;
+    lastIngressId?: string;
+    lastTaskId?: string;
+    updatedAt: string;
 }
 
 /**
@@ -18,8 +37,9 @@ export interface SessionData {
  */
 export class SessionManager {
     private prefix = 'session:';
+    private routePrefix = 'session_route:';
 
-    constructor(private redis: Redis) { }
+    constructor(private redis: Redis) {}
 
     async create(sessionId: string, data: SessionData): Promise<void> {
         const key = this.prefix + sessionId;
@@ -64,5 +84,15 @@ export class SessionManager {
         pipeline.del(`user_sessions:${userId}`);
         await pipeline.exec();
         logger.info('All sessions destroyed for user', { userId, count: sessions.length });
+    }
+
+    async saveRoute(routeKey: string, data: SessionRouteData): Promise<void> {
+        await this.redis.setex(this.routePrefix + routeKey, SESSION_TTL, JSON.stringify(data));
+    }
+
+    async getRoute(routeKey: string): Promise<SessionRouteData | null> {
+        const raw = await this.redis.get(this.routePrefix + routeKey);
+        if (!raw) return null;
+        return JSON.parse(raw) as SessionRouteData;
     }
 }

@@ -39,6 +39,22 @@ def _coerce_timestamp(value: Any) -> str:
     return str(value or "")
 
 
+def _coerce_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return [value]
+        return parsed if isinstance(parsed, list) else [value]
+    return list(value)
+
+
 @dataclass(frozen=True)
 class WorkspaceAgentProfile:
     id: str
@@ -94,6 +110,119 @@ class PolicyDecision:
     risk: str
     scope: str
     rationale: str
+
+
+@dataclass(frozen=True)
+class CapabilityGrant:
+    grant_id: str
+    scope: str = "workspace"
+    workspace_id: str = ""
+    user_id: str = ""
+    agent_profile_id: str = ""
+    channel: str = ""
+    action_selector: str = ""
+    tool_selector: str = ""
+    approval_state: str = ""
+    expires_at: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_value(cls, value: Any) -> "CapabilityGrant":
+        if isinstance(value, CapabilityGrant):
+            return value
+        payload = _coerce_dict(value)
+        return cls(
+            grant_id=str(payload.get("grant_id") or uuid.uuid4()),
+            scope=str(payload.get("scope") or "workspace"),
+            workspace_id=str(payload.get("workspace_id") or ""),
+            user_id=str(payload.get("user_id") or ""),
+            agent_profile_id=str(payload.get("agent_profile_id") or ""),
+            channel=str(payload.get("channel") or ""),
+            action_selector=str(payload.get("action_selector") or ""),
+            tool_selector=str(payload.get("tool_selector") or ""),
+            approval_state=str(payload.get("approval_state") or ""),
+            expires_at=str(payload.get("expires_at") or ""),
+            metadata=_coerce_dict(payload.get("metadata")),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "grant_id": self.grant_id,
+            "scope": self.scope,
+            "workspace_id": self.workspace_id,
+            "user_id": self.user_id,
+            "agent_profile_id": self.agent_profile_id,
+            "channel": self.channel,
+            "action_selector": self.action_selector,
+            "tool_selector": self.tool_selector,
+            "approval_state": self.approval_state,
+            "expires_at": self.expires_at,
+            "metadata": dict(self.metadata),
+        }
+
+    def is_expired(self, *, now: Optional[datetime] = None) -> bool:
+        if not self.expires_at:
+            return False
+        try:
+            expires = datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        return expires <= (now or datetime.now(timezone.utc))
+
+    def matches(
+        self,
+        *,
+        workspace_id: str = "",
+        user_id: str = "",
+        agent_profile_id: str = "",
+        channel: str = "",
+        action_name: str = "",
+        tool_name: str = "",
+    ) -> bool:
+        if self.workspace_id and self.workspace_id != workspace_id:
+            return False
+        if self.user_id and self.user_id != user_id:
+            return False
+        if self.agent_profile_id and self.agent_profile_id != agent_profile_id:
+            return False
+        if self.channel and self.channel != channel:
+            return False
+        if self.is_expired():
+            return False
+        if self.action_selector and self.action_selector not in {"*", action_name, tool_name}:
+            return False
+        if self.tool_selector and self.tool_selector not in {"*", tool_name, action_name}:
+            return False
+        return True
+
+
+@dataclass(frozen=True)
+class SessionRoute:
+    channel: str = ""
+    external_conversation_id: str = ""
+    external_thread_id: str = ""
+    return_route: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_value(cls, value: Any) -> "SessionRoute":
+        payload = _coerce_dict(value)
+        return cls(
+            channel=str(payload.get("channel") or ""),
+            external_conversation_id=str(payload.get("external_conversation_id") or ""),
+            external_thread_id=str(payload.get("external_thread_id") or ""),
+            return_route=_coerce_dict(payload.get("return_route")),
+            metadata=_coerce_dict(payload.get("metadata")),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "channel": self.channel,
+            "external_conversation_id": self.external_conversation_id,
+            "external_thread_id": self.external_thread_id,
+            "return_route": dict(self.return_route),
+            "metadata": dict(self.metadata),
+        }
 
 
 @dataclass(frozen=True)
@@ -222,7 +351,8 @@ class ExecutionContext:
     source: str
     trace_id: str
     budgets: dict[str, Any] = field(default_factory=dict)
-    permissions: dict[str, Any] = field(default_factory=dict)
+    capability_grants: tuple[CapabilityGrant, ...] = ()
+    route: Optional[SessionRoute] = None
     autonomy_policy: str = "moderate"
     kernel_preset: str = "ops"
     cancellation_token: str = ""
@@ -241,7 +371,8 @@ class ExecutionContext:
         session_id: str = "",
         source: str,
         budgets: Optional[dict[str, Any]] = None,
-        permissions: Optional[dict[str, Any]] = None,
+        capability_grants: Optional[list[dict[str, Any]] | tuple[dict[str, Any], ...]] = None,
+        route: Optional[dict[str, Any] | SessionRoute] = None,
         autonomy_policy: str = "moderate",
         kernel_preset: str = "ops",
         cancellation_token: str = "",
@@ -258,13 +389,52 @@ class ExecutionContext:
             source=source,
             trace_id=str(uuid.uuid4()),
             budgets=dict(budgets or {}),
-            permissions=dict(permissions or {}),
+            capability_grants=tuple(
+                CapabilityGrant.from_value(grant) for grant in _coerce_list(capability_grants)
+            ),
+            route=SessionRoute.from_value(route) if route else None,
             autonomy_policy=autonomy_policy,
             kernel_preset=kernel_preset,
             cancellation_token=cancellation_token,
             approval_mode=approval_mode,
             services=dict(services or {}),
         )
+
+    def has_capability(
+        self,
+        *,
+        action_name: str = "",
+        tool_name: str = "",
+        channel: str = "",
+        require_approval: bool = False,
+    ) -> bool:
+        for grant in self.capability_grants:
+            if require_approval and grant.approval_state not in {"approved", "auto_approved", ""}:
+                continue
+            if grant.matches(
+                workspace_id=self.workspace_id,
+                user_id=self.user_id,
+                agent_profile_id=self.agent_profile_id,
+                channel=channel or self.source,
+                action_name=action_name,
+                tool_name=tool_name,
+            ):
+                return True
+        return False
+
+    def grants_for(self, *, action_name: str = "", tool_name: str = "", channel: str = "") -> list[dict[str, Any]]:
+        return [
+            grant.to_dict()
+            for grant in self.capability_grants
+            if grant.matches(
+                workspace_id=self.workspace_id,
+                user_id=self.user_id,
+                agent_profile_id=self.agent_profile_id,
+                channel=channel or self.source,
+                action_name=action_name,
+                tool_name=tool_name,
+            )
+        ]
 
     def to_tool_context(self) -> dict[str, Any]:
         context = {
@@ -277,6 +447,9 @@ class ExecutionContext:
             "agent_profile_id": self.agent_profile_id,
             "source": self.source,
             "trace_id": self.trace_id,
+            "capability_grants": [grant.to_dict() for grant in self.capability_grants],
         }
+        if self.route:
+            context["session_route"] = self.route.to_dict()
         context.update(self.services)
         return context

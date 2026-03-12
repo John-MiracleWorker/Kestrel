@@ -7,7 +7,7 @@ import { SessionManager } from '../session/manager';
 import { BrainClient } from '../brain/client';
 import { logger } from '../utils/logger';
 import { wsConnectionsGauge } from '../utils/metrics';
-import { buildBrainStreamChatRequest, createNormalizedIngressEvent } from './ingress';
+import { buildBrainStreamChatRequest, buildSessionCommand, createIngressEnvelope } from './ingress';
 
 interface AuthenticatedSocket extends WebSocket {
     userId: string;
@@ -214,7 +214,7 @@ export class WebChannelAdapter extends BaseChannelAdapter {
                     typeof msg.clientMessageId === 'string' && msg.clientMessageId.trim()
                         ? msg.clientMessageId
                         : randomUUID();
-                const ingressEvent = createNormalizedIngressEvent({
+                const ingressEvent = createIngressEnvelope({
                     id: clientMessageId,
                     channel: 'web',
                     userId: socket.userId,
@@ -251,6 +251,10 @@ export class WebChannelAdapter extends BaseChannelAdapter {
                         attachments: Array.isArray(msg.attachments) ? msg.attachments : [],
                     },
                 });
+                const command = buildSessionCommand(ingressEvent, {
+                    sessionId: socket.sessionId,
+                    conversationId: msg.conversationId || '',
+                });
                 const messageId = ingressEvent.id;
 
                 logger.info('Web ingress event normalized', {
@@ -259,6 +263,15 @@ export class WebChannelAdapter extends BaseChannelAdapter {
                     correlationId: ingressEvent.correlationId,
                     dedupeKey: ingressEvent.dedupeKey,
                     hasAttachments: !!ingressEvent.attachments?.length,
+                });
+
+                await this.sessions.update(socket.sessionId, {
+                    workspaceId: ingressEvent.workspaceId,
+                    conversationId: command.conversationId,
+                    externalConversationId: ingressEvent.externalConversationId,
+                    externalThreadId: ingressEvent.externalThreadId,
+                    correlationId: ingressEvent.correlationId,
+                    returnRoute: command.returnRoute,
                 });
 
                 // Send a "thinking" indicator immediately so the user knows we're working
@@ -273,8 +286,8 @@ export class WebChannelAdapter extends BaseChannelAdapter {
 
                 try {
                     const stream = this.brain.streamChat(
-                        buildBrainStreamChatRequest(ingressEvent, {
-                            conversationId: ingressEvent.conversationId || '',
+                        buildBrainStreamChatRequest(command, {
+                            conversationId: command.conversationId || '',
                             provider: msg.provider || '',
                             model: msg.model || '',
                         }),

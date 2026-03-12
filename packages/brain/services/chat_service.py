@@ -101,6 +101,7 @@ class ChatServicerMixin(BaseServicerMixin):
         user_id = request.user_id
         workspace_id = request.workspace_id
         conversation_id = request.conversation_id
+        registered_session_id = ""
 
         logger.info(
             f"StreamChat: user={user_id}, workspace={workspace_id}, "
@@ -291,6 +292,32 @@ class ChatServicerMixin(BaseServicerMixin):
                 chat_task.status = TaskStatus.EXECUTING
 
             await runtime.agent_persistence.save_task(chat_task)
+            if getattr(runtime, "session_manager", None):
+                route = (
+                    chat_task.execution_context.route.to_dict()
+                    if getattr(chat_task, "execution_context", None)
+                    and chat_task.execution_context.route
+                    else {}
+                )
+                registered_session_id = chat_task.id
+                await runtime.session_manager.register_session(
+                    session_id=registered_session_id,
+                    task_id=chat_task.id,
+                    workspace_id=workspace_id,
+                    user_id=request.user_id,
+                    agent_type="chat",
+                    model=ctx.model,
+                    goal=chat_task.goal,
+                    agent_profile_id=getattr(chat_task.execution_context, "agent_profile_id", ""),
+                    channel=ctx.channel_name,
+                    prunable_after=None,
+                    external_conversation_id=str(
+                        route.get("external_conversation_id") or ""
+                    ),
+                    external_thread_id=str(route.get("external_thread_id") or ""),
+                    return_route=route.get("return_route") or {},
+                    session_metadata=route.get("metadata") or {},
+                )
 
             # Attach activity callback to agent sub-modules
             if hasattr(agent_loop, '_council') and agent_loop._council:
@@ -322,6 +349,8 @@ class ChatServicerMixin(BaseServicerMixin):
                 api_key=ctx.api_key,
                 user_id=request.user_id,
             )
+            if registered_session_id and getattr(runtime, "session_manager", None):
+                await runtime.session_manager.deregister_session(registered_session_id)
 
             # Send DONE
             yield self._make_response(
@@ -331,6 +360,11 @@ class ChatServicerMixin(BaseServicerMixin):
 
         except Exception as e:
             logger.error(f"StreamChat error: {e}", exc_info=True)
+            if registered_session_id and getattr(runtime, "session_manager", None):
+                try:
+                    await runtime.session_manager.deregister_session(registered_session_id)
+                except Exception as deregister_error:
+                    logger.warning("Failed to close chat session %s: %s", registered_session_id, deregister_error)
             yield self._make_response(
                 chunk_type=3,
                 error_message=str(e),

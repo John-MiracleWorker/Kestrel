@@ -1,12 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { IncomingMessage } from '../src/channels/base';
 import {
     buildBrainStreamChatRequest,
+    buildSessionCommand,
     createNormalizedIngressEvent,
-    normalizeIngressEvent,
 } from '../src/channels/ingress';
 
-describe('normalized ingress contract', () => {
+describe('ingress envelope pipeline', () => {
     it('creates a normalized ingress event with generated correlation and dedupe keys', () => {
         const event = createNormalizedIngressEvent({
             channel: 'web',
@@ -34,9 +33,9 @@ describe('normalized ingress contract', () => {
         expect(event.dedupeKey).toContain('web:user-1:conv-1:client-msg-1');
     });
 
-    it('upgrades a legacy incoming message emitted by existing adapters', () => {
-        const legacy: IncomingMessage = {
-            id: 'legacy-1',
+    it('builds a session command with cross-surface routing metadata', () => {
+        const event = createNormalizedIngressEvent({
+            id: 'ingress-1',
             channel: 'telegram',
             userId: 'resolved-user',
             workspaceId: 'ws-1',
@@ -46,18 +45,38 @@ describe('normalized ingress contract', () => {
                 channelUserId: 'tg-user-42',
                 channelMessageId: '99',
                 timestamp: new Date('2026-03-12T11:00:00.000Z'),
-                isTaskRequest: true,
                 telegramThreadId: 777,
             },
-        };
+            externalUserId: 'tg-user-42',
+            externalConversationId: 'tg-chat-99',
+            externalThreadId: '777',
+            authContext: {
+                transport: 'telegram_polling',
+                authenticatedUserId: 'resolved-user',
+                sessionId: 'sess-telegram-1',
+                isProvisionalUser: false,
+            },
+            payloadKind: 'task',
+        });
+        const command = buildSessionCommand(event, {
+            sessionId: 'sess-telegram-1',
+            conversationId: 'brain-conv-1',
+        });
 
-        const event = normalizeIngressEvent(legacy);
-
-        expect(event.externalUserId).toBe('tg-user-42');
-        expect(event.externalConversationId).toBe('tg-chat-99');
-        expect(event.externalThreadId).toBe('777');
-        expect(event.payload.kind).toBe('task');
-        expect(event.authContext.transport).toBe('legacy_adapter');
+        expect(command.sessionId).toBe('sess-telegram-1');
+        expect(command.conversationId).toBe('brain-conv-1');
+        expect(command.taskIntent).toBe('task');
+        expect(command.returnRoute).toMatchObject({
+            channel: 'telegram',
+            externalConversationId: 'tg-chat-99',
+            externalThreadId: '777',
+        });
+        expect(JSON.parse(command.parameters.return_route)).toMatchObject({
+            channel: 'telegram',
+            external_conversation_id: 'tg-chat-99',
+            external_thread_id: '777',
+            session_id: 'sess-telegram-1',
+        });
     });
 
     it('builds a Brain stream request with ingress metadata in parameters', () => {
@@ -86,8 +105,12 @@ describe('normalized ingress contract', () => {
                 isProvisionalUser: false,
             },
         });
+        const command = buildSessionCommand(event, {
+            sessionId: 'sess-2',
+            conversationId: 'conv-1',
+        });
 
-        const request = buildBrainStreamChatRequest(event, {
+        const request = buildBrainStreamChatRequest(command, {
             provider: 'openai',
             model: 'gpt-5-nano',
             conversationId: 'conv-1',

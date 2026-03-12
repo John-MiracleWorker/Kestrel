@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'crypto';
 import { z } from 'zod';
-import type { Attachment, ChannelType, IncomingMessage } from './base';
+import type { Attachment, ChannelType } from './base';
 import { generateCorrelationId } from '../utils/logger';
 
 const channelTypeSchema = z.enum([
@@ -21,7 +21,7 @@ const attachmentSchema: z.ZodType<Attachment> = z.object({
     filename: z.string().optional(),
 });
 
-const dateSchema = z.preprocess((value) => {
+const dateSchema = z.preprocess((value: unknown) => {
     if (value instanceof Date) return value;
     if (typeof value === 'string' || typeof value === 'number') return new Date(value);
     return value;
@@ -50,7 +50,7 @@ const payloadSchema = z.object({
     attachments: z.array(attachmentSchema).default([]),
 });
 
-export const normalizedIngressEventSchema = z.object({
+export const ingressEnvelopeSchema = z.object({
     id: z.string().min(1),
     channel: channelTypeSchema,
     userId: z.string().min(1),
@@ -70,9 +70,38 @@ export const normalizedIngressEventSchema = z.object({
     rawMetadata: z.record(z.string(), z.unknown()),
 });
 
+export const sessionCommandSchema = z.object({
+    sessionId: z.string().min(1),
+    conversationId: z.string().optional(),
+    userId: z.string().min(1),
+    workspaceId: z.string().min(1),
+    taskIntent: payloadKindSchema,
+    normalizedContent: z.string(),
+    attachments: z.array(attachmentSchema).default([]),
+    returnRoute: z.object({
+        channel: channelTypeSchema,
+        userId: z.string().min(1),
+        externalConversationId: z.string().optional(),
+        externalThreadId: z.string().optional(),
+        sessionId: z.string().min(1),
+    }),
+    approvalRoute: z.object({
+        channel: channelTypeSchema,
+        sessionId: z.string().min(1),
+    }),
+    artifactRoute: z.object({
+        channel: channelTypeSchema,
+        sessionId: z.string().min(1),
+    }),
+    parameters: z.record(z.string(), z.string()),
+    ingress: ingressEnvelopeSchema,
+});
+
 export type NormalizedIngressAuthContext = z.infer<typeof authContextSchema>;
 export type NormalizedIngressPayloadKind = z.infer<typeof payloadKindSchema>;
-export type NormalizedIngressEvent = z.infer<typeof normalizedIngressEventSchema>;
+export type IngressEnvelope = z.infer<typeof ingressEnvelopeSchema>;
+export type SessionCommand = z.infer<typeof sessionCommandSchema>;
+export type NormalizedIngressEvent = IngressEnvelope;
 
 type CreateNormalizedIngressEventInput = {
     id?: string;
@@ -136,14 +165,6 @@ function inferExternalThreadId(metadata: Record<string, unknown>): string | unde
     return undefined;
 }
 
-function inferPayloadKind(message: IncomingMessage): NormalizedIngressPayloadKind {
-    const metadata = message.metadata as Record<string, unknown>;
-    if (metadata.isTaskRequest === true) return 'task';
-    if (metadata.isSlashCommand === true || message.content.trim().startsWith('/'))
-        return 'command';
-    return 'message';
-}
-
 export function buildIngressDedupeKey(input: BuildDedupeKeyInput): string {
     const conversationId = input.externalConversationId || 'direct';
     const messageRef =
@@ -153,17 +174,15 @@ export function buildIngressDedupeKey(input: BuildDedupeKeyInput): string {
     return `${input.channel}:${input.externalUserId}:${conversationId}:${messageRef}`;
 }
 
-export function parseNormalizedIngressEvent(value: unknown): NormalizedIngressEvent {
-    return normalizedIngressEventSchema.parse(value);
+export function parseIngressEnvelope(value: unknown): IngressEnvelope {
+    return ingressEnvelopeSchema.parse(value);
 }
 
-export function isNormalizedIngressEvent(value: unknown): value is NormalizedIngressEvent {
-    return normalizedIngressEventSchema.safeParse(value).success;
+export function isIngressEnvelope(value: unknown): value is IngressEnvelope {
+    return ingressEnvelopeSchema.safeParse(value).success;
 }
 
-export function createNormalizedIngressEvent(
-    input: CreateNormalizedIngressEventInput,
-): NormalizedIngressEvent {
+export function createIngressEnvelope(input: CreateNormalizedIngressEventInput): IngressEnvelope {
     const attachments = input.attachments?.length ? input.attachments : undefined;
     const metadata = {
         ...input.metadata,
@@ -206,42 +225,81 @@ export function createNormalizedIngressEvent(
         rawMetadata: input.rawMetadata || { ...metadata },
     };
 
-    return parseNormalizedIngressEvent(event);
+    return parseIngressEnvelope(event);
 }
 
-export function normalizeIngressEvent(
-    message: IncomingMessage | NormalizedIngressEvent,
-): NormalizedIngressEvent {
-    if (isNormalizedIngressEvent(message)) {
-        return parseNormalizedIngressEvent(message);
+export function createNormalizedIngressEvent(
+    input: CreateNormalizedIngressEventInput,
+): IngressEnvelope {
+    return createIngressEnvelope(input);
+}
+
+export function buildSessionCommand(
+    ingress: IngressEnvelope,
+    route: {
+        sessionId?: string;
+        conversationId?: string;
+    } = {},
+): SessionCommand {
+    const sessionId =
+        route.sessionId || ingress.authContext.sessionId || ingress.conversationId || ingress.id;
+    const parameters: Record<string, string> = {
+        channel: ingress.channel,
+        correlation_id: ingress.correlationId,
+        ingress_dedupe_key: ingress.dedupeKey,
+        ingress_kind: ingress.payload.kind,
+        auth_transport: ingress.authContext.transport,
+        external_user_id: ingress.externalUserId,
+        session_id: sessionId,
+        return_route: JSON.stringify({
+            channel: ingress.channel,
+            user_id: ingress.userId,
+            external_conversation_id: ingress.externalConversationId || '',
+            external_thread_id: ingress.externalThreadId || '',
+            session_id: sessionId,
+        }),
+    };
+
+    if (ingress.externalConversationId) {
+        parameters.external_conversation_id = ingress.externalConversationId;
+    }
+    if (ingress.externalThreadId) {
+        parameters.external_thread_id = ingress.externalThreadId;
+    }
+    if (ingress.attachments?.length) {
+        parameters.attachments = JSON.stringify(ingress.attachments);
     }
 
-    return createNormalizedIngressEvent({
-        id: message.id,
-        channel: message.channel,
-        userId: message.userId,
-        workspaceId: message.workspaceId,
-        conversationId: message.conversationId,
-        content: message.content,
-        attachments: message.attachments,
-        metadata: {
-            ...message.metadata,
-            channelMessageId: message.metadata.channelMessageId || message.id,
+    return sessionCommandSchema.parse({
+        sessionId,
+        conversationId: route.conversationId ?? ingress.conversationId,
+        userId: ingress.userId,
+        workspaceId: ingress.workspaceId,
+        taskIntent: ingress.payload.kind,
+        normalizedContent: ingress.payload.content,
+        attachments: ingress.payload.attachments,
+        returnRoute: {
+            channel: ingress.channel,
+            userId: ingress.userId,
+            externalConversationId: ingress.externalConversationId,
+            externalThreadId: ingress.externalThreadId,
+            sessionId,
         },
-        externalUserId: message.metadata.channelUserId || message.userId,
-        externalConversationId: message.conversationId,
-        authContext: {
-            transport: 'legacy_adapter',
-            authenticatedUserId: message.userId,
-            isProvisionalUser: false,
+        approvalRoute: {
+            channel: ingress.channel,
+            sessionId,
         },
-        payloadKind: inferPayloadKind(message),
-        rawMetadata: { ...message.metadata },
+        artifactRoute: {
+            channel: ingress.channel,
+            sessionId,
+        },
+        parameters,
+        ingress,
     });
 }
 
 export function buildBrainStreamChatRequest(
-    message: NormalizedIngressEvent,
+    command: SessionCommand,
     overrides: {
         conversationId?: string;
         provider?: string;
@@ -256,32 +314,17 @@ export function buildBrainStreamChatRequest(
     model: string;
     parameters: Record<string, string>;
 } {
-    const parameters: Record<string, string> = {
-        channel: message.channel,
-        correlation_id: message.correlationId,
-        ingress_dedupe_key: message.dedupeKey,
-        ingress_kind: message.payload.kind,
-        auth_transport: message.authContext.transport,
-        external_user_id: message.externalUserId,
-    };
-
-    if (message.externalConversationId) {
-        parameters.external_conversation_id = message.externalConversationId;
-    }
-    if (message.externalThreadId) {
-        parameters.external_thread_id = message.externalThreadId;
-    }
-    if (message.attachments?.length) {
-        parameters.attachments = JSON.stringify(message.attachments);
-    }
-
     return {
-        userId: message.userId,
-        workspaceId: message.workspaceId,
-        conversationId: overrides.conversationId ?? message.conversationId ?? '',
-        messages: [{ role: 0, content: message.payload.content }],
+        userId: command.userId,
+        workspaceId: command.workspaceId,
+        conversationId: overrides.conversationId ?? command.conversationId ?? '',
+        messages: [{ role: 0, content: command.normalizedContent }],
         provider: overrides.provider || '',
         model: overrides.model || '',
-        parameters,
+        parameters: { ...command.parameters },
     };
 }
+
+export const normalizedIngressEventSchema = ingressEnvelopeSchema;
+export const parseNormalizedIngressEvent = parseIngressEnvelope;
+export const isNormalizedIngressEvent = isIngressEnvelope;

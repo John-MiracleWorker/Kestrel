@@ -408,6 +408,13 @@ message TaskEvent {
     TASK_COMPLETE = 7;
     TASK_FAILED = 8;
     TASK_PAUSED = 9;
+    TOOL_AUTO_APPROVED = 10;
+    VERIFIER_STARTED = 11;
+    VERIFIER_PASSED = 12;
+    VERIFIER_FAILED = 13;
+    CHECKPOINT_SAVED = 14;
+    SIMULATION_COMPLETE = 15;
+    MODEL_ROUTED = 16;
   }
 
   EventType type = 1;
@@ -516,6 +523,40 @@ message RecoveryHint {
   string description = 3;
 }
 
+message ReceiptSummary {
+  string receipt_id = 1;
+  string tool_name = 2;
+  string step_id = 3;
+  string runtime_class = 4;
+  string risk_class = 5;
+  string failure_class = 6;
+  string logs_pointer = 7;
+  int32 exit_code = 8;
+  string audit_summary = 9;
+  string artifact_manifest_json = 10;
+  string created_at = 11;
+}
+
+message VerifierEvidenceReference {
+  string id = 1;
+  string claim_text = 2;
+  string verdict = 3;
+  double confidence = 4;
+  string rationale = 5;
+  string supporting_receipt_ids_json = 6;
+  string artifact_refs_json = 7;
+  string created_at = 8;
+}
+
+message SessionProvenance {
+  string session_id = 1;
+  string channel = 2;
+  string external_conversation_id = 3;
+  string external_thread_id = 4;
+  string return_route_json = 5;
+  string metadata_json = 6;
+}
+
 message TaskDetail {
   string id = 1;
   string goal = 2;
@@ -541,6 +582,9 @@ message TaskDetail {
   bool stale = 22;
   bool orphaned = 23;
   repeated RecoveryHint recovery_hints = 24;
+  repeated ReceiptSummary receipts = 25;
+  repeated VerifierEvidenceReference verifier_evidence = 26;
+  SessionProvenance session = 27;
 }
 
 message GetTaskDetailResponse {
@@ -566,6 +610,9 @@ message TaskTimelineItem {
   string event_metadata_json = 10;
   string metrics_json = 11;
   string created_at = 12;
+  string journal_event_id = 13;
+  string receipt_id = 14;
+  string verifier_evidence_ids_json = 15;
 }
 
 message ListTaskTimelineResponse {
@@ -583,6 +630,7 @@ message TaskCheckpointItem {
   int32 step_index = 2;
   string label = 3;
   string created_at = 4;
+  string journal_event_id = 5;
 }
 
 message ListTaskCheckpointsResponse {
@@ -629,6 +677,8 @@ message ApprovalAuditItem {
   string decided_at = 9;
   string created_at = 10;
   string tool_args_json = 11;
+  string capability_grants_json = 12;
+  string receipt_id = 13;
 }
 
 message GetApprovalAuditResponse {
@@ -651,6 +701,9 @@ message OperatorTaskItem {
   string lease_expires_at = 7;
   string queue_status = 8;
   string conversation_id = 9;
+  string session_channel = 10;
+  string external_conversation_id = 11;
+  string latest_receipt_id = 12;
 }
 
 message ListOperatorTasksResponse {

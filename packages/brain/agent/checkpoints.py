@@ -31,6 +31,7 @@ class Checkpoint:
     label: str
     state_json: str  # serialized task state
     created_at: str
+    journal_event_id: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -39,6 +40,7 @@ class Checkpoint:
             "step_index": self.step_index,
             "label": self.label,
             "created_at": self.created_at,
+            "journal_event_id": self.journal_event_id,
         }
 
 
@@ -62,6 +64,7 @@ class CheckpointManager:
         label: str,
         state_json: str,
         created_at: str = "",
+        journal_event_id: str = "",
     ) -> str:
         checkpoint_id = str(uuid.uuid4())
         now = created_at or datetime.now(timezone.utc).isoformat()
@@ -69,8 +72,8 @@ class CheckpointManager:
             async with self._pool.acquire() as conn:
                 await conn.execute(
                     """
-                    INSERT INTO agent_checkpoints (id, task_id, step_index, label, state_json, created_at)
-                    VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+                    INSERT INTO agent_checkpoints (id, task_id, step_index, label, state_json, created_at, journal_event_id)
+                    VALUES ($1, $2, $3, $4, $5::jsonb, $6, NULLIF($7, '')::uuid)
                     """,
                     checkpoint_id,
                     task_id,
@@ -78,6 +81,7 @@ class CheckpointManager:
                     label,
                     state_json,
                     now,
+                    journal_event_id,
                 )
             logger.info(f"Checkpoint saved: {checkpoint_id} for task {task_id}")
             return checkpoint_id
@@ -132,7 +136,7 @@ class CheckpointManager:
             async with self._pool.acquire() as conn:
                 row = await conn.fetchrow(
                     """
-                    SELECT id, task_id, step_index, label, state_json, created_at
+                    SELECT id, task_id, step_index, label, state_json, created_at, journal_event_id
                     FROM agent_checkpoints
                     WHERE task_id = $1
                     ORDER BY created_at DESC
@@ -149,6 +153,7 @@ class CheckpointManager:
                 label=row["label"],
                 state_json=_state_json_text(row["state_json"]),
                 created_at=row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else str(row["created_at"]),
+                journal_event_id=str(row["journal_event_id"] or ""),
             )
         except Exception as e:
             logger.error(f"Failed to load latest checkpoint: {e}")
@@ -200,7 +205,7 @@ class CheckpointManager:
             async with self._pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
-                    SELECT id, task_id, step_index, label, state_json, created_at
+                    SELECT id, task_id, step_index, label, state_json, created_at, journal_event_id
                     FROM agent_checkpoints
                     WHERE task_id = $1
                     ORDER BY created_at ASC
@@ -216,6 +221,7 @@ class CheckpointManager:
                     label=row["label"],
                     state_json=_state_json_text(row["state_json"]),
                     created_at=row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else str(row["created_at"]),
+                    journal_event_id=str(row["journal_event_id"] or ""),
                 )
                 for row in rows
             ]

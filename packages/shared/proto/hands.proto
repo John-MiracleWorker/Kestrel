@@ -2,10 +2,9 @@ syntax = "proto3";
 
 package kestrel.hands;
 
-// Hands service handles sandboxed tool execution
+// Hands service handles sandboxed action execution.
 service HandsService {
-  // Execute a skill in sandboxed environment
-  rpc ExecuteSkill(SkillExecutionRequest) returns (stream SkillExecutionResponse);
+  rpc ExecuteAction(ActionExecutionRequest) returns (stream ActionExecutionEvent);
   
   // List available skills
   rpc ListSkills(ListSkillsRequest) returns (ListSkillsResponse);
@@ -14,19 +13,36 @@ service HandsService {
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 }
 
-// Skill execution request
-message SkillExecutionRequest {
-  string user_id = 1;
-  string workspace_id = 2;
-  string conversation_id = 3;
-  string skill_name = 4;
-  string function_name = 5;
-  string arguments = 6; // JSON string
-  
-  // Security and resource constraints
-  ResourceLimits limits = 7;
-  repeated string allowed_domains = 8; // for network access
-  repeated string allowed_paths = 9; // for file access
+message CapabilityGrant {
+  string grant_id = 1;
+  string scope = 2;
+  string workspace_id = 3;
+  string user_id = 4;
+  string agent_profile_id = 5;
+  string channel = 6;
+  string action_selector = 7;
+  string tool_selector = 8;
+  string approval_state = 9;
+  string expires_at = 10;
+  string metadata_json = 11;
+}
+
+message ActionExecutionRequest {
+  string request_id = 1;
+  string user_id = 2;
+  string workspace_id = 3;
+  string conversation_id = 4;
+  string session_id = 5;
+  string action_name = 6;
+  string function_name = 7;
+  string arguments_json = 8;
+  string routing_context_json = 9;
+  string budgets_json = 10;
+  bool mutating = 11;
+  ResourceLimits limits = 12;
+  repeated string allowed_domains = 13;
+  repeated string allowed_paths = 14;
+  repeated CapabilityGrant grants = 15;
 }
 
 // Resource limits for sandbox
@@ -39,33 +55,72 @@ message ResourceLimits {
   bool file_system_write = 6; // default: false
 }
 
-// Skill execution response (streamed)
-message SkillExecutionResponse {
-  enum Status {
-    RUNNING = 0;
-    SUCCESS = 1;
-    ERROR = 2;
-    TIMEOUT = 3;
-    PERMISSION_DENIED = 4;
-  }
-  
-  Status status = 1;
-  string output = 2; // stdout/result
-  string error = 3; // stderr/error message
-  
-  // Metadata
-  int32 execution_time_ms = 4;
-  int32 memory_used_mb = 5;
-  AuditLog audit_log = 6;
-  string action_event_json = 7; // shared action/event schema payload
+enum FailureClass {
+  FAILURE_CLASS_UNSPECIFIED = 0;
+  FAILURE_CLASS_NONE = 1;
+  FAILURE_CLASS_PERMISSION_DENIED = 2;
+  FAILURE_CLASS_TIMEOUT = 3;
+  FAILURE_CLASS_SANDBOX_CRASH = 4;
+  FAILURE_CLASS_EXECUTION_ERROR = 5;
+  FAILURE_CLASS_PARTIAL_OUTPUT = 6;
+  FAILURE_CLASS_VALIDATION_ERROR = 7;
+  FAILURE_CLASS_ESCALATION_REQUIRED = 8;
 }
 
-// Audit log for skill execution
-message AuditLog {
-  repeated string network_requests = 1;
-  repeated string file_accesses = 2;
-  repeated string system_calls = 3;
-  string sandbox_id = 4;
+message ArtifactManifestEntry {
+  string artifact_id = 1;
+  string name = 2;
+  string artifact_type = 3;
+  string uri = 4;
+  string mime_type = 5;
+  int64 size_bytes = 6;
+  string checksum = 7;
+  string description = 8;
+  string metadata_json = 9;
+}
+
+message ActionReceipt {
+  string receipt_id = 1;
+  string request_id = 2;
+  string runtime_class = 3;
+  string risk_class = 4;
+  FailureClass failure_class = 5;
+  string logs_pointer = 6;
+  string stdout_pointer = 7;
+  string stderr_pointer = 8;
+  string sandbox_id = 9;
+  int32 exit_code = 10;
+  string audit_summary = 11;
+  repeated ArtifactManifestEntry artifact_manifest = 12;
+  repeated string file_touches = 13;
+  repeated string network_touches = 14;
+  repeated string system_touches = 15;
+  repeated CapabilityGrant grants = 16;
+  string metadata_json = 17;
+  bool mutating = 18;
+  string finalized_at = 19;
+}
+
+enum ActionExecutionStatus {
+  ACTION_RUNNING = 0;
+  ACTION_COMPLETED = 1;
+  ACTION_FAILED = 2;
+  ACTION_DENIED = 3;
+  ACTION_TIMEOUT = 4;
+  ACTION_PARTIAL = 5;
+}
+
+message ActionExecutionEvent {
+  ActionExecutionStatus status = 1;
+  string output = 2;
+  string error = 3;
+  int32 execution_time_ms = 4;
+  int32 memory_used_mb = 5;
+  string action_event_json = 6;
+  ActionReceipt receipt = 7;
+  FailureClass failure_class = 8;
+  bool final = 9;
+  string logs_pointer = 10;
 }
 
 // List skills request

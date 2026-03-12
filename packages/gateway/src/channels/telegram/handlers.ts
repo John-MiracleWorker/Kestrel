@@ -1,5 +1,5 @@
 import { Attachment } from '../base';
-import { createNormalizedIngressEvent, type NormalizedIngressPayloadKind } from '../ingress';
+import { createIngressEnvelope, type NormalizedIngressPayloadKind } from '../ingress';
 import { TelegramAdapter } from './index';
 import { TelegramUpdate, TelegramMessage, TelegramUser } from './types';
 import { parseApprovalDecision, parseTaskRequest } from '../orchestration/intents';
@@ -22,7 +22,7 @@ type TelegramIngressSeed = {
 };
 
 function emitTelegramIngress(adapter: TelegramAdapter, seed: TelegramIngressSeed): void {
-    const event = createNormalizedIngressEvent({
+    const event = createIngressEnvelope({
         channel: 'telegram',
         userId: seed.userId,
         workspaceId: adapter.config.defaultWorkspaceId,

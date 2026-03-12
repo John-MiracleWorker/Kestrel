@@ -89,7 +89,7 @@ export function NotificationBell() {
 
                         if (isTauri()) {
                             isPermissionGranted()
-                                .then(async (granted) => {
+                                .then(async (granted: boolean) => {
                                     let permissionGranted = granted;
                                     if (!permissionGranted) {
                                         const permission = await requestPermission();

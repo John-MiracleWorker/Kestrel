@@ -62,6 +62,7 @@ async def execute_code(
     workspace_id: str = "",
     user_id: str = "",
     conversation_id: str = "",
+    execution_context=None,
 ) -> dict:
     """
     Execute code through the active runtime backend selected at startup.
@@ -93,6 +94,19 @@ async def execute_code(
                 "workspace_id": workspace_id,
                 "user_id": user_id,
                 "conversation_id": conversation_id,
+                "session_id": getattr(execution_context, "session_id", ""),
+                "source": getattr(execution_context, "source", ""),
+                "capability_grants": (
+                    [grant.to_dict() for grant in getattr(execution_context, "capability_grants", ())]
+                    if execution_context
+                    else []
+                ),
+                "session_route": (
+                    execution_context.route.to_dict()
+                    if execution_context and getattr(execution_context, "route", None)
+                    else {}
+                ),
+                "mutating": True,
             },
         )
         if "capabilities" not in result:

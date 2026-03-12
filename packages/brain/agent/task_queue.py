@@ -468,7 +468,40 @@ class JobRunner:
             user_id=task.user_id,
             source=job.source,
             budgets=task.config.to_dict(),
-            permissions={"tool_policy_bundle": list(profile.tool_policy_bundle)},
+            capability_grants=[
+                {
+                    "scope": "workspace",
+                    "workspace_id": task.workspace_id,
+                    "user_id": task.user_id,
+                    "agent_profile_id": profile.id,
+                    "channel": job.source,
+                    "action_selector": "*",
+                    "tool_selector": "*",
+                    "approval_state": "policy",
+                    "metadata": {
+                        "tool_policy_bundle": list(profile.tool_policy_bundle),
+                    },
+                }
+            ],
+            route={
+                "channel": job.source,
+                "external_conversation_id": str(
+                    job.payload_json.get("external_conversation_id", "") or ""
+                ),
+                "external_thread_id": str(
+                    job.payload_json.get("external_thread_id", "") or ""
+                ),
+                "return_route": (
+                    job.payload_json.get("return_route")
+                    if isinstance(job.payload_json.get("return_route"), dict)
+                    else {}
+                ),
+                "metadata": (
+                    job.payload_json.get("session_metadata")
+                    if isinstance(job.payload_json.get("session_metadata"), dict)
+                    else job.payload_json
+                ),
+            },
             autonomy_policy=profile.autonomy_policy,
             kernel_preset=profile.kernel_preset,
             services={
@@ -485,6 +518,7 @@ class JobRunner:
 
         self.runtime_ctx.running_tasks[task.id] = task
         if getattr(self.runtime_ctx, "session_manager", None):
+            session_route = execution_context.route.to_dict() if execution_context.route else {}
             await self.runtime_ctx.session_manager.register_session(
                 session_id=task.id,
                 task_id=task.id,
@@ -496,9 +530,15 @@ class JobRunner:
                 agent_profile_id=profile.id,
                 channel=job.source,
                 prunable_after=(_utcnow() + timedelta(days=7)).isoformat(),
+                external_conversation_id=str(
+                    session_route.get("external_conversation_id") or ""
+                ),
+                external_thread_id=str(session_route.get("external_thread_id") or ""),
+                return_route=session_route.get("return_route") or {},
+                session_metadata=session_route.get("metadata") or {},
             )
 
-        async def _refresh_checkpoint_snapshot() -> None:
+        async def _refresh_checkpoint_snapshot(journal_event_id: str = "") -> None:
             checkpoint_manager = getattr(self.runtime_ctx, "checkpoint_manager", None)
             if not checkpoint_manager:
                 return
@@ -512,6 +552,7 @@ class JobRunner:
                     "label": latest.label,
                     "step_index": latest.step_index,
                     "created_at": latest.created_at,
+                    "journal_event_id": journal_event_id or latest.journal_event_id,
                 },
             )
 
@@ -541,13 +582,13 @@ class JobRunner:
                 "metadata": payload.get("metadata") or {},
                 "metrics": payload.get("metrics") or {},
             }
-            await persist_task_event_payload(
+            journal_event_id = await persist_task_event_payload(
                 serialized,
                 workspace_id=task.workspace_id,
                 user_id=task.user_id,
             )
             if event_type in {"checkpoint_saved", TaskEventType.MODEL_ROUTED.value}:
-                await _refresh_checkpoint_snapshot()
+                await _refresh_checkpoint_snapshot(journal_event_id)
 
         bundle = await build_task_runtime_bundle(
             task=task,
@@ -572,7 +613,7 @@ class JobRunner:
                     "metadata": event.metadata or {},
                     "metrics": event.metrics or {},
                 }
-                await persist_task_event_payload(
+                journal_event_id = await persist_task_event_payload(
                     payload,
                     workspace_id=task.workspace_id,
                     user_id=task.user_id,
@@ -584,7 +625,7 @@ class JobRunner:
                     TaskEventType.TASK_FAILED.value,
                     TaskEventType.TASK_PAUSED.value,
                 }:
-                    await _refresh_checkpoint_snapshot()
+                    await _refresh_checkpoint_snapshot(journal_event_id)
         finally:
             await _refresh_checkpoint_snapshot()
             self.runtime_ctx.running_tasks.pop(task.id, None)

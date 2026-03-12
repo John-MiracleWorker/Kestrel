@@ -153,7 +153,28 @@ async def create_chat_task(request, ctx, workspace_id: str) -> AgentTask:
         session_id=request.conversation_id or chat_task.id,
         source="chat",
         budgets=chat_task.config.to_dict(),
-        permissions={"tool_policy_bundle": list(agent_profile.tool_policy_bundle)},
+        capability_grants=[
+            {
+                "scope": "workspace",
+                "workspace_id": workspace_id,
+                "user_id": request.user_id,
+                "agent_profile_id": agent_profile.id,
+                "channel": ctx.channel_name,
+                "action_selector": "*",
+                "tool_selector": "*",
+                "approval_state": "policy",
+                "metadata": {
+                    "tool_policy_bundle": list(agent_profile.tool_policy_bundle),
+                },
+            }
+        ],
+        route={
+            "channel": ctx.channel_name,
+            "external_conversation_id": ctx.request_metadata.get("external_conversation_id", ""),
+            "external_thread_id": ctx.request_metadata.get("external_thread_id", ""),
+            "return_route": ctx.return_route,
+            "metadata": ctx.request_metadata,
+        },
         autonomy_policy=agent_profile.autonomy_policy,
         kernel_preset=agent_profile.kernel_preset,
         services={

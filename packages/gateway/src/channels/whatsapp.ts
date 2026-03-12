@@ -1,6 +1,6 @@
 import { createHmac } from 'crypto';
 import { BaseChannelAdapter, ChannelType, OutgoingMessage, Attachment } from './base';
-import { createNormalizedIngressEvent, type NormalizedIngressPayloadKind } from './ingress';
+import { createIngressEnvelope, type NormalizedIngressPayloadKind } from './ingress';
 import { parseTaskRequest } from './orchestration/intents';
 import { logger } from '../utils/logger';
 
@@ -243,7 +243,7 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
         payloadKind?: NormalizedIngressPayloadKind;
         metadata?: Record<string, unknown>;
     }): void {
-        const event = createNormalizedIngressEvent({
+        const event = createIngressEnvelope({
             channel: 'whatsapp',
             userId: input.userId,
             workspaceId: this.config.defaultWorkspaceId,

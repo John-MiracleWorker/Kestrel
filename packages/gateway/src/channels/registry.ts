@@ -1,12 +1,20 @@
-import { BaseChannelAdapter, ChannelType, IncomingMessage, OutgoingMessage } from './base';
+import {
+    Attachment,
+    BaseChannelAdapter,
+    ChannelType,
+    IncomingMessage,
+    OutgoingMessage,
+} from './base';
 import { BrainClient } from '../brain/client';
 import { Deduplicator } from '../sync/deduplicator';
 import { logger } from '../utils/logger';
 import {
-    NormalizedIngressEvent,
+    IngressEnvelope,
+    SessionCommand,
     buildBrainStreamChatRequest,
-    normalizeIngressEvent,
+    buildSessionCommand,
 } from './ingress';
+import { SessionManager } from '../session/manager';
 
 /**
  * Channel Registry — manages adapter lifecycle and message routing.
@@ -18,12 +26,12 @@ import {
 export class ChannelRegistry {
     private adapters = new Map<ChannelType, BaseChannelAdapter>();
     private userChannels = new Map<string, Set<ChannelType>>(); // userId → active channels
-    private knownConversations = new Map<string, string>(); // channelKey → conversationId
     private activeStreams = new Map<string, AbortController>(); // userId → active stream controller
 
     constructor(
         private brain: BrainClient,
         private deduplicator?: Deduplicator,
+        private sessions?: SessionManager,
     ) {}
 
     /**
@@ -134,11 +142,8 @@ export class ChannelRegistry {
      * tokens are forwarded progressively. Otherwise, the response
      * is accumulated and sent as a single final message.
      */
-    private async routeMessage(
-        adapter: BaseChannelAdapter,
-        msg: IncomingMessage | NormalizedIngressEvent,
-    ): Promise<void> {
-        const event = normalizeIngressEvent(msg);
+    private async routeMessage(adapter: BaseChannelAdapter, msg: IncomingMessage): Promise<void> {
+        const event = msg as IngressEnvelope;
         const channel = adapter.channelType;
         logger.info('Routing ingress event', {
             channel,
@@ -173,17 +178,17 @@ export class ChannelRegistry {
         // Process attachments through the adapter's handler
         if (event.attachments?.length) {
             event.attachments = await Promise.all(
-                event.attachments.map((a) => adapter.handleAttachment(a)),
+                event.attachments.map((a: Attachment) => adapter.handleAttachment(a)),
             );
             event.payload.attachments = event.attachments;
         }
 
-        // Use the channel-provided conversation ID (e.g. deterministic UUID from
-        // Telegram chat ID) so Brain can load and save history across messages.
-        // Fall back to a cached ID from a previous Brain response if available.
-        const conversationKey = `${channel}:${event.userId}:${event.externalConversationId || event.conversationId || ''}`;
-        const knownConvId = this.knownConversations.get(conversationKey);
-        const useConversationId = knownConvId || event.conversationId || '';
+        const conversationKey = `${channel}:${event.workspaceId}:${event.userId}:${event.externalConversationId || event.conversationId || ''}`;
+        const knownRoute = this.sessions ? await this.sessions.getRoute(conversationKey) : null;
+        const command = buildSessionCommand(event, {
+            sessionId: knownRoute?.sessionId,
+            conversationId: knownRoute?.conversationId || event.conversationId,
+        });
 
         // Track active stream so it can be cancelled (e.g. /stop)
         const controller = new AbortController();
@@ -192,8 +197,8 @@ export class ChannelRegistry {
         // Stream response from Brain
         try {
             const stream = this.brain.streamChat(
-                buildBrainStreamChatRequest(event, {
-                    conversationId: useConversationId,
+                buildBrainStreamChatRequest(command, {
+                    conversationId: command.conversationId || '',
                 }),
             );
 
@@ -202,9 +207,9 @@ export class ChannelRegistry {
                 await this.routeWithStreaming(
                     adapter,
                     event,
+                    command,
                     stream,
                     conversationKey,
-                    useConversationId,
                     controller.signal,
                 );
             } else {
@@ -212,9 +217,9 @@ export class ChannelRegistry {
                 await this.routeWithAccumulate(
                     adapter,
                     event,
+                    command,
                     stream,
                     conversationKey,
-                    useConversationId,
                     controller.signal,
                 );
             }
@@ -244,10 +249,10 @@ export class ChannelRegistry {
      */
     private async routeWithStreaming(
         adapter: BaseChannelAdapter,
-        msg: NormalizedIngressEvent,
+        msg: IngressEnvelope,
+        command: SessionCommand,
         stream: AsyncIterable<any>,
         conversationKey: string,
-        useConversationId: string,
         signal?: AbortSignal,
     ): Promise<void> {
         const FLUSH_INTERVAL_MS = 1500; // Telegram: ~1 edit/sec max
@@ -442,9 +447,24 @@ export class ChannelRegistry {
                     await flushPromise;
 
                     const returnedConvId = chunk.conversation_id || chunk.metadata?.conversation_id;
-                    const finalConvId = returnedConvId || useConversationId;
-                    if (finalConvId && (msg.externalConversationId || msg.conversationId)) {
-                        this.knownConversations.set(conversationKey, finalConvId);
+                    const finalConvId = returnedConvId || command.conversationId;
+                    if (
+                        this.sessions &&
+                        finalConvId &&
+                        (msg.externalConversationId || msg.conversationId)
+                    ) {
+                        await this.sessions.saveRoute(conversationKey, {
+                            sessionId: command.sessionId,
+                            conversationId: finalConvId,
+                            externalConversationId: msg.externalConversationId,
+                            externalThreadId: msg.externalThreadId,
+                            channel: msg.channel,
+                            userId: msg.userId,
+                            workspaceId: msg.workspaceId,
+                            returnRoute: command.returnRoute,
+                            lastIngressId: msg.id,
+                            updatedAt: new Date().toISOString(),
+                        });
                     }
 
                     // Send final content
@@ -531,10 +551,10 @@ export class ChannelRegistry {
      */
     private async routeWithAccumulate(
         adapter: BaseChannelAdapter,
-        msg: NormalizedIngressEvent,
+        msg: IngressEnvelope,
+        command: SessionCommand,
         stream: AsyncIterable<any>,
         conversationKey: string,
-        useConversationId: string,
         signal?: AbortSignal,
     ): Promise<void> {
         let fullContent = '';
@@ -559,9 +579,24 @@ export class ChannelRegistry {
 
                 case 2: {
                     const returnedConvId = chunk.conversation_id || chunk.metadata?.conversation_id;
-                    const finalConvId = returnedConvId || useConversationId;
-                    if (finalConvId && (msg.externalConversationId || msg.conversationId)) {
-                        this.knownConversations.set(conversationKey, finalConvId);
+                    const finalConvId = returnedConvId || command.conversationId;
+                    if (
+                        this.sessions &&
+                        finalConvId &&
+                        (msg.externalConversationId || msg.conversationId)
+                    ) {
+                        await this.sessions.saveRoute(conversationKey, {
+                            sessionId: command.sessionId,
+                            conversationId: finalConvId,
+                            externalConversationId: msg.externalConversationId,
+                            externalThreadId: msg.externalThreadId,
+                            channel: msg.channel,
+                            userId: msg.userId,
+                            workspaceId: msg.workspaceId,
+                            returnRoute: command.returnRoute,
+                            lastIngressId: msg.id,
+                            updatedAt: new Date().toISOString(),
+                        });
                     }
 
                     if (fullContent) {

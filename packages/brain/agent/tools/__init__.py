@@ -47,6 +47,9 @@ _EXECUTION_RESULT_KEYS: tuple[str, ...] = (
     "memory_used_mb",
     "exit_code",
     "returncode",
+    "logs_pointer",
+    "artifact_manifest",
+    "receipt",
     "policy_reason",
     "approval_reason",
 )

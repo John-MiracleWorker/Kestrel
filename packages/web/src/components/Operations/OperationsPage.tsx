@@ -52,6 +52,32 @@ function eventLabel(event: TaskTimelineItem): string {
         .toLowerCase();
 }
 
+function parseJsonArray(value: string): any[] {
+    if (!value) return [];
+    try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+}
+
+function compactId(value: string, edge = 8): string {
+    if (!value || value.length <= edge * 2 + 1) return value;
+    return `${value.slice(0, edge)}...${value.slice(-edge)}`;
+}
+
+function receiptTone(failureClass: string): string {
+    if (!failureClass || failureClass === 'none') return 'var(--accent-green)';
+    if (failureClass === 'partial_output') return '#ffb36a';
+    if (failureClass === 'escalation_required') return '#f59e0b';
+    return '#ff8ca5';
+}
+
+function verdictTone(verdict: string): string {
+    return verdict.toLowerCase() === 'pass' ? 'var(--accent-green)' : '#ff8ca5';
+}
+
 export function OperationsPage({ workspaceId }: OperationsPageProps) {
     const [tasks, setTasks] = useState<OperatorTaskItem[]>([]);
     const [pendingApprovals, setPendingApprovals] = useState<ApprovalAuditItem[]>([]);
@@ -488,6 +514,12 @@ export function OperationsPage({ workspaceId }: OperationsPageProps) {
                                     </span>
                                     <span>{task.pendingApprovalCount} approvals</span>
                                     {task.queueStatus && <span>Queue: {task.queueStatus}</span>}
+                                    {task.sessionChannel && (
+                                        <span>Session: {task.sessionChannel}</span>
+                                    )}
+                                    {task.latestReceiptId && (
+                                        <span>Receipt: {compactId(task.latestReceiptId, 6)}</span>
+                                    )}
                                     {task.orphaned && (
                                         <span style={{ color: '#ff9f43' }}>lease expired</span>
                                     )}
@@ -498,6 +530,179 @@ export function OperationsPage({ workspaceId }: OperationsPageProps) {
                 </div>
 
                 <div style={{ display: 'grid', gap: '16px' }}>
+                    <div style={panelStyle()}>
+                        <div
+                            style={{
+                                fontSize: '1rem',
+                                fontWeight: 700,
+                                color: 'var(--text-primary)',
+                                marginBottom: '8px',
+                            }}
+                        >
+                            Receipts
+                        </div>
+                        <div
+                            style={{
+                                display: 'grid',
+                                gap: '8px',
+                                maxHeight: '180px',
+                                overflowY: 'auto',
+                            }}
+                        >
+                            {(taskDetail?.receipts || []).length === 0 && (
+                                <div style={{ color: 'var(--text-dim)' }}>
+                                    No action receipts recorded.
+                                </div>
+                            )}
+                            {(taskDetail?.receipts || []).map((receipt) => (
+                                <div
+                                    key={receipt.receiptId}
+                                    style={{
+                                        padding: '10px',
+                                        borderRadius: 'var(--radius-md)',
+                                        background: 'rgba(255, 255, 255, 0.03)',
+                                    }}
+                                >
+                                    <div
+                                        style={{
+                                            display: 'flex',
+                                            justifyContent: 'space-between',
+                                            gap: '8px',
+                                        }}
+                                    >
+                                        <div style={{ fontWeight: 600 }}>
+                                            {receipt.toolName || 'Action receipt'}
+                                        </div>
+                                        <div
+                                            style={{
+                                                color: receiptTone(receipt.failureClass),
+                                                fontSize: '0.74rem',
+                                            }}
+                                        >
+                                            {receipt.failureClass || 'none'}
+                                        </div>
+                                    </div>
+                                    <div
+                                        style={{
+                                            fontSize: '0.76rem',
+                                            color: 'var(--text-secondary)',
+                                            marginTop: '4px',
+                                        }}
+                                    >
+                                        {receipt.runtimeClass || 'runtime unknown'} · exit{' '}
+                                        {receipt.exitCode}
+                                    </div>
+                                    <div
+                                        style={{
+                                            fontSize: '0.76rem',
+                                            color: 'var(--text-secondary)',
+                                            marginTop: '4px',
+                                        }}
+                                    >
+                                        {parseJsonArray(receipt.artifactManifestJson).length}{' '}
+                                        artifacts
+                                        {receipt.createdAt
+                                            ? ` · ${new Date(receipt.createdAt).toLocaleString()}`
+                                            : ''}
+                                    </div>
+                                    {receipt.logsPointer && (
+                                        <div
+                                            style={{
+                                                fontSize: '0.72rem',
+                                                color: 'var(--text-dim)',
+                                                marginTop: '4px',
+                                            }}
+                                        >
+                                            {compactId(receipt.logsPointer, 18)}
+                                        </div>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+
+                    <div style={panelStyle()}>
+                        <div
+                            style={{
+                                fontSize: '1rem',
+                                fontWeight: 700,
+                                color: 'var(--text-primary)',
+                                marginBottom: '8px',
+                            }}
+                        >
+                            Evidence Ledger
+                        </div>
+                        <div
+                            style={{
+                                display: 'grid',
+                                gap: '8px',
+                                maxHeight: '180px',
+                                overflowY: 'auto',
+                            }}
+                        >
+                            {(taskDetail?.verifierEvidence || []).length === 0 && (
+                                <div style={{ color: 'var(--text-dim)' }}>
+                                    No verifier evidence recorded.
+                                </div>
+                            )}
+                            {(taskDetail?.verifierEvidence || []).map((evidence) => (
+                                <div
+                                    key={evidence.id}
+                                    style={{
+                                        padding: '10px',
+                                        borderRadius: 'var(--radius-md)',
+                                        background: 'rgba(255, 255, 255, 0.03)',
+                                    }}
+                                >
+                                    <div
+                                        style={{
+                                            display: 'flex',
+                                            justifyContent: 'space-between',
+                                            gap: '8px',
+                                        }}
+                                    >
+                                        <div
+                                            style={{
+                                                fontWeight: 600,
+                                                color: 'var(--text-primary)',
+                                            }}
+                                        >
+                                            {evidence.claimText || 'Verifier claim'}
+                                        </div>
+                                        <div
+                                            style={{
+                                                color: verdictTone(evidence.verdict),
+                                                fontSize: '0.74rem',
+                                            }}
+                                        >
+                                            {evidence.verdict || 'unknown'}
+                                        </div>
+                                    </div>
+                                    <div
+                                        style={{
+                                            fontSize: '0.76rem',
+                                            color: 'var(--text-secondary)',
+                                            marginTop: '4px',
+                                        }}
+                                    >
+                                        Confidence {(evidence.confidence * 100).toFixed(0)}% ·{' '}
+                                        {parseJsonArray(evidence.supportingReceiptIdsJson).length}{' '}
+                                        receipt refs
+                                    </div>
+                                    <div
+                                        style={{
+                                            fontSize: '0.76rem',
+                                            color: 'var(--text-secondary)',
+                                            marginTop: '4px',
+                                        }}
+                                    >
+                                        {evidence.rationale}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+
                     <div style={panelStyle()}>
                         <div
                             style={{
@@ -651,6 +856,12 @@ export function OperationsPage({ workspaceId }: OperationsPageProps) {
                                     {taskDetail.execution.runtimeClass && (
                                         <span>Runtime {taskDetail.execution.runtimeClass}</span>
                                     )}
+                                    {taskDetail.execution.riskClass && (
+                                        <span>Risk {taskDetail.execution.riskClass}</span>
+                                    )}
+                                    {taskDetail.session.channel && (
+                                        <span>Channel {taskDetail.session.channel}</span>
+                                    )}
                                     {taskDetail.execution.fallbackSummary && (
                                         <span>Fallback {taskDetail.execution.fallbackSummary}</span>
                                     )}
@@ -665,6 +876,50 @@ export function OperationsPage({ workspaceId }: OperationsPageProps) {
                                                 {hint.title}: {hint.description}
                                             </div>
                                         ))}
+                                    </div>
+                                )}
+                                {(taskDetail.session.sessionId ||
+                                    taskDetail.session.externalConversationId ||
+                                    taskDetail.session.externalThreadId) && (
+                                    <div
+                                        style={{
+                                            marginTop: '10px',
+                                            padding: '10px',
+                                            borderRadius: 'var(--radius-md)',
+                                            background: 'rgba(0, 243, 255, 0.04)',
+                                            display: 'grid',
+                                            gap: '4px',
+                                            fontSize: '0.76rem',
+                                            color: 'var(--text-secondary)',
+                                        }}
+                                    >
+                                        {taskDetail.session.sessionId && (
+                                            <div>
+                                                Session {compactId(taskDetail.session.sessionId)}
+                                            </div>
+                                        )}
+                                        {taskDetail.session.externalConversationId && (
+                                            <div>
+                                                External conversation{' '}
+                                                {taskDetail.session.externalConversationId}
+                                            </div>
+                                        )}
+                                        {taskDetail.session.externalThreadId && (
+                                            <div>
+                                                External thread{' '}
+                                                {taskDetail.session.externalThreadId}
+                                            </div>
+                                        )}
+                                        {taskDetail.session.returnRouteJson &&
+                                            taskDetail.session.returnRouteJson !== '{}' && (
+                                                <div>
+                                                    Return route{' '}
+                                                    {compactId(
+                                                        taskDetail.session.returnRouteJson,
+                                                        18,
+                                                    )}
+                                                </div>
+                                            )}
                                     </div>
                                 )}
                             </div>
@@ -712,6 +967,37 @@ export function OperationsPage({ workspaceId }: OperationsPageProps) {
                                                 event.toolResult ||
                                                 event.toolName ||
                                                 'Task event'}
+                                        </div>
+                                        <div
+                                            style={{
+                                                display: 'flex',
+                                                gap: '8px',
+                                                flexWrap: 'wrap',
+                                                marginTop: '6px',
+                                                fontSize: '0.74rem',
+                                                color: 'var(--text-secondary)',
+                                            }}
+                                        >
+                                            {event.toolName && <span>Tool {event.toolName}</span>}
+                                            {event.receiptId && (
+                                                <span>Receipt {compactId(event.receiptId, 6)}</span>
+                                            )}
+                                            {event.journalEventId && (
+                                                <span>
+                                                    Journal {compactId(event.journalEventId, 6)}
+                                                </span>
+                                            )}
+                                            {parseJsonArray(event.verifierEvidenceIdsJson).length >
+                                                0 && (
+                                                <span>
+                                                    Evidence{' '}
+                                                    {
+                                                        parseJsonArray(
+                                                            event.verifierEvidenceIdsJson,
+                                                        ).length
+                                                    }
+                                                </span>
+                                            )}
                                         </div>
                                     </div>
                                 ))}
@@ -767,6 +1053,17 @@ export function OperationsPage({ workspaceId }: OperationsPageProps) {
                                             ? new Date(checkpoint.createdAt).toLocaleString()
                                             : ''}
                                     </div>
+                                    {checkpoint.journalEventId && (
+                                        <div
+                                            style={{
+                                                fontSize: '0.72rem',
+                                                color: 'var(--text-dim)',
+                                                marginTop: '4px',
+                                            }}
+                                        >
+                                            Journal {compactId(checkpoint.journalEventId, 6)}
+                                        </div>
+                                    )}
                                 </div>
                             ))}
                         </div>

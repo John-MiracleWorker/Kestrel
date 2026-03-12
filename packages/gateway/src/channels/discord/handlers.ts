@@ -1,5 +1,5 @@
 import { Attachment } from '../base';
-import { createNormalizedIngressEvent, type NormalizedIngressPayloadKind } from '../ingress';
+import { createIngressEnvelope, type NormalizedIngressPayloadKind } from '../ingress';
 import { DiscordAdapter } from './index';
 import { DiscordInteraction, DiscordMessagePayload } from './types';
 import { COLORS } from './constants';
@@ -25,7 +25,7 @@ type DiscordIngressSeed = {
 };
 
 function emitDiscordIngress(adapter: DiscordAdapter, seed: DiscordIngressSeed): void {
-    const event = createNormalizedIngressEvent({
+    const event = createIngressEnvelope({
         channel: 'discord',
         userId: seed.userId,
         workspaceId: adapter.config.defaultWorkspaceId,

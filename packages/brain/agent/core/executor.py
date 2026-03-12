@@ -201,6 +201,92 @@ class TaskExecutor:
             context["user_id"] = task.user_id
         return context
 
+    @staticmethod
+    def _collect_action_receipts(task: AgentTask) -> list[dict[str, Any]]:
+        receipts: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        if not task.plan:
+            return receipts
+        for planned_step in task.plan.steps:
+            for tool_call in getattr(planned_step, "tool_calls", []) or []:
+                metadata = tool_call.get("metadata") or {}
+                if not isinstance(metadata, dict):
+                    continue
+                execution = metadata.get("execution") if isinstance(metadata.get("execution"), dict) else {}
+                receipt = None
+                if isinstance(metadata.get("receipt"), dict):
+                    receipt = metadata.get("receipt")
+                elif isinstance(execution.get("receipt"), dict):
+                    receipt = execution.get("receipt")
+                if not isinstance(receipt, dict):
+                    continue
+                receipt_id = str(receipt.get("receipt_id") or "")
+                if receipt_id and receipt_id in seen_ids:
+                    continue
+                if receipt_id:
+                    seen_ids.add(receipt_id)
+                receipts.append(dict(receipt))
+        return receipts
+
+    async def _persist_verifier_claim_evidence(
+        self,
+        *,
+        task: AgentTask,
+        step_id: str,
+        claims: list[dict[str, Any]],
+    ) -> list[str]:
+        pool = getattr(self._persistence, "_pool", None)
+        if pool is None or not claims:
+            return []
+
+        claim_ids: list[str] = []
+        async with pool.acquire() as conn:
+            for claim in claims:
+                claim_id = str(uuid.uuid4())
+                claim_ids.append(claim_id)
+                await conn.execute(
+                    """
+                    INSERT INTO verifier_claim_evidence (
+                        id,
+                        workspace_id,
+                        task_id,
+                        step_id,
+                        claim_text,
+                        verdict,
+                        confidence,
+                        rationale,
+                        supporting_receipt_ids,
+                        artifact_refs,
+                        metadata_json
+                    )
+                    VALUES (
+                        $1::uuid,
+                        NULLIF($2, '')::uuid,
+                        $3::uuid,
+                        $4,
+                        $5,
+                        $6,
+                        $7,
+                        $8,
+                        $9::jsonb,
+                        $10::jsonb,
+                        $11::jsonb
+                    )
+                    """,
+                    claim_id,
+                    task.workspace_id,
+                    task.id,
+                    step_id,
+                    str(claim.get("claim_text") or ""),
+                    str(claim.get("verdict") or "unknown"),
+                    float(claim.get("confidence") or 0.0),
+                    str(claim.get("rationale") or ""),
+                    json.dumps(claim.get("supporting_receipt_ids") or [], default=str),
+                    json.dumps(claim.get("artifact_refs") or [], default=str),
+                    json.dumps(claim.get("metadata") or {}, default=str),
+                )
+        return claim_ids
+
     def _resolve_tool_tier(
         self,
         task: AgentTask,
@@ -826,6 +912,7 @@ class TaskExecutor:
         if tool_name == "task_complete":
             if self._verifier:
                 summary = tool_args.get("summary", result.output)
+                receipts = self._collect_action_receipts(task)
                 
                 yield TaskEvent(
                     type=TaskEventType.VERIFIER_STARTED,
@@ -835,7 +922,19 @@ class TaskExecutor:
                     progress=self._progress_callback(task),
                 )
                 
-                passed, critique = await self._verifier.verify(task.goal, summary, self._evidence_chain)
+                verification = await self._verifier.verify_detailed(
+                    task.goal,
+                    summary,
+                    self._evidence_chain,
+                    action_receipts=receipts,
+                )
+                passed = bool(verification.get("passed"))
+                critique = str(verification.get("critique", ""))
+                verifier_evidence_ids = await self._persist_verifier_claim_evidence(
+                    task=task,
+                    step_id=step.id,
+                    claims=list(verification.get("claims") or []),
+                )
                 
                 if not passed:
                     error_msg = f"Verification Failed. You must fix these unsupported claims before completing the task:\n{critique}"
@@ -846,6 +945,7 @@ class TaskExecutor:
                         step_id=step.id,
                         content=error_msg,
                         progress=self._progress_callback(task),
+                        metadata={"verifier_evidence_ids": verifier_evidence_ids},
                     )
 
                     if self._metrics:
@@ -874,6 +974,7 @@ class TaskExecutor:
                     step_id=step.id,
                     content=f"Verification passed. {critique}",
                     progress=self._progress_callback(task),
+                    metadata={"verifier_evidence_ids": verifier_evidence_ids},
                 )
 
             step.status = StepStatus.COMPLETE

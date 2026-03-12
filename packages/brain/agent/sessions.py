@@ -102,6 +102,10 @@ class SessionManager:
         agent_profile_id: str | None = None,
         channel: str = "task",
         prunable_after: str | None = None,
+        external_conversation_id: str = "",
+        external_thread_id: str = "",
+        return_route: Optional[dict[str, Any]] = None,
+        session_metadata: Optional[dict[str, Any]] = None,
     ) -> None:
         """Register a new active session."""
         now = datetime.now(timezone.utc).isoformat()
@@ -126,16 +130,35 @@ class SessionManager:
                     """
                     INSERT INTO agent_sessions (id, task_id, workspace_id, user_id,
                         agent_type, status, model, current_goal, started_at, last_activity,
-                        agent_profile_id, channel, prunable_after)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, NULLIF($10, '')::uuid, $11, NULLIF($12, '')::timestamptz)
+                        agent_profile_id, channel, prunable_after, external_conversation_id,
+                        external_thread_id, return_route_json, session_metadata_json)
+                    VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $9,
+                        NULLIF($10, '')::uuid, $11, NULLIF($12, '')::timestamptz,
+                        $13, $14, $15::jsonb, $16::jsonb
+                    )
                     ON CONFLICT (id) DO UPDATE SET
-                        status = 'active', last_activity = $9, current_goal = $8,
+                        task_id = $2,
+                        workspace_id = $3,
+                        user_id = $4,
+                        status = 'active',
+                        model = $7,
+                        last_activity = $9,
+                        current_goal = $8,
                         agent_profile_id = NULLIF($10, '')::uuid, channel = $11,
-                        prunable_after = NULLIF($12, '')::timestamptz
+                        prunable_after = NULLIF($12, '')::timestamptz,
+                        external_conversation_id = $13,
+                        external_thread_id = $14,
+                        return_route_json = $15::jsonb,
+                        session_metadata_json = $16::jsonb
                     """,
                     session_id, task_id, workspace_id, user_id,
                     agent_type, "active", model, goal, now,
                     agent_profile_id or "", channel, prunable_after or "",
+                    external_conversation_id,
+                    external_thread_id,
+                    json.dumps(return_route or {}),
+                    json.dumps(session_metadata or {}),
                 )
         except Exception as e:
             logger.error(f"Failed to persist session: {e}")

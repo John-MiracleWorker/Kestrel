@@ -40,6 +40,31 @@ def _load_jsonb(value: Any) -> dict[str, Any]:
     return dict(value) if value else {}
 
 
+def _load_json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return list(value) if value else []
+
+
+def _receipt_id_from_payload(payload: dict[str, Any]) -> str:
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    execution = metadata.get("execution")
+    if not isinstance(execution, dict):
+        return ""
+    receipt = execution.get("receipt")
+    if not isinstance(receipt, dict):
+        return ""
+    return str(receipt.get("receipt_id") or "")
+
+
 def _progress_from_plan(plan: dict[str, Any]) -> tuple[str, str]:
     steps = plan.get("steps")
     if not isinstance(steps, list) or not steps:
@@ -138,23 +163,71 @@ class OperatorServicerMixin(BaseServicerMixin):
         pool = await get_pool()
         rows = await pool.fetch(
             """
-            SELECT created_at, details->'task_event' AS task_event
-            FROM audit_events
+            SELECT id, created_at, payload_json
+            FROM task_event_journal
             WHERE workspace_id = $1
               AND task_id = $2
-              AND details ? 'task_event'
-            ORDER BY created_at ASC
+            ORDER BY sequence_id ASC
             """,
             workspace_id,
             task_id,
         )
         result: list[dict[str, Any]] = []
         for row in rows:
-            task_event = row["task_event"] or {}
-            payload = dict(task_event) if isinstance(task_event, dict) else {}
+            payload = dict(row["payload_json"]) if isinstance(row["payload_json"], dict) else {}
             payload["created_at"] = _iso(row["created_at"])
+            payload["journal_event_id"] = str(row["id"])
             result.append(payload)
         return result
+
+    async def _load_receipt_rows(
+        self,
+        *,
+        task_id: str,
+    ):
+        pool = await get_pool()
+        return await pool.fetch(
+            """
+            SELECT receipt_id, task_id, step_id, tool_name, runtime_class, risk_class,
+                   failure_class, logs_pointer, exit_code, audit_summary,
+                   artifact_manifest, created_at
+            FROM action_receipts
+            WHERE task_id = $1
+            ORDER BY created_at DESC
+            """,
+            task_id,
+        )
+
+    async def _load_verifier_rows(
+        self,
+        *,
+        task_id: str,
+    ):
+        pool = await get_pool()
+        return await pool.fetch(
+            """
+            SELECT id, claim_text, verdict, confidence, rationale,
+                   supporting_receipt_ids, artifact_refs, created_at
+            FROM verifier_claim_evidence
+            WHERE task_id = $1
+            ORDER BY created_at DESC
+            """,
+            task_id,
+        )
+
+    async def _latest_session_row(self, task_id: str):
+        pool = await get_pool()
+        return await pool.fetchrow(
+            """
+            SELECT id, channel, external_conversation_id, external_thread_id,
+                   return_route_json, session_metadata_json
+            FROM agent_sessions
+            WHERE task_id = $1
+            ORDER BY last_activity DESC
+            LIMIT 1
+            """,
+            task_id,
+        )
 
     async def _list_artifact_rows(
         self,
@@ -398,7 +471,7 @@ class OperatorServicerMixin(BaseServicerMixin):
         )
         latest_checkpoint = await pool.fetchrow(
             """
-            SELECT id, label, created_at
+            SELECT id, label, created_at, journal_event_id
             FROM agent_checkpoints
             WHERE task_id = $1
             ORDER BY created_at DESC
@@ -408,6 +481,9 @@ class OperatorServicerMixin(BaseServicerMixin):
         )
         queue_row = await self._latest_queue_row(task_id)
         timeline_rows = await self._load_timeline_rows(workspace_id=workspace_id, task_id=task_id)
+        receipt_rows = await self._load_receipt_rows(task_id=task_id)
+        verifier_rows = await self._load_verifier_rows(task_id=task_id)
+        session_row = await self._latest_session_row(task_id)
 
         plan = _load_jsonb(task_row["plan"])
         current_step, total_steps = _progress_from_plan(plan)
@@ -483,6 +559,57 @@ class OperatorServicerMixin(BaseServicerMixin):
                 pending_approval_id=pending_approval_id,
                 last_checkpoint_id=last_checkpoint_id,
             ),
+            receipts=[
+                brain_pb2.ReceiptSummary(
+                    receipt_id=str(row["receipt_id"]),
+                    tool_name=str(row["tool_name"] or ""),
+                    step_id=str(row["step_id"] or ""),
+                    runtime_class=str(row["runtime_class"] or ""),
+                    risk_class=str(row["risk_class"] or ""),
+                    failure_class=str(row["failure_class"] or ""),
+                    logs_pointer=str(row["logs_pointer"] or ""),
+                    exit_code=int(row["exit_code"] or 0),
+                    audit_summary=str(row["audit_summary"] or ""),
+                    artifact_manifest_json=json.dumps(row["artifact_manifest"] or [], default=str),
+                    created_at=_iso(row["created_at"]),
+                )
+                for row in receipt_rows
+            ],
+            verifier_evidence=[
+                brain_pb2.VerifierEvidenceReference(
+                    id=str(row["id"]),
+                    claim_text=str(row["claim_text"] or ""),
+                    verdict=str(row["verdict"] or ""),
+                    confidence=float(row["confidence"] or 0.0),
+                    rationale=str(row["rationale"] or ""),
+                    supporting_receipt_ids_json=json.dumps(
+                        row["supporting_receipt_ids"] or [], default=str
+                    ),
+                    artifact_refs_json=json.dumps(row["artifact_refs"] or [], default=str),
+                    created_at=_iso(row["created_at"]),
+                )
+                for row in verifier_rows
+            ],
+            session=brain_pb2.SessionProvenance(
+                session_id=str(session_row["id"]) if session_row else "",
+                channel=str(session_row["channel"] or "") if session_row else "",
+                external_conversation_id=str(session_row["external_conversation_id"] or "")
+                if session_row
+                else "",
+                external_thread_id=str(session_row["external_thread_id"] or "")
+                if session_row
+                else "",
+                return_route_json=json.dumps(
+                    session_row["return_route_json"] or {}, default=str
+                )
+                if session_row
+                else "",
+                metadata_json=json.dumps(
+                    session_row["session_metadata_json"] or {}, default=str
+                )
+                if session_row
+                else "",
+            ),
         )
         return brain_pb2.GetTaskDetailResponse(task=detail)
 
@@ -513,6 +640,14 @@ class OperatorServicerMixin(BaseServicerMixin):
                 event_metadata_json=json.dumps(payload.get("metadata") or {}, default=str),
                 metrics_json=json.dumps(payload.get("metrics") or {}, default=str),
                 created_at=str(payload.get("created_at", "")),
+                journal_event_id=str(payload.get("journal_event_id", "")),
+                receipt_id=_receipt_id_from_payload(payload),
+                verifier_evidence_ids_json=json.dumps(
+                    (payload.get("metadata") or {}).get("verifier_evidence_ids", [])
+                    if isinstance(payload.get("metadata"), dict)
+                    else [],
+                    default=str,
+                ),
             )
             for payload in await self._load_timeline_rows(workspace_id=workspace_id, task_id=task_id)
         ]
@@ -531,7 +666,7 @@ class OperatorServicerMixin(BaseServicerMixin):
         pool = await get_pool()
         rows = await pool.fetch(
             """
-            SELECT id, step_index, label, created_at
+            SELECT id, step_index, label, created_at, journal_event_id
             FROM agent_checkpoints
             WHERE task_id = $1
             ORDER BY created_at ASC
@@ -544,6 +679,7 @@ class OperatorServicerMixin(BaseServicerMixin):
                 step_index=int(row["step_index"] or 0),
                 label=str(row["label"] or ""),
                 created_at=_iso(row["created_at"]),
+                journal_event_id=str(row["journal_event_id"] or ""),
             )
             for row in rows
         ]
@@ -598,7 +734,16 @@ class OperatorServicerMixin(BaseServicerMixin):
         query = f"""
             SELECT a.id, a.task_id, a.step_id, a.tool_name, a.reason,
                    a.risk_level, a.status, a.decided_by, a.decided_at,
-                   a.created_at, a.tool_args
+                   a.created_at, a.tool_args, a.capability_grants_json,
+                   (
+                       SELECT r.receipt_id
+                       FROM action_receipts r
+                       WHERE r.task_id = a.task_id
+                         AND r.step_id = COALESCE(a.step_id, '')
+                         AND r.tool_name = COALESCE(a.tool_name, '')
+                       ORDER BY r.created_at DESC
+                       LIMIT 1
+                   ) AS receipt_id
             FROM agent_approvals a
             JOIN agent_tasks t ON t.id = a.task_id
             WHERE {' AND '.join(clauses)}
@@ -618,6 +763,10 @@ class OperatorServicerMixin(BaseServicerMixin):
                 decided_at=_iso(row["decided_at"]),
                 created_at=_iso(row["created_at"]),
                 tool_args_json=json.dumps(row["tool_args"] or {}, default=str),
+                capability_grants_json=json.dumps(
+                    row["capability_grants_json"] or [], default=str
+                ),
+                receipt_id=str(row["receipt_id"] or ""),
             )
             for row in rows
         ]
@@ -642,7 +791,10 @@ class OperatorServicerMixin(BaseServicerMixin):
                    t.conversation_id, t.plan,
                    COALESCE(p.pending_approval_count, 0) AS pending_approval_count,
                    q.status AS queue_status,
-                   q.lease_expires_at
+                   q.lease_expires_at,
+                   s.channel AS session_channel,
+                   s.external_conversation_id,
+                   r.receipt_id AS latest_receipt_id
             FROM agent_tasks t
             LEFT JOIN LATERAL (
                 SELECT COUNT(*)::int AS pending_approval_count
@@ -657,6 +809,20 @@ class OperatorServicerMixin(BaseServicerMixin):
                 ORDER BY created_at DESC
                 LIMIT 1
             ) q ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT channel, external_conversation_id
+                FROM agent_sessions
+                WHERE task_id = t.id
+                ORDER BY last_activity DESC
+                LIMIT 1
+            ) s ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT receipt_id
+                FROM action_receipts
+                WHERE task_id = t.id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) r ON TRUE
             WHERE t.workspace_id = $1
             {status_clause}
             ORDER BY t.created_at DESC
@@ -695,6 +861,9 @@ class OperatorServicerMixin(BaseServicerMixin):
                     lease_expires_at=_iso(lease_expires_at),
                     queue_status=queue_status,
                     conversation_id=str(row["conversation_id"] or ""),
+                    session_channel=str(row["session_channel"] or ""),
+                    external_conversation_id=str(row["external_conversation_id"] or ""),
+                    latest_receipt_id=str(row["latest_receipt_id"] or ""),
                 )
             )
         return brain_pb2.ListOperatorTasksResponse(tasks=items)

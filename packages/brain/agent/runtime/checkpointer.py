@@ -86,6 +86,7 @@ class PostgresCheckpointer:
                 step_index=step_index,
                 label=f"langgraph:{label}",
                 state_json=state_json,
+                journal_event_id=str((metadata or {}).get("journal_event_id") or ""),
             )
         except Exception as e:
             logger.warning(f"Checkpoint save failed for {thread_id}: {e}")

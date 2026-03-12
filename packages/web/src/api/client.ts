@@ -508,6 +508,9 @@ export interface OperatorTaskItem {
     leaseExpiresAt: string;
     queueStatus: string;
     conversationId: string;
+    sessionChannel: string;
+    externalConversationId: string;
+    latestReceiptId: string;
 }
 
 export interface ExecutionTraceSummary {
@@ -531,6 +534,40 @@ export interface RecoveryHint {
     code: string;
     title: string;
     description: string;
+}
+
+export interface ReceiptSummary {
+    receiptId: string;
+    toolName: string;
+    stepId: string;
+    runtimeClass: string;
+    riskClass: string;
+    failureClass: string;
+    logsPointer: string;
+    exitCode: number;
+    auditSummary: string;
+    artifactManifestJson: string;
+    createdAt: string;
+}
+
+export interface VerifierEvidenceReference {
+    id: string;
+    claimText: string;
+    verdict: string;
+    confidence: number;
+    rationale: string;
+    supportingReceiptIdsJson: string;
+    artifactRefsJson: string;
+    createdAt: string;
+}
+
+export interface SessionProvenance {
+    sessionId: string;
+    channel: string;
+    externalConversationId: string;
+    externalThreadId: string;
+    returnRouteJson: string;
+    metadataJson: string;
 }
 
 export interface TaskDetail {
@@ -558,6 +595,9 @@ export interface TaskDetail {
     stale: boolean;
     orphaned: boolean;
     recoveryHints: RecoveryHint[];
+    receipts: ReceiptSummary[];
+    verifierEvidence: VerifierEvidenceReference[];
+    session: SessionProvenance;
 }
 
 export interface TaskTimelineItem {
@@ -573,6 +613,9 @@ export interface TaskTimelineItem {
     eventMetadataJson: string;
     metricsJson: string;
     createdAt: string;
+    journalEventId: string;
+    receiptId: string;
+    verifierEvidenceIdsJson: string;
 }
 
 export interface TaskCheckpointItem {
@@ -580,6 +623,7 @@ export interface TaskCheckpointItem {
     stepIndex: number;
     label: string;
     createdAt: string;
+    journalEventId: string;
 }
 
 export interface TaskArtifactItem {
@@ -605,6 +649,8 @@ export interface ApprovalAuditItem {
     decidedAt: string;
     createdAt: string;
     toolArgsJson: string;
+    capabilityGrantsJson: string;
+    receiptId: string;
 }
 
 export interface RuntimeProfile {
@@ -645,6 +691,9 @@ function mapOperatorTaskItem(raw: any): OperatorTaskItem {
         leaseExpiresAt: raw?.lease_expires_at ?? raw?.leaseExpiresAt ?? '',
         queueStatus: raw?.queue_status ?? raw?.queueStatus ?? '',
         conversationId: raw?.conversation_id ?? raw?.conversationId ?? '',
+        sessionChannel: raw?.session_channel ?? raw?.sessionChannel ?? '',
+        externalConversationId: raw?.external_conversation_id ?? raw?.externalConversationId ?? '',
+        latestReceiptId: raw?.latest_receipt_id ?? raw?.latestReceiptId ?? '',
     };
 }
 
@@ -692,6 +741,49 @@ function mapTaskDetail(raw: any): TaskDetail {
             title: hint?.title || '',
             description: hint?.description || '',
         })),
+        receipts: (raw?.receipts || []).map((receipt: any) => ({
+            receiptId: receipt?.receipt_id ?? receipt?.receiptId ?? '',
+            toolName: receipt?.tool_name ?? receipt?.toolName ?? '',
+            stepId: receipt?.step_id ?? receipt?.stepId ?? '',
+            runtimeClass: receipt?.runtime_class ?? receipt?.runtimeClass ?? '',
+            riskClass: receipt?.risk_class ?? receipt?.riskClass ?? '',
+            failureClass: receipt?.failure_class ?? receipt?.failureClass ?? '',
+            logsPointer: receipt?.logs_pointer ?? receipt?.logsPointer ?? '',
+            exitCode: Number(receipt?.exit_code ?? receipt?.exitCode ?? 0),
+            auditSummary: receipt?.audit_summary ?? receipt?.auditSummary ?? '',
+            artifactManifestJson:
+                receipt?.artifact_manifest_json ?? receipt?.artifactManifestJson ?? '[]',
+            createdAt: receipt?.created_at ?? receipt?.createdAt ?? '',
+        })),
+        verifierEvidence: (raw?.verifier_evidence ?? raw?.verifierEvidence ?? []).map(
+            (evidence: any) => ({
+                id: evidence?.id || '',
+                claimText: evidence?.claim_text ?? evidence?.claimText ?? '',
+                verdict: evidence?.verdict || '',
+                confidence: Number(evidence?.confidence ?? 0),
+                rationale: evidence?.rationale || '',
+                supportingReceiptIdsJson:
+                    evidence?.supporting_receipt_ids_json ??
+                    evidence?.supportingReceiptIdsJson ??
+                    '[]',
+                artifactRefsJson:
+                    evidence?.artifact_refs_json ?? evidence?.artifactRefsJson ?? '[]',
+                createdAt: evidence?.created_at ?? evidence?.createdAt ?? '',
+            }),
+        ),
+        session: {
+            sessionId: raw?.session?.session_id ?? raw?.session?.sessionId ?? '',
+            channel: raw?.session?.channel ?? '',
+            externalConversationId:
+                raw?.session?.external_conversation_id ??
+                raw?.session?.externalConversationId ??
+                '',
+            externalThreadId:
+                raw?.session?.external_thread_id ?? raw?.session?.externalThreadId ?? '',
+            returnRouteJson:
+                raw?.session?.return_route_json ?? raw?.session?.returnRouteJson ?? '{}',
+            metadataJson: raw?.session?.metadata_json ?? raw?.session?.metadataJson ?? '{}',
+        },
     };
 }
 
@@ -761,6 +853,10 @@ export const operations = {
                 eventMetadataJson: event?.event_metadata_json ?? event?.eventMetadataJson ?? '',
                 metricsJson: event?.metrics_json ?? event?.metricsJson ?? '',
                 createdAt: event?.created_at ?? event?.createdAt ?? '',
+                journalEventId: event?.journal_event_id ?? event?.journalEventId ?? '',
+                receiptId: event?.receipt_id ?? event?.receiptId ?? '',
+                verifierEvidenceIdsJson:
+                    event?.verifier_evidence_ids_json ?? event?.verifierEvidenceIdsJson ?? '[]',
             })),
         ),
     listCheckpoints: (workspaceId: string, taskId: string) =>
@@ -772,6 +868,7 @@ export const operations = {
                 stepIndex: Number(checkpoint?.step_index ?? checkpoint?.stepIndex ?? 0),
                 label: checkpoint?.label || '',
                 createdAt: checkpoint?.created_at ?? checkpoint?.createdAt ?? '',
+                journalEventId: checkpoint?.journal_event_id ?? checkpoint?.journalEventId ?? '',
             })),
         ),
     listArtifacts: (workspaceId: string, taskId?: string) =>
@@ -811,6 +908,9 @@ export const operations = {
                 decidedAt: approval?.decided_at ?? approval?.decidedAt ?? '',
                 createdAt: approval?.created_at ?? approval?.createdAt ?? '',
                 toolArgsJson: approval?.tool_args_json ?? approval?.toolArgsJson ?? '',
+                capabilityGrantsJson:
+                    approval?.capability_grants_json ?? approval?.capabilityGrantsJson ?? '[]',
+                receiptId: approval?.receipt_id ?? approval?.receiptId ?? '',
             })),
         );
     },

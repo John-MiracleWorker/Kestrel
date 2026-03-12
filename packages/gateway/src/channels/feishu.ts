@@ -19,11 +19,11 @@
 import {
     BaseChannelAdapter,
     ChannelType,
-    IncomingMessage,
     OutgoingMessage,
     StreamHandle,
     ToolActivity,
 } from './base';
+import { createIngressEnvelope } from './ingress';
 
 const FEISHU_WS_URL = 'wss://open.feishu.cn/open-apis/ws/v1';
 
@@ -46,8 +46,8 @@ interface FeishuMessage {
         sender_type: string;
     };
     create_time: string;
-    root_id?: string;     // Thread root message ID
-    parent_id?: string;   // Parent message in thread
+    root_id?: string; // Thread root message ID
+    parent_id?: string; // Parent message in thread
 }
 
 export class FeishuAdapter extends BaseChannelAdapter {
@@ -65,7 +65,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
             appId: process.env.FEISHU_APP_ID || '',
             appSecret: process.env.FEISHU_APP_SECRET || '',
             allowedUsers: process.env.FEISHU_ALLOWED_USERS
-                ? process.env.FEISHU_ALLOWED_USERS.split(',').map(s => s.trim())
+                ? process.env.FEISHU_ALLOWED_USERS.split(',').map((s) => s.trim())
                 : undefined,
         };
     }
@@ -119,7 +119,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
             {
                 method: 'POST',
                 headers: {
-                    'Authorization': `Bearer ${this.accessToken}`,
+                    Authorization: `Bearer ${this.accessToken}`,
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify(body),
@@ -133,10 +133,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     // ── Streaming support ────────────────────────────────────────
 
-    async sendStreamStart(
-        userId: string,
-        meta: { conversationId: string },
-    ): Promise<StreamHandle> {
+    async sendStreamStart(userId: string, meta: { conversationId: string }): Promise<StreamHandle> {
         await this.ensureAccessToken();
 
         // Send initial "thinking" message
@@ -145,7 +142,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
             {
                 method: 'POST',
                 headers: {
-                    'Authorization': `Bearer ${this.accessToken}`,
+                    Authorization: `Bearer ${this.accessToken}`,
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({
@@ -156,7 +153,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
             },
         );
 
-        const data = await resp.json() as any;
+        const data = (await resp.json()) as any;
         return {
             messageId: data?.data?.message_id || '',
             chatContext: { userId, conversationId: meta.conversationId },
@@ -167,20 +164,17 @@ export class FeishuAdapter extends BaseChannelAdapter {
         if (!handle.messageId) return;
         await this.ensureAccessToken();
 
-        await fetch(
-            `https://open.feishu.cn/open-apis/im/v1/messages/${handle.messageId}`,
-            {
-                method: 'PATCH',
-                headers: {
-                    'Authorization': `Bearer ${this.accessToken}`,
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    msg_type: 'text',
-                    content: JSON.stringify({ text: accumulatedContent }),
-                }),
+        await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${handle.messageId}`, {
+            method: 'PATCH',
+            headers: {
+                Authorization: `Bearer ${this.accessToken}`,
+                'Content-Type': 'application/json',
             },
-        );
+            body: JSON.stringify({
+                msg_type: 'text',
+                content: JSON.stringify({ text: accumulatedContent }),
+            }),
+        });
     }
 
     async sendStreamEnd(handle: StreamHandle, finalContent: string): Promise<void> {
@@ -188,22 +182,19 @@ export class FeishuAdapter extends BaseChannelAdapter {
         await this.ensureAccessToken();
 
         const content = this.formatForFeishu(finalContent);
-        await fetch(
-            `https://open.feishu.cn/open-apis/im/v1/messages/${handle.messageId}`,
-            {
-                method: 'PATCH',
-                headers: {
-                    'Authorization': `Bearer ${this.accessToken}`,
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    msg_type: 'interactive',
-                    content: JSON.stringify({
-                        elements: [{ tag: 'markdown', content }],
-                    }),
-                }),
+        await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${handle.messageId}`, {
+            method: 'PATCH',
+            headers: {
+                Authorization: `Bearer ${this.accessToken}`,
+                'Content-Type': 'application/json',
             },
-        );
+            body: JSON.stringify({
+                msg_type: 'interactive',
+                content: JSON.stringify({
+                    elements: [{ tag: 'markdown', content }],
+                }),
+            }),
+        });
     }
 
     // ── Private helpers ──────────────────────────────────────────
@@ -221,7 +212,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
             },
         );
 
-        const data = await resp.json() as any;
+        const data = (await resp.json()) as any;
         if (data.code !== 0) {
             throw new Error(`Feishu auth failed: ${data.msg}`);
         }
@@ -260,12 +251,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
             content = msg.content;
         }
 
-        const incoming: IncomingMessage = {
+        const incoming = createIngressEnvelope({
             id: msg.message_id,
             channel: this.channelType,
             userId: msg.sender.sender_id.open_id,
             workspaceId: msg.chat_id,
-            conversationId: msg.root_id || msg.message_id, // Thread-based task management
+            conversationId: msg.root_id || msg.message_id,
             content,
             metadata: {
                 channelUserId: msg.sender.sender_id.open_id,
@@ -275,7 +266,20 @@ export class FeishuAdapter extends BaseChannelAdapter {
                 rootId: msg.root_id,
                 parentId: msg.parent_id,
             },
-        };
+            externalUserId: msg.sender.sender_id.open_id,
+            externalConversationId: msg.chat_id,
+            externalThreadId: msg.root_id || msg.parent_id,
+            authContext: {
+                transport: 'feishu_websocket',
+                authenticatedUserId: msg.sender.sender_id.open_id,
+                isProvisionalUser: false,
+            },
+            rawMetadata: {
+                chatType: msg.chat_type,
+                rootId: msg.root_id,
+                parentId: msg.parent_id,
+            },
+        });
 
         this.emit('message', incoming);
     }

@@ -16,10 +16,11 @@ COPY --from=docker/compose-bin /docker-compose /usr/libexec/docker/cli-plugins/d
 COPY packages/brain/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy shared proto files, tool catalog, and action event schema
+# Copy shared proto files, tool catalog, and shared action schemas
 COPY packages/shared/proto/ ../shared/proto/
 COPY packages/shared/tool-catalog.json ../shared/tool-catalog.json
 COPY packages/shared/action_event_schema.py ../shared/action_event_schema.py
+COPY packages/shared/action_receipt_schema.py ../shared/action_receipt_schema.py
 
 # Copy brain source
 COPY packages/brain/ .

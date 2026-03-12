@@ -22,6 +22,7 @@ from core.feature_mode import (
     mode_supports_ops,
 )
 from core.grpc_setup import brain_pb2, brain_pb2_grpc, reflection
+from core.hands_grpc_setup import hands_pb2_grpc
 from db import get_pool, get_redis
 from memory.embeddings import EmbeddingPipeline
 from memory.retrieval import RetrievalPipeline
@@ -134,8 +135,6 @@ async def _init_hands_client() -> InitializerResult:
     hands_port = os.getenv("HANDS_GRPC_PORT", "50052")
     try:
         hands_channel = grpc_aio.insecure_channel(f"{hands_host}:{hands_port}")
-        import hands_pb2_grpc
-
         runtime.hands_client = hands_pb2_grpc.HandsServiceStub(hands_channel)
         logger.info("Hands gRPC client connected to %s:%s", hands_host, hands_port)
         _record_initializer("init_hands_client", "ready")

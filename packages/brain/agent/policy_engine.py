@@ -41,6 +41,40 @@ class PolicyEngine:
         if tool_name == "task_complete" or tool_name == "ask_human":
             return PolicyDecision(True, False, "low", "control", "Control tool")
 
+        if execution_context and execution_context.capability_grants:
+            matched_grants = execution_context.grants_for(
+                action_name=tool_name,
+                tool_name=tool_name,
+                channel=execution_context.source,
+            )
+            if not matched_grants:
+                return PolicyDecision(
+                    False,
+                    False,
+                    "high",
+                    "capability",
+                    "No capability grant matched this action.",
+                )
+            approval_states = {
+                str(grant.get("approval_state") or "").lower() for grant in matched_grants
+            }
+            if approval_states & {"denied", "blocked"}:
+                return PolicyDecision(
+                    False,
+                    False,
+                    "high",
+                    "capability",
+                    "Capability grant explicitly denied this action.",
+                )
+            if approval_states & {"pending", "required"}:
+                return PolicyDecision(
+                    True,
+                    True,
+                    "high",
+                    "capability",
+                    "Capability grant requires an explicit approval decision.",
+                )
+
         if tool_name == "git":
             action = str(tool_args.get("action", "")).lower()
             if action in self._READONLY_GIT_ACTIONS:

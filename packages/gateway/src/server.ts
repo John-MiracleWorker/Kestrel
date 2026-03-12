@@ -243,7 +243,7 @@ async function start() {
 
         // 6. Create channel registry + register integration routes (BEFORE listen)
         const deduplicator = new Deduplicator(redis);
-        channelRegistry = new ChannelRegistry(brainClient, deduplicator);
+        channelRegistry = new ChannelRegistry(brainClient, deduplicator, sessionManager);
 
         await integrationRoutes(app, {
             channelRegistry,

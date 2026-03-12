@@ -34,6 +34,16 @@ from action_event_schema import (
     dumps_action_event,
     stable_hash,
 )
+from action_receipt_schema import (
+    FAILURE_CLASS_EXECUTION_ERROR,
+    FAILURE_CLASS_ESCALATION_REQUIRED,
+    FAILURE_CLASS_NONE,
+    FAILURE_CLASS_PARTIAL_OUTPUT,
+    FAILURE_CLASS_PERMISSION_DENIED,
+    FAILURE_CLASS_SANDBOX_CRASH,
+    FAILURE_CLASS_TIMEOUT,
+    build_action_receipt,
+)
 
 load_dotenv()
 logger = logging.getLogger("hands")
@@ -71,6 +81,97 @@ def _classify_execution_context(skill_name: str, limits: dict) -> tuple[str, str
         file_system_write=bool(limits.get("fs_write")),
     )
     return runtime_class, risk_class
+
+
+def _request_grants(request) -> list[dict]:
+    grants = []
+    for grant in getattr(request, "grants", []):
+        metadata = {}
+        if getattr(grant, "metadata_json", ""):
+            try:
+                metadata = json.loads(grant.metadata_json)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+        grants.append(
+            {
+                "grant_id": grant.grant_id,
+                "scope": grant.scope,
+                "workspace_id": grant.workspace_id,
+                "user_id": grant.user_id,
+                "agent_profile_id": grant.agent_profile_id,
+                "channel": grant.channel,
+                "action_selector": grant.action_selector,
+                "tool_selector": grant.tool_selector,
+                "approval_state": grant.approval_state,
+                "expires_at": grant.expires_at,
+                "metadata": metadata,
+            }
+        )
+    return grants
+
+
+def _failure_class_to_proto(failure_class: str):
+    return getattr(
+        hands_pb2,
+        f"FAILURE_CLASS_{str(failure_class or FAILURE_CLASS_EXECUTION_ERROR).upper()}",
+        hands_pb2.FAILURE_CLASS_EXECUTION_ERROR,
+    )
+
+
+def _artifact_entry_to_proto(entry: dict):
+    return hands_pb2.ArtifactManifestEntry(
+        artifact_id=str(entry.get("artifact_id") or ""),
+        name=str(entry.get("name") or ""),
+        artifact_type=str(entry.get("artifact_type") or ""),
+        uri=str(entry.get("uri") or ""),
+        mime_type=str(entry.get("mime_type") or ""),
+        size_bytes=int(entry.get("size_bytes") or 0),
+        checksum=str(entry.get("checksum") or ""),
+        description=str(entry.get("description") or ""),
+        metadata_json=json.dumps(entry.get("metadata") or {}),
+    )
+
+
+def _grant_to_proto(grant: dict):
+    return hands_pb2.CapabilityGrant(
+        grant_id=str(grant.get("grant_id") or ""),
+        scope=str(grant.get("scope") or ""),
+        workspace_id=str(grant.get("workspace_id") or ""),
+        user_id=str(grant.get("user_id") or ""),
+        agent_profile_id=str(grant.get("agent_profile_id") or ""),
+        channel=str(grant.get("channel") or ""),
+        action_selector=str(grant.get("action_selector") or ""),
+        tool_selector=str(grant.get("tool_selector") or ""),
+        approval_state=str(grant.get("approval_state") or ""),
+        expires_at=str(grant.get("expires_at") or ""),
+        metadata_json=json.dumps(grant.get("metadata") or {}),
+    )
+
+
+def _receipt_to_proto(receipt: dict):
+    return hands_pb2.ActionReceipt(
+        receipt_id=str(receipt.get("receipt_id") or ""),
+        request_id=str(receipt.get("request_id") or ""),
+        runtime_class=str(receipt.get("runtime_class") or ""),
+        risk_class=str(receipt.get("risk_class") or ""),
+        failure_class=_failure_class_to_proto(receipt.get("failure_class") or FAILURE_CLASS_EXECUTION_ERROR),
+        logs_pointer=str(receipt.get("logs_pointer") or ""),
+        stdout_pointer=str(receipt.get("stdout_pointer") or ""),
+        stderr_pointer=str(receipt.get("stderr_pointer") or ""),
+        sandbox_id=str(receipt.get("sandbox_id") or ""),
+        exit_code=int(receipt.get("exit_code") or 0),
+        audit_summary=str(receipt.get("audit_summary") or ""),
+        artifact_manifest=[
+            _artifact_entry_to_proto(entry) for entry in receipt.get("artifact_manifest", [])
+        ],
+        file_touches=[str(item) for item in receipt.get("file_touches", [])],
+        network_touches=[str(item) for item in receipt.get("network_touches", [])],
+        system_touches=[str(item) for item in receipt.get("system_touches", [])],
+        grants=[_grant_to_proto(grant) for grant in receipt.get("grants", [])],
+        metadata_json=json.dumps(receipt.get("metadata") or {}),
+        mutating=bool(receipt.get("mutating")),
+        finalized_at=str(receipt.get("finalized_at") or ""),
+    )
 
 
 def load_skills(skills_dir: str = None):
@@ -116,35 +217,19 @@ class HandsServicer:
         self.permissions = permissions
         self.audit = audit
 
-    async def ExecuteSkill(self, request, context):
-        """Execute a skill in a sandboxed Docker container."""
-        skill_name = request.skill_name
+    async def ExecuteAction(self, request, context):
+        """Execute an action in a sandboxed Docker container."""
+        skill_name = request.action_name
         function_name = request.function_name
-        arguments = request.arguments
+        arguments = request.arguments_json
         user_id = request.user_id
         workspace_id = request.workspace_id
+        request_id = request.request_id or str(uuid.uuid4())
+        grants = _request_grants(request)
 
-        logger.info(f"ExecuteSkill: {skill_name}.{function_name} "
+        logger.info(f"ExecuteAction: {skill_name}.{function_name} "
                      f"user={user_id} workspace={workspace_id}")
 
-        # Check permissions
-        if not self.permissions.check(workspace_id, skill_name, function_name):
-            yield hands_pb2.SkillExecutionResponse(
-                status=hands_pb2.SkillExecutionResponse.Status.PERMISSION_DENIED,
-                error=f"Skill '{skill_name}' not allowed in workspace",
-            )
-            return
-
-        # Find skill
-        skill = _skills.get(skill_name)
-        if not skill:
-            yield hands_pb2.SkillExecutionResponse(
-                status=hands_pb2.SkillExecutionResponse.Status.ERROR,
-                error=f"Unknown skill: {skill_name}",
-            )
-            return
-
-        # Build resource limits from request or defaults
         limits = {
             "timeout": getattr(request.limits, "timeout_seconds", 30) or 30,
             "memory_mb": getattr(request.limits, "memory_mb", 512) or 512,
@@ -154,6 +239,74 @@ class HandsServicer:
             "fs_write": getattr(request.limits, "file_system_write", False),
         }
         runtime_class, risk_class = _classify_execution_context(skill_name, limits)
+
+        permission_decision = self.permissions.evaluate_action(
+            workspace_id=workspace_id,
+            action_name=skill_name,
+            function_name=function_name,
+            grants=grants,
+            mutating=bool(request.mutating),
+        )
+        if not permission_decision["allowed"]:
+            receipt = build_action_receipt(
+                request_id=request_id,
+                runtime_class=runtime_class,
+                risk_class=risk_class,
+                failure_class=permission_decision["failure_class"],
+                logs_pointer=f"hands://denied/{request_id}",
+                audit_summary=permission_decision["reason"],
+                grants=permission_decision["matched_grants"],
+                metadata={
+                    "conversation_id": request.conversation_id,
+                    "session_id": request.session_id,
+                    "routing_context_json": request.routing_context_json,
+                },
+                mutating=bool(request.mutating),
+            )
+            denial_event = build_execution_action_event(
+                source="hands.service",
+                action_type=f"{skill_name}.{function_name}",
+                status="denied",
+                runtime_class=runtime_class,
+                risk_class=risk_class,
+                before_state={"command_hash": stable_hash(arguments), "policy_decision": "admission"},
+                after_state={"command_hash": stable_hash(arguments), "policy_decision": "denied"},
+                metadata={"request_id": request_id, "reason": permission_decision["reason"]},
+            )
+            yield hands_pb2.ActionExecutionEvent(
+                status=hands_pb2.ACTION_DENIED,
+                error=permission_decision["reason"],
+                action_event_json=dumps_action_event(denial_event),
+                receipt=_receipt_to_proto(receipt),
+                failure_class=_failure_class_to_proto(permission_decision["failure_class"]),
+                final=True,
+                logs_pointer=receipt["logs_pointer"],
+            )
+            return
+
+        # Find skill
+        skill = _skills.get(skill_name)
+        if not skill:
+            receipt = build_action_receipt(
+                request_id=request_id,
+                runtime_class=runtime_class,
+                risk_class=risk_class,
+                failure_class=FAILURE_CLASS_EXECUTION_ERROR,
+                logs_pointer=f"hands://errors/{request_id}",
+                audit_summary=f"Unknown action: {skill_name}",
+                grants=grants,
+                metadata={"conversation_id": request.conversation_id},
+                mutating=bool(request.mutating),
+            )
+            yield hands_pb2.ActionExecutionEvent(
+                status=hands_pb2.ACTION_FAILED,
+                error=f"Unknown action: {skill_name}",
+                receipt=_receipt_to_proto(receipt),
+                failure_class=hands_pb2.FAILURE_CLASS_EXECUTION_ERROR,
+                final=True,
+                logs_pointer=receipt["logs_pointer"],
+            )
+            return
 
         # Start audit
         exec_id = str(uuid.uuid4())
@@ -166,24 +319,36 @@ class HandsServicer:
             arguments,
             runtime_class=runtime_class,
             risk_class=risk_class,
-            metadata={"conversation_id": request.conversation_id},
+            metadata={
+                "conversation_id": request.conversation_id,
+                "session_id": request.session_id,
+                "request_id": request_id,
+            },
         )
 
         # Yield RUNNING status
         running_event = build_execution_action_event(
             source="hands.service",
-            action_type=f"{skill_name}.{function_name}",
-            status="running",
-            runtime_class=runtime_class,
-            risk_class=risk_class,
-            before_state={"command_hash": stable_hash(arguments), "policy_decision": "admitted"},
-            after_state={"command_hash": stable_hash(arguments), "policy_decision": "running"},
-            metadata={"exec_id": exec_id, "conversation_id": request.conversation_id},
-        )
-        yield hands_pb2.SkillExecutionResponse(
-            status=hands_pb2.SkillExecutionResponse.Status.RUNNING,
+                action_type=f"{skill_name}.{function_name}",
+                status="running",
+                runtime_class=runtime_class,
+                risk_class=risk_class,
+                before_state={"command_hash": stable_hash(arguments), "policy_decision": "admitted"},
+                after_state={"command_hash": stable_hash(arguments), "policy_decision": "running"},
+                metadata={
+                    "exec_id": exec_id,
+                    "conversation_id": request.conversation_id,
+                    "session_id": request.session_id,
+                    "request_id": request_id,
+                },
+            )
+        yield hands_pb2.ActionExecutionEvent(
+            status=hands_pb2.ACTION_RUNNING,
             output=f"Executing {skill_name}.{function_name}...",
             action_event_json=dumps_action_event(running_event),
+            failure_class=hands_pb2.FAILURE_CLASS_NONE,
+            final=False,
+            logs_pointer=f"hands://sandbox/{exec_id}/logs",
         )
 
         try:
@@ -195,6 +360,7 @@ class HandsServicer:
                 limits=limits,
                 allowed_domains=list(request.allowed_domains),
                 allowed_paths=list(request.allowed_paths),
+                workspace_id=workspace_id,
             )
 
             self.audit.log_complete(
@@ -205,37 +371,73 @@ class HandsServicer:
                 audit_log=result.get("audit_log", {}),
                 runtime_class=runtime_class,
                 risk_class=risk_class,
-                metadata={"conversation_id": request.conversation_id},
+                metadata={
+                    "conversation_id": request.conversation_id,
+                    "session_id": request.session_id,
+                    "request_id": request_id,
+                },
             )
 
             audit_data = result.get("audit_log", {}) or {}
+            failure_class = (
+                FAILURE_CLASS_PARTIAL_OUTPUT if result.get("partial_output") else FAILURE_CLASS_NONE
+            )
+            receipt = build_action_receipt(
+                request_id=request_id,
+                runtime_class=runtime_class,
+                risk_class=risk_class,
+                failure_class=failure_class,
+                logs_pointer=str(result.get("logs_pointer") or ""),
+                stdout_pointer=str(result.get("stdout_pointer") or ""),
+                stderr_pointer=str(result.get("stderr_pointer") or ""),
+                sandbox_id=str(audit_data.get("sandbox_id") or ""),
+                exit_code=int(result.get("exit_code") or 0),
+                audit_summary=(
+                    f"Executed {skill_name}.{function_name} in sandbox {audit_data.get('sandbox_id', '')}"
+                ),
+                artifact_manifest=result.get("artifact_manifest", []),
+                file_touches=audit_data.get("file_accesses", []),
+                network_touches=audit_data.get("network_requests", []),
+                system_touches=audit_data.get("system_calls", []),
+                grants=permission_decision["matched_grants"] or grants,
+                metadata={
+                    "conversation_id": request.conversation_id,
+                    "session_id": request.session_id,
+                    "execution_time_ms": result.get("execution_time_ms", 0),
+                    "memory_used_mb": result.get("memory_used_mb", 0),
+                },
+                mutating=bool(request.mutating),
+            )
             success_event = build_execution_action_event(
                 source="hands.service",
                 action_type=f"{skill_name}.{function_name}",
-                status="success",
+                status="partial" if result.get("partial_output") else "success",
                 runtime_class=runtime_class,
                 risk_class=risk_class,
                 before_state={"command_hash": stable_hash(arguments), "policy_decision": "running"},
-                after_state={"command_hash": stable_hash(arguments), "policy_decision": "success"},
+                after_state={
+                    "command_hash": stable_hash(arguments),
+                    "policy_decision": "partial" if result.get("partial_output") else "success",
+                },
                 metadata={
                     "exec_id": exec_id,
                     "execution_time_ms": result.get("execution_time_ms", 0),
                     "memory_used_mb": result.get("memory_used_mb", 0),
                     "conversation_id": request.conversation_id,
+                    "request_id": request_id,
+                    "receipt_id": receipt["receipt_id"],
                 },
             )
-            yield hands_pb2.SkillExecutionResponse(
-                status=hands_pb2.SkillExecutionResponse.Status.SUCCESS,
+            yield hands_pb2.ActionExecutionEvent(
+                status=hands_pb2.ACTION_PARTIAL if result.get("partial_output") else hands_pb2.ACTION_COMPLETED,
                 output=result.get("output", ""),
                 execution_time_ms=result.get("execution_time_ms", 0),
                 memory_used_mb=result.get("memory_used_mb", 0),
                 action_event_json=dumps_action_event(success_event),
-                audit_log=hands_pb2.AuditLog(
-                    network_requests=audit_data.get("network_requests", []),
-                    file_accesses=audit_data.get("file_accesses", []),
-                    system_calls=audit_data.get("system_calls", []),
-                    sandbox_id=audit_data.get("sandbox_id", ""),
-                ),
+                receipt=_receipt_to_proto(receipt),
+                failure_class=_failure_class_to_proto(failure_class),
+                final=True,
+                logs_pointer=receipt["logs_pointer"],
             )
 
         except asyncio.TimeoutError:
@@ -244,7 +446,24 @@ class HandsServicer:
                 status="timeout",
                 runtime_class=runtime_class,
                 risk_class=risk_class,
-                metadata={"conversation_id": request.conversation_id},
+                metadata={
+                    "conversation_id": request.conversation_id,
+                    "session_id": request.session_id,
+                    "request_id": request_id,
+                },
+            )
+            receipt = build_action_receipt(
+                request_id=request_id,
+                runtime_class=runtime_class,
+                risk_class=risk_class,
+                failure_class=FAILURE_CLASS_TIMEOUT,
+                logs_pointer=f"hands://sandbox/{exec_id}/logs",
+                sandbox_id=exec_id,
+                exit_code=124,
+                audit_summary=f"Execution timed out after {limits['timeout']}s",
+                grants=permission_decision["matched_grants"] or grants,
+                metadata={"conversation_id": request.conversation_id, "session_id": request.session_id},
+                mutating=bool(request.mutating),
             )
             timeout_event = build_execution_action_event(
                 source="hands.service",
@@ -254,22 +473,49 @@ class HandsServicer:
                 risk_class=risk_class,
                 before_state={"command_hash": stable_hash(arguments), "policy_decision": "running"},
                 after_state={"command_hash": stable_hash(arguments), "policy_decision": "timeout"},
-                metadata={"exec_id": exec_id, "conversation_id": request.conversation_id},
+                metadata={
+                    "exec_id": exec_id,
+                    "conversation_id": request.conversation_id,
+                    "request_id": request_id,
+                    "receipt_id": receipt["receipt_id"],
+                },
             )
-            yield hands_pb2.SkillExecutionResponse(
-                status=hands_pb2.SkillExecutionResponse.Status.TIMEOUT,
-                error=f"Skill execution timed out after {limits['timeout']}s",
+            yield hands_pb2.ActionExecutionEvent(
+                status=hands_pb2.ACTION_TIMEOUT,
+                error=f"Action execution timed out after {limits['timeout']}s",
                 action_event_json=dumps_action_event(timeout_event),
+                receipt=_receipt_to_proto(receipt),
+                failure_class=hands_pb2.FAILURE_CLASS_TIMEOUT,
+                final=True,
+                logs_pointer=receipt["logs_pointer"],
             )
 
         except Exception as e:
+            failure_class = FAILURE_CLASS_SANDBOX_CRASH
             self.audit.log_complete(
                 exec_id,
                 status="error",
                 error=str(e),
                 runtime_class=runtime_class,
                 risk_class=risk_class,
-                metadata={"conversation_id": request.conversation_id},
+                metadata={
+                    "conversation_id": request.conversation_id,
+                    "session_id": request.session_id,
+                    "request_id": request_id,
+                },
+            )
+            receipt = build_action_receipt(
+                request_id=request_id,
+                runtime_class=runtime_class,
+                risk_class=risk_class,
+                failure_class=failure_class,
+                logs_pointer=f"hands://sandbox/{exec_id}/logs",
+                sandbox_id=exec_id,
+                exit_code=1,
+                audit_summary=str(e),
+                grants=permission_decision["matched_grants"] or grants,
+                metadata={"conversation_id": request.conversation_id, "session_id": request.session_id},
+                mutating=bool(request.mutating),
             )
             error_event = build_execution_action_event(
                 source="hands.service",
@@ -279,12 +525,22 @@ class HandsServicer:
                 risk_class=risk_class,
                 before_state={"command_hash": stable_hash(arguments), "policy_decision": "running"},
                 after_state={"command_hash": stable_hash(arguments), "policy_decision": "error"},
-                metadata={"exec_id": exec_id, "error": str(e), "conversation_id": request.conversation_id},
+                metadata={
+                    "exec_id": exec_id,
+                    "error": str(e),
+                    "conversation_id": request.conversation_id,
+                    "request_id": request_id,
+                    "receipt_id": receipt["receipt_id"],
+                },
             )
-            yield hands_pb2.SkillExecutionResponse(
-                status=hands_pb2.SkillExecutionResponse.Status.ERROR,
+            yield hands_pb2.ActionExecutionEvent(
+                status=hands_pb2.ACTION_FAILED,
                 error=str(e),
                 action_event_json=dumps_action_event(error_event),
+                receipt=_receipt_to_proto(receipt),
+                failure_class=_failure_class_to_proto(failure_class),
+                final=True,
+                logs_pointer=receipt["logs_pointer"],
             )
 
     async def ListSkills(self, request, context):
@@ -303,11 +559,13 @@ class HandsServicer:
 
             functions = []
             for fn in function_specs or []:
-                functions.append({
-                    "name": fn["name"],
-                    "description": fn.get("description", ""),
-                    "parameters_schema": json.dumps(fn.get("parameters", {})),
-                })
+                functions.append(
+                    hands_pb2.FunctionMetadata(
+                        name=fn["name"],
+                        description=fn.get("description", ""),
+                        parameters_schema=json.dumps(fn.get("parameters", {})),
+                    )
+                )
 
             capabilities = manifest.get("capabilities", {})
             requires_network = manifest.get(
@@ -319,16 +577,18 @@ class HandsServicer:
                 capabilities.get("filesystem", False),
             )
 
-            skills.append({
-                "name": name,
-                "description": manifest.get("description", ""),
-                "version": manifest.get("version", "0.1.0"),
-                "functions": functions,
-                "requires_network": requires_network,
-                "requires_filesystem": requires_filesystem,
-            })
+            skills.append(
+                hands_pb2.SkillMetadata(
+                    name=name,
+                    description=manifest.get("description", ""),
+                    version=manifest.get("version", "0.1.0"),
+                    functions=functions,
+                    requires_network=requires_network,
+                    requires_filesystem=requires_filesystem,
+                )
+            )
 
-        return {"skills": skills}
+        return hands_pb2.ListSkillsResponse(skills=skills)
 
     async def HealthCheck(self, request, context):
         """Return health status."""
