@@ -1,11 +1,4 @@
-from pathlib import Path
-import sys
-
-SHARED_PATH = Path(__file__).resolve().parents[2] / "shared"
-if str(SHARED_PATH) not in sys.path:
-    sys.path.append(str(SHARED_PATH))
-
-from action_event_schema import (
+from shared_schemas import (
     build_action_event,
     build_execution_action_event,
     classify_risk_class,

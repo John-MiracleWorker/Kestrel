@@ -1,12 +1,14 @@
 """
 Database connection pool management for PostgreSQL and Redis.
 """
+
+from __future__ import annotations
+
 import os
 import logging
 from typing import Optional
 
 import asyncpg
-import redis.asyncio as redis
 
 logger = logging.getLogger("brain.db")
 
@@ -20,7 +22,17 @@ DB_URL = os.getenv(
 )
 
 _pool: Optional[asyncpg.Pool] = None
-_redis_pool: Optional[redis.Redis] = None
+_redis_pool: Optional[object] = None
+
+
+def _import_redis_module():
+    try:
+        import redis.asyncio as redis_module
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Redis support requires the 'redis' package. Install packages/brain/requirements.txt."
+        ) from exc
+    return redis_module
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -34,9 +46,10 @@ async def get_pool() -> asyncpg.Pool:
     return _pool
 
 
-async def get_redis() -> redis.Redis:
+async def get_redis():
     global _redis_pool
     if _redis_pool is None:
+        redis = _import_redis_module()
         _redis_pool = redis.from_url(
             f"redis://{os.getenv('REDIS_HOST', 'localhost')}:{os.getenv('REDIS_PORT', '6379')}"
         )

@@ -7,9 +7,8 @@ from pathlib import Path
 from grpc_tools import protoc
 
 _THIS_DIR = Path(__file__).resolve().parent
-_BRAIN_DIR = _THIS_DIR.parent
-_PROTO_PATH = _BRAIN_DIR.parent / "shared" / "proto"
-_OUT_DIR = _BRAIN_DIR / "_generated_hands"
+_PROTO_PATH = _THIS_DIR.parent / "shared" / "proto"
+_OUT_DIR = _THIS_DIR / "_generated"
 _OUT_DIR.mkdir(exist_ok=True)
 
 protoc.main(

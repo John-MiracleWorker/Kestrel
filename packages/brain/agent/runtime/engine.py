@@ -9,8 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
-from typing import Any, AsyncIterator, Optional
+from typing import AsyncIterator
 
 from agent.types import (
     AgentTask,
@@ -18,7 +17,7 @@ from agent.types import (
     TaskEventType,
     TaskStatus,
 )
-from agent.runtime.state import KestrelState, create_initial_state
+from agent.runtime.state import create_initial_state
 
 logger = logging.getLogger("brain.agent.runtime.engine")
 
@@ -345,6 +344,8 @@ class LangGraphEngine:
                 if item is _QUEUE_DONE:
                     logger.info("engine.run: event_queue DONE sentinel received")
                     break
+                if not isinstance(item, TaskEvent):
+                    continue
                 logger.info(
                     f"engine.run: yielding event type={item.type.value if hasattr(item, 'type') else '?'}, "
                     f"content_len={len(item.content) if hasattr(item, 'content') and isinstance(item.content, str) else '?'}"

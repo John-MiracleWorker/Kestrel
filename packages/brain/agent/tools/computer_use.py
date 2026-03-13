@@ -35,22 +35,14 @@ import base64
 import json
 import logging
 import os
-import sys
-import time
 import uuid
-from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 
 from agent.runtime import get_active_runtime
 from agent.types import RiskLevel, ToolDefinition
-
-_SHARED_PATH = Path(__file__).resolve().parents[3] / "shared"
-if str(_SHARED_PATH) not in sys.path:
-    sys.path.append(str(_SHARED_PATH))
-
-from action_event_schema import build_action_event, stable_hash
+from core.shared_schemas import build_action_event, stable_hash
 
 logger = logging.getLogger("brain.agent.tools.computer_use")
 

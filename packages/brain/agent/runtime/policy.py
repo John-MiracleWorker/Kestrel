@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from agent.runtime.base import ExecutionRuntime, RuntimeCapabilities, RuntimeMode
 from agent.runtime.docker_runtime import DockerRuntime
@@ -62,7 +62,7 @@ class HybridRuntime:
             supports_code_languages=tuple(sorted(set(dc.supports_code_languages + nc.supports_code_languages))),
         )
 
-    async def execute(self, *, tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def execute(self, *, tool_name: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         if tool_name in {"host_shell", "host_python", "computer_use"}:
             return await self.native.execute(tool_name=tool_name, payload=payload)
 
@@ -146,6 +146,7 @@ def build_runtime_policy(*, hands_client: Any = None) -> ExecutionRuntime:
     """Build active runtime policy based on KESTREL_RUNTIME_MODE."""
 
     mode = _parse_mode(os.getenv("KESTREL_RUNTIME_MODE", RuntimeMode.DOCKER.value))
+    runtime: ExecutionRuntime
     if mode == RuntimeMode.NATIVE:
         runtime = NativeRuntime()
     elif mode == RuntimeMode.HYBRID:

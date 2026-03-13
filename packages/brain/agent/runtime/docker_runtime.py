@@ -4,26 +4,19 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
-from pathlib import Path
 from typing import Any, Mapping
 
 from agent.runtime.base import RuntimeCapabilities, RuntimeErrorResult, RuntimeMode
 from agent.runtime.execution_trace import attach_execution_trace
 from core.hands_grpc_setup import hands_pb2
-
-logger = logging.getLogger("brain.agent.runtime.docker")
-
-_SHARED_PATH = Path(__file__).resolve().parents[3] / "shared"
-if str(_SHARED_PATH) not in sys.path:
-    sys.path.append(str(_SHARED_PATH))
-
-from action_event_schema import (
+from core.shared_schemas import (
     build_execution_action_event,
     classify_risk_class,
     classify_runtime_class,
+    normalize_action_receipt,
 )
-from action_receipt_schema import normalize_action_receipt
+
+logger = logging.getLogger("brain.agent.runtime.docker")
 
 
 def _receipt_from_proto(receipt: Any) -> dict[str, Any]:

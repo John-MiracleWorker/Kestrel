@@ -6,7 +6,6 @@ import logging
 import os
 import json
 from datetime import datetime, timezone
-from typing import Optional
 
 logger = logging.getLogger("hands.security.allowlist")
 
@@ -28,8 +27,12 @@ class PermissionChecker:
             with open(blocklist_path) as f:
                 self._default_blocked = set(json.load(f))
 
-    def check(self, workspace_id: str, skill_name: str,
-              function_name: str = None) -> bool:
+    def check(
+        self,
+        workspace_id: str,
+        skill_name: str,
+        function_name: str | None = None,
+    ) -> bool:
         """Check if a skill/function is allowed in a workspace."""
         # Globally blocked skills
         if skill_name in self._default_blocked:
@@ -126,7 +129,7 @@ class PermissionChecker:
         self._workspace_policies[workspace_id] = policy
         logger.info(f"Policy updated for workspace {workspace_id}: {policy.get('mode')}")
 
-    def get_policy(self, workspace_id: str) -> Optional[dict]:
+    def get_policy(self, workspace_id: str) -> dict | None:
         return self._workspace_policies.get(workspace_id)
 
     @staticmethod

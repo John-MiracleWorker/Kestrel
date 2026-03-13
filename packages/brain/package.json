@@ -1,15 +1,15 @@
 {
-  "name": "@kestrel/brain",
-  "version": "0.1.0",
-  "description": "Brain service - LLM engine and reasoning coordinator",
-  "scripts": {
-    "dev": "python server.py",
-    "test": "pytest tests/",
-    "lint": "ruff check .",
-    "format": "ruff format .",
-    "typecheck": "mypy ."
-  },
-  "engines": {
-    "python": ">=3.10"
-  }
+    "name": "@kestrel/brain",
+    "version": "0.1.0",
+    "description": "Brain service - LLM engine and reasoning coordinator",
+    "scripts": {
+        "dev": "python server.py",
+        "test": "node ../../scripts/run-python-tool.cjs pytest tests",
+        "lint": "node ../../scripts/run-python-tool.cjs ruff check app.py db.py server.py users.py core services tests agent/task_events.py agent/evidence.py agent/runtime agent/tools/computer_use.py agent/tools/host_execution.py agent/tools/moltbook.py",
+        "format": "ruff format .",
+        "typecheck": "node ../../scripts/run-python-tool.cjs mypy app.py db.py server.py users.py core services tests agent/task_events.py agent/evidence.py agent/runtime agent/tools/computer_use.py agent/tools/host_execution.py agent/tools/moltbook.py"
+    },
+    "engines": {
+        "python": ">=3.10"
+    }
 }

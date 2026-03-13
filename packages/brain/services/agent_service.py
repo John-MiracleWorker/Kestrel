@@ -138,8 +138,7 @@ class AgentServicerMixin(BaseServicerMixin):
         task_id = request.task_id
         history = await load_task_event_history(task_id)
         if not history and not await is_task_terminal(task_id):
-            context.abort(grpc.StatusCode.NOT_FOUND, f"Task {task_id} is not running")
-            return
+            await context.abort(grpc.StatusCode.NOT_FOUND, f"Task {task_id} is not running")
         async for event in self._stream_task_event_feed(task_id, context):
             yield event
 
@@ -182,7 +181,7 @@ class AgentServicerMixin(BaseServicerMixin):
             return brain_pb2.ListPendingApprovalsResponse(approvals=items)
         except Exception as e:
             logger.exception("ListPendingApprovals failed")
-            context.abort(grpc.StatusCode.INTERNAL, str(e))
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     async def CancelTask(self, request, context):
         """Cancel a running agent task."""
@@ -280,10 +279,14 @@ class AgentServicerMixin(BaseServicerMixin):
         config = GCfg()
         if request.guardrails:
             g = request.guardrails
-            if g.max_iterations > 0: config.max_iterations = g.max_iterations
-            if g.max_tool_calls > 0: config.max_tool_calls = g.max_tool_calls
-            if g.max_tokens > 0:     config.max_tokens = g.max_tokens
-            if g.max_wall_time_seconds > 0: config.max_wall_time_seconds = g.max_wall_time_seconds
+            if g.max_iterations > 0:
+                config.max_iterations = g.max_iterations
+            if g.max_tool_calls > 0:
+                config.max_tool_calls = g.max_tool_calls
+            if g.max_tokens > 0:
+                config.max_tokens = g.max_tokens
+            if g.max_wall_time_seconds > 0:
+                config.max_wall_time_seconds = g.max_wall_time_seconds
 
         task = AgentTask(
             user_id=user_id,

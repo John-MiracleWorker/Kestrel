@@ -26,7 +26,7 @@ import logging
 import os
 from typing import Any
 
-from agent.types import ApprovalStatus, TaskStatus
+from agent.types import TaskStatus
 from agent.runtime.state import KestrelState
 
 logger = logging.getLogger("brain.agent.runtime.nodes.approve")
@@ -51,7 +51,8 @@ async def approve_node(
     """
     task = state["task"]
     plan = state.get("plan") or task.plan
-    council_verdict = state.get("council_verdict", {})
+    raw_council_verdict = state.get("council_verdict")
+    council_verdict = raw_council_verdict if isinstance(raw_council_verdict, dict) else {}
     simulation_warning = state.get("simulation_warning")
     updates: dict[str, Any] = {}
 

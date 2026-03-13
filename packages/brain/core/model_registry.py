@@ -18,7 +18,6 @@ import logging
 import os
 import re
 import time
-from typing import Optional
 
 logger = logging.getLogger("brain.core.model_registry")
 

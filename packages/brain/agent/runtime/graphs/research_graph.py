@@ -83,7 +83,7 @@ async def parallel_research(
                 isolated_context=True,
             ))
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        findings = []
+        findings: list[dict[str, Any]] = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.warning(f"Research angle {i} failed: {result}")
@@ -102,7 +102,7 @@ async def parallel_research(
 
     # Fallback: use search router directly
     if search_router:
-        findings = []
+        search_findings: list[dict[str, Any]] = []
         for angle in angles:
             try:
                 results = await search_router.search(
@@ -110,7 +110,7 @@ async def parallel_research(
                     max_results=5,
                     backend=search_backend,
                 )
-                findings.append({
+                search_findings.append({
                     "angle": angle,
                     "findings": "\n\n".join(
                         f"**{r.title}**\n{r.snippet}\nSource: {r.url}"
@@ -119,12 +119,12 @@ async def parallel_research(
                     "sources": [{"title": r.title, "url": r.url} for r in results],
                 })
             except Exception as e:
-                findings.append({
+                search_findings.append({
                     "angle": angle,
                     "findings": f"Search failed: {e}",
                     "sources": [],
                 })
-        return {"findings": findings}
+        return {"findings": search_findings}
 
     return {"findings": []}
 
@@ -161,7 +161,6 @@ async def synthesize_report(state: ResearchState) -> dict[str, Any]:
     topic = state["topic"]
     analysis = state.get("analysis", "")
     findings = state.get("findings", [])
-    report_format = state.get("report_format", "markdown")
 
     # Build structured report
     report_parts = [

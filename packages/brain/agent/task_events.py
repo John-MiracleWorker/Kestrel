@@ -1,11 +1,11 @@
-from __future__ import annotations
-
 """
 Shared persistence for task events with a typed Postgres journal and Redis fan-out.
 """
 
+from __future__ import annotations
+
 import json
-from typing import Any, Optional
+from typing import Any
 
 from core.config import TASK_EVENT_HISTORY_MAX, TASK_EVENT_TTL_SECONDS
 from db import get_pool, get_redis

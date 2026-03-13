@@ -2,22 +2,14 @@
 Audit logger — records all skill executions for accountability.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
-import sys
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timezone
 
-_SHARED_PATH = Path(__file__).resolve().parents[2] / "shared"
-if str(_SHARED_PATH) not in sys.path:
-    sys.path.append(str(_SHARED_PATH))
-
-from action_event_schema import (
-    build_execution_action_event,
-    normalize_action_event,
-    stable_hash,
-)
+from shared_schemas import build_execution_action_event, normalize_action_event, stable_hash
 
 logger = logging.getLogger("hands.security.audit")
 
@@ -65,7 +57,7 @@ class AuditLogger:
             "skill_name": skill_name,
             "function_name": function_name,
             "arguments_hash": command_hash,  # Don't log raw args for security
-            "started_at": datetime.utcnow().isoformat(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
             "status": "running",
             "runtime_class": runtime_class,
             "risk_class": risk_class,
@@ -80,8 +72,8 @@ class AuditLogger:
         status: str = "success",
         execution_time_ms: int = 0,
         memory_used_mb: int = 0,
-        audit_log: dict = None,
-        error: str = None,
+        audit_log: dict | None = None,
+        error: str | None = None,
         runtime_class: str = "",
         risk_class: str = "",
         metadata: dict | None = None,
@@ -90,7 +82,7 @@ class AuditLogger:
         entry = self._entries.get(exec_id, {})
         entry.update({
             "status": status,
-            "completed_at": datetime.utcnow().isoformat(),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
             "execution_time_ms": execution_time_ms,
             "memory_used_mb": memory_used_mb,
             "runtime_class": runtime_class or entry.get("runtime_class", ""),
@@ -143,7 +135,7 @@ class AuditLogger:
 
     def _write_entry(self, entry: dict):
         """Append audit entry to daily log file."""
-        date_str = datetime.utcnow().strftime("%Y-%m-%d")
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         log_file = os.path.join(self._log_dir, f"audit-{date_str}.jsonl")
         with open(log_file, "a") as f:
             f.write(json.dumps(entry) + "\n")

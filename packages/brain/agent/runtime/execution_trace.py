@@ -4,16 +4,10 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
-_SHARED_PATH = Path(__file__).resolve().parents[3] / "shared"
-if str(_SHARED_PATH) not in sys.path:
-    sys.path.append(str(_SHARED_PATH))
-
-from action_event_schema import (
+from core.shared_schemas import (
     dumps_action_event,
     normalize_action_event,
     stable_hash,

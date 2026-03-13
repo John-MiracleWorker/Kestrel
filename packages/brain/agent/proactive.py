@@ -165,7 +165,7 @@ class ProactiveEngine:
     def __init__(
         self,
         notification_router=None,
-        task_launcher: Callable = None,
+        task_launcher: Callable[..., Any] | None = None,
         llm_provider=None,
         model: str = "",
     ):

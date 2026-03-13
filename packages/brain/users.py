@@ -3,18 +3,27 @@ User creation and authentication.
 """
 import hashlib
 import hmac
-import uuid
 import logging
-
-import bcrypt
+import uuid
 
 from db import get_pool
 
 logger = logging.getLogger("brain.users")
 
 
+def _require_bcrypt():
+    try:
+        import bcrypt
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "User authentication requires the 'bcrypt' package. Install packages/brain/requirements.txt."
+        ) from exc
+    return bcrypt
+
+
 async def create_user(email: str, password: str, display_name: str = "") -> dict:
     """Create a new user with bcrypt-hashed password."""
+    bcrypt = _require_bcrypt()
     pool = await get_pool()
     user_id = str(uuid.uuid4())
     salt = ""  # Bcrypt handles salting internally
@@ -46,6 +55,7 @@ async def authenticate_user(email: str, password: str) -> dict:
     is_bcrypt = row["password_hash"].startswith("$2")
 
     if is_bcrypt:
+        bcrypt = _require_bcrypt()
         valid = bcrypt.checkpw(password.encode(), row["password_hash"].encode())
     else:
         # Legacy SHA-256 — constant-time comparison to avoid timing attacks
@@ -57,6 +67,7 @@ async def authenticate_user(email: str, password: str) -> dict:
 
     # Auto-upgrade legacy SHA-256 hashes to bcrypt on successful login
     if not is_bcrypt:
+        bcrypt = _require_bcrypt()
         new_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
         await pool.execute(
             "UPDATE users SET password_hash = $1, salt = '' WHERE id = $2",

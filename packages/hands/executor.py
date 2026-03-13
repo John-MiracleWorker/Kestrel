@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import time
-from typing import Optional
 
 logger = logging.getLogger("hands.executor")
 
@@ -80,7 +79,7 @@ class DockerExecutor:
         self._workspace_volumes: set[str] = set()
         self._sandbox_image_lock = asyncio.Lock()
         self._sandbox_image_ready = False
-        self._sandbox_image_error: Optional[str] = None
+        self._sandbox_image_error: str | None = None
 
     @property
     def active_sandboxes(self) -> int:
@@ -99,7 +98,7 @@ class DockerExecutor:
         return self._sandbox_image_ready
 
     @property
-    def sandbox_error(self) -> Optional[str]:
+    def sandbox_error(self) -> str | None:
         return self._sandbox_image_error
 
     def _get_client(self):
@@ -200,7 +199,7 @@ class DockerExecutor:
         except Exception as e:
             logger.warning(f"Warm pool init failed (non-fatal): {e}")
 
-    def _create_warm_container(self, client) -> Optional[str]:
+    def _create_warm_container(self, client) -> str | None:
         """Create a stopped container ready for use."""
         try:
             container = client.containers.create(
@@ -215,7 +214,7 @@ class DockerExecutor:
             logger.debug(f"Warm container creation failed: {e}")
             return None
 
-    async def _acquire_warm_container(self) -> Optional[str]:
+    async def _acquire_warm_container(self) -> str | None:
         """Pop a warm container from the pool (or None if empty)."""
         async with self._warm_pool_lock:
             if self._warm_pool:
@@ -310,8 +309,8 @@ class DockerExecutor:
         function_name: str,
         arguments: str,
         limits: dict,
-        allowed_domains: list[str] = None,
-        allowed_paths: list[str] = None,
+        allowed_domains: list[str] | None = None,
+        allowed_paths: list[str] | None = None,
         workspace_id: str = "",
     ) -> dict:
         """Run a skill function in a sandboxed Docker container.
@@ -334,7 +333,7 @@ class DockerExecutor:
         effective_limits = self._get_resource_profile(skill_path, limits)
 
         # Ensure workspace volume exists for persistent storage
-        workspace_volume = None
+        workspace_volume: str | None = None
         if workspace_id:
             workspace_volume = await self.ensure_workspace_volume(workspace_id)
 
@@ -504,7 +503,7 @@ class DockerExecutor:
                 "stderr": stderr,
             }
 
-        except Exception as e:
+        except Exception:
             if container:
                 try:
                     container.kill()
@@ -524,7 +523,7 @@ class DockerExecutor:
         skill_steps: list[dict],
         limits: dict,
         workspace_id: str = "",
-        allowed_domains: list[str] = None,
+        allowed_domains: list[str] | None = None,
     ) -> list[dict]:
         """Execute multiple skill invocations sequentially in a single container.
 
@@ -536,9 +535,8 @@ class DockerExecutor:
         if not skill_steps:
             return []
 
-        workspace_volume = None
         if workspace_id:
-            workspace_volume = await self.ensure_workspace_volume(workspace_id)
+            await self.ensure_workspace_volume(workspace_id)
 
         results = []
         effective_limits = self._get_resource_profile(

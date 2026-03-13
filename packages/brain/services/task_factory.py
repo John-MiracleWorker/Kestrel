@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from core.config import logger
-from core.feature_mode import FeatureMode, parse_feature_mode
+from core.feature_mode import parse_feature_mode
 from core import runtime
 
 from agent.execution_context import ExecutionContext
@@ -189,8 +189,8 @@ async def create_chat_task(request, ctx, workspace_id: str) -> AgentTask:
     )
 
     # Attach computed metadata for the orchestrator
-    chat_task._tool_registry = tool_registry
-    chat_task._feature_mode = feature_mode
-    chat_task._task_profile = task_profile
+    setattr(chat_task, "_tool_registry", tool_registry)
+    setattr(chat_task, "_feature_mode", feature_mode)
+    setattr(chat_task, "_task_profile", task_profile)
 
     return chat_task

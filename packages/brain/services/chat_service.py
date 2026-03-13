@@ -1,5 +1,4 @@
 import asyncio
-import json
 from .base import BaseServicerMixin
 from core.grpc_setup import brain_pb2
 from core.config import logger
@@ -54,7 +53,7 @@ class ChatServicerMixin(BaseServicerMixin):
                 # Try to load from workspace config
                 try:
                     pool = await get_pool()
-                    ws_config = await ProviderConfig(pool).get_config(request.workspace_id)
+                    await ProviderConfig(pool).get_config(request.workspace_id)
                     configs = await list_provider_configs(request.workspace_id)
                     for c in configs:
                         if c["provider"] == request.provider:

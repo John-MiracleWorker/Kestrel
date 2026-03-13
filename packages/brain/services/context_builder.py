@@ -5,7 +5,6 @@ import logging
 import base64
 import httpx as _httpx
 from core.prompts import KESTREL_DEFAULT_SYSTEM_PROMPT
-from db import get_pool
 from crud import get_messages
 
 logger = logging.getLogger("brain.services.context")
@@ -79,10 +78,7 @@ async def build_chat_context(request, workspace_id, pool, r, runtime, provider_n
         except Exception as hist_err:
             logger.warning(f"Failed to load conversation history: {hist_err}")
 
-    # Extract params
     params = dict(request.parameters) if request.parameters else {}
-    temperature = float(params.get("temperature", str(ws_config["temperature"])))
-    max_tokens = int(params.get("max_tokens", str(ws_config["max_tokens"])))
 
     # 1b. Process attachments
     attachment_parts = []
@@ -126,7 +122,7 @@ async def build_chat_context(request, workspace_id, pool, r, runtime, provider_n
                         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
                             text = "\n".join(page.extract_text() or "" for page in pdf.pages[:20])
                         attachment_text.append(f"\n--- Attached PDF: {filename} ---\n{text[:8000]}\n--- End PDF ---\n")
-                    except Exception as pdf_err:
+                    except Exception:
                         attachment_text.append(f"[PDF: {filename} - extraction failed]")
                 else:
                     try:

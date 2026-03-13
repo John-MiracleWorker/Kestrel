@@ -4,7 +4,7 @@ import json
 import logging
 import math
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 import grpc
@@ -88,8 +88,8 @@ def _build_recovery_hints(
     orphaned: bool,
     pending_approval_id: str,
     last_checkpoint_id: str,
-) -> list[brain_pb2.RecoveryHint]:
-    hints: list[brain_pb2.RecoveryHint] = []
+) -> list[Any]:
+    hints: list[Any] = []
 
     if pending_approval_id:
         hints.append(
@@ -287,7 +287,7 @@ class OperatorServicerMixin(BaseServicerMixin):
     @staticmethod
     def _derive_execution_summary(
         timeline_rows: list[dict[str, Any]],
-    ) -> brain_pb2.ExecutionTraceSummary:
+    ) -> Any:
         runtime_class = ""
         risk_class = ""
         fallback_summary = ""
@@ -331,7 +331,7 @@ class OperatorServicerMixin(BaseServicerMixin):
     async def GetMemoryGraph(self, request, context):
         workspace_id = request.workspace_id
         if not workspace_id:
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id is required")
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id is required")
 
         pool = await get_pool()
         graph_nodes = await pool.fetch(
@@ -451,11 +451,11 @@ class OperatorServicerMixin(BaseServicerMixin):
         workspace_id = request.workspace_id
         task_id = request.task_id
         if not workspace_id or not task_id:
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id and task_id are required")
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id and task_id are required")
 
         task_row = await self._get_workspace_task_row(workspace_id=workspace_id, task_id=task_id)
         if not task_row:
-            context.abort(grpc.StatusCode.NOT_FOUND, f"Task {task_id} not found")
+            await context.abort(grpc.StatusCode.NOT_FOUND, f"Task {task_id} not found")
 
         pool = await get_pool()
         pending_approval = await pool.fetchrow(
@@ -617,11 +617,11 @@ class OperatorServicerMixin(BaseServicerMixin):
         workspace_id = request.workspace_id
         task_id = request.task_id
         if not workspace_id or not task_id:
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id and task_id are required")
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id and task_id are required")
 
         task_row = await self._get_workspace_task_row(workspace_id=workspace_id, task_id=task_id)
         if not task_row:
-            context.abort(grpc.StatusCode.NOT_FOUND, f"Task {task_id} not found")
+            await context.abort(grpc.StatusCode.NOT_FOUND, f"Task {task_id} not found")
 
         events = [
             brain_pb2.TaskTimelineItem(
@@ -657,11 +657,11 @@ class OperatorServicerMixin(BaseServicerMixin):
         workspace_id = request.workspace_id
         task_id = request.task_id
         if not workspace_id or not task_id:
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id and task_id are required")
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id and task_id are required")
 
         task_row = await self._get_workspace_task_row(workspace_id=workspace_id, task_id=task_id)
         if not task_row:
-            context.abort(grpc.StatusCode.NOT_FOUND, f"Task {task_id} not found")
+            await context.abort(grpc.StatusCode.NOT_FOUND, f"Task {task_id} not found")
 
         pool = await get_pool()
         rows = await pool.fetch(
@@ -689,13 +689,13 @@ class OperatorServicerMixin(BaseServicerMixin):
         workspace_id = request.workspace_id
         task_id = request.task_id or ""
         if not workspace_id:
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id is required")
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id is required")
 
         task_row = None
         if task_id:
             task_row = await self._get_workspace_task_row(workspace_id=workspace_id, task_id=task_id)
             if not task_row:
-                context.abort(grpc.StatusCode.NOT_FOUND, f"Task {task_id} not found")
+                await context.abort(grpc.StatusCode.NOT_FOUND, f"Task {task_id} not found")
 
         rows = await self._list_artifact_rows(workspace_id=workspace_id, task_row=task_row, limit=50)
         artifacts = [
@@ -716,7 +716,7 @@ class OperatorServicerMixin(BaseServicerMixin):
     async def GetApprovalAudit(self, request, context):
         workspace_id = request.workspace_id
         if not workspace_id:
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id is required")
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id is required")
 
         task_id = request.task_id or ""
         status = request.status or ""
@@ -775,7 +775,7 @@ class OperatorServicerMixin(BaseServicerMixin):
     async def ListOperatorTasks(self, request, context):
         workspace_id = request.workspace_id
         if not workspace_id:
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id is required")
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id is required")
 
         pool = await get_pool()
         params: list[Any] = [workspace_id]
@@ -871,7 +871,7 @@ class OperatorServicerMixin(BaseServicerMixin):
     async def GetRuntimeProfile(self, request, context):
         workspace_id = request.workspace_id
         if not workspace_id:
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id is required")
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id is required")
 
         pool = await get_pool()
         workspace_agent = await pool.fetchrow(

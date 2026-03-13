@@ -5,44 +5,34 @@ Runs skills inside Docker containers with resource limits,
 network isolation, and full audit logging.
 """
 
+from __future__ import annotations
+
 import asyncio
+import json
 import logging
 import os
-import json
 import uuid
-import sys
-from pathlib import Path
 from concurrent import futures
 
-import grpc
 from grpc import aio as grpc_aio
 from dotenv import load_dotenv
-from grpc_tools import protoc
 
 from executor import DockerExecutor
+from grpc_setup import hands_pb2, hands_pb2_grpc
 from security.allowlist import PermissionChecker
 from security.audit import AuditLogger
-
-_SHARED_PATH = Path(__file__).resolve().parents[1] / "shared"
-if str(_SHARED_PATH) not in sys.path:
-    sys.path.append(str(_SHARED_PATH))
-
-from action_event_schema import (
+from shared_schemas import (
+    FAILURE_CLASS_EXECUTION_ERROR,
+    FAILURE_CLASS_NONE,
+    FAILURE_CLASS_PARTIAL_OUTPUT,
+    FAILURE_CLASS_SANDBOX_CRASH,
+    FAILURE_CLASS_TIMEOUT,
+    build_action_receipt,
     build_execution_action_event,
     classify_risk_class,
     classify_runtime_class,
     dumps_action_event,
     stable_hash,
-)
-from action_receipt_schema import (
-    FAILURE_CLASS_EXECUTION_ERROR,
-    FAILURE_CLASS_ESCALATION_REQUIRED,
-    FAILURE_CLASS_NONE,
-    FAILURE_CLASS_PARTIAL_OUTPUT,
-    FAILURE_CLASS_PERMISSION_DENIED,
-    FAILURE_CLASS_SANDBOX_CRASH,
-    FAILURE_CLASS_TIMEOUT,
-    build_action_receipt,
 )
 
 load_dotenv()
@@ -51,22 +41,6 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 
 GRPC_PORT = int(os.getenv("HANDS_GRPC_PORT", "50052"))
 GRPC_HOST = os.getenv("HANDS_GRPC_HOST", "0.0.0.0")
-
-PROTO_PATH = os.path.join(os.path.dirname(__file__), "../shared/proto")
-GENERATED_DIR = os.path.join(os.path.dirname(__file__), "_generated")
-os.makedirs(GENERATED_DIR, exist_ok=True)
-
-protoc.main([
-    "grpc_tools.protoc",
-    f"-I{PROTO_PATH}",
-    f"--python_out={GENERATED_DIR}",
-    f"--grpc_python_out={GENERATED_DIR}",
-    "hands.proto",
-])
-
-sys.path.insert(0, GENERATED_DIR)
-import hands_pb2
-import hands_pb2_grpc
 
 # ── Skill Registry ───────────────────────────────────────────────────
 
@@ -174,15 +148,15 @@ def _receipt_to_proto(receipt: dict):
     )
 
 
-def load_skills(skills_dir: str = None):
+def load_skills(skills_dir: str | None = None):
     """Load skill metadata from the skills directory."""
-    skills_dir = skills_dir or os.getenv("SKILLS_DIR", "./skills")
-    if not os.path.isdir(skills_dir):
-        logger.warning(f"Skills directory not found: {skills_dir}")
+    resolved_skills_dir = skills_dir or os.getenv("SKILLS_DIR", "./skills") or "./skills"
+    if not os.path.isdir(resolved_skills_dir):
+        logger.warning(f"Skills directory not found: {resolved_skills_dir}")
         return []
 
-    for name in os.listdir(skills_dir):
-        skill_path = os.path.join(skills_dir, name)
+    for name in os.listdir(resolved_skills_dir):
+        skill_path = os.path.join(resolved_skills_dir, name)
         skill_manifest_path = os.path.join(skill_path, "skill.json")
         legacy_manifest_path = os.path.join(skill_path, "manifest.json")
         manifest_path = (
@@ -211,8 +185,12 @@ def load_skills(skills_dir: str = None):
 class HandsServicer:
     """Implements kestrel.hands.HandsService."""
 
-    def __init__(self, executor: DockerExecutor, permissions: PermissionChecker,
-                 audit: AuditLogger):
+    def __init__(
+        self,
+        executor: DockerExecutor,
+        permissions: PermissionChecker,
+        audit: AuditLogger,
+    ):
         self.executor = executor
         self.permissions = permissions
         self.audit = audit

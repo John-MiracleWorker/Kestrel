@@ -3,24 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 import tempfile
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Mapping
 
 from agent.runtime.base import RuntimeCapabilities, RuntimeErrorResult, RuntimeMode
 from agent.runtime.execution_trace import attach_execution_trace, write_execution_audit_entry
-
-import logging
-
-_SHARED_PATH = Path(__file__).resolve().parents[3] / "shared"
-if str(_SHARED_PATH) not in sys.path:
-    sys.path.append(str(_SHARED_PATH))
-
-from action_event_schema import (
+from core.shared_schemas import (
     build_execution_action_event,
     classify_risk_class,
     classify_runtime_class,

@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import time
-from typing import Optional
+from typing import Any, Awaitable, Callable
 
 import httpx
 
@@ -42,7 +42,7 @@ def _resolve_user_id(
     return user_id or getattr(execution_context, "user_id", "") or ""
 
 
-def _rate_check() -> Optional[dict]:
+def _rate_check() -> dict[str, Any] | None:
     """Check if we're rate-limited. Returns error dict if limited, None if OK."""
     global _last_api_call
     now = time.monotonic()
@@ -58,7 +58,6 @@ def _rate_check() -> Optional[dict]:
     # Enforce minimum interval between calls
     elapsed = now - _last_api_call
     if elapsed < _MIN_CALL_INTERVAL:
-        import asyncio
         # Small enough to just sleep instead of blocking
         pass  # Will be enforced in async context
 
@@ -74,7 +73,7 @@ def _set_rate_limit(seconds: int = 60):
 
 
 
-def _load_api_key() -> Optional[str]:
+def _load_api_key() -> str | None:
     """Load Moltbook API key from env or credentials file."""
     key = os.environ.get("MOLTBOOK_API_KEY")
     if key:
@@ -119,7 +118,7 @@ async def _log_activity(
     submolt: str = "",
     post_id: str = "",
     url: str = "",
-    result: dict = None,
+    result: dict[str, Any] | None = None,
 ) -> None:
     """Log Moltbook activity to the database for the UI feed."""
     if not workspace_id:
@@ -230,7 +229,7 @@ async def moltbook_action(
     """Route to the appropriate Moltbook action."""
     resolved_workspace_id = _resolve_workspace_id(workspace_id, execution_context)
     resolved_user_id = _resolve_user_id(user_id, execution_context)
-    actions = {
+    actions: dict[str, Callable[..., Awaitable[dict[str, Any]]]] = {
         "register": _register,
         "status": _check_status,
         "profile": _get_profile,
@@ -243,7 +242,7 @@ async def moltbook_action(
     }
 
     handler = actions.get(action)
-    if not handler:
+    if handler is None:
         return {"error": f"Unknown action: {action}. Use one of: {list(actions.keys())}"}
 
     # Check if we need an API key (everything except register)
@@ -628,7 +627,7 @@ async def _list_submolts(**kwargs) -> dict:
     }
 
 
-def _solve_challenge(challenge: str) -> Optional[int]:
+def _solve_challenge(challenge: str) -> int | None:
     """
     Auto-solve Moltbook verification challenges.
     These are simple math problems like "What is 7 + 3?"

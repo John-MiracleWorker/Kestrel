@@ -1,4 +1,3 @@
-from provider_config import ProviderConfig
 import grpc
 from core.grpc_setup import brain_pb2
 from .base import BaseServicerMixin

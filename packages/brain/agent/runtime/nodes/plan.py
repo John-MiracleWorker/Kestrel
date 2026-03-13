@@ -36,9 +36,7 @@ from typing import Any
 from agent.types import (
     RiskLevel,
     StepStatus,
-    TaskEventType,
     TaskPlan,
-    TaskStatus,
     TaskStep,
 )
 from agent.runtime.state import KestrelState

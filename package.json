@@ -13,7 +13,7 @@
         "test": "npm test --workspaces --if-present",
         "lint": "npm run lint --workspaces --if-present",
         "typecheck": "npm run typecheck --workspaces --if-present",
-        "clean": "rm -rf packages/*/node_modules packages/*/dist node_modules",
+        "clean": "node ./scripts/clean-worktree.cjs",
         "proto:compile": "npm run proto:compile --workspace=@kestrel/shared",
         "prepare": "husky install || true"
     },

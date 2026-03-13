@@ -78,7 +78,7 @@ async def initialize_node(
             if memory_ctx:
                 updates["memory_context"] = [memory_ctx]
                 if event_callback:
-                    mem_lines = [l for l in memory_ctx.split("\n") if l.strip()]
+                    mem_lines = [line for line in memory_ctx.split("\n") if line.strip()]
                     await event_callback("memory_recalled", {
                         "count": len(mem_lines),
                         "entities": goal_terms,

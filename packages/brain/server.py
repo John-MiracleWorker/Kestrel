@@ -2,9 +2,14 @@
 
 import asyncio
 
-from app import serve
 from db import get_pool, get_redis
 from providers_registry import get_available_providers, get_provider, resolve_provider
+
+
+async def serve() -> None:
+    from app import serve as app_serve
+
+    await app_serve()
 
 __all__ = [
     "get_available_providers",

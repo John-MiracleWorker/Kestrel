@@ -16,19 +16,13 @@ No other agent provides this level of decision transparency.
 
 import json
 import logging
-import sys
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-_SHARED_PATH = Path(__file__).resolve().parents[2] / "shared"
-if str(_SHARED_PATH) not in sys.path:
-    sys.path.append(str(_SHARED_PATH))
-
-from action_event_schema import normalize_action_event
+from core.shared_schemas import normalize_action_event
 
 logger = logging.getLogger("brain.agent.evidence")
 
@@ -70,7 +64,7 @@ class EvidenceNode:
     relevance_score: float = 1.0  # How relevant this evidence was (0.0–1.0)
     timestamp: str = ""
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "type": self.evidence_type.value,
@@ -90,12 +84,12 @@ class DecisionRecord:
     description: str              # What was decided
     reasoning: str                # Why this choice was made
     evidence: list[EvidenceNode] = field(default_factory=list)
-    alternatives_considered: list[dict] = field(default_factory=list)
+    alternatives_considered: list[dict[str, Any]] = field(default_factory=list)
     confidence: float = 0.0       # 0.0–1.0
-    outcome: Optional[str] = None  # Was it successful? (filled post-execution)
+    outcome: str | None = None  # Was it successful? (filled post-execution)
     created_at: str = ""
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "step": self.step_number,
@@ -135,14 +129,14 @@ class EvidenceChain:
         decision_type: DecisionType,
         description: str,
         reasoning: str,
-        evidence: list[dict] = None,
-        alternatives: list[dict] = None,
+        evidence: list[dict[str, Any]] | None = None,
+        alternatives: list[dict[str, Any]] | None = None,
         confidence: float = 0.5,
     ) -> DecisionRecord:
         """Record a decision with its evidence."""
         self._step_counter += 1
 
-        evidence_nodes = []
+        evidence_nodes: list[EvidenceNode] = []
         for e in (evidence or []):
             evidence_nodes.append(EvidenceNode(
                 id=str(uuid.uuid4())[:8],
@@ -173,12 +167,12 @@ class EvidenceChain:
     def record_tool_decision(
         self,
         tool_name: str,
-        args: dict,
+        args: dict[str, Any],
         reasoning: str,
-        alternatives: list[str] = None,
+        alternatives: list[str] | None = None,
     ) -> DecisionRecord:
         """Convenience method for tool selection decisions."""
-        evidence_entries = [{
+        evidence_entries: list[dict[str, Any]] = [{
             "type": "heuristic",
             "content": f"Tool args: {json.dumps(args)[:300]}",
             "source": "tool_registry",
@@ -219,11 +213,11 @@ class EvidenceChain:
         self,
         plan_summary: str,
         reasoning: str,
-        reflection_result: dict = None,
+        reflection_result: dict[str, Any] | None = None,
         confidence: float = 0.7,
     ) -> DecisionRecord:
         """Convenience method for plan/strategy decisions."""
-        evidence = []
+        evidence: list[dict[str, Any]] = []
         if reflection_result:
             evidence.append({
                 "type": "reflection",
@@ -251,14 +245,14 @@ class EvidenceChain:
         """Get the full evidence chain for this task."""
         return [d.to_dict() for d in self._decisions]
 
-    def get_summary(self) -> dict:
+    def get_summary(self) -> dict[str, Any]:
         """Get a summary of the decision chain."""
         total = len(self._decisions)
         if not total:
             return {"total_decisions": 0}
 
         avg_confidence = sum(d.confidence for d in self._decisions) / total
-        by_type = {}
+        by_type: dict[str, int] = {}
         for d in self._decisions:
             by_type[d.decision_type.value] = by_type.get(d.decision_type.value, 0) + 1
 
@@ -281,9 +275,9 @@ class EvidenceChain:
         """
         lines = [
             f"# 🔍 Evidence Chain — Task {self._task_id[:8]}",
-            f"",
+            "",
             f"**Total decisions:** {len(self._decisions)}",
-            f"",
+            "",
         ]
 
         for d in self._decisions:
@@ -295,26 +289,26 @@ class EvidenceChain:
 
             lines.append(f"## Step {d.step_number}: {d.description}{outcome_icon}")
             lines.append(f"**Type:** {d.decision_type.value} · **Confidence:** {d.confidence:.0%}")
-            lines.append(f"")
+            lines.append("")
             lines.append(f"**Reasoning:** {d.reasoning}")
 
             if d.evidence:
-                lines.append(f"")
-                lines.append(f"**Evidence:**")
+                lines.append("")
+                lines.append("**Evidence:**")
                 for e in d.evidence:
                     lines.append(f"  - [{e.evidence_type.value}] {e.content[:200]}")
 
             if d.alternatives_considered:
-                lines.append(f"")
-                lines.append(f"**Alternatives considered:**")
+                lines.append("")
+                lines.append("**Alternatives considered:**")
                 for alt in d.alternatives_considered:
                     alt_name = alt.get("tool", alt.get("approach", "unknown"))
                     reason = alt.get("reason_rejected", "")
                     lines.append(f"  - ~~{alt_name}~~ — {reason}")
 
-            lines.append(f"")
-            lines.append(f"---")
-            lines.append(f"")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
 
         return "\n".join(lines)
 

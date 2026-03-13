@@ -5,7 +5,13 @@ from agent.task_events import persist_task_event_payload
 from agent.task_profiles import TaskProfile
 from agent.types import AgentTask, GuardrailConfig as GCfg
 
-async def launch_task_from_automation(workspace_id: str, user_id: str, goal: str, source: str = "automation", model_override: str = None):
+async def launch_task_from_automation(
+    workspace_id: str,
+    user_id: str,
+    goal: str,
+    source: str = "automation",
+    model_override: str | None = None,
+):
     """Task launcher callback for cron/webhook automation."""
     task = AgentTask(
         user_id=user_id,

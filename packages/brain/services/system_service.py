@@ -3,7 +3,7 @@ from core.grpc_setup import brain_pb2
 from .base import BaseServicerMixin
 from core import runtime
 from db import get_pool
-from providers_registry import get_provider, get_available_providers
+from providers_registry import get_provider
 from core.config import logger
 
 class SystemServicerMixin(BaseServicerMixin):
@@ -229,7 +229,7 @@ class SystemServicerMixin(BaseServicerMixin):
         """List scheduled jobs and recent agent tasks for a workspace."""
         workspace_id = request.workspace_id
         if not workspace_id:
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id is required")
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id is required")
 
         pool = await get_pool()
         processes = []

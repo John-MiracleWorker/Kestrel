@@ -45,7 +45,6 @@ async def generate_outline(state: ContentState) -> dict[str, Any]:
         "LLM-based outline generation is not yet implemented."
     )
     content_type = state.get("content_type", "slides")
-    source_text = state.get("source_text", "")
 
     # Default outline structure by type
     if content_type == "slides":
@@ -111,7 +110,6 @@ async def format_output(state: ContentState) -> dict[str, Any]:
         output_path = os.path.join(output_dir, f"{parent_task_id}_slides.pptx")
         try:
             from pptx import Presentation
-            from pptx.util import Inches, Pt
 
             prs = Presentation()
             sections = draft.split("## ")

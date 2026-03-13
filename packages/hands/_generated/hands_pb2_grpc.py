@@ -5,7 +5,7 @@ import warnings
 
 import hands_pb2 as hands__pb2
 
-GRPC_GENERATED_VERSION = '1.71.2'
+GRPC_GENERATED_VERSION = '1.78.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + f' but the generated code in hands_pb2_grpc.py depends on'
+        + ' but the generated code in hands_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -26,7 +26,7 @@ if _version_not_supported:
 
 
 class HandsServiceStub(object):
-    """Hands service handles sandboxed tool execution
+    """Hands service handles sandboxed action execution.
     """
 
     def __init__(self, channel):
@@ -35,10 +35,10 @@ class HandsServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.ExecuteSkill = channel.unary_stream(
-                '/kestrel.hands.HandsService/ExecuteSkill',
-                request_serializer=hands__pb2.SkillExecutionRequest.SerializeToString,
-                response_deserializer=hands__pb2.SkillExecutionResponse.FromString,
+        self.ExecuteAction = channel.unary_stream(
+                '/kestrel.hands.HandsService/ExecuteAction',
+                request_serializer=hands__pb2.ActionExecutionRequest.SerializeToString,
+                response_deserializer=hands__pb2.ActionExecutionEvent.FromString,
                 _registered_method=True)
         self.ListSkills = channel.unary_unary(
                 '/kestrel.hands.HandsService/ListSkills',
@@ -53,12 +53,11 @@ class HandsServiceStub(object):
 
 
 class HandsServiceServicer(object):
-    """Hands service handles sandboxed tool execution
+    """Hands service handles sandboxed action execution.
     """
 
-    def ExecuteSkill(self, request, context):
-        """Execute a skill in sandboxed environment
-        """
+    def ExecuteAction(self, request, context):
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -80,10 +79,10 @@ class HandsServiceServicer(object):
 
 def add_HandsServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'ExecuteSkill': grpc.unary_stream_rpc_method_handler(
-                    servicer.ExecuteSkill,
-                    request_deserializer=hands__pb2.SkillExecutionRequest.FromString,
-                    response_serializer=hands__pb2.SkillExecutionResponse.SerializeToString,
+            'ExecuteAction': grpc.unary_stream_rpc_method_handler(
+                    servicer.ExecuteAction,
+                    request_deserializer=hands__pb2.ActionExecutionRequest.FromString,
+                    response_serializer=hands__pb2.ActionExecutionEvent.SerializeToString,
             ),
             'ListSkills': grpc.unary_unary_rpc_method_handler(
                     servicer.ListSkills,
@@ -104,11 +103,11 @@ def add_HandsServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class HandsService(object):
-    """Hands service handles sandboxed tool execution
+    """Hands service handles sandboxed action execution.
     """
 
     @staticmethod
-    def ExecuteSkill(request,
+    def ExecuteAction(request,
             target,
             options=(),
             channel_credentials=None,
@@ -121,9 +120,9 @@ class HandsService(object):
         return grpc.experimental.unary_stream(
             request,
             target,
-            '/kestrel.hands.HandsService/ExecuteSkill',
-            hands__pb2.SkillExecutionRequest.SerializeToString,
-            hands__pb2.SkillExecutionResponse.FromString,
+            '/kestrel.hands.HandsService/ExecuteAction',
+            hands__pb2.ActionExecutionRequest.SerializeToString,
+            hands__pb2.ActionExecutionEvent.FromString,
             options,
             channel_credentials,
             insecure,

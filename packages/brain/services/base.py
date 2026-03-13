@@ -1,3 +1,5 @@
+from typing import Any
+
 from core.grpc_setup import brain_pb2
 from core.config import logger
 from agent.task_events import (
@@ -55,7 +57,7 @@ class BaseServicerMixin:
 
     async def _persist_task_event(
         self,
-        task_event: "brain_pb2.TaskEvent",
+        task_event: Any,
         *,
         workspace_id: str = "",
         user_id: str = "",
@@ -88,7 +90,7 @@ class BaseServicerMixin:
             logger.warning(f"Failed to persist task event: {event_err}")
 
     @staticmethod
-    def _task_event_from_json(payload: dict) -> "brain_pb2.TaskEvent":
+    def _task_event_from_json(payload: dict[str, Any]) -> Any:
         progress = payload.get("progress") or {}
         raw_metadata = payload.get("metadata")
         metadata = raw_metadata if isinstance(raw_metadata, dict) else loads_task_event_json(
@@ -117,9 +119,14 @@ class BaseServicerMixin:
             metrics_json=dumps_task_event_json(metrics),
         )
 
-    def _make_response(self, chunk_type: int, content_delta: str = "",
-                       error_message: str = "", metadata: dict = None,
-                       tool_call: dict = None):
+    def _make_response(
+        self,
+        chunk_type: int,
+        content_delta: str = "",
+        error_message: str = "",
+        metadata: dict[str, Any] | None = None,
+        tool_call: dict[str, Any] | None = None,
+    ) -> Any:
         """Build a ChatResponse object."""
         logger.debug(f"Making response chunk {chunk_type}")
         resp = brain_pb2.ChatResponse(

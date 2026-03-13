@@ -7,7 +7,7 @@ import logging
 import os
 from concurrent import futures
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from dotenv import load_dotenv
 from grpc import aio as grpc_aio
@@ -42,6 +42,12 @@ logger = logging.getLogger("brain")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 validate_config()
 
+BrainServiceServicerBase: type[Any] = getattr(
+    brain_pb2_grpc,
+    "BrainServiceServicer",
+    object,
+)
+
 
 class BrainServicer(
     AuthServicerMixin,
@@ -52,7 +58,7 @@ class BrainServicer(
     WorkflowServicerMixin,
     SystemServicerMixin,
     ProviderServicerMixin,
-    brain_pb2_grpc.BrainServiceServicer,
+    BrainServiceServicerBase,
 ):
     pass
 

@@ -1,5 +1,3 @@
-
-import pytest
 from security.allowlist import PermissionChecker
 
 def test_allowlist_default_allow_all():

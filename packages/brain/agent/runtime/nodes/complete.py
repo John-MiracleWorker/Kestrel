@@ -22,7 +22,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from agent.types import StepStatus, TaskEventType, TaskStatus
+from agent.types import TaskStatus
 from agent.runtime.state import KestrelState
 
 logger = logging.getLogger("brain.agent.runtime.nodes.complete")

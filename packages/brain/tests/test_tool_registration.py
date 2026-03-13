@@ -2,7 +2,7 @@
 
 from unittest.mock import patch, MagicMock
 
-from agent.tools import build_tool_registry, _register_core_tools, _register_ops_tools, _register_labs_tools
+from agent.tools import build_tool_registry
 
 
 def _noop_register(registry, **kwargs):

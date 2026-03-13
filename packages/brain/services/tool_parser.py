@@ -2,7 +2,6 @@ import json
 import logging
 import re
 
-from core.grpc_setup import brain_pb2
 
 logger = logging.getLogger("brain.services.tool_parser")
 

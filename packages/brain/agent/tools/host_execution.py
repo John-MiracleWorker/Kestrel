@@ -5,14 +5,12 @@ Policy decisions and approval are delegated to native policy evaluators/provider
 """
 
 import asyncio
-import json
 import logging
 import os
 import sys
 import tempfile
 import uuid
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timezone
 
 from agent.security.native_policy import (
     NativeExecutionRequest,
@@ -21,21 +19,16 @@ from agent.security.native_policy import (
 )
 from agent.runtime.execution_trace import attach_execution_trace, write_execution_audit_entry
 from agent.types import RiskLevel, ToolDefinition
-
-logger = logging.getLogger("brain.agent.tools.host_execution")
-
-_POLICY_EVALUATOR = DEFAULT_NATIVE_POLICY_EVALUATOR
-
-_SHARED_PATH = Path(__file__).resolve().parents[2] / "shared"
-if str(_SHARED_PATH) not in sys.path:
-    sys.path.append(str(_SHARED_PATH))
-
-from action_event_schema import (
+from core.shared_schemas import (
     build_execution_action_event,
     classify_risk_class,
     classify_runtime_class,
     stable_hash,
 )
+
+logger = logging.getLogger("brain.agent.tools.host_execution")
+
+_POLICY_EVALUATOR = DEFAULT_NATIVE_POLICY_EVALUATOR
 
 
 def _audit_log(
@@ -57,7 +50,7 @@ def _audit_log(
     exit_code: int | None = None,
 ):
     """Write native execution audit entries using hands-compatible schema concepts."""
-    elapsed_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
+    elapsed_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
     command_hash = stable_hash(arguments)
     start_event = build_execution_action_event(
         source="brain.tools.host_execution",
@@ -152,7 +145,7 @@ async def _authorize_native_execution(
 
 async def execute_host_shell(command: str, workspace_id: str = "", user_id: str = "") -> dict:
     """Execute a shell command directly on the host OS."""
-    started_at = datetime.utcnow()
+    started_at = datetime.now(timezone.utc)
     exec_id = str(uuid.uuid4())
     workspace_id = workspace_id or os.getenv("KESTREL_WORKSPACE_ID", "default")
     user_id = user_id or os.getenv("KESTREL_USER_ID", "agent")
@@ -265,7 +258,7 @@ async def execute_host_shell(command: str, workspace_id: str = "", user_id: str 
 
 async def execute_host_python(code: str, workspace_id: str = "", user_id: str = "") -> dict:
     """Execute python code directly on the host OS."""
-    started_at = datetime.utcnow()
+    started_at = datetime.now(timezone.utc)
     exec_id = str(uuid.uuid4())
     workspace_id = workspace_id or os.getenv("KESTREL_WORKSPACE_ID", "default")
     user_id = user_id or os.getenv("KESTREL_USER_ID", "agent")
