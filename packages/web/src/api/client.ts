@@ -16,16 +16,33 @@ type RequestOptions = {
 let accessToken: string | null = null;
 let refreshToken: string | null = null;
 let onAuthExpired: (() => void) | null = null;
+const REFRESH_STORAGE_KEY = 'kestrel_refresh';
+
+function getTokenStorage(): Storage | null {
+    if (typeof window === 'undefined') {
+        return null;
+    }
+    return window.sessionStorage;
+}
 
 export function setTokens(access: string, refresh: string) {
     accessToken = access;
     refreshToken = refresh;
     localStorage.removeItem('kestrel_access'); // Ensure it's not stored
-    localStorage.setItem('kestrel_refresh', refresh);
+    localStorage.removeItem(REFRESH_STORAGE_KEY);
+    getTokenStorage()?.setItem(REFRESH_STORAGE_KEY, refresh);
 }
 
 export function loadTokens(): boolean {
-    refreshToken = localStorage.getItem('kestrel_refresh');
+    refreshToken = getTokenStorage()?.getItem(REFRESH_STORAGE_KEY) ?? null;
+    if (!refreshToken) {
+        const legacyRefresh = localStorage.getItem(REFRESH_STORAGE_KEY);
+        if (legacyRefresh) {
+            refreshToken = legacyRefresh;
+            getTokenStorage()?.setItem(REFRESH_STORAGE_KEY, legacyRefresh);
+            localStorage.removeItem(REFRESH_STORAGE_KEY);
+        }
+    }
     return !!refreshToken;
 }
 
@@ -33,11 +50,16 @@ export function clearTokens() {
     accessToken = null;
     refreshToken = null;
     localStorage.removeItem('kestrel_access');
-    localStorage.removeItem('kestrel_refresh');
+    localStorage.removeItem(REFRESH_STORAGE_KEY);
+    getTokenStorage()?.removeItem(REFRESH_STORAGE_KEY);
 }
 
 export function getAccessToken(): string | null {
     return accessToken;
+}
+
+export function hasRefreshToken(): boolean {
+    return !!refreshToken || !!getTokenStorage()?.getItem(REFRESH_STORAGE_KEY);
 }
 
 export function setOnAuthExpired(callback: () => void) {

@@ -3,10 +3,12 @@
  */
 import { FastifyInstance } from 'fastify';
 import { requireAuth, requireWorkspace } from '../auth/middleware';
+import { getLocalGatewayStateStore, isLocalBrainMode } from '../brain/local';
 import { logger } from '../utils/logger';
 import { getPool } from '../db/pool';
 
 export async function docsRoutes(app: FastifyInstance) {
+    const localStore = isLocalBrainMode() ? getLocalGatewayStateStore() : null;
     // ── Auto-Documentation: Generate ────────────────────────────────
     app.post<{ Params: { workspaceId: string }; Body: { category?: string } }>(
         '/api/workspaces/:workspaceId/docs/generate',
@@ -16,32 +18,47 @@ export async function docsRoutes(app: FastifyInstance) {
             const { category } = request.body || {};
 
             try {
-                const pool = getPool();
-                const convContext = await pool.query(
-                    `SELECT title, created_at FROM conversations WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 20`,
-                    [workspaceId]
-                );
+                const convContext = localStore
+                    ? {
+                          rows: localStore
+                              .listRecentConversationTitles(workspaceId, 20)
+                              .map((row) => ({ title: row.title, created_at: row.createdAt })),
+                      }
+                    : await getPool().query(
+                          `SELECT title, created_at FROM conversations WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 20`,
+                          [workspaceId],
+                      );
 
-                const evidenceContext = await pool.query(
-                    `SELECT description, decision_type, reasoning FROM evidence_chain
-                     WHERE task_id IN (SELECT id FROM conversations WHERE workspace_id = $1)
-                     ORDER BY created_at DESC LIMIT 30`,
-                    [workspaceId]
-                ).catch(() => ({ rows: [] }));
+                const evidenceContext = localStore
+                    ? { rows: [] }
+                    : await getPool()
+                          .query(
+                              `SELECT description, decision_type, reasoning FROM evidence_chain
+                         WHERE task_id IN (SELECT id FROM conversations WHERE workspace_id = $1)
+                         ORDER BY created_at DESC LIMIT 30`,
+                              [workspaceId],
+                          )
+                          .catch(() => ({ rows: [] }));
 
                 const contextSummary = [
                     'Recent conversations:',
-                    ...convContext.rows.map((c: any) => `- ${c.title} (${new Date(c.created_at).toLocaleDateString()})`),
+                    ...convContext.rows.map(
+                        (c: any) => `- ${c.title} (${new Date(c.created_at).toLocaleDateString()})`,
+                    ),
                     '',
                     'Key decisions:',
-                    ...evidenceContext.rows.map((e: any) => `- [${e.decision_type}] ${e.description}: ${e.reasoning || ''}`),
+                    ...evidenceContext.rows.map(
+                        (e: any) => `- [${e.decision_type}] ${e.description}: ${e.reasoning || ''}`,
+                    ),
                 ].join('\n');
 
                 const geminiKey = process.env.GEMINI_API_KEY;
                 const openaiKey = process.env.OPENAI_API_KEY;
 
                 if (!geminiKey && !openaiKey) {
-                    return reply.status(400).send({ error: 'No API key configured for doc generation' });
+                    return reply
+                        .status(400)
+                        .send({ error: 'No API key configured for doc generation' });
                 }
 
                 const systemPrompt = `You are a technical documentation generator. Based on the project context provided, generate comprehensive documentation.
@@ -69,35 +86,64 @@ Use real details from the context, not generic placeholders.`;
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             systemInstruction: { parts: [{ text: systemPrompt }] },
-                            contents: [{ role: 'user', parts: [{ text: `Generate documentation based on this project context:\n\n${contextSummary}` }] }],
+                            contents: [
+                                {
+                                    role: 'user',
+                                    parts: [
+                                        {
+                                            text: `Generate documentation based on this project context:\n\n${contextSummary}`,
+                                        },
+                                    ],
+                                },
+                            ],
                             generationConfig: { temperature: 0.4, maxOutputTokens: 8192 },
                         }),
                     });
-                    const data = await res.json() as any;
+                    const data = (await res.json()) as any;
                     text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
                 } else if (openaiKey) {
                     const res = await fetch('https://api.openai.com/v1/chat/completions', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${openaiKey}` },
+                        headers: {
+                            'Content-Type': 'application/json',
+                            Authorization: `Bearer ${openaiKey}`,
+                        },
                         body: JSON.stringify({
                             model: 'gpt-4o',
                             messages: [
                                 { role: 'system', content: systemPrompt },
-                                { role: 'user', content: `Generate documentation based on this project context:\n\n${contextSummary}` },
+                                {
+                                    role: 'user',
+                                    content: `Generate documentation based on this project context:\n\n${contextSummary}`,
+                                },
                             ],
-                            temperature: 0.4, max_tokens: 8192,
+                            temperature: 0.4,
+                            max_tokens: 8192,
                         }),
                     });
-                    const data = await res.json() as any;
+                    const data = (await res.json()) as any;
                     text = data?.choices?.[0]?.message?.content || '';
                 }
 
                 try {
-                    const cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+                    const cleaned = text
+                        .replace(/```json\s*/gi, '')
+                        .replace(/```\s*/g, '')
+                        .trim();
                     const parsed = JSON.parse(cleaned);
                     return reply.send({ docs: parsed.docs || [] });
                 } catch {
-                    return reply.send({ docs: [{ id: 'generated-overview', title: 'Generated Overview', category: 'General', lastUpdated: new Date().toISOString(), content: text }] });
+                    return reply.send({
+                        docs: [
+                            {
+                                id: 'generated-overview',
+                                title: 'Generated Overview',
+                                category: 'General',
+                                lastUpdated: new Date().toISOString(),
+                                content: text,
+                            },
+                        ],
+                    });
                 }
             } catch (error: any) {
                 logger.error('Doc generation error', { error: error.message });

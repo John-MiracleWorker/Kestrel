@@ -21,6 +21,13 @@ import httpx
 logger = logging.getLogger("brain.providers.lmstudio")
 
 
+def _default_lmstudio_host(port: int) -> str:
+    runtime_mode = os.getenv("KESTREL_RUNTIME_MODE", "").lower()
+    if runtime_mode in {"native", "local"}:
+        return f"http://127.0.0.1:{port}"
+    return f"http://host.docker.internal:{port}"
+
+
 class LMStudioUnavailableError(Exception):
     """Raised when LM Studio is unreachable or times out.
 
@@ -35,7 +42,7 @@ _EXPLICIT_LMSTUDIO_HOST = os.getenv("LMSTUDIO_HOST", "") or os.getenv("LMSTUDIO_
 _LMSTUDIO_PORT = int(os.getenv("LMSTUDIO_PORT", "1234"))
 
 # Default fallback URL
-LMSTUDIO_HOST = _EXPLICIT_LMSTUDIO_HOST or f"http://host.docker.internal:{_LMSTUDIO_PORT}"
+LMSTUDIO_HOST = _EXPLICIT_LMSTUDIO_HOST or _default_lmstudio_host(_LMSTUDIO_PORT)
 
 # Default model — LM Studio auto-selects if empty
 LMSTUDIO_DEFAULT_MODEL = os.getenv("LMSTUDIO_DEFAULT_MODEL", "")

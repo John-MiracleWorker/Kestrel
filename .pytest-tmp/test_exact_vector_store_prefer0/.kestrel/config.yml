@@ -1,0 +1,20 @@
+runtime:
+  mode: native
+  allow_loopback_http: false
+  single_user: true
+heartbeat:
+  interval_seconds: 300
+  quiet_hours:
+    enabled: false
+    start: "23:00"
+    end: "07:00"
+permissions:
+  broad_local_control: true
+  require_approval_for_mutations: true
+models:
+  preferred_provider: auto
+  preferred_model: ""
+  ollama_url: http://127.0.0.1:11434
+  lmstudio_url: http://127.0.0.1:1234
+watch:
+  poll_interval_seconds: 5

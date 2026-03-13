@@ -7,13 +7,13 @@ import {
     requireWorkspace,
     generateSecureToken,
 } from '../auth/middleware';
+import { RedisLike } from '../redis/compat';
 import { logger } from '../utils/logger';
-import Redis from 'ioredis';
 
 /**
  * API key route plugin — manage programmatic access keys.
  */
-export default async function apiKeyRoutes(app: FastifyInstance, deps: { redis: Redis }) {
+export default async function apiKeyRoutes(app: FastifyInstance, deps: { redis: RedisLike }) {
     const { redis } = deps;
     const typedApp = app.withTypeProvider<ZodTypeProvider>();
 

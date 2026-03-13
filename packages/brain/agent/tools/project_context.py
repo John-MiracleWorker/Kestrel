@@ -13,7 +13,6 @@ Storage model:
   - content     = condensed project summary (tree + deps + structure)
 """
 
-import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -127,15 +126,11 @@ async def save_project_context(
 
     # Delete previous entry for this project (upsert pattern)
     try:
-        pool = _vector_store._pool
-        if pool:
-            await pool.execute(
-                """DELETE FROM memory_embeddings
-                   WHERE workspace_id = $1
-                   AND source_type = 'project_map'
-                   AND source_id = $2""",
-                workspace_id, slug,
-            )
+        await _vector_store.delete_by_source(
+            workspace_id=workspace_id,
+            source_type="project_map",
+            source_id=slug,
+        )
     except Exception as e:
         logger.warning(f"Failed to delete old project map for {slug}: {e}")
 
@@ -177,19 +172,10 @@ async def recall_project_context(
     slug = _slugify(project_name)
 
     try:
-        pool = _vector_store._pool
-        if not pool:
-            return None
-
-        row = await pool.fetchrow(
-            """SELECT content, metadata, created_at
-               FROM memory_embeddings
-               WHERE workspace_id = $1
-               AND source_type = 'project_map'
-               AND source_id = $2
-               ORDER BY created_at DESC
-               LIMIT 1""",
-            workspace_id, slug,
+        row = await _vector_store.get_latest_by_source(
+            workspace_id=workspace_id,
+            source_type="project_map",
+            source_id=slug,
         )
 
         if not row:
@@ -211,14 +197,12 @@ async def recall_project_context(
             return None
 
         metadata = row["metadata"]
-        if isinstance(metadata, str):
-            metadata = json.loads(metadata)
 
         return {
             "project": metadata.get("project_name", project_name),
             "summary": row["content"],
             "metadata": metadata,
-            "scanned_at": str(row["created_at"]),
+            "scanned_at": str(row.get("created_at", "")),
             "match_type": "exact",
         }
 
@@ -235,30 +219,20 @@ async def list_known_projects(
         return []
 
     try:
-        pool = _vector_store._pool
-        if not pool:
-            return []
-
-        rows = await pool.fetch(
-            """SELECT source_id, metadata, created_at
-               FROM memory_embeddings
-               WHERE workspace_id = $1
-               AND source_type = 'project_map'
-               ORDER BY created_at DESC""",
-            workspace_id,
+        rows = await _vector_store.list_by_source(
+            workspace_id=workspace_id,
+            source_type="project_map",
         )
 
         projects = []
         for row in rows:
             metadata = row["metadata"]
-            if isinstance(metadata, str):
-                metadata = json.loads(metadata)
             projects.append({
                 "slug": row["source_id"],
                 "name": metadata.get("project_name", row["source_id"]),
                 "path": metadata.get("path", ""),
                 "tech_stack": metadata.get("tech_stack", []),
-                "scanned_at": str(row["created_at"]),
+                "scanned_at": str(row.get("created_at", "")),
             })
 
         return projects

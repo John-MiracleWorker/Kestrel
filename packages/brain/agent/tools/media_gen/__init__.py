@@ -23,7 +23,8 @@ GENERATE_MEDIA_TOOL = ToolDefinition(
         "the local file path. Supports both image (SDXL) and video (SVD) "
         "generation. Use media_type='image' for images, media_type='video' "
         "for videos. Video generation takes significantly longer (up to 15 min). "
-        "Set send_telegram=true to also deliver the result to Telegram."
+        "Results are emitted as shared channel artifacts so Telegram, desktop, CLI, and web "
+        "see the same media receipt. send_telegram is retained only for backward compatibility."
     ),
     parameters={
         "type": "object",
@@ -50,7 +51,7 @@ GENERATE_MEDIA_TOOL = ToolDefinition(
             },
             "send_telegram": {
                 "type": "boolean",
-                "description": "If true, also send the generated media to the configured Telegram chat.",
+                "description": "Deprecated compatibility flag. Media delivery now flows through shared channel events.",
             },
         },
         "required": ["prompt"],
@@ -70,7 +71,8 @@ VRAM_GENERATE_IMAGE_TOOL = ToolDefinition(
         "media via SwarmUI, then reloads the LLM — preventing out-of-memory crashes. "
         "IMPORTANT: If the user asks for a video, animation, clip, or any moving/animated content, "
         "you MUST set media_type='video'. Default is 'image' for still pictures. "
-        "Set send_telegram=true to also deliver the result to Telegram."
+        "Results are emitted as shared channel artifacts so Telegram and companion surfaces stay in sync. "
+        "send_telegram is retained only for backward compatibility."
     ),
     parameters={
         "type": "object",
@@ -100,7 +102,7 @@ VRAM_GENERATE_IMAGE_TOOL = ToolDefinition(
             },
             "send_telegram": {
                 "type": "boolean",
-                "description": "If true, also send the generated media to the configured Telegram chat.",
+                "description": "Deprecated compatibility flag. Media delivery now flows through shared channel events.",
             },
             "media_type": {
                 "type": "string",
@@ -172,7 +174,7 @@ async def _vram_generate_image_handler(
 ) -> dict:
     """Handler for the vram_generate_image tool."""
     import asyncio
-    from agent.tools.media_gen.vram_orchestrator import generate_image, _send_to_telegram
+    from agent.tools.media_gen.vram_orchestrator import generate_image
 
     # generate_image is synchronous — run in executor to avoid blocking
     loop = asyncio.get_running_loop()
@@ -204,16 +206,13 @@ async def _vram_generate_image_handler(
             "so the user can see the generated media inline."
         )
 
-    # Handle Telegram delivery asynchronously (the sync caller can't await)
-    if send_telegram and result.get("file_paths"):
-        for fpath in result["file_paths"]:
-            sent = await _send_to_telegram(
-                fpath,
-                prompt,
-                media_type=media_type,
-            )
-            if sent:
-                result["telegram_sent"] = True
+    if send_telegram:
+        result["delivery"] = {
+            "mode": "channel_event",
+            "requested": True,
+            "target": "telegram",
+            "note": "Direct Brain-to-Telegram delivery is disabled; Gateway delivers shared media artifacts.",
+        }
 
     return result
 

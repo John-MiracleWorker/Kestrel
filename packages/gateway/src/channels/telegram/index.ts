@@ -27,6 +27,9 @@ import {
     sendTaskProgress,
     handleCallbackQuery,
 } from './handlers';
+import type { ChannelSessionStore } from '../store';
+import type { TelegramChannelStateRecord } from '../store';
+import { getMediaDir } from '../../utils/paths';
 
 // ── Telegram Adapter ───────────────────────────────────────────────
 
@@ -47,7 +50,8 @@ import {
  */
 export class TelegramAdapter extends BaseChannelAdapter {
     readonly channelType: ChannelType = 'telegram';
-    private readonly mediaDir = process.env.MEDIA_DIR || '/app/generated_media';
+    private readonly mediaDir = getMediaDir();
+    private persistTimer?: NodeJS.Timeout;
 
     public readonly apiBase: string;
     public pollingActive = false;
@@ -89,6 +93,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
         workspaceId: string,
     ) => Promise<Array<{ approval_id: string }>>;
     private cancelStreamHandler?: (userId: string) => void;
+    private readonly sessionStore?: ChannelSessionStore;
 
     public setApprovalHandler(
         handler: (
@@ -188,9 +193,13 @@ export class TelegramAdapter extends BaseChannelAdapter {
         return { id: this._botId, username: this._botUsername };
     }
 
-    constructor(public config: TelegramConfig) {
+    constructor(
+        public config: TelegramConfig,
+        options: { sessionStore?: ChannelSessionStore } = {},
+    ) {
         super();
         this.apiBase = `https://api.telegram.org/bot${config.botToken}`;
+        this.sessionStore = options.sessionStore;
     }
 
     // ── Lifecycle ──────────────────────────────────────────────────
@@ -203,6 +212,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
         this._botId = me.id;
         this._botUsername = me.username;
         logger.info(`Telegram bot connected: @${me.username} (${me.id})`);
+        await this.restoreSessionState();
 
         if (this.config.mode === 'webhook' && this.config.webhookUrl) {
             await this.api('setWebhook', {
@@ -223,6 +233,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
     async disconnect(): Promise<void> {
         this.pollingActive = false;
         if (this.pollingTimer) clearTimeout(this.pollingTimer);
+        if (this.persistTimer) clearTimeout(this.persistTimer);
 
         // Clear all typing indicators
         for (const [, interval] of this.typingIntervals) {
@@ -236,6 +247,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
             });
         }
 
+        await this.persistSessionState();
         this.setStatus('disconnected');
         logger.info('Telegram adapter disconnected');
     }
@@ -766,6 +778,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
 
             for (const update of updates) {
                 this.pollingOffset = update.update_id + 1;
+                this.queuePersistSessionState();
                 await processUpdate(this, update);
             }
         } catch (err) {
@@ -789,7 +802,13 @@ export class TelegramAdapter extends BaseChannelAdapter {
 
         this.userIdMap.set(chatId, userId);
         this.chatIdMap.set(userId, chatId);
+        this.queuePersistSessionState();
         return userId;
+    }
+
+    public rememberThread(userId: string, threadId?: number): void {
+        this.userThreadMap.set(userId, threadId);
+        this.queuePersistSessionState();
     }
 
     /**
@@ -844,5 +863,57 @@ export class TelegramAdapter extends BaseChannelAdapter {
         }
 
         return data.result;
+    }
+
+    private queuePersistSessionState(): void {
+        if (!this.sessionStore) {
+            return;
+        }
+        if (this.persistTimer) {
+            clearTimeout(this.persistTimer);
+        }
+        this.persistTimer = setTimeout(() => {
+            this.persistTimer = undefined;
+            void this.persistSessionState();
+        }, 25);
+    }
+
+    private async restoreSessionState(): Promise<void> {
+        if (!this.sessionStore) {
+            return;
+        }
+        const state = await this.sessionStore.getTelegramState();
+        if (!state) {
+            return;
+        }
+        this.applySessionState(state);
+    }
+
+    private applySessionState(state: TelegramChannelStateRecord): void {
+        this.pollingOffset = Number(state.pollingOffset || 0);
+        this.chatIdMap.clear();
+        this.userIdMap.clear();
+        this.userThreadMap.clear();
+        for (const mapping of state.mappings || []) {
+            this.chatIdMap.set(mapping.userId, mapping.chatId);
+            this.userIdMap.set(mapping.chatId, mapping.userId);
+            this.userThreadMap.set(mapping.userId, mapping.threadId);
+        }
+    }
+
+    private async persistSessionState(): Promise<void> {
+        if (!this.sessionStore) {
+            return;
+        }
+        const mappings = Array.from(this.chatIdMap.entries()).map(([userId, chatId]) => ({
+            userId,
+            chatId,
+            threadId: this.userThreadMap.get(userId),
+        }));
+        await this.sessionStore.setTelegramState({
+            mappings,
+            pollingOffset: this.pollingOffset,
+            updatedAt: new Date().toISOString(),
+        });
     }
 }

@@ -134,7 +134,7 @@ export async function processUpdate(
     const userId = adapter.resolveUserId(from, msg.chat.id);
 
     // Record the thread this user is currently active in
-    adapter.userThreadMap.set(userId, threadId);
+    adapter.rememberThread(userId, threadId);
 
     // Build attachments
     const attachments: Attachment[] = [];
@@ -213,7 +213,7 @@ export async function handleTaskRequest(
     const userId = adapter.resolveUserId(from, chatId);
 
     // Record the thread this user is currently active in
-    adapter.userThreadMap.set(userId, threadId);
+    adapter.rememberThread(userId, threadId);
 
     const confirmParams: Record<string, any> = {
         chat_id: chatId,
@@ -455,7 +455,7 @@ export async function handleCommand(
                 // Emit as a chat message so the agent uses the model_swap tool
                 if (msg.from) {
                     const userId = adapter.resolveUserId(msg.from, chatId);
-                    adapter.userThreadMap.set(userId, threadId);
+                    adapter.rememberThread(userId, threadId);
                     emitTelegramIngress(adapter, {
                         userId,
                         from: msg.from,
@@ -489,6 +489,92 @@ export async function handleCommand(
             );
             break;
 
+        case '/pair': {
+            if (!msg.from) {
+                break;
+            }
+            const userId = adapter.resolveUserId(msg.from, chatId);
+            adapter.rememberThread(userId, threadId);
+            await adapter.api(
+                'sendMessage',
+                withThread({
+                    chat_id: chatId,
+                    text:
+                        '*ðŸ”— Telegram Pairing*\n\n' +
+                        `Workspace: \`${adapter.config.defaultWorkspaceId}\`\n` +
+                        `Chat ID: \`${chatId}\`\n` +
+                        `User ID: \`${userId}\`\n` +
+                        `Thread: \`${threadId ?? 'main'}\`\n\n` +
+                        'This Telegram chat is now the primary companion surface for this operator session.',
+                    parse_mode: 'Markdown',
+                }),
+            );
+            break;
+        }
+
+        case '/channels':
+            await adapter.api(
+                'sendMessage',
+                withThread({
+                    chat_id: chatId,
+                    text:
+                        '*ðŸ“¡ Channel Status*\n\n' +
+                        `Primary: *Telegram*\n` +
+                        `Workspace: \`${adapter.config.defaultWorkspaceId}\`\n` +
+                        `Known pairings: \`${adapter.chatIdMap.size}\`\n` +
+                        'Companion surfaces: desktop, CLI, and web attach to the same local Kestrel state.',
+                    parse_mode: 'Markdown',
+                }),
+            );
+            break;
+
+        case '/doctor': {
+            const userId = msg.from ? adapter.resolveUserId(msg.from, chatId) : '';
+            const approvals = userId ? await adapter.listPendingApprovalsForUser(userId) : [];
+            await adapter.api(
+                'sendMessage',
+                withThread({
+                    chat_id: chatId,
+                    text:
+                        '*ðŸ©º Telegram Doctor*\n\n' +
+                        `Bot: @${adapter.botInfo?.username || 'unknown'}\n` +
+                        `Workspace: \`${adapter.config.defaultWorkspaceId}\`\n` +
+                        `Pending approvals: \`${approvals.length}\`\n` +
+                        `Routing mode: \`${adapter.config.mode}\`\n` +
+                        'Media delivery: shared channel artifacts via Gateway.',
+                    parse_mode: 'Markdown',
+                }),
+            );
+            break;
+        }
+
+        case '/memory':
+            await adapter.api(
+                'sendMessage',
+                withThread({
+                    chat_id: chatId,
+                    text:
+                        '*ðŸ§  Memory Sync*\n\n' +
+                        'Kestrel keeps shared markdown memory under `~/.kestrel/memory` and syncs it into the local index. ' +
+                        'Use the desktop observer or `kestrel memory` from the CLI to inspect and edit it.',
+                    parse_mode: 'Markdown',
+                }),
+            );
+            break;
+
+        case '/canvas':
+            await adapter.api(
+                'sendMessage',
+                withThread({
+                    chat_id: chatId,
+                    text:
+                        '*ðŸ›°ï¸ Flight Deck*\n\n' +
+                        'Use the desktop or web observer to inspect task graphs, approvals, artifacts, and live progress while continuing the conversation here in Telegram.',
+                    parse_mode: 'Markdown',
+                }),
+            );
+            break;
+
         case '/new': {
             // In forum supergroups, create a new topic; otherwise just acknowledge
             if (msg.chat.type === 'supergroup' && threadId !== undefined) {
@@ -499,7 +585,7 @@ export async function handleCommand(
                     });
                     if (msg.from) {
                         const userId = adapter.resolveUserId(msg.from, chatId);
-                        adapter.userThreadMap.set(userId, topic.message_thread_id);
+                        adapter.rememberThread(userId, topic.message_thread_id);
                     }
                     await adapter.api('sendMessage', {
                         chat_id: chatId,
@@ -538,7 +624,7 @@ export async function handleCommand(
                     });
                     if (msg.from) {
                         const userId = adapter.resolveUserId(msg.from, chatId);
-                        adapter.userThreadMap.set(userId, topic.message_thread_id);
+                        adapter.rememberThread(userId, topic.message_thread_id);
                     }
                     await adapter.api('sendMessage', {
                         chat_id: chatId,
@@ -891,7 +977,7 @@ export async function handleCallbackQuery(
     if (query.data.startsWith('model:')) {
         const modelName = query.data.substring('model:'.length);
         const userId = adapter.resolveUserId(query.from, chatId);
-        adapter.userThreadMap.set(userId, threadId);
+        adapter.rememberThread(userId, threadId);
 
         const confirmParams: Record<string, any> = {
             chat_id: chatId,

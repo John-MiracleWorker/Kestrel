@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { RichContent } from './RichContent';
 import { ActivityTimeline } from '../Agent/ActivityTimeline';
 import { KestrelProcessBar } from './KestrelProcessBar';
+import { hasRefreshToken } from '../../api/client';
 
 /* ── Feedback Buttons ─────────────────────────────────────────────── */
 
@@ -14,8 +15,7 @@ export function FeedbackButtons({ messageId }: { messageId: string }) {
         setSelected(next);
         try {
             // Best effort — don't block UI
-            const token = localStorage.getItem('kestrel_refresh');
-            if (token) {
+            if (hasRefreshToken()) {
                 await fetch('/api/workspaces/default/feedback', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -90,8 +90,13 @@ export function MessageBubble({
         toolResult?: string;
         thinking?: string;
     } | null;
-    agentActivities?: Array<{ activity_type: string;[key: string]: unknown }>;
-    routingInfo?: { provider: string; model: string; wasEscalated: boolean; complexity: number } | null;
+    agentActivities?: Array<{ activity_type: string; [key: string]: unknown }>;
+    routingInfo?: {
+        provider: string;
+        model: string;
+        wasEscalated: boolean;
+        complexity: number;
+    } | null;
 }) {
     const isUser = message.role === 'user';
 
@@ -172,8 +177,14 @@ export function MessageBubble({
                 {/* Activity Timeline — unified tool + agent activity display */}
                 {isStreaming && (toolActivity || agentActivities.length > 0) && (
                     <>
-                        <ActivityTimeline toolActivity={toolActivity} agentActivities={agentActivities} />
-                        <KestrelProcessBar activities={agentActivities} toolActivity={toolActivity} />
+                        <ActivityTimeline
+                            toolActivity={toolActivity}
+                            agentActivities={agentActivities}
+                        />
+                        <KestrelProcessBar
+                            activities={agentActivities}
+                            toolActivity={toolActivity}
+                        />
                     </>
                 )}
                 {isUser ? message.content : <RichContent content={message.content} />}

@@ -23,8 +23,6 @@ from typing import Any, Optional
 from agent.tools.media_gen.config import (
     IMAGE_TIMEOUT,
     OUTPUT_DIR,
-    TELEGRAM_BOT_TOKEN,
-    TELEGRAM_CHAT_ID,
     VIDEO_TIMEOUT,
 )
 from agent.tools.media_gen.swarm_client import SwarmClient
@@ -182,7 +180,8 @@ async def generate_media(
         prompt: The user's text prompt describing what to generate.
         media_type: "image" or "video".
         negative_prompt: Optional negative prompt for quality control.
-        send_telegram: If True, also deliver the result via Telegram.
+        send_telegram: Deprecated compatibility flag. Media delivery now flows
+            through shared channel events handled by Gateway.
         workflow_override: Optional custom workflow dict (skips template loading).
 
     Returns:
@@ -193,7 +192,7 @@ async def generate_media(
           - prompt_id (str): The ComfyUI job ID
           - progress_log (list): Summary of progress events
           - error (str): Error message if failed
-          - telegram_sent (bool): Whether Telegram delivery succeeded
+          - display_markdown (str): Shared artifact markdown for channel delivery
     """
     if not prompt:
         return {"success": False, "error": "Prompt text is required"}
@@ -265,25 +264,43 @@ async def generate_media(
             f.write(media_bytes)
 
         abs_path = os.path.abspath(local_path)
+        media_url = f"/media/{primary['filename']}"
+        display_label = "Generated video" if media_type == "video" else "Generated image"
         progress_log.append(f"Saved to {abs_path} ({len(media_bytes):,} bytes)")
         logger.info(f"Media saved: {abs_path}")
 
         result = {
             "success": True,
             "file_path": abs_path,
+            "file_paths": [abs_path],
             "filename": primary["filename"],
             "prompt_id": prompt_id,
             "media_type": media_type,
             "file_size_bytes": len(media_bytes),
             "progress_log": progress_log,
-            "telegram_sent": False,
+            "image_urls": [media_url],
+            "artifacts": [
+                {
+                    "path": abs_path,
+                    "url": media_url,
+                    "type": media_type,
+                    "filename": primary["filename"],
+                }
+            ],
+            "display_markdown": f"![{display_label}]({media_url})",
+            "instruction": (
+                "Include the display_markdown content in your response "
+                "so the user can see the generated media inline."
+            ),
         }
 
-        # 7. Optional Telegram delivery
         if send_telegram:
-            result["telegram_sent"] = await _send_to_telegram(
-                abs_path, media_type, prompt
-            )
+            result["delivery"] = {
+                "mode": "channel_event",
+                "requested": True,
+                "target": "telegram",
+                "note": "Direct Brain-to-Telegram delivery is disabled; Gateway delivers shared media artifacts.",
+            }
 
         return result
 
@@ -311,43 +328,17 @@ async def generate_media(
 
 async def _send_to_telegram(file_path: str, media_type: str, caption: str) -> bool:
     """
-    Send the generated media to Telegram using python-telegram-bot.
+    Legacy compatibility shim.
 
-    Returns True on success, False on failure (non-fatal).
+    Direct Brain-to-Telegram delivery is disabled so Gateway remains the
+    single owner of channel delivery.
     """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram delivery skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
-        return False
-
-    try:
-        from telegram import Bot
-
-        bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        truncated_caption = caption[:1024] if len(caption) > 1024 else caption
-
-        with open(file_path, "rb") as f:
-            if media_type == "video":
-                await bot.send_video(
-                    chat_id=int(TELEGRAM_CHAT_ID),
-                    video=f,
-                    caption=truncated_caption,
-                )
-            else:
-                await bot.send_photo(
-                    chat_id=int(TELEGRAM_CHAT_ID),
-                    photo=f,
-                    caption=truncated_caption,
-                )
-
-        logger.info(f"Sent {media_type} to Telegram chat {TELEGRAM_CHAT_ID}")
-        return True
-
-    except ImportError:
-        logger.warning("python-telegram-bot not installed. Skipping Telegram delivery.")
-        return False
-    except Exception as e:
-        logger.error(f"Telegram delivery failed: {e}")
-        return False
+    logger.info(
+        "Skipping legacy direct Telegram delivery for %s (%s); Gateway will deliver channel artifacts instead.",
+        file_path,
+        media_type,
+    )
+    return False
 
 
 # ── Utility: Check Host Status ───────────────────────────────────────

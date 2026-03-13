@@ -1,4 +1,4 @@
-import Redis from 'ioredis';
+import { RedisLike } from '../redis/compat';
 import { logger } from '../utils/logger';
 
 const SESSION_TTL = parseInt(process.env.REDIS_SESSION_TTL || '604800'); // 7 days
@@ -39,7 +39,7 @@ export class SessionManager {
     private prefix = 'session:';
     private routePrefix = 'session_route:';
 
-    constructor(private redis: Redis) {}
+    constructor(private redis: RedisLike) {}
 
     async create(sessionId: string, data: SessionData): Promise<void> {
         const key = this.prefix + sessionId;

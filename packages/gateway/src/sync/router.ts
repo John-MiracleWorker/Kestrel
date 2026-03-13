@@ -1,6 +1,6 @@
-import Redis from 'ioredis';
 import { ChannelType, OutgoingMessage } from '../channels/base';
 import { ChannelRegistry } from '../channels/registry';
+import { RedisLike } from '../redis/compat';
 import { logger } from '../utils/logger';
 
 // ── Notification Preference ────────────────────────────────────────
@@ -25,8 +25,8 @@ export class MessageRouter {
 
     constructor(
         private registry: ChannelRegistry,
-        private redis: Redis,
-    ) { }
+        private redis: RedisLike,
+    ) {}
 
     /**
      * Load notification preferences from Redis.
@@ -54,7 +54,8 @@ export class MessageRouter {
         await this.redis.set(
             `kestrel:notify:${userId}`,
             JSON.stringify(prefs),
-            'EX', 86400 * 30, // 30-day TTL
+            'EX',
+            86400 * 30, // 30-day TTL
         );
     }
 
@@ -88,7 +89,7 @@ export class MessageRouter {
                 // Broadcast to all enabled channels (except origin to avoid double)
                 for (const ch of prefs.enabledChannels) {
                     if (ch !== originChannel) {
-                        await this.registry.sendToChannel(ch, userId, message).catch(() => { });
+                        await this.registry.sendToChannel(ch, userId, message).catch(() => {});
                     }
                 }
                 // Always send on origin channel

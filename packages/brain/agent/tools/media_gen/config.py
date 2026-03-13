@@ -7,6 +7,7 @@ on the local LAN. All values are sourced from environment variables with sensibl
 
 import os
 import uuid
+from pathlib import Path
 
 # ── Remote Host ──────────────────────────────────────────────────────
 
@@ -38,7 +39,12 @@ WS_CONNECT_TIMEOUT = int(os.getenv("SWARM_WS_CONNECT_TIMEOUT", "15"))
 
 # ── Output ────────────────────────────────────────────────────────────
 
-OUTPUT_DIR = os.getenv("SWARM_OUTPUT_DIR", "/tmp/kestrel_media")
+def _default_output_dir() -> str:
+    kestrel_home = os.getenv("KESTREL_HOME", "~/.kestrel")
+    return str((Path(kestrel_home).expanduser() / "artifacts" / "media"))
+
+
+OUTPUT_DIR = os.getenv("SWARM_OUTPUT_DIR", _default_output_dir())
 
 # ── Telegram (optional delivery) ─────────────────────────────────────
 

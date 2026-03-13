@@ -177,12 +177,20 @@ async def _scan_subnet(subnet: str) -> list[dict]:
 
 async def _probe_known_hosts(session: aiohttp.ClientSession) -> list[dict]:
     """Probe always-checked addresses even if outside the scanned subnet."""
-    known = [
-        "host.docker.internal",  # Docker host (macOS/Windows)
-        "localhost",
-        "127.0.0.1",
-        "172.17.0.1",            # Docker bridge gateway
-    ]
+    if os.getenv("KESTREL_RUNTIME_MODE", "").lower() in {"native", "local"}:
+        known = [
+            "localhost",
+            "127.0.0.1",
+            "host.docker.internal",
+            "172.17.0.1",
+        ]
+    else:
+        known = [
+            "host.docker.internal",  # Docker host (macOS/Windows)
+            "localhost",
+            "127.0.0.1",
+            "172.17.0.1",            # Docker bridge gateway
+        ]
     tasks = [_probe_host(session, h) for h in known]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     return [r for r in results if isinstance(r, dict)]
@@ -214,13 +222,15 @@ class OllamaDiscovery:
         Falls back to OLLAMA_HOST env var if scanning is disabled or fails.
         """
         if _DISABLE_SCAN or self._static_host:
-            return self._static_host or f"http://host.docker.internal:{_OLLAMA_PORT}"
+            default_host = "http://127.0.0.1" if os.getenv("KESTREL_RUNTIME_MODE", "").lower() in {"native", "local"} else "http://host.docker.internal"
+            return self._static_host or f"{default_host}:{_OLLAMA_PORT}"
 
         await self._ensure_scanned()
 
         if self._hosts:
             return self._hosts[0]["url"]
-        return f"http://host.docker.internal:{_OLLAMA_PORT}"
+        default_host = "http://127.0.0.1" if os.getenv("KESTREL_RUNTIME_MODE", "").lower() in {"native", "local"} else "http://host.docker.internal"
+        return f"{default_host}:{_OLLAMA_PORT}"
 
     async def get_all_hosts(self) -> list[dict]:
         """Return all discovered Ollama instances, ranked best-first."""

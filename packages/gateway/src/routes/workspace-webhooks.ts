@@ -3,6 +3,7 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { requireAuth, requireWorkspace, requireRole } from '../auth/middleware';
+import { getLocalGatewayStateStore, isLocalBrainMode } from '../brain/local';
 import { getPool } from '../db/pool';
 
 const WEBHOOK_EVENTS = [
@@ -12,7 +13,7 @@ const WEBHOOK_EVENTS = [
     'message.created',
 ] as const;
 
-type WebhookEventType = typeof WEBHOOK_EVENTS[number];
+type WebhookEventType = (typeof WEBHOOK_EVENTS)[number];
 
 interface WebhookConfig {
     enabled: boolean;
@@ -37,7 +38,11 @@ function signPayload(body: string, secret: string) {
     return `sha256=${digest}`;
 }
 
-async function deliverWebhook(config: WebhookConfig, eventType: WebhookEventType, payload: Record<string, unknown>) {
+async function deliverWebhook(
+    config: WebhookConfig,
+    eventType: WebhookEventType,
+    payload: Record<string, unknown>,
+) {
     const body = JSON.stringify({
         id: crypto.randomUUID(),
         type: eventType,
@@ -75,7 +80,7 @@ async function deliverWebhook(config: WebhookConfig, eventType: WebhookEventType
 
         if (attempt < attempts) {
             const backoffMs = 1000 * 2 ** (attempt - 1);
-            await new Promise(resolve => setTimeout(resolve, backoffMs));
+            await new Promise((resolve) => setTimeout(resolve, backoffMs));
         }
     }
 
@@ -84,6 +89,7 @@ async function deliverWebhook(config: WebhookConfig, eventType: WebhookEventType
 
 export default async function workspaceWebhookRoutes(app: FastifyInstance) {
     const typedApp = app.withTypeProvider<ZodTypeProvider>();
+    const localStore = isLocalBrainMode() ? getLocalGatewayStateStore() : null;
 
     const workspaceParams = z.object({ workspaceId: z.string() });
     const inboundParams = z.object({ workspaceId: z.string(), event: z.string().optional() });
@@ -97,89 +103,136 @@ export default async function workspaceWebhookRoutes(app: FastifyInstance) {
         timeoutMs: z.number().int().min(1000).max(15000).default(5000),
     });
 
-    typedApp.get('/api/workspaces/:workspaceId/webhooks/config', {
-        preHandler: [requireAuth, requireWorkspace],
-        schema: { params: workspaceParams },
-    }, async (req) => {
-        const { workspaceId } = req.params as z.infer<typeof workspaceParams>;
-        const pool = getPool();
-        const result = await pool.query('SELECT settings FROM workspaces WHERE id = $1', [workspaceId]);
-        const settings = (result.rows[0]?.settings || {}) as Record<string, any>;
-        return {
-            webhook: {
-                ...DEFAULT_CONFIG,
-                ...(settings.webhooks || {}),
-            },
-            supportedEvents: WEBHOOK_EVENTS,
-        };
-    });
+    typedApp.get(
+        '/api/workspaces/:workspaceId/webhooks/config',
+        {
+            preHandler: [requireAuth, requireWorkspace],
+            schema: { params: workspaceParams },
+        },
+        async (req) => {
+            const { workspaceId } = req.params as z.infer<typeof workspaceParams>;
+            const settings = localStore
+                ? localStore.getWorkspaceSettings(workspaceId)
+                : (((
+                      await getPool().query('SELECT settings FROM workspaces WHERE id = $1', [
+                          workspaceId,
+                      ])
+                  ).rows[0]?.settings || {}) as Record<string, any>);
+            return {
+                webhook: {
+                    ...DEFAULT_CONFIG,
+                    ...(settings.webhooks || {}),
+                },
+                supportedEvents: WEBHOOK_EVENTS,
+            };
+        },
+    );
 
-    typedApp.put('/api/workspaces/:workspaceId/webhooks/config', {
-        preHandler: [requireAuth, requireWorkspace, requireRole('admin')],
-        schema: { params: workspaceParams, body: webhookConfigSchema },
-    }, async (req) => {
-        const { workspaceId } = req.params as z.infer<typeof workspaceParams>;
-        const payload = req.body as WebhookConfig;
-        const pool = getPool();
+    typedApp.put(
+        '/api/workspaces/:workspaceId/webhooks/config',
+        {
+            preHandler: [requireAuth, requireWorkspace, requireRole('admin')],
+            schema: { params: workspaceParams, body: webhookConfigSchema },
+        },
+        async (req) => {
+            const { workspaceId } = req.params as z.infer<typeof workspaceParams>;
+            const payload = req.body as WebhookConfig;
+            const settings = localStore
+                ? localStore.getWorkspaceSettings(workspaceId)
+                : (((
+                      await getPool().query('SELECT settings FROM workspaces WHERE id = $1', [
+                          workspaceId,
+                      ])
+                  ).rows[0]?.settings || {}) as Record<string, any>);
+            const nextSettings = {
+                ...settings,
+                webhooks: payload,
+            };
+            if (localStore) {
+                localStore.mergeWorkspaceSettings(workspaceId, { webhooks: payload });
+            } else {
+                await getPool().query(
+                    'UPDATE workspaces SET settings = $2, updated_at = NOW() WHERE id = $1',
+                    [workspaceId, nextSettings],
+                );
+            }
+            return { success: true, webhook: payload };
+        },
+    );
 
-        const result = await pool.query('SELECT settings FROM workspaces WHERE id = $1', [workspaceId]);
-        const settings = (result.rows[0]?.settings || {}) as Record<string, any>;
-        const nextSettings = {
-            ...settings,
-            webhooks: payload,
-        };
+    typedApp.post(
+        '/api/workspaces/:workspaceId/webhooks/test',
+        {
+            preHandler: [requireAuth, requireWorkspace, requireRole('admin')],
+            schema: { params: workspaceParams },
+        },
+        async (req, reply) => {
+            const { workspaceId } = req.params as z.infer<typeof workspaceParams>;
+            const settings = localStore
+                ? localStore.getWorkspaceSettings(workspaceId)
+                : (((
+                      await getPool().query('SELECT settings FROM workspaces WHERE id = $1', [
+                          workspaceId,
+                      ])
+                  ).rows[0]?.settings || {}) as Record<string, any>);
+            const config = { ...DEFAULT_CONFIG, ...(settings.webhooks || {}) } as WebhookConfig;
 
-        await pool.query('UPDATE workspaces SET settings = $2, updated_at = NOW() WHERE id = $1', [workspaceId, nextSettings]);
-        return { success: true, webhook: payload };
-    });
+            if (!config.endpointUrl || !config.secret) {
+                return reply
+                    .status(400)
+                    .send({ error: 'Configure endpoint URL and secret first.' });
+            }
 
-    typedApp.post('/api/workspaces/:workspaceId/webhooks/test', {
-        preHandler: [requireAuth, requireWorkspace, requireRole('admin')],
-        schema: { params: workspaceParams },
-    }, async (req, reply) => {
-        const { workspaceId } = req.params as z.infer<typeof workspaceParams>;
-        const pool = getPool();
-        const result = await pool.query('SELECT settings FROM workspaces WHERE id = $1', [workspaceId]);
-        const settings = (result.rows[0]?.settings || {}) as Record<string, any>;
-        const config = { ...DEFAULT_CONFIG, ...(settings.webhooks || {}) } as WebhookConfig;
+            const delivery = await deliverWebhook(config, 'task.completed', {
+                workspaceId,
+                sample: true,
+                taskId: 'sample-task',
+                summary: 'Sample webhook delivery from Settings > Integrations',
+            });
 
-        if (!config.endpointUrl || !config.secret) {
-            return reply.status(400).send({ error: 'Configure endpoint URL and secret first.' });
-        }
+            return { success: delivery.success, delivery };
+        },
+    );
 
-        const delivery = await deliverWebhook(config, 'task.completed', {
-            workspaceId,
-            sample: true,
-            taskId: 'sample-task',
-            summary: 'Sample webhook delivery from Settings > Integrations',
-        });
+    typedApp.post(
+        '/api/workspaces/:workspaceId/webhooks/inbound',
+        {
+            preHandler: [requireAuth, requireWorkspace],
+            schema: { params: inboundParams },
+        },
+        async (req, reply) => {
+            const { workspaceId, event } = req.params as z.infer<typeof inboundParams>;
+            const settings = localStore
+                ? localStore.getWorkspaceSettings(workspaceId)
+                : (((
+                      await getPool().query('SELECT settings FROM workspaces WHERE id = $1', [
+                          workspaceId,
+                      ])
+                  ).rows[0]?.settings || {}) as Record<string, any>);
+            const config = { ...DEFAULT_CONFIG, ...(settings.webhooks || {}) } as WebhookConfig;
 
-        return { success: delivery.success, delivery };
-    });
+            if (!config.secret) {
+                return reply.status(400).send({ error: 'Webhook secret is not configured' });
+            }
 
-    typedApp.post('/api/workspaces/:workspaceId/webhooks/inbound', {
-        preHandler: [requireAuth, requireWorkspace],
-        schema: { params: inboundParams },
-    }, async (req, reply) => {
-        const { workspaceId, event } = req.params as z.infer<typeof inboundParams>;
-        const pool = getPool();
-        const result = await pool.query('SELECT settings FROM workspaces WHERE id = $1', [workspaceId]);
-        const settings = (result.rows[0]?.settings || {}) as Record<string, any>;
-        const config = { ...DEFAULT_CONFIG, ...(settings.webhooks || {}) } as WebhookConfig;
+            const rawBody = JSON.stringify(req.body || {});
+            const providedSig = (req.headers['x-kestrel-signature'] as string) || '';
+            const expectedSig = signPayload(rawBody, config.secret);
+            const provided = Buffer.from(providedSig);
+            const expected = Buffer.from(expectedSig);
+            if (
+                !providedSig ||
+                provided.length !== expected.length ||
+                !crypto.timingSafeEqual(provided, expected)
+            ) {
+                return reply.status(401).send({ error: 'Invalid signature' });
+            }
 
-        if (!config.secret) {
-            return reply.status(400).send({ error: 'Webhook secret is not configured' });
-        }
-
-        const rawBody = JSON.stringify(req.body || {});
-        const providedSig = (req.headers['x-kestrel-signature'] as string) || '';
-        const expectedSig = signPayload(rawBody, config.secret);
-        const provided = Buffer.from(providedSig);
-        const expected = Buffer.from(expectedSig);
-        if (!providedSig || provided.length !== expected.length || !crypto.timingSafeEqual(provided, expected)) {
-            return reply.status(401).send({ error: 'Invalid signature' });
-        }
-
-        return { success: true, message: 'Inbound webhook accepted', event: event || 'unknown' };
-    });
+            return {
+                success: true,
+                message: 'Inbound webhook accepted',
+                event: event || 'unknown',
+            };
+        },
+    );
 }

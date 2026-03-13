@@ -1,10 +1,10 @@
 import Fastify, { FastifyInstance } from 'fastify';
 import { WebSocketServer } from 'ws';
-import Redis from 'ioredis';
 import dotenv from 'dotenv';
 import { logger, generateCorrelationId, correlatedLogger } from './utils/logger';
 import { setupMetrics } from './utils/metrics';
 import { requireAuth } from './auth/middleware';
+import { createRedisClient, isLocalRedisBackend, RedisLike } from './redis/compat';
 import { SessionManager } from './session/manager';
 import { BrainClient } from './brain/client';
 import { ChannelRegistry } from './channels/registry';
@@ -13,6 +13,12 @@ import { WebChannelAdapter } from './channels/web';
 import { TelegramAdapter } from './channels/telegram';
 import { WhatsAppAdapter } from './channels/whatsapp';
 import { DiscordAdapter } from './channels/discord';
+import {
+    createChannelStores,
+    type ChannelConfigStore,
+    type ChannelSessionStore,
+    type TelegramChannelConfigRecord,
+} from './channels/store';
 import { serializerCompiler, validatorCompiler } from 'fastify-type-provider-zod';
 import authRoutes from './routes/auth';
 import workspaceRoutes from './routes/workspaces';
@@ -115,10 +121,12 @@ app.setErrorHandler((error, request, reply) => {
 });
 
 // ── Services (initialized in start()) ────────────────────────────────
-let redis: Redis;
+let redis: RedisLike;
 let sessionManager: SessionManager;
 let brainClient: BrainClient;
 let channelRegistry: ChannelRegistry;
+let channelConfigStore: ChannelConfigStore;
+let channelSessionStore: ChannelSessionStore;
 
 // ── Health Check ─────────────────────────────────────────────────────
 app.get('/health', async () => ({
@@ -158,39 +166,74 @@ async function start() {
 
         let telegramAdapter: TelegramAdapter | undefined;
         let whatsappAdapter: WhatsAppAdapter | undefined;
+        const localRedisBackend = isLocalRedisBackend();
 
         // 1. Connect to Redis
-        redis = new Redis(config.redisUrl);
+        redis = createRedisClient(config.redisUrl);
         redis.on('error', (err) => logger.error('Redis error', { error: err.message }));
         redis.on('connect', () => logger.info('Redis connected'));
 
         // Register Rate Limiting
-        await app.register(import('@fastify/rate-limit'), {
-            global: false,
-            redis: redis,
-        });
+        if (localRedisBackend) {
+            logger.warn(
+                'Gateway is using the local Redis compatibility backend; rate limiting is process-local.',
+            );
+            await app.register(import('@fastify/rate-limit'), {
+                global: false,
+            });
+        } else {
+            await app.register(import('@fastify/rate-limit'), {
+                global: false,
+                redis: redis as any,
+            });
+        }
 
         sessionManager = new SessionManager(redis);
+        ({ channelConfigStore, channelSessionStore } = createChannelStores(
+            redis,
+            localRedisBackend,
+        ));
 
         // 2. Connect to Brain gRPC
         brainClient = new BrainClient(config.brainGrpcUrl);
         await brainClient.connect();
-        logger.info(`Brain gRPC connected at ${config.brainGrpcUrl}`);
+        logger.info(
+            brainClient.isLocalMode()
+                ? 'Gateway attached to local daemon-backed Brain client'
+                : `Brain gRPC connected at ${config.brainGrpcUrl}`,
+        );
+
+        const createTelegramAdapter = (settings: TelegramChannelConfigRecord): TelegramAdapter => {
+            const adapter = new TelegramAdapter(
+                {
+                    botToken: settings.token,
+                    mode: settings.mode,
+                    webhookUrl: settings.webhookUrl,
+                    defaultWorkspaceId:
+                        settings.workspaceId || process.env.DEFAULT_WORKSPACE_ID || 'default',
+                },
+                {
+                    sessionStore: channelSessionStore,
+                },
+            );
+            adapter.setApprovalHandler(async (approvalId, userId, approved) =>
+                brainClient.approveAction(approvalId, userId, approved),
+            );
+            adapter.setPendingApprovalsLookupHandler((userId, workspaceId) =>
+                brainClient.listPendingApprovals(userId, workspaceId),
+            );
+            return adapter;
+        };
 
         // 3. Instantiate adapters required by route handlers
         if (process.env.TELEGRAM_BOT_TOKEN) {
-            telegramAdapter = new TelegramAdapter({
-                botToken: process.env.TELEGRAM_BOT_TOKEN,
+            telegramAdapter = createTelegramAdapter({
+                token: process.env.TELEGRAM_BOT_TOKEN,
                 mode: (process.env.TELEGRAM_MODE as 'webhook' | 'polling') || 'polling',
                 webhookUrl: process.env.TELEGRAM_WEBHOOK_URL,
-                defaultWorkspaceId: process.env.DEFAULT_WORKSPACE_ID || 'default',
+                workspaceId: process.env.DEFAULT_WORKSPACE_ID || 'default',
+                updatedAt: new Date().toISOString(),
             });
-            telegramAdapter.setApprovalHandler(async (approvalId, userId, approved) =>
-                brainClient.approveAction(approvalId, userId, approved),
-            );
-            telegramAdapter.setPendingApprovalsLookupHandler((userId, workspaceId) =>
-                brainClient.listPendingApprovals(userId, workspaceId),
-            );
         }
 
         if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
@@ -248,8 +291,8 @@ async function start() {
         await integrationRoutes(app, {
             channelRegistry,
             defaultWorkspaceId: process.env.DEFAULT_WORKSPACE_ID || 'default',
-            redis,
-            brainClient,
+            channelConfigStore,
+            createTelegramAdapter,
         });
 
         // 7. Start Fastify HTTP server
@@ -270,7 +313,12 @@ async function start() {
         logger.info(`WebSocket server on ${config.wsPath}`);
 
         // Set up Redis Pub/Sub for notifications
-        const redisSub = new Redis(config.redisUrl);
+        const redisSub = createRedisClient(config.redisUrl);
+        if (localRedisBackend) {
+            logger.warn(
+                'Gateway notification pubsub is process-local under the local Redis backend.',
+            );
+        }
         redisSub.subscribe('notifications', (err, count) => {
             if (err)
                 logger.error('Failed to subscribe to notifications channel', {
@@ -300,22 +348,10 @@ async function start() {
             logger.info('Telegram adapter enabled (env var)');
         } else {
             // No env-var token — try to restore token persisted via the settings UI
-            const savedConfig = await redis.get('telegram:bot:config');
+            const savedConfig = await channelConfigStore.getTelegramConfig();
             if (savedConfig) {
                 try {
-                    const { token, workspaceId: savedWsId } = JSON.parse(savedConfig);
-                    const restoredAdapter = new TelegramAdapter({
-                        botToken: token,
-                        mode: 'polling',
-                        defaultWorkspaceId:
-                            savedWsId || process.env.DEFAULT_WORKSPACE_ID || 'default',
-                    });
-                    restoredAdapter.setApprovalHandler(async (approvalId, userId, approved) =>
-                        brainClient.approveAction(approvalId, userId, approved),
-                    );
-                    restoredAdapter.setPendingApprovalsLookupHandler((userId, workspaceId) =>
-                        brainClient.listPendingApprovals(userId, workspaceId),
-                    );
+                    const restoredAdapter = createTelegramAdapter(savedConfig);
                     await channelRegistry.register(restoredAdapter);
                     logger.info('Telegram adapter restored from persisted config');
                 } catch (err: any) {
@@ -348,6 +384,7 @@ async function start() {
         const shutdown = async () => {
             logger.info('Shutting down Gateway...');
             await channelRegistry.shutdown();
+            await redisSub.quit();
             await redis.quit();
             brainClient.close();
             await app.close();

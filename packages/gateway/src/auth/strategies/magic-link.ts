@@ -1,15 +1,15 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { generateTokenPair, generateSecureToken } from '../../auth/middleware';
 import { BrainClient } from '../../brain/client';
+import { RedisLike } from '../../redis/compat';
 import { logger } from '../../utils/logger';
-import Redis from 'ioredis';
 
 // Magic link TTL: 15 minutes
 const MAGIC_LINK_TTL = 15 * 60;
 
 interface MagicLinkDeps {
     brainClient: BrainClient;
-    redis: Redis;
+    redis: RedisLike;
 }
 
 /**
@@ -35,7 +35,7 @@ export default async function magicLinkRoutes(app: FastifyInstance, deps: MagicL
             `magic_link:${token}`,
             JSON.stringify({ email, createdAt: Date.now() }),
             'EX',
-            MAGIC_LINK_TTL
+            MAGIC_LINK_TTL,
         );
 
         const verifyUrl = `${webBaseUrl}/auth/magic-link?token=${token}`;
@@ -78,7 +78,11 @@ export default async function magicLinkRoutes(app: FastifyInstance, deps: MagicL
             user = await brainClient.authenticateUser(email, `magic_link`);
         } catch {
             // Create new user with magic link marker
-            user = await brainClient.createUser(email, `magic:${generateSecureToken(32)}`, email.split('@')[0]);
+            user = await brainClient.createUser(
+                email,
+                `magic:${generateSecureToken(32)}`,
+                email.split('@')[0],
+            );
         }
 
         // Generate tokens
@@ -96,7 +100,7 @@ export default async function magicLinkRoutes(app: FastifyInstance, deps: MagicL
             `refresh:${user.id}:${tokens.refreshToken.slice(-16)}`,
             tokens.refreshToken,
             'EX',
-            7 * 24 * 60 * 60
+            7 * 24 * 60 * 60,
         );
 
         return {

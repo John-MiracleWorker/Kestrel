@@ -5,6 +5,8 @@ from pathlib import Path
 import json
 from dotenv import load_dotenv
 
+from native_backends import use_local_redis_backend
+
 load_dotenv()
 
 # Logging — structured JSON in production, readable in dev
@@ -78,7 +80,7 @@ def validate_config() -> None:
 
     # Redis
     redis_host = os.getenv("REDIS_HOST", "")
-    if not redis_host and not os.getenv("REDIS_URL", ""):
+    if not redis_host and not os.getenv("REDIS_URL", "") and not use_local_redis_backend():
         warnings.append("REDIS_HOST not set — defaulting to 'localhost'")
 
     # gRPC port sanity

@@ -3,13 +3,14 @@ import { z } from 'zod';
 import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { requireAuth, requireWorkspace, requireRole } from '../auth/middleware';
 import { BrainClient } from '../brain/client';
+import { getLocalGatewayStateStore } from '../brain/local';
+import { RedisLike } from '../redis/compat';
 import { logger } from '../utils/logger';
 import { getPool } from '../db/pool';
-import Redis from 'ioredis';
 
 interface ProviderDeps {
     brainClient: BrainClient;
-    redis: Redis;
+    redis: RedisLike;
 }
 
 /**
@@ -20,6 +21,7 @@ interface ProviderDeps {
  */
 export default async function providerRoutes(app: FastifyInstance, deps: ProviderDeps) {
     const { brainClient, redis } = deps;
+    const localStore = brainClient.isLocalMode() ? getLocalGatewayStateStore() : null;
     const typedApp = app.withTypeProvider<ZodTypeProvider>();
 
     const workspaceParamsSchema = z.object({
@@ -96,17 +98,26 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
             // Reconstruct the final settings to save:
             // Combine existing DB settings with any new ones sent by the client.
             let finalSettings: Record<string, any> = {};
-            try {
-                const existing = await getPool().query(
-                    `SELECT settings FROM workspace_provider_config 
-                     WHERE workspace_id = $1 AND provider = $2`,
-                    [workspaceId, provider],
-                );
-                if (existing.rows.length > 0 && existing.rows[0].settings) {
-                    finalSettings = existing.rows[0].settings;
+            if (localStore) {
+                const existing = localStore
+                    .listProviderConfigs(workspaceId)
+                    .configs.find((item: any) => item.provider === provider);
+                if (existing?.settings) {
+                    finalSettings = existing.settings;
                 }
-            } catch (e) {
-                // Ignore DB error, just start with empty settings
+            } else {
+                try {
+                    const existing = await getPool().query(
+                        `SELECT settings FROM workspace_provider_config 
+                         WHERE workspace_id = $1 AND provider = $2`,
+                        [workspaceId, provider],
+                    );
+                    if (existing.rows.length > 0 && existing.rows[0].settings) {
+                        finalSettings = existing.rows[0].settings;
+                    }
+                } catch (e) {
+                    // Ignore DB error, just start with empty settings
+                }
             }
             if (body.settings) {
                 finalSettings = { ...finalSettings, ...body.settings };
@@ -135,15 +146,17 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
 
             // SetProviderConfig gRPC wipes the settings field since it's missing from protobuf.
             // We must rewrite the merged finalSettings back to the DB immediately.
-            try {
-                await getPool().query(
-                    `UPDATE workspace_provider_config
-                     SET settings = $1
-                     WHERE workspace_id = $2 AND provider = $3`,
-                    [JSON.stringify(finalSettings), workspaceId, provider],
-                );
-            } catch (e) {
-                app.log.warn({ err: e }, 'Failed to rewrite provider settings');
+            if (!localStore) {
+                try {
+                    await getPool().query(
+                        `UPDATE workspace_provider_config
+                         SET settings = $1
+                         WHERE workspace_id = $2 AND provider = $3`,
+                        [JSON.stringify(finalSettings), workspaceId, provider],
+                    );
+                } catch (e) {
+                    app.log.warn({ err: e }, 'Failed to rewrite provider settings');
+                }
             }
 
             return result;
@@ -340,6 +353,9 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
         },
         async (req) => {
             const { workspaceId } = req.params as WorkspaceParams;
+            if (localStore) {
+                return localStore.getWorkspaceSettings(workspaceId);
+            }
             try {
                 const { rows } = await getPool().query(
                     'SELECT settings FROM workspace_settings WHERE workspace_id = $1',
@@ -363,6 +379,10 @@ export default async function providerRoutes(app: FastifyInstance, deps: Provide
         async (req) => {
             const { workspaceId } = req.params as WorkspaceParams;
             const body = req.body as Record<string, any>;
+            if (localStore) {
+                localStore.mergeWorkspaceSettings(workspaceId, body);
+                return { success: true };
+            }
             try {
                 await getPool().query(
                     `INSERT INTO workspace_settings (workspace_id, settings, updated_at)

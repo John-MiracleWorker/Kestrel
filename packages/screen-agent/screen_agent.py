@@ -1,9 +1,9 @@
 """
-Screen Agent — Host-side HTTP bridge for desktop control.
+Screen Agent — host-side desktop control node for Kestrel.
 
-Runs natively on the Mac (NOT in Docker) and exposes screenshot
-capture and PyAutoGUI actions over HTTP. The Brain container calls
-this service via host.docker.internal:9800.
+Runs natively on the host and exposes screenshot capture and
+PyAutoGUI actions over HTTP. In local-native mode it registers
+itself as a paired node with the Kestrel daemon.
 
 Usage:
     pip install -r requirements.txt
@@ -12,8 +12,10 @@ Usage:
 
 import base64
 import io
+import json
 import logging
 import os
+import socket
 import subprocess
 import time
 import uuid
@@ -87,6 +89,7 @@ class UIElementsRequest(BaseModel):
 ACTION_RESULT_CACHE: dict[str, dict[str, Any]] = {}
 ACTION_CACHE_LOCK = Lock()
 ACTION_CACHE_TTL_SECONDS = int(os.getenv("SCREEN_AGENT_ACTION_CACHE_TTL_SECONDS", "600"))
+PAIRED_NODE_ID = os.getenv("KESTREL_SCREEN_NODE_ID", "screen-agent-local")
 
 
 def _cache_set(key: str, value: dict[str, Any]) -> None:
@@ -109,6 +112,44 @@ def _cache_get(key: str) -> Optional[dict[str, Any]]:
         if not entry:
             return None
         return entry["value"]
+
+
+def _register_with_kestrel() -> None:
+    payload = {
+        "request_id": str(uuid.uuid4()),
+        "method": "paired_nodes.register",
+        "params": {
+            "node_id": PAIRED_NODE_ID,
+            "node_type": "screen",
+            "capabilities": ["screenshot", "ocr", "desktop_actions", "validation"],
+            "platform": os.name,
+            "health": "ok",
+            "address": os.getenv("SCREEN_AGENT_URL", "http://127.0.0.1:9800"),
+            "workspace_binding": os.getenv("DEFAULT_WORKSPACE_ID", ""),
+        },
+    }
+    raw = (json.dumps(payload) + "\n").encode("utf-8")
+
+    try:
+        if os.name == "nt":
+            host = os.getenv("KESTREL_CONTROL_HOST", "127.0.0.1")
+            port = int(os.getenv("KESTREL_CONTROL_PORT", "8749"))
+            with socket.create_connection((host, port), timeout=1.5) as client:
+                client.sendall(raw)
+                client.recv(4096)
+        else:
+            kestrel_home = os.path.expanduser(os.getenv("KESTREL_HOME", "~/.kestrel"))
+            control_socket = os.path.join(kestrel_home, "run", "control.sock")
+            if not os.path.exists(control_socket):
+                return
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(1.5)
+                client.connect(control_socket)
+                client.sendall(raw)
+                client.recv(4096)
+        logger.info("Registered screen agent as paired node")
+    except Exception as exc:
+        logger.info("Kestrel paired-node registration skipped: %s", exc)
 
 
 # ── Coordinate Helpers ───────────────────────────────────────────────
@@ -346,7 +387,7 @@ def _validate_expectations(expectations: ValidationRequest) -> dict[str, Any]:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "screen-agent"}
+    return {"status": "ok", "service": "screen-agent", "node_id": PAIRED_NODE_ID}
 
 
 @app.get("/screenshot")
@@ -459,4 +500,5 @@ if __name__ == "__main__":
 
     logger.info("Starting Kestrel Screen Agent on port 9800...")
     logger.info("This service must run directly on the host (not in Docker)")
+    _register_with_kestrel()
     uvicorn.run(app, host="0.0.0.0", port=9800, log_level="info")

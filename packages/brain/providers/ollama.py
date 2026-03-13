@@ -17,6 +17,13 @@ import httpx
 logger = logging.getLogger("brain.providers.ollama")
 
 
+def _default_ollama_host() -> str:
+    runtime_mode = os.getenv("KESTREL_RUNTIME_MODE", "").lower()
+    if runtime_mode in {"native", "local"}:
+        return "http://127.0.0.1:11434"
+    return "http://host.docker.internal:11434"
+
+
 class OllamaUnavailableError(Exception):
     """Raised when Ollama is unreachable or times out.
 
@@ -29,7 +36,7 @@ class OllamaUnavailableError(Exception):
 _EXPLICIT_OLLAMA_HOST = os.getenv("OLLAMA_HOST", "")
 
 # For backwards-compatibility: module-level constant still usable
-OLLAMA_HOST = _EXPLICIT_OLLAMA_HOST or "http://host.docker.internal:11434"
+OLLAMA_HOST = _EXPLICIT_OLLAMA_HOST or _default_ollama_host()
 
 # Default model to use when none specified
 OLLAMA_DEFAULT_MODEL = os.getenv("OLLAMA_DEFAULT_MODEL", "")

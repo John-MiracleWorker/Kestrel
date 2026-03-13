@@ -28,8 +28,6 @@ from typing import Optional
 
 import requests
 
-from agent.tools.media_gen.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-
 logger = logging.getLogger("kestrel.vram_orchestrator")
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -70,7 +68,10 @@ IMAGE_GEN_TIMEOUT = int(os.getenv("KESTREL_IMAGE_GEN_TIMEOUT", "300"))
 VIDEO_GEN_TIMEOUT = int(os.getenv("KESTREL_VIDEO_GEN_TIMEOUT", "900"))
 
 # Directory to save generated images (shared volume with gateway for serving)
-OUTPUT_DIR = os.getenv("KESTREL_IMAGE_OUTPUT_DIR", "/app/generated_media")
+OUTPUT_DIR = os.getenv(
+    "KESTREL_IMAGE_OUTPUT_DIR",
+    str((Path(os.getenv("KESTREL_HOME", "~/.kestrel")).expanduser() / "artifacts" / "media")),
+)
 
 # HTTP timeouts for API calls (seconds)
 API_TIMEOUT = 30
@@ -568,44 +569,18 @@ async def _send_to_telegram(
     media_type: Optional[str] = None,
 ) -> bool:
     """
-    Send generated media to Telegram via python-telegram-bot.
+    Legacy compatibility shim.
 
-    Returns True on success, False on failure (non-fatal).
+    Direct Brain-to-Telegram delivery is disabled so Gateway remains the
+    single owner of channel delivery.
     """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram delivery skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
-        return False
-
-    try:
-        from telegram import Bot
-
-        bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        truncated_caption = caption[:1024] if len(caption) > 1024 else caption
-        resolved_media_type = (media_type or _infer_media_type(file_path)).strip().lower()
-
-        with open(file_path, "rb") as f:
-            if resolved_media_type == "video":
-                await bot.send_video(
-                    chat_id=int(TELEGRAM_CHAT_ID),
-                    video=f,
-                    caption=truncated_caption,
-                )
-            else:
-                await bot.send_photo(
-                    chat_id=int(TELEGRAM_CHAT_ID),
-                    photo=f,
-                    caption=truncated_caption,
-                )
-
-        logger.info(f"Sent {resolved_media_type} to Telegram chat {TELEGRAM_CHAT_ID}")
-        return True
-
-    except ImportError:
-        logger.warning("python-telegram-bot not installed. Skipping Telegram delivery.")
-        return False
-    except Exception as e:
-        logger.error(f"Telegram delivery failed: {e}")
-        return False
+    resolved_media_type = (media_type or _infer_media_type(file_path)).strip().lower()
+    logger.info(
+        "Skipping legacy direct Telegram delivery for %s (%s); Gateway will deliver channel artifacts instead.",
+        file_path,
+        resolved_media_type,
+    )
+    return False
 
 
 # ── Main Orchestrator ────────────────────────────────────────────────────────
@@ -654,7 +629,8 @@ def generate_image(
         cfg_scale: Classifier-free guidance scale.
         seed: RNG seed (-1 for random).
         swarm_model: Override the SwarmUI model (empty = SwarmUI default).
-        send_telegram: If True, deliver the generated image(s) to Telegram.
+        send_telegram: Deprecated compatibility flag. Media delivery now flows
+            through shared channel events handled by Gateway.
 
     Returns:
         dict with keys:
@@ -663,7 +639,7 @@ def generate_image(
           - llm_unloaded (bool): Whether LLM was successfully unloaded
           - llm_reloaded (bool): Whether LLM was successfully reloaded
           - image_result (dict): Raw SwarmUI response details
-          - telegram_sent (bool): Whether Telegram delivery succeeded
+          - artifacts (list[dict]): Shared artifact descriptors for channel delivery
           - error (str): Error message if failed
           - phase (str): Which phase failed (unload / verify / generate / save / reload)
     """
@@ -674,6 +650,7 @@ def generate_image(
         "llm_reloaded": False,
         "image_result": {},
         "telegram_sent": False,
+        "artifacts": [],
         "error": "",
         "phase": "",
     }
@@ -761,6 +738,14 @@ def generate_image(
             saved = _save_images(img_result["images"], prompt, base_url=img_result.get("base_url"))
             result["file_paths"] = [s["path"] for s in saved]
             result["image_urls"] = [s["url"] for s in saved]
+            result["artifacts"] = [
+                {
+                    "path": item["path"],
+                    "url": item["url"],
+                    "type": _infer_media_type(item["path"]),
+                }
+                for item in saved
+            ]
             if saved:
                 result["success"] = True
                 logger.info(f"Phase 4/6: Image generation complete. Saved {len(saved)} file(s).")
@@ -778,9 +763,8 @@ def generate_image(
         result["phase"] = "generate"
         logger.error(result["error"], exc_info=True)
 
-    # NOTE: Telegram delivery (when send_telegram=True) is handled by the
-    # async tool handler in __init__.py, which can properly await the Bot API.
-    # The result dict includes a "telegram_sent" field for the handler to set.
+    # NOTE: Channel delivery is handled by Gateway from the shared media
+    # artifact metadata returned by the tool handlers.
 
     # ── Phase 5: Free diffusion model from VRAM ──────────────────────
     logger.info("Phase 5/6: Freeing diffusion model from VRAM...")

@@ -8,7 +8,7 @@ from agent.tools.media_gen import vram_orchestrator
 
 
 @pytest.mark.asyncio
-async def test_vram_media_handler_passes_video_type_to_telegram_helper(monkeypatch):
+async def test_vram_media_handler_delegates_delivery_to_gateway(monkeypatch):
     temp_dir = Path("packages/brain/tests/.tmp")
     temp_dir.mkdir(parents=True, exist_ok=True)
     video_path = temp_dir / f"clip-{uuid.uuid4().hex}.mp4"
@@ -25,23 +25,18 @@ async def test_vram_media_handler_passes_video_type_to_telegram_helper(monkeypat
             },
         )
 
-        calls = []
-
-        async def fake_send(file_path: str, caption: str, media_type: str | None = None):
-            calls.append((file_path, caption, media_type))
-            return True
-
-        monkeypatch.setattr(vram_orchestrator, "_send_to_telegram", fake_send)
-
         result = await _vram_generate_image_handler(
             prompt="make a short video",
             media_type="video",
             send_telegram=True,
         )
 
-        assert result["telegram_sent"] is True
-        assert calls == [
-            (str(video_path), "make a short video", "video"),
-        ]
+        assert result["display_markdown"] == "![Generated video](/media/clip.mp4)"
+        assert result["delivery"] == {
+            "mode": "channel_event",
+            "requested": True,
+            "target": "telegram",
+            "note": "Direct Brain-to-Telegram delivery is disabled; Gateway delivers shared media artifacts.",
+        }
     finally:
         video_path.unlink(missing_ok=True)

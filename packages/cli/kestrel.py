@@ -35,6 +35,15 @@ import time
 from datetime import datetime
 from typing import Optional
 
+from kestrel_native import (
+    ControlClientError,
+    control_socket_available,
+    ensure_home_layout,
+    install_daemon_service,
+    send_control_request,
+    send_control_stream,
+)
+
 # ── ANSI Colors ──────────────────────────────────────────────────────
 
 class Colors:
@@ -74,6 +83,7 @@ DEFAULT_CONFIG = {
     "api_url": "http://localhost:8741",
     "api_key": "",
     "workspace_id": "",
+    "control_mode": "auto",
     "model": "gpt-4o",
     "thinking_level": "medium",
     "usage_mode": "tokens",
@@ -110,12 +120,14 @@ def save_config(config: dict) -> None:
 # ── HTTP Client ──────────────────────────────────────────────────────
 
 class KestrelClient:
-    """HTTP client for the Kestrel gateway API."""
+    """Native-control client with HTTP compatibility fallback."""
 
     def __init__(self, config: dict):
         self.base_url = config["api_url"].rstrip("/")
         self.api_key = config.get("api_key", "")
         self.workspace_id = config.get("workspace_id", "")
+        self.control_mode = config.get("control_mode", "auto")
+        self.paths = ensure_home_layout()
 
     def _headers(self) -> dict:
         headers = {"Content-Type": "application/json"}
@@ -123,7 +135,12 @@ class KestrelClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    async def _request(self, method: str, path: str, body: dict = None) -> dict:
+    def _use_local_control(self) -> bool:
+        if self.control_mode == "http":
+            return False
+        return control_socket_available(self.paths)
+
+    async def _request_http(self, method: str, path: str, body: dict = None) -> dict:
         """Make an HTTP request."""
         import httpx
         url = f"{self.base_url}{path}"
@@ -141,7 +158,7 @@ class KestrelClient:
                 return {"error": f"HTTP {resp.status_code}: {resp.text}"}
             return resp.json()
 
-    async def stream_sse(self, path: str, body: dict):
+    async def _stream_sse(self, path: str, body: dict):
         """Stream SSE events from the API."""
         import httpx
         url = f"{self.base_url}{path}"
@@ -163,33 +180,118 @@ class KestrelClient:
 
     async def start_task(self, goal: str, workspace_id: str = None):
         ws = workspace_id or self.workspace_id
+        if self._use_local_control():
+            try:
+                start = await send_control_request(
+                    "task.start",
+                    {"goal": goal, "workspace_id": ws or "local"},
+                    paths=self.paths,
+                )
+                task_id = ((start or {}).get("task") or {}).get("id")
+                if not task_id:
+                    raise ControlClientError("Native task start did not return a task id")
+                async for envelope in send_control_stream(
+                    "task.stream",
+                    {"task_id": task_id},
+                    paths=self.paths,
+                    timeout_seconds=300,
+                ):
+                    event = envelope.get("event")
+                    if event:
+                        yield event
+                return
+            except ControlClientError:
+                pass
+
         path = f"/api/workspaces/{ws}/tasks"
-        async for event in self.stream_sse(path, {"goal": goal}):
+        async for event in self._stream_sse(path, {"goal": goal}):
             yield event
 
     async def list_tasks(self, status: str = None) -> dict:
+        if self._use_local_control():
+            try:
+                result = await send_control_request("task.list", {"limit": 50}, paths=self.paths)
+                tasks = result.get("tasks", [])
+                if status:
+                    tasks = [task for task in tasks if task.get("status") == status]
+                return {"tasks": tasks}
+            except ControlClientError:
+                pass
         path = f"/api/workspaces/{self.workspace_id}/tasks"
         if status:
             path += f"?status={status}"
-        return await self._request("GET", path)
+        return await self._request_http("GET", path)
 
     async def cancel_task(self, task_id: str) -> dict:
-        return await self._request("POST", f"/api/tasks/{task_id}/cancel")
+        return await self._request_http("POST", f"/api/tasks/{task_id}/cancel")
 
     async def approve_task(self, task_id: str, approval_id: str, approved: bool) -> dict:
-        return await self._request("POST", f"/api/tasks/{task_id}/approve", {
+        if self._use_local_control():
+            try:
+                return await send_control_request(
+                    "approval",
+                    {"action": "resolve", "approval_id": approval_id, "approved": approved},
+                    paths=self.paths,
+                )
+            except ControlClientError:
+                pass
+        return await self._request_http("POST", f"/api/tasks/{task_id}/approve", {
             "approvalId": approval_id,
             "approved": approved,
         })
 
     async def list_workflows(self) -> dict:
-        return await self._request("GET", "/api/workflows")
+        if self._use_local_control():
+            return {"workflows": []}
+        return await self._request_http("GET", "/api/workflows")
 
     async def list_cron_jobs(self) -> dict:
-        return await self._request("GET", f"/api/workspaces/{self.workspace_id}/automation/cron")
+        if self._use_local_control():
+            return {"jobs": []}
+        return await self._request_http("GET", f"/api/workspaces/{self.workspace_id}/automation/cron")
 
     async def list_webhooks(self) -> dict:
-        return await self._request("GET", f"/api/workspaces/{self.workspace_id}/automation/webhooks")
+        if self._use_local_control():
+            return {"webhooks": []}
+        return await self._request_http("GET", f"/api/workspaces/{self.workspace_id}/automation/webhooks")
+
+    async def chat(self, prompt: str) -> dict:
+        if self._use_local_control():
+            try:
+                return await send_control_request("chat", {"prompt": prompt}, paths=self.paths)
+            except ControlClientError:
+                pass
+        return {"message": "", "error": "Local control API unavailable"}
+
+    async def status(self) -> dict:
+        if self._use_local_control():
+            return await send_control_request("status", paths=self.paths)
+        return {}
+
+    async def doctor(self) -> dict:
+        if self._use_local_control():
+            return await send_control_request("doctor", paths=self.paths)
+        return {"summary": {"healthy": False, "warnings": 1, "errors": 1}, "checks": []}
+
+    async def runtime_profile(self) -> dict:
+        if self._use_local_control():
+            return await send_control_request("runtime.profile", paths=self.paths)
+        return {}
+
+    async def sync_memory(self) -> dict:
+        if self._use_local_control():
+            return await send_control_request("memory.sync", paths=self.paths)
+        return {"indexed_files": 0, "namespaces": []}
+
+    async def shutdown(self) -> dict:
+        if self._use_local_control():
+            return await send_control_request("shutdown", paths=self.paths)
+        return {"status": "unavailable"}
+
+    async def paired_nodes(self) -> dict:
+        if self._use_local_control():
+            return await send_control_request("paired_nodes.status", paths=self.paths)
+        return {"nodes": []}
 
 
 # ── Display Helpers ──────────────────────────────────────────────────
@@ -310,6 +412,18 @@ def print_info(msg: str):
 
 # ── Command Handlers ─────────────────────────────────────────────────
 
+def load_channel_state(paths) -> dict:
+    """Load shared Gateway channel state from the local Kestrel home."""
+    state_path = paths.state_dir / "gateway-channels.json"
+    if not state_path.exists():
+        return {}
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 async def cmd_task(client: KestrelClient, args: argparse.Namespace):
     """Start an autonomous agent task."""
     goal = " ".join(args.goal)
@@ -420,6 +534,32 @@ async def cmd_status(client: KestrelClient, args: argparse.Namespace):
     """Show system status."""
     config = load_config()
     print_header("System Status")
+    try:
+        status = await client.status()
+    except Exception:
+        status = {}
+
+    if status:
+        uptime = int(status.get("uptime_seconds", 0))
+        days, rem = divmod(uptime, 86400)
+        hrs, rem = divmod(rem, 3600)
+        mins, _ = divmod(rem, 60)
+        uptime_str = f"{days}d {hrs}h {mins}m" if days > 0 else f"{hrs}h {mins}m"
+        print(c(f"  Native daemon running (uptime: {uptime_str})", Colors.SUCCESS))
+        runtime = status.get("runtime_profile", {})
+        local_models = runtime.get("local_models", {})
+        default_provider = local_models.get("default_provider") or "none"
+        default_model = local_models.get("default_model") or "none"
+        print(f"  {c('Control:', Colors.MUTED)}    {c(status.get('control_socket', 'unknown'), Colors.PRIMARY)}")
+        print(f"  {c('Runtime:', Colors.MUTED)}    {c(runtime.get('runtime_mode', 'native'), Colors.WHITE)}")
+        print(f"  {c('Model:', Colors.MUTED)}      {c(f'{default_provider}:{default_model}', Colors.WHITE)}")
+        print(f"  {c('Approvals:', Colors.MUTED)}  {c(str(len(status.get('pending_approvals', []))), Colors.WHITE)}")
+        print(f"  {c('API:', Colors.MUTED)}        {c(config.get('api_url', 'not set'), Colors.PRIMARY)}")
+        print(f"  {c('Workspace:', Colors.MUTED)}  {c(config.get('workspace_id', 'not set'), Colors.WHITE)}")
+        print(f"  {c('Model pref:', Colors.MUTED)} {c(config.get('model', 'default'), Colors.WHITE)}")
+        print(f"  {c('Thinking:', Colors.MUTED)}   {c(config.get('thinking_level', 'medium'), Colors.WHITE)}")
+        print(f"  {c('Usage:', Colors.MUTED)}      {c(config.get('usage_mode', 'tokens'), Colors.WHITE)}")
+        return
     
     state_file = os.path.expanduser("~/.kestrel/state/heartbeat.json")
     if os.path.exists(state_file):
@@ -449,6 +589,181 @@ async def cmd_status(client: KestrelClient, args: argparse.Namespace):
     print(f"  {c('Thinking:', Colors.MUTED)}   {c(config.get('thinking_level', 'medium'), Colors.WHITE)}")
     print(f"  {c('Usage:', Colors.MUTED)}      {c(config.get('usage_mode', 'tokens'), Colors.WHITE)}")
 
+
+async def cmd_doctor(client: KestrelClient, args: argparse.Namespace):
+    """Run local runtime diagnostics."""
+    print_header("Kestrel Doctor")
+    report = await client.doctor()
+    summary = report.get("summary", {})
+    health_color = Colors.SUCCESS if summary.get("healthy") else Colors.WARNING
+    print(f"  {c('Healthy:', Colors.MUTED)}   {c(str(bool(summary.get('healthy'))), health_color)}")
+    print(f"  {c('Warnings:', Colors.MUTED)}  {c(str(summary.get('warnings', 0)), Colors.WHITE)}")
+    print(f"  {c('Errors:', Colors.MUTED)}    {c(str(summary.get('errors', 0)), Colors.WHITE)}")
+    print()
+
+    for check in report.get("checks", []):
+        status = check.get("status", "unknown")
+        color = Colors.SUCCESS if status == "ok" else Colors.WARNING if status == "warning" else Colors.ERROR
+        print(f"  {c(status.upper().ljust(7), color)} {check.get('name', 'check')}: {check.get('detail', '')}")
+
+    paths = report.get("paths", {})
+    if paths:
+        print()
+        print(f"  {c('Home:', Colors.MUTED)}      {c(paths.get('home', ''), Colors.WHITE)}")
+        print(f"  {c('Socket:', Colors.MUTED)}    {c(paths.get('control_socket', ''), Colors.WHITE)}")
+        print(f"  {c('SQLite:', Colors.MUTED)}    {c(paths.get('sqlite_db', ''), Colors.WHITE)}")
+
+    if getattr(args, "repair", False):
+        print()
+        print_header("Repair Actions")
+        repaired = []
+        ensure_home_layout()
+        repaired.append("Ensured local Kestrel home layout exists")
+        if client._use_local_control():
+            memory_result = await client.sync_memory()
+            repaired.append(f"Synced markdown memory ({memory_result.get('indexed_files', 0)} files)")
+        else:
+            repaired.append("Daemon unavailable; skipped live memory sync")
+        for item in repaired:
+            print_success(item)
+
+
+async def cmd_onboard(client: KestrelClient, args: argparse.Namespace):
+    """Prepare the local Kestrel home and summarize the Telegram-first setup."""
+    print_header("Kestrel Onboard")
+    paths = ensure_home_layout()
+    print_success(f"Prepared local home at {paths.home}")
+
+    state = load_channel_state(paths)
+    telegram = state.get("telegram") or {}
+    telegram_config = telegram.get("config") or {}
+    if telegram_config.get("token"):
+        workspace_id = telegram_config.get("workspaceId", "default")
+        mode = telegram_config.get("mode", "polling")
+        print_info(f"Telegram bot configured for workspace {workspace_id} ({mode})")
+    else:
+        print_warning("Telegram bot is not configured yet. Use the desktop settings or Gateway integration route.")
+
+    if client._use_local_control():
+        doctor = await client.doctor()
+        summary = doctor.get("summary", {})
+        print_info(
+            f"Doctor summary: healthy={summary.get('healthy')} "
+            f"warnings={summary.get('warnings', 0)} errors={summary.get('errors', 0)}"
+        )
+    else:
+        print_warning("Local daemon is not connected. Run `kestrel install` to enable background startup.")
+
+
+async def cmd_channels(client: KestrelClient, args: argparse.Namespace):
+    """Show configured companion channels from the shared local store."""
+    print_header("Channels")
+    state = load_channel_state(client.paths)
+    telegram = state.get("telegram") or {}
+    config = telegram.get("config") or {}
+    session = telegram.get("state") or {}
+
+    if not config:
+        print_info("No companion channels configured")
+        return
+
+    print(f"  {c('Telegram:', Colors.MUTED)}  {c('configured', Colors.SUCCESS)}")
+    print(f"  {c('Workspace:', Colors.MUTED)} {c(config.get('workspaceId', 'default'), Colors.WHITE)}")
+    print(f"  {c('Mode:', Colors.MUTED)}      {c(config.get('mode', 'polling'), Colors.WHITE)}")
+    mappings = session.get("mappings", [])
+    print(f"  {c('Pairings:', Colors.MUTED)}  {c(str(len(mappings)), Colors.WHITE)}")
+    if mappings:
+        latest = mappings[-1]
+        print(
+            f"  {c('Latest:', Colors.MUTED)}    "
+            f"{c(str(latest.get('chatId')), Colors.WHITE)} -> {c(str(latest.get('userId')), Colors.WHITE)}"
+        )
+
+
+async def cmd_monitor(client: KestrelClient, args: argparse.Namespace):
+    """Show a local Telegram-first operator snapshot."""
+    print_header("Flight Deck")
+    status = await client.status()
+    runtime = status.get("runtime_profile", {})
+    channels = load_channel_state(client.paths)
+    telegram = ((channels.get("telegram") or {}).get("config") or {})
+
+    print(f"  {c('Runtime:', Colors.MUTED)}   {c(runtime.get('runtime_mode', 'unknown'), Colors.WHITE)}")
+    print(f"  {c('Model:', Colors.MUTED)}     {c(runtime.get('local_models', {}).get('default_model', 'none'), Colors.WHITE)}")
+    print(f"  {c('Approvals:', Colors.MUTED)} {c(str(len(status.get('pending_approvals', []))), Colors.WHITE)}")
+    print(f"  {c('Tasks:', Colors.MUTED)}     {c(str(len(status.get('recent_tasks', []))), Colors.WHITE)}")
+    print(
+        f"  {c('Telegram:', Colors.MUTED)}  "
+        f"{c('configured' if telegram.get('token') else 'not configured', Colors.WHITE)}"
+    )
+
+    recent_tasks = status.get("recent_tasks", [])
+    if recent_tasks:
+        print()
+        headers = ["ID", "Goal", "Status"]
+        rows = [
+            [task.get("id", "")[:8], task.get("goal", "")[:42], task.get("status", "")]
+            for task in recent_tasks[:5]
+        ]
+        print_table(headers, rows, [10, 44, 14])
+
+
+async def cmd_runtime(client: KestrelClient, args: argparse.Namespace):
+    """Show native runtime profile."""
+    print_header("Runtime Profile")
+    profile = await client.runtime_profile()
+    if not profile:
+        print_error("Native runtime profile unavailable")
+        return
+
+    print(f"  {c('Mode:', Colors.MUTED)}      {c(profile.get('runtime_mode', 'unknown'), Colors.WHITE)}")
+    print(f"  {c('Policy:', Colors.MUTED)}    {c(profile.get('policy_name', 'unknown'), Colors.WHITE)}")
+    print(f"  {c('Updated:', Colors.MUTED)}   {c(profile.get('updated_at', 'unknown'), Colors.WHITE)}")
+
+    local_models = profile.get("local_models", {})
+    print(f"  {c('Provider:', Colors.MUTED)}  {c(local_models.get('default_provider', 'none'), Colors.WHITE)}")
+    print(f"  {c('Model:', Colors.MUTED)}     {c(local_models.get('default_model', 'none'), Colors.WHITE)}")
+
+    capabilities = profile.get("runtime_capabilities", {})
+    if capabilities:
+        print()
+        for name, value in capabilities.items():
+            print(f"  {c(name + ':', Colors.MUTED):<34}{c(str(value), Colors.WHITE)}")
+
+
+async def cmd_paired_nodes(client: KestrelClient, args: argparse.Namespace):
+    """Show registered paired nodes."""
+    print_header("Paired Nodes")
+    payload = await client.paired_nodes()
+    nodes = payload.get("nodes", [])
+    if not nodes:
+        print_info("No paired nodes registered")
+        return
+
+    rows = [
+        [
+            node.get("node_id", ""),
+            node.get("node_type", ""),
+            node.get("platform", ""),
+            node.get("health", ""),
+            ",".join((node.get("capabilities", []) or [])[:3]),
+        ]
+        for node in nodes
+    ]
+    print_table(["Node", "Type", "Platform", "Health", "Capabilities"], rows)
+
+
+async def cmd_shutdown(client: KestrelClient, args: argparse.Namespace):
+    """Stop the local daemon."""
+    print_header("Stopping Kestrel Daemon")
+    result = await client.shutdown()
+    status = result.get("status", "unknown")
+    if status == "stopping":
+        print_success("Daemon shutdown requested.")
+    else:
+        print_error(f"Shutdown failed: {status}")
+
+
 async def cmd_config(client: KestrelClient, args: argparse.Namespace):
     """Configure Kestrel CLI settings."""
     config = load_config()
@@ -474,109 +789,25 @@ async def cmd_config(client: KestrelClient, args: argparse.Namespace):
 
 async def cmd_install(client: KestrelClient, args: argparse.Namespace):
     """Install Kestrel as a persistent background daemon (macOS, Linux, Windows)."""
-    import subprocess
-    import platform
     print_header("Installing Kestrel Daemon")
-
-    home = os.path.expanduser("~")
     cli_dir = os.path.abspath(os.path.dirname(__file__))
     daemon_path = os.path.join(cli_dir, "kestrel_daemon.py")
 
     if not os.path.exists(daemon_path):
         print_error(f"Daemon script not found at {daemon_path}")
         return
-
-    audit_dir = os.path.join(home, ".kestrel", "audit")
-    os.makedirs(audit_dir, exist_ok=True)
-
-    plat = platform.system()
-
-    if plat == "Darwin":
-        plist_dir = os.path.join(home, "Library", "LaunchAgents")
-        os.makedirs(plist_dir, exist_ok=True)
-        plist_path = os.path.join(plist_dir, "ai.kestrel.daemon.plist")
-        plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>ai.kestrel.daemon</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{sys.executable}</string>
-        <string>{daemon_path}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardErrorPath</key>
-    <string>{audit_dir}/daemon.err</string>
-    <key>StandardOutPath</key>
-    <string>{audit_dir}/daemon.out</string>
-</dict>
-</plist>
-"""
-        try:
-            with open(plist_path, "w") as f:
-                f.write(plist_content)
-            subprocess.run(["launchctl", "unload", plist_path], capture_output=True)
-            res = subprocess.run(["launchctl", "load", "-w", plist_path], capture_output=True, text=True)
-            if res.returncode == 0:
-                print_success("Daemon installed and started via launchctl.")
-                print_info("State directory: ~/.kestrel/")
-            else:
-                print_error(f"Failed to load daemon: {res.stderr}")
-        except Exception as e:
-            print_error(f"Error installing daemon on macOS: {e}")
-
-    elif plat == "Linux":
-        service_dir = os.path.join(home, ".config", "systemd", "user")
-        os.makedirs(service_dir, exist_ok=True)
-        service_path = os.path.join(service_dir, "kestrel-daemon.service")
-        service_content = f"""[Unit]
-Description=Kestrel Agent OS Daemon
-After=network.target
-
-[Service]
-ExecStart={sys.executable} {daemon_path}
-Restart=always
-StandardOutput=append:{audit_dir}/daemon.out
-StandardError=append:{audit_dir}/daemon.err
-
-[Install]
-WantedBy=default.target
-"""
-        try:
-            with open(service_path, "w") as f:
-                f.write(service_content)
-            subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-            subprocess.run(["systemctl", "--user", "enable", "--now", "kestrel-daemon"], check=True)
-            print_success("Daemon installed and started via systemd (user service).")
-            print_info("State directory: ~/.kestrel/")
-        except Exception as e:
-            print_error(f"Error installing daemon on Linux: {e}")
-            print_info("You may need to run: loginctl enable-linger $USER")
-
-    elif plat == "Windows":
-        try:
-            task_name = "KestrelDaemon"
-            cmd = (
-                f'schtasks /Create /F /SC ONLOGON /TN "{task_name}" '
-                f'/TR "\\"{sys.executable}\\" \\"{daemon_path}\\"" /RL HIGHEST'
-            )
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            if res.returncode == 0:
-                subprocess.run(f'schtasks /Run /TN "{task_name}"', shell=True, capture_output=True)
-                print_success("Daemon installed via Windows Task Scheduler and started.")
-                print_info("State directory: %USERPROFILE%\\.kestrel\\")
-            else:
-                print_error(f"Failed to create scheduled task: {res.stderr}")
-        except Exception as e:
-            print_error(f"Error installing daemon on Windows: {e}")
-
-    else:
-        print_error(f"Unsupported platform: {plat}")
+    try:
+        paths = ensure_home_layout()
+        result = install_daemon_service(
+            daemon_path=daemon_path,
+            python_executable=sys.executable,
+            paths=paths,
+        )
+        print_success(f"Daemon installed via {result['manager']}.")
+        print_info(f"Service file: {result['service_path']}")
+        print_info(f"State directory: {paths.home}")
+    except Exception as exc:
+        print_error(str(exc))
 
 
 # ── Memory CLI Commands ──────────────────────────────────────────────
@@ -730,6 +961,16 @@ async def interactive_repl(client: KestrelClient, config: dict):
 
             # Regular chat message — stream via SSE
             print()
+            if client._use_local_control():
+                response = await client.chat(user_input)
+                if response.get("error"):
+                    print_error(response["error"])
+                else:
+                    print(c(response.get("message", ""), Colors.WHITE))
+                    provider = response.get("provider") or "unknown"
+                    model = response.get("model") or "unknown"
+                    print(c(f"\n  {provider}:{model}\n", Colors.MUTED))
+                continue
             async for event in client.start_task(user_input):
                 print_event(event)
             print()
@@ -786,6 +1027,28 @@ Examples:
     # status
     subparsers.add_parser("status", help="Show system status")
 
+    # doctor
+    doctor_p = subparsers.add_parser("doctor", help="Run local daemon diagnostics")
+    doctor_p.add_argument("--repair", action="store_true", help="Apply safe local repair steps")
+
+    # onboard
+    subparsers.add_parser("onboard", help="Prepare the local Telegram-first Kestrel home")
+
+    # channels
+    subparsers.add_parser("channels", help="Show configured companion channels")
+
+    # monitor
+    subparsers.add_parser("monitor", help="Show a local Flight Deck snapshot")
+
+    # runtime
+    subparsers.add_parser("runtime", help="Show native runtime profile")
+
+    # paired-nodes
+    subparsers.add_parser("paired-nodes", help="Show registered paired nodes")
+
+    # shutdown
+    subparsers.add_parser("shutdown", help="Stop the local daemon")
+
     # install
     subparsers.add_parser("install", help="Install Kestrel as a background macOS daemon")
 
@@ -803,11 +1066,18 @@ Examples:
     
     mem_edit_parser = memory_subparsers.add_parser("edit", help="Open memory directory in default editor")
 
+    memory_subparsers.add_parser("sync", help="Sync markdown memory into the native index")
+
     return parser
 
 
 def main():
     """Main entry point."""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     parser = build_parser()
     args = parser.parse_args()
 
@@ -821,6 +1091,13 @@ def main():
         "cron": cmd_cron,
         "webhooks": cmd_webhooks,
         "status": cmd_status,
+        "doctor": cmd_doctor,
+        "onboard": cmd_onboard,
+        "channels": cmd_channels,
+        "monitor": cmd_monitor,
+        "runtime": cmd_runtime,
+        "paired-nodes": cmd_paired_nodes,
+        "shutdown": cmd_shutdown,
         "config": cmd_config,
         "install": cmd_install,
     }
@@ -830,6 +1107,12 @@ def main():
             cmd_memory_show(args, config)
         elif args.memory_cmd == "edit":
             cmd_memory_edit(args, config)
+        elif args.memory_cmd == "sync":
+            result = asyncio.run(client.sync_memory())
+            print_success(f"Indexed {result.get('indexed_files', 0)} markdown files.")
+            namespaces = result.get("namespaces", [])
+            if namespaces:
+                print_info(f"Namespaces: {', '.join(namespaces)}")
         else:
             parser.parse_args(["memory", "--help"])
         return

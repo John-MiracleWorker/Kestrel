@@ -73,7 +73,12 @@ function scoreModel(name: string): number {
 
 function buildHostList(): string[] {
     // Priority hosts probed first (these resolve quickly from inside Docker)
-    const priority = ['host.docker.internal', '172.17.0.1'];
+    const localRuntime = ['native', 'local'].includes(
+        (process.env.KESTREL_RUNTIME_MODE || '').toLowerCase(),
+    );
+    const priority = localRuntime
+        ? ['127.0.0.1', 'localhost', 'host.docker.internal', '172.17.0.1']
+        : ['host.docker.internal', '172.17.0.1'];
 
     // If a specific host is set, always include it
     const explicitHost = process.env.OLLAMA_HOST;

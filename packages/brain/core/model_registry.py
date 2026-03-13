@@ -307,7 +307,8 @@ class ModelRegistry:
             from providers.ollama_discovery import ollama_discovery
             host = await ollama_discovery.get_best_host()
         except Exception:
-            host = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
+            default_host = "http://127.0.0.1:11434" if os.getenv("KESTREL_RUNTIME_MODE", "").lower() in {"native", "local"} else "http://host.docker.internal:11434"
+            host = os.getenv("OLLAMA_HOST", default_host)
         url = f"{host}/api/tags"
         try:
             async with aiohttp.ClientSession() as session:
@@ -355,7 +356,8 @@ class ModelRegistry:
                 from providers.lmstudio_discovery import lmstudio_discovery
                 host = await lmstudio_discovery.get_best_host()
             except Exception:
-                host = f"http://host.docker.internal:{os.getenv('LMSTUDIO_PORT', '1234')}"
+                default_host = "127.0.0.1" if os.getenv("KESTREL_RUNTIME_MODE", "").lower() in {"native", "local"} else "host.docker.internal"
+                host = f"http://{default_host}:{os.getenv('LMSTUDIO_PORT', '1234')}"
         url = f"{host}/v1/models"
         try:
             async with aiohttp.ClientSession() as session:

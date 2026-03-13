@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { requireAuth, requireWorkspace } from '../auth/middleware';
 import { BrainClient } from '../brain/client';
+import { getLocalGatewayStateStore } from '../brain/local';
 import { logger } from '../utils/logger';
 import { getPool } from '../db/pool';
 
@@ -45,6 +46,7 @@ function parseStructuredEventJson(raw: unknown): Record<string, unknown> {
  */
 export default async function automationRoutes(app: FastifyInstance, deps: AutomationDeps) {
     const { brainClient } = deps;
+    const localStore = brainClient.isLocalMode() ? getLocalGatewayStateStore() : null;
     const typedApp = app.withTypeProvider<ZodTypeProvider>();
 
     const workspaceParamsSchema = z.object({
@@ -460,16 +462,27 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
                 const brainCaps: any[] = result.capabilities || [];
 
                 // 2. Get workspace preferences from DB
-                const { rows: prefs } = await getPool().query(
-                    'SELECT capability_id, installed, enabled FROM workspace_capabilities WHERE workspace_id = $1',
-                    [workspaceId],
-                );
                 const prefMap = new Map<string, { installed: boolean; enabled: boolean }>();
-                for (const row of prefs) {
-                    prefMap.set(row.capability_id, {
-                        installed: row.installed,
-                        enabled: row.enabled,
-                    });
+                if (localStore) {
+                    const settings = localStore.getWorkspaceSettings(workspaceId);
+                    const prefs = settings.capabilityPrefs || {};
+                    for (const [capabilityId, pref] of Object.entries(prefs)) {
+                        prefMap.set(capabilityId, {
+                            installed: Boolean((pref as any)?.installed),
+                            enabled: Boolean((pref as any)?.enabled),
+                        });
+                    }
+                } else {
+                    const { rows: prefs } = await getPool().query(
+                        'SELECT capability_id, installed, enabled FROM workspace_capabilities WHERE workspace_id = $1',
+                        [workspaceId],
+                    );
+                    for (const row of prefs) {
+                        prefMap.set(row.capability_id, {
+                            installed: row.installed,
+                            enabled: row.enabled,
+                        });
+                    }
                 }
 
                 // 3. Merge
@@ -514,6 +527,13 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
             const { workspaceId, capId } = req.params as CapabilityParams;
 
             try {
+                if (localStore) {
+                    const settings = localStore.getWorkspaceSettings(workspaceId);
+                    const prefs = settings.capabilityPrefs || {};
+                    prefs[capId] = { installed: true, enabled: true };
+                    localStore.mergeWorkspaceSettings(workspaceId, { capabilityPrefs: prefs });
+                    return { success: true, capId, installed: true, enabled: true };
+                }
                 await getPool().query(
                     `INSERT INTO workspace_capabilities (workspace_id, capability_id, installed, enabled, installed_at, updated_at)
                  VALUES ($1, $2, TRUE, TRUE, NOW(), NOW())
@@ -544,6 +564,19 @@ export default async function automationRoutes(app: FastifyInstance, deps: Autom
             const { enabled } = req.body as { enabled: boolean };
 
             try {
+                if (localStore) {
+                    const settings = localStore.getWorkspaceSettings(workspaceId);
+                    const prefs = settings.capabilityPrefs || {};
+                    if (!prefs[capId]) {
+                        return reply.status(404).send({ error: 'Capability not installed' });
+                    }
+                    prefs[capId] = {
+                        installed: Boolean(prefs[capId].installed),
+                        enabled,
+                    };
+                    localStore.mergeWorkspaceSettings(workspaceId, { capabilityPrefs: prefs });
+                    return { success: true, capId, enabled };
+                }
                 const result = await getPool().query(
                     `UPDATE workspace_capabilities SET enabled = $3, updated_at = NOW()
                  WHERE workspace_id = $1 AND capability_id = $2`,

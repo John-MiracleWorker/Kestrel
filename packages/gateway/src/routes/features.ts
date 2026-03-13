@@ -13,6 +13,7 @@ import { z } from 'zod';
 import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { requireAuth, requireWorkspace } from '../auth/middleware';
 import { BrainClient } from '../brain/client';
+import { getLocalGatewayStateStore } from '../brain/local';
 import { logger } from '../utils/logger';
 import { getPool } from '../db/pool';
 
@@ -22,6 +23,7 @@ interface FeatureDeps {
 
 export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
     const { brainClient } = deps;
+    const localStore = brainClient.isLocalMode() ? getLocalGatewayStateStore() : null;
 
     // ── P2: Message Feedback ─────────────────────────────────────────
     app.withTypeProvider<ZodTypeProvider>().post(
@@ -41,13 +43,18 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         async (request, reply) => {
             const { workspaceId } = request.params as { workspaceId: string };
             const body = request.body as {
-                conversationId: string; messageId: string; rating: number; comment: string;
+                conversationId: string;
+                messageId: string;
+                rating: number;
+                comment: string;
             };
             const userId = request.user!.id;
 
             try {
                 const result = await brainClient.call('SubmitFeedback', {
-                    userId, workspaceId, ...body,
+                    userId,
+                    workspaceId,
+                    ...body,
                 });
                 return reply.send({ success: true, id: result?.id || '' });
             } catch (error) {
@@ -73,6 +80,11 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
             const { limit } = request.query as { limit: number };
 
             try {
+                if (localStore) {
+                    return reply.send({
+                        notifications: localStore.listNotifications(userId, limit),
+                    });
+                }
                 const pool = getPool();
                 const result = await pool.query(
                     `SELECT id, type, title, body, source, data, read, created_at
@@ -80,7 +92,7 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
                      WHERE user_id = $1 AND read = false
                      ORDER BY created_at DESC
                      LIMIT $2`,
-                    [userId, limit]
+                    [userId, limit],
                 );
                 return reply.send({ notifications: result.rows });
             } catch (error) {
@@ -102,11 +114,14 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         async (request, reply) => {
             const { notificationId } = request.params as { notificationId: string };
             try {
+                if (localStore) {
+                    localStore.markNotificationRead(notificationId);
+                    return reply.send({ success: true });
+                }
                 const pool = getPool();
-                await pool.query(
-                    `UPDATE notifications SET read = true WHERE id = $1`,
-                    [notificationId]
-                );
+                await pool.query(`UPDATE notifications SET read = true WHERE id = $1`, [
+                    notificationId,
+                ]);
                 return reply.send({ success: true });
             } catch (error) {
                 logger.error('Failed to mark read', { error });
@@ -122,10 +137,14 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         async (request, reply) => {
             const userId = request.user!.id;
             try {
+                if (localStore) {
+                    localStore.markAllNotificationsRead(userId);
+                    return reply.send({ success: true });
+                }
                 const pool = getPool();
                 await pool.query(
                     `UPDATE notifications SET read = true WHERE user_id = $1 AND read = false`,
-                    [userId]
+                    [userId],
                 );
                 return reply.send({ success: true });
             } catch (error) {
@@ -145,13 +164,16 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         async (request, reply) => {
             const { workspaceId } = request.params as { workspaceId: string };
             try {
+                if (localStore) {
+                    return reply.send({ tools: localStore.listInstalledTools(workspaceId) });
+                }
                 const pool = getPool();
                 const result = await pool.query(
                     `SELECT id, name, description, server_url, transport, config, enabled, installed_at, updated_at
                      FROM installed_tools
                      WHERE workspace_id = $1
                      ORDER BY installed_at DESC`,
-                    [workspaceId]
+                    [workspaceId],
                 );
                 return reply.send({ tools: result.rows });
             } catch (err) {
@@ -180,11 +202,25 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         async (request, reply) => {
             const { workspaceId } = request.params as { workspaceId: string };
             const body = request.body as {
-                name: string; description: string; serverUrl: string;
-                transport: string; config: Record<string, unknown>;
+                name: string;
+                description: string;
+                serverUrl: string;
+                transport: string;
+                config: Record<string, unknown>;
             };
 
             try {
+                if (localStore) {
+                    return reply.send(
+                        localStore.upsertInstalledTool(workspaceId, {
+                            name: body.name,
+                            description: body.description,
+                            serverUrl: body.serverUrl,
+                            transport: body.transport,
+                            config: body.config,
+                        }),
+                    );
+                }
                 const pool = getPool();
                 await pool.query(
                     `INSERT INTO installed_tools (workspace_id, name, description, server_url, transport, config)
@@ -192,7 +228,14 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
                      ON CONFLICT (workspace_id, name)
                      DO UPDATE SET server_url = $4, transport = $5, config = $6::jsonb,
                                    description = $3, updated_at = NOW(), enabled = true`,
-                    [workspaceId, body.name, body.description, body.serverUrl, body.transport, JSON.stringify(body.config)]
+                    [
+                        workspaceId,
+                        body.name,
+                        body.description,
+                        body.serverUrl,
+                        body.transport,
+                        JSON.stringify(body.config),
+                    ],
                 );
                 logger.info(`MCP tool installed: ${body.name} in workspace ${workspaceId}`);
                 return reply.send({ success: true, name: body.name });
@@ -217,13 +260,18 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         },
         async (request, reply) => {
             const { workspaceId, toolName } = request.params as {
-                workspaceId: string; toolName: string;
+                workspaceId: string;
+                toolName: string;
             };
             try {
+                if (localStore) {
+                    localStore.deleteInstalledTool(workspaceId, toolName);
+                    return reply.send({ success: true });
+                }
                 const pool = getPool();
                 await pool.query(
                     'DELETE FROM installed_tools WHERE workspace_id = $1 AND name = $2',
-                    [workspaceId, toolName]
+                    [workspaceId, toolName],
                 );
                 logger.info(`MCP tool uninstalled: ${toolName} from workspace ${workspaceId}`);
                 return reply.send({ success: true });
@@ -244,6 +292,9 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         async (request, reply) => {
             const { workspaceId } = request.params as { workspaceId: string };
             try {
+                if (localStore) {
+                    return reply.send({ members: localStore.listWorkspaceMembers(workspaceId) });
+                }
                 const result = await brainClient.call('ListWorkspaceMembers', { workspaceId });
                 return reply.send({ members: result?.members || [] });
             } catch {
@@ -271,8 +322,16 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
             const userId = request.user!.id;
 
             try {
+                if (localStore) {
+                    return reply
+                        .status(501)
+                        .send({ error: 'Workspace invitations are unsupported in local mode' });
+                }
                 const result = await brainClient.call('InviteWorkspaceMember', {
-                    workspaceId, invitedBy: userId, email, role,
+                    workspaceId,
+                    invitedBy: userId,
+                    email,
+                    role,
                 });
                 return reply.send({
                     success: true,
@@ -300,9 +359,17 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         },
         async (request, reply) => {
             const { workspaceId, memberId } = request.params as {
-                workspaceId: string; memberId: string;
+                workspaceId: string;
+                memberId: string;
             };
             try {
+                if (localStore) {
+                    return reply
+                        .status(501)
+                        .send({
+                            error: 'Workspace membership changes are unsupported in local mode',
+                        });
+                }
                 await brainClient.call('RemoveWorkspaceMember', { workspaceId, memberId });
                 return reply.send({ success: true });
             } catch {
@@ -312,19 +379,90 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
     );
 
     // ── P2: Search MCP Servers (Smithery registry) ───────────────────
-    const BUILTIN_MCP_CATALOG: Array<{ name: string; description: string; transport: string; category: string; requires_env?: string[] }> = [
-        { name: '@modelcontextprotocol/server-filesystem', description: 'Read/write local files and directories', transport: 'stdio', category: 'files' },
-        { name: '@modelcontextprotocol/server-github', description: 'GitHub repos, issues, PRs, and code search', transport: 'stdio', category: 'dev', requires_env: ['GITHUB_PERSONAL_ACCESS_TOKEN'] },
-        { name: '@modelcontextprotocol/server-postgres', description: 'Query PostgreSQL databases', transport: 'stdio', category: 'data', requires_env: ['POSTGRES_URL'] },
-        { name: '@modelcontextprotocol/server-sqlite', description: 'Query SQLite databases', transport: 'stdio', category: 'data' },
-        { name: '@modelcontextprotocol/server-slack', description: 'Read/send Slack messages and channels', transport: 'stdio', category: 'comms', requires_env: ['SLACK_BOT_TOKEN'] },
-        { name: '@modelcontextprotocol/server-puppeteer', description: 'Browser automation and web scraping', transport: 'stdio', category: 'web' },
-        { name: '@modelcontextprotocol/server-brave-search', description: 'Web search via Brave Search API', transport: 'stdio', category: 'web', requires_env: ['BRAVE_API_KEY'] },
-        { name: '@modelcontextprotocol/server-memory', description: 'Persistent key-value memory storage', transport: 'stdio', category: 'memory' },
-        { name: '@modelcontextprotocol/server-google-maps', description: 'Google Maps geocoding, directions, places', transport: 'stdio', category: 'geo', requires_env: ['GOOGLE_MAPS_API_KEY'] },
-        { name: '@modelcontextprotocol/server-fetch', description: 'HTTP requests to external APIs', transport: 'stdio', category: 'web' },
-        { name: '@modelcontextprotocol/server-sequential-thinking', description: 'Step-by-step reasoning and problem solving', transport: 'stdio', category: 'reasoning' },
-        { name: '@modelcontextprotocol/server-everything', description: 'Kitchen-sink demo of all MCP features', transport: 'stdio', category: 'demo' },
+    const BUILTIN_MCP_CATALOG: Array<{
+        name: string;
+        description: string;
+        transport: string;
+        category: string;
+        requires_env?: string[];
+    }> = [
+        {
+            name: '@modelcontextprotocol/server-filesystem',
+            description: 'Read/write local files and directories',
+            transport: 'stdio',
+            category: 'files',
+        },
+        {
+            name: '@modelcontextprotocol/server-github',
+            description: 'GitHub repos, issues, PRs, and code search',
+            transport: 'stdio',
+            category: 'dev',
+            requires_env: ['GITHUB_PERSONAL_ACCESS_TOKEN'],
+        },
+        {
+            name: '@modelcontextprotocol/server-postgres',
+            description: 'Query PostgreSQL databases',
+            transport: 'stdio',
+            category: 'data',
+            requires_env: ['POSTGRES_URL'],
+        },
+        {
+            name: '@modelcontextprotocol/server-sqlite',
+            description: 'Query SQLite databases',
+            transport: 'stdio',
+            category: 'data',
+        },
+        {
+            name: '@modelcontextprotocol/server-slack',
+            description: 'Read/send Slack messages and channels',
+            transport: 'stdio',
+            category: 'comms',
+            requires_env: ['SLACK_BOT_TOKEN'],
+        },
+        {
+            name: '@modelcontextprotocol/server-puppeteer',
+            description: 'Browser automation and web scraping',
+            transport: 'stdio',
+            category: 'web',
+        },
+        {
+            name: '@modelcontextprotocol/server-brave-search',
+            description: 'Web search via Brave Search API',
+            transport: 'stdio',
+            category: 'web',
+            requires_env: ['BRAVE_API_KEY'],
+        },
+        {
+            name: '@modelcontextprotocol/server-memory',
+            description: 'Persistent key-value memory storage',
+            transport: 'stdio',
+            category: 'memory',
+        },
+        {
+            name: '@modelcontextprotocol/server-google-maps',
+            description: 'Google Maps geocoding, directions, places',
+            transport: 'stdio',
+            category: 'geo',
+            requires_env: ['GOOGLE_MAPS_API_KEY'],
+        },
+        {
+            name: '@modelcontextprotocol/server-fetch',
+            description: 'HTTP requests to external APIs',
+            transport: 'stdio',
+            category: 'web',
+        },
+        {
+            name: '@modelcontextprotocol/server-sequential-thinking',
+            description: 'Step-by-step reasoning and problem solving',
+            transport: 'stdio',
+            category: 'reasoning',
+        },
+        {
+            name: '@modelcontextprotocol/server-everything',
+            description: 'Kitchen-sink demo of all MCP features',
+            transport: 'stdio',
+            category: 'demo',
+        },
     ];
 
     app.withTypeProvider<ZodTypeProvider>().get(
@@ -342,20 +480,37 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
             const query = q.toLowerCase();
 
             // Search built-in catalog first
-            const builtinResults = BUILTIN_MCP_CATALOG
-                .filter(s => s.name.toLowerCase().includes(query) || s.description.toLowerCase().includes(query) || s.category.includes(query))
-                .map(s => ({ ...s, source: 'official' }));
+            const builtinResults = BUILTIN_MCP_CATALOG.filter(
+                (s) =>
+                    s.name.toLowerCase().includes(query) ||
+                    s.description.toLowerCase().includes(query) ||
+                    s.category.includes(query),
+            ).map((s) => ({ ...s, source: 'official' }));
 
             // Search Smithery registry
-            let smitheryResults: Array<{ name: string; description: string; transport: string; source: string }> = [];
+            let smitheryResults: Array<{
+                name: string;
+                description: string;
+                transport: string;
+                source: string;
+            }> = [];
             try {
-                const res = await fetch(`https://registry.smithery.ai/servers?q=${encodeURIComponent(q)}&pageSize=10`, {
-                    headers: { 'Accept': 'application/json' },
-                    signal: AbortSignal.timeout(5000),
-                });
+                const res = await fetch(
+                    `https://registry.smithery.ai/servers?q=${encodeURIComponent(q)}&pageSize=10`,
+                    {
+                        headers: { Accept: 'application/json' },
+                        signal: AbortSignal.timeout(5000),
+                    },
+                );
                 if (res.ok) {
-                    const data = await res.json() as { servers?: Array<{ qualifiedName: string; displayName: string; description: string }> };
-                    smitheryResults = (data.servers || []).map(s => ({
+                    const data = (await res.json()) as {
+                        servers?: Array<{
+                            qualifiedName: string;
+                            displayName: string;
+                            description: string;
+                        }>;
+                    };
+                    smitheryResults = (data.servers || []).map((s) => ({
                         name: s.qualifiedName || s.displayName,
                         description: (s.description || '').slice(0, 200),
                         transport: 'stdio',
@@ -368,7 +523,7 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
 
             // Deduplicate and combine
             const seen = new Set<string>();
-            const results = [...builtinResults, ...smitheryResults].filter(r => {
+            const results = [...builtinResults, ...smitheryResults].filter((r) => {
                 if (seen.has(r.name)) return false;
                 seen.add(r.name);
                 return true;
@@ -388,7 +543,9 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         async (request, reply) => {
             const { workspaceId } = (request as any).params;
             try {
-                const result = await brainClient.call('ListProcesses', { workspace_id: workspaceId });
+                const result = await brainClient.call('ListProcesses', {
+                    workspace_id: workspaceId,
+                });
                 return reply.send({
                     processes: result?.processes || [],
                     running: result?.running || 0,
@@ -403,4 +560,3 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
         },
     );
 }
-

@@ -1,7 +1,7 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
-import Redis from 'ioredis';
+import { createRedisClient, RedisLike } from '../redis/compat';
 import { logger } from '../utils/logger';
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -55,18 +55,18 @@ const REFRESH_TOKEN_EXPIRY = process.env.JWT_REFRESH_EXPIRY || '7d';
 // ── Shared Redis Connection for API Key Validation ──────────────────
 // Reuse a single connection instead of creating one per request.
 
-let _apiKeyRedis: Redis | null = null;
+let _apiKeyRedis: RedisLike | null = null;
 
-function getApiKeyRedis(): Redis {
+function getApiKeyRedis(): RedisLike {
     if (!_apiKeyRedis) {
         const redisUrl =
             process.env.REDIS_URL ||
             `redis://${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || '6379'}`;
-        _apiKeyRedis = new Redis(redisUrl, {
+        _apiKeyRedis = createRedisClient(redisUrl, {
             lazyConnect: true,
             maxRetriesPerRequest: 2,
             enableReadyCheck: true,
-        });
+        } as any);
         _apiKeyRedis.on('error', (err) =>
             logger.error('API key Redis connection error', { error: err.message }),
         );

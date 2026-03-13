@@ -96,8 +96,15 @@ async def _resolve_computer_use_model() -> str:
         COMPUTER_USE_MODEL = COMPUTER_USE_KNOWN_MODELS[0]
     return COMPUTER_USE_MODEL
 
-# Host-side screen agent URL (runs natively on the Mac)
-SCREEN_AGENT_URL = os.getenv("SCREEN_AGENT_URL", "http://host.docker.internal:9800")
+def _default_screen_agent_url() -> str:
+    runtime_mode = os.getenv("KESTREL_RUNTIME_MODE", "").lower()
+    if runtime_mode in {"native", "local"}:
+        return "http://127.0.0.1:9800"
+    return "http://host.docker.internal:9800"
+
+
+# Host-side screen agent URL (runs natively on the host)
+SCREEN_AGENT_URL = os.getenv("SCREEN_AGENT_URL", _default_screen_agent_url())
 ACTION_VERIFY_RETRIES = int(os.getenv("COMPUTER_USE_ACTION_VERIFY_RETRIES", "2"))
 ACTION_RETRY_DELAY_SECONDS = float(os.getenv("COMPUTER_USE_ACTION_RETRY_DELAY_SECONDS", "1.0"))
 

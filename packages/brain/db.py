@@ -8,7 +8,12 @@ import os
 import logging
 from typing import Optional
 
-import asyncpg
+try:
+    import asyncpg
+except ModuleNotFoundError:  # pragma: no cover - optional in native mode
+    asyncpg = None
+
+from native_backends import LocalRedis, use_local_redis_backend
 
 logger = logging.getLogger("brain.db")
 
@@ -21,7 +26,7 @@ DB_URL = os.getenv(
     f"{os.getenv('POSTGRES_DB', 'kestrel')}"
 )
 
-_pool: Optional[asyncpg.Pool] = None
+_pool: Optional["asyncpg.Pool"] = None
 _redis_pool: Optional[object] = None
 
 
@@ -35,9 +40,14 @@ def _import_redis_module():
     return redis_module
 
 
-async def get_pool() -> asyncpg.Pool:
+async def get_pool() -> "asyncpg.Pool":
     global _pool
     if _pool is None:
+        if asyncpg is None:
+            raise RuntimeError(
+                "PostgreSQL support requires the 'asyncpg' package. "
+                "Install packages/brain/requirements.txt or avoid get_pool() in native mode."
+            )
         _pool = await asyncpg.create_pool(
             DB_URL,
             min_size=int(os.getenv("POSTGRES_POOL_MIN", "2")),
@@ -49,8 +59,24 @@ async def get_pool() -> asyncpg.Pool:
 async def get_redis():
     global _redis_pool
     if _redis_pool is None:
-        redis = _import_redis_module()
-        _redis_pool = redis.from_url(
-            f"redis://{os.getenv('REDIS_HOST', 'localhost')}:{os.getenv('REDIS_PORT', '6379')}"
-        )
+        if use_local_redis_backend():
+            _redis_pool = LocalRedis()
+            logger.info("Using local SQLite-backed Redis compatibility store")
+        else:
+            redis = _import_redis_module()
+            _redis_pool = redis.from_url(
+                f"redis://{os.getenv('REDIS_HOST', 'localhost')}:{os.getenv('REDIS_PORT', '6379')}"
+            )
     return _redis_pool
+
+
+async def reset_cached_clients() -> None:
+    global _pool, _redis_pool
+    if _pool is not None:
+        await _pool.close()
+        _pool = None
+    if _redis_pool is not None and hasattr(_redis_pool, "close"):
+        maybe_awaitable = _redis_pool.close()
+        if hasattr(maybe_awaitable, "__await__"):
+            await maybe_awaitable
+    _redis_pool = None

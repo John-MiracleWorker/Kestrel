@@ -1,15 +1,15 @@
-import Redis from 'ioredis';
 import { ChannelType } from '../channels/base';
+import { RedisLike } from '../redis/compat';
 import { logger } from '../utils/logger';
 
 // ── Channel Identity ───────────────────────────────────────────────
 
 export interface ChannelIdentity {
-    userId: string;        // Kestrel user ID
+    userId: string; // Kestrel user ID
     channel: ChannelType;
     channelUserId: string; // Platform-specific ID (phone, Telegram ID, Discord ID)
     displayName?: string;
-    linked: boolean;       // Whether this identity has been explicitly linked by the user
+    linked: boolean; // Whether this identity has been explicitly linked by the user
     createdAt: Date;
 }
 
@@ -20,11 +20,11 @@ export interface ChannelIdentity {
  * message deduplication to prevent duplicate Brain calls.
  */
 export class Deduplicator {
-    private readonly DEDUP_TTL = 5;           // 5 seconds dedup window
+    private readonly DEDUP_TTL = 5; // 5 seconds dedup window
     private readonly IDENTITY_PREFIX = 'kestrel:identity:';
     private readonly DEDUP_PREFIX = 'kestrel:dedup:';
 
-    constructor(private redis: Redis) { }
+    constructor(private redis: RedisLike) {}
 
     // ── Identity Linking ───────────────────────────────────────────
 
@@ -140,11 +140,7 @@ export class Deduplicator {
      * Returns true if this is a DUPLICATE (should be skipped).
      * Returns false if this is a NEW message (should be processed).
      */
-    async isDuplicate(
-        userId: string,
-        content: string,
-        channel: ChannelType,
-    ): Promise<boolean> {
+    async isDuplicate(userId: string, content: string, channel: ChannelType): Promise<boolean> {
         // Hash the message content for the dedup key
         const contentHash = this.hashContent(content);
         const key = `${this.DEDUP_PREFIX}${userId}:${contentHash}`;
@@ -175,7 +171,7 @@ export class Deduplicator {
         let hash = 0;
         for (let i = 0; i < content.length; i++) {
             const char = content.charCodeAt(i);
-            hash = ((hash << 5) - hash) + char;
+            hash = (hash << 5) - hash + char;
             hash |= 0; // Convert to 32-bit integer
         }
         return Math.abs(hash).toString(36);
