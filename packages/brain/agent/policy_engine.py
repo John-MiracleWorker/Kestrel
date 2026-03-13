@@ -22,6 +22,20 @@ class PolicyEngine:
     }
     _READONLY_GIT_ACTIONS = {"status", "diff", "log", "branch", "show"}
 
+    _CAPABILITY_BYPASS_TOOLS = {
+        "task_complete",
+        "ask_human",
+        "mcp_status",
+        "mcp_connect",
+        "mcp_disconnect",
+        "memory_query",
+        "memory_search",
+        "web_search",
+        "read_file",
+        "list_directory",
+        "search_code",
+    }
+
     def decide(
         self,
         *,
@@ -38,8 +52,8 @@ class PolicyEngine:
         if policy_name not in {"moderate", "conservative", "full"}:
             policy_name = "moderate"
 
-        if tool_name == "task_complete" or tool_name == "ask_human":
-            return PolicyDecision(True, False, "low", "control", "Control tool")
+        if tool_name in self._CAPABILITY_BYPASS_TOOLS:
+            return PolicyDecision(True, False, "low", "control", "Safe read-only tool")
 
         if execution_context and execution_context.capability_grants:
             matched_grants = execution_context.grants_for(

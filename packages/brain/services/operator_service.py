@@ -246,7 +246,8 @@ class OperatorServicerMixin(BaseServicerMixin):
                        updated_at, created_by, data_source
                 FROM ui_artifacts
                 WHERE workspace_id = $1
-                  AND updated_at BETWEEN $2 - INTERVAL '5 minutes' AND $3 + INTERVAL '5 minutes'
+                  AND updated_at >= (CAST($2 AS timestamptz) - INTERVAL '5 minutes')
+                  AND updated_at <= (CAST($3 AS timestamptz) + INTERVAL '5 minutes')
                 ORDER BY updated_at DESC
                 LIMIT $4
                 """,
