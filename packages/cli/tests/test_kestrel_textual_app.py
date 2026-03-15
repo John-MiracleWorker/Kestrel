@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from textual.widgets import Button, TextArea
+from textual.widgets import Button, DataTable, TextArea
 
 from kestrel_cli import cli_core as cli_core_impl
 from kestrel_cli.tui.app import KestrelTextualApp
@@ -283,6 +283,20 @@ def test_tasks_keyboard_navigation_updates_selection_without_enter():
             await pilot.press("down")
             await pilot.pause(0.2)
             assert app.store.state.selected_task_id == "task-live"
+
+    asyncio.run(scenario())
+
+
+def test_invalid_row_highlight_is_ignored():
+    async def scenario():
+        app = KestrelTextualApp(FakeClient(), _config())
+        async with app.run_test(headless=True, size=(160, 46)) as pilot:
+            await pilot.pause(0.35)
+            table = app.query_one("#cockpit-tasks", DataTable)
+            table.focus()
+            before = app.store.state.selected_task_id
+            app.on_data_table_row_highlighted(DataTable.RowHighlighted(table, -1, None))  # type: ignore[arg-type]
+            assert app.store.state.selected_task_id == before
 
     asyncio.run(scenario())
 
