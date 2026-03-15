@@ -5,6 +5,21 @@ from . import native_tool_registry_core as _native_tool_registry_core
 globals().update({name: value for name, value in vars(_native_tool_registry_core).items() if not name.startswith("__")})
 
 class NativeToolRegistryHandlersMixin:
+    def _native_send_file_to_telegram(self, file_path: Path, *, caption: str = "") -> tuple[bool, str]:
+        from .native_chat_tools import _send_file_to_telegram
+
+        return _send_file_to_telegram(file_path, caption=caption)
+
+    def _native_resolve_telegram_delivery_targets(self) -> tuple[str, str]:
+        from .native_chat_tools import _resolve_telegram_delivery_targets
+
+        return _resolve_telegram_delivery_targets()
+
+    def _native_capture_screenshot_to_file(self, output_path: Path) -> None:
+        from .native_chat_tools import _capture_screenshot_to_file
+
+        _capture_screenshot_to_file(output_path)
+
     def _handle_write_file(self, context: NativeToolContext, arguments: dict[str, Any]) -> NativeExecutionResult:
         path = self._resolve_local_path(arguments.get("path"), workspace_root=context.workspace_root)
         content = str(arguments.get("content") or "")
@@ -647,10 +662,10 @@ class NativeToolRegistryHandlersMixin:
 
         sent_to_telegram = False
         if send_to_telegram:
-            tg_token, tg_chat = _resolve_telegram_delivery_targets()
+            tg_token, tg_chat = self._native_resolve_telegram_delivery_targets()
             if tg_token and tg_chat:
                 for file_path in saved_paths:
-                    sent, _delivery = _send_file_to_telegram(file_path, caption=prompt_text[:1024])
+                    sent, _delivery = self._native_send_file_to_telegram(file_path, caption=prompt_text[:1024])
                     if sent:
                         sent_to_telegram = True
 
@@ -710,7 +725,10 @@ class NativeToolRegistryHandlersMixin:
         sent_to_telegram = False
         delivery_note = ""
         if send_to_telegram:
-            sent_to_telegram, delivery_note = _send_file_to_telegram(png_path, caption=caption[:1024])
+            sent_to_telegram, delivery_note = self._native_send_file_to_telegram(
+                png_path,
+                caption=caption[:1024],
+            )
 
         message = f"Rendered the SVG to PNG.\n{svg_path}\n{png_path}"
         if send_to_telegram:
@@ -737,7 +755,7 @@ class NativeToolRegistryHandlersMixin:
         send_to_telegram = bool(arguments.get("send_to_telegram", False))
         caption = str(arguments.get("caption") or "Kestrel screenshot")
         try:
-            _capture_screenshot_to_file(file_path)
+            self._native_capture_screenshot_to_file(file_path)
         except Exception as exc:
             return NativeExecutionResult(
                 tool_name="take_screenshot",
@@ -746,7 +764,7 @@ class NativeToolRegistryHandlersMixin:
             )
         delivery_note = "Telegram delivery was not requested."
         if send_to_telegram:
-            sent, delivery_note = _send_file_to_telegram(file_path, caption=caption)
+            sent, delivery_note = self._native_send_file_to_telegram(file_path, caption=caption)
             if not sent:
                 delivery_note = f"{delivery_note} The screenshot is still available locally."
         return NativeExecutionResult(

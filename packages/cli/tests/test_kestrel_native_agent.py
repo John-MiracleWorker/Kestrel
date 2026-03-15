@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import kestrel_daemon as daemon
 import kestrel_native as native
+from kestrel_cli import native_agent_base as native_agent_base_impl
 from kestrel_cli import native_chat_tools as native_chat_tools_impl
 from kestrel_cli import native_models as native_models_impl
 
@@ -172,12 +173,6 @@ def test_native_agent_runner_persists_intermediate_step_output(tmp_path, monkeyp
         }, "fake", "model"
 
     async def next_action(self, state, step):
-        if step["id"] == "step_1":
-            return {
-                "action": "store_result",
-                "summary": "Generated the SVG markup.",
-                "result": svg_text,
-            }, "fake", "model"
         if not state.get("tool_evidence"):
             return {
                 "action": "tool_call",
@@ -196,8 +191,13 @@ def test_native_agent_runner_persists_intermediate_step_output(tmp_path, monkeyp
     async def verify(self, state, draft_response):
         return {"ok": True, "final_response": draft_response, "reason": "grounded"}, "fake", "model"
 
+    async def generate_step_output(self, state, step):
+        assert step["id"] == "step_1"
+        return svg_text, "fake", "model"
+
     monkeypatch.setattr(native.NativeAgentRunner, "_plan_goal", plan_goal)
     monkeypatch.setattr(native.NativeAgentRunner, "_next_action", next_action)
+    monkeypatch.setattr(native.NativeAgentRunner, "_generate_step_output", generate_step_output)
     monkeypatch.setattr(native.NativeAgentRunner, "_verify_response", verify)
 
     pending = asyncio.run(runner.run(goal=task["goal"], task_id=task["id"]))
@@ -536,14 +536,9 @@ def test_native_agent_runner_uses_svg_render_heuristic_for_svg_to_png_goals(tmp_
         workspace_root=tmp_path,
     )
 
-    async def next_action(self, state, step):
-        if step["id"] == "step_1":
-            return {
-                "action": "store_result",
-                "summary": "Generated SVG markup.",
-                "result": "<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'><path d='M8 24 L8 10 L12 4 L16 10 L16 24 Z'/></svg>",
-            }, "fake", "model"
-        raise AssertionError("step_2 should use the deterministic render_svg_asset fast path")
+    async def generate_step_output(self, state, step):
+        assert step["id"] == "step_1"
+        return "<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'><path d='M8 24 L8 10 L12 4 L16 10 L16 24 Z'/></svg>", "fake", "model"
 
     async def verify(self, state, draft_response):
         return {"ok": True, "final_response": draft_response, "reason": "grounded"}, "fake", "model"
@@ -551,7 +546,7 @@ def test_native_agent_runner_uses_svg_render_heuristic_for_svg_to_png_goals(tmp_
     def fake_render(_self, _svg_path: Path, png_path: Path) -> None:
         png_path.write_bytes(b"fake-png")
 
-    monkeypatch.setattr(native.NativeAgentRunner, "_next_action", next_action)
+    monkeypatch.setattr(native.NativeAgentRunner, "_generate_step_output", generate_step_output)
     monkeypatch.setattr(native.NativeAgentRunner, "_verify_response", verify)
     monkeypatch.setattr(native.NativeToolRegistry, "_render_svg_to_png", fake_render)
 
@@ -565,6 +560,40 @@ def test_native_agent_runner_uses_svg_render_heuristic_for_svg_to_png_goals(tmp_
     assert any(path.endswith(".svg") for path in artifact_paths)
     assert any(path.endswith(".png") for path in artifact_paths)
     assert "Done" in outcome.message or "Rendered" in outcome.message
+
+
+def test_render_svg_asset_can_send_png_to_telegram(tmp_path, monkeypatch):
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    registry = native.NativeToolRegistry(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        runtime_policy=native.NativeRuntimePolicy(native.DEFAULT_CONFIG),
+        workspace_root=tmp_path,
+    )
+
+    def fake_render(_svg_path: Path, png_path: Path) -> None:
+        png_path.write_bytes(b"fake-png")
+
+    monkeypatch.setattr(native.NativeToolRegistry, "_render_svg_to_png", staticmethod(fake_render))
+    monkeypatch.setattr(
+        native_chat_tools_impl,
+        "_send_file_to_telegram",
+        lambda path, caption="": (True, f"Sent {path.name}"),
+    )
+
+    result = registry.execute(
+        "render_svg_asset",
+        {
+            "svg_content": "<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'></svg>",
+            "prompt": "hand",
+            "send_to_telegram": True,
+            "caption": "hand render",
+        },
+    )
+
+    assert result.success is True
+    assert result.data["sent_to_telegram"] is True
+    assert any(artifact["path"].endswith(".png") for artifact in result.artifacts)
 
 
 def test_load_native_config_uses_fallback_yaml_parser(monkeypatch, tmp_path):
@@ -639,3 +668,236 @@ def test_native_agent_runner_uses_same_json_loop_for_local_providers(tmp_path, m
         assert requests[0].endswith("/api/chat")
     else:
         assert requests[0].endswith("/v1/chat/completions")
+
+
+def test_generate_local_text_response_can_disable_lmstudio_thinking(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def fake_detect(_config):
+        return {
+            "default_provider": "lmstudio",
+            "default_model": "ministral-3-14b-instruct-2512",
+            "reasoning_provider": "lmstudio",
+            "reasoning_model": "qwen3.5-9b",
+            "reasoning_escalation": True,
+            "reasoning_auto_restore_primary": True,
+            "providers": {
+                "lmstudio": {
+                    "base_url": "http://lmstudio.local",
+                }
+            },
+        }
+
+    async def fake_post(url, payload, timeout_seconds=60):
+        captured["url"] = url
+        captured["payload"] = payload
+        captured["timeout_seconds"] = timeout_seconds
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "ok",
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(native_models_impl, "detect_local_model_runtime", fake_detect)
+    monkeypatch.setattr(native_models_impl, "_http_post_json", fake_post)
+
+    result = asyncio.run(
+        native_models_impl._generate_local_text_response(
+            messages=[{"role": "user", "content": "hello"}],
+            config=native.DEFAULT_CONFIG,
+            enable_thinking=False,
+            timeout_seconds=45,
+        )
+    )
+
+    assert result["content"] == "ok"
+    assert captured["url"] == "http://lmstudio.local/v1/chat/completions"
+    assert captured["timeout_seconds"] == 45
+    assert captured["payload"]["model"] == "ministral-3-14b-instruct-2512"
+    assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_detect_local_model_runtime_tracks_lmstudio_reasoning_catalog(monkeypatch):
+    async def fake_get(url, timeout_seconds=2.5):
+        if url.endswith("/api/tags"):
+            raise RuntimeError("Ollama offline")
+        if url.endswith("/api/v1/models"):
+            return {
+                "models": [
+                    {
+                        "type": "llm",
+                        "key": "ministral-3-14b-instruct-2512",
+                        "loaded_instances": [{"id": "ministral-3-14b-instruct-2512"}],
+                    },
+                    {
+                        "type": "llm",
+                        "key": "qwen3.5-9b",
+                        "loaded_instances": [],
+                    },
+                ]
+            }
+        if url.endswith("/v1/models"):
+            return {
+                "data": [
+                    {"id": "ministral-3-14b-instruct-2512"},
+                ]
+            }
+        raise AssertionError(url)
+
+    monkeypatch.setattr(native_models_impl, "_http_get_json", fake_get)
+
+    runtime = asyncio.run(
+        native_models_impl.detect_local_model_runtime(
+            {
+                "models": {
+                    "preferred_provider": "lmstudio",
+                    "preferred_model": "ministral-3-14b-instruct-2512",
+                    "reasoning_provider": "lmstudio",
+                    "reasoning_model": "qwen3.5-9b",
+                    "reasoning_escalation": True,
+                    "lmstudio_url": "http://lmstudio.local",
+                }
+            }
+        )
+    )
+
+    assert runtime["default_provider"] == "lmstudio"
+    assert runtime["default_model"] == "ministral-3-14b-instruct-2512"
+    assert runtime["reasoning_model"] == "qwen3.5-9b"
+    assert runtime["reasoning_escalation"] is True
+    assert runtime["providers"]["lmstudio"]["models"] == ["ministral-3-14b-instruct-2512"]
+    assert runtime["providers"]["lmstudio"]["available_models"] == [
+        "ministral-3-14b-instruct-2512",
+        "qwen3.5-9b",
+    ]
+    assert runtime["providers"]["lmstudio"]["supports_model_swap"] is True
+
+
+def test_generate_local_text_response_uses_reasoning_model_and_restores_primary(monkeypatch):
+    captured: dict[str, object] = {}
+    loaded_models: list[str] = []
+
+    async def fake_detect(_config):
+        return {
+            "default_provider": "lmstudio",
+            "default_model": "ministral-3-14b-instruct-2512",
+            "reasoning_provider": "lmstudio",
+            "reasoning_model": "qwen3.5-9b",
+            "reasoning_escalation": True,
+            "reasoning_auto_restore_primary": True,
+            "providers": {
+                "lmstudio": {
+                    "base_url": "http://lmstudio.local",
+                    "supports_model_swap": True,
+                    "available_models": [
+                        "ministral-3-14b-instruct-2512",
+                        "qwen3.5-9b",
+                    ],
+                }
+            },
+        }
+
+    async def fake_ensure(*, base_url, target_model, available_models=None):
+        assert base_url == "http://lmstudio.local"
+        loaded_models.append(target_model)
+        return {"previous_active_models": ["ministral-3-14b-instruct-2512"], "swapped": True}
+
+    async def fake_post(url, payload, timeout_seconds=60):
+        captured["url"] = url
+        captured["payload"] = payload
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "reasoning_content": "deep answer",
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(native_models_impl, "detect_local_model_runtime", fake_detect)
+    monkeypatch.setattr(native_models_impl, "_ensure_lmstudio_model_loaded", fake_ensure)
+    monkeypatch.setattr(native_models_impl, "_http_post_json", fake_post)
+
+    result = asyncio.run(
+        native_models_impl._generate_local_text_response(
+            messages=[{"role": "user", "content": "Think step by step about the architecture tradeoffs here."}],
+            config=native.DEFAULT_CONFIG,
+        )
+    )
+
+    assert result["model"] == "qwen3.5-9b"
+    assert result["content"] == "deep answer"
+    assert captured["url"] == "http://lmstudio.local/v1/chat/completions"
+    assert captured["payload"]["model"] == "qwen3.5-9b"
+    assert loaded_models == ["qwen3.5-9b", "ministral-3-14b-instruct-2512"]
+
+
+def test_generate_step_output_retries_without_thinking_after_failure(tmp_path, monkeypatch):
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    runner = native.NativeAgentRunner(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        runtime_policy=native.NativeRuntimePolicy(native.DEFAULT_CONFIG),
+        workspace_root=tmp_path,
+    )
+    calls: list[dict[str, object]] = []
+
+    async def fake_generate_local_text_response(
+        *,
+        messages,
+        config,
+        temperature=0.2,
+        max_tokens=4096,
+        enable_thinking=None,
+        timeout_seconds=120,
+    ):
+        calls.append(
+            {
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "enable_thinking": enable_thinking,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        if len(calls) == 1:
+            raise RuntimeError("LM Studio timed out")
+        return {
+            "provider": "lmstudio",
+            "model": "qwen3-30b-a3b-instruct-2507",
+            "content": "<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'></svg>",
+        }
+
+    monkeypatch.setattr(native_agent_base_impl, "_generate_local_text_response", fake_generate_local_text_response)
+
+    content, provider, model = asyncio.run(
+        runner._generate_step_output(
+            {
+                "goal": "Create an SVG of a hand then render it as a png and send it to me in telegram",
+                "plan": {"summary": "Generate SVG markup and render it to a PNG artifact."},
+                "step_outputs": {},
+                "tool_evidence": [],
+            },
+            {
+                "id": "step_1",
+                "description": "Generate the requested SVG markup.",
+                "success_criteria": "Valid SVG markup exists for the requested subject.",
+                "preferred_tools": [],
+            },
+        )
+    )
+
+    assert content.startswith("<svg")
+    assert provider == "lmstudio"
+    assert model == "qwen3-30b-a3b-instruct-2507"
+    assert len(calls) == 2
+    assert calls[0]["enable_thinking"] is True
+    assert calls[1]["enable_thinking"] is False
+    assert calls[0]["timeout_seconds"] == 90
+    assert calls[1]["timeout_seconds"] == 45
+    assert "Return only valid standalone SVG markup." in calls[0]["messages"][0]["content"]

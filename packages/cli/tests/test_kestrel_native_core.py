@@ -300,14 +300,50 @@ def test_native_agent_runner_routes_direct_and_planned_paths(tmp_path, monkeypat
     async def planned_action(self, state, step):
         return {"action": "finish", "scope": "task", "summary": "planned answer"}, "fake", "model"
 
+    async def planned_output(self, state, step):
+        assert step["preferred_tools"] == []
+        return "planned answer", "fake", "model"
+
+    async def planned_direct_response(self, goal, history):
+        return "planned answer", "fake", "model"
+
     monkeypatch.setattr(native.NativeAgentRunner, "_plan_goal", planned_goal)
     monkeypatch.setattr(native.NativeAgentRunner, "_next_action", planned_action)
+    monkeypatch.setattr(native.NativeAgentRunner, "_generate_step_output", planned_output)
+    monkeypatch.setattr(native.NativeAgentRunner, "_direct_response", planned_direct_response)
     planned_task = state_store.create_task(goal="inspect this", kind="task")
     planned = asyncio.run(runner.run(goal="inspect this", task_id=planned_task["id"]))
     assert planned.status == "completed"
     assert planned.message == "planned answer"
     assert planned.plan is not None
     assert planned.plan["summary"] == "Inspect and report"
+
+
+def test_native_agent_runner_reissues_hard_direct_responses_through_direct_model(tmp_path, monkeypatch):
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    runner = native.NativeAgentRunner(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        runtime_policy=native.NativeRuntimePolicy(native.DEFAULT_CONFIG),
+        workspace_root=tmp_path,
+    )
+
+    async def direct_plan(self, goal, history, initial_tool_call):
+        return {"mode": "direct_response", "response": "planner shortcut"}, "fake-planner", "primary-model"
+
+    async def direct_response(self, goal, history):
+        return "reasoned answer", "lmstudio", "qwen3.5-9b"
+
+    monkeypatch.setattr(native.NativeAgentRunner, "_plan_goal", direct_plan)
+    monkeypatch.setattr(native.NativeAgentRunner, "_direct_response", direct_response)
+
+    outcome = asyncio.run(
+        runner.run(goal="Think step by step about the tradeoffs in this architecture.")
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.message == "reasoned answer"
+    assert outcome.model == "qwen3.5-9b"
 
 
 def test_native_agent_runner_builds_fallback_plan_for_empty_write_task(tmp_path, monkeypatch):
@@ -328,14 +364,17 @@ def test_native_agent_runner_builds_fallback_plan_for_empty_write_task(tmp_path,
         }, "fake", "model"
 
     async def next_action(self, state, step):
-        if step["id"] == "step_1":
-            assert step["preferred_tools"] == []
-            return {"action": "store_result", "summary": "Generated content", "result": "<svg/>"}, "fake", "model"
         assert step["preferred_tools"] == ["write_file"]
         return {"action": "finish", "scope": "task", "summary": "fallback used"}, "fake", "model"
 
+    async def generated_output(self, state, step):
+        assert step["id"] == "step_1"
+        assert step["preferred_tools"] == []
+        return "<svg/>", "fake", "model"
+
     monkeypatch.setattr(native.NativeAgentRunner, "_plan_goal", empty_plan)
     monkeypatch.setattr(native.NativeAgentRunner, "_next_action", next_action)
+    monkeypatch.setattr(native.NativeAgentRunner, "_generate_step_output", generated_output)
 
     outcome = asyncio.run(runner.run(goal="Generate an SVG and save it to my desktop"))
     assert outcome.status == "completed"
@@ -344,5 +383,3 @@ def test_native_agent_runner_builds_fallback_plan_for_empty_write_task(tmp_path,
     assert outcome.plan["summary"] == "Use write_file to complete the requested file task."
     assert [step["id"] for step in outcome.plan["steps"]] == ["step_1", "step_2"]
     assert outcome.state["step_outputs"]["step_1"]["content"] == "<svg/>"
-
-

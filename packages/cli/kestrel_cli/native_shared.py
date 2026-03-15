@@ -61,6 +61,10 @@ DEFAULT_CONFIG = {
     "models": {
         "preferred_provider": "auto",
         "preferred_model": "",
+        "reasoning_provider": "",
+        "reasoning_model": "",
+        "reasoning_escalation": False,
+        "reasoning_auto_restore_primary": True,
         "ollama_url": "http://127.0.0.1:11434",
         "lmstudio_url": "http://127.0.0.1:1234",
     },
@@ -202,6 +206,10 @@ permissions:
 models:
   preferred_provider: auto
   preferred_model: ""
+  reasoning_provider: ""
+  reasoning_model: ""
+  reasoning_escalation: false
+  reasoning_auto_restore_primary: true
   ollama_url: http://127.0.0.1:11434
   lmstudio_url: http://127.0.0.1:1234
 watch:
@@ -467,4 +475,3 @@ async def send_control_request(
         if "result" in response:
             return response["result"]
     raise ControlClientError(f"No result received for {method}")
-

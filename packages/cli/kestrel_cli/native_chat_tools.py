@@ -676,13 +676,6 @@ async def complete_local_prompt(
         }
 
     runtime = await detect_local_model_runtime(config)
-    provider = runtime.get("default_provider")
-    model = runtime.get("default_model")
-    if not provider or not model:
-        raise RuntimeError(
-            "No local model runtime is available. Start Ollama or LM Studio, then retry."
-        )
-
     # Build messages list: system prompt, then history, then current prompt
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     if history:
@@ -691,92 +684,97 @@ async def complete_local_prompt(
 
     MAX_TOOL_ROUNDS = 10
 
-    if provider == "ollama":
-        base_url = runtime["providers"]["ollama"]["base_url"]
-        payload = await _http_post_json(
-            f"{base_url}/api/chat",
-            {
-                "model": model,
-                "stream": False,
-                "messages": messages,
-            },
-        )
-        content = ((payload.get("message") or {}).get("content") or "").strip()
+    async with _local_model_session(
+        config=config,
+        runtime=runtime,
+        messages=messages,
+        enable_thinking=False,
+        model_role="primary",
+    ) as session:
+        provider = session["provider"]
+        model = session["model"]
+        base_url = str(session.get("base_url") or "").rstrip("/")
 
-    elif provider == "lmstudio":
-        base_url = runtime["providers"]["lmstudio"]["base_url"]
-        tools = get_chat_tools(tool_categories)
-
-        for _round in range(MAX_TOOL_ROUNDS):
-            request_payload: dict[str, Any] = {
-                "model": model,
-                "messages": messages,
-                "temperature": 0.2,
-                "max_tokens": 4096,
-            }
-            if tools:
-                request_payload["tools"] = tools
-                request_payload["tool_choice"] = "auto"
-
+        if provider == "ollama":
             payload = await _http_post_json(
-                f"{base_url}/v1/chat/completions",
-                request_payload,
-                timeout_seconds=120,
-            )
-            choices = payload.get("choices") or []
-            if not choices:
-                break
-
-            choice = choices[0] or {}
-            message = choice.get("message") or {}
-            tool_calls = message.get("tool_calls") or []
-
-            if not tool_calls:
-                # No tool calls — LLM produced a final text response
-                # Qwen 3.5 thinking models may put output in reasoning_content
-                content = (message.get("content") or "").strip()
-                if not content:
-                    content = (message.get("reasoning_content") or "").strip()
-                break
-
-            # Append the assistant message with tool calls to history
-            messages.append(message)
-
-            # Execute each tool call and append results
-            for tc in tool_calls:
-                fn = tc.get("function") or {}
-                tool_name = fn.get("name", "")
-                try:
-                    tool_args = json.loads(fn.get("arguments", "{}"))
-                except json.JSONDecodeError:
-                    tool_args = {}
-
-                result = _execute_tool(tool_name, tool_args)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.get("id", ""),
-                    "content": result,
-                })
-        else:
-            # Exhausted tool rounds — get final response without tools
-            payload = await _http_post_json(
-                f"{base_url}/v1/chat/completions",
+                f"{base_url}/api/chat",
                 {
+                    "model": model,
+                    "stream": False,
+                    "messages": messages,
+                },
+            )
+            content = ((payload.get("message") or {}).get("content") or "").strip()
+
+        elif provider == "lmstudio":
+            tools = get_chat_tools(tool_categories)
+
+            for _round in range(MAX_TOOL_ROUNDS):
+                request_payload: dict[str, Any] = {
                     "model": model,
                     "messages": messages,
                     "temperature": 0.2,
                     "max_tokens": 4096,
-                },
-                timeout_seconds=120,
-            )
-            choices = payload.get("choices") or []
-            msg = ((choices[0] or {}).get("message") or {}) if choices else {}
-            content = (msg.get("content") or "").strip()
-            if not content:
-                content = (msg.get("reasoning_content") or "").strip()
+                }
+                if tools:
+                    request_payload["tools"] = tools
+                    request_payload["tool_choice"] = "auto"
 
-    else:  # pragma: no cover - defensive
-        raise RuntimeError(f"Unsupported local model provider: {provider}")
+                payload = await _http_post_json(
+                    f"{base_url}/v1/chat/completions",
+                    request_payload,
+                    timeout_seconds=120,
+                )
+                choices = payload.get("choices") or []
+                if not choices:
+                    break
+
+                choice = choices[0] or {}
+                message = choice.get("message") or {}
+                tool_calls = message.get("tool_calls") or []
+
+                if not tool_calls:
+                    # No tool calls — LLM produced a final text response.
+                    content = (message.get("content") or "").strip()
+                    if not content:
+                        content = (message.get("reasoning_content") or "").strip()
+                    break
+
+                messages.append(message)
+
+                for tc in tool_calls:
+                    fn = tc.get("function") or {}
+                    tool_name = fn.get("name", "")
+                    try:
+                        tool_args = json.loads(fn.get("arguments", "{}"))
+                    except json.JSONDecodeError:
+                        tool_args = {}
+
+                    result = _execute_tool(tool_name, tool_args)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.get("id", ""),
+                        "content": result,
+                    })
+            else:
+                payload = await _http_post_json(
+                    f"{base_url}/v1/chat/completions",
+                    {
+                        "model": model,
+                        "messages": messages,
+                        "temperature": 0.2,
+                        "max_tokens": 4096,
+                    },
+                    timeout_seconds=120,
+                )
+                choices = payload.get("choices") or []
+                msg = ((choices[0] or {}).get("message") or {}) if choices else {}
+                content = (msg.get("content") or "").strip()
+                if not content:
+                    content = (msg.get("reasoning_content") or "").strip()
+
+        else:  # pragma: no cover - defensive
+            raise RuntimeError(f"Unsupported local model provider: {provider}")
 
     if not content:
         raise RuntimeError(f"{provider} returned an empty completion")
@@ -785,5 +783,4 @@ async def complete_local_prompt(
         "model": model,
         "content": content,
     }
-
 

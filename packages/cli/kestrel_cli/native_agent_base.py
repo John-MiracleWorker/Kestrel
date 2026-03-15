@@ -83,6 +83,15 @@ class NativeAgentRunnerBase:
             re.search(r"\b(?:png|jpg|jpeg|webp|render|export|convert)\b", lowered)
         )
 
+    def _extract_user_goal(self, goal: str) -> str:
+        text = str(goal or "").strip()
+        match = re.search(r"User goal:\s*(.+)$", text, re.IGNORECASE | re.DOTALL)
+        if match:
+            extracted = match.group(1).strip()
+            if extracted:
+                return extracted
+        return text
+
     def _prefers_telegram_delivery(self, goal: str) -> bool:
         lowered = str(goal or "").strip().lower()
         return any(
@@ -96,6 +105,10 @@ class NativeAgentRunnerBase:
                 "dm me",
             )
         )
+
+    def _goal_needs_reasoning(self, goal: str, history: list[dict[str, Any]] | None = None) -> bool:
+        messages = list(history or [])[-4:] + [{"role": "user", "content": str(goal or "")}]
+        return _messages_need_reasoning(messages)
 
     def _build_svg_render_plan(self, goal: str) -> NativePlan:
         return NativePlan(
@@ -367,35 +380,93 @@ class NativeAgentRunnerBase:
         )
         return response["content"], response["provider"], response["model"]
 
+    def _step_expects_svg_markup(self, state: dict[str, Any], step: dict[str, Any]) -> bool:
+        combined = " ".join(
+            part
+            for part in (
+                str(state.get("goal") or ""),
+                str((state.get("plan") or {}).get("summary") or ""),
+                str(step.get("description") or ""),
+                str(step.get("success_criteria") or ""),
+            )
+            if part
+        ).lower()
+        return "svg" in combined
+
+    def _build_step_output_messages(
+        self,
+        state: dict[str, Any],
+        step: dict[str, Any],
+        *,
+        expects_svg_markup: bool,
+    ) -> list[dict[str, str]]:
+        previous_outputs = state.get("step_outputs", {})
+        user_goal = self._extract_user_goal(state.get("goal", ""))
+        previous_sections: list[str] = []
+        for step_id, payload in list(previous_outputs.items())[-4:]:
+            if not isinstance(payload, dict):
+                continue
+            content = str(payload.get("content") or "").strip()
+            if not content:
+                continue
+            snippet = content if len(content) <= 600 else f"{content[:600]}\n..."
+            previous_sections.append(f"{step_id}:\n{snippet}")
+
+        system_lines = [
+            "You are completing one Kestrel task step.",
+            "Return only the concrete output for the current step.",
+            "Do not add explanations, markdown fences, or JSON.",
+        ]
+        if expects_svg_markup:
+            system_lines.extend(
+                [
+                    "Return only valid standalone SVG markup.",
+                    "Include width, height, and viewBox attributes.",
+                    "Make the SVG recognizable for the requested subject.",
+                ]
+            )
+
+        user_sections = [
+            f"Goal:\n{user_goal}",
+            f"Plan summary:\n{(state.get('plan') or {}).get('summary', '')}",
+            f"Current step:\n{step.get('description', '')}",
+            f"Success criteria:\n{step.get('success_criteria', '')}",
+        ]
+        if previous_sections:
+            user_sections.append("Previous outputs:\n" + "\n\n".join(previous_sections))
+
+        return [
+            {"role": "system", "content": "\n".join(system_lines)},
+            {"role": "user", "content": "\n\n".join(section for section in user_sections if section.strip())},
+        ]
+
     async def _generate_step_output(self, state: dict[str, Any], step: dict[str, Any]) -> tuple[str, str, str]:
-        response = await _generate_local_text_response(
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are generating the concrete output for a single Kestrel plan step.\n"
-                        "Return only the requested content for the step and nothing else.\n"
-                        "Do not explain your work. Do not wrap the content in JSON."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "goal": state["goal"],
-                            "plan_summary": (state.get("plan") or {}).get("summary", ""),
-                            "current_step": step,
-                            "previous_outputs": state.get("step_outputs", {}),
-                            "tool_evidence": state.get("tool_evidence", [])[-4:],
-                        },
-                        indent=2,
-                    ),
-                },
-            ],
-            config=self.config,
-            temperature=0.2,
-            max_tokens=4096,
+        expects_svg_markup = self._step_expects_svg_markup(state, step)
+        messages = self._build_step_output_messages(
+            state,
+            step,
+            expects_svg_markup=expects_svg_markup,
         )
+
+        try:
+            response = await _generate_local_text_response(
+                messages=messages,
+                config=self.config,
+                temperature=0.2,
+                max_tokens=2048 if expects_svg_markup else 4096,
+                enable_thinking=True,
+                timeout_seconds=90 if expects_svg_markup else 120,
+            )
+        except Exception:
+            response = await _generate_local_text_response(
+                messages=messages,
+                config=self.config,
+                temperature=0.1,
+                max_tokens=1536 if expects_svg_markup else 3072,
+                enable_thinking=False,
+                timeout_seconds=45 if expects_svg_markup else 60,
+            )
+
         return _strip_wrappers(response["content"]).strip(), response["provider"], response["model"]
 
     def _latest_step_output(self, state: dict[str, Any], step: dict[str, Any]) -> str:

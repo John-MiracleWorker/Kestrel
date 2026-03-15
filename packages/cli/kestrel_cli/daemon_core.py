@@ -119,6 +119,13 @@ class KestrelDaemonCore:
         self.last_watch_snapshot: dict[str, int] = {}
         self.channel_state_lock = RLock()
 
+    async def _refresh_model_runtime(self) -> dict[str, Any]:
+        self.last_model_runtime = await detect_local_model_runtime(self.config)
+        profile = self._compose_runtime_profile()
+        self.state_store.set_runtime_profile(profile)
+        write_json_atomic(self.paths.runtime_profile_json, profile)
+        return self.last_model_runtime
+
     def _enabled_chat_tool_categories(self) -> tuple[str, ...]:
         return resolve_chat_tool_categories(self.config)
 
@@ -182,8 +189,7 @@ class KestrelDaemonCore:
         if os.name != "nt" and self.paths.control_socket.exists():
             self.paths.control_socket.unlink()
 
-        self.last_model_runtime = await detect_local_model_runtime(self.config)
-        self.state_store.set_runtime_profile(self._compose_runtime_profile())
+        await self._refresh_model_runtime()
         self.last_memory_sync = sync_markdown_memory(self.paths, self.vector_store)
 
         recovered = self.state_store.recover_inflight_tasks()
@@ -252,10 +258,7 @@ class KestrelDaemonCore:
         interval = int(self.config.get("heartbeat", {}).get("interval_seconds", 300))
         while not self.stop_event.is_set():
             if not self._in_quiet_hours():
-                self.last_model_runtime = await detect_local_model_runtime(self.config)
-                profile = self._compose_runtime_profile()
-                self.state_store.set_runtime_profile(profile)
-                write_json_atomic(self.paths.runtime_profile_json, profile)
+                await self._refresh_model_runtime()
             self._write_state(status="running")
             try:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=max(interval, 1))
@@ -267,6 +270,10 @@ class KestrelDaemonCore:
         while not self.stop_event.is_set():
             changed_paths = self._detect_watched_changes()
             if changed_paths:
+                if str(self.paths.config_yml) in changed_paths:
+                    self.config = load_native_config(self.paths)
+                    self.runtime_policy = NativeRuntimePolicy(self.config)
+                    await self._refresh_model_runtime()
                 memory_changed = any(path.endswith(".md") for path in changed_paths)
                 if memory_changed:
                     self.last_memory_sync = sync_markdown_memory(self.paths, self.vector_store)
@@ -328,8 +335,10 @@ class KestrelDaemonCore:
 
     async def _dispatch(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == "status":
+            await self._refresh_model_runtime()
             return self._compose_status()
         if method == "doctor":
+            await self._refresh_model_runtime()
             return build_doctor_report(
                 paths=self.paths,
                 config=self.config,
@@ -337,6 +346,7 @@ class KestrelDaemonCore:
                 model_runtime=self.last_model_runtime,
             )
         if method == "runtime.profile":
+            await self._refresh_model_runtime()
             return self._compose_runtime_profile()
         if method == "memory.sync":
             self.last_memory_sync = sync_markdown_memory(self.paths, self.vector_store)

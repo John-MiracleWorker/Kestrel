@@ -39,9 +39,13 @@ class NativeAgentRunnerRunMixin:
             state["provider"] = provider
             state["model"] = model
             if planning_payload.get("mode") == "direct_response":
-                response_text = str(planning_payload.get("response") or "").strip()
+                response_text = ""
+                if not self._goal_needs_reasoning(goal, history):
+                    response_text = str(planning_payload.get("response") or "").strip()
                 if not response_text:
                     response_text, provider, model = await self._direct_response(goal, history)
+                state["provider"] = provider
+                state["model"] = model
                 verifier_payload, provider, model = await self._verify_response(state, response_text)
                 final_text = str(verifier_payload.get("final_response") or response_text).strip()
                 if not verifier_payload.get("ok", True):
@@ -155,6 +159,28 @@ class NativeAgentRunnerRunMixin:
             step["status"] = "running"
             self._emit("step_started", step["description"], step_id=step["id"], step=step)
             self._persist_state(task_id, state, status="running")
+
+            if (
+                not step.get("preferred_tools")
+                and not state.get("forced_action")
+                and not state.get("pending_action")
+            ):
+                generated_output, provider, model = await self._generate_step_output(state, step)
+                if generated_output:
+                    state["provider"] = provider
+                    state["model"] = model
+                    state.setdefault("step_outputs", {})[step["id"]] = {
+                        "content": generated_output,
+                        "summary": step["description"],
+                    }
+                    step["status"] = "complete"
+                    state["completed_steps"].append(step["id"])
+                    self._emit("step_complete", step["description"], step_id=step["id"], step=step)
+                    self._persist_state(task_id, state, status="running")
+                    current_index += 1
+                    state["current_step_index"] = current_index
+                    self._persist_state(task_id, state, status="running")
+                    continue
 
             for _iteration in range(self.max_step_iterations):
                 if state.get("tool_calls", 0) >= self.max_total_tool_calls:

@@ -607,7 +607,7 @@ class KestrelDaemonTelegramIOMixin:
         if tool_name == "generate_image":
             return "Generating image"
         if "svg" in lowered and re.search(r"\b(?:png|jpg|jpeg|webp|render|export|convert)\b", lowered):
-            return "Rendering SVG"
+            return "Generating SVG"
         return "Thinking"
 
     def _telegram_approval_reply_markup(self, approval_id: str) -> dict[str, Any] | None:

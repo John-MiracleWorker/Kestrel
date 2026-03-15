@@ -1,8 +1,363 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
+
 from . import native_storage as _native_storage
 
 globals().update({name: value for name, value in vars(_native_storage).items() if not name.startswith("__")})
+
+_LMSTUDIO_INFERENCE_LOCK: asyncio.Lock | None = None
+_REASONING_STRONG_PATTERNS = (
+    r"\bthink\s+(?:step by step|through this|carefully)\b",
+    r"\bstep by step\b",
+    r"\bshow (?:your|the) reasoning\b",
+    r"\broot cause\b",
+    r"\btrade-?offs?\b",
+    r"\bcompare\b.+\b(?:versus|vs\.?|against)\b",
+    r"\bdebug\b",
+    r"\bprove\b",
+    r"\bderive\b",
+    r"\bbenchmark\b",
+    r"\bspatial\b",
+    r"\bresearch\b",
+    r"\banaly[sz]e\b",
+)
+_REASONING_HINT_KEYWORDS = (
+    "reasoning",
+    "architecture",
+    "investigate",
+    "multi-step",
+    "hard problem",
+    "complex problem",
+    "tradeoff",
+    "trade-off",
+    "compare",
+    "evaluate",
+    "why this failed",
+    "what went wrong",
+)
+
+
+def _get_lmstudio_inference_lock() -> asyncio.Lock:
+    global _LMSTUDIO_INFERENCE_LOCK
+    if _LMSTUDIO_INFERENCE_LOCK is None:
+        _LMSTUDIO_INFERENCE_LOCK = asyncio.Lock()
+    return _LMSTUDIO_INFERENCE_LOCK
+
+
+def _normalize_lmstudio_model_id(model_id: str) -> str:
+    value = str(model_id or "").strip()
+    return re.sub(r":\d+$", "", value)
+
+
+def _model_preferences(config: dict[str, Any]) -> dict[str, Any]:
+    models_cfg = config.get("models") or {}
+    preferred_provider = str(models_cfg.get("preferred_provider") or "auto").strip().lower() or "auto"
+    preferred_model = str(models_cfg.get("preferred_model") or "").strip()
+    reasoning_provider = str(models_cfg.get("reasoning_provider") or preferred_provider or "auto").strip().lower() or "auto"
+    reasoning_model = str(models_cfg.get("reasoning_model") or "").strip()
+    reasoning_escalation = bool(models_cfg.get("reasoning_escalation", False))
+    reasoning_auto_restore_primary = bool(models_cfg.get("reasoning_auto_restore_primary", True))
+    return {
+        "preferred_provider": preferred_provider,
+        "preferred_model": preferred_model,
+        "reasoning_provider": reasoning_provider,
+        "reasoning_model": reasoning_model,
+        "reasoning_escalation": reasoning_escalation,
+        "reasoning_auto_restore_primary": reasoning_auto_restore_primary,
+    }
+
+
+def _first_known_model(provider_info: dict[str, Any]) -> str:
+    for key in ("models", "available_models"):
+        models = provider_info.get(key) or []
+        if models:
+            return str(models[0] or "")
+    return ""
+
+
+def _provider_has_model(provider_info: dict[str, Any], model_id: str) -> bool:
+    normalized = str(model_id or "").strip()
+    if not normalized:
+        return False
+    known = {
+        str(item).strip()
+        for item in (
+            list(provider_info.get("models") or [])
+            + list(provider_info.get("available_models") or [])
+        )
+        if str(item).strip()
+    }
+    return normalized in known if known else bool(provider_info.get("ready"))
+
+
+def _messages_need_reasoning(messages: list[dict[str, Any]]) -> bool:
+    text_parts: list[str] = []
+    for message in messages[-4:]:
+        if str(message.get("role") or "").strip().lower() != "user":
+            continue
+        content = str(message.get("content") or "").strip()
+        if content:
+            text_parts.append(content)
+    text = "\n".join(text_parts).strip().lower()
+    if not text:
+        return False
+    if any(re.search(pattern, text) for pattern in _REASONING_STRONG_PATTERNS):
+        return True
+    score = 0
+    if len(text) >= 500:
+        score += 1
+    if text.count("\n") >= 4:
+        score += 1
+    score += sum(1 for keyword in _REASONING_HINT_KEYWORDS if keyword in text)
+    if "```" in text:
+        score += 1
+    return score >= 2
+
+
+def _should_use_reasoning_profile(
+    *,
+    runtime: dict[str, Any],
+    messages: list[dict[str, Any]],
+    enable_thinking: bool | None,
+    model_role: str,
+) -> bool:
+    role = str(model_role or "auto").strip().lower()
+    if role == "primary":
+        return False
+    if role == "reasoning":
+        return True
+    if enable_thinking is False:
+        return False
+    if not runtime.get("reasoning_escalation") or not runtime.get("reasoning_model"):
+        return False
+    if enable_thinking is True:
+        return True
+    return _messages_need_reasoning(messages)
+
+
+def _resolve_local_model_selection(
+    *,
+    runtime: dict[str, Any],
+    messages: list[dict[str, Any]],
+    enable_thinking: bool | None,
+    model_role: str,
+) -> dict[str, Any]:
+    provider = str(runtime.get("default_provider") or "").strip()
+    model = str(runtime.get("default_model") or "").strip()
+    profile = "primary"
+    if _should_use_reasoning_profile(
+        runtime=runtime,
+        messages=messages,
+        enable_thinking=enable_thinking,
+        model_role=model_role,
+    ):
+        candidate_provider = str(runtime.get("reasoning_provider") or provider or "").strip()
+        candidate_model = str(runtime.get("reasoning_model") or "").strip()
+        provider_info = runtime.get("providers", {}).get(candidate_provider, {})
+        if candidate_provider and candidate_model and _provider_has_model(provider_info, candidate_model):
+            provider = candidate_provider
+            model = candidate_model
+            profile = "reasoning"
+    return {
+        "provider": provider,
+        "model": model,
+        "profile": profile,
+    }
+
+
+async def _lmstudio_active_models(base_url: str) -> list[str]:
+    payload = await _http_get_json(f"{base_url}/v1/models", timeout_seconds=10)
+    return [
+        _normalize_lmstudio_model_id(item.get("id", ""))
+        for item in payload.get("data", [])
+        if item.get("id")
+    ]
+
+
+async def _wait_for_lmstudio_active_model(
+    base_url: str,
+    target_model: str,
+    *,
+    timeout_seconds: float = 240,
+) -> None:
+    deadline = time.time() + timeout_seconds
+    normalized_target = _normalize_lmstudio_model_id(target_model)
+    while time.time() < deadline:
+        active = await _lmstudio_active_models(base_url)
+        if normalized_target in active:
+            return
+        await asyncio.sleep(2)
+    raise RuntimeError(f"Timed out waiting for LM Studio model {target_model} to become active.")
+
+
+async def _wait_for_lmstudio_clear(base_url: str, *, timeout_seconds: float = 120) -> None:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        active = await _lmstudio_active_models(base_url)
+        if not active:
+            return
+        await asyncio.sleep(2)
+    raise RuntimeError("Timed out waiting for LM Studio to clear active models.")
+
+
+async def _ensure_lmstudio_model_loaded(
+    *,
+    base_url: str,
+    target_model: str,
+    available_models: list[str] | None = None,
+) -> dict[str, Any]:
+    catalog = await _http_get_json(f"{base_url}/api/v1/models", timeout_seconds=10)
+    llm_models = [item for item in catalog.get("models", []) if item.get("type") == "llm"]
+    known_models = {str(item).strip() for item in (available_models or []) if str(item).strip()}
+    if not known_models:
+        known_models = {
+            str(model.get("key") or "").strip()
+            for model in llm_models
+            if str(model.get("key") or "").strip()
+        }
+    normalized_target = str(target_model or "").strip()
+    if normalized_target not in known_models:
+        raise RuntimeError(f"LM Studio model {normalized_target} is not downloaded or available.")
+
+    previous_active_models: list[str] = []
+    unload_instance_ids: list[str] = []
+    target_already_loaded = False
+    for model in llm_models:
+        key = str(model.get("key") or "").strip()
+        loaded_instances = list(model.get("loaded_instances") or [])
+        if loaded_instances:
+            previous_active_models.append(key)
+        if key == normalized_target and loaded_instances:
+            target_already_loaded = True
+        for instance in loaded_instances:
+            instance_id = str(instance.get("id") or key).strip()
+            if not instance_id:
+                continue
+            if key != normalized_target:
+                unload_instance_ids.append(instance_id)
+
+    for instance_id in unload_instance_ids:
+        try:
+            await _http_post_json(
+                f"{base_url}/api/v1/models/unload",
+                {"instance_id": instance_id},
+                timeout_seconds=60,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to unload LM Studio model instance {instance_id}: {exc}") from exc
+
+    if unload_instance_ids:
+        await _wait_for_lmstudio_clear(base_url)
+
+    if not target_already_loaded:
+        await _http_post_json(
+            f"{base_url}/api/v1/models/load",
+            {"model": normalized_target},
+            timeout_seconds=300,
+        )
+
+    await _wait_for_lmstudio_active_model(base_url, normalized_target)
+    return {
+        "previous_active_models": list(dict.fromkeys(previous_active_models)),
+        "swapped": bool(unload_instance_ids) or not target_already_loaded,
+    }
+
+
+@asynccontextmanager
+async def _local_model_session(
+    *,
+    config: dict[str, Any],
+    runtime: dict[str, Any],
+    messages: list[dict[str, Any]],
+    enable_thinking: bool | None,
+    model_role: str,
+) -> Any:
+    selection = _resolve_local_model_selection(
+        runtime=runtime,
+        messages=messages,
+        enable_thinking=enable_thinking,
+        model_role=model_role,
+    )
+    provider = selection["provider"]
+    model = selection["model"]
+    if not provider or not model:
+        raise RuntimeError("No local model runtime is available. Start Ollama or LM Studio, then retry.")
+
+    if provider != "lmstudio":
+        provider_info = runtime.get("providers", {}).get(provider, {})
+        yield {
+            "provider": provider,
+            "model": model,
+            "profile": selection["profile"],
+            "base_url": provider_info.get("base_url", ""),
+        }
+        return
+
+    provider_info = runtime.get("providers", {}).get("lmstudio", {})
+    base_url = str(provider_info.get("base_url") or "").rstrip("/")
+    if not base_url:
+        raise RuntimeError("LM Studio base URL is unavailable.")
+
+    async with _get_lmstudio_inference_lock():
+        if not bool(provider_info.get("supports_model_swap", False)):
+            yield {
+                "provider": provider,
+                "model": model,
+                "profile": selection["profile"],
+                "base_url": base_url,
+            }
+            return
+        restore_model = ""
+        temporary_reasoning = selection["profile"] == "reasoning" and bool(runtime.get("reasoning_auto_restore_primary"))
+        try:
+            try:
+                await _ensure_lmstudio_model_loaded(
+                    base_url=base_url,
+                    target_model=model,
+                    available_models=list(provider_info.get("available_models") or []),
+                )
+            except Exception as exc:
+                primary_model = str(runtime.get("default_model") or "").strip()
+                if selection["profile"] != "reasoning" or not primary_model or primary_model == model:
+                    raise
+                LOGGER.warning(
+                    "Reasoning model %s was unavailable; falling back to primary model %s (%s)",
+                    model,
+                    primary_model,
+                    exc,
+                )
+                model = primary_model
+                selection["profile"] = "primary"
+                temporary_reasoning = False
+                await _ensure_lmstudio_model_loaded(
+                    base_url=base_url,
+                    target_model=model,
+                    available_models=list(provider_info.get("available_models") or []),
+                )
+
+            if temporary_reasoning:
+                primary_model = str(runtime.get("default_model") or "").strip()
+                if primary_model and primary_model != model:
+                    restore_model = primary_model
+
+            yield {
+                "provider": provider,
+                "model": model,
+                "profile": selection["profile"],
+                "base_url": base_url,
+            }
+        finally:
+            if restore_model:
+                try:
+                    await _ensure_lmstudio_model_loaded(
+                        base_url=base_url,
+                        target_model=restore_model,
+                        available_models=list(provider_info.get("available_models") or []),
+                    )
+                except Exception as exc:
+                    LOGGER.warning("Failed to restore primary LM Studio model %s: %s", restore_model, exc)
 
 class NativeRuntimePolicy(RuntimePolicy):
     def __init__(self, config: dict[str, Any]) -> None:
@@ -88,6 +443,7 @@ async def _http_post_json(url: str, payload: dict[str, Any], timeout_seconds: fl
 
 
 async def detect_local_model_runtime(config: dict[str, Any]) -> dict[str, Any]:
+    preferences = _model_preferences(config)
     models_cfg = config.get("models", {})
     ollama_url = str(models_cfg.get("ollama_url") or DEFAULT_CONFIG["models"]["ollama_url"]).rstrip("/")
     lmstudio_url = str(models_cfg.get("lmstudio_url") or DEFAULT_CONFIG["models"]["lmstudio_url"]).rstrip("/")
@@ -100,29 +456,77 @@ async def detect_local_model_runtime(config: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         providers["ollama"] = {"ready": False, "models": [], "base_url": ollama_url, "error": str(exc)}
 
+    lmstudio_info: dict[str, Any] = {
+        "ready": False,
+        "chat_ready": False,
+        "catalog_ready": False,
+        "models": [],
+        "active_models": [],
+        "available_models": [],
+        "loaded_instances": [],
+        "supports_model_swap": False,
+        "base_url": lmstudio_url,
+    }
     try:
         payload = await _http_get_json(f"{lmstudio_url}/v1/models")
-        models = [item.get("id", "") for item in payload.get("data", []) if item.get("id")]
-        providers["lmstudio"] = {"ready": True, "models": models, "base_url": lmstudio_url}
+        active_models = [item.get("id", "") for item in payload.get("data", []) if item.get("id")]
+        lmstudio_info["ready"] = True
+        lmstudio_info["chat_ready"] = True
+        lmstudio_info["models"] = list(active_models)
+        lmstudio_info["active_models"] = list(active_models)
     except Exception as exc:
-        providers["lmstudio"] = {"ready": False, "models": [], "base_url": lmstudio_url, "error": str(exc)}
+        lmstudio_info["error"] = str(exc)
 
-    preferred_provider = models_cfg.get("preferred_provider", "auto")
-    preferred_model = models_cfg.get("preferred_model", "")
+    try:
+        payload = await _http_get_json(f"{lmstudio_url}/api/v1/models", timeout_seconds=10)
+        llm_models = [item for item in payload.get("models", []) if item.get("type") == "llm"]
+        available_models = [item.get("key", "") for item in llm_models if item.get("key")]
+        loaded_instances = [
+            {
+                "key": str(item.get("key") or "").strip(),
+                "id": str(instance.get("id") or item.get("key") or "").strip(),
+            }
+            for item in llm_models
+            for instance in item.get("loaded_instances", [])
+            if str(instance.get("id") or item.get("key") or "").strip()
+        ]
+        lmstudio_info["catalog_ready"] = True
+        lmstudio_info["supports_model_swap"] = True
+        lmstudio_info["available_models"] = available_models
+        lmstudio_info["loaded_instances"] = loaded_instances
+        if not lmstudio_info["models"]:
+            lmstudio_info["models"] = [entry["key"] for entry in loaded_instances if entry["key"]]
+        lmstudio_info["ready"] = lmstudio_info["ready"] or bool(available_models)
+    except Exception as exc:
+        if "error" not in lmstudio_info:
+            lmstudio_info["error"] = str(exc)
+
+    providers["lmstudio"] = lmstudio_info
+
+    preferred_provider = preferences["preferred_provider"]
+    preferred_model = preferences["preferred_model"]
     default_provider = ""
     default_model = ""
     if preferred_provider != "auto" and providers.get(preferred_provider, {}).get("ready"):
         default_provider = preferred_provider
-        default_model = preferred_model or providers[preferred_provider]["models"][:1][0]
+        default_model = preferred_model or _first_known_model(providers[preferred_provider])
     else:
         for name in ("ollama", "lmstudio"):
-            if providers.get(name, {}).get("ready") and providers[name]["models"]:
+            if providers.get(name, {}).get("ready") and _first_known_model(providers[name]):
                 default_provider = name
-                default_model = preferred_model or providers[name]["models"][0]
+                default_model = preferred_model or _first_known_model(providers[name])
                 break
     return {
         "preferred_provider": preferred_provider,
         "preferred_model": preferred_model,
+        "reasoning_provider": (
+            preferences["reasoning_provider"]
+            if preferences["reasoning_provider"] not in {"", "auto"}
+            else default_provider
+        ),
+        "reasoning_model": preferences["reasoning_model"],
+        "reasoning_escalation": preferences["reasoning_escalation"],
+        "reasoning_auto_restore_primary": preferences["reasoning_auto_restore_primary"],
         "default_provider": default_provider,
         "default_model": default_model,
         "providers": providers,
@@ -408,50 +812,59 @@ async def _generate_local_text_response(
     config: dict[str, Any],
     temperature: float = 0.2,
     max_tokens: int = 4096,
+    enable_thinking: bool | None = None,
+    timeout_seconds: float = 120,
+    model_role: str = "auto",
 ) -> dict[str, Any]:
     fake = os.getenv("KESTREL_FAKE_MODEL_RESPONSE")
     if fake:
         return {"provider": "fake", "model": "fake", "content": fake}
 
     runtime = await detect_local_model_runtime(config)
-    provider = runtime.get("default_provider")
-    model = runtime.get("default_model")
-    if not provider or not model:
-        raise RuntimeError("No local model runtime is available. Start Ollama or LM Studio, then retry.")
-
-    if provider == "ollama":
-        base_url = runtime["providers"]["ollama"]["base_url"]
-        payload = await _http_post_json(
-            f"{base_url}/api/chat",
-            {
-                "model": model,
-                "stream": False,
-                "messages": messages,
-                "options": {
-                    "temperature": temperature,
-                    "num_predict": max_tokens,
+    async with _local_model_session(
+        config=config,
+        runtime=runtime,
+        messages=messages,
+        enable_thinking=enable_thinking,
+        model_role=model_role,
+    ) as session:
+        provider = session["provider"]
+        model = session["model"]
+        base_url = str(session.get("base_url") or "").rstrip("/")
+        if provider == "ollama":
+            payload = await _http_post_json(
+                f"{base_url}/api/chat",
+                {
+                    "model": model,
+                    "stream": False,
+                    "messages": messages,
+                    "options": {
+                        "temperature": temperature,
+                        "num_predict": max_tokens,
+                    },
                 },
-            },
-            timeout_seconds=120,
-        )
-        content = ((payload.get("message") or {}).get("content") or "").strip()
-    elif provider == "lmstudio":
-        base_url = runtime["providers"]["lmstudio"]["base_url"]
-        payload = await _http_post_json(
-            f"{base_url}/v1/chat/completions",
-            {
+                timeout_seconds=timeout_seconds,
+            )
+            content = ((payload.get("message") or {}).get("content") or "").strip()
+        elif provider == "lmstudio":
+            request_payload: dict[str, Any] = {
                 "model": model,
                 "messages": messages,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
-            },
-            timeout_seconds=120,
-        )
-        choices = payload.get("choices") or []
-        message = ((choices[0] or {}).get("message") or {}) if choices else {}
-        content = (message.get("content") or message.get("reasoning_content") or "").strip()
-    else:  # pragma: no cover - defensive
-        raise RuntimeError(f"Unsupported local model provider: {provider}")
+            }
+            if enable_thinking is False:
+                request_payload["chat_template_kwargs"] = {"enable_thinking": False}
+            payload = await _http_post_json(
+                f"{base_url}/v1/chat/completions",
+                request_payload,
+                timeout_seconds=timeout_seconds,
+            )
+            choices = payload.get("choices") or []
+            message = ((choices[0] or {}).get("message") or {}) if choices else {}
+            content = (message.get("content") or message.get("reasoning_content") or "").strip()
+        else:  # pragma: no cover - defensive
+            raise RuntimeError(f"Unsupported local model provider: {provider}")
 
     if not content:
         raise RuntimeError(f"{provider} returned an empty completion")
@@ -465,12 +878,18 @@ async def _request_model_json(
     temperature: float = 0.1,
     max_tokens: int = 4096,
     repair_label: str,
+    enable_thinking: bool = False,
+    timeout_seconds: float = 90,
+    model_role: str = "primary",
 ) -> tuple[dict[str, Any], str, str]:
     response = await _generate_local_text_response(
         messages=messages,
         config=config,
         temperature=temperature,
         max_tokens=max_tokens,
+        enable_thinking=enable_thinking,
+        timeout_seconds=timeout_seconds,
+        model_role=model_role,
     )
     content = response["content"]
     try:
@@ -494,6 +913,9 @@ async def _request_model_json(
             config=config,
             temperature=temperature,
             max_tokens=max_tokens,
+            enable_thinking=enable_thinking,
+            timeout_seconds=timeout_seconds,
+            model_role=model_role,
         )
         return _extract_json_object(repaired["content"]), repaired["provider"], repaired["model"]
 
@@ -697,5 +1119,3 @@ def _build_custom_tool_blueprint(goal: str, proposal: dict[str, Any] | None = No
         "files": files,
         "goal": goal,
     }
-
-
