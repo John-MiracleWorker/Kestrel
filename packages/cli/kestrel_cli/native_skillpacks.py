@@ -22,9 +22,12 @@ from skillpacks import (  # type: ignore
     download_remote_skill_archive,
     discover_skill_packs,
     expand_pack_dependencies,
+    find_skill_pack_dir,
     load_skill_pack,
     pack_snapshot_id,
+    resolve_marketplace_pack,
     score_skill_candidate,
+    search_marketplace_packs,
     select_skill_packs,
     unpack_skill_archive,
     write_inferred_manifest,
@@ -81,6 +84,18 @@ class NativeSkillPackManager:
         if not urls:
             return []
         return discover_marketplace_packs(urls)
+
+    def _search_marketplace(self, query: str) -> list[dict[str, Any]]:
+        urls = self._marketplace_urls()
+        if not urls:
+            return []
+        return search_marketplace_packs(urls, query, limit=50)
+
+    def _resolve_marketplace_pack(self, pack_id: str) -> dict[str, Any] | None:
+        urls = self._marketplace_urls()
+        if not urls:
+            return None
+        return resolve_marketplace_pack(urls, pack_id)
 
     def _synchronize_catalog(self) -> list[SkillPack]:
         packs = discover_skill_packs(self._roots())
@@ -175,6 +190,10 @@ class NativeSkillPackManager:
             items.append(item)
         for item in marketplace:
             state = state_map.get(str(item.get("pack_id") or ""))
+            if state is None:
+                local_pack_id = str(((item.get("compat") or {}).get("local_pack_id") or "")).strip()
+                if local_pack_id:
+                    state = state_map.get(local_pack_id)
             payload = dict(item)
             payload["installed"] = bool(state)
             payload["enabled"] = bool((state or {}).get("enabled", False))
@@ -188,7 +207,8 @@ class NativeSkillPackManager:
         return {"snapshot_id": snapshot, "packs": items}
 
     def search(self, query: str, *, include_marketplace: bool = True) -> dict[str, Any]:
-        discovered, marketplace = self._resolved_catalog_entries(include_marketplace=include_marketplace)
+        discovered = self._synchronize_catalog()
+        marketplace = self._search_marketplace(query) if include_marketplace else []
         results: list[dict[str, Any]] = []
         for pack in discovered:
             score = score_skill_candidate(pack, query)
@@ -226,6 +246,20 @@ class NativeSkillPackManager:
         if remote:
             payload = dict(remote)
             state = self.state_store.get_skill_pack(pack_id) or {}
+            payload["installed"] = bool(state)
+            payload["enabled"] = bool(state.get("enabled", False))
+            payload["trusted"] = bool(state.get("trusted", False))
+            payload["scope"] = str(state.get("scope") or "marketplace")
+            payload["source_path"] = str(state.get("source_path") or payload.get("source_path") or "")
+            return payload
+        remote = self._resolve_marketplace_pack(pack_id)
+        if remote:
+            payload = dict(remote)
+            state = self.state_store.get_skill_pack(pack_id) or {}
+            if not state:
+                local_pack_id = str(((payload.get("compat") or {}).get("local_pack_id") or "")).strip()
+                if local_pack_id:
+                    state = self.state_store.get_skill_pack(local_pack_id) or {}
             payload["installed"] = bool(state)
             payload["enabled"] = bool(state.get("enabled", False))
             payload["trusted"] = bool(state.get("trusted", False))
@@ -289,7 +323,7 @@ class NativeSkillPackManager:
                 installed.extend(list(result.get("dependencies_installed") or []))
                 installed.append(dependency.pack_id)
                 continue
-            remote = marketplace.get(dependency.pack_id)
+            remote = marketplace.get(dependency.pack_id) or self._resolve_marketplace_pack(dependency.pack_id)
             if remote:
                 result = self.install(
                     pack_id=dependency.pack_id,
@@ -343,7 +377,7 @@ class NativeSkillPackManager:
         seen = _seen or set()
         if pack_id:
             pack = discovered.get(pack_id)
-            remote = marketplace.get(pack_id)
+            remote = marketplace.get(pack_id) or self._resolve_marketplace_pack(pack_id)
             if pack is None and remote is None:
                 raise RuntimeError(f"Unknown skill pack: {pack_id}")
             if pack is not None:
@@ -381,7 +415,13 @@ class NativeSkillPackManager:
                 if not install_url:
                     raise RuntimeError(f"Marketplace pack {pack_id} does not expose an installable archive.")
                 unpacked = self._download_and_unpack_remote(install_url)
-                remote_pack = load_skill_pack(unpacked, root_kind="user")
+                compat = remote.get("compat") if isinstance(remote.get("compat"), dict) else {}
+                remote_dir = find_skill_pack_dir(
+                    unpacked,
+                    pack_id=str(compat.get("local_pack_id") or pack_id),
+                    skill_dir=str(compat.get("skill_dir") or ""),
+                )
+                remote_pack = load_skill_pack(remote_dir, root_kind="user")
                 dependency_ids = self._install_pack_dependencies(
                     remote_pack,
                     scope=resolved_scope,
@@ -390,7 +430,7 @@ class NativeSkillPackManager:
                     marketplace=marketplace,
                     seen=seen | {remote_pack.pack_id},
                 )
-                installed_pack = self._copy_pack_dir(unpacked, scope=resolved_scope)
+                installed_pack = self._copy_pack_dir(remote_dir, scope=resolved_scope)
         else:
             dependency_ids = []
             if source_url:

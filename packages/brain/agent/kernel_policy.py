@@ -68,6 +68,7 @@ class KernelPolicyService:
     ) -> KernelPolicy:
         subsystem_health = dict(subsystem_health or {})
         goal_lower = task.goal.lower()
+        policy_overrides = dict(getattr(execution_context, "kernel_policy_json", {}) or {})
         preset = (
             getattr(execution_context, "kernel_preset", "")
             or getattr(execution_context, "default_mode", "")
@@ -124,6 +125,52 @@ class KernelPolicyService:
 
         profile = getattr(task, "task_profile", "") or "general"
         preferred_categories = self._CATEGORY_HINTS.get(profile, self._CATEGORY_HINTS["general"])
+
+        routing_override = str(policy_overrides.get("routing_strategy") or "").strip().lower()
+        if routing_override in {item.value for item in RoutingStrategy}:
+            routing_strategy = routing_override
+
+        planning_override = str(policy_overrides.get("planning_depth") or "").strip().lower()
+        if planning_override in {"shallow", "standard", "deep"}:
+            planning_depth = planning_override
+
+        preferred_override = policy_overrides.get("preferred_categories")
+        if isinstance(preferred_override, (list, tuple)):
+            normalized = tuple(
+                str(item).strip()
+                for item in preferred_override
+                if str(item).strip()
+            )
+            if normalized:
+                preferred_categories = normalized
+
+        try:
+            council_threshold = float(policy_overrides.get("council_threshold", council_threshold))
+        except (TypeError, ValueError):
+            pass
+        try:
+            simulation_threshold = float(policy_overrides.get("simulation_threshold", simulation_threshold))
+        except (TypeError, ValueError):
+            pass
+        try:
+            reflection_min_steps = int(policy_overrides.get("reflection_min_steps", reflection_min_steps))
+        except (TypeError, ValueError):
+            pass
+        try:
+            memory_depth = int(policy_overrides.get("memory_depth", memory_depth))
+        except (TypeError, ValueError):
+            pass
+        try:
+            persona_weight = float(policy_overrides.get("persona_weight", persona_weight))
+        except (TypeError, ValueError):
+            pass
+
+        if isinstance(policy_overrides.get("use_reflection"), bool):
+            use_reflection = bool(policy_overrides["use_reflection"])
+        if isinstance(policy_overrides.get("use_simulation"), bool):
+            use_simulation = bool(policy_overrides["use_simulation"])
+        if isinstance(policy_overrides.get("use_council"), bool):
+            use_council = bool(policy_overrides["use_council"])
 
         active_nodes = ["initialize", "policy", "plan", "execute", "reflect", "complete"]
         if use_simulation:

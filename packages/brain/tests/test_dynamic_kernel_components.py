@@ -123,3 +123,32 @@ def test_kernel_policy_uses_soft_preset_and_subsystem_health():
     assert policy.use_reflection is True
     assert policy.use_simulation is True
     assert "capability_gap" in policy.active_nodes
+
+
+def test_kernel_policy_respects_execution_context_overrides():
+    policy = KernelPolicyService().evaluate(
+        task=AgentTask(
+            user_id="u",
+            workspace_id="w",
+            goal="Research local-first model routing for the operator",
+            config=GuardrailConfig(),
+        ),
+        execution_context=type(
+            "Ctx",
+            (),
+            {
+                "kernel_preset": "ops",
+                "kernel_policy_json": {
+                    "routing_strategy": "local_first",
+                    "memory_depth": 9,
+                    "preferred_categories": ["web", "memory", "automation"],
+                },
+            },
+        )(),
+        subsystem_health={"simulation": "ready"},
+        persona_context="",
+    )
+
+    assert policy.routing_strategy == "local_first"
+    assert policy.memory_depth == 9
+    assert policy.preferred_categories == ("web", "memory", "automation")

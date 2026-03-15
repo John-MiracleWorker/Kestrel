@@ -11,6 +11,18 @@ from kestrel_cli import daemon_core as daemon_core_impl
 from kestrel_cli import daemon_telegram_io as daemon_telegram_io_impl
 from kestrel_cli import native_models as native_models_impl
 
+_TELEGRAM_STATUS_TEXTS = {
+    "Analyzing image",
+    "Capturing screenshot",
+    "Done",
+    "Error",
+    "Generating image",
+    "Saving to desktop",
+    "Sending file",
+    "Thinking",
+    "Uploading",
+}
+
 
 def _build_daemon(monkeypatch, tmp_path, *, token="test-token", chat_id="7317769764"):
     monkeypatch.setenv("KESTREL_HOME", str(tmp_path / ".kestrel"))
@@ -21,6 +33,17 @@ def _build_daemon(monkeypatch, tmp_path, *, token="test-token", chat_id="7317769
     instance = daemon.KestrelDaemon()
     instance._sync_telegram_channel_state_from_environment()
     return instance
+
+
+def _build_telegram_message_capture(sent_texts, status_messages):
+    async def capture_message(_chat_id, text, **_kwargs):
+        if text in _TELEGRAM_STATUS_TEXTS:
+            status_messages.append(text)
+        else:
+            sent_texts.append(text)
+        return {"message_id": len(sent_texts) + len(status_messages)}
+
+    return capture_message
 
 
 def test_daemon_syncs_telegram_state_from_environment(monkeypatch, tmp_path):
@@ -46,6 +69,72 @@ def test_daemon_exposes_skill_pack_catalog(monkeypatch, tmp_path):
 
     assert "snapshot_id" in result
     assert isinstance(result["packs"], list)
+
+
+def test_daemon_task_start_preserves_chat_kind_and_history(monkeypatch, tmp_path):
+    instance = _build_daemon(monkeypatch, tmp_path)
+    captured: dict[str, object] = {}
+
+    async def fake_run(task_id, goal, *, kind, history=None, initial_tool_call=None, resume_state=None, approved=False):
+        captured["task_id"] = task_id
+        captured["goal"] = goal
+        captured["kind"] = kind
+        captured["history"] = list(history or [])
+        instance.state_store.update_task(
+            task_id,
+            status="completed",
+            result={
+                "message": "Refined search complete.",
+                "provider": "fake",
+                "model": "model",
+                "plan": None,
+                "artifacts": [],
+            },
+        )
+        return native.NativeAgentOutcome(
+            status="completed",
+            message="Refined search complete.",
+            provider="fake",
+            model="model",
+        )
+
+    monkeypatch.setattr(instance, "_run_native_agent_task", fake_run)
+
+    async def scenario():
+        result = await instance._dispatch(
+            "task.start",
+            {
+                "goal": "Budget tracker",
+                "kind": "chat",
+                "history": [
+                    {
+                        "role": "user",
+                        "content": "Can you look for a skill that can help me manage my financial life?",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "Do you want me to download that skill or search for something else?",
+                    },
+                ],
+            },
+        )
+        task_id = result["task"]["id"]
+        await instance.active_tasks[task_id]
+
+    asyncio.run(scenario())
+
+    assert captured["goal"] == "Budget tracker"
+    assert captured["kind"] == "chat"
+    assert captured["history"] == [
+        {
+            "role": "user",
+            "content": "Can you look for a skill that can help me manage my financial life?",
+        },
+        {
+            "role": "assistant",
+            "content": "Do you want me to download that skill or search for something else?",
+        },
+    ]
 
 
 def test_daemon_telegram_poll_once_updates_offset(monkeypatch, tmp_path):
@@ -81,6 +170,7 @@ def test_daemon_telegram_poll_once_updates_offset(monkeypatch, tmp_path):
 def test_daemon_processes_telegram_chat_via_native_runner(monkeypatch, tmp_path):
     instance = _build_daemon(monkeypatch, tmp_path)
     sent_texts: list[str] = []
+    status_messages: list[str] = []
     captured: dict[str, object] = {}
 
     async def fake_run(task_id, goal, *, kind, history=None, initial_tool_call=None, resume_state=None, approved=False):
@@ -117,6 +207,8 @@ def test_daemon_processes_telegram_chat_via_native_runner(monkeypatch, tmp_path)
 
     monkeypatch.setattr(instance, "_run_native_agent_task", fake_run)
     monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
+    monkeypatch.setattr(instance, "_telegram_send_message", _build_telegram_message_capture(sent_texts, status_messages))
+    monkeypatch.setattr(instance, "_telegram_edit_message_text", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(instance, "_telegram_send_chat_action", noop)
     monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
     monkeypatch.setattr(instance, "_download_telegram_attachments", fake_download)
@@ -149,8 +241,103 @@ def test_daemon_processes_telegram_chat_via_native_runner(monkeypatch, tmp_path)
     assert task["goal"] == "say hi from Telegram"
     assert task["metadata"]["source"] == "telegram"
     assert task["metadata"]["telegram_chat_id"] == "7317769764"
+    assert task["metadata"]["telegram_result_message_ids"] == [2]
+    assert task["metadata"]["telegram_last_reply_text"] == "Telegram reply"
+    assert status_messages == ["Thinking"]
     assert sent_texts[-1] == "Telegram reply"
     assert captured["history"] == [{"role": "assistant", "content": "Previous bot reply"}]
+
+
+def test_daemon_telegram_chat_uses_recent_same_chat_history_without_explicit_reply(monkeypatch, tmp_path):
+    instance = _build_daemon(monkeypatch, tmp_path)
+    sent_texts: list[str] = []
+    status_messages: list[str] = []
+    captured: dict[str, object] = {}
+    prior_task = instance.state_store.create_task(
+        goal="Can you find me a budgeting skill?",
+        kind="chat",
+        metadata={
+            "source": "telegram",
+            "telegram_chat_id": "7317769764",
+            "telegram_message_id": 10,
+            "telegram_original_text": "Can you find me a budgeting skill?",
+        },
+    )
+    instance.state_store.update_task(
+        prior_task["id"],
+        status="completed",
+        result={
+            "message": "I found a budgeting skill you can try.",
+            "provider": "fake",
+            "model": "model",
+            "plan": None,
+            "artifacts": [],
+        },
+        metadata={"telegram_result_message_ids": [11]},
+    )
+
+    async def fake_run(task_id, goal, *, kind, history=None, initial_tool_call=None, resume_state=None, approved=False):
+        captured["goal"] = goal
+        captured["history"] = list(history or [])
+        instance.state_store.update_task(
+            task_id,
+            status="completed",
+            result={
+                "message": "Telegram reply",
+                "provider": "fake",
+                "model": "model",
+                "plan": None,
+                "artifacts": [],
+            },
+        )
+        return native.NativeAgentOutcome(
+            status="completed",
+            message="Telegram reply",
+            provider="fake",
+            model="model",
+        )
+
+    async def capture_text(chat_id, text, **_kwargs):
+        assert chat_id == "7317769764"
+        sent_texts.append(text)
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def fake_download(_message):
+        return [], []
+
+    monkeypatch.setattr(instance, "_run_native_agent_task", fake_run)
+    monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
+    monkeypatch.setattr(instance, "_telegram_send_message", _build_telegram_message_capture(sent_texts, status_messages))
+    monkeypatch.setattr(instance, "_telegram_edit_message_text", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(instance, "_telegram_send_chat_action", noop)
+    monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
+    monkeypatch.setattr(instance, "_download_telegram_attachments", fake_download)
+    monkeypatch.setattr(instance, "_telegram_send_delayed_working_note", noop)
+
+    asyncio.run(
+        instance._process_telegram_message(
+            {
+                "chat_id": "7317769764",
+                "chat_type": "private",
+                "message_id": 12,
+                "text": "What about investing?",
+                "from_id": "7317769764",
+                "from_username": "tiuni",
+                "first_name": "Tiuni",
+                "attachments": [],
+                "reply": {},
+            }
+        )
+    )
+
+    assert status_messages == ["Thinking"]
+    assert sent_texts[-1] == "Telegram reply"
+    assert captured["history"] == [
+        {"role": "user", "content": "Can you find me a budgeting skill?"},
+        {"role": "assistant", "content": "I found a budgeting skill you can try."},
+    ]
 
 
 def test_daemon_handle_client_suppresses_broken_pipe_during_response(monkeypatch, tmp_path):
@@ -230,10 +417,6 @@ def test_daemon_processes_structured_output_failure_as_normal_telegram_task_fail
         sent_texts.append(text)
         return None
 
-    async def capture_message(_chat_id, text, **_kwargs):
-        status_messages.append(text)
-        return {"message_id": len(status_messages)}
-
     async def capture_edit(_chat_id, _message_id, text, **_kwargs):
         edited_statuses.append(text)
         return True
@@ -241,10 +424,10 @@ def test_daemon_processes_structured_output_failure_as_normal_telegram_task_fail
     async def noop(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(instance, "_build_agent_runner", lambda *, task_id="": FakeRunner())
+    monkeypatch.setattr(instance, "_build_agent_runner", lambda *, task_id="", workspace_id=None: FakeRunner())
     monkeypatch.setattr(instance, "_download_telegram_attachments", fake_download)
     monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
-    monkeypatch.setattr(instance, "_telegram_send_message", capture_message)
+    monkeypatch.setattr(instance, "_telegram_send_message", _build_telegram_message_capture(sent_texts, status_messages))
     monkeypatch.setattr(instance, "_telegram_edit_message_text", capture_edit)
     monkeypatch.setattr(instance, "_telegram_send_chat_action", noop)
     monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
@@ -319,9 +502,13 @@ def test_daemon_processes_telegram_attachment_prompt(monkeypatch, tmp_path):
     async def noop(*_args, **_kwargs):
         return None
 
+    async def noop_message(*_args, **_kwargs):
+        return {"message_id": 1}
+
     monkeypatch.setattr(instance, "_download_telegram_attachments", fake_download)
     monkeypatch.setattr(instance, "_run_native_agent_task", fake_run)
     monkeypatch.setattr(instance, "_telegram_send_text", noop)
+    monkeypatch.setattr(instance, "_telegram_send_message", noop_message)
     monkeypatch.setattr(instance, "_telegram_send_chat_action", noop)
     monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
     monkeypatch.setattr(instance, "_telegram_send_delayed_working_note", noop)
@@ -609,17 +796,13 @@ def test_daemon_routes_recent_telegram_image_reference_to_desktop_copy(monkeypat
     async def capture_text(_chat_id, text, **_kwargs):
         sent_texts.append(text)
 
-    async def capture_message(_chat_id, text, **_kwargs):
-        status_messages.append(text)
-        return {"message_id": len(status_messages)}
-
     async def noop(*_args, **_kwargs):
         return None
 
     monkeypatch.setattr(instance, "_download_telegram_attachments", fake_download)
     monkeypatch.setattr(instance, "_run_native_agent_task", fake_run)
     monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
-    monkeypatch.setattr(instance, "_telegram_send_message", capture_message)
+    monkeypatch.setattr(instance, "_telegram_send_message", _build_telegram_message_capture(sent_texts, status_messages))
     monkeypatch.setattr(instance, "_telegram_edit_message_text", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(instance, "_telegram_send_chat_action", noop)
     monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
@@ -689,17 +872,13 @@ def test_daemon_routes_desktop_file_request_to_telegram_send(monkeypatch, tmp_pa
     async def capture_text(_chat_id, text, **_kwargs):
         sent_texts.append(text)
 
-    async def capture_message(_chat_id, text, **_kwargs):
-        status_messages.append(text)
-        return {"message_id": len(status_messages)}
-
     async def noop(*_args, **_kwargs):
         return None
 
     monkeypatch.setattr(instance, "_download_telegram_attachments", fake_download)
     monkeypatch.setattr(instance, "_run_native_agent_task", fake_run)
     monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
-    monkeypatch.setattr(instance, "_telegram_send_message", capture_message)
+    monkeypatch.setattr(instance, "_telegram_send_message", _build_telegram_message_capture(sent_texts, status_messages))
     monkeypatch.setattr(instance, "_telegram_edit_message_text", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(instance, "_telegram_send_chat_action", noop)
     monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
@@ -768,17 +947,13 @@ def test_daemon_routes_closest_desktop_file_match_to_telegram_send(monkeypatch, 
     async def capture_text(_chat_id, text, **_kwargs):
         sent_texts.append(text)
 
-    async def capture_message(_chat_id, text, **_kwargs):
-        status_messages.append(text)
-        return {"message_id": len(status_messages)}
-
     async def noop(*_args, **_kwargs):
         return None
 
     monkeypatch.setattr(instance, "_download_telegram_attachments", fake_download)
     monkeypatch.setattr(instance, "_run_native_agent_task", fake_run)
     monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
-    monkeypatch.setattr(instance, "_telegram_send_message", capture_message)
+    monkeypatch.setattr(instance, "_telegram_send_message", _build_telegram_message_capture(sent_texts, status_messages))
     monkeypatch.setattr(instance, "_telegram_edit_message_text", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(instance, "_telegram_send_chat_action", noop)
     monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
@@ -847,17 +1022,13 @@ def test_daemon_routes_keyword_desktop_file_search_to_telegram_send(monkeypatch,
     async def capture_text(_chat_id, text, **_kwargs):
         sent_texts.append(text)
 
-    async def capture_message(_chat_id, text, **_kwargs):
-        status_messages.append(text)
-        return {"message_id": len(status_messages)}
-
     async def noop(*_args, **_kwargs):
         return None
 
     monkeypatch.setattr(instance, "_download_telegram_attachments", fake_download)
     monkeypatch.setattr(instance, "_run_native_agent_task", fake_run)
     monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
-    monkeypatch.setattr(instance, "_telegram_send_message", capture_message)
+    monkeypatch.setattr(instance, "_telegram_send_message", _build_telegram_message_capture(sent_texts, status_messages))
     monkeypatch.setattr(instance, "_telegram_edit_message_text", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(instance, "_telegram_send_chat_action", noop)
     monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
@@ -891,6 +1062,7 @@ def test_daemon_routes_keyword_desktop_file_search_to_telegram_send(monkeypatch,
 def test_daemon_telegram_approve_command_resumes_task(monkeypatch, tmp_path):
     instance = _build_daemon(monkeypatch, tmp_path)
     sent_texts: list[str] = []
+    status_messages: list[str] = []
 
     task = instance.state_store.create_task(goal="create a README section", kind="task")
     approval = instance.state_store.create_approval(
@@ -922,6 +1094,8 @@ def test_daemon_telegram_approve_command_resumes_task(monkeypatch, tmp_path):
 
     monkeypatch.setattr(instance, "_resume_task_from_approval", fake_resume)
     monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
+    monkeypatch.setattr(instance, "_telegram_send_message", _build_telegram_message_capture(sent_texts, status_messages))
+    monkeypatch.setattr(instance, "_telegram_edit_message_text", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(instance, "_telegram_send_chat_action", noop)
     monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
     monkeypatch.setattr(instance, "_telegram_send_delayed_working_note", noop)
@@ -1102,6 +1276,7 @@ def test_daemon_processes_telegram_callback_approval(monkeypatch, tmp_path):
 
     monkeypatch.setattr(instance, "_resume_task_from_approval", fake_resume)
     monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
+    monkeypatch.setattr(instance, "_telegram_send_message", _build_telegram_message_capture(sent_texts, []))
     monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
     monkeypatch.setattr(instance, "_telegram_update_task_status", noop)
     monkeypatch.setattr(instance, "_telegram_edit_message_text", capture_edit)
@@ -1122,3 +1297,181 @@ def test_daemon_processes_telegram_callback_approval(monkeypatch, tmp_path):
     assert callback_answers == ["Approving..."]
     assert any("Approved" in text for text in edited_texts)
     assert any("Approved and completed." in text for text in sent_texts)
+
+
+def test_daemon_heartbeat_persists_background_suggestion_in_suggest_first(monkeypatch, tmp_path):
+    instance = _build_daemon(monkeypatch, tmp_path)
+    instance.config.setdefault("agent", {}).setdefault("proactivity", {})["background_execution"] = "suggest_first"
+    watched_file = tmp_path / "workspace" / "notes.md"
+    watched_file.parent.mkdir(parents=True, exist_ok=True)
+    watched_file.write_text("change", encoding="utf-8")
+    instance.recent_watched_changes = [str(watched_file)]
+    notifications: list[dict[str, object]] = []
+
+    async def capture_notification(**kwargs):
+        notifications.append(dict(kwargs))
+        return {"id": "notification"}
+
+    monkeypatch.setattr(instance, "_record_and_mirror_notification", capture_notification)
+
+    asyncio.run(instance._run_proactive_heartbeat())
+
+    suggestions = instance.state_store.list_background_suggestions(status="pending")
+    assert len(suggestions) == 1
+    assert suggestions[0]["status"] == "pending"
+    assert suggestions[0]["goal"]
+    assert instance.active_tasks == {}
+    assert notifications[0]["data"]["suggestion_id"] == suggestions[0]["id"]
+
+
+def test_daemon_accept_background_suggestion_starts_task(monkeypatch, tmp_path):
+    instance = _build_daemon(monkeypatch, tmp_path)
+    suggestion = instance.state_store.upsert_background_suggestion(
+        suggestion_id="suggestion-1",
+        workspace_id="local",
+        title="Background review available",
+        body="Prepared a review for changed files.",
+        goal="Review recent workspace changes without editing files.",
+        source="watched_changes",
+        fingerprint="fp-1",
+        notification_type="info",
+        task_kind="task",
+        auto_start_allowed=False,
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_execute(task_id, goal, *, kind="task", history=None):
+        captured["task_id"] = task_id
+        captured["goal"] = goal
+        captured["kind"] = kind
+        instance.state_store.update_task(
+            task_id,
+            status="completed",
+            result={
+                "message": "Background review complete.",
+                "provider": "fake",
+                "model": "model",
+                "plan": None,
+                "artifacts": [],
+            },
+        )
+
+    async def capture_notification(**_kwargs):
+        return {"id": "notification"}
+
+    monkeypatch.setattr(instance, "_execute_task", fake_execute)
+    monkeypatch.setattr(instance, "_record_and_mirror_notification", capture_notification)
+
+    async def scenario():
+        result = await instance._dispatch(
+            "suggestion.resolve",
+            {"suggestion_id": suggestion["id"], "action": "accept"},
+        )
+        await instance.active_tasks[result["task"]["id"]]
+        return result
+
+    result = asyncio.run(scenario())
+
+    resolved = instance.state_store.get_background_suggestion(suggestion["id"])
+    assert resolved["status"] == "accepted"
+    assert resolved["task_id"] == result["task"]["id"]
+    assert captured["kind"] == "task"
+    assert instance.state_store.list_learning_events(event_type="suggestion_accepted", limit=5)
+
+
+def test_daemon_research_start_creates_research_session(monkeypatch, tmp_path):
+    instance = _build_daemon(monkeypatch, tmp_path)
+
+    async def fake_execute(task_id, goal, *, kind="task", history=None):
+        instance.state_store.update_task(
+            task_id,
+            status="completed",
+            result={"message": f"Completed {goal}", "provider": "fake", "model": "model", "plan": None, "artifacts": []},
+        )
+
+    monkeypatch.setattr(instance, "_execute_task", fake_execute)
+
+    async def scenario():
+        result = await instance._dispatch("research.start", {"prompt": "Research local-first model routing"})
+        await instance.active_tasks[result["task"]["id"]]
+        return result
+
+    result = asyncio.run(scenario())
+
+    session = result["research_session"]
+    assert result["task"]["kind"] == "research"
+    assert session["task_id"] == result["task"]["id"]
+    assert Path(session["notebook_path"]).exists()
+    assert "Research local-first model routing" in Path(session["notebook_path"]).read_text(encoding="utf-8")
+
+
+def test_daemon_completed_research_persists_sessions_artifacts_and_procedures(monkeypatch, tmp_path):
+    instance = _build_daemon(monkeypatch, tmp_path)
+    task = instance.state_store.create_task(
+        goal="Research local-first model routing",
+        kind="research",
+        metadata={"workspace_id": "local", "source": "research"},
+    )
+
+    report_path = tmp_path / "report.md"
+    report_path.write_text("# report\n", encoding="utf-8")
+
+    class FakeRunner:
+        async def run(self, **_kwargs):
+            return native.NativeAgentOutcome(
+                status="completed",
+                message="Research complete with citations.",
+                provider="fake",
+                model="model",
+                plan={
+                    "summary": "Research local-first routing",
+                    "steps": [
+                        {"description": "Collect sources", "success_criteria": "Sources collected", "preferred_tools": ["fetch_url"]},
+                        {"description": "Synthesize findings", "success_criteria": "Summary written", "preferred_tools": []},
+                    ],
+                },
+                artifacts=[{"type": "report", "path": str(report_path), "mime_type": "text/markdown"}],
+                state={
+                    "tool_evidence": [
+                        {
+                            "tool_name": "fetch_url",
+                            "success": True,
+                            "data": {
+                                "url": "https://example.com/research",
+                                "status_code": 200,
+                                "content_type": "text/html",
+                                "body": "Evidence body",
+                            },
+                        }
+                    ],
+                    "verifier_result": {
+                        "ok": True,
+                        "final_response": "Research complete with citations.",
+                        "reason": "Grounded in source evidence.",
+                    },
+                },
+            )
+
+    monkeypatch.setattr(instance, "_build_agent_runner", lambda *, task_id="", workspace_id="": FakeRunner())
+
+    asyncio.run(instance._run_native_agent_task(task["id"], task["goal"], kind="research"))
+
+    sessions = instance.state_store.list_research_sessions(limit=5)
+    assert len(sessions) == 1
+    session = sessions[0]
+    assert session["status"] == "completed"
+    assert session["sources"][0]["url"] == "https://example.com/research"
+    assert Path(session["sources"][0]["snapshot_path"]).exists()
+
+    artifacts = instance.state_store.list_artifact_manifests(task["id"])
+    assert any(item["artifact_type"] == "report" for item in artifacts)
+    assert any(item["artifact_type"] == "research_source_snapshot" for item in artifacts)
+
+    procedures = instance.state_store.list_procedures(limit=5)
+    assert len(procedures) == 1
+    assert procedures[0]["source_task_id"] == task["id"]
+
+    learning_events = instance.state_store.list_learning_events(limit=10)
+    event_types = {item["event_type"] for item in learning_events}
+    assert "task_completed" in event_types
+    assert "procedure_learned" in event_types

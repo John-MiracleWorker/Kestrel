@@ -1,6 +1,13 @@
 from __future__ import annotations
 
 from . import native_shared as _native_shared
+from .local_operator_contracts import (
+    ArtifactManifest,
+    BackgroundSuggestion,
+    LearningEvent,
+    Procedure,
+    ResearchSession,
+)
 
 globals().update({name: value for name, value in vars(_native_shared).items() if not name.startswith("__")})
 
@@ -82,6 +89,155 @@ class StateStore(abc.ABC):
 
     @abc.abstractmethod
     def remove_skill_pack(self, pack_id: str) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def upsert_background_suggestion(
+        self,
+        *,
+        suggestion_id: str,
+        workspace_id: str,
+        title: str,
+        body: str,
+        goal: str,
+        source: str,
+        fingerprint: str,
+        notification_type: str = "info",
+        task_kind: str = "task",
+        auto_start_allowed: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def get_background_suggestion(self, suggestion_id: str) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def list_background_suggestions(
+        self,
+        *,
+        status: str | None = None,
+        workspace_id: str | None = None,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def resolve_background_suggestion(
+        self,
+        suggestion_id: str,
+        *,
+        status: str,
+        task_id: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def create_research_session(
+        self,
+        *,
+        session_id: str,
+        workspace_id: str,
+        task_id: str,
+        title: str,
+        prompt: str,
+        notebook_path: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def get_research_session(self, session_id: str) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def get_research_session_for_task(self, task_id: str) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def update_research_session(
+        self,
+        session_id: str,
+        *,
+        status: str | None = None,
+        notebook_path: str | None = None,
+        summary: str | None = None,
+        sources: list[dict[str, Any]] | None = None,
+        artifacts: list[dict[str, Any]] | None = None,
+        metadata: dict[str, Any] | None = None,
+        completed_at: str | None = None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def list_research_sessions(
+        self,
+        *,
+        workspace_id: str | None = None,
+        status: str | None = None,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def upsert_procedure(
+        self,
+        *,
+        procedure_id: str,
+        workspace_id: str,
+        name: str,
+        description: str,
+        trigger_text: str,
+        steps: list[dict[str, Any]],
+        source_task_id: str = "",
+        enabled: bool = True,
+        confidence: float = 0.5,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def list_procedures(
+        self,
+        *,
+        workspace_id: str | None = None,
+        enabled_only: bool = False,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def record_artifact_manifests(self, task_id: str, artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def list_artifact_manifests(self, task_id: str) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def append_learning_event(
+        self,
+        *,
+        event_id: str,
+        workspace_id: str,
+        task_id: str,
+        event_type: str,
+        summary: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def list_learning_events(
+        self,
+        *,
+        workspace_id: str | None = None,
+        task_id: str | None = None,
+        event_type: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
         raise NotImplementedError
 
 
@@ -235,6 +391,99 @@ class SQLiteStateStore(_SQLiteBase, StateStore):
                 updated_at TEXT NOT NULL,
                 removed_at TEXT NOT NULL DEFAULT ''
             );
+
+            CREATE TABLE IF NOT EXISTS background_suggestions (
+                id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL DEFAULT '',
+                goal TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                notification_type TEXT NOT NULL DEFAULT 'info',
+                task_kind TEXT NOT NULL DEFAULT 'task',
+                auto_start_allowed INTEGER NOT NULL DEFAULT 0,
+                task_id TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                decided_at TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_background_suggestions_status
+                ON background_suggestions(status, updated_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_background_suggestions_workspace
+                ON background_suggestions(workspace_id, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS research_sessions (
+                id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                task_id TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                notebook_path TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                sources_json TEXT NOT NULL DEFAULT '[]',
+                artifacts_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_research_sessions_workspace
+                ON research_sessions(workspace_id, updated_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_research_sessions_task
+                ON research_sessions(task_id);
+
+            CREATE TABLE IF NOT EXISTS procedures (
+                id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                trigger_text TEXT NOT NULL DEFAULT '',
+                steps_json TEXT NOT NULL DEFAULT '[]',
+                source_task_id TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                confidence REAL NOT NULL DEFAULT 0.5,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_procedures_workspace
+                ON procedures(workspace_id, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS artifact_manifests (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                artifact_type TEXT NOT NULL DEFAULT 'artifact',
+                path TEXT NOT NULL DEFAULT '',
+                url TEXT NOT NULL DEFAULT '',
+                mime_type TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_artifact_manifests_task
+                ON artifact_manifests(task_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS learning_events (
+                id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                task_id TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_learning_events_workspace
+                ON learning_events(workspace_id, created_at DESC);
             """
         )
         self._ensure_column("approvals", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
@@ -518,6 +767,594 @@ class SQLiteStateStore(_SQLiteBase, StateStore):
         payload["removed_at"] = removed_at
         payload["enabled"] = False
         return payload
+
+    def _background_suggestion_from_row(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        payload = BackgroundSuggestion(
+            id=str(row["id"]),
+            workspace_id=str(row["workspace_id"]),
+            title=str(row["title"]),
+            body=str(row["body"] or ""),
+            goal=str(row["goal"] or ""),
+            source=str(row["source"] or ""),
+            fingerprint=str(row["fingerprint"] or ""),
+            status=str(row["status"] or "pending"),
+            notification_type=str(row["notification_type"] or "info"),
+            task_kind=str(row["task_kind"] or "task"),
+            auto_start_allowed=bool(row["auto_start_allowed"]),
+            task_id=str(row["task_id"] or ""),
+            metadata=json.loads(row["metadata_json"]),
+            created_at=str(row["created_at"] or ""),
+            updated_at=str(row["updated_at"] or ""),
+            decided_at=str(row["decided_at"] or ""),
+        )
+        return payload.to_dict()
+
+    def upsert_background_suggestion(
+        self,
+        *,
+        suggestion_id: str,
+        workspace_id: str,
+        title: str,
+        body: str,
+        goal: str,
+        source: str,
+        fingerprint: str,
+        notification_type: str = "info",
+        task_kind: str = "task",
+        auto_start_allowed: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        current = self.get_background_suggestion(suggestion_id)
+        created_at = str((current or {}).get("created_at") or _now_iso())
+        payload = BackgroundSuggestion(
+            id=suggestion_id,
+            workspace_id=workspace_id,
+            title=title,
+            body=body,
+            goal=goal,
+            source=source,
+            fingerprint=fingerprint,
+            status=str((current or {}).get("status") or "pending"),
+            notification_type=notification_type,
+            task_kind=task_kind,
+            auto_start_allowed=auto_start_allowed,
+            task_id=str((current or {}).get("task_id") or ""),
+            metadata=dict(metadata or (current or {}).get("metadata") or {}),
+            created_at=created_at,
+            updated_at=_now_iso(),
+            decided_at=str((current or {}).get("decided_at") or ""),
+        )
+        self._conn.execute(
+            """
+            INSERT INTO background_suggestions (
+                id, workspace_id, title, body, goal, source, fingerprint,
+                status, notification_type, task_kind, auto_start_allowed,
+                task_id, metadata_json, created_at, updated_at, decided_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                workspace_id=excluded.workspace_id,
+                title=excluded.title,
+                body=excluded.body,
+                goal=excluded.goal,
+                source=excluded.source,
+                fingerprint=excluded.fingerprint,
+                notification_type=excluded.notification_type,
+                task_kind=excluded.task_kind,
+                auto_start_allowed=excluded.auto_start_allowed,
+                metadata_json=excluded.metadata_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                payload.id,
+                payload.workspace_id,
+                payload.title,
+                payload.body,
+                payload.goal,
+                payload.source,
+                payload.fingerprint,
+                payload.status,
+                payload.notification_type,
+                payload.task_kind,
+                int(payload.auto_start_allowed),
+                payload.task_id,
+                json.dumps(payload.metadata),
+                payload.created_at,
+                payload.updated_at,
+                payload.decided_at,
+            ),
+        )
+        self._conn.commit()
+        return self.get_background_suggestion(suggestion_id) or payload.to_dict()
+
+    def get_background_suggestion(self, suggestion_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM background_suggestions WHERE id = ?",
+            (suggestion_id,),
+        ).fetchone()
+        return self._background_suggestion_from_row(row)
+
+    def list_background_suggestions(
+        self,
+        *,
+        status: str | None = None,
+        workspace_id: str | None = None,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            values.append(status)
+        if workspace_id:
+            clauses.append("workspace_id = ?")
+            values.append(workspace_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM background_suggestions {where} ORDER BY updated_at DESC LIMIT ?",
+            (*values, limit),
+        ).fetchall()
+        return [
+            payload
+            for payload in (self._background_suggestion_from_row(row) for row in rows)
+            if payload is not None
+        ]
+
+    def resolve_background_suggestion(
+        self,
+        suggestion_id: str,
+        *,
+        status: str,
+        task_id: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        current = self.get_background_suggestion(suggestion_id)
+        if not current:
+            return None
+        merged_metadata = dict(current.get("metadata") or {})
+        if metadata:
+            merged_metadata.update(metadata)
+        decided_at = _now_iso()
+        self._conn.execute(
+            """
+            UPDATE background_suggestions
+            SET status = ?, task_id = ?, metadata_json = ?, updated_at = ?, decided_at = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                task_id or str(current.get("task_id") or ""),
+                json.dumps(merged_metadata),
+                decided_at,
+                decided_at if status in {"accepted", "dismissed", "expired"} else str(current.get("decided_at") or ""),
+                suggestion_id,
+            ),
+        )
+        self._conn.commit()
+        return self.get_background_suggestion(suggestion_id)
+
+    def _research_session_from_row(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        payload = ResearchSession(
+            id=str(row["id"]),
+            workspace_id=str(row["workspace_id"]),
+            task_id=str(row["task_id"] or ""),
+            title=str(row["title"] or ""),
+            prompt=str(row["prompt"] or ""),
+            status=str(row["status"] or "queued"),
+            notebook_path=str(row["notebook_path"] or ""),
+            summary=str(row["summary"] or ""),
+            sources=json.loads(row["sources_json"]),
+            artifacts=json.loads(row["artifacts_json"]),
+            metadata=json.loads(row["metadata_json"]),
+            created_at=str(row["created_at"] or ""),
+            updated_at=str(row["updated_at"] or ""),
+            completed_at=str(row["completed_at"] or ""),
+        )
+        return payload.to_dict()
+
+    def create_research_session(
+        self,
+        *,
+        session_id: str,
+        workspace_id: str,
+        task_id: str,
+        title: str,
+        prompt: str,
+        notebook_path: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = ResearchSession(
+            id=session_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            title=title,
+            prompt=prompt,
+            notebook_path=notebook_path,
+            metadata=dict(metadata or {}),
+        )
+        self._conn.execute(
+            """
+            INSERT INTO research_sessions (
+                id, workspace_id, task_id, title, prompt, status, notebook_path, summary,
+                sources_json, artifacts_json, metadata_json, created_at, updated_at, completed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload.id,
+                payload.workspace_id,
+                payload.task_id,
+                payload.title,
+                payload.prompt,
+                payload.status,
+                payload.notebook_path,
+                payload.summary,
+                json.dumps(payload.sources),
+                json.dumps(payload.artifacts),
+                json.dumps(payload.metadata),
+                payload.created_at,
+                payload.updated_at,
+                payload.completed_at,
+            ),
+        )
+        self._conn.commit()
+        return self.get_research_session(session_id) or payload.to_dict()
+
+    def get_research_session(self, session_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM research_sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        return self._research_session_from_row(row)
+
+    def get_research_session_for_task(self, task_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM research_sessions WHERE task_id = ? ORDER BY updated_at DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return self._research_session_from_row(row)
+
+    def update_research_session(
+        self,
+        session_id: str,
+        *,
+        status: str | None = None,
+        notebook_path: str | None = None,
+        summary: str | None = None,
+        sources: list[dict[str, Any]] | None = None,
+        artifacts: list[dict[str, Any]] | None = None,
+        metadata: dict[str, Any] | None = None,
+        completed_at: str | None = None,
+    ) -> dict[str, Any]:
+        current = self.get_research_session(session_id)
+        if not current:
+            raise KeyError(f"Unknown research session {session_id}")
+        merged_metadata = dict(current.get("metadata") or {})
+        if metadata:
+            merged_metadata.update(metadata)
+        payload = ResearchSession(
+            id=session_id,
+            workspace_id=str(current.get("workspace_id") or ""),
+            task_id=str(current.get("task_id") or ""),
+            title=str(current.get("title") or ""),
+            prompt=str(current.get("prompt") or ""),
+            status=str(status or current.get("status") or "queued"),
+            notebook_path=str(notebook_path if notebook_path is not None else current.get("notebook_path") or ""),
+            summary=str(summary if summary is not None else current.get("summary") or ""),
+            sources=list(sources if sources is not None else current.get("sources") or []),
+            artifacts=list(artifacts if artifacts is not None else current.get("artifacts") or []),
+            metadata=merged_metadata,
+            created_at=str(current.get("created_at") or _now_iso()),
+            updated_at=_now_iso(),
+            completed_at=str(
+                completed_at if completed_at is not None else current.get("completed_at") or ""
+            ),
+        )
+        self._conn.execute(
+            """
+            UPDATE research_sessions
+            SET status = ?, notebook_path = ?, summary = ?, sources_json = ?,
+                artifacts_json = ?, metadata_json = ?, updated_at = ?, completed_at = ?
+            WHERE id = ?
+            """,
+            (
+                payload.status,
+                payload.notebook_path,
+                payload.summary,
+                json.dumps(payload.sources),
+                json.dumps(payload.artifacts),
+                json.dumps(payload.metadata),
+                payload.updated_at,
+                payload.completed_at,
+                session_id,
+            ),
+        )
+        self._conn.commit()
+        return self.get_research_session(session_id) or payload.to_dict()
+
+    def list_research_sessions(
+        self,
+        *,
+        workspace_id: str | None = None,
+        status: str | None = None,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if workspace_id:
+            clauses.append("workspace_id = ?")
+            values.append(workspace_id)
+        if status:
+            clauses.append("status = ?")
+            values.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM research_sessions {where} ORDER BY updated_at DESC LIMIT ?",
+            (*values, limit),
+        ).fetchall()
+        return [
+            payload
+            for payload in (self._research_session_from_row(row) for row in rows)
+            if payload is not None
+        ]
+
+    def _procedure_from_row(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        payload = Procedure(
+            id=str(row["id"]),
+            workspace_id=str(row["workspace_id"]),
+            name=str(row["name"]),
+            description=str(row["description"] or ""),
+            trigger_text=str(row["trigger_text"] or ""),
+            steps=json.loads(row["steps_json"]),
+            source_task_id=str(row["source_task_id"] or ""),
+            enabled=bool(row["enabled"]),
+            confidence=float(row["confidence"] or 0.0),
+            metadata=json.loads(row["metadata_json"]),
+            created_at=str(row["created_at"] or ""),
+            updated_at=str(row["updated_at"] or ""),
+        )
+        return payload.to_dict()
+
+    def upsert_procedure(
+        self,
+        *,
+        procedure_id: str,
+        workspace_id: str,
+        name: str,
+        description: str,
+        trigger_text: str,
+        steps: list[dict[str, Any]],
+        source_task_id: str = "",
+        enabled: bool = True,
+        confidence: float = 0.5,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        current = self._procedure_from_row(
+            self._conn.execute("SELECT * FROM procedures WHERE id = ?", (procedure_id,)).fetchone()
+        )
+        payload = Procedure(
+            id=procedure_id,
+            workspace_id=workspace_id,
+            name=name,
+            description=description,
+            trigger_text=trigger_text,
+            steps=list(steps),
+            source_task_id=source_task_id,
+            enabled=enabled,
+            confidence=confidence,
+            metadata=dict(metadata or (current or {}).get("metadata") or {}),
+            created_at=str((current or {}).get("created_at") or _now_iso()),
+            updated_at=_now_iso(),
+        )
+        self._conn.execute(
+            """
+            INSERT INTO procedures (
+                id, workspace_id, name, description, trigger_text, steps_json,
+                source_task_id, enabled, confidence, metadata_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                workspace_id=excluded.workspace_id,
+                name=excluded.name,
+                description=excluded.description,
+                trigger_text=excluded.trigger_text,
+                steps_json=excluded.steps_json,
+                source_task_id=excluded.source_task_id,
+                enabled=excluded.enabled,
+                confidence=excluded.confidence,
+                metadata_json=excluded.metadata_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                payload.id,
+                payload.workspace_id,
+                payload.name,
+                payload.description,
+                payload.trigger_text,
+                json.dumps(payload.steps),
+                payload.source_task_id,
+                int(payload.enabled),
+                payload.confidence,
+                json.dumps(payload.metadata),
+                payload.created_at,
+                payload.updated_at,
+            ),
+        )
+        self._conn.commit()
+        return self._procedure_from_row(
+            self._conn.execute("SELECT * FROM procedures WHERE id = ?", (procedure_id,)).fetchone()
+        ) or payload.to_dict()
+
+    def list_procedures(
+        self,
+        *,
+        workspace_id: str | None = None,
+        enabled_only: bool = False,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if workspace_id:
+            clauses.append("workspace_id = ?")
+            values.append(workspace_id)
+        if enabled_only:
+            clauses.append("enabled = 1")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM procedures {where} ORDER BY updated_at DESC LIMIT ?",
+            (*values, limit),
+        ).fetchall()
+        return [
+            payload
+            for payload in (self._procedure_from_row(row) for row in rows)
+            if payload is not None
+        ]
+
+    def record_artifact_manifests(self, task_id: str, artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self._conn.execute("DELETE FROM artifact_manifests WHERE task_id = ?", (task_id,))
+        records: list[dict[str, Any]] = []
+        for index, artifact in enumerate(list(artifacts or []), start=1):
+            if not isinstance(artifact, dict):
+                continue
+            artifact_type = str(artifact.get("type") or artifact.get("artifact_type") or "artifact")
+            path = str(artifact.get("path") or "")
+            url = str(artifact.get("url") or "")
+            mime_type = str(artifact.get("mime_type") or artifact.get("mimeType") or "")
+            metadata = {
+                key: value
+                for key, value in dict(artifact).items()
+                if key not in {"type", "artifact_type", "path", "url", "mime_type", "mimeType"}
+            }
+            record = ArtifactManifest(
+                id=f"{task_id}:{index}",
+                task_id=task_id,
+                artifact_type=artifact_type,
+                path=path,
+                url=url,
+                mime_type=mime_type,
+                metadata=metadata,
+            )
+            self._conn.execute(
+                """
+                INSERT INTO artifact_manifests (
+                    id, task_id, artifact_type, path, url, mime_type, metadata_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.id,
+                    record.task_id,
+                    record.artifact_type,
+                    record.path,
+                    record.url,
+                    record.mime_type,
+                    json.dumps(record.metadata),
+                    record.created_at,
+                ),
+            )
+            records.append(record.to_dict())
+        self._conn.commit()
+        return records
+
+    def list_artifact_manifests(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM artifact_manifests WHERE task_id = ? ORDER BY created_at ASC",
+            (task_id,),
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            payload = ArtifactManifest(
+                id=str(row["id"]),
+                task_id=str(row["task_id"]),
+                artifact_type=str(row["artifact_type"] or "artifact"),
+                path=str(row["path"] or ""),
+                url=str(row["url"] or ""),
+                mime_type=str(row["mime_type"] or ""),
+                metadata=json.loads(row["metadata_json"]),
+                created_at=str(row["created_at"] or ""),
+            )
+            results.append(payload.to_dict())
+        return results
+
+    def append_learning_event(
+        self,
+        *,
+        event_id: str,
+        workspace_id: str,
+        task_id: str,
+        event_type: str,
+        summary: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        event = LearningEvent(
+            id=event_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            event_type=event_type,
+            summary=summary,
+            payload=dict(payload or {}),
+        )
+        self._conn.execute(
+            """
+            INSERT INTO learning_events (id, workspace_id, task_id, event_type, summary, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.id,
+                event.workspace_id,
+                event.task_id,
+                event.event_type,
+                event.summary,
+                json.dumps(event.payload),
+                event.created_at,
+            ),
+        )
+        self._conn.commit()
+        return event.to_dict()
+
+    def list_learning_events(
+        self,
+        *,
+        workspace_id: str | None = None,
+        task_id: str | None = None,
+        event_type: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if workspace_id:
+            clauses.append("workspace_id = ?")
+            values.append(workspace_id)
+        if task_id:
+            clauses.append("task_id = ?")
+            values.append(task_id)
+        if event_type:
+            clauses.append("event_type = ?")
+            values.append(event_type)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM learning_events {where} ORDER BY created_at DESC LIMIT ?",
+            (*values, limit),
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            payload = LearningEvent(
+                id=str(row["id"]),
+                workspace_id=str(row["workspace_id"]),
+                task_id=str(row["task_id"] or ""),
+                event_type=str(row["event_type"]),
+                summary=str(row["summary"]),
+                payload=json.loads(row["payload_json"]),
+                created_at=str(row["created_at"] or ""),
+            )
+            results.append(payload.to_dict())
+        return results
 
     def create_approval(
         self,
@@ -878,4 +1715,3 @@ class MacOSKeychainCredentialStore(CredentialStore):
             capture_output=True,
             text=True,
         )
-

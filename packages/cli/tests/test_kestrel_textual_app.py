@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from textual.widgets import Button, DataTable, TextArea
+from textual.widgets import Button, DataTable, Input, TextArea
 
 from kestrel_cli import cli_core as cli_core_impl
 from kestrel_cli.tui.app import KestrelTextualApp
@@ -15,7 +15,7 @@ from kestrel_cli.tui.store import TuiStore, VIEW_COCKPIT, VIEW_TASKS
 class FakeClient:
     def __init__(self):
         self.approvals_resolved: list[tuple[str, str, bool]] = []
-        self.started: list[tuple[str, str]] = []
+        self.started: list[tuple[str, str, list[dict[str, str]]]] = []
         self.installed: set[str] = set()
         self.enabled: set[str] = set()
         self.removed: list[str] = []
@@ -178,8 +178,8 @@ class FakeClient:
         self.removed.append(pack_id)
         return {"pack": {"pack_id": pack_id}}
 
-    async def start_task(self, goal, workspace_id=None, *, kind="task"):
-        self.started.append((goal, kind))
+    async def start_task(self, goal, workspace_id=None, *, kind="task", history=None):
+        self.started.append((goal, kind, list(history or [])))
         yield {"type": "thinking", "content": "Analyzing request", "task_id": "task-live"}
         yield {"type": "task_complete", "content": "Completed", "task_id": "task-live"}
 
@@ -287,6 +287,44 @@ def test_tasks_keyboard_navigation_updates_selection_without_enter():
     asyncio.run(scenario())
 
 
+def test_tasks_tab_focus_moves_between_actionable_controls():
+    async def scenario():
+        app = KestrelTextualApp(FakeClient(), _config())
+        async with app.run_test(headless=True, size=(160, 46)) as pilot:
+            await pilot.pause(0.35)
+            await pilot.click("#nav-tasks")
+            await pilot.pause(0.1)
+            assert getattr(app.focused, "id", "") == "tasks-table"
+            assert app.query_one("#tasks-list-panel").has_class("is-focused") is True
+            await pilot.press("tab")
+            await pilot.pause(0.1)
+            assert getattr(app.focused, "id", "") == "tasks-refresh"
+            assert app.query_one("#tasks-main-panel").has_class("is-focused") is True
+            await pilot.press("tab")
+            await pilot.pause(0.1)
+            assert getattr(app.focused, "id", "") == "tasks-approve"
+
+    asyncio.run(scenario())
+
+
+def test_chat_tab_focus_reaches_send_buttons():
+    async def scenario():
+        app = KestrelTextualApp(FakeClient(), _config())
+        async with app.run_test(headless=True, size=(160, 46)) as pilot:
+            await pilot.pause(0.35)
+            await pilot.click("#nav-chat")
+            await pilot.pause(0.1)
+            assert getattr(app.focused, "id", "") == "chat-composer"
+            await pilot.press("tab")
+            await pilot.pause(0.1)
+            assert getattr(app.focused, "id", "") == "chat-send"
+            await pilot.press("tab")
+            await pilot.pause(0.1)
+            assert getattr(app.focused, "id", "") == "chat-launch-task"
+
+    asyncio.run(scenario())
+
+
 def test_invalid_row_highlight_is_ignored():
     async def scenario():
         app = KestrelTextualApp(FakeClient(), _config())
@@ -296,6 +334,20 @@ def test_invalid_row_highlight_is_ignored():
             table.focus()
             before = app.store.state.selected_task_id
             app.on_data_table_row_highlighted(DataTable.RowHighlighted(table, -1, None))  # type: ignore[arg-type]
+            assert app.store.state.selected_task_id == before
+
+    asyncio.run(scenario())
+
+
+def test_invalid_row_selected_is_ignored():
+    async def scenario():
+        app = KestrelTextualApp(FakeClient(), _config())
+        async with app.run_test(headless=True, size=(160, 46)) as pilot:
+            await pilot.pause(0.35)
+            table = app.query_one("#cockpit-tasks", DataTable)
+            table.focus()
+            before = app.store.state.selected_task_id
+            app.on_data_table_row_selected(DataTable.RowSelected(table, -1, None))  # type: ignore[arg-type]
             assert app.store.state.selected_task_id == before
 
     asyncio.run(scenario())
@@ -327,8 +379,51 @@ def test_chat_send_dispatches_and_renders_reply():
             composer.load_text("Give me a workspace summary")
             await pilot.click("#chat-send")
             await pilot.pause(0.4)
-            assert client.started == [("Give me a workspace summary", "chat")]
+            assert client.started == [("Give me a workspace summary", "chat", [])]
             assert any(message.role == "assistant" for message in app.store.state.chat_messages)
+
+    asyncio.run(scenario())
+
+
+def test_chat_send_passes_recent_chat_history():
+    async def scenario():
+        client = FakeClient()
+        app = KestrelTextualApp(client, _config())
+        async with app.run_test(headless=True, size=(160, 46)) as pilot:
+            await pilot.pause(0.35)
+            app.store.append_chat(
+                role="user",
+                text="Can you look for a skill that can help me manage my financial life?",
+                meta="chat request",
+            )
+            app.store.append_chat(
+                role="assistant",
+                text="I found a finance skill. Do you want me to download that skill or search for something else?",
+                meta="lmstudio // test",
+            )
+            app._render_state()
+            await pilot.click("#nav-chat")
+            await pilot.pause(0.1)
+            composer = app.query_one("#chat-composer", TextArea)
+            composer.load_text("Budget tracker")
+            await pilot.click("#chat-send")
+            await pilot.pause(0.4)
+            assert client.started == [
+                (
+                    "Budget tracker",
+                    "chat",
+                    [
+                        {
+                            "role": "user",
+                            "content": "Can you look for a skill that can help me manage my financial life?",
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "I found a finance skill. Do you want me to download that skill or search for something else?",
+                        },
+                    ],
+                )
+            ]
 
     asyncio.run(scenario())
 
@@ -348,6 +443,48 @@ def test_approval_resolve_flow_works_from_ui():
     asyncio.run(scenario())
 
 
+def test_space_activates_focused_button():
+    async def scenario():
+        client = FakeClient()
+        app = KestrelTextualApp(client, _config())
+        async with app.run_test(headless=True, size=(160, 46)) as pilot:
+            await pilot.pause(0.35)
+            await pilot.click("#nav-approvals")
+            await pilot.pause(0.1)
+            await pilot.press("tab")
+            await pilot.pause(0.1)
+            assert getattr(app.focused, "id", "") == "approval-approve"
+            await pilot.press("space")
+            await pilot.pause(0.3)
+            assert client.approvals_resolved == [("task-1", "apr-1", True)]
+
+    asyncio.run(scenario())
+
+
+def test_overlay_close_restores_previous_focus():
+    async def scenario():
+        app = KestrelTextualApp(FakeClient(), _config())
+        async with app.run_test(headless=True, size=(160, 46)) as pilot:
+            await pilot.pause(0.35)
+            await pilot.click("#nav-tasks")
+            await pilot.pause(0.1)
+            await pilot.press("tab")
+            await pilot.pause(0.1)
+            assert getattr(app.focused, "id", "") == "tasks-refresh"
+            await pilot.press("ctrl+k")
+            await pilot.pause(0.1)
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+            assert getattr(app.focused, "id", "") == "tasks-refresh"
+            await pilot.press("ctrl+n")
+            await pilot.pause(0.1)
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+            assert getattr(app.focused, "id", "") == "tasks-refresh"
+
+    asyncio.run(scenario())
+
+
 def test_skill_install_and_toggle_from_ui():
     async def scenario():
         client = FakeClient()
@@ -362,6 +499,97 @@ def test_skill_install_and_toggle_from_ui():
             app.query_one("#skill-toggle", Button).press()
             await pilot.pause(0.25)
             assert "marketplace-demo-orchestrator" in client.enabled
+
+    asyncio.run(scenario())
+
+
+def test_chat_launch_task_shortcut_dispatches_task_mode():
+    async def scenario():
+        client = FakeClient()
+        app = KestrelTextualApp(client, _config())
+        async with app.run_test(headless=True, size=(160, 46)) as pilot:
+            await pilot.pause(0.35)
+            await pilot.click("#nav-chat")
+            await pilot.pause(0.1)
+            composer = app.query_one("#chat-composer", TextArea)
+            composer.load_text("Launch a workspace task")
+            await pilot.press("ctrl+shift+enter")
+            await pilot.pause(0.4)
+            assert client.started == [("Launch a workspace task", "task", [])]
+
+    asyncio.run(scenario())
+
+
+def test_view_shortcuts_drive_task_and_skill_actions():
+    async def scenario():
+        client = FakeClient()
+        app = KestrelTextualApp(client, _config())
+        async with app.run_test(headless=True, size=(160, 46)) as pilot:
+            await pilot.pause(0.35)
+            await pilot.click("#nav-tasks")
+            await pilot.pause(0.1)
+            await pilot.press("alt+a")
+            await pilot.pause(0.3)
+            assert client.approvals_resolved == [("task-1", "apr-1", True)]
+            await pilot.click("#nav-skills")
+            await pilot.pause(0.1)
+            await pilot.press("alt+i")
+            await pilot.pause(0.25)
+            await pilot.press("alt+e")
+            await pilot.pause(0.25)
+            await pilot.press("alt+x")
+            await pilot.pause(0.25)
+            assert "marketplace-demo-orchestrator" in client.removed
+
+    asyncio.run(scenario())
+
+
+def test_view_shortcuts_do_not_fire_while_typing_in_filter():
+    async def scenario():
+        client = FakeClient()
+        app = KestrelTextualApp(client, _config())
+        async with app.run_test(headless=True, size=(160, 46)) as pilot:
+            await pilot.pause(0.35)
+            await pilot.click("#nav-tasks")
+            await pilot.pause(0.1)
+            filter_input = app.query_one("#tasks-filter", Input)
+            filter_input.focus()
+            await pilot.pause(0.05)
+            await pilot.press("alt+a")
+            await pilot.pause(0.25)
+            assert client.approvals_resolved == []
+
+    asyncio.run(scenario())
+
+
+def test_hint_bar_updates_per_view():
+    async def scenario():
+        app = KestrelTextualApp(FakeClient(), _config())
+        async with app.run_test(headless=True, size=(160, 46)) as pilot:
+            await pilot.pause(0.35)
+            assert "ARROWS select row" in app.query_one("#hint-bar").renderable
+            await pilot.click("#nav-chat")
+            await pilot.pause(0.1)
+            assert "CTRL+SHIFT+ENTER task" in app.query_one("#hint-bar").renderable
+            await pilot.click("#nav-skills")
+            await pilot.pause(0.1)
+            assert "ALT+I install" in app.query_one("#hint-bar").renderable
+
+    asyncio.run(scenario())
+
+
+def test_mouse_click_on_table_rows_changes_state():
+    async def scenario():
+        app = KestrelTextualApp(FakeClient(), _config())
+        async with app.run_test(headless=True, size=(160, 46)) as pilot:
+            await pilot.pause(0.35)
+            await pilot.click("#cockpit-tasks", offset=(5, 3))
+            await pilot.pause(0.2)
+            assert app.store.state.active_view == VIEW_TASKS
+            assert app.store.state.selected_task_id == "task-live"
+            await pilot.click("#tasks-table", offset=(5, 3))
+            await pilot.pause(0.1)
+            assert app.store.state.selected_task_id == "task-live"
 
     asyncio.run(scenario())
 

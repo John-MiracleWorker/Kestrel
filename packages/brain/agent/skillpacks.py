@@ -24,9 +24,12 @@ from skillpacks import (  # type: ignore
     download_remote_skill_archive,
     discover_skill_packs,
     expand_pack_dependencies,
+    find_skill_pack_dir,
     load_skill_pack,
     pack_snapshot_id,
+    resolve_marketplace_pack,
     score_skill_candidate,
+    search_marketplace_packs,
     select_skill_packs,
     unpack_skill_archive,
     write_inferred_manifest,
@@ -60,6 +63,18 @@ class SkillPackManager:
         if not urls:
             return []
         return await asyncio.to_thread(discover_marketplace_packs, urls)
+
+    async def _search_marketplace(self, query: str) -> list[dict[str, Any]]:
+        urls = self._marketplace_urls()
+        if not urls:
+            return []
+        return await asyncio.to_thread(search_marketplace_packs, urls, query, limit=50)
+
+    async def _resolve_marketplace_pack(self, pack_id: str) -> dict[str, Any] | None:
+        urls = self._marketplace_urls()
+        if not urls:
+            return None
+        return await asyncio.to_thread(resolve_marketplace_pack, urls, pack_id)
 
     async def _ensure_tables(self) -> None:
         async with self._pool.acquire() as conn:
@@ -266,6 +281,10 @@ class SkillPackManager:
         state_map = {str(row.get("pack_id") or ""): row for row in state_rows}
         for item in marketplace:
             row = state_map.get(str(item.get("pack_id") or ""))
+            if row is None:
+                local_pack_id = str(((item.get("compat") or {}).get("local_pack_id") or "")).strip()
+                if local_pack_id:
+                    row = state_map.get(local_pack_id)
             payload = dict(item)
             payload["installed"] = bool(row)
             payload["enabled"] = bool((row or {}).get("enabled", False))
@@ -279,7 +298,8 @@ class SkillPackManager:
         return {"snapshot_id": pack_snapshot_id(list(discovered.values())), "packs": items}
 
     async def search(self, workspace_id: str, query: str, *, include_marketplace: bool = True) -> dict[str, Any]:
-        discovered, marketplace = await self._resolved_catalog_entries(include_marketplace=include_marketplace)
+        discovered = await self._discover()
+        marketplace = await self._search_marketplace(query) if include_marketplace else []
         results: list[dict[str, Any]] = []
         for pack in discovered:
             score = score_skill_candidate(pack, query)
@@ -309,6 +329,22 @@ class SkillPackManager:
                     except Exception:
                         pass
                 return pack
+        remote = await self._resolve_marketplace_pack(pack_id)
+        if remote:
+            state_rows = await self._load_state_rows(workspace_id)
+            state_map = {str(row.get("pack_id") or ""): row for row in state_rows}
+            row = state_map.get(pack_id)
+            if row is None:
+                local_pack_id = str(((remote.get("compat") or {}).get("local_pack_id") or "")).strip()
+                if local_pack_id:
+                    row = state_map.get(local_pack_id)
+            payload = dict(remote)
+            payload["installed"] = bool(row)
+            payload["enabled"] = bool((row or {}).get("enabled", False))
+            payload["trusted"] = bool((row or {}).get("trusted", False))
+            payload["scope"] = str((row or {}).get("scope") or "marketplace")
+            payload["source_path"] = str((row or {}).get("source_path") or payload.get("source_path") or "")
+            return payload
         return None
 
     def _workspace_skill_dir(self) -> Path:
@@ -440,7 +476,10 @@ class SkillPackManager:
                 installed.extend(list(result.get("dependencies_installed") or []))
                 installed.append(dependency.pack_id)
                 continue
-            if dependency.pack_id in marketplace:
+            remote_dependency = marketplace.get(dependency.pack_id)
+            if remote_dependency is None:
+                remote_dependency = await self._resolve_marketplace_pack(dependency.pack_id)
+            if remote_dependency is not None:
                 result = await self.install(
                     workspace_id=workspace_id,
                     pack_id=dependency.pack_id,
@@ -494,6 +533,8 @@ class SkillPackManager:
         if pack_id:
             pack = discovered.get(pack_id)
             remote = marketplace.get(pack_id)
+            if remote is None:
+                remote = await self._resolve_marketplace_pack(pack_id)
             if pack is None and remote is None:
                 raise RuntimeError(f"Unknown skill pack: {pack_id}")
             if pack is not None:
@@ -520,7 +561,13 @@ class SkillPackManager:
                 if not install_url:
                     raise RuntimeError(f"Marketplace pack {pack_id} does not expose an installable archive.")
                 unpacked = await self._download_and_unpack_remote(install_url)
-                remote_pack = load_skill_pack(unpacked, root_kind="user")
+                compat = remote.get("compat") if isinstance(remote.get("compat"), dict) else {}
+                remote_dir = find_skill_pack_dir(
+                    unpacked,
+                    pack_id=str(compat.get("local_pack_id") or pack_id),
+                    skill_dir=str(compat.get("skill_dir") or ""),
+                )
+                remote_pack = load_skill_pack(remote_dir, root_kind="user")
                 dependency_ids = await self._install_pack_dependencies(
                     workspace_id=workspace_id,
                     pack=remote_pack,
@@ -529,7 +576,7 @@ class SkillPackManager:
                     marketplace=marketplace,
                     seen=seen | {remote_pack.pack_id},
                 )
-                installed = self._copy_pack(unpacked, scope=scope)
+                installed = self._copy_pack(remote_dir, scope=scope)
         else:
             dependency_ids = []
             if source_url:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from . import native_agent as _native_agent
+from .native_persona import compose_native_system_prompt
 
 globals().update({name: value for name, value in vars(_native_agent).items() if not name.startswith("__")})
 
@@ -743,7 +744,7 @@ async def complete_local_prompt(
     *,
     prompt: str,
     config: dict[str, Any],
-    system_prompt: str = "You are Kestrel, a local autonomous agent OS focused on concise, actionable assistance.",
+    system_prompt: str | None = None,
     history: list[dict[str, str]] | None = None,
     tool_categories: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
@@ -757,7 +758,12 @@ async def complete_local_prompt(
 
     runtime = await detect_local_model_runtime(config)
     # Build messages list: system prompt, then history, then current prompt
-    messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    resolved_system_prompt = system_prompt or compose_native_system_prompt(
+        config=config,
+        role="assistant",
+        role_instructions="Answer directly, stay concrete, and use tools when the task requires actual side effects.",
+    )
+    messages: list[dict[str, Any]] = [{"role": "system", "content": resolved_system_prompt}]
     if history:
         messages.extend(history)
     messages.append({"role": "user", "content": prompt})

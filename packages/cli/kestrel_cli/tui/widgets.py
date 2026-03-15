@@ -102,7 +102,7 @@ def render_notifications(notifications: Iterable[NotificationItem]) -> list[Pane
 def time_to_iso(epoch_seconds: float) -> str:
     import datetime as _datetime
 
-    return _datetime.datetime.utcfromtimestamp(epoch_seconds).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return _datetime.datetime.fromtimestamp(epoch_seconds, _datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class StatusOrb(Static):
@@ -215,6 +215,10 @@ class ProcessBar(Static):
         )
 
 
+class ReadOnlyLog(RichLog):
+    can_focus = False
+
+
 class MetricCard(Static):
     DEFAULT_CSS = """
     MetricCard {
@@ -251,7 +255,7 @@ class MetricCard(Static):
         )
 
 
-class InspectorBody(RichLog):
+class InspectorBody(ReadOnlyLog):
     DEFAULT_CSS = """
     InspectorBody {
         background: transparent;
@@ -367,11 +371,12 @@ class NotificationCenterScreen(ModalScreen[str | None]):
                 yield Static("NOTIFICATIONS", id="notifications-title")
                 yield Button("MARK ALL READ", id="notifications-mark-read", variant="primary")
                 yield Button("CLOSE", id="notifications-close")
-            yield RichLog(id="notifications-log", wrap=True, highlight=False, markup=False)
+            yield ReadOnlyLog(id="notifications-log", wrap=True, highlight=False, markup=False)
 
     def on_mount(self) -> None:
-        log = self.query_one("#notifications-log", RichLog)
+        log = self.query_one("#notifications-log", ReadOnlyLog)
         log.clear()
+        self.query_one("#notifications-mark-read", Button).focus()
         if not self.notifications:
             log.write(Panel(Text("No notifications yet", style="#888888"), border_style="#222222"))
             return

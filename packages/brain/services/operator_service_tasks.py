@@ -451,6 +451,12 @@ class OperatorTaskMixin(BaseServicerMixin):
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "workspace_id is required")
 
         pool = await get_pool()
+        workspace_agent_store = getattr(runtime, "workspace_agent_store", None)
+        if workspace_agent_store is not None:
+            try:
+                await workspace_agent_store.ensure_profile(workspace_id)
+            except Exception as exc:
+                logger.warning("Failed to sync workspace agent profile from local operator defaults: %s", exc)
         workspace_agent = await pool.fetchrow(
             """
             SELECT autonomy_policy, persona_version, default_mode, runtime_defaults

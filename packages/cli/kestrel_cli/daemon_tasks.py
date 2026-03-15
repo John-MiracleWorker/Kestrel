@@ -1,9 +1,27 @@
 from __future__ import annotations
 
+import hashlib
+
 from . import daemon_telegram_io as _daemon_telegram_io
+from .local_operator_contracts import AgentProfile, AutonomyPolicy, VerifierResult
 from .native_models import StructuredModelOutputError
+from .native_persona import compose_native_system_prompt
 
 globals().update({name: value for name, value in vars(_daemon_telegram_io).items() if not name.startswith("__")})
+
+
+def _normalize_chat_history(history: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    for item in list(history or [])[-12:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        content = str(item.get("content") or "").strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        normalized.append({"role": role, "content": content})
+    return normalized
+
 
 class KestrelDaemonTaskMixin:
     async def _cancel_task(self, task_id: str) -> dict[str, Any]:
@@ -31,39 +49,418 @@ class KestrelDaemonTaskMixin:
     def _list_task_artifacts(self, task_id: str) -> list[dict[str, Any]]:
         events = self.event_journal.list_events(task_id)
         artifacts: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for artifact in self.state_store.list_artifact_manifests(task_id):
+            if not isinstance(artifact, dict):
+                continue
+            key = self._artifact_key(artifact)
+            if key in seen:
+                continue
+            seen.add(key)
+            artifacts.append(dict(artifact))
         for event in events:
             artifact_url = event.get("artifact_url") or event.get("url")
             artifact_path = event.get("artifact_path") or event.get("path")
             if artifact_url or artifact_path:
-                artifacts.append(
-                    {
-                        "task_id": task_id,
-                        "type": event.get("artifact_type") or event.get("type") or "artifact",
-                        "url": artifact_url or "",
-                        "path": artifact_path or "",
-                        "created_at": event.get("created_at") or "",
-                    }
-                )
+                artifact = {
+                    "task_id": task_id,
+                    "type": event.get("artifact_type") or event.get("type") or "artifact",
+                    "url": artifact_url or "",
+                    "path": artifact_path or "",
+                    "created_at": event.get("created_at") or "",
+                }
+                key = self._artifact_key(artifact)
+                if key not in seen:
+                    seen.add(key)
+                    artifacts.append(artifact)
             for artifact in event.get("artifacts") or []:
                 if isinstance(artifact, dict):
+                    key = self._artifact_key(artifact)
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     artifacts.append(dict(artifact))
         return artifacts
 
+    def _artifact_key(self, artifact: dict[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(artifact.get("type") or artifact.get("artifact_type") or "artifact"),
+            str(artifact.get("path") or ""),
+            str(artifact.get("url") or ""),
+        )
+
+    def _autonomy_policy_for_workspace(self, workspace_id: str = "") -> dict[str, Any]:
+        runtime_profile = self.runtime_policy.runtime_profile()
+        return AutonomyPolicy.from_config(
+            self._config_for_workspace(workspace_id),
+            runtime_mode=str(runtime_profile.get("runtime_mode") or "native"),
+        ).to_dict()
+
+    def _media_capabilities(self) -> dict[str, Any]:
+        categories = set(self._enabled_chat_tool_categories())
+        media_server = bool(os.getenv("SWARMUI_BASE_URL") or os.getenv("MEDIA_HOST_URL"))
+        vision_enabled = bool(os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY"))
+        return {
+            "image_generation": "media" in categories,
+            "video_generation": "media" in categories and media_server,
+            "svg_render": "media" in categories,
+            "screenshot_capture": "desktop" in categories,
+            "vision_analysis": vision_enabled,
+            "artifact_delivery": True,
+            "source_snapshots": True,
+            "remote_media_server_configured": media_server,
+        }
+
+    def _automation_permissions(self) -> dict[str, Any]:
+        permissions = self.config.get("permissions") or {}
+        channels = self._read_channel_status().get("channels", {})
+        return {
+            "broad_local_control": bool(permissions.get("broad_local_control", True)),
+            "require_approval_for_mutations": bool(
+                permissions.get("require_approval_for_mutations", True)
+            ),
+            "telegram_delivery": bool((channels.get("telegram") or {}).get("configured")),
+            "watched_files": True,
+            "background_suggestions": True,
+        }
+
+    def _control_plane_summary(self, workspace_id: str = "") -> dict[str, Any]:
+        return {
+            "pending_approvals": len(self.state_store.list_pending_approvals()),
+            "pending_suggestions": len(
+                self.state_store.list_background_suggestions(
+                    status="pending",
+                    workspace_id=workspace_id or None,
+                    limit=200,
+                )
+            ),
+            "research_sessions": len(
+                self.state_store.list_research_sessions(workspace_id=workspace_id or None, limit=200)
+            ),
+            "procedures": len(self.state_store.list_procedures(workspace_id=workspace_id or None, limit=200)),
+            "learning_events": len(
+                self.state_store.list_learning_events(workspace_id=workspace_id or None, limit=200)
+            ),
+        }
+
+    def _record_learning_event(
+        self,
+        *,
+        workspace_id: str,
+        task_id: str,
+        event_type: str,
+        summary: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.state_store.append_learning_event(
+            event_id=str(uuid.uuid4()),
+            workspace_id=workspace_id or "local",
+            task_id=task_id,
+            event_type=event_type,
+            summary=summary,
+            payload=payload or {},
+        )
+
+    def _research_notebook_path(self, session_id: str) -> Path:
+        research_dir = self.paths.memory_dir / "research"
+        research_dir.mkdir(parents=True, exist_ok=True)
+        return research_dir / f"{session_id}.md"
+
+    def _research_snapshot_dir(self, session_id: str) -> Path:
+        snapshot_dir = self.paths.artifacts_dir / "research" / session_id
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        return snapshot_dir
+
+    def _build_research_title(self, prompt: str) -> str:
+        compact = " ".join(str(prompt or "").split()).strip()
+        if not compact:
+            return "Research session"
+        return compact[:72]
+
+    def _ensure_research_session(
+        self,
+        *,
+        task_id: str,
+        workspace_id: str,
+        prompt: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        existing = self.state_store.get_research_session_for_task(task_id)
+        if existing:
+            return existing
+        session_id = str(uuid.uuid4())
+        notebook_path = self._research_notebook_path(session_id)
+        notebook_path.write_text(
+            "\n".join(
+                [
+                    f"# {self._build_research_title(prompt)}",
+                    "",
+                    "Status: queued",
+                    "",
+                    "## Prompt",
+                    prompt.strip(),
+                    "",
+                    "## Summary",
+                    "_Pending_",
+                ]
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        return self.state_store.create_research_session(
+            session_id=session_id,
+            workspace_id=workspace_id or "local",
+            task_id=task_id,
+            title=self._build_research_title(prompt),
+            prompt=prompt,
+            notebook_path=str(notebook_path),
+            metadata=metadata or {},
+        )
+
+    def _collect_research_sources(
+        self,
+        session_id: str,
+        outcome: NativeAgentOutcome,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        snapshot_dir = self._research_snapshot_dir(session_id)
+        sources: list[dict[str, Any]] = []
+        snapshot_artifacts: list[dict[str, Any]] = []
+        evidence = list((outcome.state or {}).get("tool_evidence") or [])
+        for index, item in enumerate(evidence, start=1):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("tool_name") or "") != "fetch_url":
+                continue
+            data = item.get("data") or {}
+            if not isinstance(data, dict):
+                continue
+            url = str(data.get("url") or "").strip()
+            if not url:
+                continue
+            snapshot_path = ""
+            body = str(data.get("body") or "").strip()
+            if body:
+                path = snapshot_dir / f"source-{index:02d}.txt"
+                path.write_text(
+                    "\n".join(
+                        [
+                            f"URL: {url}",
+                            f"Content-Type: {str(data.get('content_type') or '')}",
+                            f"Status: {str(data.get('status_code') or '')}",
+                            "",
+                            body,
+                        ]
+                    ).strip()
+                    + "\n",
+                    encoding="utf-8",
+                )
+                snapshot_path = str(path)
+                snapshot_artifacts.append(
+                    {
+                        "type": "research_source_snapshot",
+                        "path": snapshot_path,
+                        "url": url,
+                        "mime_type": "text/plain",
+                    }
+                )
+            sources.append(
+                {
+                    "url": url,
+                    "status_code": data.get("status_code"),
+                    "content_type": data.get("content_type"),
+                    "snapshot_path": snapshot_path,
+                }
+            )
+        return sources, snapshot_artifacts
+
+    def _sync_research_session(self, task: dict[str, Any], outcome: NativeAgentOutcome) -> list[dict[str, Any]]:
+        metadata = dict(task.get("metadata") or {})
+        workspace_id = str(metadata.get("workspace_id") or "local")
+        session = self._ensure_research_session(
+            task_id=str(task.get("id") or ""),
+            workspace_id=workspace_id,
+            prompt=str(task.get("goal") or ""),
+            metadata={"source": metadata.get("source") or "task"},
+        )
+        session_id = str(session.get("id") or "")
+        sources, source_artifacts = self._collect_research_sources(session_id, outcome)
+        all_artifacts = list(outcome.artifacts or []) + source_artifacts
+        notebook_path = Path(str(session.get("notebook_path") or self._research_notebook_path(session_id)))
+        notebook_path.parent.mkdir(parents=True, exist_ok=True)
+        notebook_lines = [
+            f"# {session.get('title') or self._build_research_title(str(task.get('goal') or ''))}",
+            "",
+            f"Status: {outcome.status}",
+            "",
+            "## Prompt",
+            str(task.get("goal") or "").strip(),
+            "",
+            "## Summary",
+            str(outcome.message or "").strip() or "_No summary generated._",
+        ]
+        if sources:
+            notebook_lines.extend(["", "## Sources"])
+            for source in sources:
+                line = f"- {source['url']}"
+                if source.get("snapshot_path"):
+                    line += f" ({source['snapshot_path']})"
+                notebook_lines.append(line)
+        if all_artifacts:
+            notebook_lines.extend(["", "## Artifacts"])
+            for artifact in all_artifacts:
+                label = str(artifact.get("path") or artifact.get("url") or "").strip()
+                if label:
+                    notebook_lines.append(f"- {artifact.get('type') or 'artifact'}: {label}")
+        notebook_path.write_text("\n".join(notebook_lines).strip() + "\n", encoding="utf-8")
+        completed_at = _now() if outcome.status in {"completed", "failed"} else ""
+        self.state_store.update_research_session(
+            session_id,
+            status=outcome.status,
+            notebook_path=str(notebook_path),
+            summary=str(outcome.message or ""),
+            sources=sources,
+            artifacts=all_artifacts,
+            metadata={"provider": outcome.provider, "model": outcome.model},
+            completed_at=completed_at,
+        )
+        return all_artifacts
+
+    def _learn_procedure(self, task: dict[str, Any], outcome: NativeAgentOutcome, *, kind: str) -> dict[str, Any] | None:
+        plan = outcome.plan if isinstance(outcome.plan, dict) else (outcome.state or {}).get("plan")
+        if not isinstance(plan, dict):
+            return None
+        steps = [step for step in list(plan.get("steps") or []) if isinstance(step, dict)]
+        if len(steps) < 2:
+            return None
+        workspace_id = str(((task.get("metadata") or {}).get("workspace_id")) or "local")
+        digest = hashlib.sha1(
+            json.dumps(
+                {
+                    "workspace_id": workspace_id,
+                    "summary": plan.get("summary"),
+                    "steps": [
+                        {
+                            "description": step.get("description"),
+                            "preferred_tools": step.get("preferred_tools"),
+                        }
+                        for step in steps
+                    ],
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        procedure = self.state_store.upsert_procedure(
+            procedure_id=f"procedure-{digest}",
+            workspace_id=workspace_id,
+            name=str(plan.get("summary") or task.get("goal") or "Learned procedure")[:96],
+            description=f"Learned from a successful {kind} task.",
+            trigger_text=str(task.get("goal") or ""),
+            steps=[
+                {
+                    "description": str(step.get("description") or ""),
+                    "success_criteria": str(step.get("success_criteria") or ""),
+                    "preferred_tools": list(step.get("preferred_tools") or []),
+                }
+                for step in steps
+            ],
+            source_task_id=str(task.get("id") or ""),
+            enabled=True,
+            confidence=min(0.95, 0.5 + (0.1 * len(steps))),
+            metadata={"kind": kind, "provider": outcome.provider, "model": outcome.model},
+        )
+        self._record_learning_event(
+            workspace_id=workspace_id,
+            task_id=str(task.get("id") or ""),
+            event_type="procedure_learned",
+            summary=f"Learned procedure: {procedure.get('name') or 'procedure'}",
+            payload={"procedure_id": procedure.get("id"), "step_count": len(steps)},
+        )
+        return procedure
+
+    def _verifier_result_from_outcome(self, outcome: NativeAgentOutcome) -> dict[str, Any]:
+        verifier = dict((outcome.state or {}).get("verifier_result") or {})
+        citations = []
+        for item in list((outcome.state or {}).get("tool_evidence") or []):
+            if not isinstance(item, dict):
+                continue
+            data = item.get("data") or {}
+            if isinstance(data, dict):
+                url = str(data.get("url") or "").strip()
+                if url:
+                    citations.append(url)
+        result = VerifierResult(
+            ok=bool(verifier.get("ok", outcome.status == "completed")),
+            final_response=str(verifier.get("final_response") or outcome.message or ""),
+            reason=str(verifier.get("reason") or ""),
+            evidence_count=len(list((outcome.state or {}).get("tool_evidence") or [])),
+            citations=citations[:8],
+        )
+        return result.to_dict()
+
+    def _finalize_local_control_plane(
+        self,
+        *,
+        task_id: str,
+        kind: str,
+        outcome: NativeAgentOutcome,
+    ) -> None:
+        task = self.state_store.get_task(task_id)
+        if not task:
+            return
+        workspace_id = str(((task.get("metadata") or {}).get("workspace_id")) or "local")
+        artifacts = list(outcome.artifacts or [])
+        if kind == "research":
+            artifacts = self._sync_research_session(task, outcome)
+        self.state_store.record_artifact_manifests(task_id, artifacts)
+        verifier_result = self._verifier_result_from_outcome(outcome)
+        self._record_learning_event(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            event_type=f"task_{outcome.status}",
+            summary=str(outcome.message or task.get("goal") or "").strip()[:200],
+            payload={
+                "kind": kind,
+                "provider": outcome.provider,
+                "model": outcome.model,
+                "artifact_count": len(artifacts),
+                "verifier_result": verifier_result,
+            },
+        )
+        if outcome.status == "completed":
+            self._learn_procedure(task, outcome, kind=kind)
+
     def _compose_runtime_profile(self) -> dict[str, Any]:
         profile = self.runtime_policy.runtime_profile()
+        workspace_id = self._resolve_workspace_id()
         profile["local_models"] = self.last_model_runtime
+        profile["autonomy_policy"] = self._autonomy_policy_for_workspace(workspace_id)
+        profile["media_capabilities"] = self._media_capabilities()
+        profile["automation_permissions"] = self._automation_permissions()
+        profile["control_plane"] = self._control_plane_summary(workspace_id)
         if getattr(self, "skill_pack_manager", None):
             catalog = self.skill_pack_manager.catalog(include_synthetic=False)
             profile["skill_packs"] = {
                 "snapshot_id": catalog.get("snapshot_id"),
                 "count": len(catalog.get("packs") or []),
             }
+        profile["agent_profile"] = AgentProfile(
+            profile_id=f"local-{workspace_id or 'workspace'}",
+            workspace_id=workspace_id or "local",
+            runtime_mode=str(profile.get("runtime_mode") or "native"),
+            autonomy_policy=dict(profile.get("autonomy_policy") or {}),
+            local_models=dict(self.last_model_runtime or {}),
+            media_capabilities=dict(profile.get("media_capabilities") or {}),
+            automation_permissions=dict(profile.get("automation_permissions") or {}),
+            control_plane=dict(profile.get("control_plane") or {}),
+        ).to_dict()
         profile["updated_at"] = _now()
         return profile
 
     def _compose_status(self) -> dict[str, Any]:
         tasks = self.state_store.list_tasks(limit=10)
         uptime = int(time.time() - self.start_time)
+        recent_background_tasks = [task for task in tasks if self._is_background_task(task)][:3]
+        workspace_id = self._resolve_workspace_id()
         return {
             "status": "running",
             "uptime_seconds": uptime,
@@ -76,6 +473,26 @@ class KestrelDaemonTaskMixin:
             "pending_approvals": self.state_store.list_pending_approvals(),
             "channels": self._read_channel_status().get("channels", {}),
             "paired_nodes": self.state_store.list_paired_nodes(),
+            "last_heartbeat_action": self.last_heartbeat_action,
+            "recent_watched_changes": [self._relative_path_label(path) for path in self.recent_watched_changes[:5]],
+            "recent_background_tasks": recent_background_tasks,
+            "background_suggestions": self.state_store.list_background_suggestions(
+                status="pending",
+                workspace_id=workspace_id or None,
+                limit=10,
+            ),
+            "research_sessions": self.state_store.list_research_sessions(
+                workspace_id=workspace_id or None,
+                limit=5,
+            ),
+            "procedures": self.state_store.list_procedures(
+                workspace_id=workspace_id or None,
+                limit=5,
+            ),
+            "learning_events": self.state_store.list_learning_events(
+                workspace_id=workspace_id or None,
+                limit=10,
+            ),
             "home": str(self.paths.home),
         }
 
@@ -85,13 +502,18 @@ class KestrelDaemonTaskMixin:
             "started_at": self.start_time,
             "uptime": time.time() - self.start_time,
             "last_heartbeat": time.time(),
-            "next_heartbeat": time.time() + int(self.config.get("heartbeat", {}).get("interval_seconds", 300)),
+            "next_heartbeat": time.time() + self._heartbeat_interval_seconds(),
             "changed_paths": changed_paths or [],
             "recent_tasks": [task["id"] for task in self.state_store.list_tasks(limit=5)],
             "pending_approvals": len(self.state_store.list_pending_approvals()),
             "memory_sync": self.last_memory_sync,
             "control_socket": str(self.paths.control_socket),
             "control_endpoint": self._control_endpoint(),
+            "last_heartbeat_action": self.last_heartbeat_action,
+            "recent_watched_changes": [self._relative_path_label(path) for path in self.recent_watched_changes[:5]],
+            "pending_suggestions": len(
+                self.state_store.list_background_suggestions(status="pending", limit=200)
+            ),
         }
         self.state_store.set_daemon_state(payload)
         write_json_atomic(self.paths.heartbeat_state_json, payload)
@@ -149,6 +571,8 @@ class KestrelDaemonTaskMixin:
         resume_state: dict[str, Any] | None = None,
         approved: bool = False,
     ):
+        task_record = self.state_store.get_task(task_id) if task_id else None
+        workspace_id = str(((task_record or {}).get("metadata") or {}).get("workspace_id") or "local")
         if resume_state:
             self.state_store.update_task(
                 task_id,
@@ -168,7 +592,7 @@ class KestrelDaemonTaskMixin:
             runner_goal = self._build_prompt(goal)
 
         try:
-            outcome = await self._build_agent_runner(task_id=task_id).run(
+            outcome = await self._build_agent_runner(task_id=task_id, workspace_id=workspace_id).run(
                 goal=runner_goal,
                 history=history or [],
                 task_id=task_id,
@@ -187,6 +611,7 @@ class KestrelDaemonTaskMixin:
                 artifacts=[],
             )
         if outcome.status == "completed":
+            self._finalize_local_control_plane(task_id=task_id, kind=kind, outcome=outcome)
             self._publish_event(
                 task_id,
                 "task_complete",
@@ -200,13 +625,32 @@ class KestrelDaemonTaskMixin:
                     "final": True,
                 },
             )
+            await self._notify_background_task_status(
+                self.state_store.get_task(task_id),
+                status="completed",
+                message=outcome.message,
+            )
         elif outcome.status == "failed":
             self.state_store.update_task(task_id, status="failed", error=outcome.message)
+            self._finalize_local_control_plane(task_id=task_id, kind=kind, outcome=outcome)
             self._publish_event(
                 task_id,
                 "task_failed",
                 outcome.message,
                 {"status": "failed", "error": outcome.message, "final": True},
+            )
+            await self._notify_background_task_status(
+                self.state_store.get_task(task_id),
+                status="failed",
+                message=outcome.message,
+            )
+        elif outcome.status == "waiting_approval":
+            self._finalize_local_control_plane(task_id=task_id, kind=kind, outcome=outcome)
+            await self._notify_background_task_status(
+                self.state_store.get_task(task_id),
+                status="waiting_approval",
+                message=outcome.message,
+                approval=outcome.approval,
             )
         return outcome
 
@@ -232,17 +676,30 @@ class KestrelDaemonTaskMixin:
         finally:
             self.active_tasks.pop(task_id, None)
 
-    async def _execute_task(self, task_id: str, goal: str) -> None:
+    async def _execute_task(
+        self,
+        task_id: str,
+        goal: str,
+        *,
+        kind: str = "task",
+        history: list[dict[str, Any]] | None = None,
+    ) -> None:
         try:
             await self._run_native_agent_task(
                 task_id,
                 goal,
-                kind="task",
+                kind=kind,
+                history=_normalize_chat_history(history),
                 initial_tool_call=self._detect_fast_path_tool_call(goal),
             )
         except asyncio.CancelledError:  # pragma: no cover - shutdown path
             self.state_store.update_task(task_id, status="cancelled", error="Task cancelled")
             self._publish_event(task_id, "task_cancelled", "Task cancelled", {"final": True, "status": "cancelled"})
+            await self._notify_background_task_status(
+                self.state_store.get_task(task_id),
+                status="failed",
+                message="Task cancelled",
+            )
             raise
         except Exception as exc:
             self.state_store.update_task(task_id, status="failed", error=str(exc))
@@ -251,6 +708,11 @@ class KestrelDaemonTaskMixin:
                 "task_failed",
                 str(exc),
                 {"status": "failed", "error": str(exc), "final": True},
+            )
+            await self._notify_background_task_status(
+                self.state_store.get_task(task_id),
+                status="failed",
+                message=str(exc),
             )
         finally:
             self.active_tasks.pop(task_id, None)
@@ -446,26 +908,31 @@ class KestrelDaemonTaskMixin:
         categories = self._enabled_chat_tool_categories()
         tool_lines = describe_chat_tool_categories(categories)
 
-        return (
-            "You are Kestrel, a local autonomous agent OS focused on concise, actionable assistance.\n\n"
-            "## Runtime Environment\n"
-            f"- Runtime mode: {profile.get('runtime_mode', 'native')}\n"
-            f"- Policy: {profile.get('policy_name', 'unknown')}\n"
-            f"- Host mounts:\n{mounts_str}\n"
-            f"- Home directory: {Path.home()}\n\n"
-            "## Tool Categories\n"
-            f"{tool_lines}\n\n"
-            "## Capabilities\n"
-            "You have tools to interact with the local system. ALWAYS use the provided tools when asked to:\n"
-            "- Create, read, or modify files\n"
-            "- List directory contents\n"
-            "- Execute shell commands\n"
-            "- Send an existing local file to Telegram when the user explicitly asks for Telegram delivery\n"
-            "- Generate media or capture the current screen when the user asks\n"
-            "IMPORTANT: Never claim you performed an action without actually calling the appropriate tool.\n"
-            "If you need to create a file, use create_file. If you need to run a command, use run_command. "
-            "If you need the current desktop image, use take_screenshot. "
-            "If you need to send a local file to Telegram, use send_local_file_to_telegram.\n"
+        return compose_native_system_prompt(
+            config=self._config_for_workspace(self._resolve_workspace_id()),
+            role="assistant",
+            ambient_state=self._ambient_state_for_workspace(self._resolve_workspace_id()),
+            workspace_system_prompt=self._workspace_system_prompt(self._resolve_workspace_id()),
+            role_instructions=(
+                "## Runtime Environment\n"
+                f"- Runtime mode: {profile.get('runtime_mode', 'native')}\n"
+                f"- Policy: {profile.get('policy_name', 'unknown')}\n"
+                f"- Host mounts:\n{mounts_str}\n"
+                f"- Home directory: {Path.home()}\n\n"
+                "## Tool Categories\n"
+                f"{tool_lines}\n\n"
+                "## Capabilities\n"
+                "You have tools to interact with the local system. ALWAYS use the provided tools when asked to:\n"
+                "- Create, read, or modify files\n"
+                "- List directory contents\n"
+                "- Execute shell commands\n"
+                "- Send an existing local file to Telegram when the user explicitly asks for Telegram delivery\n"
+                "- Generate media or capture the current screen when the user asks\n"
+                "IMPORTANT: Never claim you performed an action without actually calling the appropriate tool.\n"
+                "If you need to create a file, use create_file. If you need to run a command, use run_command. "
+                "If you need the current desktop image, use take_screenshot. "
+                "If you need to send a local file to Telegram, use send_local_file_to_telegram.\n"
+            ),
         )
 
     def _build_prompt(self, goal: str) -> str:
@@ -501,10 +968,16 @@ class KestrelDaemonTaskMixin:
 
     def _in_quiet_hours(self) -> bool:
         quiet = self.config.get("heartbeat", {}).get("quiet_hours", {})
-        if not quiet.get("enabled"):
+        if not isinstance(quiet, dict):
             return False
-        start = str(quiet.get("start", "23:00"))
-        end = str(quiet.get("end", "07:00"))
+        enabled = quiet.get("enabled")
+        start = str(quiet.get("start") or "").strip()
+        end = str(quiet.get("end") or "").strip()
+        has_window = bool(start and end)
+        if not bool(enabled) and not (enabled is None and has_window):
+            return False
+        if not has_window:
+            return False
         now = datetime_now_hhmm()
         if start <= end:
             return start <= now <= end

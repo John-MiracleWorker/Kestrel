@@ -1,10 +1,12 @@
 import asyncio
 import base64
 import copy
+import io
 import json
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -13,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import kestrel_daemon as daemon
 import kestrel_native as native
+import skillpacks as shared_skillpacks_impl
 from kestrel_cli import native_agent_base as native_agent_base_impl
 from kestrel_cli import native_chat_tools as native_chat_tools_impl
 from kestrel_cli import native_models as native_models_impl
@@ -661,6 +664,137 @@ def test_native_agent_runner_uses_svg_render_heuristic_for_svg_to_png_goals(tmp_
     assert any(path.endswith(".svg") for path in artifact_paths)
     assert any(path.endswith(".png") for path in artifact_paths)
     assert "Done" in outcome.message or "Rendered" in outcome.message
+
+
+def test_native_agent_runner_uses_skill_search_heuristic_for_skill_discovery_goals(tmp_path, monkeypatch):
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    state_store = native.SQLiteStateStore(paths.sqlite_db)
+    state_store.initialize()
+
+    class StubSkillPackManager:
+        def select_packs(self, goal, history=None):
+            return {"packs": [], "prompt_block": ""}
+
+        def enabled_tool_components(self):
+            return []
+
+        def search(self, query, include_marketplace=True):
+            assert include_marketplace is True
+            return {
+                "query": query,
+                "results": [
+                    {
+                        "pack_id": "budget-helper",
+                        "name": "budget_helper",
+                        "description": "Track expenses and monthly budgets.",
+                    }
+                ],
+                "total": 1,
+            }
+
+    runner = native.NativeAgentRunner(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        runtime_policy=native.NativeRuntimePolicy(native.DEFAULT_CONFIG),
+        state_store=state_store,
+        workspace_root=tmp_path,
+        skill_pack_manager=StubSkillPackManager(),
+    )
+
+    async def fail_next_action(self, state, step):
+        raise AssertionError("_next_action should not be called for deterministic skill search")
+
+    async def verify(self, state, draft_response):
+        return {"ok": True, "final_response": draft_response, "reason": "grounded"}, "fake", "model"
+
+    monkeypatch.setattr(native.NativeAgentRunner, "_next_action", fail_next_action)
+    monkeypatch.setattr(native.NativeAgentRunner, "_verify_response", verify)
+
+    outcome = asyncio.run(
+        runner.run(goal="Search for any skills that could help me organize my financial life")
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.plan is not None
+    assert outcome.plan["summary"] == "Search the available skill packs for a relevant match."
+    assert outcome.state["tool_evidence"][0]["tool_name"] == "skill_search"
+    assert outcome.state["tool_evidence"][0]["arguments"] == {
+        "query": "organize my financial life",
+        "include_marketplace": True,
+    }
+    assert "budget_helper" in outcome.message
+    assert "Track expenses and monthly budgets." in outcome.message
+
+
+def test_native_agent_runner_treats_short_follow_up_as_skill_search_refinement(tmp_path, monkeypatch):
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    state_store = native.SQLiteStateStore(paths.sqlite_db)
+    state_store.initialize()
+
+    class StubSkillPackManager:
+        def select_packs(self, goal, history=None):
+            return {"packs": [], "prompt_block": ""}
+
+        def enabled_tool_components(self):
+            return []
+
+        def search(self, query, include_marketplace=True):
+            assert include_marketplace is True
+            return {
+                "query": query,
+                "results": [
+                    {
+                        "pack_id": "budget-helper",
+                        "name": "budget_helper",
+                        "description": "Track expenses and monthly budgets.",
+                    }
+                ],
+                "total": 1,
+            }
+
+    runner = native.NativeAgentRunner(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        runtime_policy=native.NativeRuntimePolicy(native.DEFAULT_CONFIG),
+        state_store=state_store,
+        workspace_root=tmp_path,
+        skill_pack_manager=StubSkillPackManager(),
+    )
+
+    async def fail_next_action(self, state, step):
+        raise AssertionError("_next_action should not be called for deterministic follow-up skill search")
+
+    async def verify(self, state, draft_response):
+        return {"ok": True, "final_response": draft_response, "reason": "grounded"}, "fake", "model"
+
+    monkeypatch.setattr(native.NativeAgentRunner, "_next_action", fail_next_action)
+    monkeypatch.setattr(native.NativeAgentRunner, "_verify_response", verify)
+
+    outcome = asyncio.run(
+        runner.run(
+            goal="Budget tracker",
+            history=[
+                {
+                    "role": "user",
+                    "content": "Can you look for a skill that can help me manage my financial life?",
+                },
+                {
+                    "role": "assistant",
+                    "content": "I found a finance skill. Do you want me to download that skill or search for something else?",
+                },
+            ],
+        )
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.plan is not None
+    assert outcome.plan["summary"] == "Search the available skill packs for a relevant match."
+    assert outcome.state["tool_evidence"][0]["tool_name"] == "skill_search"
+    assert outcome.state["tool_evidence"][0]["arguments"] == {
+        "query": "Budget tracker",
+        "include_marketplace": True,
+    }
+    assert "budget_helper" in outcome.message
 
 
 def test_render_svg_asset_can_send_png_to_telegram(tmp_path, monkeypatch):
@@ -1470,6 +1604,81 @@ def test_generate_step_output_retries_without_thinking_after_failure(tmp_path, m
     assert "Return only valid standalone SVG markup." in calls[0]["messages"][0]["content"]
 
 
+def test_native_agent_runner_composes_persona_workspace_and_ambient_prompts(tmp_path, monkeypatch):
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    runner = native.NativeAgentRunner(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        runtime_policy=native.NativeRuntimePolicy(native.DEFAULT_CONFIG),
+        workspace_root=tmp_path,
+        workspace_id="workspace-1",
+        workspace_system_prompt="Prefer terse answers and mention blockers plainly.",
+        ambient_state={
+            "pending_approvals_count": 2,
+            "last_heartbeat_action": "Started a background review of recent changes.",
+            "watched_changes": ["WORKSPACE.md", "src/app.py"],
+            "recent_background_tasks": [{"status": "running", "goal": "Review recent watched changes"}],
+        },
+    )
+    captured: dict[str, list[dict[str, Any]]] = {}
+    state = {
+        "skill_selection": {"prompt_block": "Use the finance workspace pack when it is relevant."},
+        "goal": "User goal:\nInspect the workspace state",
+        "plan": {"summary": "Inspect the workspace state"},
+        "tool_evidence": [],
+        "step_outputs": {},
+    }
+
+    async def fake_request_model_json(*, messages, config, repair_label):
+        captured[repair_label] = messages
+        return {"mode": "direct_response", "response": "ok"}, "fake", "model"
+
+    async def fake_generate_local_text_response(*, messages, config, **kwargs):
+        captured["direct"] = messages
+        return {"content": "ok", "provider": "fake", "model": "model"}
+
+    monkeypatch.setattr(native_agent_base_impl, "_request_model_json", fake_request_model_json)
+    monkeypatch.setattr(native_agent_base_impl, "_generate_local_text_response", fake_generate_local_text_response)
+
+    asyncio.run(runner._plan_goal("Inspect the workspace state", [], None, state))
+    asyncio.run(runner._direct_response("Inspect the workspace state", [], state=state))
+    step_messages = runner._build_step_output_messages(
+        state,
+        {
+            "id": "step_1",
+            "description": "Summarize the current workspace state",
+            "success_criteria": "A concise summary exists",
+            "preferred_tools": [],
+        },
+        expects_svg_markup=False,
+    )
+
+    planner_prompt = captured["planner"][0]["content"]
+    direct_prompt = captured["direct"][0]["content"]
+    step_prompt = step_messages[0]["content"]
+
+    assert "You are Kestrel's native planner." in planner_prompt
+    assert "Ambient state:" in planner_prompt
+    assert "Pending approvals: 2" in planner_prompt
+    assert "Saved workspace system prompt:" in planner_prompt
+    assert "Prefer terse answers and mention blockers plainly." in planner_prompt
+    assert "Relevant skill packs:" in planner_prompt
+    assert "Return exactly one JSON object." in planner_prompt
+    assert planner_prompt.index("You are Kestrel's native planner.") < planner_prompt.index("Ambient state:")
+    assert planner_prompt.index("Ambient state:") < planner_prompt.index("Saved workspace system prompt:")
+    assert planner_prompt.index("Saved workspace system prompt:") < planner_prompt.index("Relevant skill packs:")
+    assert planner_prompt.index("Relevant skill packs:") < planner_prompt.index("Return exactly one JSON object.")
+
+    assert "You are Kestrel's native direct responder." in direct_prompt
+    assert "Started a background review of recent changes." in direct_prompt
+    assert "Prefer terse answers and mention blockers plainly." in direct_prompt
+    assert "Use the finance workspace pack when it is relevant." in direct_prompt
+
+    assert "You are Kestrel's native step writer." in step_prompt
+    assert "Saved workspace system prompt:" in step_prompt
+    assert "Relevant skill packs:" in step_prompt
+
+
 def test_native_agent_runner_returns_failed_outcome_on_structured_output_error(tmp_path, monkeypatch):
     paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
     state_store = native.SQLiteStateStore(paths.sqlite_db)
@@ -1706,6 +1915,166 @@ components:
     selected_ids = [item["pack_id"] for item in selection["packs"]]
     assert "parent-pack" in selected_ids
     assert "dependency-pack" in selected_ids
+
+
+def test_native_skill_pack_manager_supports_agent_skills_api_search_and_install(tmp_path, monkeypatch):
+    def _make_archive(pack_dir: Path, destination_dir: Path) -> Path:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        archive_base = destination_dir / pack_dir.name
+        archive_path = shutil.make_archive(
+            str(archive_base),
+            "zip",
+            root_dir=str(pack_dir.parent),
+            base_dir=pack_dir.name,
+        )
+        return Path(archive_path)
+
+    repo_root = tmp_path / "demo-agent-skills-repo"
+    skill_dir = repo_root / "plugins" / "finance" / "creating-financial-models"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        """---
+name: creating-financial-models
+description: Build financial models from company data.
+---
+
+Use this skill for DCFs, scenario planning, and finance analysis.
+""",
+        encoding="utf-8",
+    )
+    archive_path = _make_archive(repo_root, tmp_path / "archives")
+
+    api_payload = {
+        "skills": [
+            {
+                "id": "demo-creating-financial-models",
+                "name": "custom_skills",
+                "description": "creating-financial-models: Build financial models from company data.",
+                "author": "demo",
+                "stars": 42,
+                "forks": 7,
+                "githubUrl": "https://github.com/demo/repo/tree/main/plugins/finance/creating-financial-models",
+                "scopedName": "@demo/custom_skills",
+                "repoFullName": "demo/repo",
+                "path": "plugins/finance/creating-financial-models/SKILL.md",
+                "hasContent": True,
+            }
+        ],
+        "total": 1,
+        "limit": 20,
+        "offset": 0,
+    }
+
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.close()
+            return False
+
+    original_urlopen = shared_skillpacks_impl.urlopen
+
+    def fake_urlopen(request, *args, **kwargs):
+        url = request.full_url if hasattr(request, "full_url") else str(request)
+        if url.startswith("https://www.agentskills.in/api/skills"):
+            return FakeResponse(json.dumps(api_payload).encode("utf-8"))
+        if url == "https://api.github.com/repos/demo/repo/zipball/main":
+            return FakeResponse(archive_path.read_bytes())
+        return original_urlopen(request, *args, **kwargs)
+
+    monkeypatch.setattr(shared_skillpacks_impl, "urlopen", fake_urlopen)
+
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    state_store = native.SQLiteStateStore(paths.sqlite_db)
+    state_store.initialize()
+    config = copy.deepcopy(native.DEFAULT_CONFIG)
+    config["skills"]["marketplace_urls"] = ["https://www.agentskills.in/api/skills"]
+    manager = native.NativeSkillPackManager(
+        paths=paths,
+        config=config,
+        state_store=state_store,
+        workspace_root=tmp_path,
+    )
+
+    search = manager.search("creating financial models", include_marketplace=True)
+
+    assert search["total"] >= 1
+    remote = next(item for item in search["results"] if item["source_type"] == "agent_skills_api")
+    assert remote["name"] == "creating-financial-models"
+    assert remote["compat"]["skill_dir"] == "plugins/finance/creating-financial-models"
+
+    result = manager.install(pack_id=remote["pack_id"], scope="user")
+
+    assert result["pack"]["pack_id"] == "creating-financial-models"
+    assert state_store.get_skill_pack("creating-financial-models") is not None
+
+    selection = manager.select_packs("Help me build a financial model for this company.")
+    selected_ids = [item["pack_id"] for item in selection["packs"]]
+    assert "creating-financial-models" in selected_ids
+
+
+def test_native_skill_pack_manager_retries_agent_skills_search_with_simpler_queries(tmp_path, monkeypatch):
+    api_payload = {
+        "skills": [
+            {
+                "id": "openclaw-skills-skills-thisisjeron-actual-budget-skill-md",
+                "author": "openclaw",
+                "description": "actual-budget: Personal finance and budgeting workflow.",
+                "githubUrl": "https://github.com/openclaw/skills/tree/main/skills/thisisjeron/actual-budget",
+                "path": "skills/thisisjeron/actual-budget/SKILL.md",
+                "rawUrl": "https://raw.githubusercontent.com/openclaw/skills/main/skills/thisisjeron/actual-budget/SKILL.md",
+                "repoFullName": "openclaw/skills",
+                "scopedName": "@openclaw/actual-budget",
+                "stars": 2816,
+                "forks": 814,
+            }
+        ]
+    }
+    requested_urls: list[str] = []
+
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.close()
+            return False
+
+    original_urlopen = shared_skillpacks_impl.urlopen
+
+    def fake_urlopen(request, *args, **kwargs):
+        url = request.full_url if hasattr(request, "full_url") else str(request)
+        if url.startswith("https://www.agentskills.in/api/skills"):
+            requested_urls.append(url)
+            if "search=personal+finance" in url:
+                return FakeResponse(json.dumps(api_payload).encode("utf-8"))
+            return FakeResponse(json.dumps({"skills": []}).encode("utf-8"))
+        return original_urlopen(request, *args, **kwargs)
+
+    monkeypatch.setattr(shared_skillpacks_impl, "urlopen", fake_urlopen)
+
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    state_store = native.SQLiteStateStore(paths.sqlite_db)
+    state_store.initialize()
+    config = copy.deepcopy(native.DEFAULT_CONFIG)
+    config["skills"]["marketplace_urls"] = ["https://www.agentskills.in/api/skills"]
+    manager = native.NativeSkillPackManager(
+        paths=paths,
+        config=config,
+        state_store=state_store,
+        workspace_root=tmp_path,
+    )
+
+    result = manager.search(
+        "finance budgeting expense tracking investment management personal finance",
+        include_marketplace=True,
+    )
+
+    assert result["total"] >= 1
+    remote = next(item for item in result["results"] if item["source_type"] == "agent_skills_api")
+    assert remote["pack_id"] == "agentskills:openclaw:skills/thisisjeron/actual-budget"
+    assert any("search=personal+finance" in url for url in requested_urls)
 
 
 def test_daemon_detect_fast_path_tool_call_routes_skill_list(tmp_path):

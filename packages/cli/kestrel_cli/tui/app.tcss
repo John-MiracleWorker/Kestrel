@@ -55,6 +55,13 @@ Button.utility-button {
     border: round #12334a;
 }
 
+Button:focus {
+    border: round #00f3ff;
+    background: #0b2231;
+    color: #f6fbff;
+    text-style: bold;
+}
+
 #workspace-shell {
     height: 1fr;
     background: #03070d;
@@ -101,6 +108,11 @@ Button.utility-button {
     border: round #102637;
     background: #07111a;
     padding: 1;
+}
+
+.surface-panel.is-focused {
+    border: round #00f3ff;
+    background: #091723;
 }
 
 .section-title {
@@ -216,6 +228,17 @@ Button.utility-button {
     border: round #00f3ff;
 }
 
+Input:focus,
+TextArea:focus {
+    border: round #00f3ff;
+    background: #071723;
+    color: #f6fbff;
+}
+
+TextArea:focus > .text-area--cursor-line {
+    background: #0b1d29;
+}
+
 #chat-composer-actions {
     width: 22;
     padding: 0 0 0 1;
@@ -246,6 +269,30 @@ DataTable {
     background: #040a10;
     color: #d8eaf6;
     border: round #102637;
+}
+
+DataTable > .datatable--cursor {
+    background: #11354a;
+    color: #f6fbff;
+    text-style: bold;
+}
+
+DataTable:focus {
+    border: round #00f3ff;
+    background: #071723;
+}
+
+DataTable:focus > .datatable--cursor,
+DataTable:focus > .datatable--header-cursor,
+DataTable:focus > .datatable--fixed-cursor {
+    background: #00f3ff;
+    color: #03131a;
+    text-style: bold;
+}
+
+DataTable:focus > .datatable--header {
+    background: #0f2736;
+    color: #dffbff;
 }
 
 #tasks-actions,

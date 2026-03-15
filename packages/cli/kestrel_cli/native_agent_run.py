@@ -257,12 +257,21 @@ class NativeAgentRunnerRunMixin:
                 action: dict[str, Any]
                 approved_for_action = False
                 auto_render_args = None
+                auto_skill_search_args = None
                 if (
                     "render_svg_asset" in step.get("preferred_tools", [])
                     and not state.get("forced_action")
                     and not state.get("pending_action")
                 ):
                     auto_render_args = self._infer_svg_render_arguments(state, step)
+                if (
+                    not auto_render_args
+                    and "skill_search" in step.get("preferred_tools", [])
+                    and not state.get("forced_action")
+                    and not state.get("pending_action")
+                    and not state.get("tool_evidence")
+                ):
+                    auto_skill_search_args = self._infer_skill_search_arguments(state, step)
                 if auto_render_args:
                     action = {
                         "action": "tool_call",
@@ -271,6 +280,14 @@ class NativeAgentRunnerRunMixin:
                         "reason": "Deterministic SVG render from stored step output.",
                     }
                     state.setdefault("complete_step_after_tool", {})[step["id"]] = "render_svg_asset"
+                elif auto_skill_search_args:
+                    action = {
+                        "action": "tool_call",
+                        "tool_name": "skill_search",
+                        "arguments": auto_skill_search_args,
+                        "reason": "Deterministic skill search for an explicit skill-discovery request.",
+                    }
+                    state.setdefault("complete_step_after_tool", {})[step["id"]] = "skill_search"
                 elif isinstance(state.get("forced_action"), dict):
                     action = dict(state["forced_action"])
                     state["forced_action"] = None
@@ -397,7 +414,10 @@ class NativeAgentRunnerRunMixin:
                     ):
                         step["status"] = "complete"
                         state["completed_steps"].append(step["id"])
-                        summary = str(result.message or step["description"]).strip()
+                        if tool_name == "skill_search":
+                            summary = self._summarize_skill_search_result(result.data)
+                        else:
+                            summary = str(result.message or step["description"]).strip()
                         state["final_response_draft"] = summary
                         complete_after_tool.pop(step["id"], None)
                         self._emit("step_complete", summary, step_id=step["id"], step=step)

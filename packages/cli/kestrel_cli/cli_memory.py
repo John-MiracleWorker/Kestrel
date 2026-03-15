@@ -716,6 +716,7 @@ async def interactive_repl(client: KestrelClient, config: dict):
         print_logo(context)
     except TypeError:
         print_logo()
+    chat_history: list[dict[str, str]] = []
     print_panel(
         "Ready",
         [
@@ -770,6 +771,7 @@ async def interactive_repl(client: KestrelClient, config: dict):
                     elif se.get("action") == "reset_session":
                         context["total_tokens"] = 0
                         context["cost_usd"] = 0
+                        chat_history.clear()
                     elif se.get("action") == "exit_repl":
                         print(c("  Flight closed.\n", Colors.KESTREL))
                         break
@@ -791,7 +793,7 @@ async def interactive_repl(client: KestrelClient, config: dict):
             # Regular chat message — stream via SSE
             print()
             if client._use_local_control():
-                response = await client.chat(user_input)
+                response = await client.chat(user_input, history=chat_history)
                 if response.get("error"):
                     print_error(response["error"])
                 else:
@@ -816,6 +818,13 @@ async def interactive_repl(client: KestrelClient, config: dict):
                     elif response.get("artifacts"):
                         artifact_count = len(response.get("artifacts") or [])
                         print(c(f"\n  artifacts: {artifact_count}", Colors.MUTED))
+                    chat_history.extend(
+                        [
+                            {"role": "user", "content": user_input},
+                            {"role": "assistant", "content": str(response.get("message", "") or "")},
+                        ]
+                    )
+                    del chat_history[:-8]
                     print()
                 continue
             async for event in client.start_task(user_input):

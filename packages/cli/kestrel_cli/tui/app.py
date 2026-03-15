@@ -9,6 +9,7 @@ from typing import Any
 from rich.console import Group
 from rich.panel import Panel
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult, ScreenStackError
 from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
@@ -34,6 +35,7 @@ from .widgets import (
     NotificationCenterScreen,
     PaletteAction,
     ProcessBar,
+    ReadOnlyLog,
     StatusOrb,
     render_chat_message,
     render_key_value_table,
@@ -53,10 +55,10 @@ class InspectorModalScreen(ModalScreen[None]):
         with Vertical(id="inspector-modal"):
             yield Static(self.title, id="inspector-modal-title")
             yield Static(self.subtitle, id="inspector-modal-subtitle")
-            yield RichLog(id="inspector-modal-log", wrap=True, highlight=False, markup=False)
+            yield ReadOnlyLog(id="inspector-modal-log", wrap=True, highlight=False, markup=False)
 
     def on_mount(self) -> None:
-        log = self.query_one("#inspector-modal-log", RichLog)
+        log = self.query_one("#inspector-modal-log", ReadOnlyLog)
         log.clear()
         for renderable in self.renderables:
             log.write(renderable)
@@ -78,6 +80,13 @@ class KestrelTextualApp(App[None]):
         ("ctrl+r", "refresh_now", "Refresh"),
         ("ctrl+i", "toggle_details", "Details"),
         ("ctrl+enter", "send_chat", "Send"),
+        ("ctrl+shift+enter", "launch_task", "Launch Task"),
+        ("alt+r", "context_refresh", "Refresh"),
+        ("alt+a", "context_approve", "Approve"),
+        ("alt+d", "context_deny", "Deny"),
+        ("alt+i", "context_install", "Install"),
+        ("alt+e", "context_toggle_skill", "Toggle"),
+        ("alt+x", "context_remove_skill", "Remove"),
     ]
 
     def __init__(self, client: KestrelClient, config: dict[str, Any]):
@@ -90,6 +99,7 @@ class KestrelTextualApp(App[None]):
         self._tagline_index = 0
         self._suspend_table_events = False
         self._ui_ready = False
+        self._overlay_focus_target_id = ""
         self._taglines = [
             "NATIVE CONTROL // TELEGRAM PRIMARY // TASK STREAMS LIVE",
             "COCKPIT ONLINE // APPROVALS HOT // CHANNELS MIRRORED",
@@ -139,7 +149,7 @@ class KestrelTextualApp(App[None]):
                             yield Static("No pending approvals", id="chat-approval-banner")
                             yield Button("Approve", id="chat-approve-inline", variant="success")
                             yield Button("Deny", id="chat-deny-inline", variant="error")
-                        yield RichLog(id="chat-log", wrap=True, highlight=False, markup=False, auto_scroll=True)
+                        yield ReadOnlyLog(id="chat-log", wrap=True, highlight=False, markup=False, auto_scroll=True)
                         yield Static("Artifacts: none", id="chat-artifacts")
                         with Horizontal(id="chat-composer-shell", classes="surface-panel"):
                             yield TextArea(id="chat-composer")
@@ -158,7 +168,7 @@ class KestrelTextualApp(App[None]):
                                     yield Button("Refresh", id="tasks-refresh", classes="utility-button")
                                     yield Button("Approve", id="tasks-approve", variant="success")
                                     yield Button("Deny", id="tasks-deny", variant="error")
-                                yield RichLog(id="tasks-timeline", wrap=True, highlight=False, markup=False)
+                                yield ReadOnlyLog(id="tasks-timeline", wrap=True, highlight=False, markup=False)
                     with Container(id="view-approvals", classes="view-pane"):
                         with Horizontal(id="approvals-layout"):
                             with Vertical(id="approvals-list-panel", classes="surface-panel"):
@@ -169,7 +179,7 @@ class KestrelTextualApp(App[None]):
                                     yield Static("COMMAND PREVIEW", classes="section-title")
                                     yield Button("Approve", id="approval-approve", variant="success")
                                     yield Button("Deny", id="approval-deny", variant="error")
-                                yield RichLog(id="approval-preview", wrap=True, highlight=False, markup=False)
+                                yield ReadOnlyLog(id="approval-preview", wrap=True, highlight=False, markup=False)
                     with Container(id="view-skills", classes="view-pane"):
                         with Horizontal(id="skills-layout"):
                             with Vertical(id="skills-list-panel", classes="surface-panel"):
@@ -182,7 +192,7 @@ class KestrelTextualApp(App[None]):
                                     yield Button("Install", id="skill-install", variant="primary")
                                     yield Button("Enable / Disable", id="skill-toggle", classes="utility-button")
                                     yield Button("Remove", id="skill-remove", variant="error")
-                                yield RichLog(id="skill-preview", wrap=True, highlight=False, markup=False)
+                                yield ReadOnlyLog(id="skill-preview", wrap=True, highlight=False, markup=False)
                 yield InspectorPane(id="inspector")
             with Horizontal(id="bottom-bar"):
                 yield Static("", id="notice-bar")
@@ -196,6 +206,7 @@ class KestrelTextualApp(App[None]):
         await self._refresh_all()
         self._ui_ready = True
         self._focus_primary_control()
+        self._sync_focus_panels()
         self.run_worker(self._poll_runtime_loop(), name="runtime-poller", group="runtime")
         self.run_worker(self._poll_tasks_loop(), name="task-poller", group="tasks")
         self.run_worker(self._poll_approvals_loop(), name="approval-poller", group="approvals")
@@ -433,6 +444,7 @@ class KestrelTextualApp(App[None]):
         self._render_approvals()
         self._render_skills()
         self._render_inspector()
+        self._sync_focus_panels()
 
     def _render_chrome(self) -> None:
         runtime = self.store.state.runtime
@@ -454,9 +466,19 @@ class KestrelTextualApp(App[None]):
 
     def _render_bottom_bar(self) -> None:
         notice = self.store.state.notice_text or "Ready"
-        hints = "TAB cycle  ARROWS select  ENTER open  CTRL+K palette  CTRL+N notifications"
+        hints = self._view_hints()
         self._ui_query_one("#notice-bar", Static).update(notice)
         self._ui_query_one("#hint-bar", Static).update(hints)
+
+    def _view_hints(self) -> str:
+        hints = {
+            VIEW_COCKPIT: "TAB cycle  ARROWS select row  ENTER open  CTRL+K palette  CTRL+N notifications",
+            VIEW_CHAT: "TAB cycle  CTRL+ENTER send  CTRL+SHIFT+ENTER task  ENTER/SPACE buttons  CTRL+N notifications",
+            VIEW_TASKS: "TAB cycle  ARROWS select task  ENTER select  ALT+R refresh  ALT+A approve  ALT+D deny",
+            VIEW_APPROVALS: "TAB cycle  ARROWS select approval  ENTER select  ALT+A approve  ALT+D deny",
+            VIEW_SKILLS: "TAB cycle  ARROWS select pack  ENTER select  ALT+I install  ALT+E toggle  ALT+X remove",
+        }
+        return hints.get(self.store.state.active_view, "TAB cycle  CTRL+K palette  CTRL+N notifications")
 
     def _render_cockpit(self) -> None:
         runtime = self.store.state.runtime
@@ -949,6 +971,7 @@ class KestrelTextualApp(App[None]):
             task_mode = "task"
         if not clean_prompt:
             return
+        history = self.store.chat_history() if task_mode == "chat" else []
 
         composer = self._ui_query_one("#chat-composer", TextArea)
         composer.clear()
@@ -969,7 +992,7 @@ class KestrelTextualApp(App[None]):
 
         task_id = ""
         try:
-            async for event in self.client.start_task(clean_prompt, kind=task_mode):
+            async for event in self.client.start_task(clean_prompt, kind=task_mode, history=history):
                 event_task_id = str(event.get("task_id") or "")
                 if event_task_id:
                     task_id = event_task_id
@@ -1143,10 +1166,13 @@ class KestrelTextualApp(App[None]):
         if result == "mark_read":
             self.store.mark_notifications_read()
             self._render_state()
+        self._defer_focus_restore()
 
     async def _open_palette_screen(self) -> None:
+        self._remember_focus_target()
         result = await self.push_screen_wait(CommandPaletteScreen(self._palette_actions()))
         self._handle_palette_result(result)
+        self._defer_focus_restore()
 
     def _activate_view(self, view: str) -> None:
         if self.store.set_view(view):
@@ -1154,6 +1180,7 @@ class KestrelTextualApp(App[None]):
         self._sync_layout()
         self._render_state()
         self._focus_primary_control(view)
+        self._sync_focus_panels()
 
     def _focus_primary_control(self, view: str | None = None) -> None:
         target_view = view or self.store.state.active_view
@@ -1171,6 +1198,57 @@ class KestrelTextualApp(App[None]):
             self._ui_query_one(selector, expect_type).focus()
         except Exception:
             return
+
+    def _remember_focus_target(self) -> None:
+        focused = self.focused
+        if focused is not None and focused.id:
+            self._overlay_focus_target_id = focused.id
+            return
+        self._overlay_focus_target_id = ""
+
+    def _widget_is_visible(self, widget: Any) -> bool:
+        for ancestor in getattr(widget, "ancestors_with_self", []):
+            if getattr(ancestor, "display", True) is False:
+                return False
+        return True
+
+    def _focus_widget_by_id(self, widget_id: str) -> bool:
+        if not widget_id:
+            return False
+        try:
+            widget = self._ui_query_one(f"#{widget_id}")
+        except Exception:
+            return False
+        if not getattr(widget, "can_focus", False) or getattr(widget, "disabled", False):
+            return False
+        if not self._widget_is_visible(widget):
+            return False
+        try:
+            widget.focus()
+        except Exception:
+            return False
+        return True
+
+    def _restore_focus_target(self) -> None:
+        if len(self.screen_stack) > 1:
+            return
+        if self._focus_widget_by_id(self._overlay_focus_target_id):
+            self._sync_focus_panels()
+            return
+        self._focus_primary_control()
+        self._sync_focus_panels()
+
+    def _defer_focus_restore(self) -> None:
+        self.call_after_refresh(self._restore_focus_target)
+
+    def _sync_focus_panels(self) -> None:
+        screen = self._ui_screen()
+        if screen is None:
+            return
+        focused = self.focused
+        focused_ancestors = set(getattr(focused, "ancestors_with_self", [])) if focused is not None else set()
+        for panel in screen.query(".surface-panel"):
+            panel.set_class(panel in focused_ancestors, "is-focused")
 
     def action_view_cockpit(self) -> None:
         self._activate_view(VIEW_COCKPIT)
@@ -1191,6 +1269,7 @@ class KestrelTextualApp(App[None]):
         self.run_worker(self._open_palette_screen(), name="open-palette")
 
     def action_open_notifications(self) -> None:
+        self._remember_focus_target()
         self.push_screen(NotificationCenterScreen(self.store.state.notifications), self._handle_notification_result)
 
     def action_refresh_now(self) -> None:
@@ -1199,16 +1278,88 @@ class KestrelTextualApp(App[None]):
     def action_toggle_details(self) -> None:
         if self.store.state.compact_mode:
             title, subtitle, renderables = self._build_inspector_content()
-            self.push_screen(InspectorModalScreen(title=title, subtitle=subtitle, renderables=renderables))
+            self._remember_focus_target()
+            self.push_screen(
+                InspectorModalScreen(title=title, subtitle=subtitle, renderables=renderables),
+                lambda _result: self._defer_focus_restore(),
+            )
             return
         self.store.toggle_inspector()
         self._sync_layout()
         self._render_inspector()
+        self._sync_focus_panels()
 
     def action_send_chat(self) -> None:
+        if len(self.screen_stack) > 1 or self.store.state.active_view != VIEW_CHAT:
+            return
         composer = self._ui_query_one("#chat-composer", TextArea)
         prompt = composer.text
         self.run_worker(self._submit_prompt(prompt, kind="chat"), name="chat-submit")
+
+    def action_launch_task(self) -> None:
+        if len(self.screen_stack) > 1 or self.store.state.active_view != VIEW_CHAT:
+            return
+        composer = self._ui_query_one("#chat-composer", TextArea)
+        self.run_worker(self._submit_prompt(composer.text, kind="task"), name="task-submit")
+
+    def _view_shortcuts_blocked(self) -> bool:
+        if len(self.screen_stack) > 1:
+            return True
+        return isinstance(self.focused, (Input, TextArea))
+
+    def _press_button(self, button_id: str) -> bool:
+        try:
+            button = self._ui_query_one(f"#{button_id}", Button)
+        except Exception:
+            return False
+        if getattr(button, "disabled", False) or not self._widget_is_visible(button):
+            return False
+        button.focus()
+        button.press()
+        self._sync_focus_panels()
+        return True
+
+    def action_context_refresh(self) -> None:
+        if self._view_shortcuts_blocked() or self.store.state.active_view != VIEW_TASKS:
+            return
+        self._press_button("tasks-refresh")
+
+    def action_context_approve(self) -> None:
+        if self._view_shortcuts_blocked():
+            return
+        button_map = {
+            VIEW_TASKS: "tasks-approve",
+            VIEW_APPROVALS: "approval-approve",
+        }
+        button_id = button_map.get(self.store.state.active_view, "")
+        if button_id:
+            self._press_button(button_id)
+
+    def action_context_deny(self) -> None:
+        if self._view_shortcuts_blocked():
+            return
+        button_map = {
+            VIEW_TASKS: "tasks-deny",
+            VIEW_APPROVALS: "approval-deny",
+        }
+        button_id = button_map.get(self.store.state.active_view, "")
+        if button_id:
+            self._press_button(button_id)
+
+    def action_context_install(self) -> None:
+        if self._view_shortcuts_blocked() or self.store.state.active_view != VIEW_SKILLS:
+            return
+        self._press_button("skill-install")
+
+    def action_context_toggle_skill(self) -> None:
+        if self._view_shortcuts_blocked() or self.store.state.active_view != VIEW_SKILLS:
+            return
+        self._press_button("skill-toggle")
+
+    def action_context_remove_skill(self) -> None:
+        if self._view_shortcuts_blocked() or self.store.state.active_view != VIEW_SKILLS:
+            return
+        self._press_button("skill-remove")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
@@ -1237,10 +1388,10 @@ class KestrelTextualApp(App[None]):
             self.action_toggle_details()
             return
         if button_id == "chat-send":
-            self.run_worker(self._submit_prompt(self._ui_query_one("#chat-composer", TextArea).text, kind="chat"), name="chat-submit")
+            self.action_send_chat()
             return
         if button_id == "chat-launch-task":
-            self.run_worker(self._submit_prompt(self._ui_query_one("#chat-composer", TextArea).text, kind="task"), name="task-submit")
+            self.action_launch_task()
             return
         if button_id in {"chat-approve-inline", "tasks-approve", "approval-approve"}:
             approval = self._current_inline_approval() if button_id == "chat-approve-inline" else None
@@ -1277,8 +1428,14 @@ class KestrelTextualApp(App[None]):
             self._render_skills()
             self._render_inspector()
 
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "space" and isinstance(self.focused, Button):
+            self.focused.press()
+            self._sync_focus_panels()
+            event.stop()
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if self._suspend_table_events or not self._ui_ready:
+        if self._suspend_table_events or not self._ui_ready or not event.data_table.has_focus:
             return
         row_key = self._extract_row_key(event)
         if not row_key:
@@ -1328,6 +1485,13 @@ class KestrelTextualApp(App[None]):
                 return
             self.store.select_skill(row_key)
             self._render_state()
+            return
+
+    def on_descendant_focus(self, _event: events.DescendantFocus) -> None:
+        self.call_after_refresh(self._sync_focus_panels)
+
+    def on_descendant_blur(self, _event: events.DescendantBlur) -> None:
+        self.call_after_refresh(self._sync_focus_panels)
 
 
 def launch_tui(client: KestrelClient, config: dict[str, Any]) -> bool:

@@ -420,6 +420,17 @@ class TuiStore:
                 return message.artifacts
         return []
 
+    def chat_history(self, *, limit: int = 8) -> list[dict[str, str]]:
+        history: list[dict[str, str]] = []
+        for message in self.state.chat_messages:
+            if message.role not in {"user", "assistant"}:
+                continue
+            text = str(message.text or "").strip()
+            if not text:
+                continue
+            history.append({"role": message.role, "content": text})
+        return history[-max(1, limit):]
+
     def set_process(
         self,
         *,

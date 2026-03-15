@@ -80,6 +80,15 @@ DEFAULT_CONFIG = {
         "max_total_tool_calls": 24,
         "max_execution_seconds": 180,
         "allow_custom_tool_scaffolding": True,
+        "personality": {
+            "enabled": True,
+            "profile": "operator",
+            "intensity": "high",
+        },
+        "proactivity": {
+            "mode": "aggressive",
+            "background_execution": "suggest_first",
+        },
     },
     "tools": {
         "enabled_categories": ["file", "system", "web", "memory", "media", "desktop", "custom"],
@@ -233,6 +242,13 @@ agent:
   max_total_tool_calls: 24
   max_execution_seconds: 180
   allow_custom_tool_scaffolding: true
+  personality:
+    enabled: true
+    profile: operator
+    intensity: high
+  proactivity:
+    mode: aggressive
+    background_execution: suggest_first
 tools:
   enabled_categories:
     - file

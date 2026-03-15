@@ -9,8 +9,8 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlparse
-from urllib.request import urlopen
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from urllib.request import Request, urlopen
 
 try:
     import yaml
@@ -23,6 +23,52 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _PACK_MANIFEST_NAMES = ("skill.yaml", "skill.yml", "skill.json", "manifest.json")
 _PRECEDENCE_RANK = {"workspace": 3, "user": 2, "bundled": 1}
 _ALWAYS_ON_LIMIT = 5
+_AGENT_SKILLS_API_URL = "https://www.agentskills.in/api/skills"
+_AGENT_SKILLS_HOSTS = {
+    "agentskills.in",
+    "www.agentskills.in",
+    "skills.sh",
+    "www.skills.sh",
+}
+_AGENT_SKILLS_QUERY_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "any",
+    "are",
+    "as",
+    "at",
+    "be",
+    "browse",
+    "can",
+    "could",
+    "discover",
+    "find",
+    "for",
+    "help",
+    "i",
+    "in",
+    "is",
+    "it",
+    "list",
+    "look",
+    "marketplace",
+    "me",
+    "or",
+    "recommend",
+    "search",
+    "show",
+    "skill",
+    "skills",
+    "suggest",
+    "that",
+    "the",
+    "to",
+    "use",
+    "with",
+    "would",
+    "you",
+}
 
 
 def _slugify(value: str) -> str:
@@ -77,6 +123,248 @@ def _normalize_url(base_url: str, value: str) -> str:
     if base_path.exists():
         return (base_path.parent / candidate).resolve().as_uri()
     return urljoin(base_url.rstrip("/") + "/", candidate)
+
+
+def _marketplace_source_kind(source: str) -> tuple[str, str]:
+    candidate = str(source or "").strip()
+    if not candidate:
+        return "catalog", ""
+    parsed = urlparse(candidate)
+    host = parsed.netloc.lower()
+    path = parsed.path.rstrip("/")
+    if host in _AGENT_SKILLS_HOSTS:
+        if not path or path in {"/", "/docs", "/marketplace"}:
+            return "agent_skills_api", _AGENT_SKILLS_API_URL
+        if path == "/api/skills":
+            return "agent_skills_api", _AGENT_SKILLS_API_URL
+    return "catalog", candidate
+
+
+def _agent_skills_request_url(api_url: str, **params: Any) -> str:
+    parsed = urlparse(api_url)
+    existing = parse_qs(parsed.query, keep_blank_values=True)
+    for key, value in params.items():
+        if value is None or value == "":
+            continue
+        existing[str(key)] = [str(value)]
+    query = urlencode({key: values[-1] for key, values in existing.items()}, doseq=False)
+    return parsed._replace(query=query).geturl()
+
+
+def _agent_skills_fetch_json(api_url: str, **params: Any) -> dict[str, Any]:
+    request = Request(
+        _agent_skills_request_url(api_url, **params),
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "kestrel-skillpacks",
+        },
+    )
+    with urlopen(request) as response:  # nosec B310 - explicit configured marketplace source
+        text = response.read().decode("utf-8")
+    payload = _safe_structured_load(text)
+    skills = payload.get("skills")
+    if not isinstance(skills, list):
+        raise ValueError(f"Agent Skills API at {api_url} returned an invalid payload.")
+    payload["skills"] = skills
+    return payload
+
+
+def _normalize_agent_skills_query(query: str) -> str:
+    text = str(query or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"[\"'`]", " ", text)
+    text = re.sub(r"(?i)\b(?:or|and|not)\b", " ", text)
+    text = re.sub(r"[\[\]{}()|,:;/\\]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _agent_skills_query_candidates(query: str, *, limit: int = 12) -> list[str]:
+    seen: set[str] = set()
+    candidates: list[str] = []
+
+    def add(value: str) -> None:
+        candidate = re.sub(r"\s+", " ", str(value or "").strip())
+        if len(candidate) < 2:
+            return
+        key = candidate.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(candidate)
+
+    raw = re.sub(r"\s+", " ", str(query or "").strip())
+    add(raw)
+    for phrase in re.findall(r'"([^"]+)"|\'([^\']+)\'', raw):
+        add(next((item for item in phrase if item), ""))
+
+    normalized = _normalize_agent_skills_query(raw)
+    add(normalized)
+
+    tokens = [
+        token
+        for token in normalized.lower().split()
+        if token and token not in _AGENT_SKILLS_QUERY_STOP_WORDS
+    ]
+    for size in (2, 3):
+        phrases = [" ".join(tokens[index:index + size]) for index in range(len(tokens) - size + 1)]
+        for phrase in reversed(phrases):
+            add(phrase)
+    for token in reversed(tokens):
+        if len(token) >= 4:
+            add(token)
+    return candidates[: max(1, int(limit))]
+
+
+def _agent_skill_dir_path(entry: dict[str, Any]) -> str:
+    compat = entry.get("compat") if isinstance(entry.get("compat"), dict) else {}
+    compat_dir = str(compat.get("skill_dir") or "").strip().replace("\\", "/")
+    if compat_dir:
+        return compat_dir
+    path = str(entry.get("path") or "").strip().replace("\\", "/")
+    if not path:
+        return ""
+    if path.lower().endswith("/skill.md"):
+        return path[:-len("/SKILL.md")]
+    return str(Path(path).parent).replace("\\", "/")
+
+
+def _agent_skill_local_name(entry: dict[str, Any]) -> str:
+    directory = _agent_skill_dir_path(entry)
+    if directory:
+        return Path(directory).name
+    compat = entry.get("compat") if isinstance(entry.get("compat"), dict) else {}
+    local_pack_id = str(compat.get("local_pack_id") or "").strip()
+    if local_pack_id:
+        return local_pack_id
+    return str(entry.get("name") or entry.get("skill_name") or "skill").strip() or "skill"
+
+
+def _agent_skill_branch(entry: dict[str, Any]) -> str:
+    github_url = str(entry.get("githubUrl") or entry.get("github_url") or "").strip()
+    match = re.search(r"github\.com/[^/]+/[^/]+/tree/([^/]+)/", github_url)
+    if match:
+        return match.group(1).strip() or "main"
+    return str(entry.get("branch") or "main").strip() or "main"
+
+
+def _agent_skill_repo_full_name(entry: dict[str, Any]) -> str:
+    repo_full_name = str(entry.get("repoFullName") or entry.get("repo_full_name") or "").strip()
+    if repo_full_name:
+        return repo_full_name
+    github_url = str(entry.get("githubUrl") or entry.get("github_url") or "").strip()
+    match = re.search(r"github\.com/([^/]+/[^/]+)", github_url)
+    return match.group(1).strip() if match else ""
+
+
+def _agent_skill_pack_id(entry: dict[str, Any]) -> str:
+    author = _slugify(str(entry.get("author") or "unknown").strip())
+    directory = _agent_skill_dir_path(entry).strip("/")
+    if directory:
+        return f"agentskills:{author}:{directory}"
+    return f"agentskills:{author}:{_slugify(_agent_skill_local_name(entry))}"
+
+
+def _parse_agent_skill_pack_id(pack_id: str) -> tuple[str, str] | None:
+    raw = str(pack_id or "").strip()
+    match = re.fullmatch(r"agentskills:([^:]+):(.+)", raw)
+    if not match:
+        return None
+    return match.group(1).strip(), match.group(2).strip().strip("/")
+
+
+def _agent_skill_entry_from_api(item: dict[str, Any], api_url: str) -> dict[str, Any]:
+    repo_full_name = _agent_skill_repo_full_name(item)
+    branch = _agent_skill_branch(item)
+    skill_dir = _agent_skill_dir_path(item)
+    skill_path = str(item.get("path") or "").strip().replace("\\", "/")
+    local_name = _agent_skill_local_name(item)
+    raw_url = (
+        str(item.get("rawUrl") or item.get("raw_url") or "").strip()
+        or (
+            f"https://raw.githubusercontent.com/{repo_full_name}/{branch}/{skill_path}"
+            if repo_full_name and skill_path
+            else ""
+        )
+    )
+    install_url = (
+        f"https://api.github.com/repos/{repo_full_name}/zipball/{branch}"
+        if repo_full_name
+        else ""
+    )
+    category = str(item.get("category") or "").strip()
+    tags = [category] if category else []
+    return {
+        "pack_id": _agent_skill_pack_id(item),
+        "name": local_name,
+        "version": str(item.get("version") or "1.0.0").strip() or "1.0.0",
+        "description": str(item.get("description") or "").strip() or f"Marketplace skill pack {local_name}",
+        "tags": tags,
+        "use_cases": [],
+        "permissions": [],
+        "components": [],
+        "dependencies": [],
+        "prompt_preview": "",
+        "root_kind": "marketplace",
+        "source_type": "agent_skills_api",
+        "marketplace_name": "Agent Skills",
+        "marketplace_url": api_url,
+        "install_url": install_url,
+        "manifest_url": raw_url,
+        "source_path": "",
+        "github_url": str(item.get("githubUrl") or item.get("github_url") or "").strip(),
+        "scoped_name": str(item.get("scopedName") or item.get("scoped_name") or "").strip(),
+        "author": str(item.get("author") or "").strip(),
+        "stars": int(item.get("stars") or 0),
+        "forks": int(item.get("forks") or 0),
+        "repo_full_name": repo_full_name,
+        "path": "",
+        "compat": {
+            "source_format": "agent_skills_api",
+            "marketplace": True,
+            "agent_skills": True,
+            "branch": branch,
+            "skill_path": skill_path,
+            "skill_dir": skill_dir,
+            "local_pack_id": _slugify(local_name),
+            "api_id": str(item.get("id") or "").strip(),
+        },
+    }
+
+
+def _agent_skill_exact_match(entry: dict[str, Any], *, author: str = "", skill_dir: str = "", local_pack_id: str = "") -> bool:
+    if author and _slugify(str(entry.get("author") or "")) != _slugify(author):
+        return False
+    if skill_dir:
+        return _agent_skill_dir_path(entry).strip("/").lower() == skill_dir.strip("/").lower()
+    if local_pack_id:
+        return _slugify(_agent_skill_local_name(entry)) == _slugify(local_pack_id)
+    return False
+
+
+def _search_agent_skills_marketplace(api_url: str, query: str, *, author: str = "", limit: int = 50) -> list[dict[str, Any]]:
+    entries: dict[str, dict[str, Any]] = {}
+    for index, candidate in enumerate(_agent_skills_query_candidates(query)):
+        payload = _agent_skills_fetch_json(
+            api_url,
+            search=candidate,
+            author=str(author or "").strip() or None,
+            limit=max(1, int(limit)),
+            offset=0,
+        )
+        current: list[dict[str, Any]] = []
+        for item in payload.get("skills") or []:
+            if not isinstance(item, dict):
+                continue
+            entry = _agent_skill_entry_from_api(item, api_url)
+            entries.setdefault(str(entry.get("pack_id") or ""), entry)
+            current.append(entry)
+        if index == 0 and current:
+            break
+        if entries and len(entries) >= max(1, int(limit)):
+            break
+    return list(entries.values())[: max(1, int(limit))]
 
 
 def _safe_json_load(text: str) -> dict[str, Any]:
@@ -602,6 +890,9 @@ def _marketplace_entry_search_text(entry: dict[str, Any]) -> str:
         str(entry.get("pack_id") or ""),
         str(entry.get("name") or ""),
         str(entry.get("description") or ""),
+        str(entry.get("author") or ""),
+        str(entry.get("scoped_name") or entry.get("scopedName") or ""),
+        str(entry.get("repo_full_name") or entry.get("repoFullName") or ""),
         " ".join(_ensure_list(entry.get("tags"))),
         " ".join(_ensure_list(entry.get("use_cases"))),
         " ".join(
@@ -610,6 +901,15 @@ def _marketplace_entry_search_text(entry: dict[str, Any]) -> str:
             if isinstance(item, dict)
         ),
     ]
+    compat = entry.get("compat") if isinstance(entry.get("compat"), dict) else {}
+    if compat:
+        parts.extend(
+            [
+                str(compat.get("local_pack_id") or ""),
+                str(compat.get("skill_dir") or ""),
+                str(compat.get("skill_path") or ""),
+            ]
+        )
     prompt_preview = str(entry.get("prompt_preview") or "").strip()
     if prompt_preview:
         parts.append(prompt_preview[:4_000])
@@ -655,7 +955,10 @@ def fetch_marketplace_catalog(source: str) -> dict[str, Any]:
 
 def discover_marketplace_packs(urls: list[str]) -> list[dict[str, Any]]:
     discovered: dict[str, dict[str, Any]] = {}
-    for url in [str(item).strip() for item in urls if str(item).strip()]:
+    for source in [str(item).strip() for item in urls if str(item).strip()]:
+        source_kind, url = _marketplace_source_kind(source)
+        if source_kind != "catalog":
+            continue
         try:
             catalog = fetch_marketplace_catalog(url)
         except Exception:
@@ -699,6 +1002,99 @@ def discover_marketplace_packs(urls: list[str]) -> list[dict[str, Any]]:
     return sorted(discovered.values(), key=lambda item: str(item.get("name") or "").lower())
 
 
+def search_marketplace_packs(urls: list[str], query: str, *, limit: int = 50) -> list[dict[str, Any]]:
+    discovered: dict[str, dict[str, Any]] = {}
+    catalog_sources: list[str] = []
+    for source in [str(item).strip() for item in urls if str(item).strip()]:
+        source_kind, normalized = _marketplace_source_kind(source)
+        if source_kind == "agent_skills_api":
+            try:
+                for item in _search_agent_skills_marketplace(normalized, query, limit=limit):
+                    discovered[str(item.get("pack_id") or "")] = item
+            except Exception:
+                continue
+        else:
+            catalog_sources.append(normalized)
+
+    for item in discover_marketplace_packs(catalog_sources):
+        discovered.setdefault(str(item.get("pack_id") or ""), item)
+
+    return sorted(discovered.values(), key=lambda item: str(item.get("name") or "").lower())
+
+
+def resolve_marketplace_pack(urls: list[str], pack_id: str) -> dict[str, Any] | None:
+    target = str(pack_id or "").strip()
+    if not target:
+        return None
+
+    for item in discover_marketplace_packs(urls):
+        if str(item.get("pack_id") or "").lower() == target.lower():
+            return item
+
+    parsed = _parse_agent_skill_pack_id(target)
+    for source in [str(item).strip() for item in urls if str(item).strip()]:
+        source_kind, normalized = _marketplace_source_kind(source)
+        if source_kind != "agent_skills_api":
+            continue
+        try:
+            if parsed:
+                author, skill_dir = parsed
+                query = Path(skill_dir).name or skill_dir
+                matches = _search_agent_skills_marketplace(normalized, query, author=author, limit=100)
+                for item in matches:
+                    if _agent_skill_exact_match(item, author=author, skill_dir=skill_dir):
+                        return item
+            else:
+                matches = _search_agent_skills_marketplace(normalized, target, limit=100)
+                exact = [
+                    item
+                    for item in matches
+                    if _agent_skill_exact_match(
+                        item,
+                        local_pack_id=target,
+                    )
+                ]
+                if exact:
+                    exact.sort(key=lambda item: (-float(item.get("stars") or 0), str(item.get("name") or "").lower()))
+                    return exact[0]
+        except Exception:
+            continue
+    return None
+
+
+def find_skill_pack_dir(root_dir: str | Path, *, pack_id: str = "", skill_dir: str = "") -> Path:
+    root = Path(root_dir).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        raise FileNotFoundError(f"Skill pack directory not found: {root}")
+
+    normalized_dir = str(skill_dir or "").strip().replace("\\", "/").strip("/")
+    if normalized_dir:
+        for skill_md in root.rglob("SKILL.md"):
+            candidate_dir = skill_md.parent
+            relative_dir = candidate_dir.relative_to(root).as_posix()
+            if relative_dir == normalized_dir or relative_dir.endswith("/" + normalized_dir):
+                return candidate_dir
+
+    normalized_pack_id = str(pack_id or "").strip().lower()
+    if normalized_pack_id:
+        for skill_md in root.rglob("SKILL.md"):
+            candidate_dir = skill_md.parent
+            if candidate_dir.name.lower() == normalized_pack_id:
+                return candidate_dir
+            try:
+                candidate_pack = load_skill_pack(candidate_dir, root_kind="user")
+            except Exception:
+                continue
+            if candidate_pack.pack_id.lower() == normalized_pack_id:
+                return candidate_dir
+
+    raise FileNotFoundError(
+        f"Could not find a skill pack directory under {root}"
+        + (f" for path {normalized_dir}" if normalized_dir else "")
+        + (f" matching {pack_id}" if pack_id else "")
+    )
+
+
 def write_inferred_manifest(pack_dir: str | Path) -> Path:
     pack_path = Path(pack_dir).expanduser().resolve()
     manifest = _infer_manifest_from_skill_md(pack_path)
@@ -731,10 +1127,13 @@ __all__ = [
     "discover_marketplace_packs",
     "expand_pack_dependencies",
     "fetch_marketplace_catalog",
+    "find_skill_pack_dir",
     "load_skill_pack",
     "pack_snapshot_id",
+    "resolve_marketplace_pack",
     "score_skill_candidate",
     "score_skill_pack",
+    "search_marketplace_packs",
     "select_skill_packs",
     "unpack_skill_archive",
     "write_inferred_manifest",

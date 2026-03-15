@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from . import native_tool_registry as _native_tool_registry
+from .native_persona import compose_native_system_prompt
 
 globals().update({name: value for name, value in vars(_native_tool_registry).items() if not name.startswith("__")})
 
@@ -16,6 +17,10 @@ class NativeAgentRunnerBase:
         event_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
         workspace_root: Path | None = None,
         skill_pack_manager: Any | None = None,
+        workspace_id: str = "",
+        workspace_settings: dict[str, Any] | None = None,
+        workspace_system_prompt: str = "",
+        ambient_state: dict[str, Any] | None = None,
     ) -> None:
         self.paths = paths
         self.config = config
@@ -25,6 +30,10 @@ class NativeAgentRunnerBase:
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.event_callback = event_callback
         self.skill_pack_manager = skill_pack_manager
+        self.workspace_id = str(workspace_id or "").strip()
+        self.workspace_settings = dict(workspace_settings or {})
+        self.workspace_system_prompt = str(workspace_system_prompt or "").strip()
+        self.ambient_state = dict(ambient_state or {})
         self.tool_registry = NativeToolRegistry(
             paths=paths,
             config=config,
@@ -86,6 +95,22 @@ class NativeAgentRunnerBase:
     def _skill_prompt_block(self, state: dict[str, Any]) -> str:
         return str((state.get("skill_selection") or {}).get("prompt_block") or "").strip()
 
+    def _compose_system_prompt(
+        self,
+        *,
+        role: str,
+        instructions: str,
+        state: dict[str, Any] | None = None,
+    ) -> str:
+        return compose_native_system_prompt(
+            config=self.config,
+            role=role,
+            role_instructions=instructions,
+            ambient_state=self.ambient_state,
+            workspace_system_prompt=self.workspace_system_prompt,
+            skill_prompt_block=self._skill_prompt_block(state or {}),
+        )
+
     def _normalize_execution_action(self, action: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(action or {})
         action_type = str(normalized.get("action") or "").strip().lower()
@@ -116,6 +141,198 @@ class NativeAgentRunnerBase:
         return "svg" in lowered and bool(
             re.search(r"\b(?:png|jpg|jpeg|webp|render|export|convert)\b", lowered)
         )
+
+    def _infer_explicit_skill_search_query(self, goal: str) -> str | None:
+        text = str(goal or "").strip()
+        if not text:
+            return None
+        lowered = text.lower()
+        mentions_skills = bool(re.search(r"\b(?:skill|skills|skill pack|skill packs|marketplace)\b", lowered))
+        asks_to_discover = bool(
+            re.search(
+                r"\b(?:search|find|look(?:\s+up)?|discover|browse|list|show|recommend|suggest)\b",
+                lowered,
+            )
+        ) or bool(
+            re.search(
+                r"\b(?:what|which)\s+skills\b|\bare\s+there\s+any\s+skills\b|\bany\s+skills\b",
+                lowered,
+            )
+        )
+        if not mentions_skills or not asks_to_discover:
+            return None
+
+        query = text
+        query = re.sub(r"(?i)^\s*(?:please\s+)?(?:can|could|would)\s+you\s+", "", query).strip()
+        query = re.sub(r"(?i)^\s*i\s+(?:need|want|would like)\s+(?:you\s+)?to\s+", "", query).strip()
+        skill_match = re.search(r"(?i)\b(?:skill packs?|skills?|marketplace)\b", query)
+        if skill_match:
+            suffix = query[skill_match.end():].strip(" \t\r\n:,-")
+            suffix = re.sub(r"(?i)^(?:that|which)\s+", "", suffix).strip()
+            suffix = re.sub(r"(?i)^(?:can|could|would)\s+", "", suffix).strip()
+            suffix = re.sub(r"(?i)^help(?:\s+me)?\s+", "", suffix).strip()
+            suffix = re.sub(r"(?i)^(?:with|for|to)\s+", "", suffix).strip()
+            if suffix:
+                query = suffix
+
+        cleaned = re.sub(
+            r"(?i)\b(?:search|find|look(?:\s+up)?|discover|browse|list|show|recommend|suggest|skills?|skill packs?|marketplace)\b",
+            " ",
+            query,
+        )
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\r\n.,:;!?")
+        return cleaned or query.strip(" \t\r\n.,:;!?") or None
+
+    def _normalize_skill_search_refinement(self, goal: str) -> str:
+        query = self._extract_user_goal(goal)
+        query = re.sub(r"(?i)^\s*(?:something|anything)\s+else(?:\s+instead)?\s*[:,-]?\s*", "", query).strip()
+        query = re.sub(r"(?i)^\s*(?:how|what)\s+about\s+", "", query).strip()
+        query = re.sub(r"(?i)^\s*maybe\s+", "", query).strip()
+        query = re.sub(
+            r"(?i)^\s*(?:search|find|look(?:\s+up)?|browse|show|recommend|suggest)\s+(?:for\s+)?",
+            "",
+            query,
+        ).strip()
+        query = re.sub(r"(?i)\s+(?:instead|please)\s*$", "", query).strip()
+        return re.sub(r"\s+", " ", query).strip(" \t\r\n.,:;!?")
+
+    def _looks_like_skill_install_reply(self, goal: str) -> bool:
+        lowered = self._extract_user_goal(goal).strip().lower()
+        if not lowered:
+            return False
+        if lowered in {"yes", "y", "sure", "ok", "okay", "do it", "go ahead"}:
+            return True
+        if re.search(r"\b(?:download|install|enable|add|get)\b", lowered):
+            return True
+        return bool(re.fullmatch(r"(?:that|this|first|second|third|last)\s+(?:one|skill|pack)", lowered))
+
+    def _looks_like_new_task_prompt(self, goal: str) -> bool:
+        lowered = self._extract_user_goal(goal).strip().lower()
+        if not lowered:
+            return False
+        return bool(
+            re.match(
+                r"^(?:create|build|make|write|run|open|save|send|generate|draft|explain|summarize|review|analyze|help)\b",
+                lowered,
+            )
+        )
+
+    def _infer_skill_search_query_from_history(
+        self,
+        goal: str,
+        history: list[dict[str, Any]] | None = None,
+    ) -> str | None:
+        candidate = self._normalize_skill_search_refinement(goal)
+        if not candidate or candidate.lower() in {
+            "another",
+            "another one",
+            "anything else",
+            "else",
+            "other",
+            "something else",
+            "thanks",
+            "thank you",
+        }:
+            return None
+        if self._looks_like_skill_install_reply(goal) or self._looks_like_new_task_prompt(goal):
+            return None
+
+        recent_skill_request = False
+        assistant_skill_context = False
+        assistant_offered_refinement = False
+        for item in reversed(list(history or [])[-6:]):
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            content = self._extract_user_goal(str(item.get("content") or ""))
+            if not content:
+                continue
+            lowered = content.lower()
+            if role == "assistant":
+                if re.search(r"\b(?:skill|skills|skill pack|skill packs|marketplace)\b", lowered):
+                    assistant_skill_context = True
+                if re.search(r"\b(?:search|find|look(?:\s+up)?|browse|recommend|suggest)\b", lowered) and re.search(
+                    r"\b(?:else|another|different|something|anything)\b",
+                    lowered,
+                ):
+                    assistant_skill_context = True
+                    assistant_offered_refinement = True
+                if re.search(r"\b(?:download|install|enable)\b", lowered) and re.search(r"\bskill\b", lowered):
+                    assistant_skill_context = True
+                    assistant_offered_refinement = True
+                continue
+            if role == "user" and self._infer_explicit_skill_search_query(content):
+                recent_skill_request = True
+                break
+
+        if not recent_skill_request or not assistant_skill_context:
+            return None
+        if len(candidate.split()) > 8:
+            return None
+        if not assistant_offered_refinement and len(candidate.split()) < 2:
+            return None
+        return candidate
+
+    def _infer_skill_search_query(
+        self,
+        goal: str,
+        history: list[dict[str, Any]] | None = None,
+    ) -> str | None:
+        query = self._infer_explicit_skill_search_query(goal)
+        if query:
+            return query
+        return self._infer_skill_search_query_from_history(goal, history)
+
+    def _build_skill_search_plan(self, goal: str, query: str) -> NativePlan:
+        return NativePlan(
+            goal=goal,
+            summary="Search the available skill packs for a relevant match.",
+            reasoning="The user explicitly asked to discover skills, so use the skill catalog before considering custom tool scaffolding.",
+            steps=[
+                NativePlanStep(
+                    id="step_1",
+                    description=f"Search the available skill packs for matches to: {query}",
+                    success_criteria="Relevant skill packs are identified or the absence of good matches is reported.",
+                    preferred_tools=["skill_search"],
+                )
+            ],
+        )
+
+    def _infer_skill_search_arguments(self, state: dict[str, Any], step: dict[str, Any]) -> dict[str, Any] | None:
+        if "skill_search" not in step.get("preferred_tools", []):
+            return None
+        query = self._infer_skill_search_query(
+            str(state.get("goal") or ""),
+            history=list(state.get("history") or []),
+        )
+        if not query:
+            query = self._infer_skill_search_query(str(step.get("description") or ""))
+        if not query:
+            return None
+        return {"query": query, "include_marketplace": True}
+
+    def _summarize_skill_search_result(self, payload: dict[str, Any] | None) -> str:
+        data = payload if isinstance(payload, dict) else {}
+        query = str(data.get("query") or "").strip()
+        results = [item for item in list(data.get("results") or []) if isinstance(item, dict)]
+        if not results:
+            if query:
+                return f'I searched the available skill packs for "{query}" and did not find a relevant match.'
+            return "I searched the available skill packs and did not find a relevant match."
+
+        lines = []
+        if query:
+            lines.append(f'I searched the available skill packs for "{query}".')
+        else:
+            lines.append("I searched the available skill packs and found these matches.")
+        for item in results[:3]:
+            name = str(item.get("name") or item.get("pack_id") or "Unnamed skill").strip()
+            description = str(item.get("description") or "").strip()
+            lines.append(f"- {name}: {description or 'No description provided.'}")
+        remaining = max(0, int(data.get("total") or len(results)) - min(len(results), 3))
+        if remaining:
+            lines.append(f"- Plus {remaining} more match(es).")
+        return "\n".join(lines)
 
     def _extract_user_goal(self, goal: str) -> str:
         text = str(goal or "").strip()
@@ -280,33 +497,41 @@ class NativeAgentRunnerBase:
             )
             return {"mode": "plan", "plan": plan.to_dict()}, "heuristic", "run_command"
 
+        skill_search_query = self._infer_skill_search_query(goal, history)
+        if skill_search_query and self.tool_registry.get("skill_search"):
+            plan = self._build_skill_search_plan(goal, skill_search_query)
+            return {"mode": "plan", "plan": plan.to_dict()}, "heuristic", "skill_search"
+
         messages = [
             {
                 "role": "system",
-                "content": (
-                    "You are Kestrel's native planner. Return exactly one JSON object.\n"
-                    "Decide whether to answer directly or produce a step plan.\n"
-                    "JSON schema:\n"
-                    "{\n"
-                    '  "mode": "direct_response" | "plan",\n'
-                    '  "response": "string when mode is direct_response",\n'
-                    '  "summary": "string when mode is plan",\n'
-                    '  "reasoning": "string",\n'
-                    '  "steps": [\n'
-                    "    {\n"
-                    '      "id": "step_1",\n'
-                    '      "description": "what the step does",\n'
-                    '      "success_criteria": "how to tell it is done",\n'
-                    '      "preferred_tools": ["tool_name"]\n'
-                    "    }\n"
-                    "  ]\n"
-                    "}\n"
-                    "Prefer preferred_tools=[] for summarization, analysis, drafting, or synthesis steps that can be completed directly from prior evidence.\n"
-                    "Do not assign run_python just to summarize or transform text unless the user explicitly asked for executable Python.\n"
-                    "Only ask for additional user input when the task is truly blocked and no reasonable default exists.\n"
-                    "Only use tools from this catalog:\n"
-                    + json.dumps([tool.to_prompt_dict() for tool in selected_tools], indent=2)
-                    + (f"\n\nRelevant skill packs:\n{prompt_block}" if prompt_block else "")
+                "content": self._compose_system_prompt(
+                    role="planner",
+                    state=state,
+                    instructions=(
+                        "Return exactly one JSON object.\n"
+                        "Decide whether to answer directly or produce a step plan.\n"
+                        "JSON schema:\n"
+                        "{\n"
+                        '  "mode": "direct_response" | "plan",\n'
+                        '  "response": "string when mode is direct_response",\n'
+                        '  "summary": "string when mode is plan",\n'
+                        '  "reasoning": "string",\n'
+                        '  "steps": [\n'
+                        "    {\n"
+                        '      "id": "step_1",\n'
+                        '      "description": "what the step does",\n'
+                        '      "success_criteria": "how to tell it is done",\n'
+                        '      "preferred_tools": ["tool_name"]\n'
+                        "    }\n"
+                        "  ]\n"
+                        "}\n"
+                        "Prefer preferred_tools=[] for summarization, analysis, drafting, or synthesis steps that can be completed directly from prior evidence.\n"
+                        "Do not assign run_python just to summarize or transform text unless the user explicitly asked for executable Python.\n"
+                        "Only ask for additional user input when the task is truly blocked and no reasonable default exists.\n"
+                        "Only use tools from this catalog:\n"
+                        + json.dumps([tool.to_prompt_dict() for tool in selected_tools], indent=2)
+                    ),
                 ),
             },
             {
@@ -327,28 +552,31 @@ class NativeAgentRunnerBase:
         messages = [
             {
                 "role": "system",
-                "content": (
-                    "You are Kestrel's native execution controller. Return exactly one JSON object.\n"
-                    "Allowed actions:\n"
-                    "{\n"
-                    '  "action": "tool_call" | "finish" | "need_input" | "capability_gap" | "store_result",\n'
-                    '  "tool_name": "tool for tool_call",\n'
-                    '  "arguments": { },\n'
-                    '  "scope": "step" | "task" when action is finish,\n'
-                    '  "summary": "result summary",\n'
-                    '  "question": "user question" when action is need_input,\n'
-                    '  "result": "string content to persist for later steps when action is store_result",\n'
-                    '  "strategy": "custom_tool" | "missing_prerequisite" | "reuse_tools" when action is capability_gap,\n'
-                    '  "reason": "short reason"\n'
-                    "}\n"
-                    "Use store_result when you generate reusable text, code, SVG, JSON, or other content that a later step must consume.\n"
-                    "If the current step is summarization, analysis, drafting, or synthesis from prior tool outputs, return the actual text result instead of Python source code.\n"
-                    "Do not return Python code unless the step explicitly asks to create or execute Python.\n"
-                    "Use need_input only when the task is blocked and no reasonable default can be inferred from the goal or prior evidence.\n"
-                    "If no tool exists, use capability_gap instead of inventing a tool name.\n"
-                    "Only use this tool catalog:\n"
-                    + json.dumps([tool.to_prompt_dict() for tool in selected_tools], indent=2)
-                    + (f"\n\nRelevant skill packs:\n{prompt_block}" if prompt_block else "")
+                "content": self._compose_system_prompt(
+                    role="execution controller",
+                    state=state,
+                    instructions=(
+                        "Return exactly one JSON object.\n"
+                        "Allowed actions:\n"
+                        "{\n"
+                        '  "action": "tool_call" | "finish" | "need_input" | "capability_gap" | "store_result",\n'
+                        '  "tool_name": "tool for tool_call",\n'
+                        '  "arguments": { },\n'
+                        '  "scope": "step" | "task" when action is finish,\n'
+                        '  "summary": "result summary",\n'
+                        '  "question": "user question" when action is need_input,\n'
+                        '  "result": "string content to persist for later steps when action is store_result",\n'
+                        '  "strategy": "custom_tool" | "missing_prerequisite" | "reuse_tools" when action is capability_gap,\n'
+                        '  "reason": "short reason"\n'
+                        "}\n"
+                        "Use store_result when you generate reusable text, code, SVG, JSON, or other content that a later step must consume.\n"
+                        "If the current step is summarization, analysis, drafting, or synthesis from prior tool outputs, return the actual text result instead of Python source code.\n"
+                        "Do not return Python code unless the step explicitly asks to create or execute Python.\n"
+                        "Use need_input only when the task is blocked and no reasonable default can be inferred from the goal or prior evidence.\n"
+                        "If no tool exists, use capability_gap instead of inventing a tool name.\n"
+                        "Only use this tool catalog:\n"
+                        + json.dumps([tool.to_prompt_dict() for tool in selected_tools], indent=2)
+                    ),
                 ),
             },
             {
@@ -378,20 +606,25 @@ class NativeAgentRunnerBase:
         if not state.get("tool_evidence"):
             provider = str(state.get("provider") or "native-direct")
             model = str(state.get("model") or "native-direct")
-            return {"ok": True, "final_response": draft_response, "reason": "No tool evidence to verify."}, provider, model
+            payload = {"ok": True, "final_response": draft_response, "reason": "No tool evidence to verify."}
+            state["verifier_result"] = dict(payload)
+            return payload, provider, model
         messages = [
             {
                 "role": "system",
-                "content": (
-                    "You are Kestrel's native verifier. Return exactly one JSON object.\n"
-                    "Schema:\n"
-                    "{\n"
-                    '  "ok": true | false,\n'
-                    '  "final_response": "string",\n'
-                    '  "reason": "string"\n'
-                    "}\n"
-                    "Reject unsupported claims. Final response must be grounded in tool_evidence."
-                    + (f"\n\nRelevant skill packs:\n{self._skill_prompt_block(state)}" if self._skill_prompt_block(state) else "")
+                "content": self._compose_system_prompt(
+                    role="verifier",
+                    state=state,
+                    instructions=(
+                        "Return exactly one JSON object.\n"
+                        "Schema:\n"
+                        "{\n"
+                        '  "ok": true | false,\n'
+                        '  "final_response": "string",\n'
+                        '  "reason": "string"\n'
+                        "}\n"
+                        "Reject unsupported claims. Final response must be grounded in tool_evidence."
+                    ),
                 ),
             },
             {
@@ -412,16 +645,19 @@ class NativeAgentRunnerBase:
             config=self.config,
             repair_label="verifier",
         )
+        state["verifier_result"] = dict(payload)
         return payload, provider, model
 
     async def _direct_response(self, goal: str, history: list[dict[str, Any]], *, state: dict[str, Any] | None = None) -> tuple[str, str, str]:
-        prompt_block = self._skill_prompt_block(state or {})
         response = await _generate_local_text_response(
             messages=[
                 {
                     "role": "system",
-                    "content": "You are Kestrel, a concise local autonomous assistant. Answer directly and honestly."
-                    + (f"\n\nRelevant skill packs:\n{prompt_block}" if prompt_block else ""),
+                    "content": self._compose_system_prompt(
+                        role="direct responder",
+                        state=state,
+                        instructions="Answer directly, honestly, and with concrete next steps when useful.",
+                    ),
                 },
                 *history[-6:],
                 {"role": "user", "content": goal},
@@ -493,13 +729,16 @@ class NativeAgentRunnerBase:
             evidence_sections.append(f"{tool_name}:\n{snippet}")
 
         system_lines = [
-            "You are completing one Kestrel task step.",
-            "Return only the concrete output for the current step.",
-            "Do not add explanations, markdown fences, or JSON.",
+            self._compose_system_prompt(
+                role="step writer",
+                state=state,
+                instructions=(
+                    "You are completing one Kestrel task step.\n"
+                    "Return only the concrete output for the current step.\n"
+                    "Do not add explanations, markdown fences, or JSON."
+                ),
+            ),
         ]
-        prompt_block = self._skill_prompt_block(state)
-        if prompt_block:
-            system_lines.append(f"Relevant skill packs:\n{prompt_block}")
         if expects_svg_markup:
             system_lines.extend(
                 [

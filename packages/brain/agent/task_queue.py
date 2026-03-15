@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from core.local_operator import derive_workspace_agent_profile_sync
 from agent.execution_context import (
     ExecutionContext,
     Opportunity,
@@ -69,6 +70,14 @@ class WorkspaceAgentStore:
         autonomy_policy: str = "moderate",
     ) -> WorkspaceAgentProfile:
         memory_namespace = f"workspace:{workspace_id}"
+        daemon_sync = derive_workspace_agent_profile_sync(
+            fallback_autonomy_policy=autonomy_policy,
+        )
+        resolved_autonomy_policy = str(
+            daemon_sync.get("autonomy_policy") or autonomy_policy or "moderate"
+        )
+        runtime_defaults = dict(daemon_sync.get("runtime_defaults") or {})
+        kernel_policy_json = dict(daemon_sync.get("kernel_policy_json") or {})
         async with self._pool.acquire() as conn:
             try:
                 row = await conn.fetchrow(
@@ -85,33 +94,41 @@ class WorkspaceAgentStore:
                             runtime_defaults,
                             kernel_policy_json
                         )
-                    VALUES ($1, $2, $3, $4, $5, $6::jsonb, 1, '{}'::jsonb, '{}'::jsonb)
+                    VALUES ($1, $2, $3, $4, $5, $6::jsonb, 1, $7::jsonb, $8::jsonb)
                     ON CONFLICT (workspace_id) DO UPDATE SET
+                        autonomy_policy = EXCLUDED.autonomy_policy,
+                        runtime_defaults = EXCLUDED.runtime_defaults,
+                        kernel_policy_json = EXCLUDED.kernel_policy_json,
                         updated_at = now()
                     RETURNING *
                     """,
                     workspace_id,
                     default_mode,
                     default_mode,
-                    autonomy_policy,
+                    resolved_autonomy_policy,
                     memory_namespace,
                     json.dumps(["chat", "research", "coding", "ops"]),
+                    json.dumps(runtime_defaults),
+                    json.dumps(kernel_policy_json),
                 )
             except Exception:
                 row = await conn.fetchrow(
                     """
                     INSERT INTO workspace_agents
                         (workspace_id, default_mode, autonomy_policy, memory_namespace, tool_policy_bundle, persona_version, runtime_defaults)
-                    VALUES ($1, $2, $3, $4, $5::jsonb, 1, '{}'::jsonb)
+                    VALUES ($1, $2, $3, $4, $5::jsonb, 1, $6::jsonb)
                     ON CONFLICT (workspace_id) DO UPDATE SET
+                        autonomy_policy = EXCLUDED.autonomy_policy,
+                        runtime_defaults = EXCLUDED.runtime_defaults,
                         updated_at = now()
                     RETURNING *
                     """,
                     workspace_id,
                     default_mode,
-                    autonomy_policy,
+                    resolved_autonomy_policy,
                     memory_namespace,
                     json.dumps(["chat", "research", "coding", "ops"]),
+                    json.dumps(runtime_defaults),
                 )
         return WorkspaceAgentProfile.from_record(dict(row))
 
@@ -504,6 +521,8 @@ class JobRunner:
             },
             autonomy_policy=profile.autonomy_policy,
             kernel_preset=profile.kernel_preset,
+            runtime_defaults=profile.runtime_defaults,
+            kernel_policy_json=profile.kernel_policy_json,
             services={
                 "cron_scheduler": getattr(self.runtime_ctx, "cron_scheduler", None),
                 "automation_builder": getattr(self.runtime_ctx, "automation_builder", None),

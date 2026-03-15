@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Any
 
 from core.grpc_setup import brain_pb2

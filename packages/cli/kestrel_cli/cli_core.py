@@ -26,6 +26,8 @@ Usage:
     kestrel config              # Configure settings
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import json
@@ -33,7 +35,7 @@ import os
 import sys
 import time
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from kestrel_native import (
     ControlClientError,
@@ -228,13 +230,25 @@ class KestrelClient:
 
     # ── API Methods ─────────────────────────────────────────────
 
-    async def start_task(self, goal: str, workspace_id: str = None, *, kind: str = "task"):
+    async def start_task(
+        self,
+        goal: str,
+        workspace_id: str = None,
+        *,
+        kind: str = "task",
+        history: Optional[list[dict[str, str]]] = None,
+    ):
         ws = workspace_id or self.workspace_id
         if self._use_local_control():
             try:
                 start = await send_control_request(
                     "task.start",
-                    {"goal": goal, "workspace_id": ws or "local", "kind": kind},
+                    {
+                        "goal": goal,
+                        "workspace_id": ws or "local",
+                        "kind": kind,
+                        "history": list(history or []),
+                    },
                     paths=self.paths,
                 )
                 task_id = ((start or {}).get("task") or {}).get("id")
@@ -305,10 +319,14 @@ class KestrelClient:
             return {"webhooks": []}
         return await self._request_http("GET", f"/api/workspaces/{self.workspace_id}/automation/webhooks")
 
-    async def chat(self, prompt: str) -> dict:
+    async def chat(self, prompt: str, *, history: Optional[list[dict[str, str]]] = None) -> dict:
         if self._use_local_control():
             try:
-                return await send_control_request("chat", {"prompt": prompt}, paths=self.paths)
+                return await send_control_request(
+                    "chat",
+                    {"prompt": prompt, "history": list(history or [])},
+                    paths=self.paths,
+                )
             except ControlClientError:
                 pass
         return {"message": "", "error": "Local control API unavailable"}
@@ -370,6 +388,88 @@ class KestrelClient:
         if status:
             payload["status"] = status
         return await send_control_request("task.approvals", payload, paths=self.paths)
+
+    async def list_suggestions(self, *, status: str | None = "pending", limit: int = 25) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        payload: dict[str, Any] = {"limit": limit}
+        if status:
+            payload["status"] = status
+        if self.workspace_id:
+            payload["workspace_id"] = self.workspace_id
+        return await send_control_request("suggestion.list", payload, paths=self.paths)
+
+    async def resolve_suggestion(self, suggestion_id: str, *, accept: bool) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        return await send_control_request(
+            "suggestion.resolve",
+            {
+                "suggestion_id": suggestion_id,
+                "action": "accept" if accept else "dismiss",
+            },
+            paths=self.paths,
+        )
+
+    async def start_research(
+        self,
+        prompt: str,
+        *,
+        history: Optional[list[dict[str, str]]] = None,
+        workspace_id: str | None = None,
+    ) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        return await send_control_request(
+            "research.start",
+            {
+                "prompt": prompt,
+                "history": list(history or []),
+                "workspace_id": workspace_id or self.workspace_id or "local",
+            },
+            paths=self.paths,
+        )
+
+    async def list_research_sessions(self, *, status: str | None = None, limit: int = 25) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        payload: dict[str, Any] = {"limit": limit}
+        if status:
+            payload["status"] = status
+        if self.workspace_id:
+            payload["workspace_id"] = self.workspace_id
+        return await send_control_request("research.list", payload, paths=self.paths)
+
+    async def research_detail(self, session_id: str) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        return await send_control_request("research.detail", {"session_id": session_id}, paths=self.paths)
+
+    async def list_procedures(self, *, limit: int = 25, enabled_only: bool = False) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        payload: dict[str, Any] = {"limit": limit, "enabled_only": enabled_only}
+        if self.workspace_id:
+            payload["workspace_id"] = self.workspace_id
+        return await send_control_request("procedure.list", payload, paths=self.paths)
+
+    async def list_learning_events(
+        self,
+        *,
+        task_id: str | None = None,
+        event_type: str | None = None,
+        limit: int = 50,
+    ) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        payload: dict[str, Any] = {"limit": limit}
+        if self.workspace_id:
+            payload["workspace_id"] = self.workspace_id
+        if task_id:
+            payload["task_id"] = task_id
+        if event_type:
+            payload["event_type"] = event_type
+        return await send_control_request("learning.list", payload, paths=self.paths)
 
     async def skill_list(self, *, include_synthetic: bool = True, include_marketplace: bool = True) -> dict:
         if not self._use_local_control():

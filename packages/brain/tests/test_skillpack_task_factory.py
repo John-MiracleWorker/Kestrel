@@ -22,6 +22,8 @@ class _WorkspaceAgentStore:
             tool_policy_bundle=(),
             autonomy_policy="balanced",
             kernel_preset="core",
+            runtime_defaults={"local_operator": {"brain_autonomy_policy": "balanced"}},
+            kernel_policy_json={"routing_strategy": "local_first"},
         )
 
 
@@ -91,6 +93,8 @@ def test_create_chat_task_registers_selected_skill_pack_tools(monkeypatch):
     tool_names = {tool.name for tool in task._tool_registry.list_tools()}
     assert "pack_echo" in tool_names
     assert task._selected_skill_packs[0]["pack_id"] == "demo-pack"
+    assert task.execution_context.runtime_defaults["local_operator"]["brain_autonomy_policy"] == "balanced"
+    assert task.execution_context.kernel_policy_json["routing_strategy"] == "local_first"
 
 
 def test_build_request_context_auto_connects_selected_skill_pack_mcp(monkeypatch):

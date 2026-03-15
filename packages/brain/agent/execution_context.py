@@ -355,6 +355,8 @@ class ExecutionContext:
     route: Optional[SessionRoute] = None
     autonomy_policy: str = "moderate"
     kernel_preset: str = "ops"
+    runtime_defaults: dict[str, Any] = field(default_factory=dict)
+    kernel_policy_json: dict[str, Any] = field(default_factory=dict)
     cancellation_token: str = ""
     approval_mode: str = "policy"
     services: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
@@ -375,6 +377,8 @@ class ExecutionContext:
         route: Optional[dict[str, Any] | SessionRoute] = None,
         autonomy_policy: str = "moderate",
         kernel_preset: str = "ops",
+        runtime_defaults: Optional[dict[str, Any]] = None,
+        kernel_policy_json: Optional[dict[str, Any]] = None,
         cancellation_token: str = "",
         approval_mode: str = "policy",
         services: Optional[dict[str, Any]] = None,
@@ -395,6 +399,8 @@ class ExecutionContext:
             route=SessionRoute.from_value(route) if route else None,
             autonomy_policy=autonomy_policy,
             kernel_preset=kernel_preset,
+            runtime_defaults=_coerce_dict(runtime_defaults),
+            kernel_policy_json=_coerce_dict(kernel_policy_json),
             cancellation_token=cancellation_token,
             approval_mode=approval_mode,
             services=dict(services or {}),
@@ -448,6 +454,8 @@ class ExecutionContext:
             "source": self.source,
             "trace_id": self.trace_id,
             "capability_grants": [grant.to_dict() for grant in self.capability_grants],
+            "runtime_defaults": dict(self.runtime_defaults),
+            "kernel_policy_json": dict(self.kernel_policy_json),
         }
         if self.route:
             context["session_route"] = self.route.to_dict()

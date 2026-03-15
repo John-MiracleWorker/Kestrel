@@ -18,11 +18,11 @@ class KestrelDaemonTelegramIOMixin:
                 chat_id,
                 "\n".join(
                     [
-                        "Kestrel is live on Telegram.",
+                        "Kestrel is live on Telegram and watching the workspace.",
                         "Send a prompt and I'll run it here first.",
                         "Reply to one of my messages to keep the same thread context.",
                         "Attach a file or image and I'll save it locally before using it.",
-                        "/status shows runtime health.",
+                        "/status shows runtime health and the latest heartbeat move.",
                         "/approvals lists pending approvals.",
                         "/approve <id> approves a pending action.",
                         "/deny <id> denies a pending action.",
@@ -45,6 +45,7 @@ class KestrelDaemonTelegramIOMixin:
                         f"Provider: {local_models.get('default_provider', 'unknown')}",
                         f"Model: {local_models.get('default_model', 'unknown')}",
                         f"Pending approvals: {len(pending)}",
+                        f"Last heartbeat: {self.last_heartbeat_action}",
                     ]
                 ),
                 reply_to_message_id=message_id,
@@ -502,7 +503,30 @@ class KestrelDaemonTelegramIOMixin:
         await self._telegram_send_artifacts(chat_id, artifacts, reply_to_message_id=reply_to_message_id)
         reply_text = self._telegram_result_text(status, message, artifacts)
         if reply_text:
-            await self._telegram_send_text(chat_id, reply_text, reply_to_message_id=reply_to_message_id)
+            message_ids: list[int] = []
+            for chunk in self._split_telegram_text(reply_text):
+                response = await self._telegram_send_message(
+                    chat_id,
+                    chunk,
+                    reply_to_message_id=reply_to_message_id,
+                )
+                message_id = int(response.get("message_id") or 0) or None
+                if message_id:
+                    message_ids.append(message_id)
+            if message_ids:
+                existing_ids = [
+                    int(item)
+                    for item in list((task.get("metadata") or {}).get("telegram_result_message_ids") or [])
+                    if str(item).strip().isdigit()
+                ]
+                merged_ids = list(dict.fromkeys(existing_ids + message_ids))
+                self.state_store.update_task(
+                    task_id,
+                    metadata={
+                        "telegram_result_message_ids": merged_ids,
+                        "telegram_last_reply_text": reply_text,
+                    },
+                )
         await self._telegram_update_task_status(
             task_id,
             chat_id,
@@ -1005,10 +1029,31 @@ class KestrelDaemonTelegramIOMixin:
         return f"{base_prompt}\n\n" + "\n".join(notes)
 
     def _build_telegram_history(self, message: dict[str, Any]) -> list[dict[str, Any]]:
+        chat_id = str(message.get("chat_id") or "").strip()
+        current_message_id = int(message.get("message_id") or 0) or None
         reply = message.get("reply") or {}
-        if not isinstance(reply, dict) or not reply:
-            return []
+        reply_message_id = int(reply.get("message_id") or 0) or None
+        history: list[dict[str, Any]] = []
 
+        if chat_id:
+            history = self._telegram_recent_chat_history(
+                chat_id=chat_id,
+                reply_message_id=reply_message_id,
+                exclude_message_id=current_message_id,
+            )
+
+        if not isinstance(reply, dict) or not reply:
+            return history
+
+        entry = self._telegram_reply_history_entry(reply)
+        if entry and not any(
+            str(item.get("role") or "") == entry["role"] and str(item.get("content") or "") == entry["content"]
+            for item in history[-2:]
+        ):
+            history.append(entry)
+        return history[-8:]
+
+    def _telegram_reply_history_entry(self, reply: dict[str, Any]) -> dict[str, str] | None:
         lines: list[str] = []
         reply_text = str(reply.get("text") or "").strip()
         if reply_text:
@@ -1020,14 +1065,85 @@ class KestrelDaemonTelegramIOMixin:
                 details = [value for value in (attachment.get("file_name"), attachment.get("type"), attachment.get("mime_type")) if value]
                 lines.append(f"- {', '.join(details) or 'attachment'}")
         if not lines:
-            return []
+            return None
+        return {
+            "role": "assistant" if reply.get("from_is_bot") else "user",
+            "content": "\n".join(lines),
+        }
 
-        return [
-            {
-                "role": "assistant" if reply.get("from_is_bot") else "user",
-                "content": "\n".join(lines),
-            }
+    def _telegram_task_matches_message_id(self, task: dict[str, Any], message_id: int | None) -> bool:
+        if not message_id:
+            return False
+        metadata = dict(task.get("metadata") or {})
+        known_ids = {
+            int(metadata.get("telegram_message_id") or 0) or None,
+            int(metadata.get("telegram_status_message_id") or 0) or None,
+        }
+        for item in list(metadata.get("telegram_result_message_ids") or []):
+            try:
+                known_ids.add(int(item))
+            except Exception:
+                continue
+        return message_id in known_ids
+
+    def _telegram_task_history_messages(self, task: dict[str, Any]) -> list[dict[str, str]]:
+        metadata = dict(task.get("metadata") or {})
+        messages: list[dict[str, str]] = []
+
+        user_text = str(metadata.get("telegram_original_text") or "").strip()
+        if not user_text:
+            user_text = str(task.get("goal") or "").strip().split("\n\n", 1)[0].strip()
+        if user_text:
+            messages.append({"role": "user", "content": user_text})
+
+        result = dict(task.get("result") or {})
+        assistant_text = str(result.get("message") or task.get("error") or "").strip()
+        if assistant_text:
+            messages.append({"role": "assistant", "content": assistant_text})
+        return messages
+
+    def _telegram_recent_chat_history(
+        self,
+        *,
+        chat_id: str,
+        reply_message_id: int | None,
+        exclude_message_id: int | None,
+        max_tasks: int = 3,
+    ) -> list[dict[str, str]]:
+        tasks = [
+            task
+            for task in self.state_store.list_tasks(limit=40)
+            if str((task.get("metadata") or {}).get("source") or "") == "telegram"
+            and str((task.get("metadata") or {}).get("telegram_chat_id") or "") == chat_id
+            and (int((task.get("metadata") or {}).get("telegram_message_id") or 0) or None) != exclude_message_id
         ]
+        tasks.sort(
+            key=lambda task: (
+                int((task.get("metadata") or {}).get("telegram_message_id") or 0),
+                str(task.get("created_at") or ""),
+            )
+        )
+
+        if reply_message_id:
+            anchor_index = next(
+                (
+                    index + 1
+                    for index, task in enumerate(tasks)
+                    if self._telegram_task_matches_message_id(task, reply_message_id)
+                ),
+                None,
+            )
+            if anchor_index is not None:
+                tasks = tasks[:anchor_index]
+
+        selected = tasks[-max(1, max_tasks):]
+        history: list[dict[str, str]] = []
+        for task in selected:
+            for item in self._telegram_task_history_messages(task):
+                if history and history[-1] == item:
+                    continue
+                history.append(item)
+        return history[-8:]
 
     def _telegram_initial_status(self, prompt: str, initial_tool_call: dict[str, Any] | None) -> str:
         tool_name = str((initial_tool_call or {}).get("tool_name") or "").strip()

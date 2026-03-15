@@ -187,6 +187,8 @@ async def create_chat_task(request, ctx, workspace_id: str) -> AgentTask:
         },
         autonomy_policy=agent_profile.autonomy_policy,
         kernel_preset=agent_profile.kernel_preset,
+        runtime_defaults=agent_profile.runtime_defaults,
+        kernel_policy_json=agent_profile.kernel_policy_json,
         services={
             "cron_scheduler": runtime.cron_scheduler,
             "automation_builder": getattr(runtime, "automation_builder", None),

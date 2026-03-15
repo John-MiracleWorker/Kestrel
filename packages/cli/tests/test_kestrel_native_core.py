@@ -1,6 +1,10 @@
 import asyncio
+import copy
+import json
 import sys
+import time
 from pathlib import Path
+from threading import RLock
 from unittest.mock import patch
 
 import pytest
@@ -10,7 +14,46 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import kestrel_daemon as daemon
 import kestrel_native as native
 from kestrel_cli import native_chat_tools as native_chat_tools_impl
+from kestrel_cli import daemon_tasks as daemon_tasks_impl
 from kestrel_cli import native_models as native_models_impl
+
+
+def _build_test_daemon(tmp_path) -> daemon.KestrelDaemon:
+    core = object.__new__(daemon.KestrelDaemon)
+    core.paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    core.config = copy.deepcopy(native.DEFAULT_CONFIG)
+    core.state_store = native.SQLiteStateStore(core.paths.sqlite_db)
+    core.state_store.initialize()
+    core.event_journal = native.SQLiteEventJournal(core.paths.sqlite_db)
+    core.event_journal.initialize()
+    core.vector_store = native.SQLiteExactVectorStore(core.paths.sqlite_db)
+    core.vector_store.initialize()
+    core.runtime_policy = native.NativeRuntimePolicy(core.config)
+    core.skill_pack_manager = native.NativeSkillPackManager(
+        paths=core.paths,
+        config=core.config,
+        state_store=core.state_store,
+        workspace_root=tmp_path,
+    )
+    core.start_time = time.time()
+    core.stop_event = None
+    core.server = None
+    core.heartbeat_task = None
+    core.watch_task = None
+    core.telegram_poll_task = None
+    core.active_tasks = {}
+    core.active_processes = {}
+    core.stream_subscribers = {}
+    core.telegram_message_tasks = set()
+    core.last_model_runtime = {}
+    core.last_memory_sync = {}
+    core.last_watch_snapshot = {}
+    core.recent_watched_changes = []
+    core.last_heartbeat_action = "Idle"
+    core.proactive_cooldowns = {}
+    core.channel_state_lock = RLock()
+    core.gateway_state_lock = RLock()
+    return core
 
 
 def test_ensure_home_layout_creates_native_contract(tmp_path):
@@ -160,6 +203,181 @@ def test_native_runtime_policy_and_fake_completion(monkeypatch):
     )
     assert completion["provider"] == "fake"
     assert completion["content"] == "native ok"
+
+
+def test_daemon_honors_heartbeat_interval_alias_and_quiet_hours_without_enabled(monkeypatch):
+    core = object.__new__(daemon.KestrelDaemon)
+    core.config = {
+        "heartbeat": {
+            "interval": 123,
+            "interval_seconds": 45,
+            "quiet_hours": {
+                "start": "22:00",
+                "end": "06:00",
+            },
+        }
+    }
+
+    assert core._heartbeat_interval_seconds() == 45
+
+    core.config["heartbeat"].pop("interval_seconds")
+    assert core._heartbeat_interval_seconds() == 123
+
+    monkeypatch.setattr(daemon_tasks_impl, "datetime_now_hhmm", lambda: "23:15")
+    assert core._in_quiet_hours() is True
+
+
+def test_daemon_workspace_overrides_system_prompt_and_notification_persistence(tmp_path):
+    core = _build_test_daemon(tmp_path)
+    document = {
+        "version": 1,
+        "users": [{"id": "user-1", "email": "local@example.com"}],
+        "workspaces": [
+            {
+                "id": "workspace-1",
+                "name": "Local Workspace",
+                "settings": {
+                    "agent": {
+                        "personality": {
+                            "profile": "operator",
+                            "intensity": "medium",
+                        },
+                        "proactivity": {
+                            "background_execution": "notify_only",
+                        },
+                    }
+                },
+            }
+        ],
+        "conversations": [],
+        "providerConfigs": [
+            {
+                "workspaceId": "workspace-1",
+                "provider": "lmstudio",
+                "isDefault": True,
+                "systemPrompt": "Call out blockers before next steps.",
+            }
+        ],
+        "notifications": [],
+        "installedTools": [],
+    }
+    core._save_gateway_local_state(document)
+
+    config = core._config_for_workspace("workspace-1")
+    assert config["agent"]["personality"]["intensity"] == "medium"
+    assert config["agent"]["proactivity"]["background_execution"] == "notify_only"
+    assert core._workspace_system_prompt("workspace-1") == "Call out blockers before next steps."
+
+    core._record_local_notification(
+        notification_type="info",
+        title="Started background review",
+        body="I noticed watched-file changes and started a background review.",
+        source="proactive",
+        data={"workspace_id": "workspace-1", "background": True, "proactive_source": "watched_changes"},
+    )
+
+    saved = json.loads(core._gateway_local_state_path().read_text(encoding="utf-8"))
+    assert saved["notifications"][0]["userId"] == "user-1"
+    assert saved["notifications"][0]["title"] == "Started background review"
+    assert saved["notifications"][0]["data"]["background"] is True
+    assert saved["notifications"][0]["data"]["proactive_source"] == "watched_changes"
+
+
+def test_proactive_goal_safety_allows_review_and_blocks_mutating_or_media_goals():
+    core = object.__new__(daemon.KestrelDaemon)
+
+    assert core._proactive_goal_is_safe("Review and summarize the recent watched changes.") is True
+    assert core._proactive_goal_is_safe("Generate an image of the recent watched changes.") is False
+    assert core._proactive_goal_is_safe("Edit files to recover the repo.") is False
+
+
+def test_proactive_heartbeat_autostarts_safe_background_task_and_writes_notification(tmp_path, monkeypatch):
+    core = _build_test_daemon(tmp_path)
+    core._save_gateway_local_state(
+        {
+            "version": 1,
+            "users": [{"id": "user-1", "email": "local@example.com"}],
+            "workspaces": [
+                {
+                    "id": "workspace-1",
+                    "name": "Local Workspace",
+                    "settings": {
+                        "agent": {
+                            "proactivity": {
+                                "background_execution": "auto_start_safe",
+                            }
+                        }
+                    },
+                }
+            ],
+            "conversations": [],
+            "providerConfigs": [],
+            "notifications": [],
+            "installedTools": [],
+        }
+    )
+    core.recent_watched_changes = [str(core.paths.workspace_md)]
+
+    async def fake_execute_task(task_id, goal, *, kind="task", history=None):
+        return None
+
+    monkeypatch.setattr(core, "_execute_task", fake_execute_task)
+
+    async def scenario():
+        await core._run_proactive_heartbeat()
+        if core.active_tasks:
+            await asyncio.gather(*core.active_tasks.values(), return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    tasks = core.state_store.list_tasks(limit=5)
+    assert len(tasks) == 1
+    assert tasks[0]["metadata"]["background"] is True
+    assert tasks[0]["metadata"]["source"] == "proactive"
+    assert tasks[0]["metadata"]["proactive_source"] == "watched_changes"
+
+    saved = json.loads(core._gateway_local_state_path().read_text(encoding="utf-8"))
+    assert saved["notifications"][0]["title"] == "Started background review"
+    assert saved["notifications"][0]["data"]["background"] is True
+    assert "watched-file changes" in core.last_heartbeat_action
+
+
+def test_proactive_heartbeat_notify_only_mode_surfaces_notice_without_starting_task(tmp_path, monkeypatch):
+    core = _build_test_daemon(tmp_path)
+    core._save_gateway_local_state(
+        {
+            "version": 1,
+            "users": [{"id": "user-1", "email": "local@example.com"}],
+            "workspaces": [
+                {
+                    "id": "workspace-1",
+                    "name": "Local Workspace",
+                    "settings": {
+                        "agent": {
+                            "proactivity": {
+                                "background_execution": "notify_only",
+                            }
+                        }
+                    },
+                }
+            ],
+            "conversations": [],
+            "providerConfigs": [],
+            "notifications": [],
+            "installedTools": [],
+        }
+    )
+    core.recent_watched_changes = [str(core.paths.workspace_md)]
+
+    async def fake_execute_task(task_id, goal, *, kind="task", history=None):
+        raise AssertionError("notify_only mode should not start background tasks")
+
+    monkeypatch.setattr(core, "_execute_task", fake_execute_task)
+    asyncio.run(core._run_proactive_heartbeat())
+
+    assert core.state_store.list_tasks(limit=5) == []
+    saved = json.loads(core._gateway_local_state_path().read_text(encoding="utf-8"))
+    assert saved["notifications"][0]["title"] == "Background opportunity noticed"
 
 
 def test_extract_json_object_repairs_multiline_string_values():

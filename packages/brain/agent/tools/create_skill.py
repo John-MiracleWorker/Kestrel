@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Create Skill Tool — allows the agent to define new tools mid-execution.
 
