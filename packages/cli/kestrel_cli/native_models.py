@@ -594,21 +594,24 @@ class NativeExecutionResult:
     approval_payload: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, compact: bool = False) -> dict[str, Any]:
+        data_payload: dict[str, Any] = dict(self.data)
+        if compact:
+            data_payload = _compact_native_payload(data_payload)
         payload = {
             "tool_name": self.tool_name,
             "success": self.success,
             "message": self.message,
-            "data": dict(self.data),
-            "stdout": self.stdout,
-            "stderr": self.stderr,
+            "data": data_payload,
+            "stdout": _truncate_text(self.stdout, 1200) if compact else self.stdout,
+            "stderr": _truncate_text(self.stderr, 1200) if compact else self.stderr,
             "exit_code": self.exit_code,
-            "artifacts": list(self.artifacts),
+            "artifacts": _compact_native_payload(list(self.artifacts)) if compact else list(self.artifacts),
             "risk_class": self.risk_class,
             "approval_required": self.approval_required,
             "approval_operation": self.approval_operation,
-            "approval_payload": dict(self.approval_payload),
-            "metadata": dict(self.metadata),
+            "approval_payload": _compact_native_payload(dict(self.approval_payload)) if compact else dict(self.approval_payload),
+            "metadata": _compact_native_payload(dict(self.metadata)) if compact else dict(self.metadata),
         }
         return payload
 
@@ -711,6 +714,82 @@ def _truncate_text(value: str, limit: int = 12_000) -> str:
     return f"{head}\n\n... ({omitted} chars omitted) ...\n\n{tail}"
 
 
+def _compact_native_payload(value: Any, *, key: str = "", depth: int = 0) -> Any:
+    if isinstance(value, dict):
+        items = list(value.items())
+        if depth >= 2:
+            compact: dict[str, Any] = {}
+            preferred_keys = (
+                "pack_id",
+                "name",
+                "version",
+                "description",
+                "installed",
+                "enabled",
+                "trusted",
+                "scope",
+                "source_type",
+                "path",
+                "snapshot_id",
+                "query",
+                "total",
+                "mime_type",
+                "binary",
+                "size_bytes",
+                "truncated",
+            )
+            for preferred in preferred_keys:
+                if preferred in value:
+                    compact[preferred] = _compact_native_payload(value[preferred], key=preferred, depth=depth + 1)
+            if not compact:
+                for name, child in items[:6]:
+                    compact[name] = _compact_native_payload(child, key=name, depth=depth + 1)
+            omitted = len(value) - len(compact)
+            if omitted > 0:
+                compact["_omitted_fields"] = omitted
+            return compact
+
+        compact = {
+            name: _compact_native_payload(child, key=name, depth=depth + 1)
+            for name, child in items[:10]
+        }
+        if len(items) > 10:
+            compact["_omitted_fields"] = len(items) - 10
+        return compact
+
+    if isinstance(value, list):
+        if key in {"packs", "results", "matches", "artifacts", "approvals"} or len(value) > 8:
+            preview = [_compact_native_payload(item, depth=depth + 1) for item in value[:5]]
+            payload = {
+                "count": len(value),
+                "preview": preview,
+            }
+            if len(value) > 5:
+                payload["truncated_items"] = len(value) - 5
+            return payload
+        return [_compact_native_payload(item, depth=depth + 1) for item in value]
+
+    if isinstance(value, str):
+        return _truncate_text(value, 600 if depth == 0 else 240)
+
+    return value
+
+
+class StructuredModelOutputError(RuntimeError):
+    def __init__(self, *, repair_label: str, response_text: str):
+        self.repair_label = str(repair_label or "structured").strip() or "structured"
+        self.response_text = str(response_text or "")
+        sample = re.sub(r"\s+", " ", _strip_wrappers(self.response_text)).strip()
+        if not sample:
+            sample = "(empty response)"
+        if len(sample) > 180:
+            sample = f"{sample[:177]}..."
+        self.response_sample = sample
+        super().__init__(
+            f"Failed to parse {self.repair_label} model response after repair. Sample: {self.response_sample}"
+        )
+
+
 def _strip_wrappers(text: str) -> str:
     cleaned = (text or "").strip()
     if cleaned.startswith("```"):
@@ -720,6 +799,128 @@ def _strip_wrappers(text: str) -> str:
         else:
             cleaned = "\n".join(lines[1:]).strip()
     return cleaned
+
+
+def _strip_json_like_comments(raw: str) -> str:
+    cleaned: list[str] = []
+    in_string = False
+    escape = False
+    in_line_comment = False
+    in_block_comment = False
+    index = 0
+    length = len(raw)
+    while index < length:
+        char = raw[index]
+        next_char = raw[index + 1] if index + 1 < length else ""
+
+        if in_line_comment:
+            if char in "\r\n":
+                in_line_comment = False
+                cleaned.append(char)
+            index += 1
+            continue
+
+        if in_block_comment:
+            if char == "*" and next_char == "/":
+                in_block_comment = False
+                if cleaned and not cleaned[-1].isspace():
+                    cleaned.append(" ")
+                index += 2
+                continue
+            index += 1
+            continue
+
+        if in_string:
+            cleaned.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+
+        if char == '"':
+            cleaned.append(char)
+            in_string = True
+            index += 1
+            continue
+        if char == "/" and next_char == "/":
+            in_line_comment = True
+            index += 2
+            continue
+        if char == "/" and next_char == "*":
+            in_block_comment = True
+            index += 2
+            continue
+
+        cleaned.append(char)
+        index += 1
+
+    return "".join(cleaned)
+
+
+def _strip_json_like_trailing_commas(raw: str) -> str:
+    cleaned: list[str] = []
+    in_string = False
+    escape = False
+    index = 0
+    length = len(raw)
+    while index < length:
+        char = raw[index]
+        if in_string:
+            cleaned.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+
+        if char == '"':
+            cleaned.append(char)
+            in_string = True
+            index += 1
+            continue
+
+        if char == ",":
+            lookahead = index + 1
+            while lookahead < length and raw[lookahead].isspace():
+                lookahead += 1
+            if lookahead < length and raw[lookahead] in "}]":
+                index += 1
+                continue
+
+        cleaned.append(char)
+        index += 1
+
+    return "".join(cleaned)
+
+
+def _normalize_json_like_text(raw: str) -> str:
+    normalized = _strip_json_like_comments(raw)
+    normalized = _strip_json_like_trailing_commas(normalized)
+    return normalized.strip()
+
+
+def _json_object_parse_candidates(raw: str) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    normalized = _normalize_json_like_text(raw)
+    for candidate in (raw, normalized):
+        value = str(candidate or "")
+        if not value or value in seen:
+            continue
+        candidates.append(value)
+        seen.add(value)
+        repaired = _escape_json_string_control_chars(value)
+        if repaired and repaired not in seen:
+            candidates.append(repaired)
+            seen.add(repaired)
+    return candidates
 
 
 def _escape_json_string_control_chars(raw: str) -> str:
@@ -761,11 +962,7 @@ def _escape_json_string_control_chars(raw: str) -> str:
 
 
 def _load_possible_json_object(raw: str) -> dict[str, Any] | None:
-    candidates = [raw]
-    repaired = _escape_json_string_control_chars(raw)
-    if repaired != raw:
-        candidates.append(repaired)
-    for candidate in candidates:
+    for candidate in _json_object_parse_candidates(raw):
         try:
             parsed = json.loads(candidate)
         except json.JSONDecodeError:
@@ -1144,7 +1341,13 @@ async def route_local_image_request(
         )
         provider = repaired["provider"]
         model = repaired["model"]
-        routed = _extract_json_object(repaired["content"])
+        try:
+            routed = _extract_json_object(repaired["content"])
+        except Exception as exc:
+            raise StructuredModelOutputError(
+                repair_label="multimodal router",
+                response_text=repaired["content"],
+            ) from exc
 
     normalized = _normalize_local_image_route(
         routed,
@@ -1201,7 +1404,13 @@ async def _request_model_json(
             timeout_seconds=timeout_seconds,
             model_role=model_role,
         )
-        return _extract_json_object(repaired["content"]), repaired["provider"], repaired["model"]
+        try:
+            return _extract_json_object(repaired["content"]), repaired["provider"], repaired["model"]
+        except Exception as exc:
+            raise StructuredModelOutputError(
+                repair_label=repair_label,
+                response_text=repaired["content"],
+            ) from exc
 
 
 def _custom_tool_manifest_template(

@@ -1,153 +1,138 @@
 # Kestrel
 
-Kestrel is a self-hosted AI agent platform split into four main services:
+[![CI](https://github.com/John-MiracleWorker/Kestrel/actions/workflows/ci.yml/badge.svg)](https://github.com/John-MiracleWorker/Kestrel/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-- `Gateway`: Node.js/TypeScript API, auth, websocket, and channel routing layer
-- `Brain`: Python gRPC reasoning, planning, memory, and task orchestration service
-- `Hands`: Python gRPC sandbox executor backed by Docker containers
-- `Web`: React/Vite frontend for chat, tasks, settings, and operator workflows
+Kestrel is an autonomous AI agent platform that combines a Python reasoning core, a sandboxed execution service, channel-aware ingress, and multiple user surfaces across web, desktop, and native terminal workflows.
 
-The repo is a monorepo with npm workspaces under `packages/`.
+It can run in two practical modes today:
+
+- Docker-first for bringing up the full stack quickly
+- Native or hybrid for desktop-oriented development with local services and optional Docker-backed subsystems
+
+> Current state: Kestrel is real and testable today, but most of the platform should still be treated as experimental. The strongest surfaces are web chat, task APIs, sandbox execution, provider configuration, and the native CLI/daemon path. Operator tooling, some service boundaries, and broader platform hardening are still in progress.
+
+## What Exists Today
+
+- `Gateway`: Fastify API, WebSocket transport, auth, workspaces, channel ingress, provider routes, automation routes, and webhook handling
+- `Brain`: Python gRPC service for reasoning, task orchestration, memory, approvals, provider routing, workflows, and runtime policy
+- `Hands`: Python gRPC sandbox executor with Docker isolation, permission checks, and structured audit records
+- `Web`: React and Vite frontend for chat, tasks, settings, and operator-facing flows
+- `Desktop`: Tauri wrapper around the web UI for a native desktop shell
+- `CLI`: Python terminal interface with a full-screen TUI, REPL, daemon mode, task commands, memory commands, and skill pack management
+- `Channels`: Web, Telegram, Discord, and WhatsApp adapters are wired; mobile support is only partial today
 
 ## Architecture
 
-- `packages/gateway`: Fastify + gRPC bridge + channel ingress
-- `packages/brain`: Core agent runtime, persistence, providers, and automation
-- `packages/hands`: Sandboxed tool execution and audit receipts
-- `packages/web`: Browser UI
-- `packages/desktop`: Tauri wrapper for the web UI
-- `packages/shared`: Shared protobuf definitions and generated code
+```mermaid
+flowchart LR
+    U[Users and channels] --> G[Gateway]
+    W[Web and desktop UI] --> G
+    C[CLI and native daemon] --> B
+    G --> B[Brain]
+    B --> H[Hands]
+    B --> P[(Postgres + pgvector)]
+    G --> R[(Redis)]
+    B --> M[Model providers]
+    H --> D[Docker sandboxes]
+```
 
-Default local ports:
+## Product Surfaces
 
-- Web UI: `http://localhost:5173`
-- Gateway: `http://localhost:8741`
-- Brain gRPC: `localhost:50051`
-- Hands gRPC: `localhost:50052`
+### Service stack
+
+| Package            | Role                                                                   |
+| ------------------ | ---------------------------------------------------------------------- |
+| `packages/gateway` | HTTP, WebSocket, auth, channel ingress, and API routing                |
+| `packages/brain`   | Agent runtime, memory, workflows, provider routing, and task lifecycle |
+| `packages/hands`   | Sandboxed execution, permission enforcement, and audit output          |
+| `packages/shared`  | Protobuf contracts and shared typed schemas                            |
+
+### User-facing surfaces
+
+| Package            | Role                                                         |
+| ------------------ | ------------------------------------------------------------ |
+| `packages/web`     | Browser UI                                                   |
+| `packages/desktop` | Tauri desktop shell                                          |
+| `packages/cli`     | Native CLI, TUI, daemon, and local-first companion workflows |
+
+## Maturity Snapshot
+
+This is the practical summary of the current repo state:
+
+- Usable but experimental: Docker Compose stack, JWT auth, workspaces, web chat, autonomous tasks, task event persistence, Hands sandbox execution, native host execution, provider configuration, and the main channel adapters
+- Partially implemented: mobile push and sync helpers, memory graph inspection from the web UI
+- Planned only: runtime profile inspector, fuller operator dashboard, and full end-to-end platform harnesses
+
+For the detailed source of truth, see `docs/platform-capabilities.md`.
 
 ## Quick Start
 
-### Docker-first
+### Option 1: Docker-first
 
-1. Copy the environment template:
+This is the easiest way to bring up the full platform.
 
 ```bash
 cp .env.example .env
-```
-
-2. Start the full stack:
-
-```bash
 docker compose up -d --build
 ```
 
-3. Open the web UI:
+Default local endpoints:
 
-```text
-http://localhost:5173
-```
+- Web UI: `http://localhost:5173`
+- Gateway API: `http://localhost:8741`
+- Brain gRPC: `localhost:50051`
+- Hands gRPC: `localhost:50052`
+- PostgreSQL: `localhost:5432`
+- Redis: `localhost:6379`
 
-This path brings up PostgreSQL, Redis, Gateway, Brain, Hands, and the frontend together.
+### Option 2: Native or hybrid
 
-## Native Development
-
-Prerequisites:
-
-- Node.js `18+`
-- npm `9+`
-- Python `3.11+`
-- Docker Desktop or Docker Engine
-- PostgreSQL `16`
-- Redis `7`
-
-Recommended bootstrap:
-
-1. Install workspace dependencies:
+This path is better when you want the desktop-first development profile or you want to keep only heavier subsystems inside Docker.
 
 ```bash
 npm install
-```
-
-2. Create the repo-local Python environment at the repository root:
-
-```bash
-python -m venv venv
-```
-
-3. Install Python dependencies into that root environment:
-
-Windows:
-
-```powershell
-venv\Scripts\python.exe -m pip install -r packages/brain/requirements.txt
-venv\Scripts\python.exe -m pip install -r packages/hands/requirements.txt
-```
-
-macOS/Linux:
-
-```bash
+python3 -m venv venv
 venv/bin/python -m pip install -r packages/brain/requirements.txt
 venv/bin/python -m pip install -r packages/hands/requirements.txt
-```
-
-4. Copy `.env.example` to `.env` and fill in the values you need.
-
-5. Start supporting services. The simplest hybrid path is:
-
-```bash
-docker compose up -d postgres redis
-```
-
-If you want Hands to stay containerized during native development, start it too:
-
-```bash
-docker compose up -d postgres redis hands
-```
-
-6. Start the application services in separate terminals:
-
-```bash
-npm run dev --workspace=@kestrel/gateway
-npm run dev --workspace=@kestrel/web
-```
-
-Then start Brain and optionally Hands with the repo venv active, or with the venv interpreter directly.
-
-Example on Windows:
-
-```powershell
-cd packages/brain
-..\..\venv\Scripts\python.exe server.py
-```
-
-```powershell
-cd packages/hands
-..\..\venv\Scripts\python.exe server.py
-```
-
-Example on macOS/Linux:
-
-```bash
-cd packages/brain
-../../venv/bin/python server.py
-```
-
-```bash
-cd packages/hands
-../../venv/bin/python server.py
+cp config/startup/native-hybrid.env.example config/startup/native-hybrid.env
+./scripts/startup/native-hybrid.sh check
+./scripts/startup/native-hybrid.sh up
 ```
 
 Notes:
 
-- Hands still requires a working Docker daemon even when the Hands service itself runs natively, because sandbox execution is container-backed.
-- The root validation scripts resolve Python tooling from the repo-local `venv/` automatically.
-- In PowerShell, `npm` may be blocked by execution policy because it resolves to `npm.ps1`. Use `npm.cmd` instead when needed.
+- `Hands` still depends on Docker even when you run it from a native shell because sandbox execution is container-backed.
+- The native profile defaults host write and host exec tools to disabled until you provide an explicit policy file.
+- On macOS, screen automation requires Screen Recording and Accessibility permissions.
+
+## CLI And Native Workflow
+
+The CLI package exposes a local-first companion surface in addition to the service stack.
+
+Install it into the repo virtual environment:
+
+```bash
+venv/bin/python -m pip install -e packages/cli
+```
+
+Then use commands like:
+
+```bash
+kestrel
+kestrel tui
+kestrel repl
+kestrel task "review auth module"
+kestrel tasks
+kestrel monitor
+kestrel runtime
+kestrel skill list
+kestrel memory show
+```
 
 ## Validation
 
 Root validation commands:
-
-Other shells:
 
 ```bash
 npm run test
@@ -155,27 +140,31 @@ npm run typecheck
 npm run lint
 ```
 
-PowerShell on Windows:
-
-```powershell
-npm.cmd run test
-npm.cmd run typecheck
-npm.cmd run lint
-```
-
-Package-level examples:
+Useful package-level commands:
 
 ```bash
+npm run dev --workspace=@kestrel/gateway
+npm run dev --workspace=@kestrel/web
 npm run test --workspace=@kestrel/gateway
-npm run typecheck --workspace=@kestrel/brain
-npm run lint --workspace=@kestrel/hands
+npm run typecheck --workspace=@kestrel/web
+cd packages/brain && ../../venv/bin/python -m pytest tests -v
+cd packages/hands && ../../venv/bin/python -m pytest tests -v
 ```
 
-## Additional Docs
+## Documentation Map
 
-- `SETUP.md`: end-to-end setup details
-- `docs/platform-capabilities.md`: current product surface and maturity
-- `docs/service-ownership.md`: service boundaries and ownership
-- `docs/channel-support-matrix.md`: channel-by-channel support status
-- `docs/runtime-flags.md`: feature and runtime toggles
-- `docs/desktop-first-migration.md`: native or hybrid startup profile
+- `SETUP.md`: end-to-end setup guide
+- `docs/platform-capabilities.md`: what the repo supports today
+- `docs/service-ownership.md`: intended service boundaries
+- `docs/channel-support-matrix.md`: channel maturity and ingress status
+- `docs/runtime-flags.md`: runtime switches and feature flags
+- `docs/desktop-first-migration.md`: native and hybrid startup profile
+- `docs/deep-scan-architecture-audit.md`: current architecture risks and next improvement targets
+
+## Contributing
+
+See `CONTRIBUTING.md` for development expectations, validation commands, and PR guidance.
+
+## Security
+
+See `SECURITY.md` for reporting guidance and scope.

@@ -67,6 +67,35 @@ CHAT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "send_local_file_to_telegram",
+            "description": "Send an existing local file to the configured Telegram chat.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path to the local file to send.",
+                    },
+                    "caption": {
+                        "type": "string",
+                        "description": "Optional caption to include with the Telegram upload.",
+                    },
+                    "requested_name": {
+                        "type": "string",
+                        "description": "Optional original file name or search term used to choose this file.",
+                    },
+                    "send_to_telegram": {
+                        "type": "boolean",
+                        "description": "If false, only prepare the file path for channel delivery without directly uploading it.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_command",
             "description": "Execute a shell command and return its output. Use for tasks like installing packages, checking system info, etc.",
             "parameters": {
@@ -150,7 +179,7 @@ CHAT_TOOLS = [
 ]
 
 CHAT_TOOL_CATEGORIES: dict[str, tuple[str, ...]] = {
-    "file": ("create_file", "read_file", "list_directory"),
+    "file": ("create_file", "read_file", "list_directory", "send_local_file_to_telegram"),
     "system": ("run_command",),
     "media": ("generate_image",),
     "desktop": ("take_screenshot",),
@@ -337,6 +366,26 @@ def _execute_tool(name: str, arguments: dict[str, Any]) -> str:
             if len(entries) > 100:
                 result += f"\n  ... and {len(entries) - 100} more"
             return result
+
+        elif name == "send_local_file_to_telegram":
+            file_path = Path(arguments["path"]).expanduser()
+            caption = str(arguments.get("caption") or "").strip()
+            requested_name = str(arguments.get("requested_name") or "").strip()
+            send_to_telegram = bool(arguments.get("send_to_telegram", True))
+            if not file_path.exists():
+                return f"Error: File not found: {file_path}"
+            if file_path.is_dir():
+                return f"Error: Path is a directory, not a file: {file_path}"
+            if not send_to_telegram:
+                if requested_name and requested_name != file_path.name:
+                    return f"Queued {file_path.name} for Telegram delivery as the closest match for {requested_name}."
+                return f"Queued {file_path.name} for Telegram delivery."
+            sent, delivery_note = _send_file_to_telegram(file_path, caption=caption[:1024])
+            if not sent:
+                return f"Error: Failed to send {file_path.name} to Telegram. {delivery_note}"
+            if requested_name and requested_name != file_path.name:
+                return f"Sent {file_path.name} to Telegram as the closest match for {requested_name}. {delivery_note}"
+            return f"Sent {file_path.name} to Telegram. {delivery_note}"
 
         elif name == "run_command":
             command = arguments["command"]
@@ -597,7 +646,8 @@ def _execute_tool(name: str, arguments: dict[str, Any]) -> str:
             # Wait for the model to actually be ready for inference
             # The load API returns 200 when loading starts, but the
             # model may not be ready for chat completions yet.
-            # The 27B model takes ~213s to load, so we poll generously.
+            # With VRAM properly cleared, models load much faster, but
+            # we poll generously in case SwarmUI held residual GPU memory.
             for _wait in range(30):
                 _time.sleep(5)
                 try:

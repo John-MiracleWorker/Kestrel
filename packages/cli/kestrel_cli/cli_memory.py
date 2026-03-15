@@ -545,20 +545,46 @@ async def cmd_config(client: KestrelClient, args: argparse.Namespace):
     """Configure Kestrel CLI settings."""
     config = load_config()
 
+    def coerce_config_value(raw: str, existing):
+        if isinstance(existing, bool):
+            return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+        if isinstance(existing, int) and not isinstance(existing, bool):
+            try:
+                return int(raw)
+            except ValueError:
+                return raw
+        lowered = str(raw).strip().lower()
+        if lowered in {"true", "false"}:
+            return lowered == "true"
+        return raw
+
     if hasattr(args, "key") and args.key:
         key = args.key
         if hasattr(args, "value") and args.value:
-            config[key] = args.value
+            existing = get_config_value(config, key)
+            set_config_value(config, key, coerce_config_value(args.value, existing))
             save_config(config)
-            print_success(f"{key} = {args.value}")
+            print_success(f"{key} = {get_config_value(config, key)}")
         else:
-            val = config.get(key, "(not set)")
+            val = get_config_value(config, key, "(not set)")
             print(f"  {c(key, Colors.PRIMARY)} = {c(str(val), Colors.WHITE)}")
     else:
         print_header("Configuration")
-        for k, v in config.items():
+        rows: list[tuple[str, object]] = []
+
+        def walk(prefix: str, value: object) -> None:
+            if isinstance(value, dict):
+                for child_key, child_value in value.items():
+                    dotted = f"{prefix}.{child_key}" if prefix else child_key
+                    walk(dotted, child_value)
+                return
+            rows.append((prefix, value))
+
+        walk("", config)
+        for k, v in rows:
             if k == "api_key" and v:
-                v = v[:8] + "..." + v[-4:]
+                string_value = str(v)
+                v = string_value[:8] + "..." + string_value[-4:]
             print(f"  {c(k, Colors.PRIMARY):>30} = {c(str(v), Colors.WHITE)}")
         print()
         print(c("  Set a value: kestrel config <key> <value>", Colors.DIM))

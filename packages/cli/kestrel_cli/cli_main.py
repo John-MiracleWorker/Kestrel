@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from . import cli_memory as _cli_memory
-from .cli_tui import launch_tui
+from .tui import launch_tui
 
 globals().update({name: value for name, value in vars(_cli_memory).items() if not name.startswith("__")})
 

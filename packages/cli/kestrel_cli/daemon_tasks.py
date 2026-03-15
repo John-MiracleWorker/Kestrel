@@ -166,15 +166,25 @@ class KestrelDaemonTaskMixin:
             self._publish_event(task_id, "task_started", f"Started: {goal}", {"status": "running"})
             runner_goal = self._build_prompt(goal)
 
-        outcome = await self._build_agent_runner(task_id=task_id).run(
-            goal=runner_goal,
-            history=history or [],
-            task_id=task_id,
-            task_kind=kind,
-            initial_tool_call=initial_tool_call,
-            resume_state=resume_state,
-            approved=approved,
-        )
+        try:
+            outcome = await self._build_agent_runner(task_id=task_id).run(
+                goal=runner_goal,
+                history=history or [],
+                task_id=task_id,
+                task_kind=kind,
+                initial_tool_call=initial_tool_call,
+                resume_state=resume_state,
+                approved=approved,
+            )
+        except StructuredModelOutputError as exc:
+            outcome = NativeAgentOutcome(
+                status="failed",
+                message=str(exc),
+                provider="",
+                model="",
+                plan=None,
+                artifacts=[],
+            )
         if outcome.status == "completed":
             self._publish_event(
                 task_id,
@@ -368,8 +378,62 @@ class KestrelDaemonTaskMixin:
             },
         }
 
+    def _try_send_local_file_to_telegram(self, prompt: str) -> dict[str, Any] | None:
+        if "file" not in self._enabled_chat_tool_categories():
+            return None
+
+        request = _resolve_local_file_telegram_request(prompt)
+        if not request:
+            return None
+
+        resolved_path = Path(str(request.get("resolved_path") or "")).expanduser()
+        if not resolved_path.exists() or not resolved_path.is_file():
+            return None
+
+        LOGGER.info(
+            "Local file Telegram delivery request detected for %s: %r",
+            resolved_path,
+            prompt[:100],
+        )
+        return {
+            "tool_name": "send_local_file_to_telegram",
+            "arguments": {
+                "path": str(resolved_path),
+                "caption": resolved_path.name,
+                "send_to_telegram": True,
+                "requested_name": str(request.get("requested_name") or "").strip(),
+            },
+        }
+
+    def _try_skill_pack_list(self, prompt: str) -> dict[str, Any] | None:
+        categories = set(self._enabled_chat_tool_categories())
+        if "custom" not in categories or getattr(self, "skill_pack_manager", None) is None:
+            return None
+
+        lowered = str(prompt or "").strip().lower()
+        if "skill pack" not in lowered and "skill packs" not in lowered:
+            return None
+
+        if not any(token in lowered for token in ("list", "show", "what", "available", "installed", "marketplace", "catalog")):
+            return None
+
+        LOGGER.info("Skill pack catalog request detected: %r", prompt[:100])
+        return {
+            "tool_name": "skill_list",
+            "arguments": {
+                "include_synthetic": True,
+                "include_marketplace": True,
+            },
+        }
+
     def _detect_fast_path_tool_call(self, prompt: str) -> dict[str, Any] | None:
-        return self._try_screenshot_capture(prompt) or self._try_media_generation(prompt)
+        return (
+            self._try_send_local_file_to_telegram(prompt)
+            or
+            self._try_screenshot_capture(prompt)
+            or self._try_media_generation(prompt)
+            or self._try_skill_pack_list(prompt)
+        )
 
     def _build_system_prompt(self) -> str:
         profile = self._compose_runtime_profile()
@@ -395,10 +459,12 @@ class KestrelDaemonTaskMixin:
             "- Create, read, or modify files\n"
             "- List directory contents\n"
             "- Execute shell commands\n"
+            "- Send an existing local file to Telegram when the user explicitly asks for Telegram delivery\n"
             "- Generate media or capture the current screen when the user asks\n"
             "IMPORTANT: Never claim you performed an action without actually calling the appropriate tool.\n"
             "If you need to create a file, use create_file. If you need to run a command, use run_command. "
-            "If you need the current desktop image, use take_screenshot.\n"
+            "If you need the current desktop image, use take_screenshot. "
+            "If you need to send a local file to Telegram, use send_local_file_to_telegram.\n"
         )
 
     def _build_prompt(self, goal: str) -> str:

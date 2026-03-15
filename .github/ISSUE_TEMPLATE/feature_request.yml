@@ -1,0 +1,63 @@
+name: Feature request
+description: Propose a product, workflow, or developer-experience improvement
+title: '[Feature]: '
+labels:
+    - enhancement
+body:
+    - type: textarea
+      id: problem
+      attributes:
+          label: Problem or gap
+          description: Describe the current limitation or missed workflow.
+          placeholder: What is hard, missing, or misleading today?
+      validations:
+          required: true
+
+    - type: dropdown
+      id: area
+      attributes:
+          label: Primary area
+          options:
+              - Gateway
+              - Brain
+              - Hands
+              - Web
+              - Desktop
+              - CLI or daemon
+              - Shared contracts
+              - Docs
+              - CI or GitHub
+      validations:
+          required: true
+
+    - type: textarea
+      id: proposal
+      attributes:
+          label: Proposed change
+          description: Describe the behavior, workflow, or API you want.
+          placeholder: What should Kestrel do instead?
+      validations:
+          required: true
+
+    - type: textarea
+      id: use_case
+      attributes:
+          label: Use case
+          description: Explain why this matters in practice.
+          placeholder: What becomes easier, safer, or faster if this exists?
+      validations:
+          required: true
+
+    - type: textarea
+      id: tradeoffs
+      attributes:
+          label: Constraints or tradeoffs
+          description: Call out migration risks, policy concerns, or alternatives you already considered.
+
+    - type: checkboxes
+      id: checks
+      attributes:
+          label: Before submitting
+          options:
+              - label: I searched for existing feature requests covering this idea
+                required: true

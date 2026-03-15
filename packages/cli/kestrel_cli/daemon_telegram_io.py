@@ -147,6 +147,7 @@ class KestrelDaemonTelegramIOMixin:
             message=message,
             downloaded_attachments=downloaded_attachments,
         )
+        local_file_delivery_request = self._telegram_local_file_delivery_fast_path(message)
         image_attachments = self._telegram_image_attachments(downloaded_attachments)
         image_prompt = self._build_telegram_image_prompt(message, image_attachments, attachment_errors)
 
@@ -164,8 +165,56 @@ class KestrelDaemonTelegramIOMixin:
         }
         if desktop_save_request and isinstance(desktop_save_request.get("attachment"), dict):
             metadata["telegram_resolved_attachment"] = dict(desktop_save_request["attachment"])
+        if local_file_delivery_request:
+            requested_path = str(local_file_delivery_request.get("requested_path") or "").strip()
+            resolved_path = str(local_file_delivery_request.get("resolved_path") or "").strip()
+            suggestions = list(local_file_delivery_request.get("suggestions") or [])
+            if requested_path:
+                metadata["telegram_requested_local_file"] = requested_path
+            if resolved_path:
+                metadata["telegram_resolved_local_file"] = resolved_path
+            if suggestions:
+                metadata["telegram_local_file_suggestions"] = suggestions
 
         task = self.state_store.create_task(goal=prompt, kind="chat", metadata=metadata)
+        if local_file_delivery_request and local_file_delivery_request.get("missing_message"):
+            missing_message = str(local_file_delivery_request.get("missing_message") or "").strip()
+            self.state_store.update_task(
+                task["id"],
+                status="completed",
+                result={
+                    "message": missing_message,
+                    "provider": "",
+                    "model": "",
+                    "plan": None,
+                    "artifacts": [],
+                },
+            )
+            self._publish_event(
+                task["id"],
+                "task_complete",
+                missing_message,
+                {
+                    "status": "completed",
+                    "provider": "",
+                    "model": "",
+                    "plan": None,
+                    "artifacts": [],
+                    "final": True,
+                },
+            )
+            await self._telegram_update_task_status(
+                task["id"],
+                chat_id,
+                "Done",
+                reply_to_message_id=message_id,
+            )
+            await self._telegram_send_text(
+                chat_id,
+                missing_message,
+                reply_to_message_id=message_id,
+            )
+            return
         if image_attachments and not desktop_save_request:
             routed_image_request = None
             try:
@@ -248,9 +297,15 @@ class KestrelDaemonTelegramIOMixin:
         initial_tool_call = None
         if desktop_save_request:
             initial_tool_call = dict(desktop_save_request.get("initial_tool_call") or {})
+        if not initial_tool_call and local_file_delivery_request:
+            initial_tool_call = dict(local_file_delivery_request.get("initial_tool_call") or {})
         if not initial_tool_call:
             initial_tool_call = self._detect_fast_path_tool_call(prompt)
-        if initial_tool_call and str(initial_tool_call.get("tool_name") or "") in {"take_screenshot", "generate_image"}:
+        if initial_tool_call and str(initial_tool_call.get("tool_name") or "") in {
+            "take_screenshot",
+            "generate_image",
+            "send_local_file_to_telegram",
+        }:
             arguments = dict(initial_tool_call.get("arguments") or {})
             arguments["send_to_telegram"] = False
             initial_tool_call["arguments"] = arguments
@@ -880,6 +935,47 @@ class KestrelDaemonTelegramIOMixin:
             },
         }
 
+    def _telegram_local_file_delivery_fast_path(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        prompt = str(message.get("text") or "").strip()
+        request = _resolve_local_file_telegram_request(prompt)
+        if not request:
+            return None
+
+        resolved_path = Path(str(request.get("resolved_path") or "")).expanduser()
+        if resolved_path.exists() and resolved_path.is_file():
+            requested_name = str(request.get("requested_name") or "").strip()
+            return {
+                "requested_path": str(request.get("requested_path") or ""),
+                "requested_name": requested_name,
+                "resolved_path": str(resolved_path),
+                "suggestions": list(request.get("suggestions") or []),
+                "initial_tool_call": {
+                    "tool_name": "send_local_file_to_telegram",
+                    "arguments": {
+                        "path": str(resolved_path),
+                        "caption": resolved_path.name,
+                        "send_to_telegram": False,
+                        "requested_name": requested_name,
+                    },
+                },
+            }
+
+        requested_path = Path(str(request.get("requested_path") or "")).expanduser()
+        requested_name = str(request.get("requested_name") or requested_path.name or "").strip()
+        suggestions = [Path(item).name for item in request.get("suggestions") or [] if str(item).strip()]
+        lines = [f"I couldn't find {requested_name or 'that file'} on your Desktop."]
+        if suggestions:
+            label = "Closest match" if len(suggestions) == 1 else "Closest matches"
+            lines.append(f"{label}: {', '.join(suggestions[:3])}")
+        lines.append("Reply with the exact filename and I'll send it here.")
+        return {
+            "requested_path": str(requested_path),
+            "requested_name": requested_name,
+            "resolved_path": "",
+            "suggestions": suggestions,
+            "missing_message": "\n".join(lines),
+        }
+
     def _telegram_image_attachments(self, downloaded_attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         images: list[dict[str, Any]] = []
         for item in downloaded_attachments:
@@ -938,6 +1034,8 @@ class KestrelDaemonTelegramIOMixin:
         lowered = str(prompt or "").strip().lower()
         if tool_name == "copy_local_file":
             return "Saving to desktop"
+        if tool_name == "send_local_file_to_telegram":
+            return "Sending file"
         if tool_name == "take_screenshot":
             return "Capturing screenshot"
         if tool_name == "generate_image":

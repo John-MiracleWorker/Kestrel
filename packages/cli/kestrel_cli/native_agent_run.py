@@ -5,6 +5,31 @@ from . import native_agent_base as _native_agent_base
 globals().update({name: value for name, value in vars(_native_agent_base).items() if not name.startswith("__")})
 
 class NativeAgentRunnerRunMixin:
+    def _structured_output_failure(
+        self,
+        *,
+        task_id: str,
+        state: dict[str, Any],
+        provider: str,
+        model: str,
+        exc: StructuredModelOutputError,
+    ) -> NativeAgentOutcome:
+        message = str(exc).strip() or "Failed to parse structured model output."
+        resolved_provider = str(state.get("provider") or provider or "")
+        resolved_model = str(state.get("model") or model or "")
+        state["provider"] = resolved_provider
+        state["model"] = resolved_model
+        self._persist_state(task_id, state, status="failed", error=message)
+        return NativeAgentOutcome(
+            status="failed",
+            message=message,
+            provider=resolved_provider,
+            model=resolved_model,
+            plan=(state.get("plan") or None),
+            artifacts=list(state.get("artifacts", [])),
+            state=state,
+        )
+
     async def _call_plan_goal_compat(
         self,
         goal: str,
@@ -61,7 +86,16 @@ class NativeAgentRunnerRunMixin:
         model = state.get("model", "")
 
         if not state.get("plan"):
-            planning_payload, provider, model = await self._call_plan_goal_compat(goal, history, initial_tool_call, state)
+            try:
+                planning_payload, provider, model = await self._call_plan_goal_compat(goal, history, initial_tool_call, state)
+            except StructuredModelOutputError as exc:
+                return self._structured_output_failure(
+                    task_id=task_id,
+                    state=state,
+                    provider=provider,
+                    model=model,
+                    exc=exc,
+                )
             state["provider"] = provider
             state["model"] = model
             if planning_payload.get("mode") == "direct_response":
@@ -72,7 +106,16 @@ class NativeAgentRunnerRunMixin:
                     response_text, provider, model = await self._call_direct_response_compat(goal, history, state)
                 state["provider"] = provider
                 state["model"] = model
-                verifier_payload, provider, model = await self._verify_response(state, response_text)
+                try:
+                    verifier_payload, provider, model = await self._verify_response(state, response_text)
+                except StructuredModelOutputError as exc:
+                    return self._structured_output_failure(
+                        task_id=task_id,
+                        state=state,
+                        provider=provider,
+                        model=model,
+                        exc=exc,
+                    )
                 final_text = str(verifier_payload.get("final_response") or response_text).strip()
                 if not verifier_payload.get("ok", True):
                     final_text = response_text
@@ -237,7 +280,16 @@ class NativeAgentRunnerRunMixin:
                     state["pending_action"] = None
                     approved_for_action = True
                 else:
-                    action, provider, model = await self._next_action(state, step)
+                    try:
+                        action, provider, model = await self._next_action(state, step)
+                    except StructuredModelOutputError as exc:
+                        return self._structured_output_failure(
+                            task_id=task_id,
+                            state=state,
+                            provider=provider,
+                            model=model,
+                            exc=exc,
+                        )
                     state["provider"] = provider
                     state["model"] = model
                     approved_for_action = False
@@ -317,11 +369,12 @@ class NativeAgentRunnerRunMixin:
                             state=state,
                         )
 
+                    compact_result = result.to_dict(compact=True)
                     evidence = {
                         "step_id": step["id"],
                         "tool_name": tool_name,
                         "arguments": tool_args,
-                        **result.to_dict(),
+                        **compact_result,
                     }
                     state["tool_calls"] = int(state.get("tool_calls", 0)) + 1
                     state["tool_evidence"].append(evidence)
@@ -330,9 +383,9 @@ class NativeAgentRunnerRunMixin:
                         "tool_result",
                         result.to_text(),
                         toolName=tool_name,
-                        toolResult=result.to_dict(),
+                        toolResult=compact_result,
                         tool_name=tool_name,
-                        tool_result=result.to_dict(),
+                        tool_result=compact_result,
                         step_id=step["id"],
                     )
                     self._persist_state(task_id, state, status="running")
@@ -364,7 +417,27 @@ class NativeAgentRunnerRunMixin:
                     state["completed_steps"].append(step["id"])
                     state["final_response_draft"] = question
                     self._emit("step_complete", question, step_id=step["id"], step=step)
-                    break
+                    self._persist_state(
+                        task_id,
+                        state,
+                        status="completed",
+                        result={
+                            "message": question,
+                            "provider": provider,
+                            "model": model,
+                            "plan": plan,
+                            "artifacts": state.get("artifacts", []),
+                        },
+                    )
+                    return NativeAgentOutcome(
+                        status="completed",
+                        message=question,
+                        provider=provider,
+                        model=model,
+                        plan=plan,
+                        artifacts=list(state.get("artifacts", [])),
+                        state=state,
+                    )
 
                 if action_type == "store_result":
                     result_text = str(action.get("result") or "").strip()
@@ -556,7 +629,16 @@ class NativeAgentRunnerRunMixin:
             )
             draft_response = summary_response
 
-        verifier_payload, provider, model = await self._verify_response(state, draft_response)
+        try:
+            verifier_payload, provider, model = await self._verify_response(state, draft_response)
+        except StructuredModelOutputError as exc:
+            return self._structured_output_failure(
+                task_id=task_id,
+                state=state,
+                provider=provider,
+                model=model,
+                exc=exc,
+            )
         final_response = str(verifier_payload.get("final_response") or draft_response).strip()
         if not verifier_payload.get("ok", True):
             final_response = draft_response

@@ -1,0 +1,315 @@
+Screen {
+    background: #03070d;
+    color: #e6f7ff;
+}
+
+#chrome-shell {
+    layout: vertical;
+    background: #03070d;
+}
+
+#top-bar {
+    height: 4;
+    background: #07111a;
+    border: solid #102637;
+    padding: 0 1;
+}
+
+#brand-lockup {
+    width: 1fr;
+    content-align: left middle;
+}
+
+#brand-title {
+    color: #00f3ff;
+    text-style: bold;
+}
+
+#brand-subtitle {
+    color: #7f9db7;
+}
+
+#runtime-cluster {
+    width: 48;
+    align: left middle;
+    padding: 0 2;
+    border-left: solid #102637;
+    border-right: solid #102637;
+}
+
+#runtime-summary {
+    width: 1fr;
+    color: #d3e7f4;
+    content-align: left middle;
+}
+
+#top-actions {
+    width: auto;
+    align: right middle;
+}
+
+Button.utility-button {
+    margin: 0 0 0 1;
+    background: #08131d;
+    color: #9cc8ff;
+    border: round #12334a;
+}
+
+#workspace-shell {
+    height: 1fr;
+    background: #03070d;
+}
+
+#nav-rail {
+    width: 22;
+    background: #050d15;
+    border: solid #102637;
+    padding: 1;
+}
+
+.nav-heading {
+    color: #6e8aa1;
+    margin-bottom: 1;
+}
+
+.nav-button {
+    width: 100%;
+    margin: 0 0 1 0;
+    background: #07121b;
+    color: #9fb6c8;
+    border: round #102637;
+    content-align: left middle;
+}
+
+.nav-button.is-active {
+    background: #081a25;
+    color: #00f3ff;
+    border: round #00f3ff;
+    text-style: bold;
+}
+
+#workspace-stack {
+    width: 1fr;
+    padding: 1;
+}
+
+.view-pane {
+    height: 1fr;
+}
+
+.surface-panel {
+    border: round #102637;
+    background: #07111a;
+    padding: 1;
+}
+
+.section-title {
+    color: #00f3ff;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#inspector {
+    width: 38;
+    background: #050d15;
+    border: solid #102637;
+    padding: 1;
+}
+
+#inspector-title {
+    color: #00f3ff;
+    text-style: bold;
+}
+
+#inspector-subtitle {
+    color: #7f9db7;
+    margin-bottom: 1;
+}
+
+#bottom-bar {
+    height: 3;
+    background: #07111a;
+    border: solid #102637;
+    padding: 0 1;
+}
+
+#notice-bar {
+    width: 1fr;
+    color: #d3e7f4;
+    content-align: left middle;
+}
+
+#hint-bar {
+    width: auto;
+    color: #6e8aa1;
+    content-align: right middle;
+}
+
+#cockpit-metrics {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+#cockpit-metrics MetricCard {
+    width: 1fr;
+    margin: 0 1 0 0;
+}
+
+#cockpit-process,
+#chat-process {
+    margin: 0 0 1 0;
+}
+
+#cockpit-grid,
+#tasks-layout,
+#approvals-layout,
+#skills-layout {
+    height: 1fr;
+}
+
+#cockpit-grid > .surface-panel,
+#tasks-layout > .surface-panel,
+#approvals-layout > .surface-panel,
+#skills-layout > .surface-panel {
+    width: 1fr;
+    margin: 0 1 0 0;
+}
+
+#chat-approval-strip {
+    height: auto;
+    margin: 0 0 1 0;
+    align: left middle;
+}
+
+#chat-approval-banner {
+    width: 1fr;
+    color: #fbd38d;
+    content-align: left middle;
+}
+
+#chat-log,
+#tasks-timeline,
+#approval-preview,
+#skill-preview {
+    height: 1fr;
+    background: #040a10;
+    border: round #102637;
+    color: #d8eaf6;
+}
+
+#chat-artifacts {
+    height: 3;
+    color: #7f9db7;
+    content-align: left middle;
+}
+
+#chat-composer-shell {
+    height: 14;
+    margin: 1 0 0 0;
+}
+
+#chat-composer {
+    width: 1fr;
+    height: 100%;
+    background: #040a10;
+    color: #e6f7ff;
+    border: round #00f3ff;
+}
+
+#chat-composer-actions {
+    width: 22;
+    padding: 0 0 0 1;
+}
+
+#chat-composer-actions Button {
+    width: 100%;
+    margin: 0 0 1 0;
+}
+
+#tasks-list-panel,
+#approvals-list-panel,
+#skills-list-panel {
+    width: 46;
+}
+
+#tasks-filter,
+#skills-search,
+#palette-input {
+    margin: 0 0 1 0;
+    background: #040a10;
+    border: round #102637;
+    color: #e6f7ff;
+}
+
+DataTable {
+    height: 1fr;
+    background: #040a10;
+    color: #d8eaf6;
+    border: round #102637;
+}
+
+#tasks-actions,
+#approval-actions,
+#skills-actions {
+    height: auto;
+    margin: 0 0 1 0;
+    align: left middle;
+}
+
+#tasks-actions Button,
+#approval-actions Button,
+#skills-actions Button {
+    margin: 0 0 0 1;
+}
+
+ModalScreen {
+    align: center middle;
+    background: #02050a;
+}
+
+#palette-modal,
+#notifications-modal,
+#inspector-modal {
+    width: 72;
+    max-width: 90%;
+    height: auto;
+    max-height: 90%;
+    background: #07111a;
+    border: round #00f3ff;
+    padding: 1 2;
+}
+
+#notifications-title,
+#inspector-modal-title {
+    color: #00f3ff;
+    text-style: bold;
+}
+
+#notifications-actions {
+    height: auto;
+    margin: 0 0 1 0;
+    align: left middle;
+}
+
+#notifications-actions Button {
+    margin: 0 0 0 1;
+}
+
+#notifications-log,
+#inspector-modal-log {
+    height: 20;
+    background: #040a10;
+    border: round #102637;
+}
+
+#inspector-modal-subtitle {
+    color: #7f9db7;
+    margin: 0 0 1 0;
+}
+
+OptionList {
+    height: 20;
+    background: #040a10;
+    border: round #102637;
+    color: #d8eaf6;
+}

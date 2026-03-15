@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import mimetypes
+
 from . import native_tool_registry_core as _native_tool_registry_core
 
 globals().update({name: value for name, value in vars(_native_tool_registry_core).items() if not name.startswith("__")})
+
+
+_READ_FILE_BINARY_SAMPLE_BYTES = 4096
 
 class NativeToolRegistryHandlersMixin:
     def _native_send_file_to_telegram(self, file_path: Path, *, caption: str = "") -> tuple[bool, str]:
@@ -326,11 +331,110 @@ class NativeToolRegistryHandlersMixin:
             risk_class="mutating",
         )
 
+    def _handle_send_local_file_to_telegram(
+        self,
+        context: NativeToolContext,
+        arguments: dict[str, Any],
+    ) -> NativeExecutionResult:
+        file_path = self._resolve_local_path(arguments.get("path"), workspace_root=context.workspace_root)
+        caption = str(arguments.get("caption") or "").strip()
+        requested_name = str(arguments.get("requested_name") or "").strip()
+        send_to_telegram = bool(arguments.get("send_to_telegram", True))
+
+        if not file_path.exists():
+            return NativeExecutionResult(
+                tool_name="send_local_file_to_telegram",
+                success=False,
+                message=f"Local file not found: {file_path}",
+            )
+        if file_path.is_dir():
+            return NativeExecutionResult(
+                tool_name="send_local_file_to_telegram",
+                success=False,
+                message=f"Local file delivery only supports files, not directories: {file_path}",
+            )
+
+        artifacts = [self._format_artifact(file_path)]
+        if not send_to_telegram:
+            if requested_name and requested_name != file_path.name:
+                message = (
+                    f"Queued {file_path.name} for Telegram delivery as the closest match for {requested_name}."
+                )
+            else:
+                message = f"Queued {file_path.name} for Telegram delivery."
+            return NativeExecutionResult(
+                tool_name="send_local_file_to_telegram",
+                success=True,
+                message=message,
+                data={"path": str(file_path), "sent_to_telegram": False},
+                artifacts=artifacts,
+                risk_class="low",
+            )
+
+        sent, delivery_note = self._native_send_file_to_telegram(
+            file_path,
+            caption=caption[:1024],
+        )
+        if not sent:
+            return NativeExecutionResult(
+                tool_name="send_local_file_to_telegram",
+                success=False,
+                message=f"Failed to send {file_path.name} to Telegram. {delivery_note}",
+                data={"path": str(file_path), "sent_to_telegram": False},
+                artifacts=artifacts,
+                risk_class="low",
+            )
+        if requested_name and requested_name != file_path.name:
+            message = (
+                f"Sent {file_path.name} to Telegram as the closest match for {requested_name}. {delivery_note}"
+            )
+        else:
+            message = f"Sent {file_path.name} to Telegram. {delivery_note}"
+        return NativeExecutionResult(
+            tool_name="send_local_file_to_telegram",
+            success=True,
+            message=message,
+            data={"path": str(file_path), "sent_to_telegram": True},
+            artifacts=artifacts,
+            risk_class="low",
+        )
+
     def _handle_read_file(self, context: NativeToolContext, arguments: dict[str, Any]) -> NativeExecutionResult:
         path = self._resolve_local_path(arguments.get("path"), workspace_root=context.workspace_root)
         if not path.exists():
             return NativeExecutionResult(tool_name="read_file", success=False, message=f"File not found: {path}")
-        content = path.read_text(encoding="utf-8", errors="replace")
+        size_bytes = path.stat().st_size
+        with path.open("rb") as handle:
+            sample = handle.read(_READ_FILE_BINARY_SAMPLE_BYTES)
+
+        is_binary = b"\x00" in sample
+        if not is_binary:
+            try:
+                sample.decode("utf-8")
+            except UnicodeDecodeError:
+                is_binary = True
+
+        if is_binary:
+            mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            message = (
+                f"Binary file: {path.name} ({mime_type}, {size_bytes} bytes). "
+                "read_file only returns text previews."
+            )
+            return NativeExecutionResult(
+                tool_name="read_file",
+                success=True,
+                message=message,
+                data={
+                    "path": str(path),
+                    "content": message,
+                    "binary": True,
+                    "mime_type": mime_type,
+                    "size_bytes": size_bytes,
+                    "truncated": False,
+                },
+            )
+
+        content = path.read_text(encoding="utf-8")
         max_chars = max(1, int(arguments.get("max_chars") or 12_000))
         truncated = _truncate_text(content, max_chars)
         return NativeExecutionResult(

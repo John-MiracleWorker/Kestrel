@@ -526,6 +526,244 @@ def test_daemon_routes_recent_telegram_image_reference_to_desktop_copy(monkeypat
     assert sent_texts[-1] == "Queued copy to desktop."
 
 
+def test_daemon_routes_desktop_file_request_to_telegram_send(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    instance = _build_daemon(monkeypatch, tmp_path)
+    desktop = tmp_path / "Desktop"
+    desktop.mkdir(parents=True, exist_ok=True)
+    file_path = desktop / "hand.png"
+    file_path.write_bytes(b"fake-image-bytes")
+    captured: dict[str, object] = {}
+    sent_texts: list[str] = []
+    status_messages: list[str] = []
+
+    async def fake_download(_message):
+        return [], []
+
+    async def fake_run(task_id, goal, *, kind, history=None, initial_tool_call=None, resume_state=None, approved=False):
+        captured["goal"] = goal
+        captured["initial_tool_call"] = dict(initial_tool_call or {})
+        instance.state_store.update_task(
+            task_id,
+            status="completed",
+            result={
+                "message": "Sent hand.png.",
+                "provider": "fake",
+                "model": "model",
+                "plan": None,
+                "artifacts": [{"type": "file", "path": str(file_path), "name": file_path.name}],
+            },
+        )
+        return native.NativeAgentOutcome(
+            status="completed",
+            message="Sent hand.png.",
+            provider="fake",
+            model="model",
+            artifacts=[{"type": "file", "path": str(file_path), "name": file_path.name}],
+        )
+
+    async def capture_text(_chat_id, text, **_kwargs):
+        sent_texts.append(text)
+
+    async def capture_message(_chat_id, text, **_kwargs):
+        status_messages.append(text)
+        return {"message_id": len(status_messages)}
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(instance, "_download_telegram_attachments", fake_download)
+    monkeypatch.setattr(instance, "_run_native_agent_task", fake_run)
+    monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
+    monkeypatch.setattr(instance, "_telegram_send_message", capture_message)
+    monkeypatch.setattr(instance, "_telegram_edit_message_text", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(instance, "_telegram_send_chat_action", noop)
+    monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
+    monkeypatch.setattr(instance, "_telegram_send_delayed_working_note", noop)
+
+    asyncio.run(
+        instance._process_telegram_message(
+            {
+                "chat_id": "7317769764",
+                "chat_type": "private",
+                "message_id": 14585,
+                "text": "There's a file on my desktop called hand.png I want you to send it to me on telegram here",
+                "from_id": "7317769764",
+                "from_username": "tiuni",
+                "first_name": "Tiuni",
+                "attachments": [],
+                "reply": {},
+            }
+        )
+    )
+
+    task = instance.state_store.list_tasks(limit=1)[0]
+    assert task["status"] == "completed"
+    assert captured["initial_tool_call"]["tool_name"] == "send_local_file_to_telegram"
+    assert captured["initial_tool_call"]["arguments"]["path"] == str(file_path)
+    assert captured["initial_tool_call"]["arguments"]["send_to_telegram"] is False
+    assert status_messages[0] == "Sending file"
+    assert sent_texts[-1] == "Sent hand.png."
+
+
+def test_daemon_routes_closest_desktop_file_match_to_telegram_send(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    instance = _build_daemon(monkeypatch, tmp_path)
+    desktop = tmp_path / "Desktop"
+    desktop.mkdir(parents=True, exist_ok=True)
+    similar_path = desktop / "hand_image.png"
+    similar_path.write_bytes(b"fake-image-bytes")
+    captured: dict[str, object] = {}
+    sent_texts: list[str] = []
+    status_messages: list[str] = []
+
+    async def fake_download(_message):
+        return [], []
+
+    async def fake_run(task_id, goal, *, kind, history=None, initial_tool_call=None, resume_state=None, approved=False):
+        captured["initial_tool_call"] = dict(initial_tool_call or {})
+        instance.state_store.update_task(
+            task_id,
+            status="completed",
+            result={
+                "message": "Sent hand_image.png as the closest match.",
+                "provider": "fake",
+                "model": "model",
+                "plan": None,
+                "artifacts": [{"type": "file", "path": str(similar_path), "name": similar_path.name}],
+            },
+        )
+        return native.NativeAgentOutcome(
+            status="completed",
+            message="Sent hand_image.png as the closest match.",
+            provider="fake",
+            model="model",
+            artifacts=[{"type": "file", "path": str(similar_path), "name": similar_path.name}],
+        )
+
+    async def capture_text(_chat_id, text, **_kwargs):
+        sent_texts.append(text)
+
+    async def capture_message(_chat_id, text, **_kwargs):
+        status_messages.append(text)
+        return {"message_id": len(status_messages)}
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(instance, "_download_telegram_attachments", fake_download)
+    monkeypatch.setattr(instance, "_run_native_agent_task", fake_run)
+    monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
+    monkeypatch.setattr(instance, "_telegram_send_message", capture_message)
+    monkeypatch.setattr(instance, "_telegram_edit_message_text", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(instance, "_telegram_send_chat_action", noop)
+    monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
+    monkeypatch.setattr(instance, "_telegram_send_delayed_working_note", noop)
+
+    asyncio.run(
+        instance._process_telegram_message(
+            {
+                "chat_id": "7317769764",
+                "chat_type": "private",
+                "message_id": 14586,
+                "text": "There's a file on my desktop called hand.png I want you to send it to me on telegram here",
+                "from_id": "7317769764",
+                "from_username": "tiuni",
+                "first_name": "Tiuni",
+                "attachments": [],
+                "reply": {},
+            }
+        )
+    )
+
+    task = instance.state_store.list_tasks(limit=1)[0]
+    assert task["status"] == "completed"
+    assert captured["initial_tool_call"]["tool_name"] == "send_local_file_to_telegram"
+    assert captured["initial_tool_call"]["arguments"]["path"] == str(similar_path)
+    assert captured["initial_tool_call"]["arguments"]["requested_name"] == "hand.png"
+    assert status_messages[0] == "Sending file"
+    assert sent_texts[-1] == "Sent hand_image.png as the closest match."
+
+
+def test_daemon_routes_keyword_desktop_file_search_to_telegram_send(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    instance = _build_daemon(monkeypatch, tmp_path)
+    desktop = tmp_path / "Desktop"
+    desktop.mkdir(parents=True, exist_ok=True)
+    matching_path = desktop / "hand_image.png"
+    matching_path.write_bytes(b"fake-image-bytes")
+    captured: dict[str, object] = {}
+    sent_texts: list[str] = []
+    status_messages: list[str] = []
+
+    async def fake_download(_message):
+        return [], []
+
+    async def fake_run(task_id, goal, *, kind, history=None, initial_tool_call=None, resume_state=None, approved=False):
+        captured["initial_tool_call"] = dict(initial_tool_call or {})
+        instance.state_store.update_task(
+            task_id,
+            status="completed",
+            result={
+                "message": "Sent hand_image.png.",
+                "provider": "fake",
+                "model": "model",
+                "plan": None,
+                "artifacts": [{"type": "file", "path": str(matching_path), "name": matching_path.name}],
+            },
+        )
+        return native.NativeAgentOutcome(
+            status="completed",
+            message="Sent hand_image.png.",
+            provider="fake",
+            model="model",
+            artifacts=[{"type": "file", "path": str(matching_path), "name": matching_path.name}],
+        )
+
+    async def capture_text(_chat_id, text, **_kwargs):
+        sent_texts.append(text)
+
+    async def capture_message(_chat_id, text, **_kwargs):
+        status_messages.append(text)
+        return {"message_id": len(status_messages)}
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(instance, "_download_telegram_attachments", fake_download)
+    monkeypatch.setattr(instance, "_run_native_agent_task", fake_run)
+    monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
+    monkeypatch.setattr(instance, "_telegram_send_message", capture_message)
+    monkeypatch.setattr(instance, "_telegram_edit_message_text", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(instance, "_telegram_send_chat_action", noop)
+    monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
+    monkeypatch.setattr(instance, "_telegram_send_delayed_working_note", noop)
+
+    asyncio.run(
+        instance._process_telegram_message(
+            {
+                "chat_id": "7317769764",
+                "chat_type": "private",
+                "message_id": 14587,
+                "text": "Look for a file on my desktop that includes the word hand and send it to me in telegram",
+                "from_id": "7317769764",
+                "from_username": "tiuni",
+                "first_name": "Tiuni",
+                "attachments": [],
+                "reply": {},
+            }
+        )
+    )
+
+    task = instance.state_store.list_tasks(limit=1)[0]
+    assert task["status"] == "completed"
+    assert captured["initial_tool_call"]["tool_name"] == "send_local_file_to_telegram"
+    assert captured["initial_tool_call"]["arguments"]["path"] == str(matching_path)
+    assert captured["initial_tool_call"]["arguments"]["requested_name"] == "hand"
+    assert status_messages[0] == "Sending file"
+    assert sent_texts[-1] == "Sent hand_image.png."
+
+
 def test_daemon_telegram_approve_command_resumes_task(monkeypatch, tmp_path):
     instance = _build_daemon(monkeypatch, tmp_path)
     sent_texts: list[str] = []

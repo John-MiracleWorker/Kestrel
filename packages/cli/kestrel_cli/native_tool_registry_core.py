@@ -28,6 +28,7 @@ class NativeToolRegistryCore:
             "create_file": self._handle_write_file,
             "append_file": self._handle_append_file,
             "copy_local_file": self._handle_copy_local_file,
+            "send_local_file_to_telegram": self._handle_send_local_file_to_telegram,
             "read_file": self._handle_read_file,
             "read_many_files": self._handle_read_many_files,
             "list_directory": self._handle_list_directory,
@@ -103,6 +104,32 @@ class NativeToolRegistryCore:
                 },
                 risk_class="mutating",
                 approval_required=True,
+            ),
+            NativeToolSpec(
+                name="send_local_file_to_telegram",
+                description=(
+                    "Send an existing local file to the configured Telegram chat. "
+                    "Set send_to_telegram=false when the file should be returned as an artifact for channel delivery."
+                ),
+                category="file",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Existing local file to deliver."},
+                        "caption": {"type": "string", "description": "Optional Telegram caption."},
+                        "requested_name": {
+                            "type": "string",
+                            "description": "Optional original file name or search token used to choose this file.",
+                        },
+                        "send_to_telegram": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "If false, only return the file as an artifact for the caller to deliver.",
+                        },
+                    },
+                    "required": ["path"],
+                },
+                risk_class="low",
             ),
             NativeToolSpec(
                 name="read_file",

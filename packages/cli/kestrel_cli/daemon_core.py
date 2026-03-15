@@ -59,6 +59,17 @@ _SCREENSHOT_PATTERNS = (
     r"\b(?:what(?:'s| is)|show me)\b.*\b(?:on )?(?:my|the) screen\b",
 )
 
+_LOCAL_FILE_TOKEN_PATTERNS = (
+    r'["\']([^"\']+\.[A-Za-z0-9]{1,10})["\']',
+    r"((?:~|/)[^\s,;:()]+?\.[A-Za-z0-9]{1,10})",
+    r"\b([A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z0-9]{1,10})\b",
+)
+
+_LOCAL_FILE_SEARCH_PATTERNS = (
+    r"\b(?:includes?|contains?|containing|matching|matches?)\s+(?:the\s+)?(?:word|text|string|name)?\s*[\"']?([A-Za-z0-9._-]+)[\"']?",
+    r"\b(?:with|containing)\s+[\"']?([A-Za-z0-9._-]+)[\"']?\s+(?:in|on)\s+(?:its\s+)?name\b",
+)
+
 
 def _looks_like_screenshot_request(prompt: str) -> bool:
     lowered = (prompt or "").strip().lower()
@@ -78,6 +89,181 @@ def _wants_telegram_delivery(prompt: str) -> bool:
             "dm me",
         )
     )
+
+
+def _looks_like_local_file_telegram_request(prompt: str) -> bool:
+    lowered = (prompt or "").strip().lower()
+    if not _wants_telegram_delivery(prompt):
+        return False
+    return bool(re.search(r"\b(?:send|share|upload|deliver|message|dm)\b", lowered))
+
+
+def _extract_local_file_reference(prompt: str) -> str:
+    raw_prompt = str(prompt or "")
+    for pattern in _LOCAL_FILE_TOKEN_PATTERNS:
+        matches = re.findall(pattern, raw_prompt)
+        for match in matches:
+            candidate = str(match or "").strip().strip(".,;:!?")
+            if not candidate or "://" in candidate:
+                continue
+            return candidate
+    return ""
+
+
+def _extract_local_file_search_terms(prompt: str, *, requested_name: str = "") -> list[str]:
+    terms: list[str] = []
+    raw_prompt = str(prompt or "")
+    for pattern in _LOCAL_FILE_SEARCH_PATTERNS:
+        for match in re.findall(pattern, raw_prompt, flags=re.IGNORECASE):
+            value = str(match or "").strip().strip(".,;:!?").lower()
+            if value and value not in terms:
+                terms.append(value)
+
+    stem = Path(requested_name).stem.lower()
+    if stem:
+        for part in re.split(r"[^a-z0-9]+", stem):
+            if len(part) < 2:
+                continue
+            if part not in terms:
+                terms.append(part)
+    return terms
+
+
+def _list_local_file_candidates(search_root: Path, *, limit: int = 256) -> list[Path]:
+    candidates: list[Path] = []
+    try:
+        for child in sorted(search_root.iterdir()):
+            if child.is_file():
+                candidates.append(child)
+                if len(candidates) >= limit:
+                    return candidates
+    except Exception:
+        return candidates
+    return candidates
+
+
+def _resolve_local_file_telegram_request(prompt: str) -> dict[str, Any] | None:
+    if not _looks_like_local_file_telegram_request(prompt):
+        return None
+
+    file_hint = _extract_local_file_reference(prompt)
+    lowered = str(prompt or "").strip().lower()
+    desktop_root = Path.home() / "Desktop"
+    if not file_hint and "desktop" not in lowered:
+        return None
+
+    candidate_path: Path
+    requested_name = ""
+    if file_hint:
+        candidate_path = Path(file_hint).expanduser()
+        if not candidate_path.is_absolute():
+            if "desktop" in lowered:
+                candidate_path = desktop_root / candidate_path.name
+            else:
+                candidate_path = Path.cwd() / candidate_path
+        requested_name = candidate_path.name
+    else:
+        search_terms = _extract_local_file_search_terms(prompt)
+        if not search_terms:
+            return None
+        requested_name = search_terms[0]
+        candidate_path = desktop_root / requested_name
+
+    suggestions: list[str] = []
+    search_root = candidate_path.parent
+    if not search_root.exists() and "desktop" in lowered:
+        search_root = desktop_root
+
+    resolved_path = ""
+    if search_root.exists():
+        try:
+            from difflib import SequenceMatcher, get_close_matches
+
+            requested_stem = Path(requested_name).stem.lower()
+            requested_suffix = Path(requested_name).suffix.lower()
+            search_terms = _extract_local_file_search_terms(prompt, requested_name=requested_name)
+            candidates = _list_local_file_candidates(search_root)
+            ranked: list[tuple[int, Path, bool]] = []
+            direct_matches: list[Path] = []
+            for path in candidates:
+                name_lower = path.name.lower()
+                stem_lower = path.stem.lower()
+                score = 0
+                direct = False
+
+                if requested_name:
+                    requested_lower = requested_name.lower()
+                    if name_lower == requested_lower:
+                        resolved_path = str(path)
+                        direct = True
+                        score += 10_000
+                    similarity = SequenceMatcher(None, requested_lower, name_lower).ratio()
+                    score += int(similarity * 100)
+                    if requested_stem:
+                        if requested_stem == stem_lower:
+                            direct = True
+                            score += 800
+                        elif requested_stem in stem_lower:
+                            direct = True
+                            score += 320
+                        elif stem_lower in requested_stem:
+                            score += 160
+                    if requested_suffix and path.suffix.lower() == requested_suffix:
+                        score += 60
+
+                matched_terms = 0
+                for term in search_terms:
+                    if term in stem_lower:
+                        matched_terms += 1
+                        score += 140
+                    elif term in name_lower:
+                        matched_terms += 1
+                        score += 90
+
+                if search_terms and matched_terms == len(search_terms):
+                    direct = True
+                    score += 120
+                elif search_terms and not requested_name and matched_terms == 0:
+                    continue
+
+                if score <= 0:
+                    continue
+                ranked.append((score, path, direct))
+                if direct:
+                    direct_matches.append(path)
+
+            if not resolved_path:
+                if len(direct_matches) == 1:
+                    resolved_path = str(direct_matches[0])
+                elif len(ranked) == 1:
+                    resolved_path = str(ranked[0][1])
+
+            ranked.sort(key=lambda item: (-item[0], item[1].name.lower()))
+            seen: set[str] = set()
+            ranked_names = [item[1].name for item in ranked]
+            ranked_paths = [item[1] for item in ranked]
+            for name in get_close_matches(requested_name, ranked_names, n=3, cutoff=0.45):
+                for path in ranked_paths:
+                    if path.name == name and str(path) not in seen:
+                        suggestions.append(str(path))
+                        seen.add(str(path))
+                        break
+            for _, path, _ in ranked:
+                if str(path) in seen:
+                    continue
+                suggestions.append(str(path))
+                seen.add(str(path))
+                if len(suggestions) >= 3:
+                    break
+        except Exception:
+            suggestions = []
+
+    return {
+        "requested_path": str(candidate_path),
+        "requested_name": requested_name,
+        "resolved_path": resolved_path or (str(candidate_path) if candidate_path.exists() and candidate_path.is_file() else ""),
+        "suggestions": suggestions,
+    }
 
 
 def datetime_now_hhmm() -> str:
@@ -296,6 +482,26 @@ class KestrelDaemonCore:
             except asyncio.TimeoutError:
                 continue
 
+    async def _write_control_response(
+        self,
+        writer: asyncio.StreamWriter,
+        payload: dict[str, Any],
+    ) -> bool:
+        try:
+            writer.write((json.dumps(payload) + "\n").encode("utf-8"))
+            await writer.drain()
+            return True
+        except (BrokenPipeError, ConnectionResetError):
+            LOGGER.debug("Control client disconnected before response delivery")
+            return False
+
+    async def _close_control_writer(self, writer: asyncio.StreamWriter) -> None:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     async def _handle_client(
         self,
         reader: asyncio.StreamReader,
@@ -311,21 +517,24 @@ class KestrelDaemonCore:
             params = request.get("params") or {}
             if method == "task.stream":
                 async for event in self._stream_task_events(params["task_id"]):
-                    writer.write(
-                        (json.dumps({"request_id": request_id, "ok": True, "event": event}) + "\n").encode("utf-8")
-                    )
-                    await writer.drain()
-                writer.write(
-                    (json.dumps({"request_id": request_id, "ok": True, "done": True, "result": {"status": "complete"}}) + "\n").encode("utf-8")
+                    if not await self._write_control_response(
+                        writer,
+                        {"request_id": request_id, "ok": True, "event": event},
+                    ):
+                        return
+                await self._write_control_response(
+                    writer,
+                    {"request_id": request_id, "ok": True, "done": True, "result": {"status": "complete"}},
                 )
-                await writer.drain()
                 return
 
             result = await self._dispatch(method, params)
-            writer.write(
-                (json.dumps({"request_id": request_id, "ok": True, "done": True, "result": result}) + "\n").encode("utf-8")
+            await self._write_control_response(
+                writer,
+                {"request_id": request_id, "ok": True, "done": True, "result": result},
             )
-            await writer.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            LOGGER.debug("Control client disconnected during request handling")
         except Exception as exc:  # pragma: no cover - integration guard
             LOGGER.exception("Control request failed")
             payload = {
@@ -337,11 +546,9 @@ class KestrelDaemonCore:
                     "code": exc.__class__.__name__,
                 },
             }
-            writer.write((json.dumps(payload) + "\n").encode("utf-8"))
-            await writer.drain()
+            await self._write_control_response(writer, payload)
         finally:
-            writer.close()
-            await writer.wait_closed()
+            await self._close_control_writer(writer)
 
     async def _dispatch(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == "status":

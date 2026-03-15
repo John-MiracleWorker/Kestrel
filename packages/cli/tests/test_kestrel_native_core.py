@@ -179,6 +179,76 @@ def test_extract_json_object_repairs_multiline_string_values():
     assert "\n" in parsed["result"]
 
 
+def test_extract_json_object_accepts_inline_comments_and_trailing_commas():
+    payload = """{
+  "action": "tool_call",
+  "tool_name": "find_files",
+  "arguments": {
+    "pattern": "hand_image.png", // model rationale comment
+    "path": "/Users/tiuni/Desktop",
+    "limit": 5,
+  },
+}"""
+
+    parsed = native._extract_json_object(payload)
+
+    assert parsed["action"] == "tool_call"
+    assert parsed["tool_name"] == "find_files"
+    assert parsed["arguments"]["pattern"] == "hand_image.png"
+    assert parsed["arguments"]["limit"] == 5
+
+
+def test_extract_json_object_accepts_block_comments():
+    payload = """{
+  "action": "finish",
+  /* keep the response compact */
+  "summary": "Done"
+}"""
+
+    parsed = native._extract_json_object(payload)
+
+    assert parsed == {"action": "finish", "summary": "Done"}
+
+
+def test_extract_json_object_extracts_wrapped_json_like_object():
+    payload = """Here is the result:
+
+```json
+{
+  "action": "tool_call",
+  "tool_name": "fetch_url",
+  "arguments": {
+    "url": "https://example.com/ai", // preferred default
+  },
+}
+```
+
+Use that object."""
+
+    parsed = native._extract_json_object(payload)
+
+    assert parsed["action"] == "tool_call"
+    assert parsed["tool_name"] == "fetch_url"
+    assert parsed["arguments"]["url"] == "https://example.com/ai"
+
+
+def test_extract_json_object_repairs_mixed_json_like_response():
+    payload = """Planner output:
+{
+  "action": "store_result",
+  "summary": "Daily summary", /* inline note */
+  "result": "Line one
+Line two",
+}
+Thanks."""
+
+    parsed = native._extract_json_object(payload)
+
+    assert parsed["action"] == "store_result"
+    assert parsed["summary"] == "Daily summary"
+    assert parsed["result"] == "Line one\nLine two"
+
+
 def test_chat_tool_categories_default_to_all_native_categories():
     categories = native.resolve_chat_tool_categories(native.DEFAULT_CONFIG)
     assert categories == ("file", "system", "web", "memory", "media", "desktop", "custom")
@@ -217,6 +287,66 @@ def test_daemon_screenshot_request_helpers():
     assert daemon._wants_telegram_delivery("take a screenshot and send it to me")
     assert daemon._wants_telegram_delivery("share it with me on telegram")
     assert not daemon._wants_telegram_delivery("take a screenshot and save it locally")
+
+
+def test_daemon_resolves_local_file_telegram_requests_and_suggestions(monkeypatch, tmp_path):
+    monkeypatch.setattr(daemon.Path, "home", lambda: tmp_path)
+    desktop = tmp_path / "Desktop"
+    desktop.mkdir(parents=True, exist_ok=True)
+    exact_file = desktop / "hand.png"
+    exact_file.write_bytes(b"png")
+    similar_file = desktop / "hand_image.png"
+    similar_file.write_bytes(b"png")
+
+    resolved = daemon._resolve_local_file_telegram_request(
+        "There's a file on my desktop called hand.png I want you to send it to me on telegram here"
+    )
+
+    assert resolved is not None
+    assert resolved["resolved_path"] == str(exact_file)
+
+    exact_file.unlink()
+    suggested = daemon._resolve_local_file_telegram_request(
+        "There's a file on my desktop called hand.png I want you to send it to me on telegram here"
+    )
+
+    assert suggested is not None
+    assert suggested["resolved_path"] == str(similar_file)
+    assert str(similar_file) in suggested["suggestions"]
+
+
+def test_daemon_resolves_keyword_based_local_file_telegram_request(monkeypatch, tmp_path):
+    monkeypatch.setattr(daemon.Path, "home", lambda: tmp_path)
+    desktop = tmp_path / "Desktop"
+    desktop.mkdir(parents=True, exist_ok=True)
+    file_path = desktop / "hand_image.png"
+    file_path.write_bytes(b"png")
+
+    resolved = daemon._resolve_local_file_telegram_request(
+        "Look for a file on my desktop that includes the word hand and send it to me in telegram"
+    )
+
+    assert resolved is not None
+    assert resolved["requested_name"] == "hand"
+    assert resolved["resolved_path"] == str(file_path)
+
+
+def test_send_local_file_to_telegram_legacy_tool_reports_delivery(monkeypatch, tmp_path):
+    file_path = tmp_path / "hand.png"
+    file_path.write_bytes(b"fake-png-data")
+    monkeypatch.setattr(
+        native_chat_tools_impl,
+        "_send_file_to_telegram",
+        lambda path, caption="": (True, f"Sent {path.name} with {caption}"),
+    )
+
+    result = native._execute_tool(
+        "send_local_file_to_telegram",
+        {"path": str(file_path), "caption": "hello", "send_to_telegram": True},
+    )
+
+    assert "Sent hand.png to Telegram." in result
+    assert "Sent hand.png with hello" in result
 
 
 def test_control_request_uses_tcp_transport_for_windows(monkeypatch, tmp_path):

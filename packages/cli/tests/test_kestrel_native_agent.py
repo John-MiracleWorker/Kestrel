@@ -304,6 +304,65 @@ def test_store_result_does_not_complete_a_step_that_still_requires_a_tool(tmp_pa
     assert svg_path.read_text(encoding="utf-8") == svg_text
 
 
+def test_need_input_returns_question_without_advancing_plan(tmp_path, monkeypatch):
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    state_store = native.SQLiteStateStore(paths.sqlite_db)
+    state_store.initialize()
+    runner = native.NativeAgentRunner(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        runtime_policy=native.NativeRuntimePolicy(native.DEFAULT_CONFIG),
+        state_store=state_store,
+        workspace_root=tmp_path,
+    )
+    task = state_store.create_task(goal="summarize AI news and send it to telegram", kind="task")
+    question = "Which source should I use for the AI news summary?"
+    calls: list[str] = []
+
+    async def plan_goal(self, goal, history, initial_tool_call):
+        return {
+            "mode": "plan",
+            "summary": "Fetch and summarize AI news",
+            "reasoning": "This may require a news source before proceeding.",
+            "steps": [
+                {
+                    "id": "step_1",
+                    "description": "Fetch AI news from a source",
+                    "success_criteria": "News articles are available",
+                    "preferred_tools": ["fetch_url"],
+                },
+                {
+                    "id": "step_2",
+                    "description": "Summarize the fetched news",
+                    "success_criteria": "A concise summary is ready",
+                    "preferred_tools": [],
+                },
+            ],
+        }, "fake", "model"
+
+    async def next_action(self, state, step):
+        calls.append(step["id"])
+        assert step["id"] == "step_1"
+        return {"action": "need_input", "question": question}, "fake", "model"
+
+    async def verify(self, state, draft_response):
+        raise AssertionError("verify should not run when need_input ends the task")
+
+    monkeypatch.setattr(native.NativeAgentRunner, "_plan_goal", plan_goal)
+    monkeypatch.setattr(native.NativeAgentRunner, "_next_action", next_action)
+    monkeypatch.setattr(native.NativeAgentRunner, "_verify_response", verify)
+
+    outcome = asyncio.run(runner.run(goal=task["goal"], task_id=task["id"]))
+
+    assert outcome.status == "completed"
+    assert outcome.message == question
+    assert calls == ["step_1"]
+    assert outcome.state["completed_steps"] == ["step_1"]
+    stored = state_store.get_task(task["id"]) or {}
+    assert stored["status"] == "completed"
+    assert stored["result"]["message"] == question
+
+
 def test_toolless_step_falls_back_to_direct_content_generation(tmp_path, monkeypatch):
     paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
     state_store = native.SQLiteStateStore(paths.sqlite_db)
@@ -373,6 +432,43 @@ def test_toolless_step_falls_back_to_direct_content_generation(tmp_path, monkeyp
     pending = asyncio.run(runner.run(goal=task["goal"], task_id=task["id"]))
     assert pending.status == "waiting_approval"
     assert pending.state["step_outputs"]["step_1"]["content"] == svg_text
+
+
+def test_build_step_output_messages_include_recent_tool_evidence(tmp_path):
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    runner = native.NativeAgentRunner(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        runtime_policy=native.NativeRuntimePolicy(native.DEFAULT_CONFIG),
+        workspace_root=tmp_path,
+    )
+
+    messages = runner._build_step_output_messages(
+        {
+            "goal": "summarize the fetched AI news",
+            "plan": {"summary": "Summarize the fetched AI news."},
+            "step_outputs": {},
+            "tool_evidence": [
+                {
+                    "tool_name": "fetch_url",
+                    "message": "Fetched TechCrunch AI page.",
+                    "data": {
+                        "body": "OpenAI shipped a new model and Anthropic published a new reasoning update.",
+                    },
+                }
+            ],
+        },
+        {
+            "id": "step_2",
+            "description": "Summarize fetched news into a concise daily summary.",
+            "success_criteria": "Generate a grounded summary from the fetched news.",
+        },
+        expects_svg_markup=False,
+    )
+
+    assert "Recent tool evidence:" in messages[1]["content"]
+    assert "OpenAI shipped a new model" in messages[1]["content"]
+    assert "fetch_url" in messages[1]["content"]
 
 
 def test_stalled_write_file_step_falls_back_to_generated_content_and_approval(tmp_path, monkeypatch):
@@ -637,6 +733,50 @@ def test_copy_local_file_requires_approval_and_copies_file(tmp_path):
     assert destination_path.exists()
     assert destination_path.read_bytes() == b"fake-image-bytes"
     assert result.data["destination_path"] == str(destination_path)
+
+
+def test_send_local_file_to_telegram_can_stage_or_send(tmp_path, monkeypatch):
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    registry = native.NativeToolRegistry(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        runtime_policy=native.NativeRuntimePolicy(native.DEFAULT_CONFIG),
+        workspace_root=tmp_path,
+    )
+    file_path = tmp_path / "Desktop" / "hand.png"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(b"fake-image-bytes")
+
+    staged = registry.execute(
+        "send_local_file_to_telegram",
+        {
+            "path": str(file_path),
+            "send_to_telegram": False,
+            "requested_name": "hand.png",
+        },
+    )
+    assert staged.success is True
+    assert staged.data["sent_to_telegram"] is False
+    assert staged.artifacts[0]["path"] == str(file_path)
+    assert "Queued hand.png for Telegram delivery." in staged.message
+
+    monkeypatch.setattr(
+        native_tool_registry_handlers_impl.NativeToolRegistryHandlersMixin,
+        "_native_send_file_to_telegram",
+        lambda self, path, caption="": (True, f"Sent {path.name}"),
+    )
+    sent = registry.execute(
+        "send_local_file_to_telegram",
+        {
+            "path": str(file_path),
+            "caption": "hello",
+            "send_to_telegram": True,
+            "requested_name": "hand.png",
+        },
+    )
+    assert sent.success is True
+    assert sent.data["sent_to_telegram"] is True
+    assert "Sent hand.png to Telegram." in sent.message
 
 
 def test_load_native_config_uses_fallback_yaml_parser(monkeypatch, tmp_path):
@@ -1034,6 +1174,145 @@ def test_route_local_image_request_returns_generation_prompt_for_transform_reque
     assert loaded_models == ["qwen3.5-9b", "ministral-3-14b-instruct-2512"]
 
 
+def test_request_model_json_accepts_json_like_tool_call_without_repair(monkeypatch):
+    calls: list[list[dict[str, object]]] = []
+
+    async def fake_generate_local_text_response(
+        *,
+        messages,
+        config,
+        temperature=0.1,
+        max_tokens=4096,
+        enable_thinking=False,
+        timeout_seconds=90,
+        model_role="primary",
+    ):
+        calls.append(messages)
+        return {
+            "provider": "fake",
+            "model": "model",
+            "content": """```json
+{
+  "action": "tool_call",
+  "tool_name": "find_files",
+  "arguments": {
+    "pattern": "hand_image.png", // model note
+    "path": "/Users/tiuni/Desktop",
+    "limit": 5,
+  },
+}
+```""",
+        }
+
+    monkeypatch.setattr(native_models_impl, "_generate_local_text_response", fake_generate_local_text_response)
+
+    payload, provider, model = asyncio.run(
+        native_models_impl._request_model_json(
+            messages=[{"role": "user", "content": "Return a tool call."}],
+            config=native.DEFAULT_CONFIG,
+            repair_label="executor",
+        )
+    )
+
+    assert len(calls) == 1
+    assert provider == "fake"
+    assert model == "model"
+    assert payload["action"] == "tool_call"
+    assert payload["tool_name"] == "find_files"
+    assert payload["arguments"]["limit"] == 5
+
+
+def test_request_model_json_raises_contextual_error_after_failed_repair(monkeypatch):
+    responses = iter(
+        [
+            {"provider": "fake", "model": "model", "content": "not json"},
+            {"provider": "fake", "model": "model", "content": "still not json"},
+        ]
+    )
+
+    async def fake_generate_local_text_response(
+        *,
+        messages,
+        config,
+        temperature=0.1,
+        max_tokens=4096,
+        enable_thinking=False,
+        timeout_seconds=90,
+        model_role="primary",
+    ):
+        return next(responses)
+
+    monkeypatch.setattr(native_models_impl, "_generate_local_text_response", fake_generate_local_text_response)
+
+    with pytest.raises(native_models_impl.StructuredModelOutputError, match="executor"):
+        asyncio.run(
+            native_models_impl._request_model_json(
+                messages=[{"role": "user", "content": "Return a tool call."}],
+                config=native.DEFAULT_CONFIG,
+                repair_label="executor",
+            )
+        )
+
+
+def test_route_local_image_request_raises_contextual_error_after_failed_repair(monkeypatch, tmp_path):
+    image_path = tmp_path / "photo.jpg"
+    image_path.write_bytes(b"\xff\xd8\xff\xd9")
+
+    async def fake_detect(_config):
+        return {
+            "default_provider": "lmstudio",
+            "default_model": "ministral-3-14b-instruct-2512",
+            "reasoning_provider": "lmstudio",
+            "reasoning_model": "qwen3.5-9b",
+            "reasoning_escalation": True,
+            "reasoning_auto_restore_primary": True,
+            "providers": {
+                "lmstudio": {
+                    "base_url": "http://lmstudio.local",
+                    "supports_model_swap": True,
+                    "available_models": [
+                        "ministral-3-14b-instruct-2512",
+                        "qwen3.5-9b",
+                    ],
+                }
+            },
+        }
+
+    async def fake_ensure(*, base_url, target_model, available_models=None):
+        assert base_url == "http://lmstudio.local"
+        assert target_model == "qwen3.5-9b"
+        return {"previous_active_models": ["ministral-3-14b-instruct-2512"], "swapped": True}
+
+    async def fake_post(url, payload, timeout_seconds=60):
+        return {"choices": [{"message": {"content": "{ invalid router result"}}]}
+
+    async def fake_generate_local_text_response(
+        *,
+        messages,
+        config,
+        temperature=0.1,
+        max_tokens=600,
+        enable_thinking=True,
+        timeout_seconds=90,
+        model_role="reasoning",
+    ):
+        return {"provider": "fake", "model": "model", "content": "still invalid"}
+
+    monkeypatch.setattr(native_models_impl, "detect_local_model_runtime", fake_detect)
+    monkeypatch.setattr(native_models_impl, "_ensure_lmstudio_model_loaded", fake_ensure)
+    monkeypatch.setattr(native_models_impl, "_http_post_json", fake_post)
+    monkeypatch.setattr(native_models_impl, "_generate_local_text_response", fake_generate_local_text_response)
+
+    with pytest.raises(native_models_impl.StructuredModelOutputError, match="multimodal router"):
+        asyncio.run(
+            native_models_impl.route_local_image_request(
+                prompt="Turn me into a caricature",
+                image_paths=[str(image_path)],
+                config=native.DEFAULT_CONFIG,
+            )
+        )
+
+
 def test_generate_image_uses_source_image_for_img2img(tmp_path, monkeypatch):
     import httpx
 
@@ -1183,6 +1462,36 @@ def test_generate_step_output_retries_without_thinking_after_failure(tmp_path, m
     assert content.startswith("<svg")
     assert provider == "lmstudio"
     assert model == "qwen3-30b-a3b-instruct-2507"
+
+
+def test_native_agent_runner_returns_failed_outcome_on_structured_output_error(tmp_path, monkeypatch):
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    state_store = native.SQLiteStateStore(paths.sqlite_db)
+    state_store.initialize()
+    runner = native.NativeAgentRunner(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        runtime_policy=native.NativeRuntimePolicy(native.DEFAULT_CONFIG),
+        state_store=state_store,
+        workspace_root=tmp_path,
+    )
+    task = state_store.create_task(goal="find a local file and send it", kind="task")
+
+    async def plan_goal(self, goal, history, initial_tool_call):
+        raise native_models_impl.StructuredModelOutputError(
+            repair_label="planner",
+            response_text='{ "action": "tool_call", // invalid',
+        )
+
+    monkeypatch.setattr(native.NativeAgentRunner, "_plan_goal", plan_goal)
+
+    outcome = asyncio.run(runner.run(goal=task["goal"], task_id=task["id"]))
+
+    assert outcome.status == "failed"
+    assert "planner" in outcome.message
+    stored = state_store.get_task(task["id"]) or {}
+    assert stored["status"] == "failed"
+    assert "planner" in stored["error"]
     assert len(calls) == 2
     assert calls[0]["enable_thinking"] is True
     assert calls[1]["enable_thinking"] is False
@@ -1397,3 +1706,79 @@ components:
     selected_ids = [item["pack_id"] for item in selection["packs"]]
     assert "parent-pack" in selected_ids
     assert "dependency-pack" in selected_ids
+
+
+def test_daemon_detect_fast_path_tool_call_routes_skill_list(tmp_path):
+    core = object.__new__(daemon.KestrelDaemonTaskMixin)
+    core.paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    core.config = copy.deepcopy(native.DEFAULT_CONFIG)
+    core.skill_pack_manager = object()
+    core._enabled_chat_tool_categories = lambda: ("custom", "desktop", "media")
+
+    result = daemon.KestrelDaemonTaskMixin._detect_fast_path_tool_call(core, "What skill packs are installed?")
+
+    assert result == {
+        "tool_name": "skill_list",
+        "arguments": {
+            "include_synthetic": True,
+            "include_marketplace": True,
+        },
+    }
+
+
+def test_native_read_file_returns_binary_summary(tmp_path):
+    binary_path = tmp_path / "example.jpg"
+    binary_path.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x02\x03\x00binary-data")
+
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    registry = native.NativeToolRegistry(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        runtime_policy=native.NativeRuntimePolicy(native.DEFAULT_CONFIG),
+        workspace_root=tmp_path,
+    )
+
+    result = registry.execute("read_file", {"path": str(binary_path)})
+
+    assert result.success is True
+    assert result.data["binary"] is True
+    assert result.data["mime_type"] == "image/jpeg"
+    assert result.data["size_bytes"] == binary_path.stat().st_size
+    assert "Binary file: example.jpg" in result.message
+    assert "JFIF" not in result.message
+
+
+def test_native_execution_result_compact_dict_summarizes_large_skill_catalog():
+    result = native.NativeExecutionResult(
+        tool_name="skill_list",
+        success=True,
+        message="Loaded 12 skill pack entries.",
+        data={
+            "snapshot_id": "snapshot-123",
+            "packs": [
+                {
+                    "pack_id": f"pack-{index}",
+                    "name": f"Pack {index}",
+                    "description": "x" * 500,
+                    "installed": True,
+                    "enabled": True,
+                    "trusted": True,
+                    "scope": "bundled",
+                    "source_type": "skill_json",
+                    "path": f"/tmp/pack-{index}",
+                    "extra_field": "omit me",
+                }
+                for index in range(12)
+            ],
+        },
+    )
+
+    compact = result.to_dict(compact=True)
+
+    assert compact["data"]["snapshot_id"] == "snapshot-123"
+    assert compact["data"]["packs"]["count"] == 12
+    assert len(compact["data"]["packs"]["preview"]) == 5
+    preview_item = compact["data"]["packs"]["preview"][0]
+    assert preview_item["pack_id"] == "pack-0"
+    assert preview_item["name"] == "Pack 0"
+    assert "_omitted_fields" in preview_item

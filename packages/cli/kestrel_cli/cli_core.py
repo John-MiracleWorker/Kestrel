@@ -101,7 +101,45 @@ DEFAULT_CONFIG = {
     "usage_mode": "tokens",
     "verbose": False,
     "theme": "dark",
+    "tui": {
+        "default_view": "cockpit",
+        "motion_level": "high",
+        "reduced_motion": False,
+        "mouse_enabled": True,
+        "notification_verbosity": "all",
+    },
 }
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def get_config_value(config: dict, dotted_key: str, default=None):
+    current = config
+    for part in dotted_key.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return default
+        current = current[part]
+    return current
+
+
+def set_config_value(config: dict, dotted_key: str, value):
+    parts = dotted_key.split(".")
+    current = config
+    for part in parts[:-1]:
+        node = current.get(part)
+        if not isinstance(node, dict):
+            node = {}
+            current[part] = node
+        current = node
+    current[parts[-1]] = value
 
 
 def get_config_path() -> str:
@@ -118,8 +156,8 @@ def load_config() -> dict:
     if os.path.exists(path):
         with open(path, "r") as f:
             stored = json.load(f)
-            return {**DEFAULT_CONFIG, **stored}
-    return dict(DEFAULT_CONFIG)
+            return _deep_merge(DEFAULT_CONFIG, stored)
+    return _deep_merge(DEFAULT_CONFIG, {})
 
 
 def save_config(config: dict) -> None:
@@ -190,13 +228,13 @@ class KestrelClient:
 
     # ── API Methods ─────────────────────────────────────────────
 
-    async def start_task(self, goal: str, workspace_id: str = None):
+    async def start_task(self, goal: str, workspace_id: str = None, *, kind: str = "task"):
         ws = workspace_id or self.workspace_id
         if self._use_local_control():
             try:
                 start = await send_control_request(
                     "task.start",
-                    {"goal": goal, "workspace_id": ws or "local"},
+                    {"goal": goal, "workspace_id": ws or "local", "kind": kind},
                     paths=self.paths,
                 )
                 task_id = ((start or {}).get("task") or {}).get("id")
@@ -216,7 +254,7 @@ class KestrelClient:
                 pass
 
         path = f"/api/workspaces/{ws}/tasks"
-        async for event in self._stream_sse(path, {"goal": goal}):
+        async for event in self._stream_sse(path, {"goal": goal, "kind": kind}):
             yield event
 
     async def list_tasks(self, status: str = None) -> dict:
@@ -304,6 +342,34 @@ class KestrelClient:
         if self._use_local_control():
             return await send_control_request("paired_nodes.status", paths=self.paths)
         return {"nodes": []}
+
+    async def list_pending_approvals(self) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        return await send_control_request("approval", {"action": "list"}, paths=self.paths)
+
+    async def task_detail(self, task_id: str) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        return await send_control_request("task.detail", {"task_id": task_id}, paths=self.paths)
+
+    async def task_timeline(self, task_id: str) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        return await send_control_request("task.timeline", {"task_id": task_id}, paths=self.paths)
+
+    async def task_artifacts(self, task_id: str) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        return await send_control_request("task.artifacts", {"task_id": task_id}, paths=self.paths)
+
+    async def task_approvals(self, task_id: str, *, status: str | None = None) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        payload = {"task_id": task_id}
+        if status:
+            payload["status"] = status
+        return await send_control_request("task.approvals", payload, paths=self.paths)
 
     async def skill_list(self, *, include_synthetic: bool = True, include_marketplace: bool = True) -> dict:
         if not self._use_local_control():

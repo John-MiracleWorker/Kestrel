@@ -301,6 +301,9 @@ class NativeAgentRunnerBase:
                     "    }\n"
                     "  ]\n"
                     "}\n"
+                    "Prefer preferred_tools=[] for summarization, analysis, drafting, or synthesis steps that can be completed directly from prior evidence.\n"
+                    "Do not assign run_python just to summarize or transform text unless the user explicitly asked for executable Python.\n"
+                    "Only ask for additional user input when the task is truly blocked and no reasonable default exists.\n"
                     "Only use tools from this catalog:\n"
                     + json.dumps([tool.to_prompt_dict() for tool in selected_tools], indent=2)
                     + (f"\n\nRelevant skill packs:\n{prompt_block}" if prompt_block else "")
@@ -339,6 +342,9 @@ class NativeAgentRunnerBase:
                     '  "reason": "short reason"\n'
                     "}\n"
                     "Use store_result when you generate reusable text, code, SVG, JSON, or other content that a later step must consume.\n"
+                    "If the current step is summarization, analysis, drafting, or synthesis from prior tool outputs, return the actual text result instead of Python source code.\n"
+                    "Do not return Python code unless the step explicitly asks to create or execute Python.\n"
+                    "Use need_input only when the task is blocked and no reasonable default can be inferred from the goal or prior evidence.\n"
                     "If no tool exists, use capability_gap instead of inventing a tool name.\n"
                     "Only use this tool catalog:\n"
                     + json.dumps([tool.to_prompt_dict() for tool in selected_tools], indent=2)
@@ -445,6 +451,7 @@ class NativeAgentRunnerBase:
         expects_svg_markup: bool,
     ) -> list[dict[str, str]]:
         previous_outputs = state.get("step_outputs", {})
+        recent_tool_evidence = state.get("tool_evidence", [])
         user_goal = self._extract_user_goal(state.get("goal", ""))
         previous_sections: list[str] = []
         for step_id, payload in list(previous_outputs.items())[-4:]:
@@ -455,6 +462,35 @@ class NativeAgentRunnerBase:
                 continue
             snippet = content if len(content) <= 600 else f"{content[:600]}\n..."
             previous_sections.append(f"{step_id}:\n{snippet}")
+
+        evidence_sections: list[str] = []
+        for item in list(recent_tool_evidence)[-4:]:
+            if not isinstance(item, dict):
+                continue
+            tool_name = str(item.get("tool_name") or "tool").strip() or "tool"
+            snippet = ""
+            data = item.get("data")
+            if isinstance(data, dict):
+                for key in ("body", "content", "text"):
+                    value = str(data.get(key) or "").strip()
+                    if value:
+                        snippet = value
+                        break
+                if not snippet and data:
+                    try:
+                        snippet = json.dumps(data, indent=2, sort_keys=True)
+                    except TypeError:
+                        snippet = str(data)
+            if not snippet:
+                for key in ("message", "stdout", "stderr"):
+                    value = str(item.get(key) or "").strip()
+                    if value:
+                        snippet = value
+                        break
+            if not snippet:
+                continue
+            snippet = snippet if len(snippet) <= 800 else f"{snippet[:800]}\n..."
+            evidence_sections.append(f"{tool_name}:\n{snippet}")
 
         system_lines = [
             "You are completing one Kestrel task step.",
@@ -481,6 +517,8 @@ class NativeAgentRunnerBase:
         ]
         if previous_sections:
             user_sections.append("Previous outputs:\n" + "\n\n".join(previous_sections))
+        if evidence_sections:
+            user_sections.append("Recent tool evidence:\n" + "\n\n".join(evidence_sections))
 
         return [
             {"role": "system", "content": "\n".join(system_lines)},
