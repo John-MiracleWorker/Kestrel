@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from . import daemon_telegram_io as _daemon_telegram_io
+from .native_models import StructuredModelOutputError
 
 globals().update({name: value for name, value in vars(_daemon_telegram_io).items() if not name.startswith("__")})
 

@@ -9,6 +9,7 @@ import kestrel_daemon as daemon
 import kestrel_native as native
 from kestrel_cli import daemon_core as daemon_core_impl
 from kestrel_cli import daemon_telegram_io as daemon_telegram_io_impl
+from kestrel_cli import native_models as native_models_impl
 
 
 def _build_daemon(monkeypatch, tmp_path, *, token="test-token", chat_id="7317769764"):
@@ -150,6 +151,129 @@ def test_daemon_processes_telegram_chat_via_native_runner(monkeypatch, tmp_path)
     assert task["metadata"]["telegram_chat_id"] == "7317769764"
     assert sent_texts[-1] == "Telegram reply"
     assert captured["history"] == [{"role": "assistant", "content": "Previous bot reply"}]
+
+
+def test_daemon_handle_client_suppresses_broken_pipe_during_response(monkeypatch, tmp_path):
+    instance = _build_daemon(monkeypatch, tmp_path)
+    logged_exceptions: list[tuple[object, ...]] = []
+    dispatched: list[tuple[str, dict[str, object]]] = []
+
+    class FakeReader:
+        async def readline(self):
+            return b'{"request_id":"req-1","method":"status","params":{}}\n'
+
+    class FakeWriter:
+        def __init__(self):
+            self.payloads: list[bytes] = []
+            self.closed = False
+            self.drain_calls = 0
+            self.wait_closed_calls = 0
+
+        def write(self, payload):
+            self.payloads.append(payload)
+
+        async def drain(self):
+            self.drain_calls += 1
+            raise BrokenPipeError("client disconnected")
+
+        def close(self):
+            self.closed = True
+
+        async def wait_closed(self):
+            self.wait_closed_calls += 1
+            raise BrokenPipeError("already closed")
+
+    async def fake_dispatch(method, params):
+        dispatched.append((method, dict(params)))
+        return {"status": "running"}
+
+    monkeypatch.setattr(instance, "_dispatch", fake_dispatch)
+    monkeypatch.setattr(daemon_core_impl.LOGGER, "exception", lambda *args, **kwargs: logged_exceptions.append(args))
+
+    writer = FakeWriter()
+    asyncio.run(instance._handle_client(FakeReader(), writer))
+
+    assert dispatched == [("status", {})]
+    assert writer.drain_calls == 1
+    assert writer.wait_closed_calls == 1
+    assert writer.closed is True
+    assert logged_exceptions == []
+
+
+def test_daemon_processes_structured_output_failure_as_normal_telegram_task_failure(monkeypatch, tmp_path):
+    instance = _build_daemon(monkeypatch, tmp_path)
+    sent_texts: list[str] = []
+    status_messages: list[str] = []
+    edited_statuses: list[str] = []
+
+    class FakeRunner:
+        async def run(
+            self,
+            *,
+            goal,
+            history=None,
+            task_id="",
+            task_kind="task",
+            initial_tool_call=None,
+            resume_state=None,
+            approved=False,
+        ):
+            raise native_models_impl.StructuredModelOutputError(
+                repair_label="planner",
+                response_text='{ "action": "tool_call", // invalid',
+            )
+
+    async def fake_download(_message):
+        return [], []
+
+    async def capture_text(_chat_id, text, **_kwargs):
+        sent_texts.append(text)
+        return None
+
+    async def capture_message(_chat_id, text, **_kwargs):
+        status_messages.append(text)
+        return {"message_id": len(status_messages)}
+
+    async def capture_edit(_chat_id, _message_id, text, **_kwargs):
+        edited_statuses.append(text)
+        return True
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(instance, "_build_agent_runner", lambda *, task_id="": FakeRunner())
+    monkeypatch.setattr(instance, "_download_telegram_attachments", fake_download)
+    monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
+    monkeypatch.setattr(instance, "_telegram_send_message", capture_message)
+    monkeypatch.setattr(instance, "_telegram_edit_message_text", capture_edit)
+    monkeypatch.setattr(instance, "_telegram_send_chat_action", noop)
+    monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
+    monkeypatch.setattr(instance, "_telegram_send_delayed_working_note", noop)
+
+    asyncio.run(
+        instance._process_telegram_message(
+            {
+                "chat_id": "7317769764",
+                "chat_type": "private",
+                "message_id": 31,
+                "text": "say hi from Telegram",
+                "from_id": "7317769764",
+                "from_username": "tiuni",
+                "first_name": "Tiuni",
+                "attachments": [],
+                "reply": {},
+            }
+        )
+    )
+
+    task = instance.state_store.list_tasks(limit=1)[0]
+    assert task["status"] == "failed"
+    assert "planner" in str(task.get("error") or "")
+    assert status_messages == ["Thinking"]
+    assert edited_statuses == ["Error"]
+    assert sent_texts
+    assert sent_texts[-1].startswith("Couldn't finish that: Failed to parse planner model response after repair.")
+    assert "Kestrel hit an error while processing that message." not in sent_texts
 
 
 def test_daemon_processes_telegram_attachment_prompt(monkeypatch, tmp_path):

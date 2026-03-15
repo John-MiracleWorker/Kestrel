@@ -1462,6 +1462,12 @@ def test_generate_step_output_retries_without_thinking_after_failure(tmp_path, m
     assert content.startswith("<svg")
     assert provider == "lmstudio"
     assert model == "qwen3-30b-a3b-instruct-2507"
+    assert len(calls) == 2
+    assert calls[0]["enable_thinking"] is True
+    assert calls[1]["enable_thinking"] is False
+    assert calls[0]["timeout_seconds"] == 90
+    assert calls[1]["timeout_seconds"] == 45
+    assert "Return only valid standalone SVG markup." in calls[0]["messages"][0]["content"]
 
 
 def test_native_agent_runner_returns_failed_outcome_on_structured_output_error(tmp_path, monkeypatch):
@@ -1492,12 +1498,6 @@ def test_native_agent_runner_returns_failed_outcome_on_structured_output_error(t
     stored = state_store.get_task(task["id"]) or {}
     assert stored["status"] == "failed"
     assert "planner" in stored["error"]
-    assert len(calls) == 2
-    assert calls[0]["enable_thinking"] is True
-    assert calls[1]["enable_thinking"] is False
-    assert calls[0]["timeout_seconds"] == 90
-    assert calls[1]["timeout_seconds"] == 45
-    assert "Return only valid standalone SVG markup." in calls[0]["messages"][0]["content"]
 
 
 def test_native_skill_pack_manager_imports_skill_md_and_selects_it(tmp_path):
