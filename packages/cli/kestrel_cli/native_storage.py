@@ -53,6 +53,37 @@ class StateStore(abc.ABC):
     def get_runtime_profile(self) -> dict[str, Any]:
         raise NotImplementedError
 
+    @abc.abstractmethod
+    def list_skill_packs(self) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def get_skill_pack(self, pack_id: str) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def upsert_skill_pack(
+        self,
+        *,
+        pack_id: str,
+        version: str,
+        scope: str,
+        source_path: str,
+        source_type: str,
+        enabled: bool,
+        trusted: bool,
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def set_skill_pack_enabled(self, pack_id: str, enabled: bool) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def remove_skill_pack(self, pack_id: str) -> dict[str, Any] | None:
+        raise NotImplementedError
+
 
 class EventJournal(abc.ABC):
     @abc.abstractmethod
@@ -189,6 +220,20 @@ class SQLiteStateStore(_SQLiteBase, StateStore):
                 auth_json TEXT NOT NULL DEFAULT '{}',
                 workspace_binding TEXT NOT NULL DEFAULT '',
                 metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE TABLE IF NOT EXISTS skill_packs (
+                pack_id TEXT PRIMARY KEY,
+                version TEXT NOT NULL DEFAULT '',
+                scope TEXT NOT NULL DEFAULT 'user',
+                source_path TEXT NOT NULL,
+                source_type TEXT NOT NULL DEFAULT 'directory',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                trusted INTEGER NOT NULL DEFAULT 0,
+                manifest_json TEXT NOT NULL DEFAULT '{}',
+                installed_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                removed_at TEXT NOT NULL DEFAULT ''
             );
             """
         )
@@ -357,6 +402,122 @@ class SQLiteStateStore(_SQLiteBase, StateStore):
         if not row:
             return {}
         return json.loads(row["value_json"])
+
+    def list_skill_packs(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT * FROM skill_packs
+            WHERE removed_at = ''
+            ORDER BY pack_id ASC
+            """
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            payload["enabled"] = bool(payload.get("enabled"))
+            payload["trusted"] = bool(payload.get("trusted"))
+            payload["manifest"] = json.loads(row["manifest_json"])
+            results.append(payload)
+        return results
+
+    def get_skill_pack(self, pack_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            """
+            SELECT * FROM skill_packs
+            WHERE pack_id = ? AND removed_at = ''
+            """,
+            (pack_id,),
+        ).fetchone()
+        if not row:
+            return None
+        payload = dict(row)
+        payload["enabled"] = bool(payload.get("enabled"))
+        payload["trusted"] = bool(payload.get("trusted"))
+        payload["manifest"] = json.loads(row["manifest_json"])
+        return payload
+
+    def upsert_skill_pack(
+        self,
+        *,
+        pack_id: str,
+        version: str,
+        scope: str,
+        source_path: str,
+        source_type: str,
+        enabled: bool,
+        trusted: bool,
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        current = self.get_skill_pack(pack_id)
+        installed_at = str((current or {}).get("installed_at") or _now_iso())
+        updated_at = _now_iso()
+        self._conn.execute(
+            """
+            INSERT INTO skill_packs (
+                pack_id, version, scope, source_path, source_type, enabled, trusted,
+                manifest_json, installed_at, updated_at, removed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')
+            ON CONFLICT(pack_id) DO UPDATE SET
+                version=excluded.version,
+                scope=excluded.scope,
+                source_path=excluded.source_path,
+                source_type=excluded.source_type,
+                enabled=excluded.enabled,
+                trusted=excluded.trusted,
+                manifest_json=excluded.manifest_json,
+                updated_at=excluded.updated_at,
+                removed_at=''
+            """,
+            (
+                pack_id,
+                version,
+                scope,
+                source_path,
+                source_type,
+                int(enabled),
+                int(trusted),
+                json.dumps(manifest),
+                installed_at,
+                updated_at,
+            ),
+        )
+        self._conn.commit()
+        return self.get_skill_pack(pack_id) or {}
+
+    def set_skill_pack_enabled(self, pack_id: str, enabled: bool) -> dict[str, Any] | None:
+        current = self.get_skill_pack(pack_id)
+        if not current:
+            return None
+        self._conn.execute(
+            """
+            UPDATE skill_packs
+            SET enabled = ?, updated_at = ?
+            WHERE pack_id = ?
+            """,
+            (int(enabled), _now_iso(), pack_id),
+        )
+        self._conn.commit()
+        return self.get_skill_pack(pack_id)
+
+    def remove_skill_pack(self, pack_id: str) -> dict[str, Any] | None:
+        current = self.get_skill_pack(pack_id)
+        if not current:
+            return None
+        removed_at = _now_iso()
+        self._conn.execute(
+            """
+            UPDATE skill_packs
+            SET removed_at = ?, enabled = 0, updated_at = ?
+            WHERE pack_id = ?
+            """,
+            (removed_at, removed_at, pack_id),
+        )
+        self._conn.commit()
+        payload = dict(current)
+        payload["removed_at"] = removed_at
+        payload["enabled"] = False
+        return payload
 
     def create_approval(
         self,
@@ -717,5 +878,4 @@ class MacOSKeychainCredentialStore(CredentialStore):
             capture_output=True,
             text=True,
         )
-
 

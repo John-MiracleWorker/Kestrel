@@ -68,6 +68,27 @@ async def build_task_runtime_bundle(
         feature_mode=feature_mode.value,
     )
     task_tool_registry = filter_registry_for_profile(task_tool_registry, task_profile, feature_mode)
+    skill_pack_manager = getattr(runtime_ctx, "skill_pack_manager", None)
+    if skill_pack_manager:
+        try:
+            selected_packs = list(getattr(task, "_selected_skill_packs", []) or [])
+            if not selected_packs:
+                selection = await skill_pack_manager.select_packs(
+                    task.workspace_id,
+                    task.goal,
+                    history=list(getattr(task, "messages", []) or []),
+                )
+                selected_packs = list(selection.get("packs") or [])
+                setattr(task, "_selected_skill_packs", selected_packs)
+                setattr(task, "_skill_prompt_block", str(selection.get("prompt_block") or ""))
+            if selected_packs:
+                await skill_pack_manager.register_selected_tools(
+                    task_tool_registry,
+                    task.workspace_id,
+                    selected_packs,
+                )
+        except Exception:
+            pass
     evidence_chain = EvidenceChain(task_id=task.id, pool=pool)
 
     bootstrapper = getattr(runtime_ctx, "subsystem_bootstrapper", None)

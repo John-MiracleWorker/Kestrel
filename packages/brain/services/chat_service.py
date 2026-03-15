@@ -186,6 +186,28 @@ class ChatServicerMixin(BaseServicerMixin):
                 except Exception as e:
                     logger.warning(f"Failed to load workspace skills: {e}")
 
+            selected_skill_packs = list(getattr(ctx, "selected_skill_packs", []) or [])
+            if selected_skill_packs:
+                try:
+                    await _activity_callback("skill_activated", {
+                        "count": len(selected_skill_packs),
+                        "message": f"{len(selected_skill_packs)} skill packs activated",
+                        "packs": [str(item.get("name") or item.get("pack_id") or "") for item in selected_skill_packs if isinstance(item, dict)],
+                    })
+                except Exception:
+                    pass
+            selected_skill_mcp_servers = list(getattr(ctx, "selected_skill_mcp_servers", []) or [])
+            connected_skill_mcp = [item for item in selected_skill_mcp_servers if isinstance(item, dict) and item.get("connected")]
+            if connected_skill_mcp:
+                try:
+                    await _activity_callback("skill_activated", {
+                        "count": len(connected_skill_mcp),
+                        "message": f"{len(connected_skill_mcp)} skill pack MCP server(s) connected",
+                        "packs": [str(item.get("server_name") or "") for item in connected_skill_mcp],
+                    })
+                except Exception:
+                    pass
+
             # Checkpoint manager and model router
             from agent.checkpoints import CheckpointManager
             checkpoint_mgr = CheckpointManager(pool=ctx.pool)

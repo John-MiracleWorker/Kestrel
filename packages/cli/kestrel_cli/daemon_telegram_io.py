@@ -142,24 +142,114 @@ class KestrelDaemonTelegramIOMixin:
         downloaded_attachments, attachment_errors = await self._download_telegram_attachments(message)
         prompt = self._build_telegram_goal(message, downloaded_attachments, attachment_errors)
         history = self._build_telegram_history(message)
-
-        task = self.state_store.create_task(
-            goal=prompt,
-            kind="chat",
-            metadata={
-                "workspace_id": runtime.get("workspace_id") or "default",
-                "source": "telegram",
-                "telegram_chat_id": chat_id,
-                "telegram_user_id": str(message.get("from_id") or ""),
-                "telegram_message_id": message_id or 0,
-                "telegram_original_text": str(message.get("text") or ""),
-                "telegram_attachments": downloaded_attachments,
-                "telegram_attachment_errors": attachment_errors,
-                "telegram_reply": dict(message.get("reply") or {}),
-                "telegram_primary_channel": self._telegram_is_primary_channel(),
-            },
+        desktop_save_request = self._telegram_desktop_save_fast_path(
+            chat_id=chat_id,
+            message=message,
+            downloaded_attachments=downloaded_attachments,
         )
-        initial_tool_call = self._detect_fast_path_tool_call(prompt)
+        image_attachments = self._telegram_image_attachments(downloaded_attachments)
+        image_prompt = self._build_telegram_image_prompt(message, image_attachments, attachment_errors)
+
+        metadata = {
+            "workspace_id": runtime.get("workspace_id") or "default",
+            "source": "telegram",
+            "telegram_chat_id": chat_id,
+            "telegram_user_id": str(message.get("from_id") or ""),
+            "telegram_message_id": message_id or 0,
+            "telegram_original_text": str(message.get("text") or ""),
+            "telegram_attachments": downloaded_attachments,
+            "telegram_attachment_errors": attachment_errors,
+            "telegram_reply": dict(message.get("reply") or {}),
+            "telegram_primary_channel": self._telegram_is_primary_channel(),
+        }
+        if desktop_save_request and isinstance(desktop_save_request.get("attachment"), dict):
+            metadata["telegram_resolved_attachment"] = dict(desktop_save_request["attachment"])
+
+        task = self.state_store.create_task(goal=prompt, kind="chat", metadata=metadata)
+        if image_attachments and not desktop_save_request:
+            routed_image_request = None
+            try:
+                routed_image_request = await route_local_image_request(
+                    prompt=image_prompt,
+                    image_paths=[str(item.get("path") or "") for item in image_attachments],
+                    config=self.config,
+                    history=history,
+                )
+            except Exception as exc:
+                LOGGER.warning("Telegram image routing failed for task %s: %s", task["id"], exc)
+
+            route_action = str((routed_image_request or {}).get("action") or "").strip().lower()
+            if route_action == "generate_image":
+                generation_prompt = str((routed_image_request or {}).get("generation_prompt") or "").strip()
+                media_type = str((routed_image_request or {}).get("media_type") or "image").strip().lower() or "image"
+                source_image_path = str(image_attachments[0].get("path") or "").strip()
+                if media_type not in {"image", "video"}:
+                    media_type = "image"
+                initial_tool_call = {
+                    "tool_name": "generate_image",
+                    "arguments": {
+                        "prompt": generation_prompt or image_prompt,
+                        "negative_prompt": str((routed_image_request or {}).get("negative_prompt") or "").strip(),
+                        "media_type": media_type,
+                        "source_image_path": source_image_path,
+                        "init_image_creativity": float((routed_image_request or {}).get("init_image_creativity") or 0.6),
+                        "send_to_telegram": False,
+                    },
+                }
+                self.state_store.update_task(
+                    task["id"],
+                    metadata={
+                        "telegram_multimodal_route": True,
+                        "telegram_multimodal_action": "generate_image",
+                        "telegram_multimodal_model": str((routed_image_request or {}).get("model") or ""),
+                        "telegram_multimodal_provider": str((routed_image_request or {}).get("provider") or ""),
+                        "telegram_image_paths": [str(item.get("path") or "") for item in image_attachments],
+                        "telegram_generation_prompt": generation_prompt,
+                        "telegram_source_image_path": source_image_path,
+                        "telegram_init_image_creativity": float((routed_image_request or {}).get("init_image_creativity") or 0.6),
+                    },
+                )
+                await self._telegram_update_task_status(
+                    task["id"],
+                    chat_id,
+                    "Generating image",
+                    reply_to_message_id=message_id,
+                )
+                try:
+                    outcome = await self._run_native_agent_task(
+                        task["id"],
+                        prompt,
+                        kind="chat",
+                        history=history,
+                        initial_tool_call=initial_tool_call,
+                    )
+                except Exception:
+                    await self._telegram_update_task_status(task["id"], chat_id, "Error", reply_to_message_id=message_id)
+                    raise
+                await self._telegram_respond_with_outcome(chat_id, task["id"], outcome, reply_to_message_id=message_id)
+                return
+
+            await self._telegram_update_task_status(
+                task["id"],
+                chat_id,
+                "Analyzing image",
+                reply_to_message_id=message_id,
+            )
+            outcome = await self._run_telegram_multimodal_image_task(
+                task["id"],
+                prompt=image_prompt,
+                history=history,
+                image_attachments=image_attachments,
+                prefetched_response=routed_image_request if route_action == "respond" else None,
+            )
+            await self._telegram_respond_with_outcome(chat_id, task["id"], outcome, reply_to_message_id=message_id)
+            return
+
+        initial_tool_call = None
+        if desktop_save_request:
+            initial_tool_call = dict(desktop_save_request.get("initial_tool_call") or {})
+        if not initial_tool_call:
+            initial_tool_call = self._detect_fast_path_tool_call(prompt)
         if initial_tool_call and str(initial_tool_call.get("tool_name") or "") in {"take_screenshot", "generate_image"}:
             arguments = dict(initial_tool_call.get("arguments") or {})
             arguments["send_to_telegram"] = False
@@ -183,6 +273,106 @@ class KestrelDaemonTelegramIOMixin:
             await self._telegram_update_task_status(task["id"], chat_id, "Error", reply_to_message_id=message_id)
             raise
         await self._telegram_respond_with_outcome(chat_id, task["id"], outcome, reply_to_message_id=message_id)
+
+    async def _run_telegram_multimodal_image_task(
+        self,
+        task_id: str,
+        *,
+        prompt: str,
+        history: list[dict[str, Any]],
+        image_attachments: list[dict[str, Any]],
+        prefetched_response: dict[str, Any] | None = None,
+    ) -> NativeAgentOutcome:
+        self.state_store.update_task(
+            task_id,
+            status="running",
+            metadata={
+                "kind": "chat",
+                "telegram_multimodal_route": True,
+                "telegram_multimodal_action": "respond",
+                "telegram_multimodal_model": str((prefetched_response or {}).get("model") or ""),
+                "telegram_multimodal_provider": str((prefetched_response or {}).get("provider") or ""),
+                "telegram_image_paths": [str(item.get("path") or "") for item in image_attachments],
+            },
+        )
+        self._publish_event(task_id, "task_started", f"Started: {prompt}", {"status": "running"})
+
+        try:
+            response = dict(prefetched_response or {})
+            final_message = str(response.get("reply_text") or response.get("content") or "").strip()
+            provider = str(response.get("provider") or "lmstudio")
+            model = str(response.get("model") or "")
+            if not final_message:
+                response = await inspect_local_images(
+                    prompt=prompt,
+                    image_paths=[str(item.get("path") or "") for item in image_attachments],
+                    config=self.config,
+                    history=history,
+                )
+                final_message = str(response.get("content") or "").strip()
+                provider = str(response.get("provider") or "lmstudio")
+                model = str(response.get("model") or "")
+            result = {
+                "message": final_message,
+                "provider": provider,
+                "model": model,
+                "plan": None,
+                "artifacts": [],
+            }
+            self.state_store.update_task(
+                task_id,
+                status="completed",
+                result=result,
+                metadata={
+                    "telegram_multimodal_route": True,
+                    "telegram_image_count": len(image_attachments),
+                },
+            )
+            self._publish_event(
+                task_id,
+                "task_complete",
+                final_message,
+                {
+                    "status": "completed",
+                    "provider": provider,
+                    "model": model,
+                    "plan": None,
+                    "artifacts": [],
+                    "final": True,
+                },
+            )
+            return NativeAgentOutcome(
+                status="completed",
+                message=final_message,
+                provider=provider,
+                model=model,
+                plan=None,
+                artifacts=[],
+                state={"telegram_multimodal_route": True},
+            )
+        except Exception as exc:
+            error_text = f"Couldn't inspect that image locally: {exc}"
+            self.state_store.update_task(
+                task_id,
+                status="failed",
+                error=error_text,
+                metadata={"telegram_multimodal_route": True},
+            )
+            self._publish_event(
+                task_id,
+                "task_failed",
+                error_text,
+                {"status": "failed", "error": error_text, "final": True},
+            )
+            return NativeAgentOutcome(
+                status="failed",
+                message=error_text,
+                provider="",
+                model="",
+                plan=None,
+                artifacts=[],
+                state={"telegram_multimodal_route": True},
+            )
 
     async def _telegram_respond_with_outcome(
         self,
@@ -255,9 +445,9 @@ class KestrelDaemonTelegramIOMixin:
         if status == "completed":
             await self._telegram_update_task_status(task_id, chat_id, "Uploading", reply_to_message_id=reply_to_message_id)
         await self._telegram_send_artifacts(chat_id, artifacts, reply_to_message_id=reply_to_message_id)
-        summary = self._telegram_result_summary(status, message, artifacts)
-        if summary:
-            await self._telegram_send_text(chat_id, summary, reply_to_message_id=reply_to_message_id)
+        reply_text = self._telegram_result_text(status, message, artifacts)
+        if reply_text:
+            await self._telegram_send_text(chat_id, reply_text, reply_to_message_id=reply_to_message_id)
         await self._telegram_update_task_status(
             task_id,
             chat_id,
@@ -574,6 +764,150 @@ class KestrelDaemonTelegramIOMixin:
             return base_prompt
         return f"{base_prompt}\n\n" + "\n".join(notes)
 
+    def _telegram_wants_desktop_save(self, prompt: str) -> bool:
+        lowered = str(prompt or "").strip().lower()
+        if "desktop" not in lowered:
+            return False
+        return bool(re.search(r"\b(?:save|copy|move|put|store|download)\b", lowered))
+
+    def _telegram_prompt_prefers_images(self, prompt: str) -> bool:
+        lowered = str(prompt or "").strip().lower()
+        return bool(re.search(r"\b(?:image|picture|photo|png|jpg|jpeg|gif|webp|screenshot)\b", lowered))
+
+    def _telegram_attachment_is_image(self, attachment: dict[str, Any]) -> bool:
+        mime_type = str(attachment.get("mime_type") or "").strip().lower()
+        path = Path(str(attachment.get("path") or "")).expanduser()
+        return mime_type.startswith("image/") or path.suffix.lower() in {
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".webp",
+            ".bmp",
+            ".tif",
+            ".tiff",
+            ".heic",
+            ".heif",
+        }
+
+    def _telegram_recent_attachment_reference(
+        self,
+        *,
+        chat_id: str,
+        prefer_images: bool,
+        reply_message_id: int | None,
+        exclude_message_id: int | None,
+    ) -> dict[str, Any] | None:
+        tasks = self.state_store.list_tasks(limit=25)
+
+        def _attachment_from_task(task: dict[str, Any]) -> dict[str, Any] | None:
+            metadata = dict(task.get("metadata") or {})
+            if str(metadata.get("source") or "") != "telegram":
+                return None
+            if str(metadata.get("telegram_chat_id") or "") != chat_id:
+                return None
+            task_message_id = int(metadata.get("telegram_message_id") or 0) or None
+            if exclude_message_id and task_message_id == exclude_message_id:
+                return None
+            for attachment in metadata.get("telegram_attachments") or []:
+                if not isinstance(attachment, dict):
+                    continue
+                path = Path(str(attachment.get("path") or "")).expanduser()
+                if not path.exists():
+                    continue
+                if prefer_images and not self._telegram_attachment_is_image(attachment):
+                    continue
+                return attachment
+            return None
+
+        if reply_message_id:
+            for task in tasks:
+                metadata = dict(task.get("metadata") or {})
+                task_message_id = int(metadata.get("telegram_message_id") or 0) or None
+                if task_message_id == reply_message_id:
+                    match = _attachment_from_task(task)
+                    if match:
+                        return match
+
+        for task in tasks:
+            match = _attachment_from_task(task)
+            if match:
+                return match
+        return None
+
+    def _telegram_desktop_save_fast_path(
+        self,
+        *,
+        chat_id: str,
+        message: dict[str, Any],
+        downloaded_attachments: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        prompt = str(message.get("text") or "").strip()
+        if not self._telegram_wants_desktop_save(prompt):
+            return None
+
+        prefer_images = self._telegram_prompt_prefers_images(prompt)
+        current_candidates = [
+            attachment
+            for attachment in downloaded_attachments
+            if isinstance(attachment, dict) and (not prefer_images or self._telegram_attachment_is_image(attachment))
+        ]
+        attachment = current_candidates[0] if current_candidates else None
+        if attachment is None:
+            reply = message.get("reply") or {}
+            reply_message_id = int(reply.get("message_id") or 0) or None
+            attachment = self._telegram_recent_attachment_reference(
+                chat_id=chat_id,
+                prefer_images=prefer_images,
+                reply_message_id=reply_message_id,
+                exclude_message_id=int(message.get("message_id") or 0) or None,
+            )
+        if not isinstance(attachment, dict):
+            return None
+
+        source_path = Path(str(attachment.get("path") or "")).expanduser()
+        if not source_path.exists():
+            return None
+        destination_path = Path.home() / "Desktop" / source_path.name
+        return {
+            "attachment": dict(attachment),
+            "initial_tool_call": {
+                "tool_name": "copy_local_file",
+                "arguments": {
+                    "source_path": str(source_path),
+                    "destination_path": str(destination_path),
+                },
+            },
+        }
+
+    def _telegram_image_attachments(self, downloaded_attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        images: list[dict[str, Any]] = []
+        for item in downloaded_attachments:
+            if self._telegram_attachment_is_image(item):
+                images.append(item)
+        return images
+
+    def _build_telegram_image_prompt(
+        self,
+        message: dict[str, Any],
+        image_attachments: list[dict[str, Any]],
+        attachment_errors: list[str],
+    ) -> str:
+        base_prompt = str(message.get("text") or "").strip()
+        if not base_prompt:
+            if len(image_attachments) == 1:
+                base_prompt = "Describe the attached image and answer the user directly."
+            else:
+                base_prompt = "Describe the attached images and answer the user directly."
+
+        notes: list[str] = []
+        if attachment_errors:
+            notes.append("Some Telegram attachments could not be downloaded:")
+            notes.extend(f"- {item}" for item in attachment_errors[:5])
+        if not notes:
+            return base_prompt
+        return f"{base_prompt}\n\n" + "\n".join(notes)
+
     def _build_telegram_history(self, message: dict[str, Any]) -> list[dict[str, Any]]:
         reply = message.get("reply") or {}
         if not isinstance(reply, dict) or not reply:
@@ -602,6 +936,8 @@ class KestrelDaemonTelegramIOMixin:
     def _telegram_initial_status(self, prompt: str, initial_tool_call: dict[str, Any] | None) -> str:
         tool_name = str((initial_tool_call or {}).get("tool_name") or "").strip()
         lowered = str(prompt or "").strip().lower()
+        if tool_name == "copy_local_file":
+            return "Saving to desktop"
         if tool_name == "take_screenshot":
             return "Capturing screenshot"
         if tool_name == "generate_image":
@@ -663,6 +999,17 @@ class KestrelDaemonTelegramIOMixin:
         if status == "completed":
             return "Done."
         return ""
+
+    def _telegram_result_text(
+        self,
+        status: str,
+        message: str,
+        artifacts: list[dict[str, Any]] | None,
+    ) -> str:
+        clean_message = str(message or "").strip()
+        if status == "completed" and clean_message:
+            return clean_message
+        return self._telegram_result_summary(status, clean_message, artifacts)
 
     async def _telegram_finish_approval_resolution(
         self,

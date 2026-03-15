@@ -471,6 +471,7 @@ def _register_labs_tools(registry):
     from agent.tools.scanner import register_scanner_tools
     from agent.tools.computer_use import register_computer_use_tools
     from agent.tools.media_gen import register_media_gen_tools
+    from agent.tools.skill_packs import register_skill_pack_tools
     from agent.tools.build_automation import register_build_automation_tools
     from agent.tools.daemon_control import register_daemon_tools
     from agent.tools.time_travel import register_time_travel_tools
@@ -481,6 +482,7 @@ def _register_labs_tools(registry):
     register_scanner_tools(registry)
     register_computer_use_tools(registry)
     register_media_gen_tools(registry)
+    register_skill_pack_tools(registry)
     register_create_skill_tools(registry)
     register_build_automation_tools(registry)
     register_daemon_tools(registry)

@@ -110,6 +110,14 @@ CHAT_TOOLS = [
                         "description": "Type of media to generate: 'image' or 'video'. Default 'image'.",
                         "enum": ["image", "video"],
                     },
+                    "source_image_path": {
+                        "type": "string",
+                        "description": "Optional local image path to use as the source for image-to-image or reference-guided generation.",
+                    },
+                    "init_image_creativity": {
+                        "type": "number",
+                        "description": "How strongly to transform the source image. Lower values stay closer to the source, higher values are more creative.",
+                    },
                 },
                 "required": ["prompt"],
             },
@@ -359,6 +367,23 @@ def _execute_tool(name: str, arguments: dict[str, Any]) -> str:
             width = int(arguments.get("width", 1024))
             height = int(arguments.get("height", 1024))
             media_type = arguments.get("media_type", "image")
+            source_image_path = str(arguments.get("source_image_path", "") or "").strip()
+            init_image_creativity_raw = arguments.get("init_image_creativity", 0.6)
+            try:
+                init_image_creativity = float(init_image_creativity_raw)
+            except (TypeError, ValueError):
+                init_image_creativity = 0.6
+            init_image_creativity = min(max(init_image_creativity, 0.0), 1.5)
+
+            source_image_data = ""
+            if source_image_path:
+                source_path = Path(source_image_path).expanduser()
+                if not source_path.exists():
+                    return f"Error: Source image not found: {source_path}"
+                try:
+                    source_image_data = _image_data_url_from_path(source_path)
+                except Exception as e:
+                    return f"Error: Could not load source image for generation: {e}"
 
             # SwarmUI config from environment or defaults
             swarm_ip = os.getenv("SWARM_HOST_IP", "192.168.1.19")
@@ -469,6 +494,11 @@ def _execute_tool(name: str, arguments: dict[str, Any]) -> str:
                 "seed": -1,
                 "model": swarm_model,
             }
+            if source_image_data:
+                payload["rawInput"] = {
+                    "initimage": source_image_data,
+                    "initimagecreativity": init_image_creativity,
+                }
             if is_video:
                 payload["videomodel"] = swarm_video_model
                 payload["videoframes"] = 17
@@ -783,4 +813,3 @@ async def complete_local_prompt(
         "model": model,
         "content": content,
     }
-

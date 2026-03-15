@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import kestrel_daemon as daemon
 import kestrel_native as native
 from kestrel_cli import daemon_core as daemon_core_impl
+from kestrel_cli import daemon_telegram_io as daemon_telegram_io_impl
 
 
 def _build_daemon(monkeypatch, tmp_path, *, token="test-token", chat_id="7317769764"):
@@ -35,6 +36,15 @@ def test_daemon_syncs_telegram_state_from_environment(monkeypatch, tmp_path):
     assert status["configured"] is True
     assert status["mode"] == "polling"
     assert status["allowed_chat_ids"] == ["7317769764"]
+
+
+def test_daemon_exposes_skill_pack_catalog(monkeypatch, tmp_path):
+    instance = _build_daemon(monkeypatch, tmp_path)
+
+    result = asyncio.run(instance._dispatch("skill.list", {"include_synthetic": False}))
+
+    assert "snapshot_id" in result
+    assert isinstance(result["packs"], list)
 
 
 def test_daemon_telegram_poll_once_updates_offset(monkeypatch, tmp_path):
@@ -212,6 +222,310 @@ def test_daemon_processes_telegram_attachment_prompt(monkeypatch, tmp_path):
     assert str(tmp_path / "artifact.txt") in str(captured["goal"])
 
 
+def test_daemon_routes_telegram_image_attachment_to_multimodal_helper(monkeypatch, tmp_path):
+    instance = _build_daemon(monkeypatch, tmp_path)
+    image_path = tmp_path / "photo.jpg"
+    image_path.write_bytes(b"\xff\xd8\xff\xd9")
+    captured: dict[str, object] = {}
+    sent_messages: list[str] = []
+
+    async def fake_download(_message):
+        return (
+            [
+                {
+                    "type": "telegram_attachment",
+                    "telegram_type": "photo",
+                    "mime_type": "image/jpeg",
+                    "path": str(image_path),
+                    "source": "telegram",
+                    "size": 42,
+                    "message_id": 23,
+                }
+            ],
+            [],
+        )
+
+    async def fake_route_local_image_request(*, prompt, image_paths, config, history=None, temperature=0.1, max_tokens=1200, timeout_seconds=180):
+        captured["prompt"] = prompt
+        captured["image_paths"] = list(image_paths)
+        captured["history"] = list(history or [])
+        return {
+            "provider": "lmstudio",
+            "model": "qwen3.5-9b",
+            "action": "respond",
+            "reply_text": "The image shows a small test photo.",
+        }
+
+    async def fail_run(*_args, **_kwargs):
+        raise AssertionError("planner path should not run for Telegram image attachments")
+
+    async def fail_inspect(*_args, **_kwargs):
+        raise AssertionError("inspection path should reuse routed multimodal response")
+
+    async def capture_message(_chat_id, text, **_kwargs):
+        sent_messages.append(text)
+        return {"message_id": len(sent_messages)}
+
+    async def capture_text(_chat_id, text, **_kwargs):
+        sent_messages.append(text)
+        return None
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(instance, "_download_telegram_attachments", fake_download)
+    monkeypatch.setattr(instance, "_run_native_agent_task", fail_run)
+    monkeypatch.setattr(daemon_telegram_io_impl, "route_local_image_request", fake_route_local_image_request)
+    monkeypatch.setattr(daemon_telegram_io_impl, "inspect_local_images", fail_inspect)
+    monkeypatch.setattr(instance, "_telegram_send_message", capture_message)
+    monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
+    monkeypatch.setattr(instance, "_telegram_edit_message_text", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(instance, "_telegram_send_chat_action", noop)
+    monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
+    monkeypatch.setattr(instance, "_telegram_send_delayed_working_note", noop)
+
+    asyncio.run(
+        instance._process_telegram_message(
+            {
+                "chat_id": "7317769764",
+                "chat_type": "private",
+                "message_id": 23,
+                "text": "",
+                "from_id": "7317769764",
+                "from_username": "tiuni",
+                "first_name": "Tiuni",
+                "attachments": [{"type": "photo", "file_id": "img-1"}],
+                "reply": {},
+            }
+        )
+    )
+
+    task = instance.state_store.list_tasks(limit=1)[0]
+    assert task["status"] == "completed"
+    assert task["result"]["model"] == "qwen3.5-9b"
+    assert task["metadata"]["telegram_multimodal_route"] is True
+    assert task["metadata"]["telegram_multimodal_action"] == "respond"
+    assert captured["image_paths"] == [str(image_path)]
+    assert "Describe the attached image" in str(captured["prompt"])
+    assert sent_messages[0] == "Analyzing image"
+    assert sent_messages[-1] == "The image shows a small test photo."
+
+
+def test_daemon_routes_telegram_image_generation_request_to_generate_image(monkeypatch, tmp_path):
+    instance = _build_daemon(monkeypatch, tmp_path)
+    image_path = tmp_path / "photo.jpg"
+    image_path.write_bytes(b"\xff\xd8\xff\xd9")
+    captured: dict[str, object] = {}
+    sent_messages: list[str] = []
+
+    async def fake_download(_message):
+        return (
+            [
+                {
+                    "type": "telegram_attachment",
+                    "telegram_type": "photo",
+                    "mime_type": "image/jpeg",
+                    "path": str(image_path),
+                    "source": "telegram",
+                    "size": 42,
+                    "message_id": 24,
+                }
+            ],
+            [],
+        )
+
+    async def fake_route_local_image_request(*, prompt, image_paths, config, history=None, temperature=0.1, max_tokens=1200, timeout_seconds=180):
+        captured["router_prompt"] = prompt
+        captured["image_paths"] = list(image_paths)
+        return {
+            "provider": "lmstudio",
+            "model": "qwen3.5-9b",
+            "action": "generate_image",
+            "generation_prompt": "Editorial caricature portrait of a man with curly dark hair, full beard, rectangular black glasses, and exaggerated wide eyes, bold ink lines, colorful magazine illustration.",
+            "negative_prompt": "blurry, low quality, extra faces",
+            "media_type": "image",
+            "init_image_creativity": 0.71,
+        }
+
+    async def fake_run(task_id, goal, *, kind, history=None, initial_tool_call=None, resume_state=None, approved=False):
+        captured["goal"] = goal
+        captured["initial_tool_call"] = dict(initial_tool_call or {})
+        instance.state_store.update_task(
+            task_id,
+            status="completed",
+            result={
+                "message": "Generated caricature.",
+                "provider": "fake",
+                "model": "generate_image",
+                "plan": None,
+                "artifacts": [],
+            },
+        )
+        return native.NativeAgentOutcome(
+            status="completed",
+            message="Generated caricature.",
+            provider="fake",
+            model="generate_image",
+        )
+
+    async def fail_inspect(*_args, **_kwargs):
+        raise AssertionError("inspection path should not run for image-generation requests")
+
+    async def capture_message(_chat_id, text, **_kwargs):
+        sent_messages.append(text)
+        return {"message_id": len(sent_messages)}
+
+    async def capture_text(_chat_id, text, **_kwargs):
+        sent_messages.append(text)
+        return None
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(instance, "_download_telegram_attachments", fake_download)
+    monkeypatch.setattr(instance, "_run_native_agent_task", fake_run)
+    monkeypatch.setattr(daemon_telegram_io_impl, "route_local_image_request", fake_route_local_image_request)
+    monkeypatch.setattr(daemon_telegram_io_impl, "inspect_local_images", fail_inspect)
+    monkeypatch.setattr(instance, "_telegram_send_message", capture_message)
+    monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
+    monkeypatch.setattr(instance, "_telegram_edit_message_text", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(instance, "_telegram_send_chat_action", noop)
+    monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
+    monkeypatch.setattr(instance, "_telegram_send_delayed_working_note", noop)
+
+    asyncio.run(
+        instance._process_telegram_message(
+            {
+                "chat_id": "7317769764",
+                "chat_type": "private",
+                "message_id": 24,
+                "text": "Turn me into a caricature",
+                "from_id": "7317769764",
+                "from_username": "tiuni",
+                "first_name": "Tiuni",
+                "attachments": [{"type": "photo", "file_id": "img-2"}],
+                "reply": {},
+            }
+        )
+    )
+
+    task = instance.state_store.list_tasks(limit=1)[0]
+    assert task["status"] == "completed"
+    assert task["metadata"]["telegram_multimodal_route"] is True
+    assert task["metadata"]["telegram_multimodal_action"] == "generate_image"
+    assert task["metadata"]["telegram_generation_prompt"].startswith("Editorial caricature portrait")
+    assert task["metadata"]["telegram_source_image_path"] == str(image_path)
+    assert task["metadata"]["telegram_init_image_creativity"] == 0.71
+    assert captured["image_paths"] == [str(image_path)]
+    assert captured["goal"].startswith("Turn me into a caricature")
+    assert captured["initial_tool_call"]["tool_name"] == "generate_image"
+    assert captured["initial_tool_call"]["arguments"]["prompt"].startswith("Editorial caricature portrait")
+    assert captured["initial_tool_call"]["arguments"]["negative_prompt"] == "blurry, low quality, extra faces"
+    assert captured["initial_tool_call"]["arguments"]["media_type"] == "image"
+    assert captured["initial_tool_call"]["arguments"]["source_image_path"] == str(image_path)
+    assert captured["initial_tool_call"]["arguments"]["init_image_creativity"] == 0.71
+    assert captured["initial_tool_call"]["arguments"]["send_to_telegram"] is False
+    assert sent_messages[0] == "Generating image"
+    assert sent_messages[-1] == "Generated caricature."
+
+
+def test_daemon_routes_recent_telegram_image_reference_to_desktop_copy(monkeypatch, tmp_path):
+    instance = _build_daemon(monkeypatch, tmp_path)
+    image_path = tmp_path / "photo.jpg"
+    image_path.write_bytes(b"\xff\xd8\xff\xd9")
+    captured: dict[str, object] = {}
+    sent_texts: list[str] = []
+    status_messages: list[str] = []
+    prior_task = instance.state_store.create_task(
+        goal="Review the attached Telegram file or image and respond to the user.",
+        kind="chat",
+        metadata={
+            "source": "telegram",
+            "telegram_chat_id": "7317769764",
+            "telegram_message_id": 14578,
+            "telegram_attachments": [
+                {
+                    "type": "telegram_attachment",
+                    "telegram_type": "photo",
+                    "mime_type": "image/jpeg",
+                    "path": str(image_path),
+                    "source": "telegram",
+                    "size": 42,
+                    "message_id": 14578,
+                }
+            ],
+        },
+    )
+    instance.state_store.update_task(prior_task["id"], status="completed")
+
+    async def fake_download(_message):
+        return [], []
+
+    async def fake_run(task_id, goal, *, kind, history=None, initial_tool_call=None, resume_state=None, approved=False):
+        captured["goal"] = goal
+        captured["initial_tool_call"] = dict(initial_tool_call or {})
+        instance.state_store.update_task(
+            task_id,
+            status="completed",
+            result={
+                "message": "Queued copy to desktop.",
+                "provider": "fake",
+                "model": "model",
+                "plan": None,
+                "artifacts": [],
+            },
+        )
+        return native.NativeAgentOutcome(
+            status="completed",
+            message="Queued copy to desktop.",
+            provider="fake",
+            model="model",
+        )
+
+    async def capture_text(_chat_id, text, **_kwargs):
+        sent_texts.append(text)
+
+    async def capture_message(_chat_id, text, **_kwargs):
+        status_messages.append(text)
+        return {"message_id": len(status_messages)}
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(instance, "_download_telegram_attachments", fake_download)
+    monkeypatch.setattr(instance, "_run_native_agent_task", fake_run)
+    monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
+    monkeypatch.setattr(instance, "_telegram_send_message", capture_message)
+    monkeypatch.setattr(instance, "_telegram_edit_message_text", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(instance, "_telegram_send_chat_action", noop)
+    monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
+    monkeypatch.setattr(instance, "_telegram_send_delayed_working_note", noop)
+
+    asyncio.run(
+        instance._process_telegram_message(
+            {
+                "chat_id": "7317769764",
+                "chat_type": "private",
+                "message_id": 14584,
+                "text": "Can you save that image to my desktop?",
+                "from_id": "7317769764",
+                "from_username": "tiuni",
+                "first_name": "Tiuni",
+                "attachments": [],
+                "reply": {},
+            }
+        )
+    )
+
+    task = instance.state_store.list_tasks(limit=1)[0]
+    assert task["status"] == "completed"
+    assert captured["initial_tool_call"]["tool_name"] == "copy_local_file"
+    assert captured["initial_tool_call"]["arguments"]["source_path"] == str(image_path)
+    assert captured["initial_tool_call"]["arguments"]["destination_path"].endswith("/Desktop/photo.jpg")
+    assert status_messages[0] == "Saving to desktop"
+    assert sent_texts[-1] == "Queued copy to desktop."
+
+
 def test_daemon_telegram_approve_command_resumes_task(monkeypatch, tmp_path):
     instance = _build_daemon(monkeypatch, tmp_path)
     sent_texts: list[str] = []
@@ -334,6 +648,53 @@ def test_daemon_sends_delayed_working_note(monkeypatch, tmp_path):
     )
 
     assert sent_texts == ["Working..."]
+
+
+def test_daemon_sends_full_completed_telegram_reply_without_artifacts(monkeypatch, tmp_path):
+    instance = _build_daemon(monkeypatch, tmp_path)
+    sent_messages: list[str] = []
+    edited_texts: list[str] = []
+    long_message = "A" * 4501
+    task = instance.state_store.create_task(goal="long reply", kind="chat")
+    instance.state_store.update_task(
+        task["id"],
+        status="completed",
+        result={
+            "message": long_message,
+            "provider": "fake",
+            "model": "model",
+            "plan": None,
+            "artifacts": [],
+        },
+        metadata={"telegram_status_message_id": 77},
+    )
+
+    async def capture_message(_chat_id, text, **_kwargs):
+        sent_messages.append(text)
+        return {"message_id": len(sent_messages)}
+
+    async def capture_edit(_chat_id, _message_id, text, **_kwargs):
+        edited_texts.append(text)
+        return True
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(instance, "_telegram_send_message", capture_message)
+    monkeypatch.setattr(instance, "_telegram_edit_message_text", capture_edit)
+    monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
+
+    asyncio.run(
+        instance._telegram_send_task_result(
+            "7317769764",
+            task["id"],
+            reply_to_message_id=55,
+        )
+    )
+
+    assert edited_texts == ["Uploading", "Done"]
+    assert len(sent_messages) == 2
+    assert "".join(sent_messages) == long_message
 
 
 def test_daemon_processes_telegram_callback_approval(monkeypatch, tmp_path):

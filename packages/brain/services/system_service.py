@@ -150,6 +150,13 @@ class SystemServicerMixin(BaseServicerMixin):
             icon="🛠️",
         ))
         caps.append(brain_pb2.CapabilityItem(
+            name="Skill Packs",
+            description="Shared on-disk skill pack catalog spanning prompt packs, local tools, and MCP recipes.",
+            status="active" if getattr(runtime, "skill_pack_manager", None) else "disabled",
+            category="tools",
+            icon="🧩",
+        ))
+        caps.append(brain_pb2.CapabilityItem(
             name="Metrics & Observability",
             description="Real-time token usage, cost tracking, and performance metrics",
             status="active" if runtime.metrics_collector else "disabled",

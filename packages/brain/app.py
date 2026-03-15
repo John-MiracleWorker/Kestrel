@@ -373,6 +373,7 @@ async def _init_labs() -> InitializerResult:
     from agent.predictions import TaskPredictor
     from agent.proactive import HeartbeatEngine, ProactiveEngine
     from agent.sessions import SessionManager
+    from agent.skillpacks import SkillPackManager
     from agent.skills import SkillManager
     from agent.simulation import OutcomeSimulator
     from agent.ui_artifacts import UIArtifactManager
@@ -392,6 +393,7 @@ async def _init_labs() -> InitializerResult:
         persona_learner=runtime.persona_learner,
     )
     runtime.skill_manager = SkillManager(pool=pool, tool_registry=runtime.tool_registry)
+    runtime.skill_pack_manager = SkillPackManager(pool=pool)
     runtime.session_manager = SessionManager(pool=pool)
     runtime.outcome_simulator = OutcomeSimulator(provider_resolver=_resolve_default_cloud_provider)
     runtime.branch_manager = BranchManager(pool=pool)
@@ -415,6 +417,7 @@ async def _init_labs() -> InitializerResult:
     if getattr(runtime, "subsystem_bootstrapper", None):
         runtime.subsystem_bootstrapper.register("task_predictor", lambda: runtime.task_predictor, eager_instance=runtime.task_predictor)
         runtime.subsystem_bootstrapper.register("skill_manager", lambda: runtime.skill_manager, eager_instance=runtime.skill_manager)
+        runtime.subsystem_bootstrapper.register("skill_pack_manager", lambda: runtime.skill_pack_manager, eager_instance=runtime.skill_pack_manager)
         runtime.subsystem_bootstrapper.register("session_manager", lambda: runtime.session_manager, eager_instance=runtime.session_manager)
         runtime.subsystem_bootstrapper.register("simulation", lambda: runtime.outcome_simulator, eager_instance=runtime.outcome_simulator)
         runtime.subsystem_bootstrapper.register("ui_artifact_manager", lambda: runtime.ui_artifact_manager, eager_instance=runtime.ui_artifact_manager)

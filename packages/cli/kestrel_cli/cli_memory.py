@@ -356,6 +356,191 @@ async def cmd_shutdown(client: KestrelClient, args: argparse.Namespace):
         print_error(f"Shutdown failed: {status}")
 
 
+def _skill_component_summary(pack: dict) -> str:
+    components = pack.get("components") or []
+    if not isinstance(components, list) or not components:
+        return "none"
+    counts: dict[str, int] = {}
+    for item in components:
+        if not isinstance(item, dict):
+            continue
+        component_type = str(item.get("type") or "unknown")
+        counts[component_type] = counts.get(component_type, 0) + 1
+    return ", ".join(
+        f"{component_type} x{count}"
+        for component_type, count in sorted(counts.items(), key=lambda pair: pair[0])
+    ) or "none"
+
+
+def _render_skill_pack_detail(pack: dict):
+    print(f"  {c('ID:', Colors.MUTED)}          {c(str(pack.get('pack_id', '')), Colors.WHITE)}")
+    print(f"  {c('Name:', Colors.MUTED)}        {c(str(pack.get('name', '')), Colors.WHITE)}")
+    print(f"  {c('Version:', Colors.MUTED)}     {c(str(pack.get('version', '')), Colors.WHITE)}")
+    print(f"  {c('Source:', Colors.MUTED)}      {c(str(pack.get('source_type', '')), Colors.WHITE)}")
+    print(f"  {c('Scope:', Colors.MUTED)}       {c(str(pack.get('scope', pack.get('root_kind', ''))), Colors.WHITE)}")
+    print(f"  {c('Enabled:', Colors.MUTED)}     {c(str(bool(pack.get('enabled', False))), Colors.WHITE)}")
+    print(f"  {c('Trusted:', Colors.MUTED)}     {c(str(bool(pack.get('trusted', False))), Colors.WHITE)}")
+    print(f"  {c('Installed:', Colors.MUTED)}   {c(str(bool(pack.get('installed', False))), Colors.WHITE)}")
+    print(f"  {c('Components:', Colors.MUTED)}  {c(_skill_component_summary(pack), Colors.WHITE)}")
+
+    dependencies = pack.get("dependencies") or []
+    dependency_ids = [
+        str(item.get("pack_id") or "")
+        for item in dependencies
+        if isinstance(item, dict) and str(item.get("pack_id") or "").strip()
+    ]
+    if dependency_ids:
+        print(f"  {c('Depends on:', Colors.MUTED)}  {c(', '.join(dependency_ids), Colors.WHITE)}")
+
+    source_path = str(pack.get("source_path") or pack.get("path") or "").strip()
+    if source_path:
+        print(f"  {c('Path:', Colors.MUTED)}        {c(source_path, Colors.WHITE)}")
+    install_url = str(pack.get("install_url") or "").strip()
+    if install_url:
+        print(f"  {c('Install URL:', Colors.MUTED)} {c(install_url, Colors.PRIMARY)}")
+
+    description = str(pack.get("description") or "").strip()
+    if description:
+        print()
+        print(c(description, Colors.WHITE))
+
+    prompt_preview = str(pack.get("prompt_preview") or "").strip()
+    if prompt_preview:
+        print()
+        print(c("Prompt Preview", Colors.BOLD + Colors.PRIMARY))
+        print(c(prompt_preview[:1200], Colors.MUTED))
+
+
+async def cmd_skill(client: KestrelClient, args: argparse.Namespace):
+    """Manage skill packs via the local daemon."""
+    subcommand = getattr(args, "skill_cmd", "")
+    if not subcommand:
+        print_error("Use `kestrel skill --help` to see skill commands.")
+        return
+
+    if subcommand == "list":
+        print_header("Skill Packs")
+        result = await client.skill_list(
+            include_synthetic=bool(getattr(args, "include_synthetic", True)),
+            include_marketplace=bool(getattr(args, "include_marketplace", True)),
+        )
+        if result.get("error"):
+            print_error(result["error"])
+            return
+        packs = result.get("packs", [])
+        if not packs:
+            print_info("No skill packs found")
+            return
+        rows = []
+        for pack in packs:
+            rows.append(
+                [
+                    str(pack.get("pack_id", ""))[:28],
+                    "yes" if pack.get("enabled") else "no",
+                    "yes" if pack.get("trusted") else "no",
+                    str(pack.get("scope") or pack.get("root_kind") or "")[:12],
+                    _skill_component_summary(pack)[:24],
+                ]
+            )
+        print_table(["Pack", "Enabled", "Trusted", "Scope", "Components"], rows, [30, 10, 10, 14, 26])
+        return
+
+    if subcommand == "search":
+        print_header("Skill Search")
+        query = " ".join(getattr(args, "query", []) or []).strip()
+        result = await client.skill_search(query, include_marketplace=bool(getattr(args, "include_marketplace", True)))
+        if result.get("error"):
+            print_error(result["error"])
+            return
+        matches = result.get("results", [])
+        if not matches:
+            print_info(f"No skill packs matched: {query}")
+            return
+        rows = []
+        for pack in matches:
+            rows.append(
+                [
+                    str(pack.get("pack_id", ""))[:28],
+                    f"{float(pack.get('score', 0)):.1f}",
+                    str(pack.get("source_type") or pack.get("root_kind") or "")[:16],
+                    str(pack.get("description") or "")[:52],
+                ]
+            )
+        print_table(["Pack", "Score", "Source", "Description"], rows, [30, 8, 18, 54])
+        return
+
+    if subcommand == "inspect":
+        pack_id = str(getattr(args, "pack_id", "") or "").strip()
+        print_header(f"Skill Pack: {pack_id}")
+        result = await client.skill_inspect(pack_id)
+        if result.get("error"):
+            print_error(result["error"])
+            return
+        pack = result.get("pack") or {}
+        if not pack:
+            print_error(f"Unknown skill pack: {pack_id}")
+            return
+        _render_skill_pack_detail(pack)
+        return
+
+    if subcommand == "install":
+        print_header("Install Skill Pack")
+        result = await client.skill_install(
+            pack_id=str(getattr(args, "pack_id", "") or "").strip(),
+            source_path=str(getattr(args, "source_path", "") or "").strip(),
+            source_url=str(getattr(args, "source_url", "") or "").strip(),
+            scope=str(getattr(args, "scope", "user") or "user").strip(),
+        )
+        if result.get("error"):
+            print_error(result["error"])
+            return
+        pack = result.get("pack") or {}
+        print_success(f"{result.get('action', 'installed')}: {pack.get('pack_id', 'unknown')}")
+        dependencies = result.get("dependencies_installed") or []
+        if dependencies:
+            print_info(f"Dependencies installed: {', '.join(str(item) for item in dependencies)}")
+        return
+
+    if subcommand == "import":
+        print_header("Import Skill Pack")
+        result = await client.skill_import(
+            source_path=str(getattr(args, "source_path", "") or "").strip(),
+            scope=str(getattr(args, "scope", "user") or "user").strip(),
+        )
+        if result.get("error"):
+            print_error(result["error"])
+            return
+        pack = result.get("pack") or {}
+        print_success(f"{result.get('action', 'imported')}: {pack.get('pack_id', 'unknown')}")
+        return
+
+    if subcommand == "enable":
+        result = await client.skill_enable(str(getattr(args, "pack_id", "") or "").strip())
+        if result.get("error"):
+            print_error(result["error"])
+            return
+        print_success(f"Enabled {result.get('pack', {}).get('pack_id', getattr(args, 'pack_id', ''))}")
+        return
+
+    if subcommand == "disable":
+        result = await client.skill_disable(str(getattr(args, "pack_id", "") or "").strip())
+        if result.get("error"):
+            print_error(result["error"])
+            return
+        print_success(f"Disabled {result.get('pack', {}).get('pack_id', getattr(args, 'pack_id', ''))}")
+        return
+
+    if subcommand == "remove":
+        result = await client.skill_remove(str(getattr(args, "pack_id", "") or "").strip())
+        if result.get("error"):
+            print_error(result["error"])
+            return
+        print_success(f"{result.get('action', 'removed')}: {result.get('pack', {}).get('pack_id', getattr(args, 'pack_id', ''))}")
+        return
+
+    print_error(f"Unknown skill command: {subcommand}")
+
+
 async def cmd_config(client: KestrelClient, args: argparse.Namespace):
     """Configure Kestrel CLI settings."""
     config = load_config()
@@ -488,13 +673,9 @@ def cmd_memory_edit(args, config: dict):
 
 async def interactive_repl(client: KestrelClient, config: dict):
     """Run the interactive Kestrel REPL."""
-    from agent.commands import CommandParser  # noqa: delayed import
+    from .cli_commands import CommandParser
 
     parser = CommandParser()
-    print_logo()
-    print(c("  Type a message to chat, /help for commands, or Ctrl+C to exit.", Colors.DIM))
-    print()
-
     context = {
         "model": config.get("model", ""),
         "total_tokens": 0,
@@ -503,11 +684,32 @@ async def interactive_repl(client: KestrelClient, config: dict):
         "session_type": "main",
         "thinking_level": config.get("thinking_level", "medium"),
         "usage_mode": config.get("usage_mode", "tokens"),
+        "verbose": bool(config.get("verbose", False)),
     }
+    try:
+        print_logo(context)
+    except TypeError:
+        print_logo()
+    print_panel(
+        "Ready",
+        [
+            "Type a message to chat with the active runtime.",
+            "Use /help for shell controls or prefix with ! to launch an autonomous task.",
+        ],
+        tone="info",
+    )
+    print()
+
+    def _command_tone(command_name: str, response: str) -> str:
+        if response.startswith("Unknown command:"):
+            return "warning"
+        if command_name in {"new", "reset", "think", "usage", "model", "verbose", "cancel", "exit"}:
+            return "success"
+        return "info"
 
     while True:
         try:
-            prompt = c("🦅 kestrel", Colors.KESTREL) + c(" ❯ ", Colors.MUTED)
+            prompt = repl_prompt(context)
             user_input = input(prompt).strip()
 
             if not user_input:
@@ -517,7 +719,9 @@ async def interactive_repl(client: KestrelClient, config: dict):
             if parser.is_command(user_input):
                 result = parser.parse(user_input, context)
                 if result:
-                    print(f"\n{result.response}\n")
+                    print()
+                    print_panel(result.command, result.response, tone=_command_tone(result.command, result.response))
+                    print()
 
                     # Apply side effects
                     se = result.side_effects
@@ -533,9 +737,16 @@ async def interactive_repl(client: KestrelClient, config: dict):
                         context["model"] = se["value"]
                         config["model"] = se["value"]
                         save_config(config)
+                    elif se.get("action") == "set_verbose":
+                        context["verbose"] = bool(se["value"])
+                        config["verbose"] = bool(se["value"])
+                        save_config(config)
                     elif se.get("action") == "reset_session":
                         context["total_tokens"] = 0
                         context["cost_usd"] = 0
+                    elif se.get("action") == "exit_repl":
+                        print(c("  Flight closed.\n", Colors.KESTREL))
+                        break
                 continue
 
             # Check for task prefix
@@ -558,6 +769,13 @@ async def interactive_repl(client: KestrelClient, config: dict):
                 if response.get("error"):
                     print_error(response["error"])
                 else:
+                    provider = response.get("provider") or "unknown"
+                    model = response.get("model") or "unknown"
+                    print(
+                        f"{badge('ASSISTANT', Colors.WHITE, Colors.PRIMARY_BG)} "
+                        f"{badge(provider, Colors.WHITE, Colors.SURFACE_SOFT)} "
+                        f"{badge(model, Colors.WHITE, Colors.SURFACE_ACCENT)}"
+                    )
                     print(c(response.get("message", ""), Colors.WHITE))
                     if response.get("plan"):
                         plan = response["plan"] or {}
@@ -572,9 +790,7 @@ async def interactive_repl(client: KestrelClient, config: dict):
                     elif response.get("artifacts"):
                         artifact_count = len(response.get("artifacts") or [])
                         print(c(f"\n  artifacts: {artifact_count}", Colors.MUTED))
-                    provider = response.get("provider") or "unknown"
-                    model = response.get("model") or "unknown"
-                    print(c(f"\n  {provider}:{model}\n", Colors.MUTED))
+                    print()
                 continue
             async for event in client.start_task(user_input):
                 print_event(event)
@@ -590,4 +806,3 @@ async def interactive_repl(client: KestrelClient, config: dict):
 
 
 # ── Main Entry Point ─────────────────────────────────────────────────
-

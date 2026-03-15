@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import base64
 import fnmatch
 import hashlib
 import json
@@ -11,6 +12,7 @@ import mimetypes
 import os
 import platform
 import re
+import shutil
 import sqlite3
 import socket
 import subprocess
@@ -38,6 +40,7 @@ except ModuleNotFoundError:  # pragma: no cover - packaging guard
 LOGGER = logging.getLogger("kestrel.native")
 DEFAULT_CONTROL_HOST = os.getenv("KESTREL_CONTROL_HOST", "127.0.0.1")
 DEFAULT_CONTROL_PORT = int(os.getenv("KESTREL_CONTROL_PORT", "8749"))
+CONTROL_STREAM_LIMIT = 1024 * 1024
 
 
 DEFAULT_CONFIG = {
@@ -81,6 +84,12 @@ DEFAULT_CONFIG = {
     "tools": {
         "enabled_categories": ["file", "system", "web", "memory", "media", "desktop", "custom"],
     },
+    "skills": {
+        "max_active_per_task": 5,
+        "auto_enable_bundled": True,
+        "auto_connect_mcp_recipes": True,
+        "marketplace_urls": [],
+    },
     "communication": {
         "primary_channel": "telegram",
         "mirror_channels": ["web"],
@@ -119,6 +128,7 @@ class KestrelPaths:
     cache_dir: Path
     models_dir: Path
     tools_dir: Path
+    skills_dir: Path
     control_socket: Path
     control_host: str
     control_port: int
@@ -143,6 +153,7 @@ def resolve_paths(home_override: str | None = None) -> KestrelPaths:
     cache_dir = home / "cache"
     models_dir = home / "models"
     tools_dir = home / "tools"
+    skills_dir = home / "skills"
     return KestrelPaths(
         home=home,
         run_dir=run_dir,
@@ -155,6 +166,7 @@ def resolve_paths(home_override: str | None = None) -> KestrelPaths:
         cache_dir=cache_dir,
         models_dir=models_dir,
         tools_dir=tools_dir,
+        skills_dir=skills_dir,
         control_socket=run_dir / "control.sock",
         control_host=os.getenv("KESTREL_CONTROL_HOST", DEFAULT_CONTROL_HOST),
         control_port=int(os.getenv("KESTREL_CONTROL_PORT", str(DEFAULT_CONTROL_PORT))),
@@ -187,6 +199,7 @@ def ensure_home_layout(home_override: str | None = None) -> KestrelPaths:
         paths.cache_dir,
         paths.models_dir,
         paths.tools_dir,
+        paths.skills_dir,
     ):
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -229,6 +242,11 @@ tools:
     - media
     - desktop
     - custom
+skills:
+  max_active_per_task: 5
+  auto_enable_bundled: true
+  auto_connect_mcp_recipes: true
+  marketplace_urls: []
 communication:
   primary_channel: telegram
   mirror_channels:
@@ -424,12 +442,12 @@ async def send_control_stream(
     request_id = str(uuid.uuid4())
     if os.name == "nt":
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(paths.control_host, paths.control_port),
+            asyncio.open_connection(paths.control_host, paths.control_port, limit=CONTROL_STREAM_LIMIT),
             timeout=timeout_seconds,
         )
     else:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_unix_connection(str(paths.control_socket)),
+            asyncio.open_unix_connection(str(paths.control_socket), limit=CONTROL_STREAM_LIMIT),
             timeout=timeout_seconds,
         )
     payload = {

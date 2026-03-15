@@ -20,6 +20,189 @@ class NativeToolRegistryHandlersMixin:
 
         _capture_screenshot_to_file(output_path)
 
+    def _skill_manager_or_result(self) -> NativeExecutionResult | Any:
+        manager = getattr(self, "skill_pack_manager", None)
+        if manager is None:
+            return NativeExecutionResult(
+                tool_name="skill_manager",
+                success=False,
+                message="Skill pack manager is unavailable.",
+            )
+        return manager
+
+    def _handle_skill_search(self, context: NativeToolContext, arguments: dict[str, Any]) -> NativeExecutionResult:
+        manager = self._skill_manager_or_result()
+        if isinstance(manager, NativeExecutionResult):
+            return manager
+        query = str(arguments.get("query") or "").strip()
+        result = manager.search(query, include_marketplace=bool(arguments.get("include_marketplace", True)))
+        return NativeExecutionResult(
+            tool_name="skill_search",
+            success=True,
+            message=f"Found {int(result.get('total') or 0)} matching skill pack(s).",
+            data=result,
+        )
+
+    def _handle_skill_list(self, context: NativeToolContext, arguments: dict[str, Any]) -> NativeExecutionResult:
+        manager = self._skill_manager_or_result()
+        if isinstance(manager, NativeExecutionResult):
+            return manager
+        result = manager.catalog(
+            include_synthetic=bool(arguments.get("include_synthetic", True)),
+            include_marketplace=bool(arguments.get("include_marketplace", True)),
+        )
+        return NativeExecutionResult(
+            tool_name="skill_list",
+            success=True,
+            message=f"Loaded {len(result.get('packs') or [])} skill pack entries.",
+            data=result,
+        )
+
+    def _handle_skill_inspect(self, context: NativeToolContext, arguments: dict[str, Any]) -> NativeExecutionResult:
+        manager = self._skill_manager_or_result()
+        if isinstance(manager, NativeExecutionResult):
+            return manager
+        pack_id = str(arguments.get("pack_id") or "").strip().lower()
+        if not pack_id:
+            return NativeExecutionResult(tool_name="skill_inspect", success=False, message="pack_id is required")
+        result = manager.inspect(pack_id)
+        if result is None:
+            return NativeExecutionResult(tool_name="skill_inspect", success=False, message=f"Unknown skill pack: {pack_id}")
+        return NativeExecutionResult(
+            tool_name="skill_inspect",
+            success=True,
+            message=f"Inspected skill pack {pack_id}.",
+            data=result,
+        )
+
+    def _handle_skill_install(self, context: NativeToolContext, arguments: dict[str, Any]) -> NativeExecutionResult:
+        manager = self._skill_manager_or_result()
+        if isinstance(manager, NativeExecutionResult):
+            return manager
+        pack_id = str(arguments.get("pack_id") or "").strip().lower()
+        source_path = str(arguments.get("source_path") or "").strip()
+        source_url = str(arguments.get("source_url") or "").strip()
+        scope = str(arguments.get("scope") or "user").strip().lower() or "user"
+        if not pack_id and not source_path and not source_url:
+            return NativeExecutionResult(tool_name="skill_install", success=False, message="pack_id, source_path, or source_url is required")
+        if not context.approved:
+            source_label = source_path or source_url
+            summary = f"Install skill pack {pack_id}" if pack_id else f"Install skill pack from {source_label}"
+            return NativeExecutionResult(
+                tool_name="skill_install",
+                success=False,
+                message=f"Approval required to install skill pack {pack_id or source_label}",
+                risk_class="mutating",
+                approval_required=True,
+                approval_operation="skill_install",
+                approval_payload={
+                    "summary": summary,
+                    "arguments": {"pack_id": pack_id, "source_path": source_path, "source_url": source_url, "scope": scope},
+                },
+            )
+        result = manager.install(pack_id=pack_id, source_path=source_path, source_url=source_url, scope=scope)
+        self.reload_skill_tools()
+        return NativeExecutionResult(
+            tool_name="skill_install",
+            success=True,
+            message=f"Installed skill pack {result['pack']['pack_id']}.",
+            data=result,
+            risk_class="mutating",
+        )
+
+    def _handle_skill_import(self, context: NativeToolContext, arguments: dict[str, Any]) -> NativeExecutionResult:
+        manager = self._skill_manager_or_result()
+        if isinstance(manager, NativeExecutionResult):
+            return manager
+        source_path = str(arguments.get("source_path") or "").strip()
+        scope = str(arguments.get("scope") or "user").strip().lower() or "user"
+        if not source_path:
+            return NativeExecutionResult(tool_name="skill_import", success=False, message="source_path is required")
+        if not context.approved:
+            return NativeExecutionResult(
+                tool_name="skill_import",
+                success=False,
+                message=f"Approval required to import skill pack from {source_path}",
+                risk_class="mutating",
+                approval_required=True,
+                approval_operation="skill_import",
+                approval_payload={
+                    "summary": f"Import skill pack from {source_path}",
+                    "arguments": {"source_path": source_path, "scope": scope},
+                },
+            )
+        result = manager.import_pack(source_path=source_path, scope=scope)
+        self.reload_skill_tools()
+        return NativeExecutionResult(
+            tool_name="skill_import",
+            success=True,
+            message=f"Imported skill pack {result['pack']['pack_id']}.",
+            data=result,
+            risk_class="mutating",
+        )
+
+    def _handle_skill_enable(self, context: NativeToolContext, arguments: dict[str, Any]) -> NativeExecutionResult:
+        manager = self._skill_manager_or_result()
+        if isinstance(manager, NativeExecutionResult):
+            return manager
+        pack_id = str(arguments.get("pack_id") or "").strip().lower()
+        if not pack_id:
+            return NativeExecutionResult(tool_name="skill_enable", success=False, message="pack_id is required")
+        result = manager.enable(pack_id)
+        self.reload_skill_tools()
+        return NativeExecutionResult(
+            tool_name="skill_enable",
+            success=True,
+            message=f"Enabled skill pack {pack_id}.",
+            data=result,
+        )
+
+    def _handle_skill_disable(self, context: NativeToolContext, arguments: dict[str, Any]) -> NativeExecutionResult:
+        manager = self._skill_manager_or_result()
+        if isinstance(manager, NativeExecutionResult):
+            return manager
+        pack_id = str(arguments.get("pack_id") or "").strip().lower()
+        if not pack_id:
+            return NativeExecutionResult(tool_name="skill_disable", success=False, message="pack_id is required")
+        result = manager.disable(pack_id)
+        self.reload_skill_tools()
+        return NativeExecutionResult(
+            tool_name="skill_disable",
+            success=True,
+            message=f"Disabled skill pack {pack_id}.",
+            data=result,
+        )
+
+    def _handle_skill_remove(self, context: NativeToolContext, arguments: dict[str, Any]) -> NativeExecutionResult:
+        manager = self._skill_manager_or_result()
+        if isinstance(manager, NativeExecutionResult):
+            return manager
+        pack_id = str(arguments.get("pack_id") or "").strip().lower()
+        if not pack_id:
+            return NativeExecutionResult(tool_name="skill_remove", success=False, message="pack_id is required")
+        if not context.approved:
+            return NativeExecutionResult(
+                tool_name="skill_remove",
+                success=False,
+                message=f"Approval required to remove skill pack {pack_id}",
+                risk_class="mutating",
+                approval_required=True,
+                approval_operation="skill_remove",
+                approval_payload={
+                    "summary": f"Remove skill pack {pack_id}",
+                    "arguments": {"pack_id": pack_id},
+                },
+            )
+        result = manager.remove(pack_id)
+        self.reload_skill_tools()
+        return NativeExecutionResult(
+            tool_name="skill_remove",
+            success=True,
+            message=f"Removed skill pack {pack_id}.",
+            data=result,
+            risk_class="mutating",
+        )
+
     def _handle_write_file(self, context: NativeToolContext, arguments: dict[str, Any]) -> NativeExecutionResult:
         path = self._resolve_local_path(arguments.get("path"), workspace_root=context.workspace_root)
         content = str(arguments.get("content") or "")
@@ -76,6 +259,70 @@ class NativeToolRegistryHandlersMixin:
             message=f"Appended {len(content)} characters to {path}",
             data={"path": str(path), "bytes_appended": len(content.encode('utf-8'))},
             artifacts=[self._format_artifact(path)],
+            risk_class="mutating",
+        )
+
+    def _handle_copy_local_file(self, context: NativeToolContext, arguments: dict[str, Any]) -> NativeExecutionResult:
+        source_path = self._resolve_local_path(arguments.get("source_path"), workspace_root=context.workspace_root)
+        destination_path = self._resolve_local_path(arguments.get("destination_path"), workspace_root=context.workspace_root)
+        overwrite = bool(arguments.get("overwrite", False))
+        if not source_path.exists():
+            return NativeExecutionResult(
+                tool_name="copy_local_file",
+                success=False,
+                message=f"Source file not found: {source_path}",
+            )
+        if source_path.is_dir():
+            return NativeExecutionResult(
+                tool_name="copy_local_file",
+                success=False,
+                message=f"Source path is a directory, not a file: {source_path}",
+            )
+
+        target_path = destination_path
+        if destination_path.exists() and destination_path.is_dir():
+            target_path = destination_path / source_path.name
+        elif not destination_path.exists() and destination_path.suffix == "":
+            target_path = destination_path / source_path.name
+
+        if not context.approved:
+            return NativeExecutionResult(
+                tool_name="copy_local_file",
+                success=False,
+                message=f"Approval required to copy {source_path} to {target_path}",
+                risk_class="mutating",
+                approval_required=True,
+                approval_operation="file_write",
+                approval_payload={
+                    "summary": f"Copy {source_path.name} to {target_path}",
+                    "source_path": str(source_path),
+                    "destination_path": str(target_path),
+                    "arguments": {
+                        "source_path": str(source_path),
+                        "destination_path": str(target_path),
+                        "overwrite": overwrite,
+                    },
+                },
+            )
+
+        if target_path.exists() and not overwrite:
+            counter = 2
+            original_target = target_path
+            while target_path.exists():
+                target_path = original_target.with_name(f"{original_target.stem}-{counter}{original_target.suffix}")
+                counter += 1
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, target_path)
+        return NativeExecutionResult(
+            tool_name="copy_local_file",
+            success=True,
+            message=f"Copied {source_path.name} to {target_path}",
+            data={
+                "source_path": str(source_path),
+                "destination_path": str(target_path),
+                "overwrite": overwrite,
+            },
+            artifacts=[self._format_artifact(target_path)],
             risk_class="mutating",
         )
 
@@ -455,7 +702,32 @@ class NativeToolRegistryHandlersMixin:
         width = int(arguments.get("width", 1024) or 1024)
         height = int(arguments.get("height", 1024) or 1024)
         media_type = str(arguments.get("media_type", "image") or "image")
+        source_image_path = str(arguments.get("source_image_path") or "").strip()
+        init_image_creativity_raw = arguments.get("init_image_creativity", 0.6)
         send_to_telegram = bool(arguments.get("send_to_telegram", False))
+        try:
+            init_image_creativity = float(init_image_creativity_raw)
+        except (TypeError, ValueError):
+            init_image_creativity = 0.6
+        init_image_creativity = min(max(init_image_creativity, 0.0), 1.5)
+
+        source_image_data = ""
+        if source_image_path:
+            source_path = Path(source_image_path).expanduser()
+            if not source_path.exists():
+                return NativeExecutionResult(
+                    tool_name="generate_image",
+                    success=False,
+                    message=f"Source image not found: {source_path}",
+                )
+            try:
+                source_image_data = _image_data_url_from_path(source_path)
+            except Exception as exc:
+                return NativeExecutionResult(
+                    tool_name="generate_image",
+                    success=False,
+                    message=f"Could not load source image for generation: {exc}",
+                )
 
         swarm_ip = os.getenv("SWARM_HOST_IP", "192.168.1.19")
         swarm_port = os.getenv("SWARM_PORT", "7801")
@@ -565,6 +837,11 @@ class NativeToolRegistryHandlersMixin:
             "seed": -1,
             "model": swarm_model,
         }
+        if source_image_data:
+            payload["rawInput"] = {
+                "initimage": source_image_data,
+                "initimagecreativity": init_image_creativity,
+            }
         if is_video:
             payload.update(
                 {

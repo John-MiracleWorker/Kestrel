@@ -23,7 +23,9 @@ except ModuleNotFoundError:  # pragma: no cover - packaging guard
 from kestrel_native import (
     MacOSKeychainCredentialStore,
     NativeAgentRunner,
+    NativeAgentOutcome,
     NativeRuntimePolicy,
+    NativeSkillPackManager,
     SQLiteEventJournal,
     SQLiteExactVectorStore,
     SQLiteStateStore,
@@ -32,7 +34,9 @@ from kestrel_native import (
     describe_chat_tool_categories,
     detect_local_model_runtime,
     ensure_home_layout,
+    inspect_local_images,
     load_native_config,
+    route_local_image_request,
     resolve_chat_tool_categories,
     sync_markdown_memory,
     write_json_atomic,
@@ -104,6 +108,11 @@ class KestrelDaemonCore:
         self.vector_store.initialize()
         self.credential_store = MacOSKeychainCredentialStore()
         self.runtime_policy = NativeRuntimePolicy(self.config)
+        self.skill_pack_manager = NativeSkillPackManager(
+            paths=self.paths,
+            config=self.config,
+            state_store=self.state_store,
+        )
         self.start_time = time.time()
         self.stop_event = asyncio.Event()
         self.server: asyncio.AbstractServer | None = None
@@ -167,6 +176,7 @@ class KestrelDaemonCore:
             vector_store=self.vector_store,
             state_store=self.state_store,
             event_callback=event_callback,
+            skill_pack_manager=self.skill_pack_manager,
         )
 
     async def run(self) -> None:
@@ -348,6 +358,44 @@ class KestrelDaemonCore:
         if method == "runtime.profile":
             await self._refresh_model_runtime()
             return self._compose_runtime_profile()
+        if method == "skill.list":
+            return self.skill_pack_manager.catalog(
+                include_synthetic=bool(params.get("include_synthetic", True)),
+                include_marketplace=bool(params.get("include_marketplace", True)),
+            )
+        if method == "skill.search":
+            return self.skill_pack_manager.search(
+                str(params.get("query") or ""),
+                include_marketplace=bool(params.get("include_marketplace", True)),
+            )
+        if method == "skill.inspect":
+            pack_id = str(params.get("pack_id") or "").strip().lower()
+            if not pack_id:
+                raise RuntimeError("skill.inspect requires pack_id")
+            result = self.skill_pack_manager.inspect(pack_id)
+            if result is None:
+                raise RuntimeError(f"Unknown skill pack: {pack_id}")
+            return {"pack": result}
+        if method == "skill.install":
+            result = self.skill_pack_manager.install(
+                pack_id=str(params.get("pack_id") or "").strip().lower(),
+                source_path=str(params.get("source_path") or "").strip(),
+                source_url=str(params.get("source_url") or "").strip(),
+                scope=str(params.get("scope") or "user").strip().lower() or "user",
+            )
+            return result
+        if method == "skill.import":
+            result = self.skill_pack_manager.import_pack(
+                source_path=str(params.get("source_path") or "").strip(),
+                scope=str(params.get("scope") or "user").strip().lower() or "user",
+            )
+            return result
+        if method == "skill.enable":
+            return self.skill_pack_manager.enable(str(params.get("pack_id") or "").strip().lower())
+        if method == "skill.disable":
+            return self.skill_pack_manager.disable(str(params.get("pack_id") or "").strip().lower())
+        if method == "skill.remove":
+            return self.skill_pack_manager.remove(str(params.get("pack_id") or "").strip().lower())
         if method == "memory.sync":
             self.last_memory_sync = sync_markdown_memory(self.paths, self.vector_store)
             self._write_state(status="running")

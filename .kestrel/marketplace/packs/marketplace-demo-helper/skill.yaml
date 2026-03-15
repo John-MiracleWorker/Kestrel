@@ -1,0 +1,14 @@
+id: marketplace-demo-helper
+name: Marketplace Demo Helper
+version: 1.0.0
+description: Shared helper instructions from the seeded local marketplace.
+tags:
+  - marketplace
+  - demo
+  - helper
+use_cases:
+  - summarize findings
+  - structure notes
+components:
+  - type: prompt
+    path: SKILL.md

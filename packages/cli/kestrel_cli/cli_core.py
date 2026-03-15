@@ -64,6 +64,18 @@ class Colors:
     CYAN = "\033[38;5;81m"
     PURPLE = "\033[38;5;141m"
     WHITE = "\033[38;5;255m"
+    INK = "\033[38;5;16m"
+    SOFT = "\033[38;5;252m"
+    SURFACE = "\033[48;5;236m"
+    SURFACE_ALT = "\033[48;5;238m"
+    SURFACE_SOFT = "\033[48;5;235m"
+    SURFACE_ACCENT = "\033[48;5;24m"
+    KESTREL_BG = "\033[48;5;208m"
+    PRIMARY_BG = "\033[48;5;25m"
+    SUCCESS_BG = "\033[48;5;28m"
+    WARNING_BG = "\033[48;5;130m"
+    ERROR_BG = "\033[48;5;88m"
+    MUTED_BG = "\033[48;5;240m"
 
     @staticmethod
     def strip(text: str) -> str:
@@ -293,6 +305,77 @@ class KestrelClient:
             return await send_control_request("paired_nodes.status", paths=self.paths)
         return {"nodes": []}
 
+    async def skill_list(self, *, include_synthetic: bool = True, include_marketplace: bool = True) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        return await send_control_request(
+            "skill.list",
+            {
+                "include_synthetic": include_synthetic,
+                "include_marketplace": include_marketplace,
+            },
+            paths=self.paths,
+        )
+
+    async def skill_search(self, query: str, *, include_marketplace: bool = True) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        return await send_control_request(
+            "skill.search",
+            {"query": query, "include_marketplace": include_marketplace},
+            paths=self.paths,
+        )
+
+    async def skill_inspect(self, pack_id: str) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        return await send_control_request("skill.inspect", {"pack_id": pack_id}, paths=self.paths)
+
+    async def skill_install(
+        self,
+        *,
+        pack_id: str = "",
+        source_path: str = "",
+        source_url: str = "",
+        scope: str = "user",
+    ) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        return await send_control_request(
+            "skill.install",
+            {
+                "pack_id": pack_id,
+                "source_path": source_path,
+                "source_url": source_url,
+                "scope": scope,
+            },
+            paths=self.paths,
+        )
+
+    async def skill_import(self, *, source_path: str, scope: str = "user") -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        return await send_control_request(
+            "skill.import",
+            {"source_path": source_path, "scope": scope},
+            paths=self.paths,
+        )
+
+    async def skill_enable(self, pack_id: str) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        return await send_control_request("skill.enable", {"pack_id": pack_id}, paths=self.paths)
+
+    async def skill_disable(self, pack_id: str) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        return await send_control_request("skill.disable", {"pack_id": pack_id}, paths=self.paths)
+
+    async def skill_remove(self, pack_id: str) -> dict:
+        if not self._use_local_control():
+            return {"error": "Local control API unavailable"}
+        return await send_control_request("skill.remove", {"pack_id": pack_id}, paths=self.paths)
+
 
 # ── Display Helpers ──────────────────────────────────────────────────
 
@@ -304,4 +387,3 @@ LOGO = r"""
     ║                                   ║
     ╚═══════════════════════════════════╝
 """
-

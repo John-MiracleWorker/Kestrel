@@ -142,6 +142,16 @@ async def create_chat_task(request, ctx, workspace_id: str) -> AgentTask:
         feature_mode=feature_mode.value,
     )
     tool_registry = filter_registry_for_profile(tool_registry, task_profile, feature_mode)
+    skill_pack_manager = getattr(runtime, "skill_pack_manager", None)
+    if skill_pack_manager and getattr(ctx, "selected_skill_packs", None):
+        try:
+            await skill_pack_manager.register_selected_tools(
+                tool_registry,
+                workspace_id,
+                list(ctx.selected_skill_packs),
+            )
+        except Exception as exc:
+            logger.warning("Failed to register selected skill pack tools: %s", exc)
 
     agent_profile = await runtime.workspace_agent_store.ensure_profile(workspace_id)
     chat_task.execution_context = ExecutionContext.create(
@@ -192,5 +202,8 @@ async def create_chat_task(request, ctx, workspace_id: str) -> AgentTask:
     setattr(chat_task, "_tool_registry", tool_registry)
     setattr(chat_task, "_feature_mode", feature_mode)
     setattr(chat_task, "_task_profile", task_profile)
+    setattr(chat_task, "_selected_skill_packs", list(getattr(ctx, "selected_skill_packs", [])))
+    setattr(chat_task, "_skill_prompt_block", str(getattr(ctx, "skill_prompt_block", "")))
+    setattr(chat_task, "_selected_skill_mcp_servers", list(getattr(ctx, "selected_skill_mcp_servers", [])))
 
     return chat_task

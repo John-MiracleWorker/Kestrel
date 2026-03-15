@@ -15,6 +15,7 @@ class NativeAgentRunnerBase:
         state_store: SQLiteStateStore | None = None,
         event_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
         workspace_root: Path | None = None,
+        skill_pack_manager: Any | None = None,
     ) -> None:
         self.paths = paths
         self.config = config
@@ -23,12 +24,14 @@ class NativeAgentRunnerBase:
         self.state_store = state_store
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.event_callback = event_callback
+        self.skill_pack_manager = skill_pack_manager
         self.tool_registry = NativeToolRegistry(
             paths=paths,
             config=config,
             runtime_policy=runtime_policy,
             vector_store=vector_store,
             workspace_root=self.workspace_root,
+            skill_pack_manager=skill_pack_manager,
         )
         self.max_plan_steps = int(self.config.get("agent", {}).get("max_plan_steps", 8))
         self.max_step_iterations = int(self.config.get("agent", {}).get("max_step_iterations", 6))
@@ -51,6 +54,37 @@ class NativeAgentRunnerBase:
             "step_outputs": state.get("step_outputs", {}),
         }
         self.state_store.update_task(task_id, status=status, metadata=metadata, result=result, error=error)
+
+    def _ensure_skill_selection(self, state: dict[str, Any]) -> None:
+        if state.get("skill_selection") or self.skill_pack_manager is None:
+            return
+        try:
+            selection = self.skill_pack_manager.select_packs(
+                str(state.get("goal") or ""),
+                history=list(state.get("history") or []),
+            )
+        except Exception as exc:
+            LOGGER.warning("Failed to resolve native skill packs: %s", exc)
+            return
+        if isinstance(selection, dict):
+            state["skill_selection"] = selection
+
+    def _selected_skill_pack_ids(self, state: dict[str, Any]) -> tuple[str, ...]:
+        packs = (state.get("skill_selection") or {}).get("packs") or []
+        selected: list[str] = []
+        for pack in packs:
+            if not isinstance(pack, dict):
+                continue
+            pack_id = str(pack.get("pack_id") or "").strip().lower()
+            if pack_id:
+                selected.append(pack_id)
+        return tuple(selected)
+
+    def _active_tools_for_state(self, state: dict[str, Any]) -> list[NativeToolSpec]:
+        return self.tool_registry.list_tools(selected_pack_ids=self._selected_skill_pack_ids(state))
+
+    def _skill_prompt_block(self, state: dict[str, Any]) -> str:
+        return str((state.get("skill_selection") or {}).get("prompt_block") or "").strip()
 
     def _normalize_execution_action(self, action: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(action or {})
@@ -204,7 +238,10 @@ class NativeAgentRunnerBase:
 
         return None
 
-    async def _plan_goal(self, goal: str, history: list[dict[str, Any]], initial_tool_call: dict[str, Any] | None) -> tuple[dict[str, Any], str, str]:
+    async def _plan_goal(self, goal: str, history: list[dict[str, Any]], initial_tool_call: dict[str, Any] | None, state: dict[str, Any] | None = None) -> tuple[dict[str, Any], str, str]:
+        state = state or {}
+        selected_tools = self._active_tools_for_state(state)
+        prompt_block = self._skill_prompt_block(state)
         if initial_tool_call:
             plan = NativePlan(
                 goal=goal,
@@ -265,7 +302,8 @@ class NativeAgentRunnerBase:
                     "  ]\n"
                     "}\n"
                     "Only use tools from this catalog:\n"
-                    + json.dumps([tool.to_prompt_dict() for tool in self.tool_registry.list_tools()], indent=2)
+                    + json.dumps([tool.to_prompt_dict() for tool in selected_tools], indent=2)
+                    + (f"\n\nRelevant skill packs:\n{prompt_block}" if prompt_block else "")
                 ),
             },
             {
@@ -281,6 +319,8 @@ class NativeAgentRunnerBase:
         return payload, provider, model
 
     async def _next_action(self, state: dict[str, Any], step: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
+        selected_tools = self._active_tools_for_state(state)
+        prompt_block = self._skill_prompt_block(state)
         messages = [
             {
                 "role": "system",
@@ -301,7 +341,8 @@ class NativeAgentRunnerBase:
                     "Use store_result when you generate reusable text, code, SVG, JSON, or other content that a later step must consume.\n"
                     "If no tool exists, use capability_gap instead of inventing a tool name.\n"
                     "Only use this tool catalog:\n"
-                    + json.dumps([tool.to_prompt_dict() for tool in self.tool_registry.list_tools()], indent=2)
+                    + json.dumps([tool.to_prompt_dict() for tool in selected_tools], indent=2)
+                    + (f"\n\nRelevant skill packs:\n{prompt_block}" if prompt_block else "")
                 ),
             },
             {
@@ -344,6 +385,7 @@ class NativeAgentRunnerBase:
                     '  "reason": "string"\n'
                     "}\n"
                     "Reject unsupported claims. Final response must be grounded in tool_evidence."
+                    + (f"\n\nRelevant skill packs:\n{self._skill_prompt_block(state)}" if self._skill_prompt_block(state) else "")
                 ),
             },
             {
@@ -366,12 +408,14 @@ class NativeAgentRunnerBase:
         )
         return payload, provider, model
 
-    async def _direct_response(self, goal: str, history: list[dict[str, Any]]) -> tuple[str, str, str]:
+    async def _direct_response(self, goal: str, history: list[dict[str, Any]], *, state: dict[str, Any] | None = None) -> tuple[str, str, str]:
+        prompt_block = self._skill_prompt_block(state or {})
         response = await _generate_local_text_response(
             messages=[
                 {
                     "role": "system",
-                    "content": "You are Kestrel, a concise local autonomous assistant. Answer directly and honestly.",
+                    "content": "You are Kestrel, a concise local autonomous assistant. Answer directly and honestly."
+                    + (f"\n\nRelevant skill packs:\n{prompt_block}" if prompt_block else ""),
                 },
                 *history[-6:],
                 {"role": "user", "content": goal},
@@ -417,6 +461,9 @@ class NativeAgentRunnerBase:
             "Return only the concrete output for the current step.",
             "Do not add explanations, markdown fences, or JSON.",
         ]
+        prompt_block = self._skill_prompt_block(state)
+        if prompt_block:
+            system_lines.append(f"Relevant skill packs:\n{prompt_block}")
         if expects_svg_markup:
             system_lines.extend(
                 [

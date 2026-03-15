@@ -95,7 +95,11 @@ class NativeToolRegistryCustomMixin:
         context: NativeToolContext,
         arguments: dict[str, Any],
     ) -> NativeExecutionResult:
-        tool_dir = context.paths.tools_dir / spec.name
+        tool_dir = (
+            self._resolve_local_path(spec.source_dir, workspace_root=context.workspace_root)
+            if str(spec.source_dir or "").strip()
+            else context.paths.tools_dir / spec.name
+        )
         entrypoint = self._resolve_local_path(spec.entrypoint, workspace_root=tool_dir)
         if not entrypoint.exists():
             return NativeExecutionResult(
@@ -168,5 +172,4 @@ class NativeToolRegistryCustomMixin:
             artifacts=[],
             risk_class=spec.risk_class,
         )
-
 

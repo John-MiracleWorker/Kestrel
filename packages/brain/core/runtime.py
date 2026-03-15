@@ -52,6 +52,7 @@ class RuntimeContext:
     notification_router: Any = None
     workflow_registry: Any = None
     skill_manager: Any = None
+    skill_pack_manager: Any = None
     session_manager: Any = None
     sandbox_manager: Any = None
     branch_manager: Any = None

@@ -51,6 +51,12 @@ class KestrelDaemonTaskMixin:
     def _compose_runtime_profile(self) -> dict[str, Any]:
         profile = self.runtime_policy.runtime_profile()
         profile["local_models"] = self.last_model_runtime
+        if getattr(self, "skill_pack_manager", None):
+            catalog = self.skill_pack_manager.catalog(include_synthetic=False)
+            profile["skill_packs"] = {
+                "snapshot_id": catalog.get("snapshot_id"),
+                "count": len(catalog.get("packs") or []),
+            }
         profile["updated_at"] = _now()
         return profile
 
@@ -318,7 +324,8 @@ class KestrelDaemonTaskMixin:
             r'\b(?:generate|create|make|draw|paint|render|produce|design)\b.*\b(?:image|picture|photo|illustration|artwork|art|portrait|drawing|painting|graphic)\b',
             r'\b(?:image|picture|photo|illustration|artwork|portrait)\b.*\b(?:of|showing|depicting|with)\b',
             r'\b(?:generate|create|make|render|produce)\b.*\b(?:video|animation|clip|gif)\b',
-            r'\b(?:i want|i need|i\'d like|can you|could you|please)\b.*\b(?:image|picture|photo|video)\b',
+            r'\b(?:i want|i need|i\'d like)\b.*\b(?:image|picture|photo|video)\b',
+            r'\b(?:can you|could you|please)\b.*\b(?:generate|create|make|draw|paint|render|produce)\b.*\b(?:image|picture|photo|video|illustration|artwork|art|portrait|drawing|painting|graphic)\b',
             r'\b(?:render|export|convert)\b.*\b(?:image|picture|photo|art|video)\b',
         ]
 

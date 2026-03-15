@@ -7,6 +7,7 @@ from agent.tools.catalog import SEARCH_TOOL_CATALOG_TOOL, register_catalog_tools
 from agent.tools.create_skill import register_create_skill_tools
 from agent.tools.media_gen import register_media_gen_tools
 from agent.tools.sessions import register_sessions_tools
+from agent.tools.skill_packs import register_skill_pack_tools
 from agent.types import AgentTask, GuardrailConfig, RiskLevel, ToolDefinition
 
 
@@ -31,6 +32,7 @@ def test_register_helpers_expose_dynamic_tools():
     register_create_skill_tools(registry)
     register_media_gen_tools(registry)
     register_sessions_tools(registry)
+    register_skill_pack_tools(registry)
 
     names = {tool.name for tool in registry.list_tools()}
     assert SEARCH_TOOL_CATALOG_TOOL.name in names
@@ -40,6 +42,8 @@ def test_register_helpers_expose_dynamic_tools():
     assert "vram_generate_image" in names
     assert "sessions_list" in names
     assert "sessions_send" in names
+    assert "skill_search" in names
+    assert "skill_install" in names
 
 
 def test_selector_prefers_media_for_dalle_requests():

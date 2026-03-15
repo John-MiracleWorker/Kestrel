@@ -28,6 +28,9 @@ class ChatRequestContext:
     channel_name: str
     request_metadata: dict[str, str]
     return_route: dict[str, str]
+    selected_skill_packs: list[dict[str, Any]]
+    skill_prompt_block: str
+    selected_skill_mcp_servers: list[dict[str, Any]]
 
 
 async def build_request_context(request, workspace_id: str) -> ChatRequestContext:
@@ -93,6 +96,58 @@ async def build_request_context(request, workspace_id: str) -> ChatRequestContex
         "",
     )
 
+    selected_skill_packs: list[dict[str, Any]] = []
+    skill_prompt_block = ""
+    selected_skill_mcp_servers: list[dict[str, Any]] = []
+    skill_pack_manager = getattr(runtime, "skill_pack_manager", None)
+    if skill_pack_manager is not None and user_content:
+        try:
+            selection = await skill_pack_manager.select_packs(
+                workspace_id,
+                user_content,
+                history=messages,
+            )
+            selected_skill_packs = list(selection.get("packs") or [])
+            skill_prompt_block = str(selection.get("prompt_block") or "").strip()
+            if skill_prompt_block and messages:
+                for message in messages:
+                    if not isinstance(message, dict):
+                        continue
+                    if message.get("role") in ("system", 2):
+                        message["content"] += "\n\n" + skill_prompt_block
+                        break
+            if selected_skill_packs:
+                selected_skill_mcp_servers = await skill_pack_manager.auto_connect_selected_mcp(
+                    workspace_id,
+                    selected_skill_packs,
+                )
+                connected = [item for item in selected_skill_mcp_servers if item.get("connected")]
+                if connected and messages:
+                    lines = [
+                        "## Skill Pack MCP Servers",
+                        "These MCP servers were auto-connected from the active skill packs. Use `mcp_call(server_name=..., tool_name=..., arguments=...)` to invoke them.",
+                    ]
+                    for item in connected:
+                        tools = item.get("tools") or []
+                        tool_names = ", ".join(
+                            str(tool.get("name") or "")
+                            for tool in tools
+                            if isinstance(tool, dict) and str(tool.get("name") or "").strip()
+                        )
+                        suffix = f" tools: {tool_names}" if tool_names else ""
+                        lines.append(
+                            f"- `{item.get('server_name')}` from `{item.get('pack_id')}`.{suffix}"
+                        )
+                    mcp_block = "\n".join(lines)
+                    for message in messages:
+                        if not isinstance(message, dict):
+                            continue
+                        if message.get("role") in ("system", 2):
+                            message["content"] += "\n\n" + mcp_block
+                            break
+        except Exception as exc:
+            logger.warning("Failed to resolve skill packs for request: %s", exc)
+
     return ChatRequestContext(
         pool=pool,
         redis=r,
@@ -107,4 +162,7 @@ async def build_request_context(request, workspace_id: str) -> ChatRequestContex
         channel_name=channel_name,
         request_metadata=request_metadata,
         return_route=return_route,
+        selected_skill_packs=selected_skill_packs,
+        skill_prompt_block=skill_prompt_block,
+        selected_skill_mcp_servers=selected_skill_mcp_servers,
     )

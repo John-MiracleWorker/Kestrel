@@ -544,8 +544,12 @@ class NativeToolSpec:
     approval_required: bool = False
     runtime: str = "builtin"
     entrypoint: str = ""
+    source_dir: str = ""
     aliases: tuple[str, ...] = ()
     setup_notes: list[str] = field(default_factory=list)
+    source: str = "builtin"
+    pack_id: str = ""
+    always_on: bool = False
 
     def to_openai_tool(self) -> dict[str, Any]:
         return {
@@ -565,6 +569,9 @@ class NativeToolSpec:
             "risk_class": self.risk_class,
             "approval_required": self.approval_required,
             "runtime": self.runtime,
+            "source": self.source,
+            "pack_id": self.pack_id,
+            "always_on": self.always_on,
             "aliases": list(self.aliases),
             "input_schema": self.input_schema,
             "setup_notes": list(self.setup_notes),
@@ -869,6 +876,283 @@ async def _generate_local_text_response(
     if not content:
         raise RuntimeError(f"{provider} returned an empty completion")
     return {"provider": provider, "model": model, "content": content}
+
+
+def _image_data_url_from_path(path: Path) -> str:
+    expanded = path.expanduser().resolve()
+    if not expanded.exists():
+        raise RuntimeError(f"Image not found: {expanded}")
+    mime_type = (mimetypes.guess_type(expanded.name)[0] or "").strip().lower()
+    if not mime_type.startswith("image/"):
+        raise RuntimeError(f"Unsupported image type for multimodal inspection: {expanded.name}")
+    encoded = base64.b64encode(expanded.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+async def inspect_local_images(
+    *,
+    prompt: str,
+    image_paths: list[str],
+    config: dict[str, Any],
+    history: list[dict[str, Any]] | None = None,
+    temperature: float = 0.1,
+    max_tokens: int = 2048,
+    timeout_seconds: float = 180,
+) -> dict[str, Any]:
+    fake = os.getenv("KESTREL_FAKE_MODEL_RESPONSE")
+    if fake:
+        return {"provider": "fake", "model": "fake", "content": fake}
+
+    clean_prompt = str(prompt or "").strip() or "Describe the attached image and answer the user directly."
+    selected_paths = [str(Path(raw).expanduser()) for raw in image_paths if str(raw).strip()][:4]
+    if not selected_paths:
+        raise RuntimeError("At least one local image is required for multimodal inspection.")
+
+    runtime = await detect_local_model_runtime(config)
+    session_messages = [{"role": "user", "content": clean_prompt}]
+    async with _local_model_session(
+        config=config,
+        runtime=runtime,
+        messages=session_messages,
+        enable_thinking=True,
+        model_role="reasoning",
+    ) as session:
+        provider = session["provider"]
+        model = session["model"]
+        base_url = str(session.get("base_url") or "").rstrip("/")
+        if provider != "lmstudio":
+            raise RuntimeError("Local multimodal image inspection currently requires LM Studio.")
+
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": (
+                    "You are Kestrel on Telegram. Inspect the attached image input directly and answer the user "
+                    "concisely and concretely. Do not claim that you cannot view images when image input is present."
+                ),
+            }
+        ]
+        for item in list(history or [])[-4:]:
+            role = str(item.get("role") or "user").strip().lower()
+            if role not in {"system", "assistant", "user"}:
+                role = "user"
+            content = item.get("content")
+            if isinstance(content, list):
+                continue
+            text = str(content or "").strip()
+            if text:
+                messages.append({"role": role, "content": text})
+
+        user_content: list[dict[str, Any]] = [{"type": "text", "text": clean_prompt}]
+        for raw_path in selected_paths:
+            data_url = await asyncio.to_thread(_image_data_url_from_path, Path(raw_path))
+            user_content.append({"type": "image_url", "image_url": {"url": data_url}})
+        payload = {
+            "model": model,
+            "messages": messages + [{"role": "user", "content": user_content}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        response = await _http_post_json(
+            f"{base_url}/v1/chat/completions",
+            payload,
+            timeout_seconds=timeout_seconds,
+        )
+        choices = response.get("choices") or []
+        message = ((choices[0] or {}).get("message") or {}) if choices else {}
+        content = (message.get("content") or message.get("reasoning_content") or "").strip()
+
+    if not content:
+        raise RuntimeError(f"{provider} returned an empty multimodal completion")
+    return {"provider": provider, "model": model, "content": content}
+
+
+def _normalize_local_image_route(
+    payload: dict[str, Any],
+    *,
+    fallback_prompt: str,
+    fallback_reply: str,
+) -> dict[str, Any]:
+    action = str(payload.get("action") or "").strip().lower()
+    if action not in {"respond", "generate_image"}:
+        action = "respond"
+
+    reply_text = str(
+        payload.get("reply_text")
+        or payload.get("response")
+        or payload.get("message")
+        or ""
+    ).strip()
+    generation_prompt = str(
+        payload.get("generation_prompt")
+        or payload.get("prompt")
+        or ""
+    ).strip()
+    negative_prompt = str(payload.get("negative_prompt") or "").strip()
+    media_type = str(payload.get("media_type") or "image").strip().lower() or "image"
+    init_image_creativity = payload.get("init_image_creativity")
+    if media_type not in {"image", "video"}:
+        media_type = "image"
+    try:
+        init_image_creativity = float(init_image_creativity)
+    except (TypeError, ValueError):
+        init_image_creativity = 0.6
+    init_image_creativity = min(max(init_image_creativity, 0.0), 1.5)
+
+    if action == "generate_image" and not generation_prompt:
+        action = "respond"
+
+    if action == "respond" and not reply_text:
+        reply_text = fallback_reply.strip()
+
+    return {
+        "action": action,
+        "reply_text": reply_text,
+        "generation_prompt": generation_prompt or fallback_prompt,
+        "negative_prompt": negative_prompt,
+        "media_type": media_type,
+        "init_image_creativity": init_image_creativity,
+    }
+
+
+async def route_local_image_request(
+    *,
+    prompt: str,
+    image_paths: list[str],
+    config: dict[str, Any],
+    history: list[dict[str, Any]] | None = None,
+    temperature: float = 0.1,
+    max_tokens: int = 1200,
+    timeout_seconds: float = 180,
+) -> dict[str, Any]:
+    fake = os.getenv("KESTREL_FAKE_MODEL_RESPONSE")
+    clean_prompt = str(prompt or "").strip() or "Describe the attached image and answer the user directly."
+    if fake:
+        parsed = _load_possible_json_object(fake) or {"action": "respond", "reply_text": fake}
+        normalized = _normalize_local_image_route(
+            parsed,
+            fallback_prompt=clean_prompt,
+            fallback_reply=fake,
+        )
+        normalized.update({"provider": "fake", "model": "fake"})
+        return normalized
+
+    selected_paths = [str(Path(raw).expanduser()) for raw in image_paths if str(raw).strip()][:4]
+    if not selected_paths:
+        raise RuntimeError("At least one local image is required for multimodal routing.")
+
+    runtime = await detect_local_model_runtime(config)
+    session_messages = [{"role": "user", "content": clean_prompt}]
+    async with _local_model_session(
+        config=config,
+        runtime=runtime,
+        messages=session_messages,
+        enable_thinking=True,
+        model_role="reasoning",
+    ) as session:
+        provider = session["provider"]
+        model = session["model"]
+        base_url = str(session.get("base_url") or "").rstrip("/")
+        if provider != "lmstudio":
+            raise RuntimeError("Local multimodal image routing currently requires LM Studio.")
+
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": (
+                    "You are Kestrel's multimodal Telegram router. Look at the user's prompt and the attached "
+                    "image input together, then decide the next action. Return exactly one JSON object with this "
+                    'schema: {"action":"respond"|"generate_image","reply_text":"","generation_prompt":"",'
+                    '"negative_prompt":"","media_type":"image"|"video","init_image_creativity":0.6}. '
+                    "Choose action='generate_image' when the user wants a new generated asset derived from the "
+                    "attached image, including transformations, stylizations, avatars, caricatures, edits, "
+                    "memes, posters, or 'turn me into' style requests. When generating, write a self-contained "
+                    "generation_prompt that includes the important visible traits from the attached image so a "
+                    "text-to-image model can recreate the subject, and set init_image_creativity to indicate how "
+                    "loosely the output should follow the source image. Lower values stay closer to the source; "
+                    "higher values allow stronger transformation. Choose action='respond' when the user wants "
+                    "description, identification, analysis, OCR-style reading, or discussion about the image, and "
+                    "put the full user-facing answer in reply_text. Prefer respond if the request is ambiguous. "
+                    "Never mention tool limitations or claim that you cannot see the image."
+                ),
+            }
+        ]
+        for item in list(history or [])[-4:]:
+            role = str(item.get("role") or "user").strip().lower()
+            if role not in {"system", "assistant", "user"}:
+                role = "user"
+            content = item.get("content")
+            if isinstance(content, list):
+                continue
+            text = str(content or "").strip()
+            if text:
+                messages.append({"role": role, "content": text})
+
+        user_content: list[dict[str, Any]] = [
+            {"type": "text", "text": clean_prompt},
+            {"type": "text", "text": "Return exactly one JSON object and nothing else."},
+        ]
+        for raw_path in selected_paths:
+            data_url = await asyncio.to_thread(_image_data_url_from_path, Path(raw_path))
+            user_content.append({"type": "image_url", "image_url": {"url": data_url}})
+        payload = {
+            "model": model,
+            "messages": messages + [{"role": "user", "content": user_content}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        response = await _http_post_json(
+            f"{base_url}/v1/chat/completions",
+            payload,
+            timeout_seconds=timeout_seconds,
+        )
+        choices = response.get("choices") or []
+        message = ((choices[0] or {}).get("message") or {}) if choices else {}
+        content = (message.get("content") or message.get("reasoning_content") or "").strip()
+
+    if not content:
+        raise RuntimeError(f"{provider} returned an empty multimodal routing completion")
+
+    try:
+        routed = _extract_json_object(content)
+    except Exception:
+        repair_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Rewrite the previous multimodal routing result as exactly one valid JSON object with keys "
+                    "action, reply_text, generation_prompt, negative_prompt, and media_type."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Original user prompt:\n{clean_prompt}\n\n"
+                    f"Previous routing result:\n{content}\n\n"
+                    "Return exactly one valid JSON object and nothing else."
+                ),
+            },
+        ]
+        repaired = await _generate_local_text_response(
+            messages=repair_messages,
+            config=config,
+            temperature=temperature,
+            max_tokens=600,
+            enable_thinking=True,
+            timeout_seconds=min(timeout_seconds, 90),
+            model_role="reasoning",
+        )
+        provider = repaired["provider"]
+        model = repaired["model"]
+        routed = _extract_json_object(repaired["content"])
+
+    normalized = _normalize_local_image_route(
+        routed,
+        fallback_prompt=clean_prompt,
+        fallback_reply=content,
+    )
+    normalized.update({"provider": provider, "model": model})
+    return normalized
 
 
 async def _request_model_json(

@@ -5,6 +5,31 @@ from . import native_agent_base as _native_agent_base
 globals().update({name: value for name, value in vars(_native_agent_base).items() if not name.startswith("__")})
 
 class NativeAgentRunnerRunMixin:
+    async def _call_plan_goal_compat(
+        self,
+        goal: str,
+        history: list[dict[str, Any]],
+        initial_tool_call: dict[str, Any] | None,
+        state: dict[str, Any],
+    ) -> tuple[dict[str, Any], str, str]:
+        import inspect
+
+        if "state" in inspect.signature(self._plan_goal).parameters:
+            return await self._plan_goal(goal, history, initial_tool_call, state)
+        return await self._plan_goal(goal, history, initial_tool_call)
+
+    async def _call_direct_response_compat(
+        self,
+        goal: str,
+        history: list[dict[str, Any]],
+        state: dict[str, Any],
+    ) -> tuple[str, str, str]:
+        import inspect
+
+        if "state" in inspect.signature(self._direct_response).parameters:
+            return await self._direct_response(goal, history, state=state)
+        return await self._direct_response(goal, history)
+
     async def run(
         self,
         *,
@@ -30,12 +55,13 @@ class NativeAgentRunnerRunMixin:
         state.setdefault("forced_action", None)
         state.setdefault("final_response_draft", "")
         state.setdefault("complete_step_after_tool", {})
+        self._ensure_skill_selection(state)
 
         provider = state.get("provider", "")
         model = state.get("model", "")
 
         if not state.get("plan"):
-            planning_payload, provider, model = await self._plan_goal(goal, history, initial_tool_call)
+            planning_payload, provider, model = await self._call_plan_goal_compat(goal, history, initial_tool_call, state)
             state["provider"] = provider
             state["model"] = model
             if planning_payload.get("mode") == "direct_response":
@@ -43,7 +69,7 @@ class NativeAgentRunnerRunMixin:
                 if not self._goal_needs_reasoning(goal, history):
                     response_text = str(planning_payload.get("response") or "").strip()
                 if not response_text:
-                    response_text, provider, model = await self._direct_response(goal, history)
+                    response_text, provider, model = await self._call_direct_response_compat(goal, history, state)
                 state["provider"] = provider
                 state["model"] = model
                 verifier_payload, provider, model = await self._verify_response(state, response_text)
@@ -114,7 +140,7 @@ class NativeAgentRunnerRunMixin:
         plan = state.get("plan") or {}
         steps = list(plan.get("steps") or [])
         if not steps:
-            response_text, provider, model = await self._direct_response(goal, history)
+            response_text, provider, model = await self._call_direct_response_compat(goal, history, state)
             self._persist_state(
                 task_id,
                 state,
@@ -523,9 +549,10 @@ class NativeAgentRunnerRunMixin:
 
         draft_response = str(state.get("final_response_draft") or "").strip()
         if not draft_response:
-            summary_response, provider, model = await self._direct_response(
+            summary_response, provider, model = await self._call_direct_response_compat(
                 f"Summarize the completed work for this goal using the provided evidence only.\n\nGoal:\n{goal}\n\nEvidence:\n{json.dumps(state.get('tool_evidence', []), indent=2)}",
                 [],
+                state,
             )
             draft_response = summary_response
 

@@ -1,0 +1,15 @@
+id: marketplace-demo-orchestrator
+name: Marketplace Demo Orchestrator
+version: 1.0.0
+description: Demo marketplace pack that depends on the helper pack.
+tags:
+  - marketplace
+  - demo
+  - orchestration
+use_cases:
+  - coordinate a small research workflow
+dependencies:
+  - marketplace-demo-helper
+components:
+  - type: prompt
+    path: SKILL.md

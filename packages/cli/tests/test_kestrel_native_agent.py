@@ -1,4 +1,8 @@
 import asyncio
+import base64
+import copy
+import json
+import shutil
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +16,7 @@ import kestrel_native as native
 from kestrel_cli import native_agent_base as native_agent_base_impl
 from kestrel_cli import native_chat_tools as native_chat_tools_impl
 from kestrel_cli import native_models as native_models_impl
+from kestrel_cli import native_tool_registry_handlers as native_tool_registry_handlers_impl
 
 
 def test_native_agent_runner_searches_todos_without_approval(tmp_path, monkeypatch):
@@ -596,6 +601,44 @@ def test_render_svg_asset_can_send_png_to_telegram(tmp_path, monkeypatch):
     assert any(artifact["path"].endswith(".png") for artifact in result.artifacts)
 
 
+def test_copy_local_file_requires_approval_and_copies_file(tmp_path):
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    registry = native.NativeToolRegistry(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        runtime_policy=native.NativeRuntimePolicy(native.DEFAULT_CONFIG),
+        workspace_root=tmp_path,
+    )
+    source_path = tmp_path / "artifacts" / "photo.jpg"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"fake-image-bytes")
+    destination_path = tmp_path / "Desktop" / "photo.jpg"
+
+    approval = registry.execute(
+        "copy_local_file",
+        {
+            "source_path": str(source_path),
+            "destination_path": str(destination_path),
+        },
+    )
+    assert approval.approval_required is True
+    assert approval.approval_operation == "file_write"
+    assert "Copy photo.jpg" in approval.approval_payload["summary"]
+
+    result = registry.execute(
+        "copy_local_file",
+        {
+            "source_path": str(source_path),
+            "destination_path": str(destination_path),
+        },
+        approved=True,
+    )
+    assert result.success is True
+    assert destination_path.exists()
+    assert destination_path.read_bytes() == b"fake-image-bytes"
+    assert result.data["destination_path"] == str(destination_path)
+
+
 def test_load_native_config_uses_fallback_yaml_parser(monkeypatch, tmp_path):
     paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
     paths.config_yml.write_text(
@@ -837,6 +880,251 @@ def test_generate_local_text_response_uses_reasoning_model_and_restores_primary(
     assert loaded_models == ["qwen3.5-9b", "ministral-3-14b-instruct-2512"]
 
 
+def test_inspect_local_images_uses_reasoning_model_with_image_payload(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+    loaded_models: list[str] = []
+    image_path = tmp_path / "photo.jpg"
+    image_path.write_bytes(b"\xff\xd8\xff\xd9")
+
+    async def fake_detect(_config):
+        return {
+            "default_provider": "lmstudio",
+            "default_model": "ministral-3-14b-instruct-2512",
+            "reasoning_provider": "lmstudio",
+            "reasoning_model": "qwen3.5-9b",
+            "reasoning_escalation": True,
+            "reasoning_auto_restore_primary": True,
+            "providers": {
+                "lmstudio": {
+                    "base_url": "http://lmstudio.local",
+                    "supports_model_swap": True,
+                    "available_models": [
+                        "ministral-3-14b-instruct-2512",
+                        "qwen3.5-9b",
+                    ],
+                }
+            },
+        }
+
+    async def fake_ensure(*, base_url, target_model, available_models=None):
+        assert base_url == "http://lmstudio.local"
+        loaded_models.append(target_model)
+        return {"previous_active_models": ["ministral-3-14b-instruct-2512"], "swapped": True}
+
+    async def fake_post(url, payload, timeout_seconds=60):
+        captured["url"] = url
+        captured["payload"] = payload
+        captured["timeout_seconds"] = timeout_seconds
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "The image shows a test scene.",
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(native_models_impl, "detect_local_model_runtime", fake_detect)
+    monkeypatch.setattr(native_models_impl, "_ensure_lmstudio_model_loaded", fake_ensure)
+    monkeypatch.setattr(native_models_impl, "_http_post_json", fake_post)
+
+    result = asyncio.run(
+        native_models_impl.inspect_local_images(
+            prompt="Describe the attached image.",
+            image_paths=[str(image_path)],
+            config=native.DEFAULT_CONFIG,
+            history=[{"role": "assistant", "content": "Previous context."}],
+            timeout_seconds=75,
+        )
+    )
+
+    assert result["model"] == "qwen3.5-9b"
+    assert result["content"] == "The image shows a test scene."
+    assert captured["url"] == "http://lmstudio.local/v1/chat/completions"
+    assert captured["timeout_seconds"] == 75
+    assert captured["payload"]["model"] == "qwen3.5-9b"
+    user_content = captured["payload"]["messages"][-1]["content"]
+    assert user_content[0] == {"type": "text", "text": "Describe the attached image."}
+    assert user_content[1]["type"] == "image_url"
+    assert user_content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert loaded_models == ["qwen3.5-9b", "ministral-3-14b-instruct-2512"]
+
+
+def test_route_local_image_request_returns_generation_prompt_for_transform_request(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+    loaded_models: list[str] = []
+    image_path = tmp_path / "photo.jpg"
+    image_path.write_bytes(b"\xff\xd8\xff\xd9")
+
+    async def fake_detect(_config):
+        return {
+            "default_provider": "lmstudio",
+            "default_model": "ministral-3-14b-instruct-2512",
+            "reasoning_provider": "lmstudio",
+            "reasoning_model": "qwen3.5-9b",
+            "reasoning_escalation": True,
+            "reasoning_auto_restore_primary": True,
+            "providers": {
+                "lmstudio": {
+                    "base_url": "http://lmstudio.local",
+                    "supports_model_swap": True,
+                    "available_models": [
+                        "ministral-3-14b-instruct-2512",
+                        "qwen3.5-9b",
+                    ],
+                }
+            },
+        }
+
+    async def fake_ensure(*, base_url, target_model, available_models=None):
+        assert base_url == "http://lmstudio.local"
+        loaded_models.append(target_model)
+        return {"previous_active_models": ["ministral-3-14b-instruct-2512"], "swapped": True}
+
+    async def fake_post(url, payload, timeout_seconds=60):
+        captured["url"] = url
+        captured["payload"] = payload
+        captured["timeout_seconds"] = timeout_seconds
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "action": "generate_image",
+                                "generation_prompt": "Caricature portrait of a man with curly dark hair, a full beard, rectangular glasses, and exaggerated wide eyes.",
+                                "negative_prompt": "blurry, low quality",
+                                "media_type": "image",
+                                "init_image_creativity": 0.72,
+                            }
+                        ),
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(native_models_impl, "detect_local_model_runtime", fake_detect)
+    monkeypatch.setattr(native_models_impl, "_ensure_lmstudio_model_loaded", fake_ensure)
+    monkeypatch.setattr(native_models_impl, "_http_post_json", fake_post)
+
+    result = asyncio.run(
+        native_models_impl.route_local_image_request(
+            prompt="Turn me into a caricature",
+            image_paths=[str(image_path)],
+            config=native.DEFAULT_CONFIG,
+            history=[{"role": "assistant", "content": "Previous context."}],
+            timeout_seconds=75,
+        )
+    )
+
+    assert result["model"] == "qwen3.5-9b"
+    assert result["action"] == "generate_image"
+    assert result["generation_prompt"].startswith("Caricature portrait")
+    assert result["negative_prompt"] == "blurry, low quality"
+    assert result["media_type"] == "image"
+    assert result["init_image_creativity"] == pytest.approx(0.72)
+    assert captured["url"] == "http://lmstudio.local/v1/chat/completions"
+    assert captured["timeout_seconds"] == 75
+    user_content = captured["payload"]["messages"][-1]["content"]
+    assert user_content[0] == {"type": "text", "text": "Turn me into a caricature"}
+    assert user_content[1] == {"type": "text", "text": "Return exactly one JSON object and nothing else."}
+    assert user_content[2]["type"] == "image_url"
+    assert user_content[2]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert loaded_models == ["qwen3.5-9b", "ministral-3-14b-instruct-2512"]
+
+
+def test_generate_image_uses_source_image_for_img2img(tmp_path, monkeypatch):
+    import httpx
+
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    registry = native.NativeToolRegistry(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        runtime_policy=native.NativeRuntimePolicy(native.DEFAULT_CONFIG),
+        workspace_root=tmp_path,
+    )
+    source_path = tmp_path / "selfie.png"
+    source_path.write_bytes(
+        base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5d8AAAAASUVORK5CYII="
+        )
+    )
+
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def __init__(self, *, status_code=200, json_data=None, text="", content=b""):
+            self.status_code = status_code
+            self._json_data = json_data or {}
+            self.text = text
+            self.content = content
+
+        def json(self):
+            return self._json_data
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError("error", request=None, response=None)
+
+    model_checks = {"count": 0}
+
+    def fake_get(url, timeout=10):
+        if url.endswith("/api/v1/models"):
+            model_checks["count"] += 1
+            loaded_instances = [{"id": "inst-1"}] if model_checks["count"] == 1 else []
+            return FakeResponse(
+                json_data={
+                    "models": [
+                        {
+                            "key": "ministral-3-14b-instruct-2512",
+                            "type": "llm",
+                            "loaded_instances": loaded_instances,
+                        }
+                    ]
+                }
+            )
+        if "/View/" in url:
+            return FakeResponse(content=b"\x89PNG\r\n\x1a\nfakepng")
+        raise AssertionError(f"unexpected GET {url}")
+
+    def fake_post(url, json=None, timeout=15):
+        if url.endswith("/api/v1/models/unload"):
+            return FakeResponse()
+        if url.endswith("/api/v1/models/load"):
+            return FakeResponse()
+        if url.endswith("/API/GetNewSession"):
+            return FakeResponse(json_data={"session_id": "sess-1"})
+        if url.endswith("/API/GenerateText2Image"):
+            captured["payload"] = dict(json or {})
+            return FakeResponse(json_data={"images": ["View/local/raw/test.png"]})
+        if url.endswith("/API/FreeBackendMemory"):
+            return FakeResponse(json_data={"count": 0})
+        raise AssertionError(f"unexpected POST {url}")
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(native_tool_registry_handlers_impl.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(registry, "_reload_lmstudio_models", lambda *_args, **_kwargs: True)
+
+    result = registry.execute(
+        "generate_image",
+        {
+            "prompt": "Turn this selfie into a caricature",
+            "negative_prompt": "blurry",
+            "media_type": "image",
+            "source_image_path": str(source_path),
+            "init_image_creativity": 0.68,
+        },
+    )
+
+    assert result.success is True
+    payload = captured["payload"]
+    assert payload["prompt"] == "Turn this selfie into a caricature"
+    assert payload["rawInput"]["initimage"].startswith("data:image/png;base64,")
+    assert payload["rawInput"]["initimagecreativity"] == pytest.approx(0.68)
+
+
 def test_generate_step_output_retries_without_thinking_after_failure(tmp_path, monkeypatch):
     paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
     runner = native.NativeAgentRunner(
@@ -901,3 +1189,211 @@ def test_generate_step_output_retries_without_thinking_after_failure(tmp_path, m
     assert calls[0]["timeout_seconds"] == 90
     assert calls[1]["timeout_seconds"] == 45
     assert "Return only valid standalone SVG markup." in calls[0]["messages"][0]["content"]
+
+
+def test_native_skill_pack_manager_imports_skill_md_and_selects_it(tmp_path):
+    source_dir = tmp_path / "release-notes-skill"
+    source_dir.mkdir(parents=True)
+    (source_dir / "SKILL.md").write_text(
+        """---
+name: Release Notes Helper
+description: Summarize changes into release notes.
+tags:
+  - release
+  - changelog
+use_cases:
+  - write release notes
+---
+
+Turn raw code changes into concise release notes with sections for fixes and improvements.
+""",
+        encoding="utf-8",
+    )
+
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    state_store = native.SQLiteStateStore(paths.sqlite_db)
+    state_store.initialize()
+    manager = native.NativeSkillPackManager(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        state_store=state_store,
+        workspace_root=tmp_path,
+    )
+
+    install_result = manager.import_pack(source_path=str(source_dir))
+    selection = manager.select_packs("Write release notes for today's fixes and improvements.")
+
+    assert install_result["action"] == "installed"
+    assert install_result["pack"]["pack_id"] == "release-notes-helper"
+    assert selection["packs"][0]["pack_id"] == "release-notes-helper"
+    assert "Release Notes Helper" in selection["prompt_block"]
+
+
+def test_native_skill_pack_tools_are_visible_only_when_selected(tmp_path):
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    pack_dir = paths.skills_dir / "echo-skill"
+    pack_dir.mkdir(parents=True)
+    (pack_dir / "skill.yaml").write_text(
+        """
+id: echo-skill
+name: Echo Skill
+version: 1.0.0
+description: Echo back provided text.
+components:
+  - type: native_tool
+    name: echo_skill_tool
+    description: Echo the provided text.
+    runtime: python
+    entrypoint: tool.py
+    input_schema:
+      type: object
+      properties:
+        text:
+          type: string
+      required:
+        - text
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (pack_dir / "tool.py").write_text(
+        "import json,sys\npayload=json.loads(sys.stdin.read() or '{}')\nprint(json.dumps({'success': True, 'message': payload.get('text','')}))\n",
+        encoding="utf-8",
+    )
+
+    state_store = native.SQLiteStateStore(paths.sqlite_db)
+    state_store.initialize()
+    manager = native.NativeSkillPackManager(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        state_store=state_store,
+        workspace_root=tmp_path,
+    )
+    state_store.upsert_skill_pack(
+        pack_id="echo-skill",
+        version="1.0.0",
+        scope="user",
+        source_path=str(pack_dir),
+        source_type="manifest",
+        enabled=True,
+        trusted=True,
+        manifest={"id": "echo-skill"},
+    )
+    registry = native.NativeToolRegistry(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        runtime_policy=native.NativeRuntimePolicy(native.DEFAULT_CONFIG),
+        workspace_root=tmp_path,
+        skill_pack_manager=manager,
+    )
+
+    default_tools = {tool.name for tool in registry.list_tools()}
+    selected_tools = {tool.name for tool in registry.list_tools(selected_pack_ids=("echo-skill",))}
+
+    assert "echo_skill_tool" not in default_tools
+    assert "echo_skill_tool" in selected_tools
+
+
+def test_native_skill_pack_marketplace_install_resolves_dependencies(tmp_path):
+    def _make_archive(pack_dir: Path, destination_dir: Path) -> Path:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        archive_base = destination_dir / pack_dir.name
+        archive_path = shutil.make_archive(
+            str(archive_base),
+            "zip",
+            root_dir=str(pack_dir.parent),
+            base_dir=pack_dir.name,
+        )
+        return Path(archive_path)
+
+    remote_root = tmp_path / "remote-marketplace"
+    dependency_dir = remote_root / "dependency-pack"
+    dependency_dir.mkdir(parents=True)
+    (dependency_dir / "skill.yaml").write_text(
+        """
+id: dependency-pack
+name: Dependency Pack
+version: 1.0.0
+description: Shared helper instructions.
+components:
+  - type: prompt
+    path: SKILL.md
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (dependency_dir / "SKILL.md").write_text("Use the dependency helper when drafting reports.\n", encoding="utf-8")
+
+    parent_dir = remote_root / "parent-pack"
+    parent_dir.mkdir(parents=True)
+    (parent_dir / "skill.yaml").write_text(
+        """
+id: parent-pack
+name: Parent Pack
+version: 1.0.0
+description: Depends on the helper pack.
+dependencies:
+  - dependency-pack
+components:
+  - type: prompt
+    path: SKILL.md
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (parent_dir / "SKILL.md").write_text("Use the parent workflow.\n", encoding="utf-8")
+
+    archive_dir = remote_root / "archives"
+    dependency_archive = _make_archive(dependency_dir, archive_dir)
+    parent_archive = _make_archive(parent_dir, archive_dir)
+    catalog_path = remote_root / "catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "name": "Local Test Marketplace",
+                "packs": [
+                    {
+                        "id": "dependency-pack",
+                        "name": "Dependency Pack",
+                        "version": "1.0.0",
+                        "description": "Shared helper instructions.",
+                        "install_url": dependency_archive.as_uri(),
+                    },
+                    {
+                        "id": "parent-pack",
+                        "name": "Parent Pack",
+                        "version": "1.0.0",
+                        "description": "Depends on the helper pack.",
+                        "dependencies": ["dependency-pack"],
+                        "install_url": parent_archive.as_uri(),
+                    },
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    state_store = native.SQLiteStateStore(paths.sqlite_db)
+    state_store.initialize()
+    config = copy.deepcopy(native.DEFAULT_CONFIG)
+    config["skills"]["marketplace_urls"] = [catalog_path.as_uri()]
+    manager = native.NativeSkillPackManager(
+        paths=paths,
+        config=config,
+        state_store=state_store,
+        workspace_root=tmp_path,
+    )
+
+    search = manager.search("helper pack", include_marketplace=True)
+    result = manager.install(pack_id="parent-pack", scope="user")
+
+    assert any(item["pack_id"] == "dependency-pack" for item in search["results"])
+    assert result["pack"]["pack_id"] == "parent-pack"
+    assert "dependency-pack" in (result.get("dependencies_installed") or [])
+    assert state_store.get_skill_pack("dependency-pack") is not None
+    selection = manager.select_packs("Use the parent workflow for this task.")
+    selected_ids = [item["pack_id"] for item in selection["packs"]]
+    assert "parent-pack" in selected_ids
+    assert "dependency-pack" in selected_ids
