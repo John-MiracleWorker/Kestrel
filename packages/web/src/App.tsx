@@ -31,6 +31,7 @@ export default function App() {
     const [currentWorkspace, setCurrentWorkspace] = useState<Workspace | null>(null);
     const [currentConversation, setCurrentConversation] = useState<Conversation | null>(null);
     const [initialMessages, setInitialMessages] = useState<Message[]>([]);
+    const [sidebarOpen, setSidebarOpen] = useState(false);
     const [showSettings, setShowSettings] = useState(false);
     const [showMoltbook, setShowMoltbook] = useState(false);
     const [showMemoryPalace, setShowMemoryPalace] = useState(false);
@@ -275,22 +276,51 @@ export default function App() {
 
     return (
         <div style={{ display: 'flex', height: '100vh', width: '100vw', overflow: 'hidden' }}>
-            <Sidebar
-                currentWorkspace={currentWorkspace}
-                currentConversation={currentConversation}
-                activeSurface={activeSurface}
-                onSelectWorkspace={handleSelectWorkspace}
-                onSelectConversation={handleSelectConversation}
-                onNewConversation={handleNewConversation}
-                onOpenOperations={handleOpenOperations}
-                onOpenSettings={() => setShowSettings(true)}
-                onOpenMoltbook={() => setShowMoltbook(true)}
-                onOpenMemoryPalace={() => setShowMemoryPalace(true)}
-                onOpenDocs={() => setShowDocs(true)}
-                onOpenScreenShare={() => setShowScreenShare(true)}
-                onOpenPRReview={() => setShowPRReview(true)}
-                onLogout={logout}
+            {/* Responsive sidebar toggle */}
+            <button
+                className="sidebar-toggle"
+                onClick={() => setSidebarOpen(!sidebarOpen)}
+                aria-label="Toggle sidebar"
+            >
+                {sidebarOpen ? '✕' : '☰'}
+            </button>
+
+            {/* Backdrop for mobile sidebar */}
+            <div
+                className={`sidebar-backdrop ${sidebarOpen ? 'sidebar-backdrop-visible' : ''}`}
+                onClick={() => setSidebarOpen(false)}
             />
+
+            <div className={`sidebar-responsive ${sidebarOpen ? 'sidebar-open' : ''}`}>
+                <Sidebar
+                    currentWorkspace={currentWorkspace}
+                    currentConversation={currentConversation}
+                    activeSurface={activeSurface}
+                    onSelectWorkspace={(ws) => {
+                        handleSelectWorkspace(ws);
+                        setSidebarOpen(false);
+                    }}
+                    onSelectConversation={(conv) => {
+                        handleSelectConversation(conv);
+                        setSidebarOpen(false);
+                    }}
+                    onNewConversation={() => {
+                        handleNewConversation();
+                        setSidebarOpen(false);
+                    }}
+                    onOpenOperations={() => {
+                        handleOpenOperations();
+                        setSidebarOpen(false);
+                    }}
+                    onOpenSettings={() => setShowSettings(true)}
+                    onOpenMoltbook={() => setShowMoltbook(true)}
+                    onOpenMemoryPalace={() => setShowMemoryPalace(true)}
+                    onOpenDocs={() => setShowDocs(true)}
+                    onOpenScreenShare={() => setShowScreenShare(true)}
+                    onOpenPRReview={() => setShowPRReview(true)}
+                    onLogout={logout}
+                />
+            </div>
 
             <div
                 style={{
@@ -337,15 +367,17 @@ export default function App() {
                 </Routes>
             </div>
 
-            <LiveCanvas
-                isVisible={showCanvas && activeSurface === 'chat'}
-                activeTask={streamingMessage ? 'PROCESSING_USER_QUERY' : 'SYSTEM_READY'}
-                isStreaming={!!streamingMessage}
-                content={streamingMessage?.content}
-                toolActivity={streamingMessage?.toolActivity}
-                agentActivities={streamingMessage?.agentActivities}
-                delegationEvents={streamingMessage?.delegationEvents}
-            />
+            <div className="live-canvas-responsive">
+                <LiveCanvas
+                    isVisible={showCanvas && activeSurface === 'chat'}
+                    activeTask={streamingMessage ? 'PROCESSING_USER_QUERY' : 'SYSTEM_READY'}
+                    isStreaming={!!streamingMessage}
+                    content={streamingMessage?.content}
+                    toolActivity={streamingMessage?.toolActivity}
+                    agentActivities={streamingMessage?.agentActivities}
+                    delegationEvents={streamingMessage?.delegationEvents}
+                />
+            </div>
 
             {showSettings && (
                 <SettingsPanel

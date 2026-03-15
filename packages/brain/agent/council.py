@@ -32,6 +32,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
+from agent.council_prompts import ROLE_PROMPTS, VOTE_PROMPT
+
 logger = logging.getLogger("brain.agent.council")
 
 
@@ -60,66 +62,6 @@ class VoteType(str, Enum):
     REJECT = "reject"
     ABSTAIN = "abstain"
     CONDITIONAL = "conditional"  # Approve with conditions
-
-
-ROLE_PROMPTS = {
-    CouncilRole.ARCHITECT: """You are the **Architect** on this council. Your focus is:
-- System design and architecture patterns
-- Scalability and maintainability
-- Component boundaries and dependencies
-- Technical debt implications
-
-Evaluate this proposal from an architectural perspective. Be specific about design concerns.""",
-
-    CouncilRole.IMPLEMENTER: """You are the **Implementer** on this council. Your focus is:
-- Practical coding feasibility
-- Edge cases and error handling
-- Testing strategy
-- Performance implications
-- Implementation effort estimate
-
-Evaluate this proposal from a practical implementation perspective.""",
-
-    CouncilRole.SECURITY: """You are the **Security Reviewer** on this council. Your focus is:
-- Authentication and authorization gaps
-- Data exposure risks
-- Input validation and sanitization
-- Dependency vulnerabilities
-- Compliance implications
-
-Evaluate this proposal for security concerns. Flag anything that could be exploited.""",
-
-    CouncilRole.DEVILS_ADVOCATE: """You are the **Devil's Advocate** on this council. Your job is to:
-- Challenge every assumption
-- Find the weakest points in the proposal
-- Suggest what could go wrong
-- Question whether simpler alternatives exist
-- Push back on complexity
-
-Be constructively critical. Your goal is to strengthen the proposal, not kill it.""",
-
-    CouncilRole.USER_ADVOCATE: """You are the **User Advocate** on this council. Your focus is:
-- User experience impact
-- Simplicity and intuitiveness
-- Breaking changes for existing users
-- Documentation needs
-- Accessibility and usability
-
-Evaluate this proposal from the end user's perspective.""",
-}
-
-VOTE_PROMPT = """Based on your review, cast your vote:
-
-Respond in JSON:
-{{
-  "vote": "approve" | "reject" | "conditional" | "abstain",
-  "confidence": 0.0 to 1.0,
-  "summary": "one-line summary of your position",
-  "concerns": ["list of specific concerns"],
-  "conditions": ["if conditional, what needs to change"],
-  "suggestions": ["specific improvements"]
-}}
-"""
 
 
 @dataclass
@@ -495,7 +437,7 @@ class CouncilSession:
             self._opinion_cache.move_to_end(cache_key)
             return self._opinion_cache[cache_key]
 
-        role_prompt = ROLE_PROMPTS.get(role, "Evaluate this proposal.")
+        role_prompt = ROLE_PROMPTS.get(role.value, "Evaluate this proposal.")
 
         full_prompt = f"""{role_prompt}
 

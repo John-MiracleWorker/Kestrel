@@ -58,6 +58,9 @@ def _classify_openai(model_id: str) -> str:
         return "power"
     if "mini" in mid or "nano" in mid:
         return "fast"
+    # GPT-OSS: OpenAI's open-source reasoning models (20B/120B)
+    if "gpt-oss" in mid:
+        return "power"
     if re.match(r"^gpt-\d", mid) or "o3" in mid:
         return "power"
     return "other"
@@ -127,6 +130,9 @@ def _classify_lmstudio(model_id: str) -> str:
         return "power"
     # DeepSeek Coder v2: capable coding model
     if "deepseek" in mid and "lite" not in mid:
+        return "power"
+    # GPT-OSS: OpenAI's open-source reasoning models (20B/120B)
+    if "gpt-oss" in mid:
         return "power"
 
     return "fast"

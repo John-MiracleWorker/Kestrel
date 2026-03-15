@@ -114,14 +114,15 @@ body {
 }
 
 @keyframes glowPulse {
-
     0%,
     100% {
         box-shadow: 0 0 8px rgba(0, 243, 255, 0.1);
     }
 
     50% {
-        box-shadow: 0 0 16px rgba(0, 243, 255, 0.25), 0 0 40px rgba(0, 243, 255, 0.08);
+        box-shadow:
+            0 0 16px rgba(0, 243, 255, 0.25),
+            0 0 40px rgba(0, 243, 255, 0.08);
     }
 }
 
@@ -140,7 +141,6 @@ body {
 }
 
 @keyframes subtleFloat {
-
     0%,
     100% {
         transform: translateY(0);
@@ -166,7 +166,6 @@ body {
 }
 
 @keyframes borderGlow {
-
     0%,
     100% {
         border-color: rgba(0, 243, 255, 0.15);
@@ -180,7 +179,9 @@ body {
 /* ── Terminal Utilities ───────────────────────────────────────────── */
 .terminal-border {
     border: 1px solid var(--border-color);
-    transition: border-color 0.3s, box-shadow 0.3s;
+    transition:
+        border-color 0.3s,
+        box-shadow 0.3s;
 }
 
 .terminal-border:hover {
@@ -189,7 +190,9 @@ body {
 
 .terminal-border:focus-within {
     border-color: var(--accent-cyan);
-    box-shadow: 0 0 12px rgba(0, 243, 255, 0.15), 0 0 4px rgba(0, 243, 255, 0.1);
+    box-shadow:
+        0 0 12px rgba(0, 243, 255, 0.15),
+        0 0 4px rgba(0, 243, 255, 0.1);
 }
 
 .terminal-text {
@@ -223,12 +226,17 @@ body {
     -webkit-backdrop-filter: blur(8px);
     border: 1px solid rgba(255, 255, 255, 0.04);
     border-radius: var(--radius-md);
-    transition: border-color 0.3s, box-shadow 0.3s, transform 0.2s;
+    transition:
+        border-color 0.3s,
+        box-shadow 0.3s,
+        transform 0.2s;
 }
 
 .glass-card:hover {
     border-color: rgba(0, 243, 255, 0.12);
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3), 0 0 20px rgba(0, 243, 255, 0.04);
+    box-shadow:
+        0 4px 20px rgba(0, 0, 0, 0.3),
+        0 0 20px rgba(0, 243, 255, 0.04);
     transform: translateY(-1px);
 }
 
@@ -346,7 +354,6 @@ body {
 }
 
 @keyframes pulse {
-
     0%,
     80%,
     100% {
@@ -440,6 +447,85 @@ body {
     display: flex;
     flex-direction: column;
     min-width: 0;
+}
+
+/* ── Responsive: Sidebar toggle button ────────────────────────────── */
+.sidebar-toggle {
+    display: none;
+    position: fixed;
+    top: 12px;
+    left: 12px;
+    z-index: 100;
+    width: 36px;
+    height: 36px;
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    color: var(--accent-cyan);
+    font-size: 1.1rem;
+    cursor: pointer;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.3s;
+    backdrop-filter: blur(8px);
+}
+
+.sidebar-toggle:hover {
+    border-color: var(--accent-cyan);
+    box-shadow: 0 0 12px rgba(0, 243, 255, 0.2);
+}
+
+/* ── Responsive: Sidebar overlay backdrop ─────────────────────────── */
+.sidebar-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 89;
+    background: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(4px);
+}
+
+/* ── Responsive: Compact screens (≤960px) ─────────────────────────── */
+@media (max-width: 960px) {
+    .sidebar-toggle {
+        display: flex;
+    }
+
+    .sidebar-responsive {
+        position: fixed;
+        top: 0;
+        left: 0;
+        z-index: 90;
+        height: 100vh;
+        transform: translateX(-100%);
+        transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        box-shadow: 4px 0 24px rgba(0, 0, 0, 0.5);
+    }
+
+    .sidebar-responsive.sidebar-open {
+        transform: translateX(0);
+    }
+
+    .sidebar-backdrop.sidebar-backdrop-visible {
+        display: block;
+    }
+
+    .live-canvas-responsive {
+        display: none !important;
+    }
+}
+
+/* ── Responsive: Narrow screens (≤600px) ──────────────────────────── */
+@media (max-width: 600px) {
+    .auth-card {
+        max-width: 100%;
+        padding: var(--space-4);
+        margin: 0 var(--space-2);
+    }
+
+    .sidebar-responsive {
+        width: 100vw !important;
+    }
 }
 
 /* ── Auth pages ───────────────────────────────────────────────────── */

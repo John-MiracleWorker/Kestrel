@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
 import { workspaces, conversations, type Workspace, type Conversation } from '../../api/client';
 import { ProcessesPanel } from './ProcessesPanel';
+import { SidebarDeleteDialog } from './SidebarDeleteDialog';
+import { SidebarFooter } from './SidebarFooter';
 
 interface SidebarProps {
     currentWorkspace: Workspace | null;
@@ -525,280 +527,25 @@ export function Sidebar({
                     ))}
                 </div>
 
-                {/* Footer status bar style */}
-                <div
-                    style={{
-                        padding: '10px 12px',
-                        borderTop: '1px solid var(--border-color)',
-                        background:
-                            'linear-gradient(180deg, var(--bg-panel), rgba(0, 243, 255, 0.02))',
-                        fontSize: '0.72rem',
-                        display: 'flex',
-                        justifyContent: 'space-between',
-                        alignItems: 'center',
-                        color: 'var(--text-dim)',
-                        gap: '4px',
-                    }}
-                >
-                    <button
-                        onClick={onOpenSettings}
-                        style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '6px',
-                            cursor: 'pointer',
-                            padding: '6px 10px',
-                            borderRadius: 'var(--radius-sm)',
-                            transition: 'all 0.2s',
-                            fontSize: '0.72rem',
-                        }}
-                        onMouseEnter={(e) => {
-                            e.currentTarget.style.background = 'rgba(0, 255, 157, 0.08)';
-                            e.currentTarget.style.color = 'var(--accent-green)';
-                        }}
-                        onMouseLeave={(e) => {
-                            e.currentTarget.style.background = 'transparent';
-                            e.currentTarget.style.color = '';
-                        }}
-                    >
-                        <span style={{ color: 'var(--accent-green)', fontSize: '0.5rem' }}>●</span>{' '}
-                        CONFIG
-                    </button>
-                    <div style={{ display: 'flex', gap: '2px' }}>
-                        <button
-                            onClick={() => setShowProcesses(true)}
-                            title="Background Processes"
-                            style={{
-                                cursor: 'pointer',
-                                fontSize: '1rem',
-                                background: 'transparent',
-                                border: 'none',
-                                padding: '4px 8px',
-                                borderRadius: 'var(--radius-sm)',
-                                transition: 'all 0.2s',
-                            }}
-                            onMouseEnter={(e) => {
-                                e.currentTarget.style.background = 'rgba(0, 243, 255, 0.1)';
-                                e.currentTarget.style.boxShadow = '0 0 10px rgba(0, 243, 255, 0.1)';
-                            }}
-                            onMouseLeave={(e) => {
-                                e.currentTarget.style.background = 'transparent';
-                                e.currentTarget.style.boxShadow = 'none';
-                            }}
-                        >
-                            ⚙
-                        </button>
-                        <button
-                            onClick={onOpenMoltbook}
-                            title="Moltbook Activity"
-                            style={{
-                                cursor: 'pointer',
-                                fontSize: '1rem',
-                                background: 'transparent',
-                                border: 'none',
-                                padding: '4px 8px',
-                                borderRadius: 'var(--radius-sm)',
-                                transition: 'all 0.2s',
-                            }}
-                            onMouseEnter={(e) => {
-                                e.currentTarget.style.background = 'rgba(189, 0, 255, 0.1)';
-                                e.currentTarget.style.boxShadow = '0 0 10px rgba(189, 0, 255, 0.1)';
-                            }}
-                            onMouseLeave={(e) => {
-                                e.currentTarget.style.background = 'transparent';
-                                e.currentTarget.style.boxShadow = 'none';
-                            }}
-                        >
-                            🦞
-                        </button>
-                        <button
-                            onClick={onOpenMemoryPalace}
-                            title="Memory Palace"
-                            style={{
-                                cursor: 'pointer',
-                                fontSize: '1rem',
-                                background: 'transparent',
-                                border: 'none',
-                                padding: '4px 8px',
-                                borderRadius: 'var(--radius-sm)',
-                                transition: 'all 0.2s',
-                            }}
-                            onMouseEnter={(e) => {
-                                e.currentTarget.style.background = 'rgba(168, 85, 247, 0.1)';
-                                e.currentTarget.style.boxShadow =
-                                    '0 0 10px rgba(168, 85, 247, 0.1)';
-                            }}
-                            onMouseLeave={(e) => {
-                                e.currentTarget.style.background = 'transparent';
-                                e.currentTarget.style.boxShadow = 'none';
-                            }}
-                        >
-                            🧠
-                        </button>
-                        <button
-                            onClick={onOpenDocs}
-                            title="Auto-Documentation"
-                            style={{
-                                cursor: 'pointer',
-                                fontSize: '1rem',
-                                background: 'transparent',
-                                border: 'none',
-                                padding: '4px 8px',
-                                borderRadius: 'var(--radius-sm)',
-                                transition: 'all 0.2s',
-                            }}
-                            onMouseEnter={(e) => {
-                                e.currentTarget.style.background = 'rgba(16, 185, 129, 0.1)';
-                                e.currentTarget.style.boxShadow =
-                                    '0 0 10px rgba(16, 185, 129, 0.1)';
-                            }}
-                            onMouseLeave={(e) => {
-                                e.currentTarget.style.background = 'transparent';
-                                e.currentTarget.style.boxShadow = 'none';
-                            }}
-                        >
-                            📖
-                        </button>
-                        <button
-                            onClick={onOpenScreenShare}
-                            title="Live Screen-Share Agent"
-                            style={{
-                                cursor: 'pointer',
-                                fontSize: '1rem',
-                                background: 'transparent',
-                                border: 'none',
-                                padding: '4px 8px',
-                                borderRadius: 'var(--radius-sm)',
-                                transition: 'all 0.2s',
-                            }}
-                            onMouseEnter={(e) => {
-                                e.currentTarget.style.background = 'rgba(245, 158, 11, 0.1)';
-                                e.currentTarget.style.boxShadow =
-                                    '0 0 10px rgba(245, 158, 11, 0.1)';
-                            }}
-                            onMouseLeave={(e) => {
-                                e.currentTarget.style.background = 'transparent';
-                                e.currentTarget.style.boxShadow = 'none';
-                            }}
-                        >
-                            📺
-                        </button>
-                        <button
-                            onClick={onOpenPRReview}
-                            title="PR Reviews"
-                            style={{
-                                cursor: 'pointer',
-                                fontSize: '1rem',
-                                background: 'transparent',
-                                border: 'none',
-                                padding: '4px 8px',
-                                borderRadius: 'var(--radius-sm)',
-                                transition: 'all 0.2s',
-                            }}
-                            onMouseEnter={(e) => {
-                                e.currentTarget.style.background = 'rgba(59, 130, 246, 0.1)';
-                                e.currentTarget.style.boxShadow =
-                                    '0 0 10px rgba(59, 130, 246, 0.1)';
-                            }}
-                            onMouseLeave={(e) => {
-                                e.currentTarget.style.background = 'transparent';
-                                e.currentTarget.style.boxShadow = 'none';
-                            }}
-                        >
-                            🔍
-                        </button>
-                    </div>
-                    <button
-                        onClick={onLogout}
-                        style={{
-                            cursor: 'pointer',
-                            fontSize: '0.65rem',
-                            padding: '4px 8px',
-                            borderRadius: 'var(--radius-sm)',
-                            transition: 'all 0.2s',
-                            color: 'var(--text-dim)',
-                            letterSpacing: '0.05em',
-                        }}
-                        onMouseEnter={(e) => {
-                            e.currentTarget.style.color = 'var(--accent-error)';
-                            e.currentTarget.style.background = 'rgba(255, 0, 85, 0.06)';
-                        }}
-                        onMouseLeave={(e) => {
-                            e.currentTarget.style.color = 'var(--text-dim)';
-                            e.currentTarget.style.background = 'transparent';
-                        }}
-                    >
-                        EXIT
-                    </button>
-                </div>
+                <SidebarFooter
+                    onOpenSettings={onOpenSettings}
+                    onShowProcesses={() => setShowProcesses(true)}
+                    onOpenMoltbook={onOpenMoltbook}
+                    onOpenMemoryPalace={onOpenMemoryPalace}
+                    onOpenDocs={onOpenDocs}
+                    onOpenScreenShare={onOpenScreenShare}
+                    onOpenPRReview={onOpenPRReview}
+                    onLogout={onLogout}
+                />
             </aside>
 
-            {/* Delete Confirmation Modal */}
             {deleteConfirmationId && (
-                <div
-                    style={{
-                        position: 'fixed',
-                        inset: 0,
-                        zIndex: 50,
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        background: 'rgba(0, 0, 0, 0.7)',
-                        backdropFilter: 'blur(12px)',
-                    }}
-                    onClick={() => setDeleteConfirmationId(null)}
-                >
-                    <div
-                        className="card animate-fade-in"
-                        style={{
-                            maxWidth: 400,
-                            width: '100%',
-                            margin: '0 var(--space-4)',
-                            padding: 'var(--space-6)',
-                        }}
-                        onClick={(e) => e.stopPropagation()}
-                    >
-                        <h3
-                            style={{
-                                fontSize: '1.0625rem',
-                                fontWeight: 700,
-                                marginBottom: 'var(--space-2)',
-                            }}
-                        >
-                            Delete Conversation
-                        </h3>
-                        <p
-                            style={{
-                                color: 'var(--color-text-secondary)',
-                                marginBottom: 'var(--space-6)',
-                                fontSize: '0.875rem',
-                            }}
-                        >
-                            Are you sure you want to delete this conversation? This action cannot be
-                            undone.
-                        </p>
-                        <div
-                            style={{
-                                display: 'flex',
-                                justifyContent: 'flex-end',
-                                gap: 'var(--space-3)',
-                            }}
-                        >
-                            <button
-                                className="btn btn-ghost"
-                                onClick={() => setDeleteConfirmationId(null)}
-                            >
-                                Cancel
-                            </button>
-                            <button className="btn btn-danger" onClick={confirmDelete}>
-                                Delete
-                            </button>
-                        </div>
-                    </div>
-                </div>
+                <SidebarDeleteDialog
+                    onCancel={() => setDeleteConfirmationId(null)}
+                    onConfirm={confirmDelete}
+                />
             )}
 
-            {/* Processes Panel */}
             {showProcesses && currentWorkspace && (
                 <ProcessesPanel
                     workspaceId={currentWorkspace.id}
