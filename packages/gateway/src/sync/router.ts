@@ -5,7 +5,7 @@ import { logger } from '../utils/logger';
 
 // ── Notification Preference ────────────────────────────────────────
 
-export type NotifyStrategy = 'same_channel' | 'all_channels' | 'prefer_web';
+export type NotifyStrategy = 'same_channel' | 'all_channels' | 'prefer_web' | 'prefer_telegram';
 
 export interface UserNotificationPrefs {
     strategy: NotifyStrategy;
@@ -37,8 +37,8 @@ export class MessageRouter {
 
         const raw = await this.redis.get(`kestrel:notify:${userId}`);
         const defaults: UserNotificationPrefs = {
-            strategy: 'same_channel',
-            enabledChannels: ['web', 'telegram', 'whatsapp', 'discord'],
+            strategy: 'prefer_telegram',
+            enabledChannels: ['telegram', 'web', 'whatsapp', 'discord'],
         };
 
         const prefs = raw ? { ...defaults, ...JSON.parse(raw) } : defaults;
@@ -103,6 +103,19 @@ export class MessageRouter {
                     await this.registry.sendToChannel('web', userId, message);
                     // Also send on origin if it's not web
                     if (originChannel !== 'web') {
+                        await this.registry.sendToChannel(originChannel, userId, message);
+                    }
+                } else {
+                    await this.registry.sendToChannel(originChannel, userId, message);
+                }
+                break;
+
+            case 'prefer_telegram':
+                // Send on Telegram if connected, otherwise use origin channel
+                const telegramAdapter = this.registry.getAdapter('telegram');
+                if (telegramAdapter?.status === 'connected') {
+                    await this.registry.sendToChannel('telegram', userId, message);
+                    if (originChannel !== 'telegram') {
                         await this.registry.sendToChannel(originChannel, userId, message);
                     }
                 } else {

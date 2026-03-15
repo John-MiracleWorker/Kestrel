@@ -524,6 +524,49 @@ def test_take_screenshot_failure_reports_real_error(monkeypatch):
     assert "simulated" not in lowered
 
 
+def test_native_agent_runner_uses_svg_render_heuristic_for_svg_to_png_goals(tmp_path, monkeypatch):
+    paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
+    state_store = native.SQLiteStateStore(paths.sqlite_db)
+    state_store.initialize()
+    runner = native.NativeAgentRunner(
+        paths=paths,
+        config=native.DEFAULT_CONFIG,
+        runtime_policy=native.NativeRuntimePolicy(native.DEFAULT_CONFIG),
+        state_store=state_store,
+        workspace_root=tmp_path,
+    )
+
+    async def next_action(self, state, step):
+        if step["id"] == "step_1":
+            return {
+                "action": "store_result",
+                "summary": "Generated SVG markup.",
+                "result": "<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'><path d='M8 24 L8 10 L12 4 L16 10 L16 24 Z'/></svg>",
+            }, "fake", "model"
+        raise AssertionError("step_2 should use the deterministic render_svg_asset fast path")
+
+    async def verify(self, state, draft_response):
+        return {"ok": True, "final_response": draft_response, "reason": "grounded"}, "fake", "model"
+
+    def fake_render(_self, _svg_path: Path, png_path: Path) -> None:
+        png_path.write_bytes(b"fake-png")
+
+    monkeypatch.setattr(native.NativeAgentRunner, "_next_action", next_action)
+    monkeypatch.setattr(native.NativeAgentRunner, "_verify_response", verify)
+    monkeypatch.setattr(native.NativeToolRegistry, "_render_svg_to_png", fake_render)
+
+    goal = "Create an SVG of a hand then render it as a png and send it to me in telegram"
+    outcome = asyncio.run(runner.run(goal=goal))
+
+    assert outcome.status == "completed"
+    assert outcome.plan is not None
+    assert outcome.plan["summary"] == "Generate SVG markup and render it to a PNG artifact."
+    artifact_paths = [artifact["path"] for artifact in outcome.artifacts]
+    assert any(path.endswith(".svg") for path in artifact_paths)
+    assert any(path.endswith(".png") for path in artifact_paths)
+    assert "Done" in outcome.message or "Rendered" in outcome.message
+
+
 def test_load_native_config_uses_fallback_yaml_parser(monkeypatch, tmp_path):
     paths = native.ensure_home_layout(str(tmp_path / ".kestrel"))
     paths.config_yml.write_text(

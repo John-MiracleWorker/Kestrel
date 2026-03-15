@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.metadata
 import json
 import logging
 import mimetypes
@@ -83,6 +84,13 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _daemon_version() -> str:
+    try:
+        return importlib.metadata.version("kestrel-cli")
+    except importlib.metadata.PackageNotFoundError:
+        return "dev"
+
+
 class KestrelDaemonCore:
     def __init__(self) -> None:
         self.paths = ensure_home_layout()
@@ -113,6 +121,31 @@ class KestrelDaemonCore:
 
     def _enabled_chat_tool_categories(self) -> tuple[str, ...]:
         return resolve_chat_tool_categories(self.config)
+
+    def _communication_preferences(self) -> dict[str, Any]:
+        communication = self.config.get("communication") or {}
+        if not isinstance(communication, dict):
+            communication = {}
+        telegram = communication.get("telegram") or {}
+        if not isinstance(telegram, dict):
+            telegram = {}
+        mirror_channels = communication.get("mirror_channels")
+        if not isinstance(mirror_channels, list):
+            mirror_channels = ["web"]
+        return {
+            "primary_channel": str(communication.get("primary_channel") or "telegram").strip().lower(),
+            "mirror_channels": [
+                str(item).strip().lower()
+                for item in mirror_channels
+                if str(item).strip()
+            ],
+            "telegram_native_primary": bool(telegram.get("native_primary", True)),
+            "telegram_mobile_concise": bool(telegram.get("mobile_concise", True)),
+        }
+
+    def _telegram_is_primary_channel(self) -> bool:
+        prefs = self._communication_preferences()
+        return prefs["primary_channel"] == "telegram" and prefs["telegram_native_primary"]
 
     def _build_agent_runner(self, *, task_id: str = "") -> NativeAgentRunner:
         event_callback = None
@@ -180,7 +213,16 @@ class KestrelDaemonCore:
         self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self.watch_task = asyncio.create_task(self._watch_loop())
         await self._configure_telegram_transport()
-        LOGGER.info("Kestrel daemon started on %s", self._control_endpoint())
+        prefs = self._communication_preferences()
+        LOGGER.info(
+            "Kestrel daemon started on %s (version=%s, primary_channel=%s, mirror_channels=%s, telegram_owner=%s, code=%s)",
+            self._control_endpoint(),
+            _daemon_version(),
+            prefs["primary_channel"],
+            ",".join(prefs["mirror_channels"]) or "none",
+            "native_daemon" if prefs["telegram_native_primary"] else "gateway",
+            Path(__file__).resolve(),
+        )
 
     async def _shutdown(self) -> None:
         for task in (self.heartbeat_task, self.watch_task, self.telegram_poll_task):
@@ -228,6 +270,8 @@ class KestrelDaemonCore:
                 memory_changed = any(path.endswith(".md") for path in changed_paths)
                 if memory_changed:
                     self.last_memory_sync = sync_markdown_memory(self.paths, self.vector_store)
+                if str(self._channel_state_path()) in changed_paths:
+                    await self._configure_telegram_transport()
                 LOGGER.info("Watched files changed: %s", changed_paths)
                 self._write_state(status="running", changed_paths=changed_paths)
             try:

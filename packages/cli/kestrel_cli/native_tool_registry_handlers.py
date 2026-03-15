@@ -368,6 +368,70 @@ class NativeToolRegistryHandlersMixin:
             },
         )
 
+    def _reload_lmstudio_models(self, lmstudio_url: str, model_ids: list[str]) -> bool:
+        import httpx as _httpx
+
+        if not model_ids:
+            return True
+        for model_id in model_ids:
+            try:
+                _httpx.post(f"{lmstudio_url}/api/v1/models/load", json={"model": model_id}, timeout=300)
+            except Exception:
+                pass
+        for _wait in range(30):
+            time.sleep(5)
+            try:
+                test_resp = _httpx.post(
+                    f"{lmstudio_url}/v1/chat/completions",
+                    json={
+                        "model": model_ids[0],
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 1,
+                    },
+                    timeout=30,
+                )
+                if test_resp.status_code == 200:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _slugify_media_name(self, value: str, default: str = "generated") -> str:
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+        if not slug:
+            return default
+        return slug[:48]
+
+    def _render_svg_to_png(self, svg_path: Path, png_path: Path) -> None:
+        png_path.parent.mkdir(parents=True, exist_ok=True)
+        sips_result = subprocess.run(
+            ["sips", "-s", "format", "png", str(svg_path), "--out", str(png_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if sips_result.returncode == 0 and png_path.exists():
+            return
+
+        qlmanage_result = subprocess.run(
+            ["qlmanage", "-t", "-s", "2048", "-o", str(png_path.parent), str(svg_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        quicklook_candidates = (
+            png_path.parent / f"{svg_path.stem}.png",
+            png_path.parent / f"{svg_path.name}.png",
+        )
+        for candidate in quicklook_candidates:
+            if candidate.exists():
+                if candidate != png_path:
+                    png_path.write_bytes(candidate.read_bytes())
+                    candidate.unlink()
+                return
+        stderr = (sips_result.stderr or qlmanage_result.stderr or "").strip()
+        raise RuntimeError(stderr or "SVG rendering failed with both sips and qlmanage.")
+
     def _handle_generate_image(self, context: NativeToolContext, arguments: dict[str, Any]) -> NativeExecutionResult:
         import httpx as _httpx
 
@@ -376,6 +440,7 @@ class NativeToolRegistryHandlersMixin:
         width = int(arguments.get("width", 1024) or 1024)
         height = int(arguments.get("height", 1024) or 1024)
         media_type = str(arguments.get("media_type", "image") or "image")
+        send_to_telegram = bool(arguments.get("send_to_telegram", False))
 
         swarm_ip = os.getenv("SWARM_HOST_IP", "192.168.1.19")
         swarm_port = os.getenv("SWARM_PORT", "7801")
@@ -391,28 +456,41 @@ class NativeToolRegistryHandlersMixin:
 
         try:
             models_resp = _httpx.get(f"{lmstudio_url}/api/v1/models", timeout=10)
+            models_resp.raise_for_status()
             models_data = models_resp.json().get("models", [])
-            model_ids = [m.get("key", "") for m in models_data if m.get("key")]
-            instance_ids = [
-                inst.get("id", "")
-                for model_info in models_data
-                for inst in model_info.get("loaded_instances", [])
-                if inst.get("id")
-            ]
-            for instance_id in instance_ids:
-                _httpx.post(
+        except Exception as exc:
+            return NativeExecutionResult(
+                tool_name="generate_image",
+                success=False,
+                message=f"Could not inspect LM Studio before media generation: {exc}",
+            )
+
+        model_ids = [m.get("key", "") for m in models_data if m.get("key")]
+        instance_ids = [
+            inst.get("id", "")
+            for model_info in models_data
+            for inst in model_info.get("loaded_instances", [])
+            if inst.get("id")
+        ]
+        unload_errors: list[str] = []
+        for instance_id in instance_ids:
+            try:
+                unload_resp = _httpx.post(
                     f"{lmstudio_url}/api/v1/models/unload",
                     json={"instance_id": instance_id},
                     timeout=15,
                 )
-        except Exception as exc:
-            return NativeExecutionResult(tool_name="generate_image", success=False, message=f"Failed to unload LLM from VRAM: {exc}")
+                if unload_resp.status_code >= 400:
+                    unload_errors.append(f"{instance_id}: {unload_resp.status_code} {unload_resp.text[:160]}")
+            except Exception as exc:
+                unload_errors.append(f"{instance_id}: {exc}")
 
         vram_clear = False
         for _retry in range(10):
             time.sleep(4)
             try:
                 check = _httpx.get(f"{lmstudio_url}/api/v1/models", timeout=10)
+                check.raise_for_status()
                 all_models = check.json().get("models", [])
                 loaded_count = sum(
                     len(model_info.get("loaded_instances", []))
@@ -425,12 +503,21 @@ class NativeToolRegistryHandlersMixin:
             except Exception:
                 pass
         if not vram_clear:
-            for model_id in model_ids:
-                try:
-                    _httpx.post(f"{lmstudio_url}/api/v1/models/load", json={"model": model_id}, timeout=30)
-                except Exception:
-                    pass
-            return NativeExecutionResult(tool_name="generate_image", success=False, message="VRAM did not clear after unloading LLM. Aborting to prevent OOM crash.")
+            reload_ok = self._reload_lmstudio_models(lmstudio_url, model_ids)
+            detail = unload_errors[0] if unload_errors else "LM Studio kept one or more LLM instances loaded."
+            return NativeExecutionResult(
+                tool_name="generate_image",
+                success=False,
+                message=(
+                    "Could not free LM Studio VRAM safely for media generation. "
+                    f"{detail} LLM {'reloaded' if reload_ok else 'reload failed'}."
+                ),
+                metadata={
+                    "reason": "vram_not_cleared",
+                    "unload_errors": unload_errors,
+                    "reload_ok": reload_ok,
+                },
+            )
 
         time.sleep(3)
 
@@ -442,12 +529,13 @@ class NativeToolRegistryHandlersMixin:
             if not session_id:
                 raise RuntimeError("SwarmUI returned no session_id")
         except Exception as exc:
-            for model_id in model_ids:
-                try:
-                    _httpx.post(f"{lmstudio_url}/api/v1/models/load", json={"model": model_id}, timeout=30)
-                except Exception:
-                    pass
-            return NativeExecutionResult(tool_name="generate_image", success=False, message=f"Error connecting to SwarmUI: {exc}")
+            reload_ok = self._reload_lmstudio_models(lmstudio_url, model_ids)
+            return NativeExecutionResult(
+                tool_name="generate_image",
+                success=False,
+                message=f"Could not start the SwarmUI media session: {exc}. LLM {'reloaded' if reload_ok else 'reload failed'}.",
+                metadata={"reason": "swarm_session_failed", "reload_ok": reload_ok},
+            )
 
         is_video = media_type == "video"
         payload: dict[str, Any] = {
@@ -481,12 +569,13 @@ class NativeToolRegistryHandlersMixin:
                 timeout=1800 if is_video else 300,
             )
         except Exception as exc:
-            for model_id in model_ids:
-                try:
-                    _httpx.post(f"{lmstudio_url}/api/v1/models/load", json={"model": model_id}, timeout=30)
-                except Exception:
-                    pass
-            return NativeExecutionResult(tool_name="generate_image", success=False, message=f"SwarmUI generation failed: {exc}")
+            reload_ok = self._reload_lmstudio_models(lmstudio_url, model_ids)
+            return NativeExecutionResult(
+                tool_name="generate_image",
+                success=False,
+                message=f"SwarmUI media generation failed: {exc}. LLM {'reloaded' if reload_ok else 'reload failed'}.",
+                metadata={"reason": "generation_request_failed", "reload_ok": reload_ok},
+            )
 
         generation_error = None
         data = {}
@@ -538,52 +627,32 @@ class NativeToolRegistryHandlersMixin:
         except Exception:
             time.sleep(8)
 
-        reload_ok = False
-        for model_id in model_ids:
-            try:
-                _httpx.post(f"{lmstudio_url}/api/v1/models/load", json={"model": model_id}, timeout=300)
-            except Exception:
-                pass
-        for _wait in range(30):
-            time.sleep(5)
-            try:
-                test_resp = _httpx.post(
-                    f"{lmstudio_url}/v1/chat/completions",
-                    json={
-                        "model": model_ids[0] if model_ids else "auto",
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "max_tokens": 1,
-                    },
-                    timeout=30,
-                )
-                if test_resp.status_code == 200:
-                    reload_ok = True
-                    break
-            except Exception:
-                pass
-
+        reload_ok = self._reload_lmstudio_models(lmstudio_url, model_ids)
         if generation_error:
             return NativeExecutionResult(
                 tool_name="generate_image",
                 success=False,
-                message=f"{generation_error}. LLM {'reloaded' if reload_ok else 'reload FAILED'}.",
+                message=f"{generation_error}. LLM {'reloaded' if reload_ok else 'reload failed'}.",
                 artifacts=[self._format_artifact(path, "media") for path in saved_paths],
                 data={"saved_paths": [str(path) for path in saved_paths]},
+                metadata={"reason": "generation_failed", "reload_ok": reload_ok},
             )
         if not saved_paths:
             return NativeExecutionResult(
                 tool_name="generate_image",
                 success=False,
-                message=f"Failed to download generated media. LLM {'reloaded' if reload_ok else 'reload FAILED'}.",
+                message=f"Generated media could not be downloaded. LLM {'reloaded' if reload_ok else 'reload failed'}.",
+                metadata={"reason": "download_failed", "reload_ok": reload_ok},
             )
 
         sent_to_telegram = False
-        tg_token, tg_chat = _resolve_telegram_delivery_targets()
-        if tg_token and tg_chat:
-            for file_path in saved_paths:
-                sent, _delivery = _send_file_to_telegram(file_path, caption=prompt_text[:1024])
-                if sent:
-                    sent_to_telegram = True
+        if send_to_telegram:
+            tg_token, tg_chat = _resolve_telegram_delivery_targets()
+            if tg_token and tg_chat:
+                for file_path in saved_paths:
+                    sent, _delivery = _send_file_to_telegram(file_path, caption=prompt_text[:1024])
+                    if sent:
+                        sent_to_telegram = True
 
         saved_path_strings = [str(path) for path in saved_paths]
         note = "" if reload_ok else " WARNING: LLM reload failed."
@@ -598,6 +667,67 @@ class NativeToolRegistryHandlersMixin:
             ),
             data={"saved_paths": saved_path_strings, "sent_to_telegram": sent_to_telegram},
             artifacts=[self._format_artifact(path, "media") for path in saved_paths],
+            metadata={"reload_ok": reload_ok},
+        )
+
+    def _handle_render_svg_asset(self, context: NativeToolContext, arguments: dict[str, Any]) -> NativeExecutionResult:
+        svg_content = str(arguments.get("svg_content") or "").strip()
+        if not svg_content:
+            return NativeExecutionResult(
+                tool_name="render_svg_asset",
+                success=False,
+                message="svg_content is required",
+            )
+        if "<svg" not in svg_content.lower():
+            return NativeExecutionResult(
+                tool_name="render_svg_asset",
+                success=False,
+                message="svg_content must contain SVG markup.",
+            )
+
+        prompt = str(arguments.get("prompt") or "").strip()
+        base_name = self._slugify_media_name(arguments.get("base_name") or prompt or "generated-svg", "generated-svg")
+        send_to_telegram = bool(arguments.get("send_to_telegram", False))
+        caption = str(arguments.get("caption") or prompt or "Kestrel SVG render").strip()
+
+        output_dir = context.paths.artifacts_dir / "media"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"{base_name}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        svg_path = output_dir / f"{stem}.svg"
+        png_path = output_dir / f"{stem}.png"
+
+        try:
+            svg_path.write_text(svg_content, encoding="utf-8")
+            self._render_svg_to_png(svg_path, png_path)
+        except Exception as exc:
+            return NativeExecutionResult(
+                tool_name="render_svg_asset",
+                success=False,
+                message=f"SVG render failed: {exc}",
+                artifacts=[self._format_artifact(svg_path, "svg")] if svg_path.exists() else [],
+            )
+
+        sent_to_telegram = False
+        delivery_note = ""
+        if send_to_telegram:
+            sent_to_telegram, delivery_note = _send_file_to_telegram(png_path, caption=caption[:1024])
+
+        message = f"Rendered the SVG to PNG.\n{svg_path}\n{png_path}"
+        if send_to_telegram:
+            message = f"{message}\n{delivery_note}"
+        return NativeExecutionResult(
+            tool_name="render_svg_asset",
+            success=True,
+            message=message,
+            data={
+                "svg_path": str(svg_path),
+                "png_path": str(png_path),
+                "sent_to_telegram": sent_to_telegram,
+            },
+            artifacts=[
+                self._format_artifact(svg_path, "svg"),
+                self._format_artifact(png_path, "image"),
+            ],
         )
 
     def _handle_take_screenshot(self, context: NativeToolContext, arguments: dict[str, Any]) -> NativeExecutionResult:
@@ -626,4 +756,3 @@ class NativeToolRegistryHandlersMixin:
             data={"path": str(file_path), "sent_to_telegram": send_to_telegram},
             artifacts=[self._format_artifact(file_path, "image")],
         )
-

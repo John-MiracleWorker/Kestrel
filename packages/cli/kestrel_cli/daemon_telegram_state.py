@@ -86,6 +86,7 @@ class KestrelDaemonTelegramStateMixin:
         telegram = dict(payload.get("telegram") or {})
         config = dict(telegram.get("config") or {})
         state = dict(telegram.get("state") or {})
+        communication = self._communication_preferences()
 
         env_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         env_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -116,6 +117,7 @@ class KestrelDaemonTelegramStateMixin:
             "mode": str(config.get("mode") or "polling").strip().lower(),
             "workspace_id": str(config.get("workspaceId") or "default"),
             "allowed_chat_ids": allowed_chat_ids,
+            "communication": communication,
         }
 
     def _sync_telegram_channel_state_from_environment(self) -> None:
@@ -152,6 +154,9 @@ class KestrelDaemonTelegramStateMixin:
                     "running": bool(self.telegram_poll_task and not self.telegram_poll_task.done()),
                     "workspace_id": config.get("workspaceId") or "",
                     "mode": config.get("mode") or "polling",
+                    "owner": "native_daemon" if self._telegram_is_primary_channel() else "gateway",
+                    "primary": self._telegram_is_primary_channel(),
+                    "mirror_channels": list((runtime.get("communication") or {}).get("mirror_channels") or []),
                     "updated_at": config.get("updatedAt") or "",
                     "known_mappings": len((state.get("mappings") or [])),
                     "allowed_chat_ids": list(runtime.get("allowed_chat_ids") or []),
@@ -241,7 +246,7 @@ class KestrelDaemonTelegramStateMixin:
             {
                 "offset": offset,
                 "timeout": 25,
-                "allowed_updates": ["message"],
+                "allowed_updates": ["message", "callback_query"],
             },
         )
         handled = 0
@@ -254,6 +259,16 @@ class KestrelDaemonTelegramStateMixin:
         return handled
 
     def _handle_telegram_update(self, update: dict[str, Any]) -> bool:
+        callback_query = update.get("callback_query")
+        if isinstance(callback_query, dict):
+            normalized_callback = self._normalize_telegram_callback(callback_query)
+            if not normalized_callback:
+                return False
+            task = asyncio.create_task(self._process_telegram_callback(normalized_callback))
+            self.telegram_message_tasks.add(task)
+            task.add_done_callback(self._on_telegram_message_task_done)
+            return True
+
         message = update.get("message") or update.get("edited_message")
         if not isinstance(message, dict):
             return False
@@ -268,6 +283,25 @@ class KestrelDaemonTelegramStateMixin:
         self.telegram_message_tasks.add(task)
         task.add_done_callback(self._on_telegram_message_task_done)
         return True
+
+    def _normalize_telegram_callback(self, callback_query: dict[str, Any]) -> dict[str, Any] | None:
+        message = callback_query.get("message") or {}
+        if not isinstance(message, dict):
+            return None
+        chat = message.get("chat") or {}
+        sender = callback_query.get("from") or {}
+        chat_id = str(chat.get("id") or "").strip()
+        if not chat_id:
+            return None
+        return {
+            "callback_id": str(callback_query.get("id") or "").strip(),
+            "data": str(callback_query.get("data") or "").strip(),
+            "chat_id": chat_id,
+            "message_id": int(message.get("message_id") or 0),
+            "from_id": str(sender.get("id") or "").strip(),
+            "from_username": str(sender.get("username") or "").strip(),
+            "first_name": str(sender.get("first_name") or "").strip(),
+        }
 
     def _on_telegram_message_task_done(self, task: asyncio.Task) -> None:
         self.telegram_message_tasks.discard(task)
@@ -393,4 +427,3 @@ class KestrelDaemonTelegramStateMixin:
                 f"Kestrel hit an error while processing that message: {exc}",
                 reply_to_message_id=int(message.get("message_id") or 0) or None,
             )
-

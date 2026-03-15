@@ -309,6 +309,8 @@ class KestrelDaemonTaskMixin:
         tool call so the agent loop can execute it with normal events.
         """
         lower = prompt.lower().strip()
+        if "svg" in lower and re.search(r"\b(?:png|jpg|jpeg|webp|render|export|convert)\b", lower):
+            return None
 
         # Match patterns like "generate an image of...", "create a picture of...",
         # "draw me a...", "make a photo of...", "can you generate an image..."
@@ -317,6 +319,7 @@ class KestrelDaemonTaskMixin:
             r'\b(?:image|picture|photo|illustration|artwork|portrait)\b.*\b(?:of|showing|depicting|with)\b',
             r'\b(?:generate|create|make|render|produce)\b.*\b(?:video|animation|clip|gif)\b',
             r'\b(?:i want|i need|i\'d like|can you|could you|please)\b.*\b(?:image|picture|photo|video)\b',
+            r'\b(?:render|export|convert)\b.*\b(?:image|picture|photo|art|video)\b',
         ]
 
         is_media_request = any(re.search(pat, lower) for pat in media_patterns)
@@ -334,6 +337,7 @@ class KestrelDaemonTaskMixin:
             "arguments": {
                 "prompt": prompt,
                 "media_type": media_type,
+                "send_to_telegram": _wants_telegram_delivery(prompt),
             },
         }
 
@@ -402,6 +406,7 @@ class KestrelDaemonTaskMixin:
             self.paths.heartbeat_md,
             self.paths.workspace_md,
             self.paths.watchlist_yml,
+            self._channel_state_path(),
         ]
         watched.extend(sorted(self.paths.memory_dir.rglob("*.md")))
         for path in watched:
@@ -430,5 +435,3 @@ class KestrelDaemonTaskMixin:
         if start <= end:
             return start <= now <= end
         return now >= start or now <= end
-
-

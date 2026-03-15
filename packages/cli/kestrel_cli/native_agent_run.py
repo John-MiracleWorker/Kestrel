@@ -161,7 +161,22 @@ class NativeAgentRunnerRunMixin:
                     break
                 action: dict[str, Any]
                 approved_for_action = False
-                if isinstance(state.get("forced_action"), dict):
+                auto_render_args = None
+                if (
+                    "render_svg_asset" in step.get("preferred_tools", [])
+                    and not state.get("forced_action")
+                    and not state.get("pending_action")
+                ):
+                    auto_render_args = self._infer_svg_render_arguments(state, step)
+                if auto_render_args:
+                    action = {
+                        "action": "tool_call",
+                        "tool_name": "render_svg_asset",
+                        "arguments": auto_render_args,
+                        "reason": "Deterministic SVG render from stored step output.",
+                    }
+                    state.setdefault("complete_step_after_tool", {})[step["id"]] = "render_svg_asset"
+                elif isinstance(state.get("forced_action"), dict):
                     action = dict(state["forced_action"])
                     state["forced_action"] = None
                     approved_for_action = False
@@ -453,6 +468,18 @@ class NativeAgentRunnerRunMixin:
                         state.setdefault("complete_step_after_tool", {})[step["id"]] = "write_file"
                         self._persist_state(task_id, state, status="running")
                         continue
+                if "render_svg_asset" in step.get("preferred_tools", []):
+                    render_args = self._infer_svg_render_arguments(state, step)
+                    if render_args and not state.get("forced_action") and not state.get("pending_action"):
+                        state["forced_action"] = {
+                            "action": "tool_call",
+                            "tool_name": "render_svg_asset",
+                            "arguments": render_args,
+                            "reason": "Fallback SVG render execution for a stalled SVG conversion step.",
+                        }
+                        state.setdefault("complete_step_after_tool", {})[step["id"]] = "render_svg_asset"
+                        self._persist_state(task_id, state, status="running")
+                        continue
                 self._persist_state(task_id, state, status="failed", error=f"Step failed or stalled: {step['description']}")
                 return NativeAgentOutcome(
                     status="failed",
@@ -504,5 +531,3 @@ class NativeAgentRunnerRunMixin:
             artifacts=list(state.get("artifacts", [])),
             state=state,
         )
-
-

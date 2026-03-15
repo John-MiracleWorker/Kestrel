@@ -333,4 +333,69 @@ def test_daemon_sends_delayed_working_note(monkeypatch, tmp_path):
         )
     )
 
-    assert sent_texts == ["Working on it. I'll reply here when it's ready."]
+    assert sent_texts == ["Working..."]
+
+
+def test_daemon_processes_telegram_callback_approval(monkeypatch, tmp_path):
+    instance = _build_daemon(monkeypatch, tmp_path)
+    sent_texts: list[str] = []
+    edited_texts: list[str] = []
+    callback_answers: list[str] = []
+
+    task = instance.state_store.create_task(goal="create a README section", kind="task")
+    approval = instance.state_store.create_approval(
+        task_id=task["id"],
+        operation="file_write",
+        command="Write README section",
+        resume={"state": {"goal": task["goal"], "plan": {"steps": []}}},
+    )
+
+    async def fake_resume(task_id, approval_payload):
+        assert approval_payload["id"] == approval["id"]
+        instance.state_store.update_task(
+            task_id,
+            status="completed",
+            result={
+                "message": "Approved and completed.",
+                "provider": "fake",
+                "model": "model",
+                "plan": None,
+                "artifacts": [],
+            },
+        )
+
+    async def capture_text(_chat_id, text, **_kwargs):
+        sent_texts.append(text)
+
+    async def capture_edit(_chat_id, _message_id, text, **_kwargs):
+        edited_texts.append(text)
+        return True
+
+    async def capture_answer(_callback_id, text=""):
+        callback_answers.append(text)
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(instance, "_resume_task_from_approval", fake_resume)
+    monkeypatch.setattr(instance, "_telegram_send_text", capture_text)
+    monkeypatch.setattr(instance, "_telegram_send_artifacts", noop)
+    monkeypatch.setattr(instance, "_telegram_update_task_status", noop)
+    monkeypatch.setattr(instance, "_telegram_edit_message_text", capture_edit)
+    monkeypatch.setattr(instance, "_telegram_answer_callback_query", capture_answer)
+
+    asyncio.run(
+        instance._process_telegram_callback(
+            {
+                "callback_id": "cb-1",
+                "data": f"approval:approve:{approval['id']}",
+                "chat_id": "7317769764",
+                "message_id": 44,
+                "from_id": "7317769764",
+            }
+        )
+    )
+
+    assert callback_answers == ["Approving..."]
+    assert any("Approved" in text for text in edited_texts)
+    assert any("Approved and completed." in text for text in sent_texts)

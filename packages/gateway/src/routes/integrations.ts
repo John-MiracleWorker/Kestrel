@@ -12,6 +12,7 @@ interface IntegrationDeps {
     defaultWorkspaceId?: string;
     channelConfigStore: ChannelConfigStore;
     createTelegramAdapter: (config: TelegramChannelConfigRecord) => TelegramAdapter;
+    nativeTelegramOwner?: boolean;
 }
 
 /**
@@ -25,6 +26,7 @@ export default async function integrationRoutes(
         defaultWorkspaceId,
         channelConfigStore,
         createTelegramAdapter,
+        nativeTelegramOwner = false,
     }: IntegrationDeps,
 ) {
     const typedApp = app.withTypeProvider<ZodTypeProvider>();
@@ -51,6 +53,7 @@ export default async function integrationRoutes(
             const tokenConfigured = !!savedConfig?.token || !!telegramAdapter;
             return {
                 telegram: {
+                    owner: nativeTelegramOwner ? 'native_daemon' : 'gateway',
                     connected: telegramAdapter?.status === 'connected',
                     status: telegramAdapter?.status ?? 'disconnected',
                     botId: telegramAdapter?.botInfo?.id,
@@ -104,6 +107,21 @@ export default async function integrationRoutes(
                 if (!enabled) {
                     await channelConfigStore.clearTelegramConfig();
                     return { success: true, status: 'disconnected' };
+                }
+
+                if (nativeTelegramOwner) {
+                    await channelConfigStore.setTelegramConfig({
+                        token,
+                        mode,
+                        webhookUrl,
+                        workspaceId: workspaceId || defaultWorkspaceId || 'default',
+                        updatedAt: new Date().toISOString(),
+                    });
+                    return {
+                        success: true,
+                        owner: 'native_daemon',
+                        status: 'managed_by_native_daemon',
+                    };
                 }
 
                 // Create and register new adapter

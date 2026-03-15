@@ -35,6 +35,7 @@ class NativeToolRegistryCore:
             "memory_search": self._handle_memory_search,
             "fetch_url": self._handle_fetch_url,
             "generate_image": self._handle_generate_image,
+            "render_svg_asset": self._handle_render_svg_asset,
             "take_screenshot": self._handle_take_screenshot,
             "custom_tool_create": self._handle_custom_tool_create,
         }
@@ -217,8 +218,25 @@ class NativeToolRegistryCore:
                         "width": {"type": "integer"},
                         "height": {"type": "integer"},
                         "media_type": {"type": "string", "enum": ["image", "video"]},
+                        "send_to_telegram": {"type": "boolean"},
                     },
                     "required": ["prompt"],
+                },
+            ),
+            NativeToolSpec(
+                name="render_svg_asset",
+                description="Save SVG markup to the local artifact store and render it to a PNG image.",
+                category="media",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "svg_content": {"type": "string"},
+                        "prompt": {"type": "string"},
+                        "base_name": {"type": "string"},
+                        "send_to_telegram": {"type": "boolean"},
+                        "caption": {"type": "string"},
+                    },
+                    "required": ["svg_content"],
                 },
             ),
             NativeToolSpec(
@@ -380,4 +398,3 @@ class NativeToolRegistryCore:
             "name": path.name,
             "size_bytes": path.stat().st_size if path.exists() else 0,
         }
-

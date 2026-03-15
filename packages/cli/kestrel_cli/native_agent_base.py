@@ -77,9 +77,66 @@ class NativeAgentRunnerBase:
             )
         return normalized
 
+    def _looks_like_svg_render_goal(self, goal: str) -> bool:
+        lowered = str(goal or "").strip().lower()
+        return "svg" in lowered and bool(
+            re.search(r"\b(?:png|jpg|jpeg|webp|render|export|convert)\b", lowered)
+        )
+
+    def _prefers_telegram_delivery(self, goal: str) -> bool:
+        lowered = str(goal or "").strip().lower()
+        return any(
+            phrase in lowered
+            for phrase in (
+                "send it to me",
+                "send me",
+                "share it with me",
+                "telegram",
+                "message me",
+                "dm me",
+            )
+        )
+
+    def _build_svg_render_plan(self, goal: str) -> NativePlan:
+        return NativePlan(
+            goal=goal,
+            summary="Generate SVG markup and render it to a PNG artifact.",
+            reasoning="The request explicitly asks for SVG creation plus image rendering, so use a deterministic local SVG render flow instead of a plain chat reply.",
+            steps=[
+                NativePlanStep(
+                    id="step_1",
+                    description="Generate the requested SVG markup.",
+                    success_criteria="Valid SVG markup exists for the requested subject.",
+                    preferred_tools=[],
+                ),
+                NativePlanStep(
+                    id="step_2",
+                    description="Render the SVG markup to a PNG artifact with render_svg_asset.",
+                    success_criteria="Both the SVG and PNG artifacts are saved locally and ready for delivery.",
+                    preferred_tools=["render_svg_asset"],
+                ),
+            ],
+        )
+
+    def _infer_svg_render_arguments(self, state: dict[str, Any], step: dict[str, Any]) -> dict[str, Any] | None:
+        svg_content = self._latest_step_output(state, step)
+        if not svg_content or "<svg" not in svg_content.lower():
+            return None
+        goal = str(state.get("goal") or "")
+        base_name = "hand" if "hand" in goal.lower() else "generated-svg"
+        return {
+            "svg_content": svg_content,
+            "prompt": goal,
+            "base_name": base_name,
+            "send_to_telegram": False,
+        }
+
     def _fallback_plan_for_goal(self, goal: str) -> NativePlan | None:
         lowered = goal.lower()
         available_tools = {tool.name for tool in self.tool_registry.list_tools()}
+
+        if self._looks_like_svg_render_goal(goal) and "render_svg_asset" in available_tools:
+            return self._build_svg_render_plan(goal)
 
         if any(token in lowered for token in ("save", "write", "desktop", ".svg", ".txt", ".md", ".json", ".html", ".xml")) and "write_file" in available_tools:
             return NativePlan(
@@ -150,6 +207,10 @@ class NativeAgentRunnerBase:
                 ],
             )
             return {"mode": "plan", "plan": plan.to_dict()}, "native-fast-path", initial_tool_call["tool_name"]
+
+        if self._looks_like_svg_render_goal(goal) and self.tool_registry.get("render_svg_asset"):
+            plan = self._build_svg_render_plan(goal)
+            return {"mode": "plan", "plan": plan.to_dict()}, "heuristic", "render_svg_asset"
 
         lowered = goal.strip().lower()
         if lowered.startswith("shell:"):
@@ -403,4 +464,3 @@ class NativeAgentRunnerBase:
         if target_path is None:
             return None
         return {"path": str(target_path), "content": content}
-

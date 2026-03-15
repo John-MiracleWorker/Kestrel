@@ -77,6 +77,14 @@ DEFAULT_CONFIG = {
     "tools": {
         "enabled_categories": ["file", "system", "web", "memory", "media", "desktop", "custom"],
     },
+    "communication": {
+        "primary_channel": "telegram",
+        "mirror_channels": ["web"],
+        "telegram": {
+            "native_primary": True,
+            "mobile_concise": True,
+        },
+    },
 }
 
 
@@ -213,6 +221,13 @@ tools:
     - media
     - desktop
     - custom
+communication:
+  primary_channel: telegram
+  mirror_channels:
+    - web
+  telegram:
+    native_primary: true
+    mobile_concise: true
 """
     heartbeat_text = """# Kestrel Heartbeat Tasks
 
@@ -452,5 +467,4 @@ async def send_control_request(
         if "result" in response:
             return response["result"]
     raise ControlClientError(f"No result received for {method}")
-
 

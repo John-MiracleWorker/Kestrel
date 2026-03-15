@@ -202,6 +202,14 @@ async function start() {
                 ? 'Gateway attached to local daemon-backed Brain client'
                 : `Brain gRPC connected at ${config.brainGrpcUrl}`,
         );
+        const nativeTelegramOwner =
+            brainClient.isLocalMode() &&
+            process.env.GATEWAY_ALLOW_TELEGRAM_IN_LOCAL_MODE !== 'true';
+        if (nativeTelegramOwner) {
+            logger.info(
+                'Gateway Telegram adapter disabled because the native daemon owns Telegram in local mode',
+            );
+        }
 
         const createTelegramAdapter = (settings: TelegramChannelConfigRecord): TelegramAdapter => {
             const adapter = new TelegramAdapter(
@@ -226,7 +234,7 @@ async function start() {
         };
 
         // 3. Instantiate adapters required by route handlers
-        if (process.env.TELEGRAM_BOT_TOKEN) {
+        if (process.env.TELEGRAM_BOT_TOKEN && !nativeTelegramOwner) {
             telegramAdapter = createTelegramAdapter({
                 token: process.env.TELEGRAM_BOT_TOKEN,
                 mode: (process.env.TELEGRAM_MODE as 'webhook' | 'polling') || 'polling',
@@ -293,6 +301,7 @@ async function start() {
             defaultWorkspaceId: process.env.DEFAULT_WORKSPACE_ID || 'default',
             channelConfigStore,
             createTelegramAdapter,
+            nativeTelegramOwner,
         });
 
         // 7. Start Fastify HTTP server
@@ -346,7 +355,7 @@ async function start() {
         if (telegramAdapter) {
             await channelRegistry.register(telegramAdapter);
             logger.info('Telegram adapter enabled (env var)');
-        } else {
+        } else if (!nativeTelegramOwner) {
             // No env-var token — try to restore token persisted via the settings UI
             const savedConfig = await channelConfigStore.getTelegramConfig();
             if (savedConfig) {
