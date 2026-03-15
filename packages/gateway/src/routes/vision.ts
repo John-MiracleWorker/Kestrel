@@ -63,7 +63,9 @@ export default async function visionRoutes(
                 return reply.status(400).send({ error: 'Missing image data' });
             }
 
-            logger.info(`Vision analyze from user ${user.id}, ~${Math.round(image.length / 1024)}KB`);
+            logger.info(
+                `Vision analyze from user ${user.id}, ~${Math.round(image.length / 1024)}KB`,
+            );
 
             try {
                 const geminiKey = process.env.GEMINI_API_KEY;
@@ -71,7 +73,13 @@ export default async function visionRoutes(
                 let result: any;
 
                 if (geminiKey) {
-                    result = await callGeminiVision(geminiKey, 'gemini-2.0-flash', image, mimeType, context);
+                    result = await callGeminiVision(
+                        geminiKey,
+                        'gemini-2.0-flash',
+                        image,
+                        mimeType,
+                        context,
+                    );
                 } else if (openaiKey) {
                     result = await callOpenAIVision(openaiKey, 'gpt-4o', image, mimeType, context);
                 } else {
@@ -84,14 +92,20 @@ export default async function visionRoutes(
                 return reply.send(result);
             } catch (error: any) {
                 logger.error('Vision analysis failed', { error: error.message });
-                return reply.status(500).send({ error: 'Vision analysis failed', message: error.message });
+                return reply
+                    .status(500)
+                    .send({ error: 'Vision analysis failed', message: error.message });
             }
         },
     );
 }
 
 async function callGeminiVision(
-    apiKey: string, model: string, imageBase64: string, mimeType: string, context?: string,
+    apiKey: string,
+    model: string,
+    imageBase64: string,
+    mimeType: string,
+    context?: string,
 ): Promise<any> {
     const userPrompt = context
         ? `Analyze this screenshot. Additional context: ${context}`
@@ -103,12 +117,12 @@ async function callGeminiVision(
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             systemInstruction: { parts: [{ text: VISION_SYSTEM_PROMPT }] },
-            contents: [{
-                role: 'user', parts: [
-                    { text: userPrompt },
-                    { inlineData: { mimeType, data: imageBase64 } },
-                ]
-            }],
+            contents: [
+                {
+                    role: 'user',
+                    parts: [{ text: userPrompt }, { inlineData: { mimeType, data: imageBase64 } }],
+                },
+            ],
             generationConfig: { temperature: 0.3, maxOutputTokens: 2048 },
         }),
     });
@@ -118,13 +132,17 @@ async function callGeminiVision(
         throw new Error(`Gemini API error ${response.status}: ${errorText.slice(0, 200)}`);
     }
 
-    const data = await response.json() as any;
+    const data = (await response.json()) as any;
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     return parseVisionResponse(text);
 }
 
 async function callOpenAIVision(
-    apiKey: string, model: string, imageBase64: string, mimeType: string, context?: string,
+    apiKey: string,
+    model: string,
+    imageBase64: string,
+    mimeType: string,
+    context?: string,
 ): Promise<any> {
     const userPrompt = context
         ? `Analyze this screenshot. Additional context: ${context}`
@@ -138,10 +156,17 @@ async function callOpenAIVision(
             messages: [
                 { role: 'system', content: VISION_SYSTEM_PROMPT },
                 {
-                    role: 'user', content: [
+                    role: 'user',
+                    content: [
                         { type: 'text', text: userPrompt },
-                        { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}`, detail: 'high' } },
-                    ]
+                        {
+                            type: 'image_url',
+                            image_url: {
+                                url: `data:${mimeType};base64,${imageBase64}`,
+                                detail: 'high',
+                            },
+                        },
+                    ],
                 },
             ],
             temperature: 0.3,
@@ -154,14 +179,17 @@ async function callOpenAIVision(
         throw new Error(`OpenAI API error ${response.status}: ${errorText.slice(0, 200)}`);
     }
 
-    const data = await response.json() as any;
+    const data = (await response.json()) as any;
     const text = data?.choices?.[0]?.message?.content || '';
     return parseVisionResponse(text);
 }
 
 function parseVisionResponse(text: string): any {
     try {
-        const cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+        const cleaned = text
+            .replace(/```json\s*/gi, '')
+            .replace(/```\s*/g, '')
+            .trim();
         const parsed = JSON.parse(cleaned);
 
         if (parsed.suggestions && Array.isArray(parsed.suggestions)) {
@@ -181,14 +209,16 @@ function parseVisionResponse(text: string): any {
     } catch {
         logger.warn('Vision response was not valid JSON, wrapping as info');
         return {
-            suggestions: [{
-                id: `vision-${Date.now()}`,
-                type: 'info',
-                title: 'Screen Analysis',
-                description: text.slice(0, 300),
-                lineRef: null,
-                timestamp: Date.now(),
-            }],
+            suggestions: [
+                {
+                    id: `vision-${Date.now()}`,
+                    type: 'info',
+                    title: 'Screen Analysis',
+                    description: text.slice(0, 300),
+                    lineRef: null,
+                    timestamp: Date.now(),
+                },
+            ],
             context: 'raw analysis',
         };
     }

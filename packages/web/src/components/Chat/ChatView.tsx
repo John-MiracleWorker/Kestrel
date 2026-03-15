@@ -24,7 +24,7 @@ interface ChatViewProps {
             toolResult?: string;
             thinking?: string;
         } | null;
-        agentActivities?: Array<{ activity_type: string;[key: string]: unknown }>;
+        agentActivities?: Array<{ activity_type: string; [key: string]: unknown }>;
         routingInfo?: RoutingInfo | null;
     } | null;
     onSendMessage: (
@@ -407,18 +407,26 @@ export function ChatView({
 
                     {/* Inline Approval Buttons */}
                     {pendingApproval && onApproval && (
-                        <div style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '12px',
-                            padding: '16px 20px',
-                            margin: '8px 0',
-                            background: 'rgba(0, 243, 255, 0.05)',
-                            border: '1px solid rgba(0, 243, 255, 0.2)',
-                            borderRadius: '8px',
-                        }}>
+                        <div
+                            style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '12px',
+                                padding: '16px 20px',
+                                margin: '8px 0',
+                                background: 'rgba(0, 243, 255, 0.05)',
+                                border: '1px solid rgba(0, 243, 255, 0.2)',
+                                borderRadius: '8px',
+                            }}
+                        >
                             <span style={{ fontSize: '1.2rem' }}>🛡️</span>
-                            <span style={{ flex: 1, fontSize: '0.85rem', color: 'var(--text-primary)' }}>
+                            <span
+                                style={{
+                                    flex: 1,
+                                    fontSize: '0.85rem',
+                                    color: 'var(--text-primary)',
+                                }}
+                            >
                                 Approval required
                             </span>
                             <button
@@ -576,4 +584,3 @@ export function ChatView({
         </div>
     );
 }
-

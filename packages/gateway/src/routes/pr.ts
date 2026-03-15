@@ -25,24 +25,39 @@ export async function prRoutes(app: FastifyInstance) {
             }
 
             try {
-                const prRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`, {
-                    headers: { Authorization: `token ${token}`, Accept: 'application/vnd.github.v3+json' },
-                });
+                const prRes = await fetch(
+                    `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`,
+                    {
+                        headers: {
+                            Authorization: `token ${token}`,
+                            Accept: 'application/vnd.github.v3+json',
+                        },
+                    },
+                );
                 if (!prRes.ok) throw new Error(`GitHub API error: ${prRes.status}`);
-                const prData = await prRes.json() as any;
+                const prData = (await prRes.json()) as any;
 
-                const diffRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`, {
-                    headers: { Authorization: `token ${token}`, Accept: 'application/vnd.github.v3.diff' },
-                });
+                const diffRes = await fetch(
+                    `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`,
+                    {
+                        headers: {
+                            Authorization: `token ${token}`,
+                            Accept: 'application/vnd.github.v3.diff',
+                        },
+                    },
+                );
                 if (!diffRes.ok) throw new Error(`GitHub diff error: ${diffRes.status}`);
                 const diff = await diffRes.text();
-                const truncatedDiff = diff.length > 15000 ? diff.slice(0, 15000) + '\n... (diff truncated)' : diff;
+                const truncatedDiff =
+                    diff.length > 15000 ? diff.slice(0, 15000) + '\n... (diff truncated)' : diff;
 
                 const geminiKey = process.env.GEMINI_API_KEY;
                 const openaiKey = process.env.OPENAI_API_KEY;
 
                 if (!geminiKey && !openaiKey) {
-                    return reply.status(400).send({ error: 'No LLM API key configured for PR review' });
+                    return reply
+                        .status(400)
+                        .send({ error: 'No LLM API key configured for PR review' });
                 }
 
                 const prReviewPrompt = `You are a senior code reviewer. Analyze this pull request and provide a thorough review.
@@ -86,38 +101,61 @@ Respond in this JSON format (no markdown fences):
                             generationConfig: { temperature: 0.3, maxOutputTokens: 4096 },
                         }),
                     });
-                    const data = await res.json() as any;
+                    const data = (await res.json()) as any;
                     text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
                 } else if (openaiKey) {
                     const res = await fetch('https://api.openai.com/v1/chat/completions', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${openaiKey}` },
+                        headers: {
+                            'Content-Type': 'application/json',
+                            Authorization: `Bearer ${openaiKey}`,
+                        },
                         body: JSON.stringify({
                             model: 'gpt-4o',
                             messages: [{ role: 'user', content: prReviewPrompt }],
-                            temperature: 0.3, max_tokens: 4096,
+                            temperature: 0.3,
+                            max_tokens: 4096,
                         }),
                     });
-                    const data = await res.json() as any;
+                    const data = (await res.json()) as any;
                     text = data?.choices?.[0]?.message?.content || '';
                 }
 
                 try {
-                    const cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+                    const cleaned = text
+                        .replace(/```json\s*/gi, '')
+                        .replace(/```\s*/g, '')
+                        .trim();
                     const review = JSON.parse(cleaned);
                     return reply.send({
                         review,
                         pr: {
-                            title: prData.title, number: prData.number, author: prData.user?.login,
-                            url: prData.html_url, state: prData.state,
-                            additions: prData.additions, deletions: prData.deletions,
+                            title: prData.title,
+                            number: prData.number,
+                            author: prData.user?.login,
+                            url: prData.html_url,
+                            state: prData.state,
+                            additions: prData.additions,
+                            deletions: prData.deletions,
                             changedFiles: prData.changed_files,
                         },
                     });
                 } catch {
                     return reply.send({
-                        review: { summary: text.slice(0, 500), verdict: 'comment', score: 5, issues: [], positives: [], risks: [] },
-                        pr: { title: prData.title, number: prData.number, author: prData.user?.login, url: prData.html_url },
+                        review: {
+                            summary: text.slice(0, 500),
+                            verdict: 'comment',
+                            score: 5,
+                            issues: [],
+                            positives: [],
+                            risks: [],
+                        },
+                        pr: {
+                            title: prData.title,
+                            number: prData.number,
+                            author: prData.user?.login,
+                            url: prData.html_url,
+                        },
                     });
                 }
             } catch (error: any) {
@@ -145,16 +183,26 @@ Respond in this JSON format (no markdown fences):
             try {
                 const res = await fetch(
                     `https://api.github.com/repos/${owner}/${repo}/pulls?state=${state}&per_page=20`,
-                    { headers: { Authorization: `token ${token}`, Accept: 'application/vnd.github.v3+json' } },
+                    {
+                        headers: {
+                            Authorization: `token ${token}`,
+                            Accept: 'application/vnd.github.v3+json',
+                        },
+                    },
                 );
                 if (!res.ok) throw new Error(`GitHub API error: ${res.status}`);
 
-                const prs = await res.json() as any[];
+                const prs = (await res.json()) as any[];
                 return reply.send({
                     prs: prs.map((pr: any) => ({
-                        number: pr.number, title: pr.title, author: pr.user?.login,
-                        state: pr.state, url: pr.html_url, createdAt: pr.created_at,
-                        additions: pr.additions, deletions: pr.deletions,
+                        number: pr.number,
+                        title: pr.title,
+                        author: pr.user?.login,
+                        state: pr.state,
+                        url: pr.html_url,
+                        createdAt: pr.created_at,
+                        additions: pr.additions,
+                        deletions: pr.deletions,
                         labels: pr.labels?.map((l: any) => l.name) || [],
                     })),
                 });

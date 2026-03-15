@@ -2,7 +2,7 @@ import React from 'react';
 
 /* ── KestrelProcessBar ────────────────────────────────────────────── */
 
-type Activity = { activity_type: string;[key: string]: unknown };
+type Activity = { activity_type: string; [key: string]: unknown };
 
 interface PhaseData {
     key: string;
@@ -104,12 +104,12 @@ function buildPhases(
             toolActivity.status === 'thinking'
                 ? 'Reasoning'
                 : toolActivity.status === 'planning'
-                    ? 'Planning'
-                    : toolActivity.status === 'calling' || toolActivity.status === 'tool_calling'
-                        ? toolActivity.toolName || 'Tool'
-                        : toolActivity.status === 'result' || toolActivity.status === 'tool_result'
-                            ? `${toolActivity.toolName} ✓`
-                            : 'Working';
+                  ? 'Planning'
+                  : toolActivity.status === 'calling' || toolActivity.status === 'tool_calling'
+                    ? toolActivity.toolName || 'Tool'
+                    : toolActivity.status === 'result' || toolActivity.status === 'tool_result'
+                      ? `${toolActivity.toolName} ✓`
+                      : 'Working';
         phases.push({
             key: 'tools',
             icon: '⚡',
@@ -239,12 +239,12 @@ export function KestrelProcessBar({
         ? toolActivity.status === 'thinking'
             ? '🧠 Reasoning…'
             : toolActivity.status === 'planning'
-                ? '📋 Planning…'
-                : toolActivity.status === 'calling' || toolActivity.status === 'tool_calling'
-                    ? `⚡ Using ${toolActivity.toolName || 'tool'}…`
-                    : toolActivity.status === 'result' || toolActivity.status === 'tool_result'
-                        ? `✅ ${toolActivity.toolName || 'Tool'} complete`
-                        : '🔄 Working…'
+              ? '📋 Planning…'
+              : toolActivity.status === 'calling' || toolActivity.status === 'tool_calling'
+                ? `⚡ Using ${toolActivity.toolName || 'tool'}…`
+                : toolActivity.status === 'result' || toolActivity.status === 'tool_result'
+                  ? `✅ ${toolActivity.toolName || 'Tool'} complete`
+                  : '🔄 Working…'
         : '🔄 Processing…';
 
     const isActive =
@@ -478,8 +478,8 @@ export function PhaseDetail({ item, phaseKey }: { item: Activity; phaseKey: stri
             item.severity === 'critical'
                 ? '#ef4444'
                 : item.severity === 'high'
-                    ? '#f59e0b'
-                    : '#6b7280';
+                  ? '#f59e0b'
+                  : '#6b7280';
         return (
             <div style={{ display: 'flex', gap: '8px', padding: '2px 0' }}>
                 <span
@@ -529,4 +529,3 @@ export function PhaseDetail({ item, phaseKey }: { item: Activity; phaseKey: stri
     if (text) return <div style={dim}>{text.substring(0, 200)}</div>;
     return null;
 }
-

@@ -20,7 +20,9 @@ interface DocsPanelProps {
 /* ── Mock Docs ────────────────────────────────────────────────── */
 const MOCK_DOCS: DocFile[] = [
     {
-        id: 'overview', title: 'Overview', category: 'General',
+        id: 'overview',
+        title: 'Overview',
+        category: 'General',
         lastUpdated: new Date().toISOString(),
         content: `# Kestrel Platform Overview
 
@@ -64,7 +66,9 @@ Modern single-page application with terminal-inspired dark UI.
 `,
     },
     {
-        id: 'api-chat', title: '/api/chat', category: 'API Reference',
+        id: 'api-chat',
+        title: '/api/chat',
+        category: 'API Reference',
         lastUpdated: new Date(Date.now() - 3600000).toISOString(),
         content: `# Chat API
 
@@ -96,7 +100,9 @@ Requires \`Authorization: Bearer <token>\` header.
 `,
     },
     {
-        id: 'api-workspaces', title: '/api/workspaces', category: 'API Reference',
+        id: 'api-workspaces',
+        title: '/api/workspaces',
+        category: 'API Reference',
         lastUpdated: new Date(Date.now() - 7200000).toISOString(),
         content: `# Workspaces API
 
@@ -122,7 +128,9 @@ Delete a workspace and all associated data.
 `,
     },
     {
-        id: 'brain', title: 'Brain Service', category: 'Components',
+        id: 'brain',
+        title: 'Brain Service',
+        category: 'Components',
         lastUpdated: new Date(Date.now() - 1800000).toISOString(),
         content: `# Brain Service
 
@@ -158,7 +166,9 @@ LLM provider abstraction:
 `,
     },
     {
-        id: 'gateway', title: 'Gateway Service', category: 'Components',
+        id: 'gateway',
+        title: 'Gateway Service',
+        category: 'Components',
         lastUpdated: new Date(Date.now() - 5400000).toISOString(),
         content: `# Gateway Service
 
@@ -219,7 +229,9 @@ Supported events: \`task.started\`, \`task.completed\`, \`task.failed\`, \`messa
 `,
     },
     {
-        id: 'frontend', title: 'Frontend', category: 'Components',
+        id: 'frontend',
+        title: 'Frontend',
+        category: 'Components',
         lastUpdated: new Date(Date.now() - 900000).toISOString(),
         content: `# Frontend
 
@@ -257,7 +269,9 @@ Navigation sidebar with:
 `,
     },
     {
-        id: 'data-flow', title: 'Data Flow', category: 'Architecture',
+        id: 'data-flow',
+        title: 'Data Flow',
+        category: 'Architecture',
         lastUpdated: new Date(Date.now() - 10800000).toISOString(),
         content: `# Data Flow
 
@@ -289,74 +303,128 @@ const CATEGORIES = ['General', 'Architecture', 'API Reference', 'Components'];
 /* ── Styles ────────────────────────────────────────────────────── */
 const S = {
     overlay: {
-        position: 'fixed' as const, top: 0, left: 0, right: 0, bottom: 0,
-        background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(8px)',
-        zIndex: 10000, display: 'flex', fontFamily: 'JetBrains Mono, monospace',
+        position: 'fixed' as const,
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        background: 'rgba(0,0,0,0.85)',
+        backdropFilter: 'blur(8px)',
+        zIndex: 10000,
+        display: 'flex',
+        fontFamily: 'JetBrains Mono, monospace',
     },
     nav: {
-        width: '220px', background: '#080808', borderRight: '1px solid #222',
-        overflowY: 'auto' as const, padding: '16px 0',
+        width: '220px',
+        background: '#080808',
+        borderRight: '1px solid #222',
+        overflowY: 'auto' as const,
+        padding: '16px 0',
     },
     navHeader: {
-        padding: '0 16px 16px', fontSize: '0.75rem', fontWeight: 700,
-        color: '#00f3ff', letterSpacing: '0.06em',
-        borderBottom: '1px solid #222', marginBottom: '8px',
+        padding: '0 16px 16px',
+        fontSize: '0.75rem',
+        fontWeight: 700,
+        color: '#00f3ff',
+        letterSpacing: '0.06em',
+        borderBottom: '1px solid #222',
+        marginBottom: '8px',
     },
     categoryTitle: {
-        fontSize: '0.6rem', color: '#444', textTransform: 'uppercase' as const,
-        letterSpacing: '0.08em', padding: '12px 16px 4px',
+        fontSize: '0.6rem',
+        color: '#444',
+        textTransform: 'uppercase' as const,
+        letterSpacing: '0.08em',
+        padding: '12px 16px 4px',
     },
     navItem: (active: boolean) => ({
-        padding: '6px 16px', fontSize: '0.7rem', cursor: 'pointer',
+        padding: '6px 16px',
+        fontSize: '0.7rem',
+        cursor: 'pointer',
         color: active ? '#e0e0e0' : '#666',
         background: active ? 'rgba(0,243,255,0.06)' : 'transparent',
         borderLeft: active ? '2px solid #00f3ff' : '2px solid transparent',
         transition: 'all 0.15s',
     }),
     content: {
-        flex: 1, display: 'flex', flexDirection: 'column' as const,
+        flex: 1,
+        display: 'flex',
+        flexDirection: 'column' as const,
     },
     contentHeader: {
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        padding: '12px 24px', borderBottom: '1px solid #222', background: '#080808',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        padding: '12px 24px',
+        borderBottom: '1px solid #222',
+        background: '#080808',
     },
     closeBtn: {
-        background: 'none', border: 'none', color: '#555',
-        fontSize: '1.1rem', cursor: 'pointer', padding: '4px 8px',
+        background: 'none',
+        border: 'none',
+        color: '#555',
+        fontSize: '1.1rem',
+        cursor: 'pointer',
+        padding: '4px 8px',
     },
     driftBanner: {
-        display: 'flex', alignItems: 'center', gap: '8px',
-        padding: '8px 24px', background: 'rgba(245,158,11,0.08)',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '8px',
+        padding: '8px 24px',
+        background: 'rgba(245,158,11,0.08)',
         borderBottom: '1px solid rgba(245,158,11,0.2)',
-        fontSize: '0.65rem', color: '#f59e0b',
+        fontSize: '0.65rem',
+        color: '#f59e0b',
     },
     contentBody: {
-        flex: 1, overflowY: 'auto' as const, padding: '24px',
+        flex: 1,
+        overflowY: 'auto' as const,
+        padding: '24px',
     },
     markdown: {
-        fontSize: '0.78rem', color: '#e0e0e0', lineHeight: 1.7,
+        fontSize: '0.78rem',
+        color: '#e0e0e0',
+        lineHeight: 1.7,
     },
     regenBtn: {
-        background: 'rgba(168,85,247,0.1)', border: '1px solid rgba(168,85,247,0.3)',
-        borderRadius: '4px', color: '#a855f7', fontSize: '0.65rem',
-        padding: '4px 12px', cursor: 'pointer',
+        background: 'rgba(168,85,247,0.1)',
+        border: '1px solid rgba(168,85,247,0.3)',
+        borderRadius: '4px',
+        color: '#a855f7',
+        fontSize: '0.65rem',
+        padding: '4px 12px',
+        cursor: 'pointer',
     },
     freshness: (stale: boolean) => ({
-        display: 'inline-flex', alignItems: 'center', gap: '4px',
-        fontSize: '0.6rem', color: stale ? '#f59e0b' : '#10b981',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: '4px',
+        fontSize: '0.6rem',
+        color: stale ? '#f59e0b' : '#10b981',
     }),
     freshnesssDot: (stale: boolean) => ({
-        width: '5px', height: '5px', borderRadius: '50%',
+        width: '5px',
+        height: '5px',
+        borderRadius: '50%',
         background: stale ? '#f59e0b' : '#10b981',
     }),
     codeBlock: {
-        background: '#0d0d0d', border: '1px solid #1a1a1a', borderRadius: '4px',
-        padding: '12px', margin: '12px 0', fontFamily: 'JetBrains Mono, monospace',
-        fontSize: '0.72rem', color: '#00f3ff', overflowX: 'auto' as const,
+        background: '#0d0d0d',
+        border: '1px solid #1a1a1a',
+        borderRadius: '4px',
+        padding: '12px',
+        margin: '12px 0',
+        fontFamily: 'JetBrains Mono, monospace',
+        fontSize: '0.72rem',
+        color: '#00f3ff',
+        overflowX: 'auto' as const,
         whiteSpace: 'pre-wrap' as const,
     },
     table: {
-        width: '100%', borderCollapse: 'collapse' as const, margin: '12px 0',
+        width: '100%',
+        borderCollapse: 'collapse' as const,
+        margin: '12px 0',
         fontSize: '0.7rem',
     },
 };
@@ -372,7 +440,11 @@ function renderMarkdown(content: string): React.ReactElement[] {
     for (const line of lines) {
         if (line.startsWith('```')) {
             if (inCode) {
-                elements.push(<pre key={key++} style={S.codeBlock}>{codeContent.trim()}</pre>);
+                elements.push(
+                    <pre key={key++} style={S.codeBlock}>
+                        {codeContent.trim()}
+                    </pre>,
+                );
                 codeContent = '';
                 inCode = false;
             } else {
@@ -380,33 +452,95 @@ function renderMarkdown(content: string): React.ReactElement[] {
             }
             continue;
         }
-        if (inCode) { codeContent += line + '\n'; continue; }
-        if (!line.trim()) { elements.push(<br key={key++} />); continue; }
+        if (inCode) {
+            codeContent += line + '\n';
+            continue;
+        }
+        if (!line.trim()) {
+            elements.push(<br key={key++} />);
+            continue;
+        }
         if (line.startsWith('# ')) {
-            elements.push(<h1 key={key++} style={{ fontSize: '1.1rem', color: '#e0e0e0', margin: '20px 0 8px', fontWeight: 700 }}>{line.slice(2)}</h1>);
+            elements.push(
+                <h1
+                    key={key++}
+                    style={{
+                        fontSize: '1.1rem',
+                        color: '#e0e0e0',
+                        margin: '20px 0 8px',
+                        fontWeight: 700,
+                    }}
+                >
+                    {line.slice(2)}
+                </h1>,
+            );
         } else if (line.startsWith('## ')) {
-            elements.push(<h2 key={key++} style={{ fontSize: '0.9rem', color: '#ccc', margin: '16px 0 6px', fontWeight: 600 }}>{line.slice(3)}</h2>);
+            elements.push(
+                <h2
+                    key={key++}
+                    style={{
+                        fontSize: '0.9rem',
+                        color: '#ccc',
+                        margin: '16px 0 6px',
+                        fontWeight: 600,
+                    }}
+                >
+                    {line.slice(3)}
+                </h2>,
+            );
         } else if (line.startsWith('### ')) {
-            elements.push(<h3 key={key++} style={{ fontSize: '0.8rem', color: '#aaa', margin: '12px 0 4px', fontWeight: 600 }}>{line.slice(4)}</h3>);
+            elements.push(
+                <h3
+                    key={key++}
+                    style={{
+                        fontSize: '0.8rem',
+                        color: '#aaa',
+                        margin: '12px 0 4px',
+                        fontWeight: 600,
+                    }}
+                >
+                    {line.slice(4)}
+                </h3>,
+            );
         } else if (line.startsWith('| ')) {
             // Table row
-            const cells = line.split('|').slice(1, -1).map(c => c.trim());
-            if (cells.every(c => c.match(/^-+$/))) continue; // separator
+            const cells = line
+                .split('|')
+                .slice(1, -1)
+                .map((c) => c.trim());
+            if (cells.every((c) => c.match(/^-+$/))) continue; // separator
             elements.push(
                 <tr key={key++} style={{ borderBottom: '1px solid #1a1a1a' }}>
                     {cells.map((c, i) => (
-                        <td key={i} style={{ padding: '4px 8px', color: '#e0e0e0', fontSize: '0.7rem' }}>{c}</td>
+                        <td
+                            key={i}
+                            style={{ padding: '4px 8px', color: '#e0e0e0', fontSize: '0.7rem' }}
+                        >
+                            {c}
+                        </td>
                     ))}
-                </tr>
+                </tr>,
             );
         } else if (line.startsWith('- ')) {
             elements.push(
-                <div key={key++} style={{ paddingLeft: '16px', fontSize: '0.75rem', color: '#ccc', margin: '2px 0' }}>
+                <div
+                    key={key++}
+                    style={{
+                        paddingLeft: '16px',
+                        fontSize: '0.75rem',
+                        color: '#ccc',
+                        margin: '2px 0',
+                    }}
+                >
                     • {renderInlineCode(line.slice(2))}
-                </div>
+                </div>,
             );
         } else {
-            elements.push(<p key={key++} style={{ margin: '4px 0', fontSize: '0.75rem', color: '#ccc' }}>{renderInlineCode(line)}</p>);
+            elements.push(
+                <p key={key++} style={{ margin: '4px 0', fontSize: '0.75rem', color: '#ccc' }}>
+                    {renderInlineCode(line)}
+                </p>,
+            );
         }
     }
     // Wrap table rows
@@ -420,7 +554,7 @@ function renderMarkdown(content: string): React.ReactElement[] {
                 final.push(
                     <table key={`table-${key++}`} style={S.table}>
                         <tbody>{tableRows}</tbody>
-                    </table>
+                    </table>,
                 );
                 tableRows = [];
             }
@@ -428,7 +562,11 @@ function renderMarkdown(content: string): React.ReactElement[] {
         }
     }
     if (tableRows.length) {
-        final.push(<table key={`table-${key++}`} style={S.table}><tbody>{tableRows}</tbody></table>);
+        final.push(
+            <table key={`table-${key++}`} style={S.table}>
+                <tbody>{tableRows}</tbody>
+            </table>,
+        );
     }
     return final;
 }
@@ -437,7 +575,20 @@ function renderInlineCode(text: string): React.ReactNode {
     const parts = text.split(/(`[^`]+`)/g);
     return parts.map((part, i) => {
         if (part.startsWith('`') && part.endsWith('`')) {
-            return <code key={i} style={{ background: '#1a1a1a', padding: '1px 4px', borderRadius: '2px', color: '#00f3ff', fontSize: '0.7rem' }}>{part.slice(1, -1)}</code>;
+            return (
+                <code
+                    key={i}
+                    style={{
+                        background: '#1a1a1a',
+                        padding: '1px 4px',
+                        borderRadius: '2px',
+                        color: '#00f3ff',
+                        fontSize: '0.7rem',
+                    }}
+                >
+                    {part.slice(1, -1)}
+                </code>
+            );
         }
         return part;
     });
@@ -452,7 +603,7 @@ export function DocsPanel({ workspaceId, isVisible, onClose }: DocsPanelProps) {
     const [isLive, setIsLive] = useState(false);
     const [usingMockDocs, setUsingMockDocs] = useState(false);
 
-    const activeDoc = docs.find(d => d.id === selectedDoc) || docs[0];
+    const activeDoc = docs.find((d) => d.id === selectedDoc) || docs[0];
     const timeSince = (date: string) => {
         const diff = Date.now() - new Date(date).getTime();
         if (diff < 60000) return 'just now';
@@ -460,29 +611,39 @@ export function DocsPanel({ workspaceId, isVisible, onClose }: DocsPanelProps) {
         if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
         return `${Math.floor(diff / 86400000)}d ago`;
     };
-    const isStale = activeDoc ? (Date.now() - new Date(activeDoc.lastUpdated).getTime() > 3600000) : false;
+    const isStale = activeDoc
+        ? Date.now() - new Date(activeDoc.lastUpdated).getTime() > 3600000
+        : false;
 
     // Fetch real docs on mount
     useEffect(() => {
         if (!isVisible || !workspaceId) return;
-        request<{ docs: DocFile[] }>(`/workspaces/${workspaceId}/docs/generate`, { method: 'POST', body: {} })
-            .then(result => {
+        request<{ docs: DocFile[] }>(`/workspaces/${workspaceId}/docs/generate`, {
+            method: 'POST',
+            body: {},
+        })
+            .then((result) => {
                 if (result.docs?.length > 0) {
                     setDocs(result.docs);
                     setSelectedDoc(result.docs[0].id);
                     setIsLive(true);
                 }
             })
-            .catch(() => { setUsingMockDocs(true); /* keep mock docs as fallback */ });
+            .catch(() => {
+                setUsingMockDocs(true); /* keep mock docs as fallback */
+            });
     }, [isVisible, workspaceId]);
 
     const handleRegenerate = async () => {
         setRegenerating(true);
         try {
-            const result = await request<{ docs: DocFile[] }>(`/workspaces/${workspaceId}/docs/generate`, {
-                method: 'POST',
-                body: { category: activeDoc?.category },
-            });
+            const result = await request<{ docs: DocFile[] }>(
+                `/workspaces/${workspaceId}/docs/generate`,
+                {
+                    method: 'POST',
+                    body: { category: activeDoc?.category },
+                },
+            );
             if (result.docs?.length > 0) {
                 setDocs(result.docs);
                 setSelectedDoc(result.docs[0].id);
@@ -501,21 +662,36 @@ export function DocsPanel({ workspaceId, isVisible, onClose }: DocsPanelProps) {
         <div style={S.overlay}>
             {/* Left Nav */}
             <div style={S.nav}>
-                <div style={S.navHeader}>✦ Kestrel Docs{isLive && <span style={{ color: '#10b981', fontSize: '0.5rem', marginLeft: '6px' }}>● LIVE</span>}</div>
-                {CATEGORIES.map(cat => (
+                <div style={S.navHeader}>
+                    ✦ Kestrel Docs
+                    {isLive && (
+                        <span style={{ color: '#10b981', fontSize: '0.5rem', marginLeft: '6px' }}>
+                            ● LIVE
+                        </span>
+                    )}
+                </div>
+                {CATEGORIES.map((cat) => (
                     <div key={cat}>
                         <div style={S.categoryTitle}>{cat}</div>
-                        {docs.filter(d => d.category === cat).map(doc => (
-                            <div
-                                key={doc.id}
-                                style={S.navItem(selectedDoc === doc.id)}
-                                onClick={() => setSelectedDoc(doc.id)}
-                                onMouseEnter={e => { if (selectedDoc !== doc.id) (e.target as HTMLElement).style.color = '#aaa'; }}
-                                onMouseLeave={e => { if (selectedDoc !== doc.id) (e.target as HTMLElement).style.color = '#666'; }}
-                            >
-                                {doc.title}
-                            </div>
-                        ))}
+                        {docs
+                            .filter((d) => d.category === cat)
+                            .map((doc) => (
+                                <div
+                                    key={doc.id}
+                                    style={S.navItem(selectedDoc === doc.id)}
+                                    onClick={() => setSelectedDoc(doc.id)}
+                                    onMouseEnter={(e) => {
+                                        if (selectedDoc !== doc.id)
+                                            (e.target as HTMLElement).style.color = '#aaa';
+                                    }}
+                                    onMouseLeave={(e) => {
+                                        if (selectedDoc !== doc.id)
+                                            (e.target as HTMLElement).style.color = '#666';
+                                    }}
+                                >
+                                    {doc.title}
+                                </div>
+                            ))}
                     </div>
                 ))}
             </div>
@@ -531,32 +707,43 @@ export function DocsPanel({ workspaceId, isVisible, onClose }: DocsPanelProps) {
                         </span>
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                        <button style={S.regenBtn} onClick={() => void handleRegenerate()} disabled={regenerating}>
+                        <button
+                            style={S.regenBtn}
+                            onClick={() => void handleRegenerate()}
+                            disabled={regenerating}
+                        >
                             {regenerating ? 'Regenerating...' : '✦ Regenerate'}
                         </button>
-                        <button style={S.closeBtn} onClick={onClose}>✕</button>
+                        <button style={S.closeBtn} onClick={onClose}>
+                            ✕
+                        </button>
                     </div>
                 </div>
 
                 {usingMockDocs && (
-                    <div style={{ background: '#1a0f00', color: '#f59e0b', fontSize: '0.65rem', padding: '4px 12px', borderBottom: '1px solid #2a1a00', letterSpacing: '0.04em' }}>
+                    <div
+                        style={{
+                            background: '#1a0f00',
+                            color: '#f59e0b',
+                            fontSize: '0.65rem',
+                            padding: '4px 12px',
+                            borderBottom: '1px solid #2a1a00',
+                            letterSpacing: '0.04em',
+                        }}
+                    >
                         ⚠ Unable to generate live docs — showing cached reference
                     </div>
                 )}
 
                 {driftCount > 0 && (
-                    <div style={S.driftBanner}>
-                        ⚠ {driftCount} files changed since last sync
-                    </div>
+                    <div style={S.driftBanner}>⚠ {driftCount} files changed since last sync</div>
                 )}
 
                 <div style={S.contentBody}>
-                    <div style={S.markdown}>
-                        {renderMarkdown(activeDoc.content)}
-                    </div>
+                    <div style={S.markdown}>{renderMarkdown(activeDoc.content)}</div>
                 </div>
             </div>
         </div>,
-        document.body
+        document.body,
     );
 }

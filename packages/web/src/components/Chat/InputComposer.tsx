@@ -12,12 +12,37 @@ interface SlashCommand {
 }
 
 const SLASH_COMMANDS: SlashCommand[] = [
-    { command: '/workflow', label: 'Run Workflow', icon: '🔄', description: 'Launch an automated workflow' },
-    { command: '/memory', label: 'Memory Palace', icon: '🧠', description: 'Search the memory graph' },
-    { command: '/docs', label: 'Documentation', icon: '📖', description: 'Open auto-documentation' },
-    { command: '/canvas', label: 'Toggle Canvas', icon: '📺', description: 'Show/hide the live HUD' },
+    {
+        command: '/workflow',
+        label: 'Run Workflow',
+        icon: '🔄',
+        description: 'Launch an automated workflow',
+    },
+    {
+        command: '/memory',
+        label: 'Memory Palace',
+        icon: '🧠',
+        description: 'Search the memory graph',
+    },
+    {
+        command: '/docs',
+        label: 'Documentation',
+        icon: '📖',
+        description: 'Open auto-documentation',
+    },
+    {
+        command: '/canvas',
+        label: 'Toggle Canvas',
+        icon: '📺',
+        description: 'Show/hide the live HUD',
+    },
     { command: '/settings', label: 'Settings', icon: '⚙️', description: 'Open settings panel' },
-    { command: '/clear', label: 'New Session', icon: '✨', description: 'Start a fresh conversation' },
+    {
+        command: '/clear',
+        label: 'New Session',
+        icon: '✨',
+        description: 'Start a fresh conversation',
+    },
     { command: '/pr', label: 'PR Review', icon: '🔍', description: 'Open PR review panel' },
     { command: '/screen', label: 'Screen Share', icon: '🖥️', description: 'Start screen sharing' },
 ];
@@ -55,10 +80,11 @@ export function InputComposer({
 
     // Filter slash commands
     const filteredCommands = slashQuery
-        ? SLASH_COMMANDS.filter(c =>
-            c.command.includes(slashQuery.toLowerCase()) ||
-            c.label.toLowerCase().includes(slashQuery.toLowerCase())
-        )
+        ? SLASH_COMMANDS.filter(
+              (c) =>
+                  c.command.includes(slashQuery.toLowerCase()) ||
+                  c.label.toLowerCase().includes(slashQuery.toLowerCase()),
+          )
         : SLASH_COMMANDS;
 
     // Detect /slash
@@ -78,40 +104,46 @@ export function InputComposer({
         setSlashIndex(0);
     }, [filteredCommands.length]);
 
-    const executeSlash = useCallback((cmd: SlashCommand) => {
-        setShowSlash(false);
-        onChange('');
-        if (onSlashCommand) {
-            onSlashCommand(cmd.command);
-        }
-    }, [onChange, onSlashCommand]);
+    const executeSlash = useCallback(
+        (cmd: SlashCommand) => {
+            setShowSlash(false);
+            onChange('');
+            if (onSlashCommand) {
+                onSlashCommand(cmd.command);
+            }
+        },
+        [onChange, onSlashCommand],
+    );
 
-    const handleComposerKeyDown = useCallback((e: React.KeyboardEvent) => {
-        if (showSlash && filteredCommands.length > 0) {
-            if (e.key === 'ArrowDown') {
-                e.preventDefault();
-                setSlashIndex(i => Math.min(i + 1, filteredCommands.length - 1));
-                return;
+    const handleComposerKeyDown = useCallback(
+        (e: React.KeyboardEvent) => {
+            if (showSlash && filteredCommands.length > 0) {
+                if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    setSlashIndex((i) => Math.min(i + 1, filteredCommands.length - 1));
+                    return;
+                }
+                if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    setSlashIndex((i) => Math.max(i - 1, 0));
+                    return;
+                }
+                if (e.key === 'Enter' || e.key === 'Tab') {
+                    e.preventDefault();
+                    executeSlash(filteredCommands[slashIndex]);
+                    return;
+                }
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    setShowSlash(false);
+                    return;
+                }
             }
-            if (e.key === 'ArrowUp') {
-                e.preventDefault();
-                setSlashIndex(i => Math.max(i - 1, 0));
-                return;
-            }
-            if (e.key === 'Enter' || e.key === 'Tab') {
-                e.preventDefault();
-                executeSlash(filteredCommands[slashIndex]);
-                return;
-            }
-            if (e.key === 'Escape') {
-                e.preventDefault();
-                setShowSlash(false);
-                return;
-            }
-        }
-        // Default key handling (Enter to submit, etc.)
-        onKeyDown(e);
-    }, [showSlash, filteredCommands, slashIndex, executeSlash, onKeyDown]);
+            // Default key handling (Enter to submit, etc.)
+            onKeyDown(e);
+        },
+        [showSlash, filteredCommands, slashIndex, executeSlash, onKeyDown],
+    );
 
     // Auto-resize textarea
     useEffect(() => {
@@ -137,7 +169,8 @@ export function InputComposer({
                         border: '1px solid rgba(0, 243, 255, 0.2)',
                         borderRadius: '8px',
                         overflow: 'hidden',
-                        boxShadow: '0 -8px 32px rgba(0, 0, 0, 0.6), 0 0 20px rgba(0, 243, 255, 0.04)',
+                        boxShadow:
+                            '0 -8px 32px rgba(0, 0, 0, 0.6), 0 0 20px rgba(0, 243, 255, 0.04)',
                         animation: 'slash-in 0.12s ease-out',
                         maxHeight: '260px',
                         overflowY: 'auto',
@@ -167,8 +200,12 @@ export function InputComposer({
                                 gap: '10px',
                                 padding: '8px 12px',
                                 cursor: 'pointer',
-                                background: i === slashIndex ? 'rgba(0, 243, 255, 0.08)' : 'transparent',
-                                borderLeft: i === slashIndex ? '2px solid var(--accent-cyan)' : '2px solid transparent',
+                                background:
+                                    i === slashIndex ? 'rgba(0, 243, 255, 0.08)' : 'transparent',
+                                borderLeft:
+                                    i === slashIndex
+                                        ? '2px solid var(--accent-cyan)'
+                                        : '2px solid transparent',
                                 transition: 'all 0.1s',
                             }}
                         >
@@ -180,7 +217,10 @@ export function InputComposer({
                                     style={{
                                         fontFamily: 'var(--font-mono)',
                                         fontSize: '0.8rem',
-                                        color: i === slashIndex ? 'var(--accent-cyan)' : 'var(--text-primary)',
+                                        color:
+                                            i === slashIndex
+                                                ? 'var(--accent-cyan)'
+                                                : 'var(--text-primary)',
                                     }}
                                 >
                                     {cmd.command}
@@ -294,7 +334,10 @@ export function InputComposer({
                                             {f.name}
                                         </span>
                                         <span
-                                            style={{ color: 'var(--text-dim)', fontSize: '0.65rem' }}
+                                            style={{
+                                                color: 'var(--text-dim)',
+                                                fontSize: '0.65rem',
+                                            }}
                                         >
                                             {(f.size / 1024).toFixed(0)}KB
                                         </span>
@@ -343,9 +386,17 @@ export function InputComposer({
                         onClick={onAttach}
                         title="Attach files (images, code, PDFs)"
                         style={{
-                            background: pendingFiles.length > 0 ? 'rgba(168,85,247,0.2)' : 'transparent',
-                            color: pendingFiles.length > 0 ? 'var(--accent-purple)' : 'var(--text-dim)',
-                            border: '1px solid ' + (pendingFiles.length > 0 ? 'var(--accent-purple)' : 'var(--text-dim)'),
+                            background:
+                                pendingFiles.length > 0 ? 'rgba(168,85,247,0.2)' : 'transparent',
+                            color:
+                                pendingFiles.length > 0
+                                    ? 'var(--accent-purple)'
+                                    : 'var(--text-dim)',
+                            border:
+                                '1px solid ' +
+                                (pendingFiles.length > 0
+                                    ? 'var(--accent-purple)'
+                                    : 'var(--text-dim)'),
                             padding: '10px 12px',
                             borderRadius: '4px',
                             cursor: 'pointer',
@@ -397,15 +448,39 @@ export function InputComposer({
                     }}
                 >
                     <span>
-                        <kbd style={{ border: '1px solid var(--border-color)', padding: '1px 4px', borderRadius: '2px' }}>/</kbd>
-                        {' '}commands
+                        <kbd
+                            style={{
+                                border: '1px solid var(--border-color)',
+                                padding: '1px 4px',
+                                borderRadius: '2px',
+                            }}
+                        >
+                            /
+                        </kbd>{' '}
+                        commands
                         {'  ·  '}
-                        <kbd style={{ border: '1px solid var(--border-color)', padding: '1px 4px', borderRadius: '2px' }}>⌘K</kbd>
-                        {' '}palette
+                        <kbd
+                            style={{
+                                border: '1px solid var(--border-color)',
+                                padding: '1px 4px',
+                                borderRadius: '2px',
+                            }}
+                        >
+                            ⌘K
+                        </kbd>{' '}
+                        palette
                     </span>
                     <span>
-                        <kbd style={{ border: '1px solid var(--border-color)', padding: '1px 4px', borderRadius: '2px' }}>Shift+Enter</kbd>
-                        {' '}new line
+                        <kbd
+                            style={{
+                                border: '1px solid var(--border-color)',
+                                padding: '1px 4px',
+                                borderRadius: '2px',
+                            }}
+                        >
+                            Shift+Enter
+                        </kbd>{' '}
+                        new line
                     </span>
                 </div>
             </form>

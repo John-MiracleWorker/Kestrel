@@ -54,8 +54,10 @@ function detectPhase(
     const lastActivity = agentActivities?.[agentActivities.length - 1];
     const aType = lastActivity?.activity_type || '';
 
-    if (aType.startsWith('council_')) return { label: 'DELIBERATING', icon: '🗳️', color: '#ec4899' };
-    if (aType.startsWith('reflection')) return { label: 'REFLECTING', icon: '🪞', color: '#06b6d4' };
+    if (aType.startsWith('council_'))
+        return { label: 'DELIBERATING', icon: '🗳️', color: '#ec4899' };
+    if (aType.startsWith('reflection'))
+        return { label: 'REFLECTING', icon: '🪞', color: '#06b6d4' };
     if (aType.startsWith('planning')) return { label: 'PLANNING', icon: '📋', color: '#3b82f6' };
     if (aType.startsWith('memory')) return { label: 'RECALLING', icon: '🧠', color: '#10b981' };
 
@@ -140,19 +142,19 @@ export function LiveCanvas({
     const charCount = content.length;
     const wordCount = content ? content.split(/\s+/).filter(Boolean).length : 0;
     const elapsedSec = (elapsedMs / 1000).toFixed(1);
-    const tokPerSec = elapsedMs > 500 ? ((charCount / 4) / (elapsedMs / 1000)).toFixed(1) : '–';
+    const tokPerSec = elapsedMs > 500 ? (charCount / 4 / (elapsedMs / 1000)).toFixed(1) : '–';
 
     // Council activities
-    const councilActivities = (agentActivities || []).filter(
-        (a) => a?.activity_type?.startsWith('council_'),
+    const councilActivities = (agentActivities || []).filter((a) =>
+        a?.activity_type?.startsWith('council_'),
     );
     const lastCouncil = councilActivities[councilActivities.length - 1];
     const councilVotes = lastCouncil?.opinions as Array<{ role: string; vote: string }> | undefined;
     const councilDecision = lastCouncil?.decision as string | undefined;
 
     // Memory activities
-    const memoryActivities = (agentActivities || []).filter(
-        (a) => a?.activity_type?.startsWith('memory'),
+    const memoryActivities = (agentActivities || []).filter((a) =>
+        a?.activity_type?.startsWith('memory'),
     );
 
     if (!isVisible) return null;
@@ -262,35 +264,60 @@ export function LiveCanvas({
                                         ⚡ {toolActivity.toolName}
                                     </div>
                                     {toolActivity.toolArgs && (
-                                        <div style={{ color: 'var(--text-dim)', marginTop: '4px', maxHeight: '40px', overflow: 'hidden' }}>
+                                        <div
+                                            style={{
+                                                color: 'var(--text-dim)',
+                                                marginTop: '4px',
+                                                maxHeight: '40px',
+                                                overflow: 'hidden',
+                                            }}
+                                        >
                                             {toolActivity.toolArgs.slice(0, 100)}
                                         </div>
                                     )}
                                 </div>
                             )}
                             {/* History */}
-                            {toolHistory.slice(-5).reverse().map((t, i) => (
-                                <div
-                                    key={i}
-                                    style={{
-                                        padding: '6px 8px',
-                                        background: 'rgba(255,255,255,0.03)',
-                                        borderRadius: '4px',
-                                        fontFamily: 'var(--font-mono)',
-                                        fontSize: '0.68rem',
-                                    }}
-                                >
-                                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                        <span style={{ color: '#10b981' }}>✓</span>
-                                        <span style={{ color: 'var(--text-primary)' }}>{t.name}</span>
-                                    </div>
-                                    {t.result && (
-                                        <div style={{ color: 'var(--text-dim)', marginTop: '2px', maxHeight: '30px', overflow: 'hidden' }}>
-                                            {t.result.slice(0, 80)}…
+                            {toolHistory
+                                .slice(-5)
+                                .reverse()
+                                .map((t, i) => (
+                                    <div
+                                        key={i}
+                                        style={{
+                                            padding: '6px 8px',
+                                            background: 'rgba(255,255,255,0.03)',
+                                            borderRadius: '4px',
+                                            fontFamily: 'var(--font-mono)',
+                                            fontSize: '0.68rem',
+                                        }}
+                                    >
+                                        <div
+                                            style={{
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                gap: '6px',
+                                            }}
+                                        >
+                                            <span style={{ color: '#10b981' }}>✓</span>
+                                            <span style={{ color: 'var(--text-primary)' }}>
+                                                {t.name}
+                                            </span>
                                         </div>
-                                    )}
-                                </div>
-                            ))}
+                                        {t.result && (
+                                            <div
+                                                style={{
+                                                    color: 'var(--text-dim)',
+                                                    marginTop: '2px',
+                                                    maxHeight: '30px',
+                                                    overflow: 'hidden',
+                                                }}
+                                            >
+                                                {t.result.slice(0, 80)}…
+                                            </div>
+                                        )}
+                                    </div>
+                                ))}
                         </div>
                     )}
                 </HudPanel>
@@ -316,9 +343,13 @@ export function LiveCanvas({
                                     <span
                                         style={{
                                             color:
-                                                v.vote === 'approve' ? '#10b981' :
-                                                    v.vote === 'reject' ? '#ef4444' :
-                                                        v.vote === 'modify' ? '#f59e0b' : 'var(--text-dim)',
+                                                v.vote === 'approve'
+                                                    ? '#10b981'
+                                                    : v.vote === 'reject'
+                                                      ? '#ef4444'
+                                                      : v.vote === 'modify'
+                                                        ? '#f59e0b'
+                                                        : 'var(--text-dim)',
                                             fontWeight: 'bold',
                                         }}
                                     >
@@ -327,7 +358,15 @@ export function LiveCanvas({
                                 </div>
                             ))}
                             {councilDecision && (
-                                <div style={{ color: '#ec4899', fontFamily: 'var(--font-mono)', fontSize: '0.7rem', marginTop: '4px', fontWeight: 'bold' }}>
+                                <div
+                                    style={{
+                                        color: '#ec4899',
+                                        fontFamily: 'var(--font-mono)',
+                                        fontSize: '0.7rem',
+                                        marginTop: '4px',
+                                        fontWeight: 'bold',
+                                    }}
+                                >
                                     DECISION: {councilDecision.toUpperCase()}
                                 </div>
                             )}
@@ -351,7 +390,8 @@ export function LiveCanvas({
                                         borderRadius: '4px',
                                     }}
                                 >
-                                    🧠 {String(m.content || m.query || m.activity_type).slice(0, 80)}
+                                    🧠{' '}
+                                    {String(m.content || m.query || m.activity_type).slice(0, 80)}
                                 </div>
                             ))}
                         </div>

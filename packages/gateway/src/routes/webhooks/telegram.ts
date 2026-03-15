@@ -28,45 +28,52 @@ export default async function telegramWebhookRoutes(
 
     const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET || '';
 
-    const telegramUpdateSchema = z.object({
-        update_id: z.number(),
-    }).passthrough();
+    const telegramUpdateSchema = z
+        .object({
+            update_id: z.number(),
+        })
+        .passthrough();
     type TelegramUpdate = z.infer<typeof telegramUpdateSchema>;
 
-    typedApp.post('/webhooks/telegram', {
-        schema: { body: telegramUpdateSchema }
-    }, async (req, reply) => {
-        try {
-            // Verify the secret token header set via Telegram's setWebhook API.
-            // This prevents arbitrary POST requests from being accepted.
-            if (webhookSecret) {
-                const headerSecret = req.headers['x-telegram-bot-api-secret-token'] as string | undefined;
-                if (!headerSecret || headerSecret !== webhookSecret) {
-                    logger.warn('Telegram webhook: invalid or missing secret token');
-                    return reply.code(403).send({ error: 'Forbidden' });
+    typedApp.post(
+        '/webhooks/telegram',
+        {
+            schema: { body: telegramUpdateSchema },
+        },
+        async (req, reply) => {
+            try {
+                // Verify the secret token header set via Telegram's setWebhook API.
+                // This prevents arbitrary POST requests from being accepted.
+                if (webhookSecret) {
+                    const headerSecret = req.headers['x-telegram-bot-api-secret-token'] as
+                        | string
+                        | undefined;
+                    if (!headerSecret || headerSecret !== webhookSecret) {
+                        logger.warn('Telegram webhook: invalid or missing secret token');
+                        return reply.code(403).send({ error: 'Forbidden' });
+                    }
+                } else {
+                    logger.warn('TELEGRAM_WEBHOOK_SECRET not configured — webhook is unprotected');
                 }
-            } else {
-                logger.warn('TELEGRAM_WEBHOOK_SECRET not configured — webhook is unprotected');
-            }
 
-            const update = req.body as TelegramUpdate;
+                const update = req.body as TelegramUpdate;
 
-            // Process asynchronously — respond 200 immediately
-            // so Telegram doesn't retry
-            setImmediate(() => {
-                processUpdate(telegramAdapter, update).catch((err: Error) => {
-                    logger.error('Failed to process Telegram update', {
-                        updateId: update.update_id,
-                        error: err.message,
+                // Process asynchronously — respond 200 immediately
+                // so Telegram doesn't retry
+                setImmediate(() => {
+                    processUpdate(telegramAdapter, update).catch((err: Error) => {
+                        logger.error('Failed to process Telegram update', {
+                            updateId: update.update_id,
+                            error: err.message,
+                        });
                     });
                 });
-            });
 
-            return reply.code(200).send({ ok: true });
-
-        } catch (err) {
-            logger.error('Telegram webhook error', { error: (err as Error).message });
-            return reply.code(500).send({ error: 'Internal error' });
-        }
-    });
+                return reply.code(200).send({ ok: true });
+            } catch (err) {
+                logger.error('Telegram webhook error', { error: (err as Error).message });
+                return reply.code(500).send({ error: 'Internal error' });
+            }
+        },
+    );
 }

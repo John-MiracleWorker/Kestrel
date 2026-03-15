@@ -364,11 +364,9 @@ export async function featureRoutes(app: FastifyInstance, deps: FeatureDeps) {
             };
             try {
                 if (localStore) {
-                    return reply
-                        .status(501)
-                        .send({
-                            error: 'Workspace membership changes are unsupported in local mode',
-                        });
+                    return reply.status(501).send({
+                        error: 'Workspace membership changes are unsupported in local mode',
+                    });
                 }
                 await brainClient.call('RemoveWorkspaceMember', { workspaceId, memberId });
                 return reply.send({ success: true });

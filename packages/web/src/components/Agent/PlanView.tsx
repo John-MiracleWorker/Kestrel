@@ -24,11 +24,7 @@ export function PlanView({ planJson, progress }: PlanViewProps) {
         const plan = JSON.parse(planJson);
         steps = plan.steps || [];
     } catch {
-        return (
-            <div className="plan-view plan-view--error">
-                Could not parse plan data.
-            </div>
-        );
+        return <div className="plan-view plan-view--error">Could not parse plan data.</div>;
     }
 
     const completedStep = parseInt(progress.current_step || '0');
@@ -46,14 +42,11 @@ export function PlanView({ planJson, progress }: PlanViewProps) {
                         index < completedStep
                             ? 'complete'
                             : index === completedStep
-                                ? 'active'
-                                : 'pending';
+                              ? 'active'
+                              : 'pending';
 
                     return (
-                        <div
-                            key={step.id}
-                            className={`plan-step plan-step--${stepStatus}`}
-                        >
+                        <div key={step.id} className={`plan-step plan-step--${stepStatus}`}>
                             <div className="plan-step__indicator">
                                 {stepStatus === 'complete' && '✅'}
                                 {stepStatus === 'active' && '🔄'}
@@ -61,9 +54,7 @@ export function PlanView({ planJson, progress }: PlanViewProps) {
                             </div>
                             <div className="plan-step__content">
                                 <div className="plan-step__name">{step.name}</div>
-                                <div className="plan-step__desc">
-                                    {step.description}
-                                </div>
+                                <div className="plan-step__desc">{step.description}</div>
                                 {step.depends_on.length > 0 && (
                                     <div className="plan-step__deps">
                                         Depends on: {step.depends_on.join(', ')}

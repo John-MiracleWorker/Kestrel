@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import traceback
+from functools import partial
 from typing import Any
 
 from rich.console import Group
 from rich.panel import Panel
 from rich.text import Text
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, ScreenStackError
 from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, RichLog, Static, TextArea
@@ -194,6 +195,7 @@ class KestrelTextualApp(App[None]):
         self.set_interval(0.85, self._tick_brandline)
         await self._refresh_all()
         self._ui_ready = True
+        self._focus_primary_control()
         self.run_worker(self._poll_runtime_loop(), name="runtime-poller", group="runtime")
         self.run_worker(self._poll_tasks_loop(), name="task-poller", group="tasks")
         self.run_worker(self._poll_approvals_loop(), name="approval-poller", group="approvals")
@@ -226,10 +228,15 @@ class KestrelTextualApp(App[None]):
     def _ui_screen(self):
         if self.screen_stack:
             return self.screen_stack[0]
-        return self.screen
+        try:
+            return self.screen
+        except ScreenStackError:
+            return None
 
     def _ui_query_one(self, selector, expect_type=None):
         screen = self._ui_screen()
+        if screen is None:
+            raise ScreenStackError("No screens on stack")
         if expect_type is None:
             return screen.query_one(selector)
         return screen.query_one(selector, expect_type)
@@ -325,6 +332,16 @@ class KestrelTextualApp(App[None]):
         except Exception as exc:
             self._report_error("Task detail refresh failed", exc, notify=False)
 
+    def _queue_task_bundle_refresh(self, task_id: str, *, name: str, exclusive: bool = False) -> None:
+        if not task_id or not self._running or not self.is_mounted:
+            return
+        self.run_worker(
+            partial(self._refresh_task_bundle, task_id),
+            name=name,
+            group="task-bundle",
+            exclusive=exclusive,
+        )
+
     async def _refresh_approvals(self) -> None:
         self.store.mark_busy("approvals", True)
         try:
@@ -406,7 +423,7 @@ class KestrelTextualApp(App[None]):
         self._render_bottom_bar()
 
     def _render_state(self) -> None:
-        if not self.is_mounted:
+        if not self.is_mounted or self._ui_screen() is None:
             return
         self._sync_layout()
         self._render_chrome()
@@ -437,7 +454,7 @@ class KestrelTextualApp(App[None]):
 
     def _render_bottom_bar(self) -> None:
         notice = self.store.state.notice_text or "Ready"
-        hints = "CTRL+K palette  CTRL+N notifications  CTRL+R refresh  CTRL+I details  CTRL+ENTER send"
+        hints = "TAB cycle  ARROWS select  ENTER open  CTRL+K palette  CTRL+N notifications"
         self._ui_query_one("#notice-bar", Static).update(notice)
         self._ui_query_one("#hint-bar", Static).update(hints)
 
@@ -1136,8 +1153,24 @@ class KestrelTextualApp(App[None]):
             self.store.set_notice(f"{view.title()} ready", "info")
         self._sync_layout()
         self._render_state()
-        if view == VIEW_CHAT:
-            self._ui_query_one("#chat-composer", TextArea).focus()
+        self._focus_primary_control(view)
+
+    def _focus_primary_control(self, view: str | None = None) -> None:
+        target_view = view or self.store.state.active_view
+        selector_map: dict[str, tuple[str, Any]] = {
+            VIEW_COCKPIT: ("#cockpit-tasks", DataTable),
+            VIEW_CHAT: ("#chat-composer", TextArea),
+            VIEW_TASKS: ("#tasks-table", DataTable),
+            VIEW_APPROVALS: ("#approvals-table", DataTable),
+            VIEW_SKILLS: ("#skills-table", DataTable),
+        }
+        selector, expect_type = selector_map.get(target_view, ("", None))
+        if not selector or expect_type is None:
+            return
+        try:
+            self._ui_query_one(selector, expect_type).focus()
+        except Exception:
+            return
 
     def action_view_cockpit(self) -> None:
         self._activate_view(VIEW_COCKPIT)
@@ -1220,7 +1253,7 @@ class KestrelTextualApp(App[None]):
         if button_id == "tasks-refresh":
             selected_task_id = self.store.state.selected_task_id
             if selected_task_id:
-                self.run_worker(self._refresh_task_bundle(selected_task_id), name="task-bundle-refresh")
+                self._queue_task_bundle_refresh(selected_task_id, name="task-bundle-refresh")
             else:
                 self.run_worker(self._refresh_tasks(), name="task-refresh")
             return
@@ -1247,23 +1280,43 @@ class KestrelTextualApp(App[None]):
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if self._suspend_table_events or not self._ui_ready:
             return
-        row_key = str(event.row_key.value)
+        row_key = self._extract_row_key(event)
+        if not row_key:
+            return
         self._handle_table_selection(event.data_table.id or "", row_key, activate=True)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        del event
-        return
+        if self._suspend_table_events or not self._ui_ready or not event.data_table.has_focus:
+            return
+        row_key = self._extract_row_key(event)
+        if not row_key:
+            return
+        self._handle_table_selection(event.data_table.id or "", row_key, activate=False)
+
+    def _extract_row_key(self, event: DataTable.RowSelected | DataTable.RowHighlighted) -> str:
+        row_key = getattr(event, "row_key", None)
+        if row_key is None:
+            return ""
+        value = getattr(row_key, "value", row_key)
+        return str(value or "")
 
     def _handle_table_selection(self, table_id: str, row_key: str, *, activate: bool) -> None:
         if table_id in {"cockpit-tasks", "tasks-table"}:
+            changed = self.store.state.selected_task_id != row_key
+            if not changed and not activate:
+                return
             self.store.select_task(row_key)
-            self.run_worker(self._refresh_task_bundle(row_key), name=f"task-bundle-{row_key}")
+            if changed and self._running and self.is_mounted:
+                self._queue_task_bundle_refresh(row_key, name=f"task-bundle-{row_key}", exclusive=True)
             if activate and table_id == "cockpit-tasks":
                 self._activate_view(VIEW_TASKS)
             else:
                 self._render_state()
             return
         if table_id in {"cockpit-approvals", "approvals-table"}:
+            changed = self.store.state.selected_approval_id != row_key
+            if not changed and not activate:
+                return
             self.store.select_approval(row_key)
             if activate and table_id == "cockpit-approvals":
                 self._activate_view(VIEW_APPROVALS)
@@ -1271,6 +1324,8 @@ class KestrelTextualApp(App[None]):
                 self._render_state()
             return
         if table_id == "skills-table":
+            if self.store.state.selected_skill_id == row_key and not activate:
+                return
             self.store.select_skill(row_key)
             self._render_state()
 

@@ -227,6 +227,7 @@ def test_textual_app_boots_and_lands_in_cockpit():
             await pilot.pause(0.35)
             assert app.store.state.active_view == VIEW_COCKPIT
             assert "ministral" in str(app.query_one("#runtime-summary").renderable).lower()
+            assert getattr(app.focused, "id", "") == "cockpit-tasks"
 
     asyncio.run(scenario())
 
@@ -266,6 +267,22 @@ def test_textual_navigation_button_switches_view():
             await pilot.click("#nav-tasks")
             await pilot.pause(0.1)
             assert app.store.state.active_view == VIEW_TASKS
+            assert getattr(app.focused, "id", "") == "tasks-table"
+
+    asyncio.run(scenario())
+
+
+def test_tasks_keyboard_navigation_updates_selection_without_enter():
+    async def scenario():
+        app = KestrelTextualApp(FakeClient(), _config())
+        async with app.run_test(headless=True, size=(160, 46)) as pilot:
+            await pilot.pause(0.35)
+            await pilot.click("#nav-tasks")
+            await pilot.pause(0.1)
+            assert app.store.state.selected_task_id == "task-1"
+            await pilot.press("down")
+            await pilot.pause(0.2)
+            assert app.store.state.selected_task_id == "task-live"
 
     asyncio.run(scenario())
 

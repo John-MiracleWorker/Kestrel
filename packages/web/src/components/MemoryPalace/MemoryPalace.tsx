@@ -6,7 +6,15 @@ import { request } from '../../api/client';
 interface MemoryNode {
     id: string;
     label: string;
-    entity_type: 'file' | 'person' | 'decision' | 'concept' | 'error' | 'project' | 'tool' | 'conversation';
+    entity_type:
+        | 'file'
+        | 'person'
+        | 'decision'
+        | 'concept'
+        | 'error'
+        | 'project'
+        | 'tool'
+        | 'conversation';
     description?: string;
     weight: number;
     mentions: number;
@@ -291,7 +299,8 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
             const si = idx.get(link.source);
             const ti = idx.get(link.target);
             if (si === undefined || ti === undefined) continue;
-            const src = nodes[si], tgt = nodes[ti];
+            const src = nodes[si],
+                tgt = nodes[ti];
             const dx = tgt.x - src.x;
             const dy = tgt.y - src.y;
             const dist = Math.sqrt(dx * dx + dy * dy);
@@ -305,7 +314,8 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
             tgt.vy -= fy;
         }
         // Centering + damping + velocity clamping + integration
-        const cx = w / 2, cy = h / 2;
+        const cx = w / 2,
+            cy = h / 2;
         const maxV = 8; // velocity cap to prevent explosions
         for (const n of nodes) {
             // Centering gravity
@@ -361,7 +371,8 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
             const tgt = nodes.find((n) => n.id === link.target);
             if (!src || !tgt) continue;
             const isHighlighted = filteredIds.has(src.id) && filteredIds.has(tgt.id);
-            const isConnected = selected && (link.source === selected.id || link.target === selected.id);
+            const isConnected =
+                selected && (link.source === selected.id || link.target === selected.id);
 
             ctx.beginPath();
             ctx.moveTo(src.x, src.y);
@@ -371,8 +382,10 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
             ctx.stroke();
 
             // Label on hover or when selected
-            if ((hovered && (link.source === hovered || link.target === hovered)) ||
-                (selected && (link.source === selected.id || link.target === selected.id))) {
+            if (
+                (hovered && (link.source === hovered || link.target === hovered)) ||
+                (selected && (link.source === selected.id || link.target === selected.id))
+            ) {
                 const mx = (src.x + tgt.x) / 2;
                 const my = (src.y + tgt.y) / 2;
                 ctx.fillStyle = '#555';
@@ -420,7 +433,8 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
             // Always show labels (truncated for smaller nodes)
             const showLabel = isHovered || isSelected || node.weight >= 3 || isConversation;
             if (showLabel) {
-                const labelText = node.label.length > 20 ? node.label.slice(0, 18) + '…' : node.label;
+                const labelText =
+                    node.label.length > 20 ? node.label.slice(0, 18) + '…' : node.label;
                 ctx.fillStyle = isFiltered ? '#d0d0d0' : '#444';
                 ctx.font = `${isHovered ? 11 : 10}px JetBrains Mono`;
                 ctx.textAlign = 'center';
@@ -529,10 +543,15 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
         if (!d) return '—';
         try {
             return new Date(d).toLocaleDateString('en-US', {
-                month: 'short', day: 'numeric', year: '2-digit',
-                hour: '2-digit', minute: '2-digit',
+                month: 'short',
+                day: 'numeric',
+                year: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
             });
-        } catch { return '—'; }
+        } catch {
+            return '—';
+        }
     };
 
     return createPortal(
@@ -584,7 +603,11 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
 
                         {/* Type badge */}
                         <div style={{ marginBottom: '12px' }}>
-                            <span style={S.metaBadge(ENTITY_COLORS[selectedNode.entity_type] || '#888')}>
+                            <span
+                                style={S.metaBadge(
+                                    ENTITY_COLORS[selectedNode.entity_type] || '#888',
+                                )}
+                            >
                                 {selectedNode.entity_type}
                             </span>
                         </div>
@@ -593,9 +616,7 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
                         {selectedNode.description && (
                             <>
                                 <div style={S.sectionTitle}>// Description</div>
-                                <div style={S.descriptionBox}>
-                                    {selectedNode.description}
-                                </div>
+                                <div style={S.descriptionBox}>{selectedNode.description}</div>
                             </>
                         )}
 
@@ -626,9 +647,13 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
                         <div style={S.sectionTitle}>// Connections ({selectedLinks.length})</div>
                         {selectedLinks.map((l, i) => {
                             const otherId = l.source === selectedNode.id ? l.target : l.source;
-                            const otherNode = nodes.find(n => n.id === otherId);
-                            const otherColor = otherNode ? ENTITY_COLORS[otherNode.entity_type] || '#888' : '#888';
-                            const otherIcon = otherNode ? ENTITY_ICONS[otherNode.entity_type] || '•' : '•';
+                            const otherNode = nodes.find((n) => n.id === otherId);
+                            const otherColor = otherNode
+                                ? ENTITY_COLORS[otherNode.entity_type] || '#888'
+                                : '#888';
+                            const otherIcon = otherNode
+                                ? ENTITY_ICONS[otherNode.entity_type] || '•'
+                                : '•';
                             const otherLabel = otherNode?.label || otherId.slice(0, 12);
                             return (
                                 <div
@@ -642,7 +667,9 @@ export function MemoryPalace({ workspaceId, isVisible, onClose }: MemoryPalacePr
                                         if (otherNode) setSelectedNode(otherNode);
                                     }}
                                 >
-                                    <span style={{ color: '#00f3ff', fontSize: '0.65rem' }}>{l.relation}</span>
+                                    <span style={{ color: '#00f3ff', fontSize: '0.65rem' }}>
+                                        {l.relation}
+                                    </span>
                                     {' → '}
                                     <span style={{ color: otherColor }}>
                                         {otherIcon} {otherLabel}

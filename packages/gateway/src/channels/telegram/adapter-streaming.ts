@@ -226,6 +226,10 @@ export async function sendStreamEnd(
     }
 
     for (const media of mediaFiles) {
+        if (typeof adapter.sendMediaFile === 'function') {
+            await adapter.sendMediaFile(chatId, media, threadId);
+            continue;
+        }
         await sendMediaFile(adapter, chatId, media, threadId);
     }
 }

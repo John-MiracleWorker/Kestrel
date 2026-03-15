@@ -145,7 +145,7 @@ export function ActivityTimeline({ toolActivity, agentActivities = [] }: Activit
     if (nodes.length === 0) return null;
 
     const toggle = (id: string) => {
-        setExpanded(prev => {
+        setExpanded((prev) => {
             const next = new Set(prev);
             if (next.has(id)) next.delete(id);
             else next.add(id);
@@ -170,7 +170,11 @@ export function ActivityTimeline({ toolActivity, agentActivities = [] }: Activit
                 return (
                     <div
                         key={node.id}
-                        style={{ display: 'flex', gap: '10px', cursor: node.detail ? 'pointer' : 'default' }}
+                        style={{
+                            display: 'flex',
+                            gap: '10px',
+                            cursor: node.detail ? 'pointer' : 'default',
+                        }}
                         onClick={() => node.detail && toggle(node.id)}
                     >
                         {/* Timeline line + dot */}
@@ -189,8 +193,12 @@ export function ActivityTimeline({ toolActivity, agentActivities = [] }: Activit
                                     height: '8px',
                                     borderRadius: '50%',
                                     background: node.color,
-                                    boxShadow: node.status === 'active' ? `0 0 8px ${node.color}` : 'none',
-                                    animation: node.status === 'active' ? 'timeline-pulse 1.5s ease-in-out infinite' : 'none',
+                                    boxShadow:
+                                        node.status === 'active' ? `0 0 8px ${node.color}` : 'none',
+                                    animation:
+                                        node.status === 'active'
+                                            ? 'timeline-pulse 1.5s ease-in-out infinite'
+                                            : 'none',
                                     flexShrink: 0,
                                     marginTop: '4px',
                                 }}
@@ -219,7 +227,9 @@ export function ActivityTimeline({ toolActivity, agentActivities = [] }: Activit
                                 }}
                             >
                                 <span>{node.icon}</span>
-                                <span style={{ color: node.color, fontWeight: 600 }}>{node.label}</span>
+                                <span style={{ color: node.color, fontWeight: 600 }}>
+                                    {node.label}
+                                </span>
                                 {node.status === 'active' && (
                                     <span
                                         style={{

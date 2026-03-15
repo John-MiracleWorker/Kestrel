@@ -7,13 +7,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 const tempRoots: string[] = [];
 const activeServers: net.Server[] = [];
 
+type ControlServerEndpoint = { kind: 'tcp'; port: number } | { kind: 'unix'; socketPath: string };
+
 function makeTempRoot(): string {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kestrel-brain-local-'));
     tempRoots.push(root);
     return root;
 }
 
-async function startControlServer(): Promise<number> {
+async function startControlServer(root: string): Promise<ControlServerEndpoint> {
     const server = net.createServer((socket) => {
         let buffer = '';
         socket.on('data', (chunk) => {
@@ -81,13 +83,22 @@ async function startControlServer(): Promise<number> {
         });
     });
 
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    if (process.platform === 'win32') {
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    } else {
+        const socketPath = path.join(root, 'run', 'control.sock');
+        fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+        await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+        activeServers.push(server);
+        return { kind: 'unix', socketPath };
+    }
+
     activeServers.push(server);
     const address = server.address();
     if (!address || typeof address === 'string') {
         throw new Error('Failed to bind control server');
     }
-    return address.port;
+    return { kind: 'tcp', port: address.port };
 }
 
 afterEach(async () => {
@@ -110,11 +121,13 @@ afterEach(async () => {
 describe('BrainClient local mode', () => {
     it('uses daemon transport for chat and task reads while persisting local operator state', async () => {
         const root = makeTempRoot();
-        const port = await startControlServer();
+        const endpoint = await startControlServer(root);
         process.env.KESTREL_HOME = root;
         process.env.KESTREL_RUNTIME_MODE = 'native';
-        process.env.KESTREL_CONTROL_HOST = '127.0.0.1';
-        process.env.KESTREL_CONTROL_PORT = String(port);
+        if (endpoint.kind === 'tcp') {
+            process.env.KESTREL_CONTROL_HOST = '127.0.0.1';
+            process.env.KESTREL_CONTROL_PORT = String(endpoint.port);
+        }
 
         const { BrainClient } = await import('../src/brain/client');
         const client = new BrainClient('unused');

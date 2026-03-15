@@ -9,8 +9,12 @@ import {
 import { logger } from '../../utils/logger';
 import { DiscordConfig, DiscordInteraction, DiscordMessagePayload, DiscordUser } from './types';
 import { SLASH_COMMANDS, COLORS } from './constants';
-import { handleMessage, handleTaskMessage, handleInteraction, handleComponentInteraction } from './handlers';
-
+import {
+    handleMessage,
+    handleTaskMessage,
+    handleInteraction,
+    handleComponentInteraction,
+} from './handlers';
 
 // ── Discord Adapter ────────────────────────────────────────────────
 
@@ -40,14 +44,14 @@ export class DiscordAdapter extends BaseChannelAdapter {
     private sequence: number | null = null;
 
     // Channel → userId mapping
-    public channelUserMap = new Map<string, string>();    // discordUserId → kestrelUserId
-    public userChannelMap = new Map<string, string>();    // kestrelUserId → discordChannelId
+    public channelUserMap = new Map<string, string>(); // discordUserId → kestrelUserId
+    public userChannelMap = new Map<string, string>(); // kestrelUserId → discordChannelId
 
     // Typing indicators
     private typingIntervals = new Map<string, NodeJS.Timeout>();
 
     // Active task threads
-    public taskThreads = new Map<string, string>();  // taskConversationId → threadId
+    public taskThreads = new Map<string, string>(); // taskConversationId → threadId
 
     // Pending approvals
     public pendingApprovals = new Map<string, { channelId: string; userId: string }>();
@@ -96,18 +100,18 @@ export class DiscordAdapter extends BaseChannelAdapter {
     public isAllowed(roles?: string[]): boolean {
         if (!this.config.allowedRoleIds?.length) return true;
         if (!roles?.length) return false;
-        return roles.some(r => this.config.allowedRoleIds!.includes(r));
+        return roles.some((r) => this.config.allowedRoleIds!.includes(r));
     }
 
     // ── Typing Indicators ──────────────────────────────────────────
 
     public startTyping(channelId: string): void {
-        this.apiRequest('POST', `/channels/${channelId}/typing`).catch(() => { });
+        this.apiRequest('POST', `/channels/${channelId}/typing`).catch(() => {});
 
         if (!this.typingIntervals.has(channelId)) {
             const interval = setInterval(() => {
-                this.apiRequest('POST', `/channels/${channelId}/typing`).catch(() => { });
-            }, 8000);  // Discord typing indicator lasts ~10s
+                this.apiRequest('POST', `/channels/${channelId}/typing`).catch(() => {});
+            }, 8000); // Discord typing indicator lasts ~10s
             this.typingIntervals.set(channelId, interval);
         }
     }
@@ -166,19 +170,21 @@ export class DiscordAdapter extends BaseChannelAdapter {
         switch (op) {
             case 10: // HELLO
                 this.startHeartbeat(d.heartbeat_interval);
-                this.gatewayWs?.send(JSON.stringify({
-                    op: 2,
-                    d: {
-                        token: this.config.botToken,
-                        intents: (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15),
-                        // GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT | GUILD_MESSAGE_REACTIONS
-                        properties: {
-                            os: process.platform,
-                            browser: 'kestrel',
-                            device: 'kestrel',
+                this.gatewayWs?.send(
+                    JSON.stringify({
+                        op: 2,
+                        d: {
+                            token: this.config.botToken,
+                            intents: (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15),
+                            // GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT | GUILD_MESSAGE_REACTIONS
+                            properties: {
+                                os: process.platform,
+                                browser: 'kestrel',
+                                device: 'kestrel',
+                            },
                         },
-                    },
-                }));
+                    }),
+                );
                 break;
 
             case 0: // DISPATCH
@@ -205,14 +211,16 @@ export class DiscordAdapter extends BaseChannelAdapter {
             case 9: // INVALID SESSION
                 logger.warn('Discord invalid session, re-identifying...');
                 if (d) {
-                    this.gatewayWs?.send(JSON.stringify({
-                        op: 6,
-                        d: {
-                            token: this.config.botToken,
-                            session_id: this.sessionId,
-                            seq: this.sequence,
-                        },
-                    }));
+                    this.gatewayWs?.send(
+                        JSON.stringify({
+                            op: 6,
+                            d: {
+                                token: this.config.botToken,
+                                session_id: this.sessionId,
+                                seq: this.sequence,
+                            },
+                        }),
+                    );
                 } else {
                     reject?.(new Error('Discord session invalidated'));
                 }
@@ -268,23 +276,27 @@ export class DiscordAdapter extends BaseChannelAdapter {
             const chunks = this.chunkMessage(content, 4000);
             for (let i = 0; i < chunks.length; i++) {
                 const payload: any = {
-                    embeds: [{
-                        description: chunks[i],
-                        color: COLORS.primary,
-                    }],
+                    embeds: [
+                        {
+                            description: chunks[i],
+                            color: COLORS.primary,
+                        },
+                    ],
                 };
 
                 // Add buttons only to last chunk
                 if (i === chunks.length - 1 && message.options?.buttons?.length) {
-                    payload.components = [{
-                        type: 1,
-                        components: message.options.buttons.map((btn) => ({
-                            type: 2,
-                            style: 1,
-                            label: btn.label,
-                            custom_id: btn.action,
-                        })),
-                    }];
+                    payload.components = [
+                        {
+                            type: 1,
+                            components: message.options.buttons.map((btn) => ({
+                                type: 2,
+                                style: 1,
+                                label: btn.label,
+                                custom_id: btn.action,
+                            })),
+                        },
+                    ];
                 }
 
                 await this.apiRequest('POST', `/channels/${channelId}/messages`, payload);
@@ -294,15 +306,17 @@ export class DiscordAdapter extends BaseChannelAdapter {
             const payload: any = { content };
 
             if (message.options?.buttons?.length) {
-                payload.components = [{
-                    type: 1,
-                    components: message.options.buttons.map((btn) => ({
-                        type: 2,
-                        style: 1,
-                        label: btn.label,
-                        custom_id: btn.action,
-                    })),
-                }];
+                payload.components = [
+                    {
+                        type: 1,
+                        components: message.options.buttons.map((btn) => ({
+                            type: 2,
+                            style: 1,
+                            label: btn.label,
+                            custom_id: btn.action,
+                        })),
+                    },
+                ];
             }
 
             await this.apiRequest('POST', `/channels/${channelId}/messages`, payload);
@@ -340,12 +354,12 @@ export class DiscordAdapter extends BaseChannelAdapter {
      */
     async sendTaskProgress(channelId: string, step: string, detail: string = ''): Promise<void> {
         const payload = {
-            embeds: [{
-                description: detail
-                    ? `🔧 **${step}**\n${detail}`
-                    : `🔧 ${step}`,
-                color: COLORS.progress,
-            }],
+            embeds: [
+                {
+                    description: detail ? `🔧 **${step}**\n${detail}` : `🔧 ${step}`,
+                    color: COLORS.progress,
+                },
+            ],
         };
 
         await this.apiRequest('POST', `/channels/${channelId}/messages`, payload);
@@ -362,29 +376,33 @@ export class DiscordAdapter extends BaseChannelAdapter {
         this.pendingApprovals.set(approvalId, { channelId, userId: '' });
 
         await this.apiRequest('POST', `/channels/${channelId}/messages`, {
-            embeds: [{
-                title: '⚠️ Approval Required',
-                description: `${description}\n\nID: \`${approvalId}\``,
-                color: COLORS.warning,
-                timestamp: new Date().toISOString(),
-            }],
-            components: [{
-                type: 1,
-                components: [
-                    {
-                        type: 2,
-                        style: 3, // SUCCESS (green)
-                        label: '✅ Approve',
-                        custom_id: `approve:${approvalId}`,
-                    },
-                    {
-                        type: 2,
-                        style: 4, // DANGER (red)
-                        label: '❌ Reject',
-                        custom_id: `reject:${approvalId}`,
-                    },
-                ],
-            }],
+            embeds: [
+                {
+                    title: '⚠️ Approval Required',
+                    description: `${description}\n\nID: \`${approvalId}\``,
+                    color: COLORS.warning,
+                    timestamp: new Date().toISOString(),
+                },
+            ],
+            components: [
+                {
+                    type: 1,
+                    components: [
+                        {
+                            type: 2,
+                            style: 3, // SUCCESS (green)
+                            label: '✅ Approve',
+                            custom_id: `approve:${approvalId}`,
+                        },
+                        {
+                            type: 2,
+                            style: 4, // DANGER (red)
+                            label: '❌ Reject',
+                            custom_id: `reject:${approvalId}`,
+                        },
+                    ],
+                },
+            ],
         });
     }
 

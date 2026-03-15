@@ -3,10 +3,10 @@ import './MetricsBar.css';
 
 /**
  * MetricsBar — real-time token/cost/performance display.
- * 
+ *
  * Shows compact metrics during agent execution:
  * - Total tokens used
- * - Estimated cost in USD  
+ * - Estimated cost in USD
  * - Elapsed time
  * - Tool call count
  * - LLM call count
@@ -100,9 +100,14 @@ export const MetricsBar: React.FC<MetricsBarProps> = ({ metrics, isRunning }) =>
                 {(metrics.context_compactions ?? 0) > 0 && (
                     <>
                         <div className="metrics-bar__divider" />
-                        <div className="metrics-bar__item metrics-bar__item--warning" title="Context compactions">
+                        <div
+                            className="metrics-bar__item metrics-bar__item--warning"
+                            title="Context compactions"
+                        >
                             <span className="metrics-bar__icon">📦</span>
-                            <span className="metrics-bar__value">{metrics.context_compactions}</span>
+                            <span className="metrics-bar__value">
+                                {metrics.context_compactions}
+                            </span>
                             <span className="metrics-bar__label">compact</span>
                         </div>
                     </>
@@ -111,7 +116,10 @@ export const MetricsBar: React.FC<MetricsBarProps> = ({ metrics, isRunning }) =>
                 {(metrics.model_failovers ?? 0) > 0 && (
                     <>
                         <div className="metrics-bar__divider" />
-                        <div className="metrics-bar__item metrics-bar__item--danger" title="Model failovers">
+                        <div
+                            className="metrics-bar__item metrics-bar__item--danger"
+                            title="Model failovers"
+                        >
                             <span className="metrics-bar__icon">🔄</span>
                             <span className="metrics-bar__value">{metrics.model_failovers}</span>
                             <span className="metrics-bar__label">failover</span>

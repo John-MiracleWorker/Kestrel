@@ -33,89 +33,149 @@ const TYPE_ICONS: Record<string, string> = {
 /* ── Styles ────────────────────────────────────────────────────── */
 const S = {
     panel: {
-        position: 'fixed' as const, bottom: '20px', right: '20px',
-        width: '380px', maxHeight: '520px',
-        background: 'rgba(10,10,10,0.95)', backdropFilter: 'blur(12px)',
-        border: '1px solid #222', borderRadius: '8px',
-        fontFamily: 'JetBrains Mono, monospace', zIndex: 9999,
-        display: 'flex', flexDirection: 'column' as const,
+        position: 'fixed' as const,
+        bottom: '20px',
+        right: '20px',
+        width: '380px',
+        maxHeight: '520px',
+        background: 'rgba(10,10,10,0.95)',
+        backdropFilter: 'blur(12px)',
+        border: '1px solid #222',
+        borderRadius: '8px',
+        fontFamily: 'JetBrains Mono, monospace',
+        zIndex: 9999,
+        display: 'flex',
+        flexDirection: 'column' as const,
         boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
         overflow: 'hidden',
     },
     header: {
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        padding: '10px 14px', borderBottom: '1px solid #222',
-        cursor: 'grab', userSelect: 'none' as const,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        padding: '10px 14px',
+        borderBottom: '1px solid #222',
+        cursor: 'grab',
+        userSelect: 'none' as const,
     },
     title: {
-        fontSize: '0.7rem', fontWeight: 700, color: '#00f3ff',
-        letterSpacing: '0.06em', textTransform: 'uppercase' as const,
+        fontSize: '0.7rem',
+        fontWeight: 700,
+        color: '#00f3ff',
+        letterSpacing: '0.06em',
+        textTransform: 'uppercase' as const,
     },
     statusDot: (active: boolean) => ({
-        width: '6px', height: '6px', borderRadius: '50%',
+        width: '6px',
+        height: '6px',
+        borderRadius: '50%',
         background: active ? '#10b981' : '#555',
-        display: 'inline-block', marginRight: '6px',
+        display: 'inline-block',
+        marginRight: '6px',
         boxShadow: active ? '0 0 6px #10b981' : 'none',
     }),
     headerBtns: {
-        display: 'flex', gap: '6px',
+        display: 'flex',
+        gap: '6px',
     },
     iconBtn: {
-        background: 'none', border: 'none', color: '#555',
-        fontSize: '0.8rem', cursor: 'pointer', padding: '2px 4px',
+        background: 'none',
+        border: 'none',
+        color: '#555',
+        fontSize: '0.8rem',
+        cursor: 'pointer',
+        padding: '2px 4px',
     },
     body: {
-        flex: 1, overflowY: 'auto' as const, padding: '8px 14px',
+        flex: 1,
+        overflowY: 'auto' as const,
+        padding: '8px 14px',
     },
     suggestion: (type: string) => ({
-        padding: '10px 12px', marginBottom: '8px',
-        background: '#111', borderRadius: '4px',
+        padding: '10px 12px',
+        marginBottom: '8px',
+        background: '#111',
+        borderRadius: '4px',
         borderLeft: `3px solid ${TYPE_COLORS[type] || '#555'}`,
         animation: 'fadeIn 0.3s ease-out',
     }),
     suggTitle: {
-        fontSize: '0.75rem', color: '#e0e0e0', marginBottom: '4px',
-        display: 'flex', alignItems: 'center', gap: '6px',
+        fontSize: '0.75rem',
+        color: '#e0e0e0',
+        marginBottom: '4px',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '6px',
     },
     suggDesc: {
-        fontSize: '0.7rem', color: '#888', lineHeight: 1.45,
+        fontSize: '0.7rem',
+        color: '#888',
+        lineHeight: 1.45,
     },
     actionBtn: {
-        background: 'none', border: '1px solid #333', borderRadius: '3px',
-        color: '#00f3ff', fontSize: '0.6rem', padding: '3px 8px',
-        cursor: 'pointer', marginTop: '8px', float: 'right' as const,
+        background: 'none',
+        border: '1px solid #333',
+        borderRadius: '3px',
+        color: '#00f3ff',
+        fontSize: '0.6rem',
+        padding: '3px 8px',
+        cursor: 'pointer',
+        marginTop: '8px',
+        float: 'right' as const,
     },
     statusBar: {
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        padding: '8px 14px', borderTop: '1px solid #222',
-        background: '#080808', fontSize: '0.6rem', color: '#555',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        padding: '8px 14px',
+        borderTop: '1px solid #222',
+        background: '#080808',
+        fontSize: '0.6rem',
+        color: '#555',
     },
     resolutionPill: (active: boolean) => ({
-        padding: '2px 6px', borderRadius: '3px', fontSize: '0.55rem',
+        padding: '2px 6px',
+        borderRadius: '3px',
+        fontSize: '0.55rem',
         border: `1px solid ${active ? '#a855f7' : '#333'}`,
         color: active ? '#a855f7' : '#555',
         background: active ? 'rgba(168,85,247,0.1)' : 'transparent',
-        cursor: 'pointer', marginLeft: '4px',
+        cursor: 'pointer',
+        marginLeft: '4px',
     }),
     pauseBtn: {
-        background: 'none', border: '1px solid #333', borderRadius: '3px',
-        color: '#f59e0b', fontSize: '0.6rem', padding: '2px 8px',
+        background: 'none',
+        border: '1px solid #333',
+        borderRadius: '3px',
+        color: '#f59e0b',
+        fontSize: '0.6rem',
+        padding: '2px 8px',
         cursor: 'pointer',
     },
     emptyState: {
-        padding: '40px 20px', textAlign: 'center' as const,
-        color: '#444', fontSize: '0.7rem',
+        padding: '40px 20px',
+        textAlign: 'center' as const,
+        color: '#444',
+        fontSize: '0.7rem',
     },
     analyzing: {
-        padding: '12px 14px', borderBottom: '1px solid #222',
-        background: 'rgba(0,243,255,0.03)', fontSize: '0.65rem',
-        color: '#00f3ff', display: 'flex', alignItems: 'center', gap: '8px',
+        padding: '12px 14px',
+        borderBottom: '1px solid #222',
+        background: 'rgba(0,243,255,0.03)',
+        fontSize: '0.65rem',
+        color: '#00f3ff',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '8px',
     },
     error: {
-        padding: '10px 12px', marginBottom: '8px',
-        background: '#111', borderRadius: '4px',
+        padding: '10px 12px',
+        marginBottom: '8px',
+        background: '#111',
+        borderRadius: '4px',
         borderLeft: '3px solid #ef4444',
-        fontSize: '0.7rem', color: '#f87171',
+        fontSize: '0.7rem',
+        color: '#f87171',
     },
 };
 
@@ -164,7 +224,7 @@ export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProp
 
         setIsAnalyzing(true);
         setError(null);
-        setFrameCount(prev => prev + 1);
+        setFrameCount((prev) => prev + 1);
 
         try {
             const result = await request<{
@@ -179,10 +239,10 @@ export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProp
             });
 
             if (result.suggestions?.length > 0) {
-                setSuggestions(prev => {
+                setSuggestions((prev) => {
                     // Deduplicate by title
-                    const existingTitles = new Set(prev.map(s => s.title));
-                    const newSuggs = result.suggestions.filter(s => !existingTitles.has(s.title));
+                    const existingTitles = new Set(prev.map((s) => s.title));
+                    const newSuggs = result.suggestions.filter((s) => !existingTitles.has(s.title));
                     // Keep max 10 suggestions
                     return [...newSuggs, ...prev].slice(0, 10);
                 });
@@ -238,7 +298,7 @@ export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProp
     };
 
     const stopCapture = () => {
-        streamRef.current?.getTracks().forEach(t => t.stop());
+        streamRef.current?.getTracks().forEach((t) => t.stop());
         streamRef.current = null;
         if (videoRef.current) {
             videoRef.current.pause();
@@ -265,13 +325,13 @@ export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProp
     };
 
     const dismissSuggestion = (id: string) => {
-        setSuggestions(prev => prev.filter(s => s.id !== id));
+        setSuggestions((prev) => prev.filter((s) => s.id !== id));
     };
 
     // Cleanup on unmount
     useEffect(() => {
         return () => {
-            streamRef.current?.getTracks().forEach(t => t.stop());
+            streamRef.current?.getTracks().forEach((t) => t.stop());
             if (intervalRef.current) clearInterval(intervalRef.current);
         };
     }, []);
@@ -286,12 +346,19 @@ export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProp
 
     // Drag handlers
     const handleDragStart = (e: React.MouseEvent) => {
-        dragRef.current = { isDragging: true, startX: e.clientX - position.x, startY: e.clientY - position.y };
+        dragRef.current = {
+            isDragging: true,
+            startX: e.clientX - position.x,
+            startY: e.clientY - position.y,
+        };
     };
 
     const handleDragMove = useCallback((e: MouseEvent) => {
         if (dragRef.current.isDragging) {
-            setPosition({ x: e.clientX - dragRef.current.startX, y: e.clientY - dragRef.current.startY });
+            setPosition({
+                x: e.clientX - dragRef.current.startX,
+                y: e.clientY - dragRef.current.startY,
+            });
         }
     }, []);
 
@@ -326,8 +393,23 @@ export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProp
                     </span>
                 </div>
                 <div style={S.headerBtns}>
-                    <button style={S.iconBtn} onClick={() => setShowSettings(!showSettings)} title="Settings">⚙</button>
-                    <button style={S.iconBtn} onClick={() => { stopCapture(); onClose(); }} title="Close">✕</button>
+                    <button
+                        style={S.iconBtn}
+                        onClick={() => setShowSettings(!showSettings)}
+                        title="Settings"
+                    >
+                        ⚙
+                    </button>
+                    <button
+                        style={S.iconBtn}
+                        onClick={() => {
+                            stopCapture();
+                            onClose();
+                        }}
+                        title="Close"
+                    >
+                        ✕
+                    </button>
                 </div>
             </div>
 
@@ -341,14 +423,31 @@ export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProp
 
             {/* Settings */}
             {showSettings && (
-                <div style={{ padding: '10px 14px', borderBottom: '1px solid #222', background: '#0d0d0d' }}>
-                    <div style={{ fontSize: '0.65rem', color: '#555', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                <div
+                    style={{
+                        padding: '10px 14px',
+                        borderBottom: '1px solid #222',
+                        background: '#0d0d0d',
+                    }}
+                >
+                    <div
+                        style={{
+                            fontSize: '0.65rem',
+                            color: '#555',
+                            marginBottom: '6px',
+                            textTransform: 'uppercase',
+                            letterSpacing: '0.06em',
+                        }}
+                    >
                         Capture Interval
                     </div>
                     <div style={{ display: 'flex', gap: '4px', marginBottom: '10px' }}>
-                        {[5000, 10000, 20000, 30000].map(ms => (
-                            <button key={ms} style={S.resolutionPill(captureInterval === ms)}
-                                onClick={() => setCaptureInterval(ms)}>
+                        {[5000, 10000, 20000, 30000].map((ms) => (
+                            <button
+                                key={ms}
+                                style={S.resolutionPill(captureInterval === ms)}
+                                onClick={() => setCaptureInterval(ms)}
+                            >
                                 {ms / 1000}s
                             </button>
                         ))}
@@ -362,42 +461,60 @@ export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProp
                     <div style={S.emptyState}>
                         <div style={{ fontSize: '1.5rem', marginBottom: '12px' }}>👁</div>
                         <div style={{ marginBottom: '12px' }}>
-                            Share your screen and Kestrel will analyze it in real-time using AI vision, providing contextual code suggestions.
+                            Share your screen and Kestrel will analyze it in real-time using AI
+                            vision, providing contextual code suggestions.
                         </div>
-                        <button style={{
-                            ...S.actionBtn, float: 'none' as any,
-                            fontSize: '0.7rem', padding: '6px 16px',
-                            background: 'rgba(0,243,255,0.1)',
-                            border: '1px solid rgba(0,243,255,0.3)',
-                        }} onClick={startCapture}>
+                        <button
+                            style={{
+                                ...S.actionBtn,
+                                float: 'none' as any,
+                                fontSize: '0.7rem',
+                                padding: '6px 16px',
+                                background: 'rgba(0,243,255,0.1)',
+                                border: '1px solid rgba(0,243,255,0.3)',
+                            }}
+                            onClick={startCapture}
+                        >
                             Start Watching
                         </button>
                     </div>
                 ) : suggestions.length === 0 && !error ? (
                     <div style={S.emptyState}>
                         <div style={{ marginBottom: '8px' }}>
-                            {isAnalyzing ? 'Analyzing your screen...' : 'Watching for code issues...'}
+                            {isAnalyzing
+                                ? 'Analyzing your screen...'
+                                : 'Watching for code issues...'}
                         </div>
                         <div style={{ color: '#333' }}>AI suggestions will appear here.</div>
                         {screenContext && (
-                            <div style={{ color: '#444', marginTop: '8px', fontSize: '0.6rem', fontStyle: 'italic' }}>
+                            <div
+                                style={{
+                                    color: '#444',
+                                    marginTop: '8px',
+                                    fontSize: '0.6rem',
+                                    fontStyle: 'italic',
+                                }}
+                            >
                                 Sees: {screenContext}
                             </div>
                         )}
                     </div>
                 ) : (
                     <>
-                        {error && (
-                            <div style={S.error}>
-                                ✗ {error}
-                            </div>
-                        )}
+                        {error && <div style={S.error}>✗ {error}</div>}
                         {screenContext && (
-                            <div style={{ fontSize: '0.6rem', color: '#444', marginBottom: '8px', fontStyle: 'italic' }}>
+                            <div
+                                style={{
+                                    fontSize: '0.6rem',
+                                    color: '#444',
+                                    marginBottom: '8px',
+                                    fontStyle: 'italic',
+                                }}
+                            >
                                 Sees: {screenContext}
                             </div>
                         )}
-                        {suggestions.map(s => (
+                        {suggestions.map((s) => (
                             <div key={s.id} style={S.suggestion(s.type)}>
                                 <div style={S.suggTitle}>
                                     <span>{TYPE_ICONS[s.type]}</span>
@@ -405,7 +522,13 @@ export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProp
                                 </div>
                                 <div style={S.suggDesc}>{s.description}</div>
                                 {s.lineRef && (
-                                    <div style={{ fontSize: '0.6rem', color: '#555', marginTop: '4px' }}>
+                                    <div
+                                        style={{
+                                            fontSize: '0.6rem',
+                                            color: '#555',
+                                            marginTop: '4px',
+                                        }}
+                                    >
                                         📍 {s.lineRef}
                                     </div>
                                 )}
@@ -433,6 +556,6 @@ export function ScreenShare({ workspaceId, isVisible, onClose }: ScreenShareProp
                 </div>
             </div>
         </div>,
-        document.body
+        document.body,
     );
 }

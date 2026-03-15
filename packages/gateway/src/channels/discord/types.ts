@@ -3,9 +3,9 @@
 export interface DiscordConfig {
     botToken: string;
     clientId: string;
-    guildId?: string;               // For guild-specific slash commands
+    guildId?: string; // For guild-specific slash commands
     defaultWorkspaceId: string;
-    allowedRoleIds?: string[];      // Optional: restrict to users with these roles
+    allowedRoleIds?: string[]; // Optional: restrict to users with these roles
 }
 
 // ── Discord API Types ──────────────────────────────────────────────
@@ -35,7 +35,7 @@ export interface DiscordMessagePayload {
 
 export interface DiscordInteraction {
     id: string;
-    type: number;                    // 2 = APPLICATION_COMMAND, 3 = MESSAGE_COMPONENT
+    type: number; // 2 = APPLICATION_COMMAND, 3 = MESSAGE_COMPONENT
     data?: {
         name: string;
         custom_id?: string;

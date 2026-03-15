@@ -9,7 +9,14 @@ import type { DelegationEvent } from '../../hooks/useChat';
 // ── Agent State ──────────────────────────────────────────────────────
 interface AgentState {
     specialist: string;
-    status: 'spawning' | 'thinking' | 'tool_calling' | 'tool_result' | 'step_done' | 'complete' | 'failed';
+    status:
+        | 'spawning'
+        | 'thinking'
+        | 'tool_calling'
+        | 'tool_result'
+        | 'step_done'
+        | 'complete'
+        | 'failed';
     goal?: string;
     tools?: string[];
     lastThinking?: string;
@@ -25,50 +32,73 @@ interface AgentState {
 // ── Specialist Colors & Emojis ───────────────────────────────────────
 const SPECIALIST_THEME: Record<string, { emoji: string; color: string; label: string }> = {
     // Coordinator specialists
-    'Researcher': { emoji: '🔬', color: '#f59e0b', label: 'RESEARCHER' },
-    'Coder': { emoji: '💻', color: '#3b82f6', label: 'CODER' },
+    Researcher: { emoji: '🔬', color: '#f59e0b', label: 'RESEARCHER' },
+    Coder: { emoji: '💻', color: '#3b82f6', label: 'CODER' },
     'Data Analyst': { emoji: '📊', color: '#8b5cf6', label: 'ANALYST' },
-    'Reviewer': { emoji: '🔍', color: '#ec4899', label: 'REVIEWER' },
+    Reviewer: { emoji: '🔍', color: '#ec4899', label: 'REVIEWER' },
     'Code Explorer': { emoji: '🗺️', color: '#10b981', label: 'EXPLORER' },
     // Council roles
-    'safety': { emoji: '🛡️', color: '#ef4444', label: 'SAFETY' },
-    'ethics': { emoji: '⚖️', color: '#f59e0b', label: 'ETHICS' },
-    'pragmatism': { emoji: '🔧', color: '#10b981', label: 'PRAGMATISM' },
-    'innovation': { emoji: '💡', color: '#8b5cf6', label: 'INNOVATION' },
-    'engineering': { emoji: '⚙️', color: '#3b82f6', label: 'ENGINEERING' },
-    'science': { emoji: '🧪', color: '#06b6d4', label: 'SCIENCE' },
-    'mysticism': { emoji: '✨', color: '#c084fc', label: 'MYSTICISM' },
-    'existentialism': { emoji: '🌌', color: '#6366f1', label: 'EXISTENTIALISM' },
+    safety: { emoji: '🛡️', color: '#ef4444', label: 'SAFETY' },
+    ethics: { emoji: '⚖️', color: '#f59e0b', label: 'ETHICS' },
+    pragmatism: { emoji: '🔧', color: '#10b981', label: 'PRAGMATISM' },
+    innovation: { emoji: '💡', color: '#8b5cf6', label: 'INNOVATION' },
+    engineering: { emoji: '⚙️', color: '#3b82f6', label: 'ENGINEERING' },
+    science: { emoji: '🧪', color: '#06b6d4', label: 'SCIENCE' },
+    mysticism: { emoji: '✨', color: '#c084fc', label: 'MYSTICISM' },
+    existentialism: { emoji: '🌌', color: '#6366f1', label: 'EXISTENTIALISM' },
 };
 
 function getTheme(specialist: string) {
-    return SPECIALIST_THEME[specialist] || SPECIALIST_THEME[specialist.toLowerCase()] || { emoji: '🤖', color: '#00f3ff', label: specialist.toUpperCase() };
+    return (
+        SPECIALIST_THEME[specialist] ||
+        SPECIALIST_THEME[specialist.toLowerCase()] || {
+            emoji: '🤖',
+            color: '#00f3ff',
+            label: specialist.toUpperCase(),
+        }
+    );
 }
 
 // ── Status Badge Colors ──────────────────────────────────────────────
 function statusColor(status: string): string {
     switch (status) {
-        case 'spawning': return '#6b7280';
-        case 'thinking': return '#00f3ff';
-        case 'tool_calling': return '#f59e0b';
-        case 'tool_result': return '#8b5cf6';
-        case 'step_done': return '#3b82f6';
-        case 'complete': return '#10b981';
-        case 'failed': return '#ef4444';
-        default: return '#6b7280';
+        case 'spawning':
+            return '#6b7280';
+        case 'thinking':
+            return '#00f3ff';
+        case 'tool_calling':
+            return '#f59e0b';
+        case 'tool_result':
+            return '#8b5cf6';
+        case 'step_done':
+            return '#3b82f6';
+        case 'complete':
+            return '#10b981';
+        case 'failed':
+            return '#ef4444';
+        default:
+            return '#6b7280';
     }
 }
 
 function statusLabel(status: string): string {
     switch (status) {
-        case 'spawning': return 'SPAWNING';
-        case 'thinking': return 'THINKING';
-        case 'tool_calling': return 'USING TOOL';
-        case 'tool_result': return 'ANALYZING';
-        case 'step_done': return 'PROCESSING';
-        case 'complete': return 'COMPLETE';
-        case 'failed': return 'FAILED';
-        default: return status.toUpperCase();
+        case 'spawning':
+            return 'SPAWNING';
+        case 'thinking':
+            return 'THINKING';
+        case 'tool_calling':
+            return 'USING TOOL';
+        case 'tool_result':
+            return 'ANALYZING';
+        case 'step_done':
+            return 'PROCESSING';
+        case 'complete':
+            return 'COMPLETE';
+        case 'failed':
+            return 'FAILED';
+        default:
+            return status.toUpperCase();
     }
 }
 
@@ -92,12 +122,14 @@ export function AgentDebatePanel({ events }: AgentDebatePanelProps) {
 
         for (const evt of events.slice(Object.keys(agents).length > 0 ? -5 : 0)) {
             const name = evt.specialist;
-            if (!name
-                && evt.type !== 'parallel_delegation_started'
-                && evt.type !== 'parallel_delegation_complete'
-                && evt.type !== 'council_started'
-                && evt.type !== 'council_verdict'
-            ) continue;
+            if (
+                !name &&
+                evt.type !== 'parallel_delegation_started' &&
+                evt.type !== 'parallel_delegation_complete' &&
+                evt.type !== 'council_started' &&
+                evt.type !== 'council_verdict'
+            )
+                continue;
 
             // ── Coordinator events ──────────────────────────────
             if (evt.type === 'parallel_delegation_started') {
@@ -151,7 +183,8 @@ export function AgentDebatePanel({ events }: AgentDebatePanelProps) {
                 // Council opinion = agent completed their evaluation
                 agentMap[name].status = 'complete';
                 agentMap[name].lastThinking = evt.thinking; // analysis mapped to thinking
-                agentMap[name].result = `${evt.status?.toUpperCase() || 'VOTE'}: ${evt.thinking || ''}`;
+                agentMap[name].result =
+                    `${evt.status?.toUpperCase() || 'VOTE'}: ${evt.thinking || ''}`;
                 continue;
             }
 
@@ -210,7 +243,11 @@ export function AgentDebatePanel({ events }: AgentDebatePanelProps) {
                     if (evt.tool) {
                         agent.toolHistory = [
                             ...agent.toolHistory.slice(-4),
-                            { tool: evt.tool, result: evt.toolResult?.slice(0, 100), timestamp: Date.now() },
+                            {
+                                tool: evt.tool,
+                                result: evt.toolResult?.slice(0, 100),
+                                timestamp: Date.now(),
+                            },
                         ];
                     }
                 } else if (evt.status === 'step_done') {
@@ -262,26 +299,32 @@ export function AgentDebatePanel({ events }: AgentDebatePanelProps) {
                         animation: activeCount > 0 ? 'pulse 1.5s ease-in-out infinite' : 'none',
                     }}
                 />
-                <span style={{
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: '0.75rem',
-                    fontWeight: 'bold',
-                    color: '#00f3ff',
-                    letterSpacing: '0.08em',
-                }}>
+                <span
+                    style={{
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: '0.75rem',
+                        fontWeight: 'bold',
+                        color: '#00f3ff',
+                        letterSpacing: '0.08em',
+                    }}
+                >
                     🗣️ AGENT DEBATE
                 </span>
-                <span style={{
-                    marginLeft: 'auto',
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: '0.65rem',
-                    color: 'var(--text-dim)',
-                    background: 'rgba(0,243,255,0.1)',
-                    padding: '2px 8px',
-                    borderRadius: '10px',
-                    border: '1px solid rgba(0,243,255,0.2)',
-                }}>
-                    {activeCount > 0 ? `${activeCount} ACTIVE` : `${totalAgents || agentList.length} AGENTS`}
+                <span
+                    style={{
+                        marginLeft: 'auto',
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: '0.65rem',
+                        color: 'var(--text-dim)',
+                        background: 'rgba(0,243,255,0.1)',
+                        padding: '2px 8px',
+                        borderRadius: '10px',
+                        border: '1px solid rgba(0,243,255,0.2)',
+                    }}
+                >
+                    {activeCount > 0
+                        ? `${activeCount} ACTIVE`
+                        : `${totalAgents || agentList.length} AGENTS`}
                 </span>
             </div>
 
@@ -321,77 +364,94 @@ function AgentCard({ agent }: { agent: AgentState }) {
             {/* Header: Emoji + Name + Badge */}
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <span style={{ fontSize: '1.1rem' }}>{theme.emoji}</span>
-                <span style={{
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: '0.75rem',
-                    fontWeight: 'bold',
-                    color: theme.color,
-                }}>
+                <span
+                    style={{
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: '0.75rem',
+                        fontWeight: 'bold',
+                        color: theme.color,
+                    }}
+                >
                     {agent.specialist}
                 </span>
-                <span style={{
-                    marginLeft: 'auto',
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: '0.6rem',
-                    fontWeight: 'bold',
-                    color: badgeColor,
-                    background: `${badgeColor}18`,
-                    border: `1px solid ${badgeColor}40`,
-                    padding: '1px 8px',
-                    borderRadius: '10px',
-                    letterSpacing: '0.05em',
-                }}>
+                <span
+                    style={{
+                        marginLeft: 'auto',
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: '0.6rem',
+                        fontWeight: 'bold',
+                        color: badgeColor,
+                        background: `${badgeColor}18`,
+                        border: `1px solid ${badgeColor}40`,
+                        padding: '1px 8px',
+                        borderRadius: '10px',
+                        letterSpacing: '0.05em',
+                    }}
+                >
                     {badge}
                 </span>
             </div>
 
             {/* Goal (shown briefly at start) */}
             {agent.goal && agent.status === 'thinking' && !agent.lastThinking && (
-                <div style={{
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: '0.65rem',
-                    color: 'var(--text-dim)',
-                    marginTop: '6px',
-                    paddingLeft: '26px',
-                    opacity: 0.7,
-                }}>
+                <div
+                    style={{
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: '0.65rem',
+                        color: 'var(--text-dim)',
+                        marginTop: '6px',
+                        paddingLeft: '26px',
+                        opacity: 0.7,
+                    }}
+                >
                     📋 {agent.goal.slice(0, 120)}
                 </div>
             )}
 
             {/* Thought Bubble */}
             {agent.lastThinking && isActive && (
-                <div style={{
-                    marginTop: '6px',
-                    paddingLeft: '26px',
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: '0.65rem',
-                    color: 'var(--text-secondary)',
-                    fontStyle: 'italic',
-                    display: 'flex',
-                    gap: '6px',
-                    alignItems: 'flex-start',
-                }}>
+                <div
+                    style={{
+                        marginTop: '6px',
+                        paddingLeft: '26px',
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: '0.65rem',
+                        color: 'var(--text-secondary)',
+                        fontStyle: 'italic',
+                        display: 'flex',
+                        gap: '6px',
+                        alignItems: 'flex-start',
+                    }}
+                >
                     <span style={{ color: '#00f3ff', flexShrink: 0 }}>💭</span>
-                    <span>{agent.lastThinking.slice(0, 150)}{agent.lastThinking.length > 150 ? '…' : ''}</span>
+                    <span>
+                        {agent.lastThinking.slice(0, 150)}
+                        {agent.lastThinking.length > 150 ? '…' : ''}
+                    </span>
                 </div>
             )}
 
             {/* Active Tool Indicator */}
             {agent.status === 'tool_calling' && agent.lastTool && (
-                <div style={{
-                    marginTop: '6px',
-                    paddingLeft: '26px',
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: '0.65rem',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '6px',
-                }}>
-                    <span style={{
-                        color: '#f59e0b',
-                        animation: 'pulse 1s ease-in-out infinite',
-                    }}>⚡</span>
+                <div
+                    style={{
+                        marginTop: '6px',
+                        paddingLeft: '26px',
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: '0.65rem',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '6px',
+                    }}
+                >
+                    <span
+                        style={{
+                            color: '#f59e0b',
+                            animation: 'pulse 1s ease-in-out infinite',
+                        }}
+                    >
+                        ⚡
+                    </span>
                     <span style={{ color: '#f59e0b', fontWeight: 'bold' }}>{agent.lastTool}</span>
                     {agent.lastToolArgs && (
                         <span style={{ color: 'var(--text-dim)', fontSize: '0.6rem' }}>
@@ -403,28 +463,32 @@ function AgentCard({ agent }: { agent: AgentState }) {
 
             {/* Tool Result Preview */}
             {agent.status === 'tool_result' && agent.lastToolResult && (
-                <div style={{
-                    marginTop: '6px',
-                    paddingLeft: '26px',
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: '0.6rem',
-                    color: '#10b981',
-                    maxHeight: '40px',
-                    overflow: 'hidden',
-                }}>
+                <div
+                    style={{
+                        marginTop: '6px',
+                        paddingLeft: '26px',
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: '0.6rem',
+                        color: '#10b981',
+                        maxHeight: '40px',
+                        overflow: 'hidden',
+                    }}
+                >
                     ✓ {agent.lastToolResult.slice(0, 120)}
                 </div>
             )}
 
             {/* Tool History (compact) */}
             {agent.toolHistory.length > 0 && isActive && (
-                <div style={{
-                    marginTop: '4px',
-                    paddingLeft: '26px',
-                    display: 'flex',
-                    gap: '4px',
-                    flexWrap: 'wrap',
-                }}>
+                <div
+                    style={{
+                        marginTop: '4px',
+                        paddingLeft: '26px',
+                        display: 'flex',
+                        gap: '4px',
+                        flexWrap: 'wrap',
+                    }}
+                >
                     {agent.toolHistory.slice(-3).map((t, i) => (
                         <span
                             key={i}
@@ -445,17 +509,19 @@ function AgentCard({ agent }: { agent: AgentState }) {
 
             {/* Complete Result Preview */}
             {agent.status === 'complete' && agent.result && (
-                <div style={{
-                    marginTop: '6px',
-                    paddingLeft: '26px',
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: '0.6rem',
-                    color: 'var(--text-secondary)',
-                    maxHeight: isExpanded ? '200px' : '40px',
-                    overflow: 'hidden',
-                    transition: 'max-height 0.3s ease',
-                    lineHeight: '1.4',
-                }}>
+                <div
+                    style={{
+                        marginTop: '6px',
+                        paddingLeft: '26px',
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: '0.6rem',
+                        color: 'var(--text-secondary)',
+                        maxHeight: isExpanded ? '200px' : '40px',
+                        overflow: 'hidden',
+                        transition: 'max-height 0.3s ease',
+                        lineHeight: '1.4',
+                    }}
+                >
                     {agent.result.slice(0, isExpanded ? 800 : 120)}
                     {!isExpanded && agent.result.length > 120 && (
                         <span style={{ color: '#00f3ff', cursor: 'pointer' }}> ▸ more</span>
@@ -465,13 +531,15 @@ function AgentCard({ agent }: { agent: AgentState }) {
 
             {/* Failed indicator */}
             {agent.status === 'failed' && agent.result && (
-                <div style={{
-                    marginTop: '6px',
-                    paddingLeft: '26px',
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: '0.6rem',
-                    color: '#ef4444',
-                }}>
+                <div
+                    style={{
+                        marginTop: '6px',
+                        paddingLeft: '26px',
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: '0.6rem',
+                        color: '#ef4444',
+                    }}
+                >
                     ⚠️ {agent.result.slice(0, 100)}
                 </div>
             )}

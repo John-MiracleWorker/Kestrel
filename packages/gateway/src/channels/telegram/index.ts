@@ -17,6 +17,7 @@ import {
     poll,
     startPolling,
     callTelegramApi,
+    persistSessionState as persistSessionStateHelper,
     queuePersistSessionState,
 } from './adapter-lifecycle';
 import {
@@ -41,6 +42,7 @@ import {
     setPendingApprovalsLookupHandler,
 } from './adapter-state';
 import {
+    sendMediaFile as sendMediaFileHelper,
     sendStreamEnd,
     sendStreamStart,
     sendStreamUpdate,
@@ -235,7 +237,19 @@ export class TelegramAdapter extends BaseChannelAdapter {
         return callTelegramApi(this, method, params);
     }
 
+    public async persistSessionState(): Promise<void> {
+        return persistSessionStateHelper(this);
+    }
+
     public queuePersistSessionState(): void {
         queuePersistSessionState(this);
+    }
+
+    public async sendMediaFile(
+        chatId: number,
+        media: { alt: string; filePath: string; type: 'photo' | 'video' },
+        threadId?: number,
+    ): Promise<void> {
+        return sendMediaFileHelper(this, chatId, media, threadId);
     }
 }

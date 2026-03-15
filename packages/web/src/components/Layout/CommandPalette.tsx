@@ -36,7 +36,7 @@ export function CommandPalette({ isOpen, onClose, actions }: CommandPaletteProps
 
     const filtered = useMemo(() => {
         if (!query.trim()) return actions;
-        return actions.filter(a => fuzzyMatch(a.label, query) || fuzzyMatch(a.category, query));
+        return actions.filter((a) => fuzzyMatch(a.label, query) || fuzzyMatch(a.category, query));
     }, [query, actions]);
 
     // Reset on open
@@ -53,33 +53,39 @@ export function CommandPalette({ isOpen, onClose, actions }: CommandPaletteProps
         setSelectedIndex(0);
     }, [filtered.length]);
 
-    const executeItem = useCallback((item: CommandItem) => {
-        item.action();
-        onClose();
-    }, [onClose]);
+    const executeItem = useCallback(
+        (item: CommandItem) => {
+            item.action();
+            onClose();
+        },
+        [onClose],
+    );
 
-    const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
-        switch (e.key) {
-            case 'ArrowDown':
-                e.preventDefault();
-                setSelectedIndex(i => Math.min(i + 1, filtered.length - 1));
-                break;
-            case 'ArrowUp':
-                e.preventDefault();
-                setSelectedIndex(i => Math.max(i - 1, 0));
-                break;
-            case 'Enter':
-                e.preventDefault();
-                if (filtered[selectedIndex]) {
-                    executeItem(filtered[selectedIndex]);
-                }
-                break;
-            case 'Escape':
-                e.preventDefault();
-                onClose();
-                break;
-        }
-    }, [filtered, selectedIndex, executeItem, onClose]);
+    const handleKeyDown = useCallback(
+        (e: React.KeyboardEvent) => {
+            switch (e.key) {
+                case 'ArrowDown':
+                    e.preventDefault();
+                    setSelectedIndex((i) => Math.min(i + 1, filtered.length - 1));
+                    break;
+                case 'ArrowUp':
+                    e.preventDefault();
+                    setSelectedIndex((i) => Math.max(i - 1, 0));
+                    break;
+                case 'Enter':
+                    e.preventDefault();
+                    if (filtered[selectedIndex]) {
+                        executeItem(filtered[selectedIndex]);
+                    }
+                    break;
+                case 'Escape':
+                    e.preventDefault();
+                    onClose();
+                    break;
+            }
+        },
+        [filtered, selectedIndex, executeItem, onClose],
+    );
 
     // Global shortcut listener
     useEffect(() => {
@@ -101,7 +107,7 @@ export function CommandPalette({ isOpen, onClose, actions }: CommandPaletteProps
     if (!isOpen) return null;
 
     // Group by category
-    const categories = [...new Set(filtered.map(a => a.category))];
+    const categories = [...new Set(filtered.map((a) => a.category))];
 
     return (
         <div
@@ -129,7 +135,7 @@ export function CommandPalette({ isOpen, onClose, actions }: CommandPaletteProps
                     boxShadow: '0 24px 80px rgba(0, 0, 0, 0.8), 0 0 40px rgba(0, 243, 255, 0.06)',
                     animation: 'palette-in 0.15s ease-out',
                 }}
-                onClick={e => e.stopPropagation()}
+                onClick={(e) => e.stopPropagation()}
             >
                 {/* Search input */}
                 <div
@@ -145,7 +151,7 @@ export function CommandPalette({ isOpen, onClose, actions }: CommandPaletteProps
                     <input
                         ref={inputRef}
                         value={query}
-                        onChange={e => setQuery(e.target.value)}
+                        onChange={(e) => setQuery(e.target.value)}
                         onKeyDown={handleKeyDown}
                         placeholder="Type a command..."
                         style={{
@@ -194,7 +200,7 @@ export function CommandPalette({ isOpen, onClose, actions }: CommandPaletteProps
                         </div>
                     )}
 
-                    {categories.map(cat => (
+                    {categories.map((cat) => (
                         <div key={cat}>
                             <div
                                 style={{
@@ -209,8 +215,8 @@ export function CommandPalette({ isOpen, onClose, actions }: CommandPaletteProps
                                 {cat}
                             </div>
                             {filtered
-                                .filter(a => a.category === cat)
-                                .map(item => {
+                                .filter((a) => a.category === cat)
+                                .map((item) => {
                                     const globalIdx = filtered.indexOf(item);
                                     const isSelected = globalIdx === selectedIndex;
                                     return (
@@ -224,12 +230,22 @@ export function CommandPalette({ isOpen, onClose, actions }: CommandPaletteProps
                                                 gap: '10px',
                                                 padding: '10px 18px',
                                                 cursor: 'pointer',
-                                                background: isSelected ? 'rgba(0, 243, 255, 0.08)' : 'transparent',
-                                                borderLeft: isSelected ? '2px solid var(--accent-cyan)' : '2px solid transparent',
+                                                background: isSelected
+                                                    ? 'rgba(0, 243, 255, 0.08)'
+                                                    : 'transparent',
+                                                borderLeft: isSelected
+                                                    ? '2px solid var(--accent-cyan)'
+                                                    : '2px solid transparent',
                                                 transition: 'all 0.1s',
                                             }}
                                         >
-                                            <span style={{ fontSize: '1.1rem', width: '24px', textAlign: 'center' }}>
+                                            <span
+                                                style={{
+                                                    fontSize: '1.1rem',
+                                                    width: '24px',
+                                                    textAlign: 'center',
+                                                }}
+                                            >
                                                 {item.icon}
                                             </span>
                                             <span
@@ -237,7 +253,9 @@ export function CommandPalette({ isOpen, onClose, actions }: CommandPaletteProps
                                                     flex: 1,
                                                     fontFamily: 'var(--font-mono)',
                                                     fontSize: '0.85rem',
-                                                    color: isSelected ? 'var(--accent-cyan)' : 'var(--text-primary)',
+                                                    color: isSelected
+                                                        ? 'var(--accent-cyan)'
+                                                        : 'var(--text-primary)',
                                                 }}
                                             >
                                                 {item.label}

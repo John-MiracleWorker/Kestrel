@@ -45,12 +45,10 @@ export const WorkflowPicker: React.FC<WorkflowPickerProps> = ({
     const [variables, setVariables] = useState<Record<string, string>>({});
     const [filter, setFilter] = useState<string>('all');
 
-    const selected = workflows.find(w => w.id === selectedId);
-    const categories = ['all', ...Array.from(new Set(workflows.map(w => w.category)))];
+    const selected = workflows.find((w) => w.id === selectedId);
+    const categories = ['all', ...Array.from(new Set(workflows.map((w) => w.category)))];
 
-    const filtered = filter === 'all'
-        ? workflows
-        : workflows.filter(w => w.category === filter);
+    const filtered = filter === 'all' ? workflows : workflows.filter((w) => w.category === filter);
 
     const handleSelect = (workflow: Workflow) => {
         if (selectedId === workflow.id) {
@@ -61,7 +59,7 @@ export const WorkflowPicker: React.FC<WorkflowPickerProps> = ({
         setSelectedId(workflow.id);
         // Pre-fill defaults
         const defaults: Record<string, string> = {};
-        workflow.variables.forEach(v => {
+        workflow.variables.forEach((v) => {
             defaults[v.name] = v.default || '';
         });
         setVariables(defaults);
@@ -74,16 +72,14 @@ export const WorkflowPicker: React.FC<WorkflowPickerProps> = ({
         setVariables({});
     };
 
-    const canLaunch = selected?.variables.every(
-        v => !v.required || variables[v.name]?.trim()
-    );
+    const canLaunch = selected?.variables.every((v) => !v.required || variables[v.name]?.trim());
 
     return (
         <div className="workflow-picker">
             <div className="workflow-picker__header">
                 <h3 className="workflow-picker__title">Quick Actions</h3>
                 <div className="workflow-picker__filters">
-                    {categories.map(cat => (
+                    {categories.map((cat) => (
                         <button
                             key={cat}
                             className={`workflow-picker__filter ${filter === cat ? 'active' : ''}`}
@@ -96,7 +92,7 @@ export const WorkflowPicker: React.FC<WorkflowPickerProps> = ({
             </div>
 
             <div className="workflow-picker__grid">
-                {filtered.map(wf => (
+                {filtered.map((wf) => (
                     <div
                         key={wf.id}
                         className={`workflow-card ${selectedId === wf.id ? 'workflow-card--selected' : ''}`}
@@ -109,8 +105,10 @@ export const WorkflowPicker: React.FC<WorkflowPickerProps> = ({
                         </div>
                         {wf.tags && wf.tags.length > 0 && (
                             <div className="workflow-card__tags">
-                                {wf.tags.slice(0, 3).map(tag => (
-                                    <span key={tag} className="workflow-card__tag">{tag}</span>
+                                {wf.tags.slice(0, 3).map((tag) => (
+                                    <span key={tag} className="workflow-card__tag">
+                                        {tag}
+                                    </span>
                                 ))}
                             </div>
                         )}
@@ -126,11 +124,13 @@ export const WorkflowPicker: React.FC<WorkflowPickerProps> = ({
                     </div>
 
                     <div className="workflow-picker__fields">
-                        {selected.variables.map(v => (
+                        {selected.variables.map((v) => (
                             <div key={v.name} className="workflow-field">
                                 <label className="workflow-field__label">
                                     {v.label}
-                                    {v.required && <span className="workflow-field__required">*</span>}
+                                    {v.required && (
+                                        <span className="workflow-field__required">*</span>
+                                    )}
                                 </label>
                                 {v.description && (
                                     <span className="workflow-field__hint">{v.description}</span>
@@ -140,17 +140,23 @@ export const WorkflowPicker: React.FC<WorkflowPickerProps> = ({
                                     <select
                                         className="workflow-field__select"
                                         value={variables[v.name] || ''}
-                                        onChange={e => setVariables({ ...variables, [v.name]: e.target.value })}
+                                        onChange={(e) =>
+                                            setVariables({ ...variables, [v.name]: e.target.value })
+                                        }
                                     >
-                                        {v.options?.map(opt => (
-                                            <option key={opt} value={opt}>{opt}</option>
+                                        {v.options?.map((opt) => (
+                                            <option key={opt} value={opt}>
+                                                {opt}
+                                            </option>
                                         ))}
                                     </select>
                                 ) : v.type === 'textarea' ? (
                                     <textarea
                                         className="workflow-field__textarea"
                                         value={variables[v.name] || ''}
-                                        onChange={e => setVariables({ ...variables, [v.name]: e.target.value })}
+                                        onChange={(e) =>
+                                            setVariables({ ...variables, [v.name]: e.target.value })
+                                        }
                                         placeholder={v.description || v.label}
                                         rows={3}
                                     />
@@ -159,7 +165,9 @@ export const WorkflowPicker: React.FC<WorkflowPickerProps> = ({
                                         className="workflow-field__input"
                                         type={v.type === 'number' ? 'number' : 'text'}
                                         value={variables[v.name] || ''}
-                                        onChange={e => setVariables({ ...variables, [v.name]: e.target.value })}
+                                        onChange={(e) =>
+                                            setVariables({ ...variables, [v.name]: e.target.value })
+                                        }
                                         placeholder={v.description || v.label}
                                     />
                                 )}
