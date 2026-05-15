@@ -62,6 +62,16 @@ class RunManager:
             workspace=str(run_config.workspace),
             model=run_config.model,
         )
+        self.state.create_task_node(
+            task_id=f"task_{uuid4().hex}",
+            run_id=run_id,
+            title="Root objective",
+            goal=message,
+            profile="planner",
+            status="queued",
+            approved=True,
+            plan={"autonomy_mode": "background"},
+        )
         self.events.publish(run_id, "run.queued", {"message": message, "session_id": run.session_id})
         self._start_thread(run_id, self._run_agent_turn, run_config, message, run.session_id)
         return run
@@ -113,6 +123,8 @@ class RunManager:
         agent = build_agent(self.config, tools=registry)
         try:
             call = ToolCall(name=tool_name, arguments=arguments)
+            if run_id:
+                self.events.publish(run_id, "tool.started", {"tool": tool_name, "tool_call_id": call.id})
             execution = registry.execute(
                 call,
                 ToolContext(
@@ -127,9 +139,54 @@ class RunManager:
             )
             if run_id:
                 self.events.publish(run_id, "tool.executed", _execution_payload(execution))
+                self.events.publish(
+                    run_id,
+                    "tool.completed" if execution.success else "tool.failed",
+                    _execution_payload(execution),
+                )
             return execution
         finally:
             agent.close()
+
+    def task_graph(self, run_id: str) -> dict[str, Any]:
+        self.state.get_run(run_id)
+        return {
+            "tasks": [asdict(task) for task in self.state.list_task_nodes(run_id)],
+            "subagents": [asdict(subagent) for subagent in self.state.list_subagent_runs(run_id)],
+        }
+
+    def approve_task(self, run_id: str, task_id: str) -> dict[str, Any]:
+        self.state.get_run(run_id)
+        task = self.state.update_task_node(task_id, approved=True, status="approved")
+        self.events.publish(run_id, "task.approved", asdict(task))
+        return asdict(task)
+
+    def create_subagent(self, *, run_id: str, profile: str, goal: str, task_id: str | None = None) -> dict[str, Any]:
+        run = self.state.get_run(run_id)
+        profile = profile if profile in {"planner", "worker", "reviewer"} else "worker"
+        if task_id is None:
+            task = self.state.create_task_node(
+                task_id=f"task_{uuid4().hex}",
+                run_id=run_id,
+                title=f"{profile.title()} subtask",
+                goal=goal,
+                profile=profile,
+                status="queued",
+                approved=True,
+            )
+            task_id = task.task_id
+        subagent = self.state.create_subagent_run(
+            subagent_id=f"subagent_{uuid4().hex}",
+            run_id=run_id,
+            task_id=task_id,
+            profile=profile,
+            goal=goal,
+            status="queued",
+        )
+        config = replace(self.config, workspace=Path(run.workspace), model=run.model)
+        self.events.publish(run_id, "subagent.queued", asdict(subagent))
+        self._start_thread(subagent.subagent_id, self._run_subagent, config, subagent.subagent_id, run_id, run.session_id)
+        return asdict(subagent)
 
     def _run_agent_turn(self, run_id: str, config: AgentConfig, message: str, session_id: str) -> None:
         if self._is_cancelled(run_id):
@@ -147,6 +204,11 @@ class RunManager:
             )
             for execution in result.tool_executions:
                 self.events.publish(run_id, "tool.executed", _execution_payload(execution))
+                self.events.publish(
+                    run_id,
+                    "tool.completed" if execution.success else "tool.failed",
+                    _execution_payload(execution),
+                )
             status = "blocked" if result.stop_reason == "approval_required" else "completed"
             self.state.update_run(
                 run_id,
@@ -200,6 +262,7 @@ class RunManager:
                 result=_execution_payload(execution),
             )
             self.events.publish(run_id, "tool.executed", _execution_payload(execution))
+            self.events.publish(run_id, "tool.completed" if execution.success else "tool.failed", _execution_payload(execution))
             continuation = (
                 f"Continue the previous run after approved tool `{call.name}`.\n\n"
                 f"Tool success: {execution.success}\n"
@@ -225,6 +288,46 @@ class RunManager:
         except Exception as exc:  # noqa: BLE001
             self.state.update_run(run_id, status="failed", error=f"{type(exc).__name__}: {exc}", stop_reason="error")
             self.events.publish(run_id, "run.failed", {"error": f"{type(exc).__name__}: {exc}"})
+        finally:
+            agent.close()
+
+    def _run_subagent(
+        self,
+        thread_key: str,
+        config: AgentConfig,
+        subagent_id: str,
+        run_id: str,
+        session_id: str,
+    ) -> None:
+        del thread_key
+        subagent = self.state.get_subagent_run(subagent_id)
+        running = self.state.update_subagent_run(subagent_id, status="running")
+        if subagent.task_id:
+            self.state.update_task_node(subagent.task_id, status="running")
+        self.events.publish(run_id, "subagent.started", asdict(running))
+        agent = self._build_agent(config)
+        try:
+            prompt = _subagent_prompt(subagent.profile, subagent.goal)
+            result = agent.chat(
+                prompt,
+                session_id=session_id,
+                run_id=run_id,
+                approval_handler=self._approval_handler,
+                stream_handler=self._stream_handler(run_id),
+            )
+            updated = self.state.update_subagent_run(subagent_id, status="completed", result=result.assistant_message)
+            if subagent.task_id:
+                self.state.update_task_node(
+                    subagent.task_id,
+                    status="completed",
+                    result={"assistant_message": result.assistant_message, "stop_reason": result.stop_reason},
+                )
+            self.events.publish(run_id, "subagent.completed", asdict(updated))
+        except Exception as exc:  # noqa: BLE001
+            updated = self.state.update_subagent_run(subagent_id, status="failed", error=f"{type(exc).__name__}: {exc}")
+            if subagent.task_id:
+                self.state.update_task_node(subagent.task_id, status="failed", result={"error": updated.error})
+            self.events.publish(run_id, "subagent.failed", asdict(updated))
         finally:
             agent.close()
 
@@ -308,3 +411,12 @@ def _turn_payload(result: AgentTurnResult) -> dict[str, Any]:
         "memory_writes": list(result.memory_writes),
         "stop_reason": result.stop_reason,
     }
+
+
+def _subagent_prompt(profile: str, goal: str) -> str:
+    role = {
+        "planner": "Break the goal into a concise execution plan with dependencies and checks.",
+        "worker": "Execute the bounded subtask using available low-risk tools and report concrete results.",
+        "reviewer": "Review the proposed or completed work for risks, missing tests, and next checks.",
+    }.get(profile, "Execute the bounded subtask and report concrete results.")
+    return f"Subagent profile: {profile}\nRole: {role}\nGoal:\n{goal}"

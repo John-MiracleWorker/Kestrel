@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def utc_now() -> str:
@@ -29,6 +29,36 @@ class RunRecord:
     context_chars: int = 0
     tool_count: int = 0
     stop_reason: str = ""
+    error: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class TaskNodeRecord:
+    task_id: str
+    run_id: str
+    title: str
+    goal: str
+    profile: str
+    status: str
+    parent_id: str | None = None
+    approved: bool = False
+    plan: dict[str, Any] | None = None
+    result: dict[str, Any] | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class SubagentRunRecord:
+    subagent_id: str
+    run_id: str
+    profile: str
+    goal: str
+    status: str
+    task_id: str | None = None
+    result: str = ""
     error: str | None = None
     created_at: str = ""
     updated_at: str = ""
@@ -189,6 +219,14 @@ class AgentStateStore:
     def upsert_mcp_server(self, server: dict[str, Any]) -> dict[str, Any]:
         server_id = str(server["id"])
         now = utc_now()
+        tools = list(server.get("tools", []))
+        capabilities = server.get("capabilities") or sorted(
+            {
+                str(capability)
+                for tool in tools
+                for capability in list(dict(tool).get("capabilities", []))
+            }
+        )
         payload = {
             "name": server.get("name", server_id),
             "transport": server.get("transport", "stdio"),
@@ -197,9 +235,15 @@ class AgentStateStore:
             "env_json": json.dumps(server.get("env", {})),
             "url": server.get("url"),
             "enabled": 1 if server.get("enabled", True) else 0,
-            "tools_json": json.dumps(server.get("tools", [])),
+            "tools_json": json.dumps(tools),
             "status": server.get("status", "configured"),
             "error": server.get("error"),
+            "last_synced_at": server.get("last_synced_at"),
+            "last_seen_at": server.get("last_seen_at"),
+            "tool_count": int(server.get("tool_count", len(tools))),
+            "capabilities_json": json.dumps(capabilities),
+            "risk_policy": server.get("risk_policy", "default"),
+            "secret_env_json": json.dumps(server.get("secret_env", {})),
             "updated_at": now,
         }
         with self._connect() as conn:
@@ -207,8 +251,9 @@ class AgentStateStore:
                 """
                 INSERT INTO mcp_servers (
                     id, name, transport, command, args_json, env_json, url, enabled,
-                    tools_json, status, error, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tools_json, status, error, last_synced_at, last_seen_at, tool_count,
+                    capabilities_json, risk_policy, secret_env_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     transport = excluded.transport,
@@ -220,6 +265,12 @@ class AgentStateStore:
                     tools_json = excluded.tools_json,
                     status = excluded.status,
                     error = excluded.error,
+                    last_synced_at = excluded.last_synced_at,
+                    last_seen_at = excluded.last_seen_at,
+                    tool_count = excluded.tool_count,
+                    capabilities_json = excluded.capabilities_json,
+                    risk_policy = excluded.risk_policy,
+                    secret_env_json = excluded.secret_env_json,
                     updated_at = excluded.updated_at
                 """,
                 (server_id, *payload.values()),
@@ -281,6 +332,127 @@ class AgentStateStore:
             rows = conn.execute("SELECT * FROM skill_registry ORDER BY name ASC").fetchall()
         return [_skill_from_row(row) for row in rows]
 
+    def set_skill_enabled(self, skill_id: str, enabled: bool) -> dict[str, Any]:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE skill_registry SET enabled = ?, updated_at = ? WHERE id = ?",
+                (1 if enabled else 0, utc_now(), skill_id),
+            )
+        return self.get_skill(skill_id)
+
+    def create_task_node(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        title: str,
+        goal: str,
+        profile: str = "planner",
+        status: str = "queued",
+        parent_id: str | None = None,
+        approved: bool = False,
+        plan: dict[str, Any] | None = None,
+    ) -> TaskNodeRecord:
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO task_nodes (
+                    task_id, run_id, parent_id, title, goal, profile, status, approved,
+                    plan_json, result_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    task_id,
+                    run_id,
+                    parent_id,
+                    title,
+                    goal,
+                    profile,
+                    status,
+                    1 if approved else 0,
+                    json.dumps(plan or {}),
+                    now,
+                    now,
+                ),
+            )
+        return self.get_task_node(task_id)
+
+    def update_task_node(self, task_id: str, **fields: object) -> TaskNodeRecord:
+        if not fields:
+            return self.get_task_node(task_id)
+        fields["updated_at"] = utc_now()
+        assignments = ", ".join(f"{_task_column(key)} = ?" for key in fields)
+        values = [_encode(value) for value in fields.values()]
+        values.append(task_id)
+        with self._connect() as conn:
+            conn.execute(f"UPDATE task_nodes SET {assignments} WHERE task_id = ?", values)
+        return self.get_task_node(task_id)
+
+    def get_task_node(self, task_id: str) -> TaskNodeRecord:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown task: {task_id}")
+        return _task_from_row(row)
+
+    def list_task_nodes(self, run_id: str) -> list[TaskNodeRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_nodes WHERE run_id = ? ORDER BY created_at ASC",
+                (run_id,),
+            ).fetchall()
+        return [_task_from_row(row) for row in rows]
+
+    def create_subagent_run(
+        self,
+        *,
+        subagent_id: str,
+        run_id: str,
+        profile: str,
+        goal: str,
+        status: str = "queued",
+        task_id: str | None = None,
+    ) -> SubagentRunRecord:
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO subagent_runs (
+                    subagent_id, run_id, task_id, profile, goal, status, result, error,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, '', NULL, ?, ?)
+                """,
+                (subagent_id, run_id, task_id, profile, goal, status, now, now),
+            )
+        return self.get_subagent_run(subagent_id)
+
+    def update_subagent_run(self, subagent_id: str, **fields: object) -> SubagentRunRecord:
+        if not fields:
+            return self.get_subagent_run(subagent_id)
+        fields["updated_at"] = utc_now()
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        values = [_encode(value) for value in fields.values()]
+        values.append(subagent_id)
+        with self._connect() as conn:
+            conn.execute(f"UPDATE subagent_runs SET {assignments} WHERE subagent_id = ?", values)
+        return self.get_subagent_run(subagent_id)
+
+    def get_subagent_run(self, subagent_id: str) -> SubagentRunRecord:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM subagent_runs WHERE subagent_id = ?", (subagent_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown subagent run: {subagent_id}")
+        return _subagent_from_row(row)
+
+    def list_subagent_runs(self, run_id: str) -> list[SubagentRunRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM subagent_runs WHERE run_id = ? ORDER BY created_at ASC",
+                (run_id,),
+            ).fetchall()
+        return [_subagent_from_row(row) for row in rows]
+
     def schema_version(self) -> int:
         with self._connect() as conn:
             row = conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
@@ -301,6 +473,13 @@ class AgentStateStore:
             current = 0 if row is None else int(row["version"])
             if current < 1:
                 _apply_schema_v1(conn)
+                current = 1
+            if current < 2:
+                _apply_schema_v2(conn)
+                current = 2
+            if current < SCHEMA_VERSION:
+                raise RuntimeError(f"Unsupported schema migration target: {current} -> {SCHEMA_VERSION}")
+            if current == SCHEMA_VERSION:
                 conn.execute(
                     """
                     INSERT INTO schema_version (id, version, updated_at)
@@ -309,7 +488,7 @@ class AgentStateStore:
                         version = excluded.version,
                         updated_at = excluded.updated_at
                     """,
-                    (SCHEMA_VERSION, utc_now()),
+                    (current, utc_now()),
                 )
 
     @contextmanager
@@ -401,6 +580,61 @@ def _apply_schema_v1(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_schema_v2(conn: sqlite3.Connection) -> None:
+    existing = _columns(conn, "mcp_servers")
+    for name, definition in {
+        "last_synced_at": "TEXT",
+        "last_seen_at": "TEXT",
+        "tool_count": "INTEGER NOT NULL DEFAULT 0",
+        "capabilities_json": "TEXT NOT NULL DEFAULT '[]'",
+        "risk_policy": "TEXT NOT NULL DEFAULT 'default'",
+        "secret_env_json": "TEXT NOT NULL DEFAULT '{}'",
+    }.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE mcp_servers ADD COLUMN {name} {definition}")
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS task_nodes (
+            task_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            parent_id TEXT,
+            title TEXT NOT NULL,
+            goal TEXT NOT NULL,
+            profile TEXT NOT NULL,
+            status TEXT NOT NULL,
+            approved INTEGER NOT NULL DEFAULT 0,
+            plan_json TEXT NOT NULL DEFAULT '{}',
+            result_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS subagent_runs (
+            subagent_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            task_id TEXT,
+            profile TEXT NOT NULL,
+            goal TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result TEXT NOT NULL DEFAULT '',
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_task_nodes_run_id ON task_nodes(run_id);
+        CREATE INDEX IF NOT EXISTS idx_task_nodes_status ON task_nodes(status);
+        CREATE INDEX IF NOT EXISTS idx_subagent_runs_run_id ON subagent_runs(run_id);
+        CREATE INDEX IF NOT EXISTS idx_subagent_runs_status ON subagent_runs(status);
+        """
+    )
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
 def _run_from_row(row: sqlite3.Row) -> RunRecord:
     return RunRecord(
         run_id=str(row["run_id"]),
@@ -448,6 +682,12 @@ def _mcp_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "tools": json.loads(str(row["tools_json"])),
         "status": str(row["status"]),
         "error": None if row["error"] is None else str(row["error"]),
+        "last_synced_at": _row_get(row, "last_synced_at"),
+        "last_seen_at": _row_get(row, "last_seen_at"),
+        "tool_count": int(str(_row_get(row, "tool_count", 0) or 0)),
+        "capabilities": json.loads(str(_row_get(row, "capabilities_json", "[]") or "[]")),
+        "risk_policy": str(_row_get(row, "risk_policy", "default") or "default"),
+        "secret_env": json.loads(str(_row_get(row, "secret_env_json", "{}") or "{}")),
         "updated_at": str(row["updated_at"]),
     }
 
@@ -464,6 +704,38 @@ def _skill_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _task_from_row(row: sqlite3.Row) -> TaskNodeRecord:
+    return TaskNodeRecord(
+        task_id=str(row["task_id"]),
+        run_id=str(row["run_id"]),
+        parent_id=None if row["parent_id"] is None else str(row["parent_id"]),
+        title=str(row["title"]),
+        goal=str(row["goal"]),
+        profile=str(row["profile"]),
+        status=str(row["status"]),
+        approved=bool(row["approved"]),
+        plan=json.loads(str(row["plan_json"])),
+        result=_json_or_none(row["result_json"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _subagent_from_row(row: sqlite3.Row) -> SubagentRunRecord:
+    return SubagentRunRecord(
+        subagent_id=str(row["subagent_id"]),
+        run_id=str(row["run_id"]),
+        task_id=None if row["task_id"] is None else str(row["task_id"]),
+        profile=str(row["profile"]),
+        goal=str(row["goal"]),
+        status=str(row["status"]),
+        result=str(row["result"]),
+        error=None if row["error"] is None else str(row["error"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
 def _json_or_none(value: object) -> Any | None:
     if value is None:
         return None
@@ -474,3 +746,15 @@ def _encode(value: object) -> object:
     if isinstance(value, (dict, list, tuple)):
         return json.dumps(value)
     return value
+
+
+def _row_get(row: sqlite3.Row, key: str, default: object = None) -> object:
+    return row[key] if key in row.keys() else default
+
+
+def _task_column(field: str) -> str:
+    if field == "plan":
+        return "plan_json"
+    if field == "result":
+        return "result_json"
+    return field

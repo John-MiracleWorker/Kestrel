@@ -14,8 +14,10 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - OpenAI-compatible chat completions provider for local/model-server endpoints.
 - Built-in tool registry with approval gates for shell, file writes, patch application, tests, and Codex CLI delegation.
 - Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry, and memory search.
-- SQLite state store for runs, run steps, approvals, MCP servers, and skills, now initialized through schema version `1`.
+- SQLite state store for runs, run steps, approvals, MCP servers, skills, task nodes, and subagent runs, now initialized through schema version `2`.
 - Paper-guided nested learning kernel with context-flow metadata, optimizer traces, conservative continuum-memory routing, and a `memory.learn` tool/API path.
+- MCP server records now track health metadata, tool counts, capabilities, last sync/seen timestamps, and expose test/sync/invoke API routes.
+- First task-graph and subagent run records exist, with in-process planner/worker/reviewer profiles and UI/API surfaces.
 
 ## Partially Implemented
 
@@ -25,6 +27,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Codex CLI: `codex.exec` is available as a high-risk tool with approval gating. It is not yet a general planner or autonomous repair loop.
 - Consolidation: memory consolidation scaffolding exists, but promotion policy, evidence thresholds, and validation loops are still basic.
 - Self-modification: the runtime can record validated self-improvement signals and policy candidates, but code changes and policy writes still require explicit gates.
+- Subagents: local subagent runs can be queued and tracked. True branch/worktree isolation and Codex-backed worker fan-out are still next steps.
 
 ## Not Done Yet
 

@@ -53,6 +53,9 @@ class SkillManager:
     def list_skills(self) -> list[dict[str, Any]]:
         return self.state.list_skills()
 
+    def set_enabled(self, skill_id: str, enabled: bool) -> dict[str, Any]:
+        return self.state.set_skill_enabled(skill_id, enabled)
+
     def tool_adapters(self) -> list[AgentTool]:
         adapters: list[AgentTool] = []
         for skill in self.state.list_skills():

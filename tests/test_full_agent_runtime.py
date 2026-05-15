@@ -43,15 +43,19 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     state = AgentStateStore(db_path)
 
-    assert state.schema_version() == 1
+    assert state.schema_version() == 2
     with sqlite3.connect(db_path) as conn:
         run_indexes = {row[1] for row in conn.execute("PRAGMA index_list('runs')").fetchall()}
         approval_indexes = {row[1] for row in conn.execute("PRAGMA index_list('approval_requests')").fetchall()}
         step_indexes = {row[1] for row in conn.execute("PRAGMA index_list('run_steps')").fetchall()}
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+        mcp_columns = {row[1] for row in conn.execute("PRAGMA table_info('mcp_servers')").fetchall()}
 
     assert "idx_runs_status" in run_indexes
     assert "idx_approval_requests_status" in approval_indexes
     assert "idx_run_steps_run_id_id" in step_indexes
+    assert {"task_nodes", "subagent_runs"} <= tables
+    assert {"last_seen_at", "tool_count", "capabilities_json"} <= mcp_columns
 
 
 def test_mcp_static_tools_enter_unified_registry(tmp_path: Path) -> None:
@@ -83,6 +87,25 @@ def test_mcp_static_tools_enter_unified_registry(tmp_path: Path) -> None:
     assert specs["mcp.demo.echo"].source == "mcp"
 
 
+def test_mcp_static_server_test_updates_health(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = MCPManager(state)
+    manager.add_server(
+        {
+            "id": "static",
+            "transport": "stdio",
+            "tools": [{"name": "echo", "description": "Echo", "capabilities": ["test"]}],
+        }
+    )
+
+    result = manager.test_server("static")
+    server = result["server"]
+
+    assert result["ok"] is True
+    assert server["status"] == "online"
+    assert server["last_seen_at"]
+
+
 def test_skill_discovery_exposes_nested_learning_skill(tmp_path: Path) -> None:
     state = AgentStateStore(tmp_path / "state.db")
     skill_dir = tmp_path / "skills" / "review"
@@ -106,6 +129,8 @@ def test_skill_discovery_exposes_nested_learning_skill(tmp_path: Path) -> None:
     adapters = manager.tool_adapters()
     assert adapters[0].spec.name == "skill.review.run"
     assert adapters[0].spec.source == "skill"
+    disabled = manager.set_enabled("review", False)
+    assert disabled["enabled"] is False
 
 
 def test_run_manager_completes_background_mock_run(tmp_path: Path) -> None:
@@ -114,6 +139,21 @@ def test_run_manager_completes_background_mock_run(tmp_path: Path) -> None:
     final = _wait_for_status(manager, run.run_id, {"completed", "failed"})
     assert final["status"] == "completed"
     assert "Mock response: hello" in final["assistant_message"]
+    graph = manager.task_graph(run.run_id)
+    assert graph["tasks"]
+    assert graph["tasks"][0]["title"] == "Root objective"
+
+
+def test_run_manager_runs_mock_subagent(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    run = manager.create_run(message="main run", session_id="session")
+    subagent = manager.create_subagent(run_id=run.run_id, profile="reviewer", goal="Review the mock output.")
+    final = _wait_for_subagent(manager, run.run_id, str(subagent["subagent_id"]), {"completed", "failed"})
+
+    assert final["status"] == "completed"
+    assert "Mock response" in str(final["result"])
+    graph = manager.task_graph(run.run_id)
+    assert graph["subagents"]
 
 
 def test_run_manager_publishes_stream_tokens(tmp_path: Path) -> None:
@@ -206,3 +246,14 @@ def _wait_for_status(manager: RunManager, run_id: str, statuses: set[str]) -> di
             return run
         sleep(0.05)
     raise AssertionError(f"run {run_id} did not reach {statuses}")
+
+
+def _wait_for_subagent(manager: RunManager, run_id: str, subagent_id: str, statuses: set[str]) -> dict[str, object]:
+    deadline = monotonic() + 5
+    while monotonic() < deadline:
+        graph = manager.task_graph(run_id)
+        for subagent in graph["subagents"]:
+            if str(subagent["subagent_id"]) == subagent_id and str(subagent["status"]) in statuses:
+                return subagent
+        sleep(0.05)
+    raise AssertionError(f"subagent {subagent_id} did not reach {statuses}")

@@ -108,7 +108,7 @@ npm run build --prefix web
 nest-agent server --backend memory --provider mock --host 127.0.0.1 --port 8765
 ```
 
-Open `http://127.0.0.1:8765/` to use the local workbench. It exposes background runs, SSE timeline events, human approvals, built-in tools, MCP servers, skills, and memory search.
+Open `http://127.0.0.1:8765/` to use the local workbench. It exposes background runs, SSE timeline events, human approvals, built-in tools, MCP server health/sync controls, local subagent runs, skills, and memory search.
 
 ## Codex CLI connection
 
@@ -139,7 +139,7 @@ The scaffold is runnable with the in-memory backend, mock provider, local web UI
 
 It is **not yet a complete Hermes/OpenClaw agent**. Native provider tool-calling, durable multi-step planning, production auth, full MCP session execution, richer skill sandboxing, and autonomous self-improvement controls still need hardening. See `docs/IMPLEMENTATION_STATUS.md` for the current truth table.
 
-The nested learning pass now records context-flow and optimizer-trace metadata for validated memory updates via `memory.learn` and `memory.consolidate`. This is the runtime-memory analogue of the paper’s nested context-flow idea, not a claim of neural weight-level HOPE/self-modifying model training.
+The nested learning pass now records context-flow and optimizer-trace metadata for validated memory updates via `memory.learn` and `memory.consolidate`. The MCP/subagent pass adds durable MCP health metadata, normalized tool lifecycle events, task graph records, and in-process planner/worker/reviewer subagents. This is still the runtime-memory analogue of the paper’s nested context-flow idea, not a claim of neural weight-level HOPE/self-modifying model training.
 
 ## Critical next Codex task
 

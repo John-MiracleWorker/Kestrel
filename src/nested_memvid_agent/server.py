@@ -70,6 +70,12 @@ def create_app(config: AgentConfig | None = None) -> Any:
         enabled: bool = True
         tools: list[dict[str, Any]] = Field(default_factory=list)
 
+    class SubagentRequest(BaseModel):  # type: ignore[valid-type,misc]
+        run_id: str
+        profile: str = "worker"
+        goal: str
+        task_id: str | None = None
+
     class MemorySearchRequest(BaseModel):  # type: ignore[valid-type,misc]
         query: str
         layers: list[str] | None = None
@@ -125,6 +131,20 @@ def create_app(config: AgentConfig | None = None) -> Any:
     def cancel_run(run_id: str) -> dict[str, object]:
         try:
             return runs.cancel_run(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/runs/{run_id}/task-graph")  # type: ignore[untyped-decorator]
+    def task_graph(run_id: str) -> dict[str, object]:
+        try:
+            return runs.task_graph(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/approve-task")  # type: ignore[untyped-decorator]
+    def approve_task(run_id: str, request: dict[str, str]) -> dict[str, object]:
+        try:
+            return runs.approve_task(run_id, str(request["task_id"]))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -205,6 +225,40 @@ def create_app(config: AgentConfig | None = None) -> Any:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.post("/api/mcp/servers/{server_id}/test")  # type: ignore[untyped-decorator]
+    def test_mcp_server(server_id: str) -> dict[str, object]:
+        try:
+            return mcp.test_server(server_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/mcp/servers/{server_id}/tools/{tool_name}/invoke")  # type: ignore[untyped-decorator]
+    def invoke_mcp_tool(server_id: str, tool_name: str, request: ToolInvokeRequest) -> dict[str, object]:
+        try:
+            execution = mcp.invoke_tool(server_id, tool_name, request.arguments)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "tool": execution.call.name,
+            "tool_call_id": execution.call.id,
+            "success": execution.success,
+            "content": execution.content,
+            "data": execution.data,
+            "error": execution.error,
+        }
+
+    @app.post("/api/subagents")  # type: ignore[untyped-decorator]
+    def create_subagent(request: SubagentRequest) -> dict[str, object]:
+        try:
+            return runs.create_subagent(
+                run_id=request.run_id,
+                profile=request.profile,
+                goal=request.goal,
+                task_id=request.task_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.get("/api/skills")  # type: ignore[untyped-decorator]
     def list_skills() -> list[dict[str, object]]:
         return skills.list_skills()
@@ -212,6 +266,20 @@ def create_app(config: AgentConfig | None = None) -> Any:
     @app.post("/api/skills/discover")  # type: ignore[untyped-decorator]
     def discover_skills() -> list[dict[str, object]]:
         return skills.discover()
+
+    @app.post("/api/skills/{skill_id}/enable")  # type: ignore[untyped-decorator]
+    def enable_skill(skill_id: str) -> dict[str, object]:
+        try:
+            return skills.set_enabled(skill_id, True)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/skills/{skill_id}/disable")  # type: ignore[untyped-decorator]
+    def disable_skill(skill_id: str) -> dict[str, object]:
+        try:
+            return skills.set_enabled(skill_id, False)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/skills/{skill_id}/run")  # type: ignore[untyped-decorator]
     def run_skill(skill_id: str, request: ToolInvokeRequest) -> dict[str, object]:

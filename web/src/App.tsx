@@ -58,6 +58,8 @@ type McpServer = {
   status: string;
   enabled: boolean;
   tools: Tool[];
+  tool_count?: number;
+  last_seen_at?: string | null;
   error?: string | null;
 };
 
@@ -74,6 +76,11 @@ type EventRow = {
   payload: Record<string, unknown>;
 };
 
+type TaskGraph = {
+  tasks: Array<{ task_id: string; title: string; goal: string; profile: string; status: string; approved: boolean }>;
+  subagents: Array<{ subagent_id: string; profile: string; goal: string; status: string; result: string; error?: string | null }>;
+};
+
 const api = {
   async get<T>(path: string): Promise<T> {
     const response = await fetch(path);
@@ -86,6 +93,11 @@ const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
+    if (!response.ok) throw new Error(await response.text());
+    return response.json();
+  },
+  async delete<T>(path: string): Promise<T> {
+    const response = await fetch(path, { method: "DELETE" });
     if (!response.ok) throw new Error(await response.text());
     return response.json();
   }
@@ -108,7 +120,13 @@ export function App() {
   const [learningExplicit, setLearningExplicit] = useState(false);
   const [learningResult, setLearningResult] = useState<Record<string, unknown> | null>(null);
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
+  const [mcpId, setMcpId] = useState("");
+  const [mcpCommand, setMcpCommand] = useState("");
+  const [mcpTransport, setMcpTransport] = useState("stdio");
   const [skills, setSkills] = useState<Skill[]>([]);
+  const [taskGraph, setTaskGraph] = useState<TaskGraph | null>(null);
+  const [subagentProfile, setSubagentProfile] = useState("worker");
+  const [subagentGoal, setSubagentGoal] = useState("");
   const activeRun = useMemo(() => runs.find((run) => run.run_id === activeRunId) ?? runs[0], [runs, activeRunId]);
   const streamedAssistant = useMemo(
     () =>
@@ -157,10 +175,18 @@ export function App() {
       "run.failed",
       "approval.requested",
       "tool.executed",
+      "tool.started",
+      "tool.completed",
+      "tool.failed",
       "assistant.token",
       "assistant.tool_call",
       "assistant.usage",
-      "assistant.provider_error"
+      "assistant.provider_error",
+      "task.approved",
+      "subagent.queued",
+      "subagent.started",
+      "subagent.completed",
+      "subagent.failed"
     ].forEach((type) => {
       source.addEventListener(type, (event) => {
         const parsed = JSON.parse((event as MessageEvent).data);
@@ -178,6 +204,8 @@ export function App() {
     setMessage("");
     setActiveRunId(run.run_id);
     await refresh();
+    const graph = await api.get<TaskGraph>(`/api/runs/${run.run_id}/task-graph`);
+    setTaskGraph(graph);
   }
 
   async function decide(approval: Approval, approved: boolean) {
@@ -215,6 +243,61 @@ export function App() {
     await refresh();
   }
 
+  async function refreshTaskGraph() {
+    if (!activeRun?.run_id) return;
+    const graph = await api.get<TaskGraph>(`/api/runs/${activeRun.run_id}/task-graph`);
+    setTaskGraph(graph);
+  }
+
+  async function submitSubagent(event: FormEvent) {
+    event.preventDefault();
+    if (!activeRun?.run_id || !subagentGoal.trim()) return;
+    await api.post("/api/subagents", {
+      run_id: activeRun.run_id,
+      profile: subagentProfile,
+      goal: subagentGoal
+    });
+    setSubagentGoal("");
+    await refreshTaskGraph();
+  }
+
+  async function submitMcp(event: FormEvent) {
+    event.preventDefault();
+    if (!mcpId.trim()) return;
+    await api.post("/api/mcp/servers", {
+      id: mcpId.trim(),
+      name: mcpId.trim(),
+      transport: mcpTransport,
+      command: mcpTransport === "stdio" ? mcpCommand.trim() || null : null,
+      url: mcpTransport === "stdio" ? null : mcpCommand.trim() || null,
+      args: [],
+      tools: []
+    });
+    setMcpId("");
+    setMcpCommand("");
+    await refresh();
+  }
+
+  async function syncMcp(server: McpServer) {
+    await api.post(`/api/mcp/servers/${server.id}/sync`);
+    await refresh();
+  }
+
+  async function testMcp(server: McpServer) {
+    await api.post(`/api/mcp/servers/${server.id}/test`);
+    await refresh();
+  }
+
+  async function deleteMcp(server: McpServer) {
+    await api.delete(`/api/mcp/servers/${server.id}`);
+    await refresh();
+  }
+
+  async function toggleSkill(skill: Skill) {
+    await api.post(`/api/skills/${skill.id}/${skill.enabled ? "disable" : "enable"}`);
+    await refresh();
+  }
+
   return (
     <div className="shell">
       <aside className="sidebar">
@@ -228,6 +311,7 @@ export function App() {
         <nav>
           <a href="#chat"><Sparkles size={18} /> Chat</a>
           <a href="#approvals"><ShieldCheck size={18} /> Approvals</a>
+          <a href="#subagents"><Brain size={18} /> Subagents</a>
           <a href="#tools"><Wrench size={18} /> Tools</a>
           <a href="#memory"><Database size={18} /> Memory</a>
           <a href="#mcp"><PlugZap size={18} /> MCP</a>
@@ -282,6 +366,37 @@ export function App() {
               <div className="event" key={event.id}>
                 <span>{event.type}</span>
                 <code>{JSON.stringify(event.payload).slice(0, 220)}</code>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section id="subagents" className="band two-col">
+          <form onSubmit={submitSubagent} className="memory-search">
+            <div className="section-title"><Brain size={18} /> Subagents</div>
+            <select value={subagentProfile} onChange={(event) => setSubagentProfile(event.target.value)}>
+              <option value="worker">Worker</option>
+              <option value="planner">Planner</option>
+              <option value="reviewer">Reviewer</option>
+            </select>
+            <textarea value={subagentGoal} onChange={(event) => setSubagentGoal(event.target.value)} placeholder="Bounded subagent goal for the active run" />
+            <button type="submit" disabled={!activeRun}>Queue Subagent</button>
+            <button type="button" onClick={refreshTaskGraph} disabled={!activeRun}>Refresh Graph</button>
+          </form>
+          <div>
+            <div className="section-title"><Activity size={18} /> Task Graph</div>
+            {taskGraph?.tasks.map((task) => (
+              <div className="row" key={task.task_id}>
+                <strong>{task.title}</strong>
+                <span>{task.profile} / {task.status} / {task.approved ? "approved" : "needs review"}</span>
+                <p>{task.goal}</p>
+              </div>
+            ))}
+            {taskGraph?.subagents.map((subagent) => (
+              <div className="row" key={subagent.subagent_id}>
+                <strong>{subagent.profile}</strong>
+                <span>{subagent.status}</span>
+                <p>{subagent.result || subagent.error || subagent.goal}</p>
               </div>
             ))}
           </div>
@@ -364,10 +479,26 @@ export function App() {
         <section id="mcp" className="band two-col">
           <div>
             <div className="section-title"><PlugZap size={18} /> MCP Servers</div>
+            <form onSubmit={submitMcp} className="memory-search">
+              <input value={mcpId} onChange={(event) => setMcpId(event.target.value)} placeholder="Server id" />
+              <select value={mcpTransport} onChange={(event) => setMcpTransport(event.target.value)}>
+                <option value="stdio">stdio</option>
+                <option value="streamable_http">streamable http</option>
+                <option value="sse">sse</option>
+              </select>
+              <input value={mcpCommand} onChange={(event) => setMcpCommand(event.target.value)} placeholder="Command or URL" />
+              <button type="submit">Add Server</button>
+            </form>
             {mcpServers.map((server) => (
               <div className="row" key={server.id}>
                 <strong>{server.name}</strong>
-                <span>{server.transport} / {server.status}</span>
+                <span>{server.transport} / {server.status} / {server.tool_count ?? server.tools.length} tools</span>
+                {server.error && <p>{server.error}</p>}
+                <div className="actions">
+                  <button onClick={() => testMcp(server)}>Test</button>
+                  <button onClick={() => syncMcp(server)}>Sync</button>
+                  <button className="danger" onClick={() => deleteMcp(server)}>Delete</button>
+                </div>
               </div>
             ))}
           </div>
@@ -379,6 +510,7 @@ export function App() {
                 <strong>{skill.name}</strong>
                 <span>{skill.enabled ? "enabled" : "disabled"}</span>
                 <p>{skill.description}</p>
+                <button onClick={() => toggleSkill(skill)}>{skill.enabled ? "Disable" : "Enable"}</button>
               </div>
             ))}
           </div>

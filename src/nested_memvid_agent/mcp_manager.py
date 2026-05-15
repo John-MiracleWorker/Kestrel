@@ -5,6 +5,7 @@ import json
 import threading
 from collections.abc import Awaitable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from importlib import import_module
 from typing import Any, cast
 
@@ -49,10 +50,36 @@ class MCPManager:
             server["tools"] = tools
             server["status"] = "synced"
             server["error"] = None
+            server["last_synced_at"] = _now()
+            server["last_seen_at"] = _now()
+            server["tool_count"] = len(tools)
+            server["capabilities"] = _capabilities_from_tools(tools)
         except Exception as exc:  # noqa: BLE001 - stored for UI visibility
             server["status"] = "error"
             server["error"] = f"{type(exc).__name__}: {exc}"
         return self.state.upsert_mcp_server(server)
+
+    def test_server(self, server_id: str) -> dict[str, Any]:
+        server = self.state.get_mcp_server(server_id)
+        if server.get("tools"):
+            server["status"] = "online"
+            server["error"] = None
+            server["last_seen_at"] = _now()
+            return {"ok": True, "message": "Static MCP tool manifest is available.", "server": self.state.upsert_mcp_server(server)}
+        try:
+            tools = self._discover_tools(_server_from_state(server))
+            server["tools"] = tools
+            server["status"] = "online"
+            server["error"] = None
+            server["last_seen_at"] = _now()
+            server["last_synced_at"] = _now()
+            server["tool_count"] = len(tools)
+            server["capabilities"] = _capabilities_from_tools(tools)
+            return {"ok": True, "message": f"Connected and discovered {len(tools)} tools.", "server": self.state.upsert_mcp_server(server)}
+        except Exception as exc:  # noqa: BLE001
+            server["status"] = "error"
+            server["error"] = f"{type(exc).__name__}: {exc}"
+            return {"ok": False, "message": server["error"], "server": self.state.upsert_mcp_server(server)}
 
     def tool_adapters(self) -> list[AgentTool]:
         adapters: list[AgentTool] = []
@@ -75,6 +102,17 @@ class MCPManager:
             return ToolExecution(call=call, success=True, content=result, data={"server_id": server.id})
         except Exception as exc:  # noqa: BLE001
             return ToolExecution(call=call, success=False, content=str(exc), error="mcp_tool_failed")
+
+    def invoke_tool(self, server_id: str, tool_name: str, arguments: dict[str, Any]) -> ToolExecution:
+        row = self.state.get_mcp_server(server_id)
+        server = _server_from_state(row)
+        remote_name = _remote_name_for(row, tool_name)
+        execution = self.call_tool(server, remote_name, arguments)
+        row["last_seen_at"] = _now()
+        row["status"] = "online" if execution.success else "error"
+        row["error"] = None if execution.success else execution.content
+        self.state.upsert_mcp_server(row)
+        return execution
 
 
 class MCPToolAdapter(AgentTool):
@@ -211,6 +249,24 @@ def _normalize_tool(server: MCPServerConfig, tool: dict[str, Any]) -> dict[str, 
         "requires_approval": bool(tool.get("requires_approval", False)),
         "capabilities": list(tool.get("capabilities", ["mcp"])),
     }
+
+
+def _remote_name_for(row: dict[str, Any], tool_name: str) -> str:
+    short_name = tool_name.removeprefix(f"mcp.{row['id']}.")
+    for tool in row.get("tools", []):
+        if tool.get("name") == tool_name or tool.get("name") == f"mcp.{row['id']}.{tool_name}":
+            return str(tool.get("remote_name") or short_name)
+        if tool.get("remote_name") == tool_name:
+            return str(tool["remote_name"])
+    return short_name
+
+
+def _capabilities_from_tools(tools: list[dict[str, Any]]) -> list[str]:
+    return sorted({str(capability) for tool in tools for capability in tool.get("capabilities", [])})
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 def _normalize_sdk_tool(server: MCPServerConfig, tool: Any) -> dict[str, Any]:
