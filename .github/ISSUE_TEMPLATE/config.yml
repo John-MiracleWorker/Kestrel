@@ -1,5 +1,0 @@
-blank_issues_enabled: true
-contact_links:
-    - name: Security policy
-      url: https://github.com/John-MiracleWorker/Kestrel/security/policy
-      about: Read the repository security reporting guidance before posting sensitive issues.

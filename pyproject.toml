@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nested-memvid-agent"
+version = "0.1.0"
+description = "Nested Learning-inspired agent memory scaffold using Memvid .mv2 files as portable memory layers."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Nested Learning Agent scaffold" }]
+dependencies = []
+
+[project.optional-dependencies]
+memvid = ["memvid-sdk>=2.0"]
+openai = ["openai>=1.0"]
+server = ["fastapi>=0.110", "uvicorn>=0.29"]
+mcp = ["mcp>=1.0"]
+dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.10"]
+
+[project.scripts]
+nested-memvid = "nested_memvid_agent.cli:main"
+nest-agent = "nested_memvid_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+exclude = ["build", "dist"]

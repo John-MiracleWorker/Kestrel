@@ -1,0 +1,17 @@
+{
+  "name": "Nested MV2 Agent",
+  "provider": "openai",
+  "model": "gpt-5.5",
+  "backend": "memvid",
+  "memory_dir": ".nest/memory",
+  "workspace": ".",
+  "max_tool_rounds": 6,
+  "context_budget_chars": 18000,
+  "allow_shell": false,
+  "allow_file_write": false,
+  "allow_policy_writes": false,
+  "allow_codex_cli": false,
+  "require_approval_for_high_risk_tools": true,
+  "stream": false,
+  "log_dir": ".nest/logs"
+}
