@@ -263,6 +263,7 @@ code {
 
 .actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
@@ -301,6 +302,45 @@ code {
   display: grid;
   align-content: start;
   gap: 10px;
+}
+
+.mcp-health {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.mcp-health span {
+  border: 1px solid #d9dfd4;
+  background: #f7f9f4;
+  border-radius: 6px;
+  color: #4d5a50;
+  font-size: 12px;
+  padding: 4px 7px;
+}
+
+.tool-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.tool-list button {
+  min-height: 32px;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.mcp-invoke {
+  border: 1px solid #d9dfd4;
+  background: #ffffff;
+  border-radius: 8px;
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 14px;
 }
 
 .learning-panel {

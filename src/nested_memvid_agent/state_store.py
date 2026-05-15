@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_now() -> str:
@@ -242,8 +242,13 @@ class AgentStateStore:
             "last_seen_at": server.get("last_seen_at"),
             "tool_count": int(server.get("tool_count", len(tools))),
             "capabilities_json": json.dumps(capabilities),
-            "risk_policy": server.get("risk_policy", "default"),
+            "risk_policy": server.get("risk_policy", "approval_by_default"),
             "secret_env_json": json.dumps(server.get("secret_env", {})),
+            "session_state": server.get("session_state", "disconnected"),
+            "last_call_at": server.get("last_call_at"),
+            "last_error_at": server.get("last_error_at"),
+            "failure_count": int(server.get("failure_count", 0)),
+            "last_latency_ms": server.get("last_latency_ms"),
             "updated_at": now,
         }
         with self._connect() as conn:
@@ -252,8 +257,9 @@ class AgentStateStore:
                 INSERT INTO mcp_servers (
                     id, name, transport, command, args_json, env_json, url, enabled,
                     tools_json, status, error, last_synced_at, last_seen_at, tool_count,
-                    capabilities_json, risk_policy, secret_env_json, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    capabilities_json, risk_policy, secret_env_json, session_state, last_call_at,
+                    last_error_at, failure_count, last_latency_ms, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     transport = excluded.transport,
@@ -271,6 +277,11 @@ class AgentStateStore:
                     capabilities_json = excluded.capabilities_json,
                     risk_policy = excluded.risk_policy,
                     secret_env_json = excluded.secret_env_json,
+                    session_state = excluded.session_state,
+                    last_call_at = excluded.last_call_at,
+                    last_error_at = excluded.last_error_at,
+                    failure_count = excluded.failure_count,
+                    last_latency_ms = excluded.last_latency_ms,
                     updated_at = excluded.updated_at
                 """,
                 (server_id, *payload.values()),
@@ -477,6 +488,9 @@ class AgentStateStore:
             if current < 2:
                 _apply_schema_v2(conn)
                 current = 2
+            if current < 3:
+                _apply_schema_v3(conn)
+                current = 3
             if current < SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported schema migration target: {current} -> {SCHEMA_VERSION}")
             if current == SCHEMA_VERSION:
@@ -631,6 +645,19 @@ def _apply_schema_v2(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_schema_v3(conn: sqlite3.Connection) -> None:
+    existing = _columns(conn, "mcp_servers")
+    for name, definition in {
+        "session_state": "TEXT NOT NULL DEFAULT 'disconnected'",
+        "last_call_at": "TEXT",
+        "last_error_at": "TEXT",
+        "failure_count": "INTEGER NOT NULL DEFAULT 0",
+        "last_latency_ms": "INTEGER",
+    }.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE mcp_servers ADD COLUMN {name} {definition}")
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -686,8 +713,13 @@ def _mcp_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "last_seen_at": _row_get(row, "last_seen_at"),
         "tool_count": int(str(_row_get(row, "tool_count", 0) or 0)),
         "capabilities": json.loads(str(_row_get(row, "capabilities_json", "[]") or "[]")),
-        "risk_policy": str(_row_get(row, "risk_policy", "default") or "default"),
+        "risk_policy": str(_row_get(row, "risk_policy", "approval_by_default") or "approval_by_default"),
         "secret_env": json.loads(str(_row_get(row, "secret_env_json", "{}") or "{}")),
+        "session_state": str(_row_get(row, "session_state", "disconnected") or "disconnected"),
+        "last_call_at": _row_get(row, "last_call_at"),
+        "last_error_at": _row_get(row, "last_error_at"),
+        "failure_count": int(str(_row_get(row, "failure_count", 0) or 0)),
+        "last_latency_ms": _row_get(row, "last_latency_ms"),
         "updated_at": str(row["updated_at"]),
     }
 

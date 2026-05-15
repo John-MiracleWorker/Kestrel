@@ -1,5 +1,6 @@
 import json
 import queue
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from importlib import import_module
 from pathlib import Path
@@ -41,7 +42,15 @@ def create_app(config: AgentConfig | None = None) -> Any:
     skills = SkillManager(active_config.skills_dir, state)
     runs = RunManager(config=active_config, state=state, events=events, mcp=mcp, skills=skills)
 
-    app = FastAPI(title="Nested MV2 Agent")
+    @asynccontextmanager
+    async def lifespan(app_instance: Any) -> Any:
+        del app_instance
+        try:
+            yield
+        finally:
+            mcp.shutdown()
+
+    app = FastAPI(title="Nested MV2 Agent", lifespan=lifespan)
 
     class CreateRunRequest(BaseModel):  # type: ignore[valid-type,misc]
         message: str
@@ -69,6 +78,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         url: str | None = None
         enabled: bool = True
         tools: list[dict[str, Any]] = Field(default_factory=list)
+        risk_policy: str = "approval_by_default"
 
     class SubagentRequest(BaseModel):  # type: ignore[valid-type,misc]
         run_id: str
@@ -217,6 +227,34 @@ def create_app(config: AgentConfig | None = None) -> Any:
     def delete_mcp_server(server_id: str) -> dict[str, bool]:
         mcp.delete_server(server_id)
         return {"ok": True}
+
+    @app.post("/api/mcp/servers/{server_id}/connect")  # type: ignore[untyped-decorator]
+    def connect_mcp_server(server_id: str) -> dict[str, object]:
+        try:
+            return mcp.connect_server(server_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/mcp/servers/{server_id}/disconnect")  # type: ignore[untyped-decorator]
+    def disconnect_mcp_server(server_id: str) -> dict[str, object]:
+        try:
+            return mcp.disconnect_server(server_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/mcp/servers/{server_id}/restart")  # type: ignore[untyped-decorator]
+    def restart_mcp_server(server_id: str) -> dict[str, object]:
+        try:
+            return mcp.restart_server(server_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/mcp/servers/{server_id}/health")  # type: ignore[untyped-decorator]
+    def mcp_server_health(server_id: str) -> dict[str, object]:
+        try:
+            return mcp.server_health(server_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/mcp/servers/{server_id}/sync")  # type: ignore[untyped-decorator]
     def sync_mcp_server(server_id: str) -> dict[str, object]:

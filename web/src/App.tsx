@@ -38,9 +38,16 @@ type Approval = {
 type Tool = {
   name: string;
   description: string;
+  parameters?: Record<string, unknown>;
   risk: string;
   requires_approval: boolean;
   source: string;
+  server_id?: string | null;
+};
+
+type McpTool = Tool & {
+  remote_name?: string;
+  capabilities?: string[];
 };
 
 type MemoryHit = {
@@ -56,10 +63,16 @@ type McpServer = {
   name: string;
   transport: string;
   status: string;
+  session_state?: string;
   enabled: boolean;
-  tools: Tool[];
+  tools: McpTool[];
   tool_count?: number;
   last_seen_at?: string | null;
+  last_call_at?: string | null;
+  last_error_at?: string | null;
+  failure_count?: number;
+  last_latency_ms?: number | null;
+  risk_policy?: string;
   error?: string | null;
 };
 
@@ -123,6 +136,9 @@ export function App() {
   const [mcpId, setMcpId] = useState("");
   const [mcpCommand, setMcpCommand] = useState("");
   const [mcpTransport, setMcpTransport] = useState("stdio");
+  const [mcpToolSelection, setMcpToolSelection] = useState("");
+  const [mcpArguments, setMcpArguments] = useState("{}");
+  const [mcpInvokeResult, setMcpInvokeResult] = useState<Record<string, unknown> | null>(null);
   const [skills, setSkills] = useState<Skill[]>([]);
   const [taskGraph, setTaskGraph] = useState<TaskGraph | null>(null);
   const [subagentProfile, setSubagentProfile] = useState("worker");
@@ -135,6 +151,17 @@ export function App() {
         .map((event) => String(event.payload.content ?? ""))
         .join(""),
     [events]
+  );
+  const mcpToolOptions = useMemo(
+    () =>
+      mcpServers.flatMap((server) =>
+        server.tools.map((tool) => ({
+          server,
+          tool,
+          value: `${server.id}::${tool.remote_name ?? tool.name}`
+        }))
+      ),
+    [mcpServers]
   );
 
   async function refresh() {
@@ -271,10 +298,16 @@ export function App() {
       command: mcpTransport === "stdio" ? mcpCommand.trim() || null : null,
       url: mcpTransport === "stdio" ? null : mcpCommand.trim() || null,
       args: [],
-      tools: []
+      tools: [],
+      risk_policy: "approval_by_default"
     });
     setMcpId("");
     setMcpCommand("");
+    await refresh();
+  }
+
+  async function controlMcp(server: McpServer, action: "connect" | "disconnect" | "restart") {
+    await api.post(`/api/mcp/servers/${server.id}/${action}`);
     await refresh();
   }
 
@@ -288,8 +321,30 @@ export function App() {
     await refresh();
   }
 
+  async function healthMcp(server: McpServer) {
+    await api.get(`/api/mcp/servers/${server.id}/health`);
+    await refresh();
+  }
+
   async function deleteMcp(server: McpServer) {
     await api.delete(`/api/mcp/servers/${server.id}`);
+    await refresh();
+  }
+
+  async function invokeMcp(event: FormEvent) {
+    event.preventDefault();
+    if (!mcpToolSelection) return;
+    const [serverId, toolName] = mcpToolSelection.split("::");
+    try {
+      const parsed = JSON.parse(mcpArguments || "{}");
+      const result = await api.post<Record<string, unknown>>(
+        `/api/mcp/servers/${serverId}/tools/${encodeURIComponent(toolName)}/invoke`,
+        { arguments: parsed }
+      );
+      setMcpInvokeResult(result);
+    } catch (error) {
+      setMcpInvokeResult({ success: false, error: error instanceof Error ? error.message : String(error) });
+    }
     await refresh();
   }
 
@@ -492,15 +547,55 @@ export function App() {
             {mcpServers.map((server) => (
               <div className="row" key={server.id}>
                 <strong>{server.name}</strong>
-                <span>{server.transport} / {server.status} / {server.tool_count ?? server.tools.length} tools</span>
+                <span>{server.transport} / {server.status} / {server.session_state ?? "disconnected"} / {server.tool_count ?? server.tools.length} tools</span>
+                <div className="mcp-health">
+                  <span>{server.risk_policy ?? "approval_by_default"}</span>
+                  <span>{server.failure_count ?? 0} failures</span>
+                  <span>{server.last_latency_ms ?? 0} ms</span>
+                  {server.last_seen_at && <span>seen {new Date(server.last_seen_at).toLocaleTimeString()}</span>}
+                </div>
                 {server.error && <p>{server.error}</p>}
                 <div className="actions">
+                  <button onClick={() => controlMcp(server, "connect")}>Connect</button>
+                  <button onClick={() => healthMcp(server)}>Health</button>
+                  <button onClick={() => controlMcp(server, "restart")}>Restart</button>
+                  <button onClick={() => controlMcp(server, "disconnect")}>Disconnect</button>
                   <button onClick={() => testMcp(server)}>Test</button>
                   <button onClick={() => syncMcp(server)}>Sync</button>
                   <button className="danger" onClick={() => deleteMcp(server)}>Delete</button>
                 </div>
+                {server.tools.length > 0 && (
+                  <div className="tool-list">
+                    {server.tools.map((tool) => (
+                      <button
+                        type="button"
+                        key={tool.name}
+                        onClick={() => {
+                          setMcpToolSelection(`${server.id}::${tool.remote_name ?? tool.name}`);
+                          setMcpArguments(JSON.stringify(tool.parameters ?? {}, null, 2));
+                        }}
+                      >
+                        {tool.remote_name ?? tool.name} / {tool.risk}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             ))}
+            <form onSubmit={invokeMcp} className="mcp-invoke">
+              <div className="section-title"><Wrench size={18} /> Manual MCP Invoke</div>
+              <select value={mcpToolSelection} onChange={(event) => setMcpToolSelection(event.target.value)}>
+                <option value="">Select tool</option>
+                {mcpToolOptions.map(({ server, tool, value }) => (
+                  <option key={value} value={value}>
+                    {server.id} / {tool.remote_name ?? tool.name}
+                  </option>
+                ))}
+              </select>
+              <textarea value={mcpArguments} onChange={(event) => setMcpArguments(event.target.value)} />
+              <button type="submit" disabled={!mcpToolSelection}>Invoke Tool</button>
+              {mcpInvokeResult && <code>{JSON.stringify(mcpInvokeResult).slice(0, 680)}</code>}
+            </form>
           </div>
           <div>
             <div className="section-title"><Sparkles size={18} /> Skills</div>

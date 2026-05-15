@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from pathlib import Path
 from time import monotonic, sleep
+from types import SimpleNamespace
+from typing import Any
 
+import nested_memvid_agent.mcp_manager as mcp_module
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.event_bus import RunEventBus
 from nested_memvid_agent.mcp_manager import MCPManager
 from nested_memvid_agent.run_manager import RunManager
+from nested_memvid_agent.server import create_app
 from nested_memvid_agent.skill_manager import SkillManager
 from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.tools.builtin import build_default_tools
@@ -43,7 +48,7 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     state = AgentStateStore(db_path)
 
-    assert state.schema_version() == 2
+    assert state.schema_version() == 3
     with sqlite3.connect(db_path) as conn:
         run_indexes = {row[1] for row in conn.execute("PRAGMA index_list('runs')").fetchall()}
         approval_indexes = {row[1] for row in conn.execute("PRAGMA index_list('approval_requests')").fetchall()}
@@ -55,7 +60,16 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
     assert "idx_approval_requests_status" in approval_indexes
     assert "idx_run_steps_run_id_id" in step_indexes
     assert {"task_nodes", "subagent_runs"} <= tables
-    assert {"last_seen_at", "tool_count", "capabilities_json"} <= mcp_columns
+    assert {
+        "last_seen_at",
+        "tool_count",
+        "capabilities_json",
+        "session_state",
+        "last_call_at",
+        "last_error_at",
+        "failure_count",
+        "last_latency_ms",
+    } <= mcp_columns
 
 
 def test_mcp_static_tools_enter_unified_registry(tmp_path: Path) -> None:
@@ -85,6 +99,8 @@ def test_mcp_static_tools_enter_unified_registry(tmp_path: Path) -> None:
     specs = {spec.name: spec for spec in registry.specs()}
     assert "mcp.demo.echo" in specs
     assert specs["mcp.demo.echo"].source == "mcp"
+    assert specs["mcp.demo.echo"].risk == "medium"
+    assert specs["mcp.demo.echo"].requires_approval is True
 
 
 def test_mcp_static_server_test_updates_health(tmp_path: Path) -> None:
@@ -103,7 +119,104 @@ def test_mcp_static_server_test_updates_health(tmp_path: Path) -> None:
 
     assert result["ok"] is True
     assert server["status"] == "online"
+    assert server["session_state"] == "static"
     assert server["last_seen_at"]
+
+
+def test_mcp_live_session_reuses_worker_and_tracks_calls(tmp_path: Path, monkeypatch: Any) -> None:
+    factory = _FakeMCPFactory()
+    monkeypatch.setattr(mcp_module, "_session_context", factory)
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = MCPManager(state)
+    manager.add_server({"id": "live", "transport": "stdio", "command": "fake-mcp"})
+
+    connected = manager.connect_server("live")
+    assert connected["ok"] is True
+    assert connected["server"]["session_state"] == "connected"
+    assert connected["server"]["tools"][0]["requires_approval"] is True
+
+    first = manager.invoke_tool("live", "echo", {"message": "one"})
+    second = manager.invoke_tool("live", "mcp.live.echo", {"message": "two"})
+    row = state.get_mcp_server("live")
+
+    assert first.success is True
+    assert second.success is True
+    assert "echo:one" in first.content
+    assert "echo:two" in second.content
+    assert factory.enter_count == 1
+    assert row["status"] == "online"
+    assert row["session_state"] == "connected"
+    assert row["last_call_at"]
+    assert row["failure_count"] == 0
+
+    disconnected = manager.disconnect_server("live")
+    assert disconnected["server"]["session_state"] == "disconnected"
+    assert factory.exit_count == 1
+
+
+def test_mcp_config_change_tears_down_existing_session(tmp_path: Path, monkeypatch: Any) -> None:
+    factory = _FakeMCPFactory()
+    monkeypatch.setattr(mcp_module, "_session_context", factory)
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = MCPManager(state)
+    manager.add_server({"id": "live", "transport": "stdio", "command": "fake-mcp"})
+    assert manager.connect_server("live")["ok"] is True
+
+    updated = manager.add_server({"id": "live", "transport": "stdio", "command": "replacement-mcp"})
+
+    assert factory.exit_count == 1
+    assert updated["session_state"] == "disconnected"
+    assert updated["command"] == "replacement-mcp"
+
+
+def test_mcp_live_timeout_marks_server_unhealthy(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setattr(mcp_module, "_session_context", lambda server: _SlowMCPContext())
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = MCPManager(state, timeout_seconds=0.01)
+    manager.add_server({"id": "slow", "transport": "stdio", "command": "slow-mcp"})
+
+    result = manager.connect_server("slow")
+    row = state.get_mcp_server("slow")
+
+    assert result["ok"] is False
+    assert row["status"] == "error"
+    assert row["session_state"] == "error"
+    assert row["failure_count"] == 1
+    assert "timed out" in str(row["error"])
+    manager.shutdown()
+
+
+def test_server_exposes_mcp_lifecycle_routes(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    config = AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        state_path=tmp_path / "state.db",
+        skills_dir=tmp_path / "skills",
+        workspace=tmp_path,
+    )
+    client = TestClient(create_app(config))
+    payload = {
+        "id": "static",
+        "transport": "stdio",
+        "tools": [{"name": "echo", "description": "Echo", "capabilities": ["test"]}],
+    }
+
+    added = client.post("/api/mcp/servers", json=payload)
+    assert added.status_code == 200
+    health = client.get("/api/mcp/servers/static/health")
+    assert health.status_code == 200
+    assert health.json()["server"]["session_state"] == "static"
+    disconnected = client.post("/api/mcp/servers/static/disconnect")
+    assert disconnected.status_code == 200
+    assert disconnected.json()["server"]["session_state"] == "disconnected"
+    restarted = client.post("/api/mcp/servers/static/restart")
+    assert restarted.status_code == 200
+    assert restarted.json()["server"]["session_state"] == "static"
 
 
 def test_skill_discovery_exposes_nested_learning_skill(tmp_path: Path) -> None:
@@ -217,6 +330,59 @@ def test_run_manager_marks_denied_approval_failed(tmp_path: Path) -> None:
     assert final["status"] == "failed"
     assert final["stop_reason"] == "approval_denied"
     assert final["error"] == "Approval denied"
+
+
+class _FakeMCPSession:
+    async def list_tools(self) -> Any:
+        return SimpleNamespace(
+            tools=[
+                SimpleNamespace(
+                    name="echo",
+                    description="Echo test tool",
+                    inputSchema={"type": "object", "properties": {"message": {"type": "string"}}},
+                )
+            ]
+        )
+
+    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
+        return SimpleNamespace(content=[SimpleNamespace(text=f"{tool_name}:{arguments.get('message', '')}")])
+
+
+class _FakeMCPContext:
+    def __init__(self, factory: _FakeMCPFactory) -> None:
+        self.factory = factory
+        self.session = _FakeMCPSession()
+
+    async def __aenter__(self) -> _FakeMCPSession:
+        self.factory.enter_count += 1
+        return self.session
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.factory.exit_count += 1
+
+
+class _FakeMCPFactory:
+    def __init__(self) -> None:
+        self.enter_count = 0
+        self.exit_count = 0
+
+    def __call__(self, server: object) -> _FakeMCPContext:
+        del server
+        return _FakeMCPContext(self)
+
+
+class _SlowMCPSession:
+    async def list_tools(self) -> Any:
+        await asyncio.sleep(1)
+        return SimpleNamespace(tools=[])
+
+
+class _SlowMCPContext:
+    async def __aenter__(self) -> _SlowMCPSession:
+        return _SlowMCPSession()
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None
 
 
 def _manager(tmp_path: Path, *, stream: bool = False) -> RunManager:
