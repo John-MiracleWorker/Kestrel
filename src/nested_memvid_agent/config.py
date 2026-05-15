@@ -17,6 +17,10 @@ class AgentConfig:
     timeout_seconds: int = 60
     max_retries: int = 2
     temperature: float = 0.2
+    codex_sandbox: str = "read-only"
+    codex_profile: str | None = None
+    codex_skip_git_repo_check: bool = False
+    codex_ephemeral: bool = True
     backend: str = "memory"
     memory_dir: Path = Path(".nest/memory")
     workspace: Path = Path(".")
@@ -43,6 +47,10 @@ class AgentConfig:
             timeout_seconds=_env_int("NEST_AGENT_TIMEOUT_SECONDS", 60),
             max_retries=_env_int("NEST_AGENT_MAX_RETRIES", 2),
             temperature=_env_float("NEST_AGENT_TEMPERATURE", 0.2),
+            codex_sandbox=os.getenv("NEST_AGENT_CODEX_SANDBOX", "read-only"),
+            codex_profile=_env_str_or_none("NEST_AGENT_CODEX_PROFILE"),
+            codex_skip_git_repo_check=_env_bool("NEST_AGENT_CODEX_SKIP_GIT_REPO_CHECK"),
+            codex_ephemeral=not _env_bool("NEST_AGENT_CODEX_PERSIST_SESSION"),
             backend=os.getenv("NEST_AGENT_BACKEND", "memory"),
             memory_dir=Path(os.getenv("NEST_AGENT_MEMORY_DIR", ".nest/memory")),
             workspace=Path(os.getenv("NEST_AGENT_WORKSPACE", ".")),

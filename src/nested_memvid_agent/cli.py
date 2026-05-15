@@ -19,13 +19,17 @@ def _add_common_args(parser: argparse.ArgumentParser, *, default: object = argpa
 
 def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     _add_common_args(parser)
-    parser.add_argument("--provider", choices=["mock", "openai", "openai-compatible"], default="mock")
+    parser.add_argument("--provider", choices=["mock", "openai", "openai-compatible", "codex-cli"], default="mock")
     parser.add_argument("--model", default="mock")
     parser.add_argument("--base-url")
     parser.add_argument("--api-key-env")
     parser.add_argument("--timeout-seconds", type=int, default=60)
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--codex-sandbox", choices=["read-only", "workspace-write", "danger-full-access"], default="read-only")
+    parser.add_argument("--codex-profile")
+    parser.add_argument("--codex-skip-git-repo-check", action="store_true")
+    parser.add_argument("--codex-persist-session", action="store_true")
     parser.add_argument("--workspace", type=Path, default=Path("."))
     parser.add_argument("--log-dir", type=Path, default=Path(".nest/logs"))
     parser.add_argument("--allow-shell", action="store_true")
@@ -168,6 +172,10 @@ def _agent_config_from_args(args: argparse.Namespace, *, backend: str, memory_di
         timeout_seconds=args.timeout_seconds,
         max_retries=args.max_retries,
         temperature=args.temperature,
+        codex_sandbox=args.codex_sandbox,
+        codex_profile=args.codex_profile,
+        codex_skip_git_repo_check=args.codex_skip_git_repo_check,
+        codex_ephemeral=not args.codex_persist_session,
         backend=backend,
         memory_dir=memory_dir,
         workspace=args.workspace,

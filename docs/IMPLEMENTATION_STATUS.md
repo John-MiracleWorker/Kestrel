@@ -12,6 +12,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Deterministic mock provider for fast tests and reproducible golden evals.
 - OpenAI Responses provider adapter using the portable JSON tool envelope.
 - OpenAI-compatible chat completions provider for local/model-server endpoints.
+- Codex CLI provider that can use local `codex exec` as the normal response engine.
 - Built-in tool registry with approval gates for shell, file writes, patch application, tests, and Codex CLI delegation.
 - Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry, and memory search.
 - SQLite state store for runs, run steps, approvals, MCP servers, skills, task nodes, and subagent runs, now initialized through schema version `2`.
@@ -24,7 +25,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Streaming: the runtime, CLI, and web run event bus accept stream events. Providers without native streaming use the compatibility wrapper around `generate()`.
 - MCP: server configuration, static tool discovery, and registry exposure exist. Full live MCP session execution still needs hardening per transport.
 - Skills: filesystem discovery and skill tool adapters exist. Sandboxed skill execution and richer skill manifests remain incomplete.
-- Codex CLI: `codex.exec` is available as a high-risk tool with approval gating. It is not yet a general planner or autonomous repair loop.
+- Codex CLI: `codex-cli` can drive responses and `codex.exec` is available as a high-risk approval-gated tool. It is not yet a branch-isolated autonomous repair loop.
 - Consolidation: memory consolidation scaffolding exists, but promotion policy, evidence thresholds, and validation loops are still basic.
 - Self-modification: the runtime can record validated self-improvement signals and policy candidates, but code changes and policy writes still require explicit gates.
 - Subagents: local subagent runs can be queued and tracked. True branch/worktree isolation and Codex-backed worker fan-out are still next steps.

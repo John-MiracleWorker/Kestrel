@@ -99,6 +99,22 @@ nest-agent chat \
 
 Use `--api-key-env NAME` when the endpoint needs a non-default API key environment variable. The runtime also accepts `--stream`, which streams token events through the CLI and web run event bus; providers without native streaming use the compatibility stream wrapper.
 
+## Codex CLI as response provider
+
+Kestrel can use the local Codex CLI as its normal response engine while keeping Kestrel in charge of memory, approvals, tools, MCP, and file writes:
+
+```bash
+nest-agent chat \
+  --backend memvid \
+  --memory-dir .nest/memory \
+  --provider codex-cli \
+  --model gpt-5.5 \
+  --timeout-seconds 600 \
+  --message "Help me continue this build"
+```
+
+The provider runs `codex exec` with `--sandbox read-only`, `--ephemeral`, and `--output-last-message` by default. If Codex needs Kestrel to run a tool, it should return the existing Kestrel JSON tool envelope. Keep write-capable Codex work behind the separate approval-gated `codex.exec` tool.
+
 ## Local web agent
 
 ```bash
