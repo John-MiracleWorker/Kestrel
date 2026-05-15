@@ -16,7 +16,7 @@ body {
   min-width: 320px;
 }
 
-button, input {
+button, input, select, textarea {
   font: inherit;
 }
 
@@ -195,13 +195,20 @@ nav a:hover {
   border-top: 1px solid #d9dfd4;
 }
 
-input {
+input, select, textarea {
   width: 100%;
   min-height: 40px;
   border: 1px solid #b8c2b2;
   border-radius: 6px;
   padding: 0 12px;
   background: #ffffff;
+}
+
+textarea {
+  min-height: 96px;
+  padding: 10px 12px;
+  resize: vertical;
+  line-height: 1.35;
 }
 
 .timeline {
@@ -294,6 +301,34 @@ code {
   display: grid;
   align-content: start;
   gap: 10px;
+}
+
+.learning-panel {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+
+.learning-controls {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) 96px 72px;
+  gap: 8px;
+}
+
+.check-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #4d5a50;
+}
+
+.check-row input {
+  width: 18px;
+  min-height: 18px;
+}
+
+.wide {
+  grid-column: 1 / -1;
 }
 
 .empty, .muted {

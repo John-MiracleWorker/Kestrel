@@ -7,6 +7,7 @@ This is **not just a RAG backend**. It includes the pieces required for a real a
 - interactive CLI chat runtime
 - provider abstraction for LLMs
 - OpenAI Responses API adapter scaffold
+- OpenAI-compatible chat completions adapter for local/model-server endpoints
 - deterministic mock LLM for tests
 - tool registry and built-in tools
 - safety gates for shell and file writes
@@ -14,7 +15,8 @@ This is **not just a RAG backend**. It includes the pieces required for a real a
 - Memvid `.mv2` backend adapter
 - in-memory backend for tests and Codex iteration
 - context compiler
-- consolidation engine scaffold
+- paper-guided nested learning kernel
+- consolidation and learning-signal tools
 - event logging
 - validation plan and golden test pipeline
 
@@ -37,7 +39,7 @@ Tool results + observations
         ↓
 Working memory + event log
         ↓
-Consolidation pipeline
+Nested learning kernel / consolidation pipeline
         ↓
 Episodic → Semantic → Procedural → Policy .mv2 layers
 ```
@@ -82,6 +84,21 @@ nest-agent chat \
 
 If your model name differs, pass the model available in your account. The scaffold keeps provider wiring isolated so Codex can swap in your preferred model/provider without touching the runtime.
 
+## OpenAI-compatible local providers
+
+For local servers that expose an OpenAI-compatible chat completions API:
+
+```bash
+nest-agent chat \
+  --backend memory \
+  --provider openai-compatible \
+  --base-url http://127.0.0.1:1234/v1 \
+  --model local-model \
+  --message "hello"
+```
+
+Use `--api-key-env NAME` when the endpoint needs a non-default API key environment variable. The runtime also accepts `--stream`, which streams token events through the CLI and web run event bus; providers without native streaming use the compatibility stream wrapper.
+
 ## Local web agent
 
 ```bash
@@ -118,7 +135,11 @@ The alternate MCP route is also available through the MCP server registry by con
 
 ## Current build status
 
-The scaffold is runnable with the in-memory backend and mock provider. The Memvid adapter is tested against the installed `memvid-sdk` behind `RUN_MEMVID_INTEGRATION=1`.
+The scaffold is runnable with the in-memory backend, mock provider, local web UI, approval-gated built-in tools, MCP/skill registry surfaces, Codex CLI bridge, Memvid `.mv2` backend, and OpenAI/OpenAI-compatible provider adapters.
+
+It is **not yet a complete Hermes/OpenClaw agent**. Native provider tool-calling, durable multi-step planning, production auth, full MCP session execution, richer skill sandboxing, and autonomous self-improvement controls still need hardening. See `docs/IMPLEMENTATION_STATUS.md` for the current truth table.
+
+The nested learning pass now records context-flow and optimizer-trace metadata for validated memory updates via `memory.learn` and `memory.consolidate`. This is the runtime-memory analogue of the paper’s nested context-flow idea, not a claim of neural weight-level HOPE/self-modifying model training.
 
 ## Critical next Codex task
 

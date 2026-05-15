@@ -8,6 +8,7 @@ from typing import Any
 
 from ..consolidation import Consolidator
 from ..models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
+from ..nested_learning import LearningSignal, NestedLearningKernel
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
 from .base import AgentTool, ToolContext
 from .registry import ToolRegistry
@@ -608,6 +609,7 @@ class MemoryConsolidateTool(AgentTool):
                 "source_layer": {"type": "string"},
                 "validation_score": {"type": "number", "minimum": 0, "maximum": 1},
                 "repeat_count": {"type": "integer", "minimum": 1},
+                "explicit_instruction": {"type": "boolean"},
                 "dry_run": {"type": "boolean"},
             },
             "required": ["query"],
@@ -628,7 +630,13 @@ class MemoryConsolidateTool(AgentTool):
                 return self._result(call, success=False, content="No consolidation candidate found.", error="candidate_not_found")
             validation_score = float(arguments.get("validation_score", 0.7))
             repeat_count = int(arguments.get("repeat_count", 1))
-            candidate = Consolidator().propose(hits[0].record, validation_score=validation_score, repeat_count=repeat_count)
+            explicit_instruction = bool(arguments.get("explicit_instruction", False))
+            candidate = Consolidator().propose(
+                hits[0].record,
+                validation_score=validation_score,
+                repeat_count=repeat_count,
+                explicit_instruction=explicit_instruction,
+            )
             if candidate is None:
                 return self._result(call, success=True, content="No promotion proposed.", data={"promoted": False})
             if candidate.target_layer == MemoryLayer.POLICY and not context.config.allow_policy_writes:
@@ -652,10 +660,100 @@ class MemoryConsolidateTool(AgentTool):
                 "target_layer": candidate.target_layer.value,
                 "reason": candidate.reason,
                 "confidence": candidate.promoted_confidence,
+                "context_flow": candidate.flow.to_metadata(),
+                "optimizer_trace": candidate.optimizer_trace.to_metadata(),
             }
             return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
         except Exception as exc:  # noqa: BLE001
             return self._result(call, success=False, content=str(exc), error="memory_consolidate_failed")
+
+
+class MemoryLearnTool(AgentTool):
+    spec = ToolSpec(
+        name="memory.learn",
+        description="Compress a validated learning signal into the correct nested memory layer using context-flow gates.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "content": {"type": "string"},
+                "kind": {"type": "string"},
+                "source_layer": {"type": "string"},
+                "target_layer": {"type": "string"},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "importance": {"type": "number", "minimum": 0, "maximum": 1},
+                "validation_score": {"type": "number", "minimum": 0, "maximum": 1},
+                "repeat_count": {"type": "integer", "minimum": 1},
+                "explicit_instruction": {"type": "boolean"},
+                "dry_run": {"type": "boolean"},
+                "source": {"type": "string"},
+                "locator": {"type": "string"},
+            },
+            "required": ["title", "content"],
+        },
+        risk="medium",
+        capabilities=("nested-learning", "continuum-memory"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        title = str(arguments.get("title", "")).strip()
+        content = str(arguments.get("content", "")).strip()
+        if not title:
+            return self._result(call, success=False, content="Missing title", error="missing_title")
+        if not content:
+            return self._result(call, success=False, content="Missing content", error="missing_content")
+        try:
+            source_layer = _layer_arg(arguments.get("source_layer")) or MemoryLayer.WORKING
+            target_layer = _layer_arg(arguments.get("target_layer"))
+            kind = MemoryKind(str(arguments.get("kind", MemoryKind.OBSERVATION.value)))
+            signal = LearningSignal(
+                title=title,
+                content=content,
+                kind=kind,
+                source_layer=source_layer,
+                confidence=float(arguments.get("confidence", 0.6)),
+                importance=float(arguments.get("importance", 0.5)),
+                validation_score=float(arguments.get("validation_score", 0.7)),
+                repeat_count=int(arguments.get("repeat_count", 1)),
+                explicit_instruction=bool(arguments.get("explicit_instruction", False)),
+                source=str(arguments.get("source", "tool.memory.learn")),
+                locator=str(arguments.get("locator", context.session_id)),
+                metadata={"session_id": context.session_id, "run_id": context.run_id},
+                requested_target_layer=target_layer,
+            )
+            kernel = NestedLearningKernel()
+            decision = kernel.decide(signal)
+            if not decision.accepted:
+                return self._result(
+                    call,
+                    success=True,
+                    content=json.dumps(decision.to_payload(), indent=2),
+                    data=decision.to_payload(),
+                )
+            if decision.target_layer == MemoryLayer.POLICY and not context.config.allow_policy_writes:
+                payload = decision.to_payload()
+                payload["policy_write_enabled"] = False
+                return self._result(
+                    call,
+                    success=False,
+                    content=json.dumps(payload, indent=2),
+                    data=payload,
+                    error="policy_write_disabled",
+                )
+            record = kernel.to_memory_record(signal, decision)
+            dry_run = bool(arguments.get("dry_run", False))
+            record_id = None if dry_run else context.memory.put(record)
+            if record_id is not None:
+                context.memory.seal_all()
+            payload = {
+                **decision.to_payload(),
+                "dry_run": dry_run,
+                "record_id": record_id,
+            }
+            return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="memory_learn_failed")
 
 
 def build_default_tools() -> ToolRegistry:
@@ -676,6 +774,7 @@ def build_default_tools() -> ToolRegistry:
     registry.register(MemvidVerifyTool())
     registry.register(MemvidDoctorTool())
     registry.register(MemvidStatsTool())
+    registry.register(MemoryLearnTool())
     registry.register(MemoryConsolidateTool())
     return registry
 

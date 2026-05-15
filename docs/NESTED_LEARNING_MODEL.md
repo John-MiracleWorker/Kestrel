@@ -6,6 +6,20 @@ The agent is modeled as a set of nested learning/update loops. Each loop compres
 
 The LLM is not the only learner. The full agent system learns through memory extraction, retrieval feedback, evaluation, consolidation, correction, and policy updates.
 
+This implementation maps the paper "Nested Learning: The Illusion of Deep Learning Architectures" to agent memory infrastructure rather than model-weight training. The paper frames learning systems as nested, multi-level and/or parallel optimization problems with their own context flows, treats optimizers as associative memories that compress their context, and proposes continuum memory as a spectrum of update frequencies. In this repo, those ideas become explicit context-flow records, optimizer traces, and conservative memory routing gates.
+
+## Paper-guided implementation
+
+The executable bridge lives in `src/nested_memvid_agent/nested_learning.py`.
+
+- `ContextFlow` represents a nested optimization loop with a level, update frequency, source layers, target layer, objective, compression rule, and retention behavior.
+- `OptimizerTrace` records the associative-memory update trace for a learning decision: surprise, validation score, repeat count, compression ratio, confidence delta, and effective confidence.
+- `NestedLearningKernel` decides whether a validated signal should be rejected, written, or promoted, and attaches context-flow metadata to the resulting memory record.
+- `memory.learn` compresses a validated learning signal into the appropriate layer. Policy writes are still blocked unless the policy gate and config enablement both pass.
+- `memory.consolidate` now uses the same kernel so promotion metadata includes the context flow and optimizer trace.
+
+This is not a claim that the repo implements HOPE or neural self-modifying weights. It is the agent-runtime analogue: nested context-flow optimization over durable memory layers.
+
 ## Layers
 
 ### L0: Event log
@@ -64,6 +78,8 @@ The LLM is not the only learner. The full agent system learns through memory ext
 | Episodic | Semantic | validation_score >= 0.78 and fact-like |
 | Episodic | Procedural | validation_score >= 0.78 and repeat_count >= 2 for failure/procedure |
 | Procedural | Policy | validation_score >= 0.95 and repeat_count >= 5 |
+
+The implementation adds one more policy constraint: policy promotion must be based on an explicit instruction or reviewed rule. A repeated ordinary event can become semantic/procedural memory, but it must not become policy by accident.
 
 ## Confidence model
 

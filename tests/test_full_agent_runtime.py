@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from time import monotonic, sleep
 
@@ -36,6 +37,21 @@ def test_state_store_tracks_runs_and_approvals(tmp_path: Path) -> None:
 
     decided = state.decide_approval("approval_test", status="approved", decision={"approved": True})
     assert decided["status"] == "approved"
+
+
+def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    state = AgentStateStore(db_path)
+
+    assert state.schema_version() == 1
+    with sqlite3.connect(db_path) as conn:
+        run_indexes = {row[1] for row in conn.execute("PRAGMA index_list('runs')").fetchall()}
+        approval_indexes = {row[1] for row in conn.execute("PRAGMA index_list('approval_requests')").fetchall()}
+        step_indexes = {row[1] for row in conn.execute("PRAGMA index_list('run_steps')").fetchall()}
+
+    assert "idx_runs_status" in run_indexes
+    assert "idx_approval_requests_status" in approval_indexes
+    assert "idx_run_steps_run_id_id" in step_indexes
 
 
 def test_mcp_static_tools_enter_unified_registry(tmp_path: Path) -> None:
@@ -100,6 +116,18 @@ def test_run_manager_completes_background_mock_run(tmp_path: Path) -> None:
     assert "Mock response: hello" in final["assistant_message"]
 
 
+def test_run_manager_publishes_stream_tokens(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, stream=True)
+    run = manager.create_run(message="hello", session_id="session")
+    final = _wait_for_status(manager, run.run_id, {"completed", "failed"})
+    assert final["status"] == "completed"
+
+    events = manager.state.list_run_steps(run.run_id)
+    token_events = [event for event in events if event["type"] == "assistant.token"]
+    assert token_events
+    assert "Mock response: hello" in str(token_events[0]["payload"]["content"])
+
+
 def test_run_manager_pauses_and_resumes_approved_tool(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     manager.state.create_run(
@@ -125,7 +153,33 @@ def test_run_manager_pauses_and_resumes_approved_tool(tmp_path: Path) -> None:
     assert final["tool_count"] >= 1
 
 
-def _manager(tmp_path: Path) -> RunManager:
+def test_run_manager_marks_denied_approval_failed(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.state.create_run(
+        run_id="run_manual",
+        message="manual",
+        session_id="session",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+
+    execution = manager.invoke_tool(
+        tool_name="shell.run",
+        arguments={"command": ["echo", "denied"]},
+        session_id="session",
+        run_id="run_manual",
+    )
+    assert execution.error == "approval_pending"
+    approval = manager.state.list_approvals(status="pending")[0]
+
+    manager.decide_approval(approval["approval_id"], approved=False, arguments=approval["arguments"])
+    final = manager.get_run("run_manual")
+    assert final["status"] == "failed"
+    assert final["stop_reason"] == "approval_denied"
+    assert final["error"] == "Approval denied"
+
+
+def _manager(tmp_path: Path, *, stream: bool = False) -> RunManager:
     config = AgentConfig(
         backend="memory",
         provider="mock",
@@ -135,6 +189,7 @@ def _manager(tmp_path: Path) -> RunManager:
         state_path=tmp_path / "state.db",
         skills_dir=tmp_path / "skills",
         workspace=tmp_path,
+        stream=stream,
     )
     state = AgentStateStore(config.state_path)
     events = RunEventBus(state)

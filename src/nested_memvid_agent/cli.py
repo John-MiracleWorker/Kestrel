@@ -9,6 +9,7 @@ from .config import AgentConfig
 from .context_compiler import ContextCompiler
 from .models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from .orchestrator import build_memory_system
+from .runtime_models import LLMStreamEvent
 
 
 def _add_common_args(parser: argparse.ArgumentParser, *, default: object = argparse.SUPPRESS) -> None:
@@ -18,14 +19,20 @@ def _add_common_args(parser: argparse.ArgumentParser, *, default: object = argpa
 
 def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     _add_common_args(parser)
-    parser.add_argument("--provider", choices=["mock", "openai"], default="mock")
+    parser.add_argument("--provider", choices=["mock", "openai", "openai-compatible"], default="mock")
     parser.add_argument("--model", default="mock")
+    parser.add_argument("--base-url")
+    parser.add_argument("--api-key-env")
+    parser.add_argument("--timeout-seconds", type=int, default=60)
+    parser.add_argument("--max-retries", type=int, default=2)
+    parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--workspace", type=Path, default=Path("."))
     parser.add_argument("--log-dir", type=Path, default=Path(".nest/logs"))
     parser.add_argument("--allow-shell", action="store_true")
     parser.add_argument("--allow-file-write", action="store_true")
     parser.add_argument("--allow-policy-writes", action="store_true")
     parser.add_argument("--allow-codex-cli", action="store_true")
+    parser.add_argument("--stream", action="store_true")
     parser.add_argument("--max-tool-rounds", type=int, default=6)
     parser.add_argument("--context-budget-chars", type=int, default=18_000)
 
@@ -75,27 +82,13 @@ def main() -> None:
     memory_dir = getattr(args, "memory_dir", Path("./memory"))
 
     if args.cmd == "chat":
-        config = AgentConfig(
-            provider=args.provider,
-            model=args.model,
-            backend=backend,
-            memory_dir=memory_dir,
-            workspace=args.workspace,
-            log_dir=args.log_dir,
-            allow_shell=args.allow_shell,
-            allow_file_write=args.allow_file_write,
-            allow_policy_writes=args.allow_policy_writes,
-            allow_codex_cli=args.allow_codex_cli,
-            max_tool_rounds=args.max_tool_rounds,
-            context_budget_chars=args.context_budget_chars,
-        )
+        config = _agent_config_from_args(args, backend=backend, memory_dir=memory_dir)
         agent = build_agent(config)
         try:
             if args.message:
                 if _handle_slash_command(agent, args.message.strip(), args.session_id):
                     return
-                result = agent.chat(args.message, session_id=args.session_id)
-                print(result.assistant_message)
+                _chat_and_print(agent, args.message, session_id=args.session_id)
                 return
             print("Nested MV2 Agent chat. Type /exit to quit.")
             while True:
@@ -106,8 +99,7 @@ def main() -> None:
                     continue
                 if _handle_slash_command(agent, user_message, args.session_id):
                     continue
-                result = agent.chat(user_message, session_id=args.session_id)
-                print(f"agent> {result.assistant_message}")
+                _chat_and_print(agent, user_message, session_id=args.session_id, prefix="agent> ")
         finally:
             agent.close()
         return
@@ -119,20 +111,7 @@ def main() -> None:
             raise RuntimeError("Install server extras with `pip install -e '.[server]'`.") from exc
         from .server import create_app
 
-        config = AgentConfig(
-            provider=args.provider,
-            model=args.model,
-            backend=backend,
-            memory_dir=memory_dir,
-            workspace=args.workspace,
-            log_dir=args.log_dir,
-            allow_shell=args.allow_shell,
-            allow_file_write=args.allow_file_write,
-            allow_policy_writes=args.allow_policy_writes,
-            allow_codex_cli=args.allow_codex_cli,
-            max_tool_rounds=args.max_tool_rounds,
-            context_budget_chars=args.context_budget_chars,
-        )
+        config = _agent_config_from_args(args, backend=backend, memory_dir=memory_dir)
         uvicorn.run(create_app(config), host=args.host, port=args.port)
         return
 
@@ -178,6 +157,56 @@ def main() -> None:
             return
     finally:
         memory.close_all()
+
+
+def _agent_config_from_args(args: argparse.Namespace, *, backend: str, memory_dir: Path) -> AgentConfig:
+    return AgentConfig(
+        provider=args.provider,
+        model=args.model,
+        base_url=args.base_url,
+        api_key_env=args.api_key_env,
+        timeout_seconds=args.timeout_seconds,
+        max_retries=args.max_retries,
+        temperature=args.temperature,
+        backend=backend,
+        memory_dir=memory_dir,
+        workspace=args.workspace,
+        log_dir=args.log_dir,
+        allow_shell=args.allow_shell,
+        allow_file_write=args.allow_file_write,
+        allow_policy_writes=args.allow_policy_writes,
+        allow_codex_cli=args.allow_codex_cli,
+        stream=args.stream,
+        max_tool_rounds=args.max_tool_rounds,
+        context_budget_chars=args.context_budget_chars,
+    )
+
+
+def _chat_and_print(agent: NestedMV2Agent, user_message: str, *, session_id: str, prefix: str = "") -> None:
+    streamed = False
+    prefix_printed = False
+
+    def stream_handler(event: LLMStreamEvent) -> None:
+        nonlocal streamed, prefix_printed
+        if event.type != "token":
+            return
+        content = event.content
+        if not content:
+            return
+        if prefix and not prefix_printed:
+            print(prefix, end="", flush=True)
+            prefix_printed = True
+        print(content, end="", flush=True)
+        streamed = True
+
+    result = agent.chat(user_message, session_id=session_id, stream_handler=stream_handler)
+    if streamed:
+        print()
+        return
+    if prefix_printed:
+        print(result.assistant_message)
+        return
+    print(f"{prefix}{result.assistant_message}" if prefix else result.assistant_message)
 
 
 def _handle_slash_command(agent: NestedMV2Agent, command: str, session_id: str) -> bool:

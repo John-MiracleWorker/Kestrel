@@ -40,6 +40,33 @@ class LLMResponse:
 
 
 @dataclass(frozen=True)
+class LLMOptions:
+    stream: bool = False
+    timeout_seconds: int = 60
+    max_retries: int = 2
+    temperature: float = 0.2
+
+
+LLMStreamEventType = Literal[
+    "token",
+    "tool_call_delta",
+    "tool_call",
+    "message_complete",
+    "provider_error",
+    "usage",
+]
+
+
+@dataclass(frozen=True)
+class LLMStreamEvent:
+    type: LLMStreamEventType
+    content: str = ""
+    tool_call: ToolCall | None = None
+    response: LLMResponse | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ToolSpec:
     name: str
     description: str

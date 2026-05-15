@@ -100,9 +100,24 @@ export function App() {
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [memoryQuery, setMemoryQuery] = useState("");
   const [memoryHits, setMemoryHits] = useState<MemoryHit[]>([]);
+  const [learningTitle, setLearningTitle] = useState("");
+  const [learningContent, setLearningContent] = useState("");
+  const [learningKind, setLearningKind] = useState("observation");
+  const [learningValidation, setLearningValidation] = useState("0.78");
+  const [learningRepeat, setLearningRepeat] = useState("1");
+  const [learningExplicit, setLearningExplicit] = useState(false);
+  const [learningResult, setLearningResult] = useState<Record<string, unknown> | null>(null);
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
   const [skills, setSkills] = useState<Skill[]>([]);
   const activeRun = useMemo(() => runs.find((run) => run.run_id === activeRunId) ?? runs[0], [runs, activeRunId]);
+  const streamedAssistant = useMemo(
+    () =>
+      events
+        .filter((event) => event.type === "assistant.token")
+        .map((event) => String(event.payload.content ?? ""))
+        .join(""),
+    [events]
+  );
 
   async function refresh() {
     const [runList, toolList, approvalList, mcpList, skillList] = await Promise.all([
@@ -135,11 +150,22 @@ export function App() {
       setEvents((rows) => [...rows.slice(-80), parsed]);
       refresh().catch(console.error);
     };
-    ["run.started", "run.completed", "run.blocked", "run.failed", "approval.requested", "tool.executed"].forEach((type) => {
+    [
+      "run.started",
+      "run.completed",
+      "run.blocked",
+      "run.failed",
+      "approval.requested",
+      "tool.executed",
+      "assistant.token",
+      "assistant.tool_call",
+      "assistant.usage",
+      "assistant.provider_error"
+    ].forEach((type) => {
       source.addEventListener(type, (event) => {
         const parsed = JSON.parse((event as MessageEvent).data);
         setEvents((rows) => [...rows.slice(-80), parsed]);
-        refresh().catch(console.error);
+        if (type !== "assistant.token") refresh().catch(console.error);
       });
     });
     return () => source.close();
@@ -167,6 +193,21 @@ export function App() {
     if (!memoryQuery.trim()) return;
     const hits = await api.post<MemoryHit[]>("/api/memory/search", { query: memoryQuery, k: 8 });
     setMemoryHits(hits);
+  }
+
+  async function submitLearning(event: FormEvent) {
+    event.preventDefault();
+    if (!learningTitle.trim() || !learningContent.trim()) return;
+    const result = await api.post<Record<string, unknown>>("/api/memory/learn", {
+      title: learningTitle,
+      content: learningContent,
+      kind: learningKind,
+      validation_score: Number(learningValidation),
+      repeat_count: Number(learningRepeat),
+      explicit_instruction: learningExplicit
+    });
+    setLearningResult(result);
+    await refresh();
   }
 
   async function discoverSkills() {
@@ -222,7 +263,7 @@ export function App() {
               {activeRun ? (
                 <>
                   <div className="bubble user">{activeRun.message}</div>
-                  <div className="bubble agent">{activeRun.assistant_message || activeRun.stop_reason || "Working..."}</div>
+                  <div className="bubble agent">{activeRun.assistant_message || streamedAssistant || activeRun.stop_reason || "Working..."}</div>
                 </>
               ) : (
                 <div className="empty">No runs yet.</div>
@@ -284,7 +325,32 @@ export function App() {
             <input value={memoryQuery} onChange={(event) => setMemoryQuery(event.target.value)} placeholder="Search nested memory..." />
             <button type="submit">Search</button>
           </form>
-          <div className="hits">
+          <div className="learning-panel">
+            <form onSubmit={submitLearning} className="memory-search">
+              <div className="section-title"><Brain size={18} /> Learning Signal</div>
+              <input value={learningTitle} onChange={(event) => setLearningTitle(event.target.value)} placeholder="Title" />
+              <textarea value={learningContent} onChange={(event) => setLearningContent(event.target.value)} placeholder="Validated memory content" />
+              <div className="learning-controls">
+                <select value={learningKind} onChange={(event) => setLearningKind(event.target.value)}>
+                  <option value="observation">Observation</option>
+                  <option value="fact">Fact</option>
+                  <option value="event">Event</option>
+                  <option value="failure">Failure</option>
+                  <option value="procedure">Procedure</option>
+                  <option value="policy">Policy</option>
+                </select>
+                <input value={learningValidation} onChange={(event) => setLearningValidation(event.target.value)} inputMode="decimal" />
+                <input value={learningRepeat} onChange={(event) => setLearningRepeat(event.target.value)} inputMode="numeric" />
+              </div>
+              <label className="check-row">
+                <input type="checkbox" checked={learningExplicit} onChange={(event) => setLearningExplicit(event.target.checked)} />
+                <span>Explicit instruction</span>
+              </label>
+              <button type="submit">Learn</button>
+            </form>
+            {learningResult && <code>{JSON.stringify(learningResult).slice(0, 420)}</code>}
+          </div>
+          <div className="hits wide">
             {memoryHits.map((hit, index) => (
               <div className="hit" key={`${hit.title}-${index}`}>
                 <strong>{hit.title}</strong>

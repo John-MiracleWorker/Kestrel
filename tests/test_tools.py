@@ -79,6 +79,7 @@ def test_default_registry_includes_spec_tools() -> None:
         "memvid.verify",
         "memvid.doctor",
         "memvid.stats",
+        "memory.learn",
         "memory.consolidate",
         "codex.exec",
     } <= names
@@ -184,3 +185,53 @@ def test_memory_consolidate_promotes_repeated_procedure(tmp_path: Path) -> None:
     assert memory.retrieve(
         RetrievalQuery(query="Repeatable test recipe", layers=(MemoryLayer.PROCEDURAL,), k_per_layer=3)
     )
+
+
+def test_memory_learn_routes_validated_signal(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    result = registry.execute(
+        ToolCall(
+            name="memory.learn",
+            arguments={
+                "title": "Validated project fact",
+                "content": "The agent stores one .mv2 file per memory layer.",
+                "kind": "fact",
+                "source_layer": "episodic",
+                "validation_score": 0.84,
+                "repeat_count": 1,
+            },
+        ),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.success
+    assert result.data["target_layer"] == "semantic"
+    hits = memory.retrieve(RetrievalQuery(query=".mv2 file per memory layer", layers=(MemoryLayer.SEMANTIC,), k_per_layer=3))
+    assert hits
+    assert hits[0].record.metadata["nested_learning"]["context_flow"]["id"] == "episode_to_semantic"
+
+
+def test_memory_learn_blocks_policy_without_config_enablement(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    result = registry.execute(
+        ToolCall(
+            name="memory.learn",
+            arguments={
+                "title": "Policy candidate",
+                "content": "Always require explicit review before changing policy memory.",
+                "kind": "policy",
+                "source_layer": "procedural",
+                "target_layer": "policy",
+                "validation_score": 0.99,
+                "repeat_count": 5,
+                "explicit_instruction": True,
+            },
+        ),
+        ToolContext(memory=memory, config=AgentConfig(allow_policy_writes=False), workspace=tmp_path),
+    )
+
+    assert not result.success
+    assert result.error == "policy_write_disabled"
+    assert not memory.retrieve(RetrievalQuery(query="explicit review before changing policy", layers=(MemoryLayer.POLICY,), k_per_layer=3))

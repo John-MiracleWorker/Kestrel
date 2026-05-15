@@ -10,6 +10,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+SCHEMA_VERSION = 1
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -39,7 +41,7 @@ class AgentStateStore:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
-        self._init_schema()
+        self._migrate_schema()
 
     def create_run(
         self,
@@ -279,74 +281,36 @@ class AgentStateStore:
             rows = conn.execute("SELECT * FROM skill_registry ORDER BY name ASC").fetchall()
         return [_skill_from_row(row) for row in rows]
 
-    def _init_schema(self) -> None:
+    def schema_version(self) -> int:
         with self._connect() as conn:
-            conn.executescript(
+            row = conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
+        return 0 if row is None else int(row["version"])
+
+    def _migrate_schema(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS runs (
-                    run_id TEXT PRIMARY KEY,
-                    status TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    workspace TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    assistant_message TEXT NOT NULL DEFAULT '',
-                    context_chars INTEGER NOT NULL DEFAULT 0,
-                    tool_count INTEGER NOT NULL DEFAULT 0,
-                    stop_reason TEXT NOT NULL DEFAULT '',
-                    error TEXT,
-                    created_at TEXT NOT NULL,
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    version INTEGER NOT NULL,
                     updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS run_steps (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT NOT NULL,
-                    type TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS approval_requests (
-                    approval_id TEXT PRIMARY KEY,
-                    run_id TEXT NOT NULL,
-                    tool_call_id TEXT NOT NULL,
-                    tool_name TEXT NOT NULL,
-                    arguments_json TEXT NOT NULL,
-                    risk TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    decision_json TEXT,
-                    result_json TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS mcp_servers (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    transport TEXT NOT NULL,
-                    command TEXT,
-                    args_json TEXT NOT NULL,
-                    env_json TEXT NOT NULL,
-                    url TEXT,
-                    enabled INTEGER NOT NULL,
-                    tools_json TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    error TEXT,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS skill_registry (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    path TEXT NOT NULL,
-                    manifest_json TEXT NOT NULL,
-                    enabled INTEGER NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
+                )
                 """
             )
+            row = conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
+            current = 0 if row is None else int(row["version"])
+            if current < 1:
+                _apply_schema_v1(conn)
+                conn.execute(
+                    """
+                    INSERT INTO schema_version (id, version, updated_at)
+                    VALUES (1, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        version = excluded.version,
+                        updated_at = excluded.updated_at
+                    """,
+                    (SCHEMA_VERSION, utc_now()),
+                )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -358,6 +322,83 @@ class AgentStateStore:
                 conn.commit()
             finally:
                 conn.close()
+
+
+def _apply_schema_v1(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS runs (
+            run_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            message TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            workspace TEXT NOT NULL,
+            model TEXT NOT NULL,
+            assistant_message TEXT NOT NULL DEFAULT '',
+            context_chars INTEGER NOT NULL DEFAULT 0,
+            tool_count INTEGER NOT NULL DEFAULT 0,
+            stop_reason TEXT NOT NULL DEFAULT '',
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS run_steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS approval_requests (
+            approval_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            tool_call_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            arguments_json TEXT NOT NULL,
+            risk TEXT NOT NULL,
+            status TEXT NOT NULL,
+            decision_json TEXT,
+            result_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS mcp_servers (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            transport TEXT NOT NULL,
+            command TEXT,
+            args_json TEXT NOT NULL,
+            env_json TEXT NOT NULL,
+            url TEXT,
+            enabled INTEGER NOT NULL,
+            tools_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error TEXT,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS skill_registry (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            path TEXT NOT NULL,
+            manifest_json TEXT NOT NULL,
+            enabled INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
+        CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at);
+        CREATE INDEX IF NOT EXISTS idx_run_steps_run_id_id ON run_steps(run_id, id);
+        CREATE INDEX IF NOT EXISTS idx_approval_requests_status ON approval_requests(status);
+        CREATE INDEX IF NOT EXISTS idx_approval_requests_run_id ON approval_requests(run_id);
+        CREATE INDEX IF NOT EXISTS idx_mcp_servers_enabled ON mcp_servers(enabled);
+        CREATE INDEX IF NOT EXISTS idx_skill_registry_enabled ON skill_registry(enabled);
+        """
+    )
 
 
 def _run_from_row(row: sqlite3.Row) -> RunRecord:

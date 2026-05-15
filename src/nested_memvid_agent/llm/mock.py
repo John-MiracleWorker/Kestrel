@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from ..runtime_models import ChatMessage, LLMResponse, ToolCall, ToolSpec
+from ..runtime_models import ChatMessage, LLMOptions, LLMResponse, ToolCall, ToolSpec
 from .base import LLMProvider
 
 
@@ -17,7 +17,13 @@ class MockLLMProvider(LLMProvider):
     def __init__(self, canned: Iterable[LLMResponse] | None = None) -> None:
         self._responses = list(canned or [])
 
-    def generate(self, messages: list[ChatMessage], tools: list[ToolSpec]) -> LLMResponse:
+    def generate(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec],
+        options: LLMOptions | None = None,
+    ) -> LLMResponse:
+        del options
         if self._responses:
             return self._responses.pop(0)
         if messages and messages[-1].role == "tool":

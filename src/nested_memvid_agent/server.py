@@ -80,6 +80,20 @@ def create_app(config: AgentConfig | None = None) -> Any:
         source_layer: str | None = None
         validation_score: float = 0.7
         repeat_count: int = 1
+        explicit_instruction: bool = False
+        dry_run: bool = False
+
+    class MemoryLearnRequest(BaseModel):  # type: ignore[valid-type,misc]
+        title: str
+        content: str
+        kind: str = "observation"
+        source_layer: str = "working"
+        target_layer: str | None = None
+        confidence: float = 0.6
+        importance: float = 0.5
+        validation_score: float = 0.7
+        repeat_count: int = 1
+        explicit_instruction: bool = False
         dry_run: bool = False
 
     @app.get("/api/health")  # type: ignore[untyped-decorator]
@@ -236,6 +250,19 @@ def create_app(config: AgentConfig | None = None) -> Any:
     def consolidate_memory(request: MemoryConsolidateRequest) -> dict[str, object]:
         execution = runs.invoke_tool(
             tool_name="memory.consolidate",
+            arguments=request.model_dump(),
+            session_id="api",
+        )
+        if execution.content.startswith("{"):
+            payload = json.loads(execution.content)
+            if isinstance(payload, dict):
+                return dict(payload)
+        return {"success": execution.success, "content": execution.content, "error": execution.error}
+
+    @app.post("/api/memory/learn")  # type: ignore[untyped-decorator]
+    def learn_memory(request: MemoryLearnRequest) -> dict[str, object]:
+        execution = runs.invoke_tool(
+            tool_name="memory.learn",
             arguments=request.model_dump(),
             session_id="api",
         )

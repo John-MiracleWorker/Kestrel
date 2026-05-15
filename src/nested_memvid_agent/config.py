@@ -12,6 +12,11 @@ class AgentConfig:
     name: str = "Nested MV2 Agent"
     provider: str = "mock"
     model: str = "mock"
+    base_url: str | None = None
+    api_key_env: str | None = None
+    timeout_seconds: int = 60
+    max_retries: int = 2
+    temperature: float = 0.2
     backend: str = "memory"
     memory_dir: Path = Path(".nest/memory")
     workspace: Path = Path(".")
@@ -33,6 +38,11 @@ class AgentConfig:
         return cls(
             provider=os.getenv("NEST_AGENT_PROVIDER", "mock"),
             model=os.getenv("NEST_AGENT_MODEL", "mock"),
+            base_url=_env_str_or_none("NEST_AGENT_BASE_URL"),
+            api_key_env=_env_str_or_none("NEST_AGENT_API_KEY_ENV"),
+            timeout_seconds=_env_int("NEST_AGENT_TIMEOUT_SECONDS", 60),
+            max_retries=_env_int("NEST_AGENT_MAX_RETRIES", 2),
+            temperature=_env_float("NEST_AGENT_TEMPERATURE", 0.2),
             backend=os.getenv("NEST_AGENT_BACKEND", "memory"),
             memory_dir=Path(os.getenv("NEST_AGENT_MEMORY_DIR", ".nest/memory")),
             workspace=Path(os.getenv("NEST_AGENT_WORKSPACE", ".")),
@@ -44,6 +54,7 @@ class AgentConfig:
             allow_file_write=_env_bool("NEST_AGENT_ALLOW_FILE_WRITE"),
             allow_policy_writes=_env_bool("NEST_AGENT_ALLOW_POLICY_WRITES"),
             allow_codex_cli=_env_bool("NEST_AGENT_ALLOW_CODEX_CLI"),
+            stream=_env_bool("NEST_AGENT_STREAM"),
         )
 
     @classmethod
@@ -62,3 +73,25 @@ class AgentConfig:
 
 def _env_bool(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return int(raw)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return float(raw)
+
+
+def _env_str_or_none(name: str) -> str | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    return stripped or None

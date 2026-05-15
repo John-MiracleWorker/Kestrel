@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -8,11 +9,22 @@ from .config import AgentConfig
 from .context_compiler import ContextCompiler, ContextCompilerConfig
 from .event_log import AgentEvent, JsonlEventLog
 from .layers import LayeredMemorySystem
-from .llm.base import LLMProvider
+from .llm.base import LLMProvider, ProviderError
 from .models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord
-from .runtime_models import AgentTurnResult, ChatMessage, ToolExecution
+from .runtime_models import (
+    AgentTurnResult,
+    ChatMessage,
+    LLMOptions,
+    LLMResponse,
+    LLMStreamEvent,
+    ToolCall,
+    ToolExecution,
+    ToolSpec,
+)
 from .tools.base import ApprovalHandler, ToolContext
 from .tools.registry import ToolRegistry
+
+StreamHandler = Callable[[LLMStreamEvent], None]
 
 
 @dataclass(frozen=True)
@@ -44,6 +56,7 @@ class NestedMV2Agent:
         run_id: str | None = None,
         approval_handler: ApprovalHandler | None = None,
         approved_tool_call_ids: frozenset[str] = frozenset(),
+        stream_handler: StreamHandler | None = None,
     ) -> AgentTurnResult:
         session = session_id or f"session_{uuid4().hex}"
         memory_writes: list[str] = []
@@ -73,7 +86,7 @@ class NestedMV2Agent:
         final_content = ""
         stop_reason = "complete"
         for round_index in range(self.config.max_tool_rounds + 1):
-            response = self.llm.generate(messages, self.tools.specs())
+            response = self._generate_response(messages, self.tools.specs(), stream_handler)
             if not response.tool_calls:
                 final_content = response.content
                 break
@@ -126,7 +139,7 @@ class NestedMV2Agent:
                         session_id=session,
                     )
                 )
-                if execution.error == "approval_pending":
+                if execution.error in {"approval_pending", "approval_required"}:
                     approval_pending = True
             if approval_pending:
                 final_content = response.content or "Waiting for approval before continuing."
@@ -169,6 +182,54 @@ class NestedMV2Agent:
             stop_reason=stop_reason,
         )
 
+    def _generate_response(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec],
+        stream_handler: StreamHandler | None,
+    ) -> LLMResponse:
+        options = LLMOptions(
+            stream=self.config.stream,
+            timeout_seconds=self.config.timeout_seconds,
+            max_retries=self.config.max_retries,
+            temperature=self.config.temperature,
+        )
+        if not self.config.stream:
+            return self.llm.generate(messages, tools, options)
+
+        content_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        completed: LLMResponse | None = None
+        emitted_provider_error = False
+        try:
+            for event in self.llm.stream(messages, tools, options):
+                if event.type == "provider_error":
+                    if stream_handler is not None:
+                        stream_handler(event)
+                        emitted_provider_error = True
+                    raise ProviderError(event.content or "Provider stream failed", code=str(event.data.get("code", "provider_error")))
+                if stream_handler is not None:
+                    stream_handler(event)
+                if event.type == "token" and event.content:
+                    content_parts.append(event.content)
+                elif event.type == "tool_call" and event.tool_call is not None:
+                    tool_calls.append(event.tool_call)
+                elif event.type == "message_complete" and event.response is not None:
+                    completed = event.response
+        except ProviderError as exc:
+            if stream_handler is not None and not emitted_provider_error:
+                stream_handler(
+                    LLMStreamEvent(
+                        type="provider_error",
+                        content=str(exc),
+                        data={"code": exc.code, "retryable": exc.retryable},
+                    )
+                )
+            raise
+
+        if completed is not None:
+            return completed
+        return LLMResponse(content="".join(content_parts), tool_calls=tuple(tool_calls), raw={"stream_completed": False})
 
     def close(self) -> None:
         self.memory.close_all()

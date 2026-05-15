@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
 from threading import Lock, Thread
@@ -11,7 +12,7 @@ from .app_factory import build_agent
 from .config import AgentConfig
 from .event_bus import RunEventBus
 from .mcp_manager import MCPManager
-from .runtime_models import AgentTurnResult, ToolCall, ToolExecution, ToolSpec
+from .runtime_models import AgentTurnResult, LLMStreamEvent, ToolCall, ToolExecution, ToolSpec
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore, RunRecord
 from .tools.base import ToolContext
@@ -142,6 +143,7 @@ class RunManager:
                 session_id=session_id,
                 run_id=run_id,
                 approval_handler=self._approval_handler,
+                stream_handler=self._stream_handler(run_id),
             )
             for execution in result.tool_executions:
                 self.events.publish(run_id, "tool.executed", _execution_payload(execution))
@@ -208,6 +210,7 @@ class RunManager:
                 session_id=session_id,
                 run_id=run_id,
                 approval_handler=self._approval_handler,
+                stream_handler=self._stream_handler(run_id),
             )
             status = "blocked" if result.stop_reason == "approval_required" else "completed"
             self.state.update_run(
@@ -247,6 +250,23 @@ class RunManager:
 
     def _build_agent(self, config: AgentConfig) -> NestedMV2Agent:
         return build_agent(config, tools=self.build_registry())
+
+    def _stream_handler(self, run_id: str) -> Callable[[LLMStreamEvent], None]:
+        def handle(event: LLMStreamEvent) -> None:
+            if event.type == "token":
+                self.events.publish(run_id, "assistant.token", {"content": event.content})
+            elif event.type == "tool_call" and event.tool_call is not None:
+                self.events.publish(
+                    run_id,
+                    "assistant.tool_call",
+                    {"tool": event.tool_call.name, "tool_call_id": event.tool_call.id, "arguments": event.tool_call.arguments},
+                )
+            elif event.type == "usage":
+                self.events.publish(run_id, "assistant.usage", event.data)
+            elif event.type == "provider_error":
+                self.events.publish(run_id, "assistant.provider_error", {"content": event.content, **event.data})
+
+        return handle
 
     def build_registry(self) -> ToolRegistry:
         registry = build_default_tools()
