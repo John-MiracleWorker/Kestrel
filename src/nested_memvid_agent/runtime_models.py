@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Any, Literal
+from uuid import uuid4
+
+MessageRole = Literal["system", "user", "assistant", "tool"]
+
+
+@dataclass(frozen=True)
+class ChatMessage:
+    role: MessageRole
+    content: str
+    name: str | None = None
+    tool_call_id: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def to_openai_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"role": self.role, "content": self.content}
+        if self.name:
+            payload["name"] = self.name
+        if self.tool_call_id:
+            payload["tool_call_id"] = self.tool_call_id
+        return payload
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    name: str
+    arguments: dict[str, Any]
+    id: str = field(default_factory=lambda: f"tool_{uuid4().hex}")
+
+
+@dataclass(frozen=True)
+class LLMResponse:
+    content: str
+    tool_calls: tuple[ToolCall, ...] = ()
+    raw: Any | None = None
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    parameters: dict[str, Any]
+    risk: Literal["low", "medium", "high"] = "low"
+    requires_approval: bool = False
+    source: Literal["builtin", "mcp", "skill"] = "builtin"
+    server_id: str | None = None
+    skill_id: str | None = None
+    capabilities: tuple[str, ...] = ()
+
+    def to_prompt_block(self) -> str:
+        return (
+            f"Tool: {self.name}\n"
+            f"Risk: {self.risk}\n"
+            f"Requires approval: {self.requires_approval}\n"
+            f"Source: {self.source}\n"
+            f"Description: {self.description}\n"
+            f"Parameters JSON schema: {self.parameters}"
+        )
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+            "risk": self.risk,
+            "requires_approval": self.requires_approval,
+            "source": self.source,
+            "server_id": self.server_id,
+            "skill_id": self.skill_id,
+            "capabilities": list(self.capabilities),
+        }
+
+
+@dataclass(frozen=True)
+class ToolExecution:
+    call: ToolCall
+    success: bool
+    content: str
+    data: dict[str, Any] = field(default_factory=dict)
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class AgentTurnResult:
+    session_id: str
+    user_message: str
+    assistant_message: str
+    tool_executions: tuple[ToolExecution, ...]
+    context_chars: int
+    memory_writes: tuple[str, ...]
+    stop_reason: str

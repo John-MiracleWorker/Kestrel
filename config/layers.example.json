@@ -1,0 +1,57 @@
+{
+  "working": {
+    "description": "Current task state, volatile scratch memory, active assumptions.",
+    "mv2_file": "working.mv2",
+    "update_cadence": "every_step",
+    "retrieval_k": 6,
+    "context_budget_chars": 3500,
+    "min_write_confidence": 0.2,
+    "promotion_threshold": 0.65,
+    "retention_days": 2,
+    "search_mode": "lex"
+  },
+  "episodic": {
+    "description": "Meaningful events, tool results, failures, decisions, session summaries.",
+    "mv2_file": "episodic.mv2",
+    "update_cadence": "event_or_session",
+    "retrieval_k": 8,
+    "context_budget_chars": 4500,
+    "min_write_confidence": 0.5,
+    "promotion_threshold": 0.75,
+    "retention_days": 90,
+    "search_mode": "auto"
+  },
+  "semantic": {
+    "description": "Stable facts about codebases, APIs, users, projects, and domains.",
+    "mv2_file": "semantic.mv2",
+    "update_cadence": "validated_fact",
+    "retrieval_k": 8,
+    "context_budget_chars": 4500,
+    "min_write_confidence": 0.75,
+    "promotion_threshold": 0.85,
+    "retention_days": 365,
+    "search_mode": "auto"
+  },
+  "procedural": {
+    "description": "Reusable methods, debug recipes, known workflows, tool-use skills.",
+    "mv2_file": "procedural.mv2",
+    "update_cadence": "validated_repeated_success",
+    "retrieval_k": 6,
+    "context_budget_chars": 4000,
+    "min_write_confidence": 0.82,
+    "promotion_threshold": 0.9,
+    "retention_days": 365,
+    "search_mode": "auto"
+  },
+  "policy": {
+    "description": "Slow-changing behavior rules and safety constraints. Write rarely.",
+    "mv2_file": "policy.mv2",
+    "update_cadence": "rare_manual_or_high_confidence",
+    "retrieval_k": 5,
+    "context_budget_chars": 3000,
+    "min_write_confidence": 0.95,
+    "promotion_threshold": 0.97,
+    "retention_days": 730,
+    "search_mode": "lex"
+  }
+}
