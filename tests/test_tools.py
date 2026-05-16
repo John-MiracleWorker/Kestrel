@@ -476,6 +476,7 @@ def test_default_registry_includes_spec_tools() -> None:
         "repair.validate",
         "repair.rollback",
         "repair.orchestrate_validate",
+        "repair.review",
         "diagnosis.classify",
         "diagnosis.recall",
         "repo.search",
@@ -637,6 +638,79 @@ def test_lint_run_uses_shell_enablement_and_allowlist(tmp_path: Path, monkeypatc
 
     assert allowed.success
     assert "clean" in allowed.content
+
+
+def test_repair_review_creates_commit_gate_after_successful_validation(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    subprocess.run(["git", "switch", "-c", "codex/repair-review"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "README.md").write_text("patched\n")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(
+        name="repair.review",
+        arguments={
+            "validation": {"success": True, "command": ["pytest", "-q"], "content": "passed"},
+            "summary": "README patch validated with tests.",
+        },
+    )
+
+    result = registry.execute(call, ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path))
+
+    assert result.success
+    assert result.data["commit_gate"]["commit_allowed"] is True
+    assert result.data["commit_gate"]["approval_required_before_commit"] is True
+    review_path = tmp_path / ".nest" / "repair_reviews" / f"{result.data['review_id']}.json"
+    assert review_path.exists()
+    assert json.loads(review_path.read_text())["diff_hash"] == result.data["diff_hash"]
+
+
+def test_git_commit_blocks_repair_branch_without_reviewer_gate(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    subprocess.run(["git", "switch", "-c", "codex/repair-no-review"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "README.md").write_text("patched\n")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(name="git.commit", arguments={"message": "repair commit"}, id="commit_repair_no_review")
+
+    result = registry.execute(call, _approved_context(memory, tmp_path, call))
+    after = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
+
+    assert not result.success
+    assert result.error == "repair_review_required"
+    assert after == before
+
+
+def test_git_commit_allows_repair_branch_with_current_reviewer_gate(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "switch", "-c", "codex/repair-reviewed"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "README.md").write_text("patched\n")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    review = registry.execute(
+        ToolCall(
+            name="repair.review",
+            arguments={"validation": {"success": True, "command": ["pytest", "-q"]}, "summary": "validated"},
+        ),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+    call = ToolCall(
+        name="git.commit",
+        arguments={"message": "repair commit", "repair_review_id": review.data["review_id"]},
+        id="commit_repair_reviewed",
+    )
+
+    result = registry.execute(call, _approved_context(memory, tmp_path, call))
+    log = subprocess.run(["git", "log", "-1", "--pretty=%s"], cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    assert result.success
+    assert log.stdout.strip() == "repair commit"
+    assert result.data["repair_review_id"] == review.data["review_id"]
 
 
 def test_git_commit_requires_approval_and_never_pushes(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
