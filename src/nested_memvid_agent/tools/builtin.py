@@ -967,6 +967,173 @@ class RepairPrepareTool(AgentTool):
             return self._result(call, success=False, content=str(exc), error="repair_prepare_failed")
 
 
+class RepairStatusTool(AgentTool):
+    spec = ToolSpec(
+        name="repair.status",
+        description="Report whether the workspace is on a repair branch, changed files, and optional base SHA trace metadata.",
+        parameters={
+            "type": "object",
+            "properties": {"base_sha": {"type": "string"}},
+        },
+        capabilities=("safe-repair", "git-isolation"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        try:
+            branch = _git_output(context.workspace, ["git", "branch", "--show-current"])
+            head = _git_output(context.workspace, ["git", "rev-parse", "HEAD"])
+            status = _git_output(context.workspace, ["git", "status", "--porcelain"])
+            changed_files = _changed_files_from_status(status)
+            base_sha = str(arguments.get("base_sha", "")).strip() or None
+            payload = {
+                "branch": branch,
+                "head_sha": head,
+                "base_sha": base_sha,
+                "active_repair_branch": _is_repair_branch(branch),
+                "dirty": bool(status.strip()),
+                "changed_files": changed_files,
+                "raw_status": status,
+            }
+            return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="repair_status_failed")
+
+
+class RepairApplyPatchTool(AgentTool):
+    spec = ToolSpec(
+        name="repair.apply_patch",
+        description="Apply a repair patch only while on an active repair branch. Requires approval and file-write capability.",
+        parameters={
+            "type": "object",
+            "properties": {"patch": {"type": "string"}, "check": {"type": "boolean"}},
+            "required": ["patch"],
+        },
+        risk="high",
+        requires_approval=True,
+        capabilities=("safe-repair", "patching"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        patch_text = str(arguments.get("patch", ""))
+        if not patch_text.strip():
+            return self._result(call, success=False, content="Missing patch", error="missing_patch")
+        try:
+            branch = _git_output(context.workspace, ["git", "branch", "--show-current"])
+            if not _is_repair_branch(branch):
+                return self._result(
+                    call,
+                    success=False,
+                    content=f"Refusing to apply repair patch on non-repair branch: {branch}",
+                    error="not_repair_branch",
+                    data={"branch": branch},
+                )
+            _validate_patch_paths(context.workspace, patch_text)
+            command = ["git", "apply", "--check"] if bool(arguments.get("check", False)) else ["git", "apply", "--whitespace=nowarn"]
+            completed = subprocess.run(
+                command,
+                cwd=context.workspace,
+                input=patch_text,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            return self._result(
+                call,
+                success=completed.returncode == 0,
+                content=content,
+                data={"branch": branch, "returncode": completed.returncode, "check": bool(arguments.get("check", False))},
+                error=None if completed.returncode == 0 else "repair_patch_failed",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="repair_patch_failed")
+
+
+class RepairValidateTool(AgentTool):
+    spec = ToolSpec(
+        name="repair.validate",
+        description="Run a bounded repair validation command on an active repair branch and classify failures.",
+        parameters={
+            "type": "object",
+            "properties": {"command": {"type": "array", "items": {"type": "string"}}, "timeout": {"type": "integer"}},
+            "required": ["command"],
+        },
+        risk="high",
+        requires_approval=True,
+        capabilities=("safe-repair", "validation", "self-diagnosis"),
+    )
+    allowed_first_tokens = {"pytest", "python", "python3", "ruff", "mypy"}
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        command_raw = arguments.get("command")
+        if not isinstance(command_raw, list) or not all(isinstance(item, str) for item in command_raw):
+            return self._result(call, success=False, content="command must be list[str]", error="bad_command")
+        command = list(command_raw)
+        if not command or Path(command[0]).name not in self.allowed_first_tokens:
+            return self._result(call, success=False, content="Command is not allowlisted", error="command_not_allowlisted")
+        try:
+            branch = _git_output(context.workspace, ["git", "branch", "--show-current"])
+            if not _is_repair_branch(branch):
+                return self._result(call, success=False, content=f"Not on a repair branch: {branch}", error="not_repair_branch")
+            completed = subprocess.run(
+                command,
+                cwd=context.workspace,
+                capture_output=True,
+                text=True,
+                timeout=int(arguments.get("timeout", 120)),
+                check=False,
+            )
+            content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            diagnosis = classify_failure(content, source="repair.validate").to_payload() if completed.returncode != 0 else None
+            return self._result(
+                call,
+                success=completed.returncode == 0,
+                content=content,
+                data={"branch": branch, "returncode": completed.returncode, "diagnosis": diagnosis},
+                error=None if completed.returncode == 0 else "repair_validation_failed",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="repair_validation_failed")
+
+
+class RepairRollbackTool(AgentTool):
+    spec = ToolSpec(
+        name="repair.rollback",
+        description="Rollback uncommitted changes on an active repair branch. Requires approval and never runs on main/master.",
+        parameters={"type": "object", "properties": {}},
+        risk="high",
+        requires_approval=True,
+        capabilities=("safe-repair", "rollback"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        try:
+            branch = _git_output(context.workspace, ["git", "branch", "--show-current"])
+            if not _is_repair_branch(branch):
+                return self._result(call, success=False, content=f"Not on a repair branch: {branch}", error="not_repair_branch")
+            reset = subprocess.run(["git", "checkout", "--", "."], cwd=context.workspace, capture_output=True, text=True, timeout=30, check=False)
+            clean = subprocess.run(["git", "clean", "-fd"], cwd=context.workspace, capture_output=True, text=True, timeout=30, check=False)
+            success = reset.returncode == 0 and clean.returncode == 0
+            content = (
+                f"reset_exit_code={reset.returncode}\nRESET_STDOUT:\n{reset.stdout}\nRESET_STDERR:\n{reset.stderr}\n"
+                f"clean_exit_code={clean.returncode}\nCLEAN_STDOUT:\n{clean.stdout}\nCLEAN_STDERR:\n{clean.stderr}"
+            )
+            return self._result(
+                call,
+                success=success,
+                content=content,
+                data={"branch": branch, "reset_returncode": reset.returncode, "clean_returncode": clean.returncode},
+                error=None if success else "repair_rollback_failed",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="repair_rollback_failed")
+
+
 class GitStatusTool(AgentTool):
     spec = ToolSpec(
         name="git.status",
@@ -1472,6 +1639,10 @@ def build_default_tools() -> ToolRegistry:
     registry.register(DiagnosisClassifyTool())
     registry.register(DiagnosisRecallTool())
     registry.register(RepairPrepareTool())
+    registry.register(RepairStatusTool())
+    registry.register(RepairApplyPatchTool())
+    registry.register(RepairValidateTool())
+    registry.register(RepairRollbackTool())
     registry.register(MemorySearchTool())
     registry.register(MemoryWriteTool())
     registry.register(ContextPackTool())
@@ -1511,6 +1682,36 @@ def _safe_branch_name(name: str) -> bool:
         return False
     allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/-")
     return all(char in allowed for char in name)
+
+
+def _is_repair_branch(name: str) -> bool:
+    return name.startswith(("codex/", "repair/", "fix/")) and name not in {"main", "master"}
+
+
+def _git_output(workspace: Path, command: list[str]) -> str:
+    completed = subprocess.run(
+        command,
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"git command failed ({completed.returncode}): {' '.join(command)}\n{completed.stderr}")
+    return completed.stdout.strip()
+
+
+def _changed_files_from_status(status: str) -> list[str]:
+    files: list[str] = []
+    for line in status.splitlines():
+        if not line:
+            continue
+        path = line[3:] if len(line) > 3 and line[2] == " " else line[2:]
+        if " -> " in path:
+            path = path.split(" -> ", maxsplit=1)[1]
+        files.append(path.strip())
+    return files
 
 
 def _safe_path(root: Path, relative: str) -> Path:
