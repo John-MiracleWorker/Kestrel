@@ -23,6 +23,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Multi-channel ingress for Telegram Bot API updates, Discord message/interaction-shaped payloads, and generic/custom webhooks, with CLI and API routes.
 - SQLite state store for runs, run steps, approvals, MCP servers, skills, task nodes, and subagent runs, now initialized through schema version `5`.
 - Paper-guided nested learning kernel with context-flow metadata, optimizer traces, conservative continuum-memory routing, and a `memory.learn` tool/API path.
+- Memory learning decisions now expose explicit promotion gate metadata so rejected/accepted decisions can explain target layer, observed evidence, repeat-count thresholds, validation thresholds, and explicit-instruction requirements.
 - Run-scoped `complete.mv2` task capsules, preview-only capsule summaries, dry-run consolidation decisions, and approval-gated capsule apply.
 - MCP server records now track health metadata, tool counts, capabilities, last sync/seen/call/error timestamps, session state, failure counts, and latency.
 - MCP server records now persist vetting metadata: transport/network exposure, secret-env requirements, per-tool risk/approval classification, risk reasons, and recommended trust posture.
@@ -69,6 +70,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Provider fallback only runs for `ProviderError(retryable=True)` failures; non-retryable errors fail fast and preserve the original provider error.
 - MCP tools remain approval-by-default unless a server is explicitly configured to trust its manifest; dangerous tool names/descriptions such as file writes, deletes, shell execution, patching, committing, or secrets are promoted to high risk during vetting.
 - Invalid skill manifests are rejected during discovery; accepted skill manifests record validation status plus manifest/SKILL.md content hashes for provenance.
+- Memory promotion decisions must carry auditable gate metadata; one-off procedural successes and ordinary events can explain why they were not promoted into procedural/policy memory.
 
 ## Validation Commands
 
