@@ -1157,7 +1157,7 @@ class RepairOrchestrateValidateTool(AgentTool):
                 "reason": "Validation passed; no retry needed." if completed.returncode == 0 else "No similar lesson was found; follow the diagnostic playbook.",
                 "strategy_changed": True,
             }
-            next_action = "review_and_commit_only_after_approval" if completed.returncode == 0 else "retry_with_diagnostic_playbook"
+            next_action = "create_repair_review_before_commit" if completed.returncode == 0 else "retry_with_diagnostic_playbook"
             if completed.returncode != 0:
                 classification = classify_failure(validation_content, source="repair.orchestrate_validate")
                 diagnosis = classification.to_payload()
