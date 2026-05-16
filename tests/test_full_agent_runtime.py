@@ -9,13 +9,16 @@ from types import SimpleNamespace
 from typing import Any
 
 import nested_memvid_agent.mcp_manager as mcp_module
+from nested_memvid_agent.agent import AgentDependencies, NestedMV2Agent
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.event_bus import RunEventBus
+from nested_memvid_agent.event_log import JsonlEventLog
+from nested_memvid_agent.llm.mock import MockLLMProvider
 from nested_memvid_agent.mcp_manager import MCPManager
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
 from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.run_manager import RunManager
-from nested_memvid_agent.runtime_models import AgentTurnResult
+from nested_memvid_agent.runtime_models import AgentTurnResult, LLMResponse, ToolCall
 from nested_memvid_agent.server import create_app
 from nested_memvid_agent.skill_manager import SkillManager, validate_skill_manifest
 from nested_memvid_agent.state_store import AgentStateStore
@@ -71,6 +74,29 @@ def test_state_store_approval_decisions_are_immutable_after_first_decision(tmp_p
     assert approved["status"] == "approved"
     assert replayed_denial["status"] == "approved"
     assert replayed_denial["decision"] == {"approved": True}
+
+
+def test_state_store_records_approval_result_without_flipping_decision(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    state.create_approval(
+        approval_id="approval_test",
+        run_id="run_test",
+        tool_call_id="call_test",
+        tool_name="test.run",
+        arguments={"command": ["python3", "-c", "print('ok')"]},
+        risk="high",
+    )
+
+    decided = state.decide_approval("approval_test", status="approved", decision={"approved": True})
+    assert decided["result"] is None
+
+    recorded = state.record_approval_result("approval_test", {"success": True, "content": "ok"})
+    assert recorded["status"] == "approved"
+    assert recorded["decision"] == {"approved": True}
+    assert recorded["result"] == {"success": True, "content": "ok"}
+
+    replay = state.record_approval_result("approval_test", {"success": False, "content": "late failure"})
+    assert replay["result"] == {"success": True, "content": "ok"}
 
 
 def test_state_store_enforces_run_lifecycle_transitions(tmp_path: Path) -> None:
@@ -705,6 +731,72 @@ def test_run_manager_completes_background_mock_run(tmp_path: Path) -> None:
     graph = manager.task_graph(run.run_id)
     assert graph["tasks"]
     assert graph["tasks"][0]["title"] == "Root objective"
+
+
+def test_full_agent_flow_blocks_approves_resumes_traces_and_capsules(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.config = AgentConfig(
+        **{
+            **manager.config.__dict__,
+            "allow_shell": True,
+            "enable_task_capsules": True,
+        }
+    )
+    scripted = [
+        LLMResponse(
+            content="I need approval to run validation.",
+            tool_calls=(
+                ToolCall(
+                    name="test.run",
+                    arguments={"command": ["python3", "-c", "print('full-flow-ok')"]},
+                ),
+            ),
+        ),
+        LLMResponse(content="Validation completed after approval."),
+    ]
+
+    def build_scripted_agent(config: AgentConfig) -> NestedMV2Agent:
+        response = scripted.pop(0)
+        return NestedMV2Agent(
+            AgentDependencies(
+                memory=build_memory_system(config.backend, config.memory_dir),
+                llm=MockLLMProvider(canned=[response]),
+                tools=manager.build_registry(),
+                config=config,
+                event_log=JsonlEventLog(config.log_dir / "events.jsonl"),
+            )
+        )
+
+    manager._build_agent = build_scripted_agent  # type: ignore[method-assign]
+
+    run = manager.create_run(message="Run the full validation flow", session_id="session")
+    blocked = _wait_for_status(manager, run.run_id, {"blocked", "failed"})
+    assert blocked["status"] == "blocked"
+    assert blocked["stop_reason"] == "approval_required"
+
+    approvals = manager.state.list_approvals(status="pending")
+    assert len(approvals) == 1
+    approval = approvals[0]
+    assert approval["tool_name"] == "test.run"
+
+    manager.decide_approval(approval["approval_id"], approved=True, arguments=approval["arguments"])
+    final = _wait_for_status(manager, run.run_id, {"completed", "failed"})
+
+    assert final["status"] == "completed"
+    assert final["assistant_message"] == "Validation completed after approval."
+    decided = manager.state.list_approvals(status="approved")[0]
+    assert decided["result"]["success"] is True
+    assert "full-flow-ok" in decided["result"]["content"]
+
+    graph = manager.task_graph(run.run_id)
+    assert graph["tasks"]
+    trace = manager.run_trace(run.run_id)
+    event_types = [event["type"] for event in manager.state.list_run_steps(run.run_id)]
+    assert "approval.requested" in event_types
+    assert "tool.completed" in event_types
+    assert "run.completed" in event_types
+    assert trace["run"]["status"] == "completed"
+    assert (manager.config.memory_dir.parent / "runs" / run.run_id / "complete.mv2").exists()
 
 
 def test_run_manager_creates_durable_child_plan_for_multi_step_goal(tmp_path: Path) -> None:

@@ -319,12 +319,7 @@ class RunManager:
                     approved_tool_call_arguments={call.id: arguments},
                 ),
             )
-            self.state.decide_approval(
-                str(approval["approval_id"]),
-                status="approved",
-                decision={"approved": True, "arguments": arguments},
-                result=_execution_payload(execution),
-            )
+            self.state.record_approval_result(str(approval["approval_id"]), _execution_payload(execution))
             self.events.publish(run_id, "tool.executed", _execution_payload(execution))
             self.events.publish(run_id, "tool.completed" if execution.success else "tool.failed", _execution_payload(execution))
             continuation = (
