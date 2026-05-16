@@ -640,6 +640,77 @@ def test_lint_run_uses_shell_enablement_and_allowlist(tmp_path: Path, monkeypatc
     assert "clean" in allowed.content
 
 
+def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    (tmp_path / "calculator.py").write_text("def add(a, b):\n    return a - b\n")
+    (tmp_path / "test_calculator.py").write_text(
+        "from calculator import add\n\n"
+        "def test_adds_numbers():\n"
+        "    assert add(2, 3) == 5\n"
+    )
+    subprocess.run(["git", "add", "calculator.py", "test_calculator.py"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed failing calculator"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+
+    prepare = ToolCall(name="repair.prepare", arguments={"branch": "codex/repair-calculator"}, id="prepare_e2e")
+    prepared = registry.execute(prepare, _approved_context(memory, tmp_path, prepare))
+    assert prepared.success
+
+    patch_call = ToolCall(
+        name="repair.apply_patch",
+        arguments={
+            "patch": "diff --git a/calculator.py b/calculator.py\n"
+            "--- a/calculator.py\n"
+            "+++ b/calculator.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def add(a, b):\n"
+            "-    return a - b\n"
+            "+    return a + b\n"
+        },
+        id="patch_e2e",
+    )
+    patched = registry.execute(patch_call, _approved_context(memory, tmp_path, patch_call))
+    assert patched.success
+
+    validation_call = ToolCall(
+        name="repair.orchestrate_validate",
+        arguments={"command": ["python", "-m", "pytest", "-q", "test_calculator.py"]},
+        id="validate_e2e",
+    )
+    validation = registry.execute(validation_call, _approved_context(memory, tmp_path, validation_call, allow_shell=True))
+    assert validation.success
+    assert validation.data["validation"]["success"] is True
+    assert validation.data["next_action"] == "create_repair_review_before_commit"
+    assert validation.data["commit_allowed"] is False
+
+    review = registry.execute(
+        ToolCall(
+            name="repair.review",
+            arguments={"validation": validation.data["validation"], "summary": "Calculator repair validated by targeted pytest."},
+        ),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+    assert review.success
+    assert review.data["commit_gate"]["commit_allowed"] is True
+    assert review.data["commit_gate"]["approval_required_before_commit"] is True
+    assert (tmp_path / ".nest" / "repair_reviews" / f"{review.data['review_id']}.json").exists()
+
+    commit_call = ToolCall(
+        name="git.commit",
+        arguments={"message": "repair calculator add", "repair_review_id": review.data["review_id"]},
+        id="commit_e2e",
+    )
+    blocked_commit = registry.execute(commit_call, ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path))
+    assert blocked_commit.error == "approval_required"
+
+
 def test_repair_review_creates_commit_gate_after_successful_validation(tmp_path: Path) -> None:
     _init_git_repo(tmp_path)
     subprocess.run(["git", "switch", "-c", "codex/repair-review"], cwd=tmp_path, check=True, capture_output=True, text=True)
