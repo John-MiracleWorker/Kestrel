@@ -11,6 +11,7 @@ from threading import RLock
 from typing import Any
 
 SCHEMA_VERSION = 5
+_TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 
 
 def utc_now() -> str:
@@ -124,6 +125,8 @@ class AgentStateStore:
             if current_row is None:
                 raise KeyError(f"Unknown run: {run_id}")
             current = _run_from_row(current_row)
+            if current.status in _TERMINAL_RUN_STATUSES:
+                return current
             if not _run_transition_allowed(current.status, status):
                 return current
             updates = dict(fields)
@@ -267,6 +270,14 @@ class AgentStateStore:
         result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self._connect() as conn:
+            current = conn.execute(
+                "SELECT status FROM approval_requests WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Unknown approval: {approval_id}")
+            if str(current["status"]) != "pending":
+                return self.get_approval(approval_id)
             conn.execute(
                 """
                 UPDATE approval_requests
