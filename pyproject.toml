@@ -17,7 +17,7 @@ memvid = ["memvid-sdk>=2.0"]
 openai = ["openai>=1.0"]
 server = ["fastapi>=0.110", "uvicorn>=0.29"]
 mcp = ["mcp>=1.0"]
-dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.10"]
+dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.10", "fastapi>=0.110", "uvicorn>=0.29"]
 
 [project.scripts]
 nested-memvid = "nested_memvid_agent.cli:main"
