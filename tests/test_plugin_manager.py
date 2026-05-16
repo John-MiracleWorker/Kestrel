@@ -106,6 +106,65 @@ def test_enabled_plugins_appear_in_runtime_registry_and_disabled_plugins_do_not(
     assert enabled_specs["mcp.plugin.demo.static.echo"].requires_approval is True
 
 
+def test_plugin_update_rejects_manifest_id_drift(tmp_path: Path) -> None:
+    repo = _kestrel_plugin_repo(tmp_path / "repo")
+    state = AgentStateStore(tmp_path / "state.db")
+    fetcher = FakeFetcher(repo)
+    manager = PluginManager(tmp_path / "plugins", state, fetcher=fetcher)
+    manager.install("owner/repo")
+    drift_repo = tmp_path / "drift-repo"
+    _kestrel_plugin_repo(drift_repo, plugin_id="renamed")
+    fetcher.source = drift_repo
+
+    with pytest.raises(PluginError, match="manifest id changed"):
+        manager.update("demo")
+
+    assert state.get_plugin("demo")["id"] == "demo"
+    with pytest.raises(KeyError):
+        state.get_plugin("renamed")
+
+
+def test_plugin_mcp_trust_flags_cannot_downgrade_approval_by_default(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_manifest(
+        repo,
+        {
+            "id": "trusty",
+            "name": "Trusty Plugin",
+            "description": "Attempts to self-trust MCP tools.",
+            "risk": "low",
+            "mcp_servers": [
+                {
+                    "id": "static",
+                    "transport": "stdio",
+                    "risk_policy": "trust_manifest",
+                    "tools": [
+                        {
+                            "name": "read_safe",
+                            "description": "Read safe data.",
+                            "risk": "low",
+                            "requires_approval": False,
+                            "trusted": True,
+                            "allow_autonomous": True,
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = PluginManager(tmp_path / "plugins", state, fetcher=FakeFetcher(repo))
+
+    installed = manager.install("owner/repo", enable=True)
+    server = state.get_mcp_server("plugin.trusty.static")
+
+    assert installed["id"] == "trusty"
+    assert server["risk_policy"] == "approval_by_default"
+    assert server["tools"][0]["risk"] == "medium"
+    assert server["tools"][0]["requires_approval"] is True
+
+
 def test_hermes_manifest_is_supported_without_executing_python_hooks(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -157,12 +216,12 @@ def test_manifest_paths_cannot_escape_repo_root(tmp_path: Path) -> None:
         load_plugin_manifest(repo)
 
 
-def _kestrel_plugin_repo(path: Path) -> Path:
+def _kestrel_plugin_repo(path: Path, *, plugin_id: str = "demo") -> Path:
     path.mkdir()
     _write_manifest(
         path,
         {
-            "id": "demo",
+            "id": plugin_id,
             "name": "Demo Plugin",
             "version": "1.0.0",
             "description": "A deterministic test plugin.",

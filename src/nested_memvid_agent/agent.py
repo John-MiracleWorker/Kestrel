@@ -70,6 +70,7 @@ class NestedMV2Agent:
         run_id: str | None = None,
         approval_handler: ApprovalHandler | None = None,
         approved_tool_call_ids: frozenset[str] = frozenset(),
+        approved_tool_call_arguments: dict[str, dict[str, Any]] | None = None,
         stream_handler: StreamHandler | None = None,
         source: TurnSource | None = None,
     ) -> AgentTurnResult:
@@ -252,6 +253,7 @@ class NestedMV2Agent:
                 run_id=active_run_id,
                 approval_handler=approval_handler,
                 approved_tool_call_ids=approved_tool_call_ids,
+                approved_tool_call_arguments=approved_tool_call_arguments,
             )
             approval_pending = False
             for call in response.tool_calls:

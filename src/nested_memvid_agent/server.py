@@ -49,7 +49,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
     active_config = config or AgentConfig.from_env()
     state = AgentStateStore(active_config.state_path)
     events = RunEventBus(state)
-    mcp = MCPManager(state)
+    mcp = MCPManager(state, allow_network_endpoints=active_config.allow_mcp_network_endpoints)
     skills = SkillManager(active_config.skills_dir, state)
     plugins = PluginManager(active_config.plugins_dir, state)
     runs = RunManager(config=active_config, state=state, events=events, mcp=mcp, skills=skills, plugins=plugins)
@@ -124,6 +124,28 @@ def create_app(config: AgentConfig | None = None) -> Any:
             "signature_secret_env_configured": bool(signature_env and os.getenv(signature_env)),
         }
         return safe
+
+    def mcp_public(server: dict[str, Any]) -> dict[str, object]:
+        safe = dict(server)
+        secret_env = dict(safe.pop("secret_env", {}) or {})
+        safe["secret_env_status"] = {
+            str(target): {
+                "source_env": str(source),
+                "configured": bool(os.getenv(str(source), "").strip()),
+            }
+            for target, source in sorted(secret_env.items())
+        }
+        return safe
+
+    def mcp_result_public(result: dict[str, Any]) -> dict[str, object]:
+        safe = dict(result)
+        if isinstance(safe.get("server"), dict):
+            safe["server"] = mcp_public(dict(safe["server"]))
+        return safe
+
+    def require_plugin_install_enabled() -> None:
+        if not active_config.allow_plugin_install:
+            raise HTTPException(status_code=403, detail="plugin_install_disabled")
 
     @asynccontextmanager
     async def lifespan(app_instance: Any) -> Any:
@@ -307,6 +329,10 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 "allow_policy_writes": active_config.allow_policy_writes,
                 "allow_codex_cli": active_config.allow_codex_cli,
                 "allow_plugin_install": active_config.allow_plugin_install,
+                "allow_git_commit": active_config.allow_git_commit,
+                "allow_memory_import": active_config.allow_memory_import,
+                "allow_executable_skills": active_config.allow_executable_skills,
+                "allow_mcp_network_endpoints": active_config.allow_mcp_network_endpoints,
                 "require_approval_for_high_risk_tools": active_config.require_approval_for_high_risk_tools,
                 "enable_agentic_cycle": active_config.enable_agentic_cycle,
                 "enable_autonomous_scheduler": active_config.enable_autonomous_scheduler,
@@ -537,27 +563,35 @@ def create_app(config: AgentConfig | None = None) -> Any:
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/mcp/servers")  # type: ignore[untyped-decorator]
     def list_mcp_servers() -> list[dict[str, object]]:
-        return mcp.list_servers()
+        return [mcp_public(server) for server in mcp.list_servers()]
 
     @app.get("/api/mcp/servers/{server_id}")  # type: ignore[untyped-decorator]
     def get_mcp_server(server_id: str) -> dict[str, object]:
         try:
-            return state.get_mcp_server(server_id)
+            return mcp_public(state.get_mcp_server(server_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/mcp/servers")  # type: ignore[untyped-decorator]
     def add_mcp_server(request: MCPServerRequest) -> dict[str, object]:
-        return mcp.add_server(request.model_dump())
+        try:
+            return mcp_public(mcp.add_server(request.model_dump()))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.put("/api/mcp/servers/{server_id}")  # type: ignore[untyped-decorator]
     def update_mcp_server(server_id: str, request: MCPServerRequest) -> dict[str, object]:
         payload = request.model_dump()
         payload["id"] = server_id
-        return mcp.add_server(payload)
+        try:
+            return mcp_public(mcp.add_server(payload))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.delete("/api/mcp/servers/{server_id}")  # type: ignore[untyped-decorator]
     def delete_mcp_server(server_id: str) -> dict[str, bool]:
@@ -567,49 +601,57 @@ def create_app(config: AgentConfig | None = None) -> Any:
     @app.post("/api/mcp/servers/{server_id}/connect")  # type: ignore[untyped-decorator]
     def connect_mcp_server(server_id: str) -> dict[str, object]:
         try:
-            return mcp.connect_server(server_id)
+            return mcp_result_public(mcp.connect_server(server_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/mcp/servers/{server_id}/disconnect")  # type: ignore[untyped-decorator]
     def disconnect_mcp_server(server_id: str) -> dict[str, object]:
         try:
-            return mcp.disconnect_server(server_id)
+            return mcp_result_public(mcp.disconnect_server(server_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/mcp/servers/{server_id}/restart")  # type: ignore[untyped-decorator]
     def restart_mcp_server(server_id: str) -> dict[str, object]:
         try:
-            return mcp.restart_server(server_id)
+            return mcp_result_public(mcp.restart_server(server_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/mcp/servers/{server_id}/health")  # type: ignore[untyped-decorator]
     def mcp_server_health(server_id: str) -> dict[str, object]:
         try:
-            return mcp.server_health(server_id)
+            server = state.get_mcp_server(server_id)
+            return {"ok": server.get("status") != "error", "message": "Stored MCP health snapshot.", "server": mcp_public(server)}
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/mcp/servers/{server_id}/sync")  # type: ignore[untyped-decorator]
     def sync_mcp_server(server_id: str) -> dict[str, object]:
         try:
-            return mcp.sync_server(server_id)
+            return mcp_public(mcp.sync_server(server_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/mcp/servers/{server_id}/test")  # type: ignore[untyped-decorator]
     def test_mcp_server(server_id: str) -> dict[str, object]:
         try:
-            return mcp.test_server(server_id)
+            return mcp_result_public(mcp.test_server(server_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/mcp/servers/{server_id}/tools/{tool_name}/invoke")  # type: ignore[untyped-decorator]
     def invoke_mcp_tool(server_id: str, tool_name: str, request: ToolInvokeRequest) -> dict[str, object]:
         try:
-            execution = mcp.invoke_tool(server_id, tool_name, request.arguments)
+            state.get_mcp_server(server_id)
+            registered_name = tool_name if tool_name.startswith("mcp.") else f"mcp.{server_id}.{tool_name}"
+            execution = runs.invoke_tool(
+                tool_name=registered_name,
+                arguments=request.arguments,
+                session_id=request.session_id,
+                run_id=request.run_id,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {
@@ -623,11 +665,24 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
     @app.get("/api/plugins")  # type: ignore[untyped-decorator]
     def list_plugins() -> list[dict[str, object]]:
-        plugins.sync_all()
         return plugins.list_plugins()
 
     @app.get("/api/plugins/{plugin_id}")  # type: ignore[untyped-decorator]
     def get_plugin(plugin_id: str) -> dict[str, object]:
+        try:
+            return plugins.get_plugin(plugin_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/plugins/sync")  # type: ignore[untyped-decorator]
+    def sync_plugins() -> list[dict[str, object]]:
+        require_plugin_install_enabled()
+        plugins.sync_all()
+        return plugins.list_plugins()
+
+    @app.post("/api/plugins/{plugin_id}/sync")  # type: ignore[untyped-decorator]
+    def sync_plugin(plugin_id: str) -> dict[str, object]:
+        require_plugin_install_enabled()
         try:
             plugins.sync_plugin(plugin_id)
             return plugins.get_plugin(plugin_id)
@@ -636,6 +691,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
     @app.post("/api/plugins/install")  # type: ignore[untyped-decorator]
     def install_plugin(request: PluginInstallRequest) -> dict[str, object]:
+        require_plugin_install_enabled()
         try:
             plugin = plugins.install(
                 request.source,
@@ -650,6 +706,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
     @app.post("/api/plugins/{plugin_id}/enable")  # type: ignore[untyped-decorator]
     def enable_plugin(plugin_id: str) -> dict[str, object]:
+        require_plugin_install_enabled()
         try:
             plugin = plugins.set_enabled(plugin_id, True)
             audit_plugin("enable", plugin)
@@ -668,6 +725,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
     @app.post("/api/plugins/{plugin_id}/update")  # type: ignore[untyped-decorator]
     def update_plugin(plugin_id: str, request: PluginUpdateRequest | None = None) -> dict[str, object]:
+        require_plugin_install_enabled()
         try:
             plugin = plugins.update(plugin_id, ref=request.ref if request else None)
             audit_plugin("update", plugin)

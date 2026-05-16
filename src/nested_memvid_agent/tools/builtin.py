@@ -299,6 +299,7 @@ class CapsuleApplyTool(AgentTool):
             "required": ["run_id"],
         },
         risk="high",
+        requires_approval=True,
         capabilities=("task-capsule", "nested-learning", "memory-write"),
     )
 
@@ -340,17 +341,6 @@ class CapsuleApplyTool(AgentTool):
                     content=json.dumps(payload, indent=2),
                     data=payload,
                     error="auto_consolidation_disabled",
-                )
-
-            if context.config.require_approval_for_high_risk_tools and call.id not in context.approved_tool_call_ids:
-                if context.approval_handler is not None:
-                    return context.approval_handler(call, self.spec, context)
-                return self._result(
-                    call,
-                    success=False,
-                    content="Capsule apply requires approval before writing memory.",
-                    data={"status": "approval_required"},
-                    error="approval_required",
                 )
 
             wrote = False

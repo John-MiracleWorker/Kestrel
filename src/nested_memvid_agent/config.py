@@ -35,6 +35,10 @@ class AgentConfig:
     allow_policy_writes: bool = False
     allow_codex_cli: bool = False
     allow_plugin_install: bool = False
+    allow_git_commit: bool = False
+    allow_memory_import: bool = False
+    allow_executable_skills: bool = False
+    allow_mcp_network_endpoints: bool = False
     require_approval_for_high_risk_tools: bool = True
     enable_agentic_cycle: bool = True
     enable_autonomous_scheduler: bool = False
@@ -96,6 +100,10 @@ class AgentConfig:
             allow_policy_writes=_env_bool("NEST_AGENT_ALLOW_POLICY_WRITES"),
             allow_codex_cli=_env_bool("NEST_AGENT_ALLOW_CODEX_CLI"),
             allow_plugin_install=_env_bool("NEST_AGENT_ALLOW_PLUGIN_INSTALL"),
+            allow_git_commit=_env_bool("NEST_AGENT_ALLOW_GIT_COMMIT"),
+            allow_memory_import=_env_bool("NEST_AGENT_ALLOW_MEMORY_IMPORT"),
+            allow_executable_skills=_env_bool("NEST_AGENT_ALLOW_EXECUTABLE_SKILLS"),
+            allow_mcp_network_endpoints=_env_bool("NEST_AGENT_ALLOW_MCP_NETWORK_ENDPOINTS"),
             enable_agentic_cycle=not _env_bool("NEST_AGENT_DISABLE_AGENTIC_CYCLE"),
             enable_autonomous_scheduler=_env_bool("NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER"),
             max_scheduler_tasks=_env_int("NEST_AGENT_MAX_SCHEDULER_TASKS", 3),

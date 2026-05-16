@@ -77,6 +77,7 @@ Run the server:
 docker run --rm \
   -p 127.0.0.1:8765:8765 \
   -v kestrel-data:/data \
+  -e NEST_AGENT_API_TOKEN='replace-with-local-secret' \
   -e OPENAI_API_KEY \
   kestrel-agent:local
 ```
@@ -92,8 +93,16 @@ allow_shell=false
 allow_file_write=false
 allow_policy_writes=false
 allow_codex_cli=false
+allow_plugin_install=false
+allow_git_commit=false
+allow_memory_import=false
+allow_executable_skills=false
+allow_mcp_network_endpoints=false
+require_api_auth=true
 enable_auto_consolidation=false
 ```
+
+The container command binds to `0.0.0.0` inside Docker, so the image requires API auth by default. Set `NEST_AGENT_API_TOKEN` for `docker run` and `docker compose`; startup fails before serving if a non-loopback bind is requested without a configured token.
 
 ## Docker Compose
 
@@ -103,7 +112,7 @@ Copy `.env.example` to `.env`, fill provider keys only where needed, then:
 docker compose up --build
 ```
 
-Compose binds to `127.0.0.1:8765` and stores memory/state/logs in the `kestrel-data` volume.
+Compose binds to `127.0.0.1:8765`, requires `NEST_AGENT_API_TOKEN`, and stores memory/state/logs in the `kestrel-data` volume.
 
 ## Provider Setup
 

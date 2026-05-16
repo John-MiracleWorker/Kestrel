@@ -8,7 +8,8 @@ from pathlib import Path
 
 from pytest import MonkeyPatch, raises
 
-from nested_memvid_agent.cli import main
+from nested_memvid_agent.cli import _validate_server_bind, main
+from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
 from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.state_store import AgentStateStore
@@ -108,6 +109,7 @@ def test_plugins_subcommands_install_list_and_toggle(
         str(tmp_path / "plugins"),
         "--memory-dir",
         str(tmp_path / "memory"),
+        "--allow-plugin-install",
     ]
     monkeypatch.setattr(sys, "argv", ["nest-agent", "plugins", "install", "owner/repo", *common_args])
     main()
@@ -124,6 +126,24 @@ def test_plugins_subcommands_install_list_and_toggle(
     monkeypatch.setattr(sys, "argv", ["nest-agent", "plugins", "disable", "clip", *common_args])
     main()
     assert "clip [not enabled]" in capsys.readouterr().out
+
+
+def test_server_non_loopback_requires_api_auth_token(monkeypatch: MonkeyPatch) -> None:
+    with raises(SystemExit, match="unsafe_bind"):
+        _validate_server_bind("0.0.0.0", AgentConfig(require_api_auth=False))
+
+    with raises(SystemExit, match="unsafe_bind"):
+        _validate_server_bind(
+            "0.0.0.0",
+            AgentConfig(require_api_auth=True, api_auth_token_env="KESTREL_BIND_TEST_TOKEN"),
+        )
+
+    monkeypatch.setenv("KESTREL_BIND_TEST_TOKEN", "secret-token")
+    _validate_server_bind(
+        "0.0.0.0",
+        AgentConfig(require_api_auth=True, api_auth_token_env="KESTREL_BIND_TEST_TOKEN"),
+    )
+    _validate_server_bind("127.0.0.1", AgentConfig(require_api_auth=False))
 
 
 def test_context_subcommand_compiles_prompt(tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object) -> None:

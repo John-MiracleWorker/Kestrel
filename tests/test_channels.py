@@ -114,6 +114,29 @@ def test_channel_webhook_signature_gate_rejects_bad_signatures(tmp_path: Path, m
         raise AssertionError("Expected invalid signature to be rejected")
 
 
+def test_unknown_explicit_channel_id_is_rejected(tmp_path: Path, monkeypatch: object) -> None:
+    monkeypatch.setenv("KESTREL_WEBHOOK_SECRET", "secret")  # type: ignore[attr-defined]
+    signed = ChannelEndpointConfig(
+        id="signed",
+        provider="webhook",
+        settings={"signature_secret_env": "KESTREL_WEBHOOK_SECRET"},
+    )
+    manager = ChannelManager(_config(tmp_path), channel_configs=[signed])
+
+    try:
+        manager.handle_payload(
+            provider="webhook",
+            channel_id="typo",
+            payload={"text": "unsigned bypass", "conversation_id": "thread"},
+        )
+    except Exception as exc:  # noqa: BLE001 - assert channel boundary error without importing pytest
+        assert "Unknown channel" in str(exc)
+    else:
+        raise AssertionError("Expected unknown explicit channel id to be rejected")
+
+    assert not (tmp_path / "memory" / "working.memory.json").exists()
+
+
 def test_server_exposes_channel_ingest_route(tmp_path: Path) -> None:
     from fastapi.testclient import TestClient
 

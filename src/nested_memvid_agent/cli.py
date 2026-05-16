@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import ipaddress
 import json
 import platform
 import subprocess
@@ -69,6 +70,10 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-policy-writes", action="store_true")
     parser.add_argument("--allow-codex-cli", action="store_true")
     parser.add_argument("--allow-plugin-install", action="store_true")
+    parser.add_argument("--allow-git-commit", action="store_true")
+    parser.add_argument("--allow-memory-import", action="store_true")
+    parser.add_argument("--allow-executable-skills", action="store_true")
+    parser.add_argument("--allow-mcp-network-endpoints", action="store_true")
     parser.add_argument("--enable-autonomous-scheduler", action="store_true")
     parser.add_argument("--max-scheduler-tasks", type=int, default=3)
     parser.add_argument("--max-scheduler-cycles", type=int, default=5)
@@ -327,6 +332,7 @@ def main() -> None:
         from .server import create_app
 
         config = _agent_config_from_args(args, backend=backend, memory_dir=memory_dir)
+        _validate_server_bind(args.host, config)
         uvicorn.run(create_app(config), host=args.host, port=args.port)
         return
 
@@ -502,6 +508,10 @@ def _agent_config_from_args(args: argparse.Namespace, *, backend: str, memory_di
         allow_policy_writes=args.allow_policy_writes,
         allow_codex_cli=args.allow_codex_cli,
         allow_plugin_install=args.allow_plugin_install,
+        allow_git_commit=args.allow_git_commit,
+        allow_memory_import=args.allow_memory_import,
+        allow_executable_skills=args.allow_executable_skills,
+        allow_mcp_network_endpoints=args.allow_mcp_network_endpoints,
         enable_autonomous_scheduler=args.enable_autonomous_scheduler,
         max_scheduler_tasks=args.max_scheduler_tasks,
         max_scheduler_cycles=args.max_scheduler_cycles,
@@ -517,6 +527,26 @@ def _agent_config_from_args(args: argparse.Namespace, *, backend: str, memory_di
         context_pack_token_budget=args.context_pack_token_budget,
         context_pack_expand_raw=args.context_pack_expand_raw,
     )
+
+
+def _validate_server_bind(host: str, config: AgentConfig) -> None:
+    if _is_loopback_host(host):
+        return
+    if not config.require_api_auth or not _env_has_value(config.api_auth_token_env):
+        raise SystemExit(
+            "unsafe_bind: non-loopback server hosts require --require-api-auth "
+            f"and a configured {config.api_auth_token_env} token."
+        )
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = host.strip().lower()
+    if normalized in {"localhost", "localhost.localdomain"}:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 def _load_channel_payload(args: argparse.Namespace) -> dict[str, Any]:
@@ -652,6 +682,10 @@ def _doctor_tool_config(config: AgentConfig) -> dict[str, Any]:
         "allow_policy_writes": config.allow_policy_writes,
         "allow_codex_cli": config.allow_codex_cli,
         "allow_plugin_install": config.allow_plugin_install,
+        "allow_git_commit": config.allow_git_commit,
+        "allow_memory_import": config.allow_memory_import,
+        "allow_executable_skills": config.allow_executable_skills,
+        "allow_mcp_network_endpoints": config.allow_mcp_network_endpoints,
         "require_approval_for_high_risk_tools": config.require_approval_for_high_risk_tools,
         "max_tool_rounds": config.max_tool_rounds,
         "context_budget_chars": config.context_budget_chars,
@@ -725,7 +759,7 @@ def _env_has_value(name: str) -> bool:
 def _build_run_manager(config: AgentConfig) -> RunManager:
     state = AgentStateStore(config.state_path)
     events = RunEventBus(state)
-    mcp = MCPManager(state)
+    mcp = MCPManager(state, allow_network_endpoints=config.allow_mcp_network_endpoints)
     skills = SkillManager(config.skills_dir, state)
     plugins = PluginManager(config.plugins_dir, state)
     return RunManager(config=config, state=state, events=events, mcp=mcp, skills=skills, plugins=plugins)
@@ -883,10 +917,10 @@ def _handle_plugins_command(
 ) -> None:
     try:
         if args.plugins_cmd == "list":
-            manager.plugins.sync_all()
             _print_plugins(manager.plugins.list_plugins(), json_output=args.json)
             return
         if args.plugins_cmd == "install":
+            _require_plugin_install_enabled(manager.config)
             plugin = manager.plugins.install(
                 args.source,
                 ref=args.ref,
@@ -900,6 +934,7 @@ def _handle_plugins_command(
             _print_plugin(manager.plugins.get_plugin(args.plugin_id), json_output=args.json)
             return
         if args.plugins_cmd == "enable":
+            _require_plugin_install_enabled(manager.config)
             plugin = manager.plugins.set_enabled(args.plugin_id, True)
             _write_plugin_audit(manager, backend=backend, memory_dir=memory_dir, action="enable", plugin=plugin)
             _print_plugin(plugin, json_output=args.json)
@@ -910,6 +945,7 @@ def _handle_plugins_command(
             _print_plugin(plugin, json_output=args.json)
             return
         if args.plugins_cmd == "update":
+            _require_plugin_install_enabled(manager.config)
             plugin = manager.plugins.update(args.plugin_id, ref=args.ref)
             _write_plugin_audit(manager, backend=backend, memory_dir=memory_dir, action="update", plugin=plugin)
             _print_plugin(plugin, json_output=args.json)
@@ -923,6 +959,11 @@ def _handle_plugins_command(
             return
     except (PluginError, FileExistsError, KeyError) as exc:
         raise SystemExit(str(exc)) from exc
+
+
+def _require_plugin_install_enabled(config: AgentConfig) -> None:
+    if not config.allow_plugin_install:
+        raise SystemExit("plugin_install_disabled")
 
 
 def _write_plugin_audit(
@@ -1071,7 +1112,6 @@ def _handle_slash_command(
         if manager is None:
             print("Plugin status requires CLI run-manager mode.")
             return True
-        manager.plugins.sync_all()
         _print_plugins(manager.plugins.list_plugins(), json_output=False)
         return True
 

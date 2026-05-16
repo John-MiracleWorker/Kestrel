@@ -80,9 +80,16 @@ def test_capsule_apply_dry_run_plans_without_writing(tmp_path: Path) -> None:
     )
     memory = build_memory_system("memory", config.memory_dir)
 
+    arguments = {"run_id": "run_apply_preview", "dry_run": True}
     result = build_default_tools().execute(
-        ToolCall(name="capsule.apply", arguments={"run_id": "run_apply_preview", "dry_run": True}),
-        ToolContext(memory=memory, config=config, workspace=tmp_path),
+        ToolCall(name="capsule.apply", arguments=arguments, id="tool_apply_preview"),
+        ToolContext(
+            memory=memory,
+            config=config,
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"tool_apply_preview"}),
+            approved_tool_call_arguments={"tool_apply_preview": arguments},
+        ),
     )
 
     payload = json.loads(result.content)
@@ -102,9 +109,16 @@ def test_capsule_apply_requires_auto_consolidation_config(tmp_path: Path) -> Non
     )
     memory = build_memory_system("memory", config.memory_dir)
 
+    arguments = {"run_id": "run_apply_disabled"}
     result = build_default_tools().execute(
-        ToolCall(name="capsule.apply", arguments={"run_id": "run_apply_disabled"}),
-        ToolContext(memory=memory, config=config, workspace=tmp_path),
+        ToolCall(name="capsule.apply", arguments=arguments, id="tool_apply_disabled"),
+        ToolContext(
+            memory=memory,
+            config=config,
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"tool_apply_disabled"}),
+            approved_tool_call_arguments={"tool_apply_disabled": arguments},
+        ),
     )
 
     assert not result.success
@@ -149,13 +163,15 @@ def test_capsule_apply_after_approval_writes_non_policy_and_blocks_policy(tmp_pa
     )
     memory = build_memory_system("memory", config.memory_dir)
 
+    arguments = {"run_id": "run_apply_write", "include_policy": True}
     result = build_default_tools().execute(
-        ToolCall(name="capsule.apply", arguments={"run_id": "run_apply_write", "include_policy": True}, id="tool_apply"),
+        ToolCall(name="capsule.apply", arguments=arguments, id="tool_apply"),
         ToolContext(
             memory=memory,
             config=config,
             workspace=tmp_path,
             approved_tool_call_ids=frozenset({"tool_apply"}),
+            approved_tool_call_arguments={"tool_apply": arguments},
         ),
     )
 
@@ -170,6 +186,40 @@ def test_capsule_apply_after_approval_writes_non_policy_and_blocks_policy(tmp_pa
     )
     policy_decisions = [item for item in payload["decisions"] if item["requested_target_layer"] == "policy"]
     assert policy_decisions[0]["blocked"] == "policy_requires_explicit_instruction"
+
+
+def test_capsule_apply_rejects_changed_arguments_after_approval(tmp_path: Path) -> None:
+    config = AgentConfig(memory_dir=tmp_path / "memory", enable_auto_consolidation=True)
+    write_run_capsule(
+        runs_dir=config.memory_dir.parent / "runs",
+        run_id="run_apply_original",
+        objective="Original apply",
+        candidate_facts=("Only the originally approved capsule may be applied.",),
+    )
+    write_run_capsule(
+        runs_dir=config.memory_dir.parent / "runs",
+        run_id="run_apply_changed",
+        objective="Changed apply",
+        candidate_facts=("Changed capsule arguments must not write memory.",),
+    )
+    memory = build_memory_system("memory", config.memory_dir)
+
+    result = build_default_tools().execute(
+        ToolCall(name="capsule.apply", arguments={"run_id": "run_apply_changed"}, id="tool_apply_exact"),
+        ToolContext(
+            memory=memory,
+            config=config,
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"tool_apply_exact"}),
+            approved_tool_call_arguments={"tool_apply_exact": {"run_id": "run_apply_original"}},
+        ),
+    )
+
+    assert not result.success
+    assert result.error == "approval_required"
+    assert not memory.retrieve(
+        RetrievalQuery(query="Changed capsule arguments", layers=(MemoryLayer.SEMANTIC,), k_per_layer=3)
+    )
 
 
 def test_memory_conflicts_returns_structured_output(tmp_path: Path) -> None:

@@ -105,6 +105,70 @@ def test_high_risk_tool_requires_enablement(tmp_path: Path) -> None:
     assert result.error == "tool_disabled"
 
 
+def test_mapped_high_risk_tools_require_capability_even_when_approval_is_disabled(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    plugin_repo = tmp_path / "plugin-repo"
+    plugin_repo.mkdir()
+    (plugin_repo / "kestrel.plugin.json").write_text(
+        json.dumps(
+            {
+                "id": "disabledplug",
+                "name": "Disabled Plugin",
+                "description": "Should not be fetched while plugin installs are disabled.",
+                "skills": [{"id": "hello", "description": "Hello.", "instructions": "Hello."}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_fetch(self: object, source: object, destination: Path, ref: str | None = None) -> str:
+        del self, source, ref
+        shutil.copytree(plugin_repo, destination)
+        return "d" * 40
+
+    monkeypatch.setattr("nested_memvid_agent.plugin_manager.GitPluginFetcher.fetch", fake_fetch)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    config = AgentConfig(
+        require_approval_for_high_risk_tools=False,
+        state_path=tmp_path / "state.db",
+        skills_dir=tmp_path / "skills",
+        plugins_dir=tmp_path / "plugins",
+    )
+    cases = [
+        ("shell.run", {"command": ["echo", "capability-bypass"]}),
+        ("file.write", {"path": "blocked.txt", "content": "blocked"}),
+        ("patch.apply", {"patch": "diff --git a/blocked.txt b/blocked.txt\n"}),
+        ("codex.exec", {"prompt": "summarize this repo"}),
+        (
+            "skill.install",
+            {
+                "manifest": {
+                    "id": "blocked-skill",
+                    "name": "Blocked Skill",
+                    "description": "Should not install without file-write enablement.",
+                    "runtime": {"type": "instruction"},
+                },
+                "instructions": "Do nothing.",
+            },
+        ),
+        ("plugin.install", {"source": "owner/repo"}),
+    ]
+
+    for tool_name, arguments in cases:
+        result = registry.execute(
+            ToolCall(name=tool_name, arguments=arguments, id=f"{tool_name.replace('.', '_')}_disabled"),
+            ToolContext(memory=memory, config=config, workspace=tmp_path),
+        )
+        assert result.error == "tool_disabled", tool_name
+
+    assert not (tmp_path / "blocked.txt").exists()
+    assert not (tmp_path / "skills" / "blocked-skill").exists()
+    assert not (tmp_path / "plugins" / "disabledplug").exists()
+
+
 def test_malformed_tool_arguments_fail_cleanly(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
@@ -116,6 +180,24 @@ def test_malformed_tool_arguments_fail_cleanly(tmp_path: Path) -> None:
 
     assert not result.success
     assert result.error == "invalid_tool_arguments"
+
+
+def test_id_only_approval_is_not_sufficient_for_high_risk_exact_call(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+
+    result = registry.execute(
+        ToolCall(name="shell.run", arguments={"command": ["echo", "must-not-run"]}, id="shell_id_only"),
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_shell=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"shell_id_only"}),
+        ),
+    )
+
+    assert not result.success
+    assert result.error == "approval_required"
 
 
 def test_high_risk_tool_with_allow_flag_still_requests_approval(tmp_path: Path) -> None:
@@ -388,7 +470,12 @@ def _init_git_repo(path: Path) -> str:
 def _approved_context(memory: object, tmp_path: Path, call: ToolCall, *, allow_shell: bool = False) -> ToolContext:
     return ToolContext(
         memory=memory,  # type: ignore[arg-type]
-        config=AgentConfig(allow_file_write=True, allow_shell=allow_shell),
+        config=AgentConfig(
+            allow_file_write=True,
+            allow_shell=allow_shell,
+            allow_git_commit=True,
+            allow_memory_import=True,
+        ),
         workspace=tmp_path,
         approved_tool_call_ids=frozenset({call.id}),
         approved_tool_call_arguments={call.id: call.arguments},
@@ -821,7 +908,13 @@ def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_
         id="commit_e2e",
     )
     blocked_commit = registry.execute(commit_call, ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path))
-    assert blocked_commit.error == "approval_required"
+    assert blocked_commit.error == "tool_disabled"
+
+    approval_blocked_commit = registry.execute(
+        commit_call,
+        ToolContext(memory=memory, config=AgentConfig(allow_git_commit=True), workspace=tmp_path),
+    )
+    assert approval_blocked_commit.error == "approval_required"
 
     approved_commit = registry.execute(commit_call, _approved_context(memory, tmp_path, commit_call))
     assert approved_commit.success
@@ -964,7 +1057,7 @@ def test_git_commit_requires_approval_and_never_pushes(tmp_path: Path, monkeypat
     registry = build_default_tools()
     call = ToolCall(name="git.commit", arguments={"message": "test commit"}, id="commit1")
 
-    blocked = registry.execute(call, ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path))
+    blocked = registry.execute(call, ToolContext(memory=memory, config=AgentConfig(allow_git_commit=True), workspace=tmp_path))
     assert blocked.error == "approval_required"
 
     captured: dict[str, object] = {"commands": []}
@@ -982,9 +1075,10 @@ def test_git_commit_requires_approval_and_never_pushes(tmp_path: Path, monkeypat
         call,
         ToolContext(
             memory=memory,
-            config=AgentConfig(),
+            config=AgentConfig(allow_git_commit=True),
             workspace=tmp_path,
             approved_tool_call_ids=frozenset({"commit1"}),
+            approved_tool_call_arguments={"commit1": {"message": "test commit"}},
         ),
     )
 
@@ -1036,16 +1130,17 @@ def test_memory_inspect_export_and_import_are_structured_and_gated(tmp_path: Pat
         },
         id="import1",
     )
-    blocked = registry.execute(import_call, ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path))
+    blocked = registry.execute(import_call, ToolContext(memory=memory, config=AgentConfig(allow_memory_import=True), workspace=tmp_path))
     assert blocked.error == "approval_required"
 
     imported = registry.execute(
         import_call,
         ToolContext(
             memory=memory,
-            config=AgentConfig(),
+            config=AgentConfig(allow_memory_import=True),
             workspace=tmp_path,
             approved_tool_call_ids=frozenset({"import1"}),
+            approved_tool_call_arguments={"import1": import_call.arguments},
         ),
     )
     assert imported.success
@@ -1073,9 +1168,19 @@ def test_memory_import_keeps_policy_writes_separately_gated(tmp_path: Path) -> N
         ),
         ToolContext(
             memory=memory,
-            config=AgentConfig(allow_policy_writes=False),
+            config=AgentConfig(allow_memory_import=True, allow_policy_writes=False),
             workspace=tmp_path,
             approved_tool_call_ids=frozenset({"import_policy"}),
+            approved_tool_call_arguments={"import_policy": {
+                "records": [
+                    {
+                        "layer": "policy",
+                        "kind": "policy",
+                        "title": "Imported policy",
+                        "content": "Never write policy memory without explicit policy enablement.",
+                    }
+                ]
+            }},
         ),
     )
 

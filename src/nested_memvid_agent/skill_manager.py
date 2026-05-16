@@ -38,7 +38,16 @@ class SkillManager:
     def discover(self) -> list[dict[str, Any]]:
         found: list[dict[str, Any]] = []
         self.validation_errors = []
-        for skill_dir in sorted(path for path in self.root.iterdir() if path.is_dir()):
+        root_resolved = self.root.resolve()
+        for skill_dir in sorted(path for path in self.root.iterdir() if path.is_dir() and not path.is_symlink()):
+            try:
+                resolved = skill_dir.resolve()
+            except OSError as exc:
+                self.validation_errors.append({"path": str(skill_dir), "errors": [f"path_resolve_failed:{type(exc).__name__}"]})
+                continue
+            if resolved != root_resolved and root_resolved not in resolved.parents:
+                self.validation_errors.append({"path": str(skill_dir), "errors": ["skill_path_escapes_root"]})
+                continue
             manifest_path = skill_dir / "skill.json"
             instructions_path = skill_dir / "SKILL.md"
             if not manifest_path.exists() or not instructions_path.exists():
@@ -129,6 +138,14 @@ class SkillToolAdapter(AgentTool):
     def __init__(self, capsule: SkillCapsule) -> None:
         self.capsule = capsule
         risk = str(capsule.manifest.get("risk", "medium"))
+        runtime = capsule.manifest.get("runtime", {"type": "instruction"})
+        runtime_type = str(runtime.get("type", "instruction")) if isinstance(runtime, dict) else "instruction"
+        executable_runtime = runtime_type in {"python", "shell", "container"}
+        capabilities = [str(item) for item in capsule.manifest.get("capabilities", ["skill", "nested-learning"])]
+        if executable_runtime and "executable-skill" not in capabilities:
+            capabilities.append("executable-skill")
+        if executable_runtime:
+            capabilities.append(f"runtime:{runtime_type}")
         self.spec = ToolSpec(
             name=f"skill.{capsule.id}.run",
             description=capsule.description or f"Run skill capsule {capsule.name}.",
@@ -145,11 +162,13 @@ class SkillToolAdapter(AgentTool):
                     },
                 )
             ),
-            risk="high" if risk == "high" else "medium" if risk == "medium" else "low",
-            requires_approval=bool(capsule.manifest.get("requires_approval", risk in {"medium", "high"})),
+            risk="high" if executable_runtime or risk == "high" else "medium" if risk == "medium" else "low",
+            requires_approval=True
+            if executable_runtime
+            else bool(capsule.manifest.get("requires_approval", risk in {"medium", "high"})),
             source="skill",
             skill_id=capsule.id,
-            capabilities=tuple(str(item) for item in capsule.manifest.get("capabilities", ["skill", "nested-learning"])),
+            capabilities=tuple(capabilities),
         )
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
@@ -159,6 +178,14 @@ class SkillToolAdapter(AgentTool):
             return self._result(call, success=False, content="Missing skill task.", error="missing_task")
 
         runtime = self.capsule.manifest.get("runtime", {"type": "instruction"})
+        runtime_type = str(runtime.get("type", "instruction")) if isinstance(runtime, dict) else "instruction"
+        if runtime_type in {"python", "shell", "container"} and not context.config.allow_executable_skills:
+            return self._result(
+                call,
+                success=False,
+                content="Executable skill runtimes are disabled by default.",
+                error="tool_disabled",
+            )
         try:
             runtime_result = _run_skill_runtime(
                 self.capsule,

@@ -10,6 +10,8 @@ from time import monotonic, sleep
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 import nested_memvid_agent.mcp_manager as mcp_module
 from nested_memvid_agent.agent import AgentDependencies, NestedMV2Agent
 from nested_memvid_agent.config import AgentConfig
@@ -385,14 +387,15 @@ def test_mcp_static_tools_enter_unified_registry(tmp_path: Path) -> None:
 
 def test_mcp_vetting_metadata_identifies_secrets_network_and_high_risk_tools(tmp_path: Path) -> None:
     state = AgentStateStore(tmp_path / "state.db")
-    manager = MCPManager(state)
+    manager = MCPManager(state, allow_network_endpoints=True)
 
     row = manager.add_server(
         {
             "id": "github",
             "transport": "sse",
             "url": "https://mcp.example.test/sse",
-            "env": {"GITHUB_TOKEN": "dummy-token", "LOG_LEVEL": "debug"},
+            "env": {"LOG_LEVEL": "debug"},
+            "secret_env": {"GITHUB_TOKEN": "GITHUB_TOKEN"},
             "tools": [
                 {"name": "list_issues", "description": "List issues", "risk": "low"},
                 {"name": "write_file", "description": "Write a file", "risk": "low"},
@@ -411,6 +414,93 @@ def test_mcp_vetting_metadata_identifies_secrets_network_and_high_risk_tools(tmp
     assert high_risk["write_file"]["requires_approval"] is True
     assert row["tools"][1]["risk"] == "high"
     assert row["tools"][1]["requires_approval"] is True
+
+
+def test_mcp_env_rejects_raw_secret_keys(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = MCPManager(state)
+
+    with pytest.raises(ValueError, match="secret_env"):
+        manager.add_server(
+            {
+                "id": "raw-secret",
+                "transport": "stdio",
+                "command": "fake-mcp",
+                "env": {"GITHUB_TOKEN": "raw-token"},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "file:///tmp/socket",
+        "https://user:pass@mcp.example.test/sse",
+        "https://169.254.169.254/latest/meta-data",
+    ],
+)
+def test_mcp_network_endpoint_validation_rejects_unsafe_urls(tmp_path: Path, url: str) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = MCPManager(state, allow_network_endpoints=True)
+
+    with pytest.raises(ValueError):
+        manager.add_server({"id": "unsafe-url", "transport": "sse", "url": url})
+
+
+def test_mcp_stdio_validation_rejects_shell_launchers(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = MCPManager(state)
+
+    with pytest.raises(ValueError):
+        manager.add_server({"id": "shell", "transport": "stdio", "command": "/bin/sh", "args": ["-c", "echo unsafe"]})
+
+
+def test_mcp_trusted_flags_do_not_bypass_approval_by_default(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = MCPManager(state)
+
+    row = manager.add_server(
+        {
+            "id": "trusted",
+            "transport": "stdio",
+            "tools": [
+                {
+                    "name": "read_safe",
+                    "description": "Read safe data.",
+                    "risk": "low",
+                    "requires_approval": False,
+                    "trusted": True,
+                    "allow_autonomous": True,
+                }
+            ],
+        }
+    )
+
+    assert row["tools"][0]["risk"] == "medium"
+    assert row["tools"][0]["requires_approval"] is True
+
+
+def test_mcp_secret_env_is_resolved_only_at_runtime(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setenv("MCP_FIXTURE_TOKEN", "super-secret-token")
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = MCPManager(state)
+    row = manager.add_server(
+        {
+            "id": "secret-stdio",
+            "transport": "stdio",
+            "command": "fake-mcp",
+            "env": {"LOG_LEVEL": "debug"},
+            "secret_env": {"MCP_API_TOKEN": "MCP_FIXTURE_TOKEN"},
+        }
+    )
+    server = mcp_module._server_from_state(row)
+
+    runtime_env = mcp_module._runtime_env(server)
+
+    assert runtime_env["LOG_LEVEL"] == "debug"
+    assert runtime_env["MCP_API_TOKEN"] == "super-secret-token"
+    assert "super-secret-token" not in json.dumps(row)
+    assert row["secret_env"] == {"MCP_API_TOKEN": "MCP_FIXTURE_TOKEN"}
 
 
 def test_mcp_static_server_test_updates_health(tmp_path: Path) -> None:
@@ -520,7 +610,10 @@ def test_server_exposes_mcp_lifecycle_routes(tmp_path: Path) -> None:
     assert added.status_code == 200
     health = client.get("/api/mcp/servers/static/health")
     assert health.status_code == 200
-    assert health.json()["server"]["session_state"] == "static"
+    assert health.json()["server"]["session_state"] == "disconnected"
+    checked = client.post("/api/mcp/servers/static/test")
+    assert checked.status_code == 200
+    assert checked.json()["server"]["session_state"] == "static"
     disconnected = client.post("/api/mcp/servers/static/disconnect")
     assert disconnected.status_code == 200
     assert disconnected.json()["server"]["session_state"] == "disconnected"
@@ -697,12 +790,13 @@ def test_server_exposes_local_operator_api_parity(tmp_path: Path, monkeypatch: A
         "id": "operator-static",
         "transport": "stdio",
         "tools": [{"name": "echo", "description": "Echo"}],
-        "secret_env": {"api_key": "MCP_API_KEY"},
+        "secret_env": {"MCP_API_KEY": "MCP_API_KEY"},
     }
     assert client.post("/api/mcp/servers", json=mcp_payload).status_code == 200
     mcp_detail = client.get("/api/mcp/servers/operator-static")
     assert mcp_detail.status_code == 200
-    assert mcp_detail.json()["secret_env"] == {"api_key": "MCP_API_KEY"}
+    assert "secret_env" not in mcp_detail.json()
+    assert mcp_detail.json()["secret_env_status"]["MCP_API_KEY"]["configured"] is False
     mcp_updated = client.put("/api/mcp/servers/operator-static", json={**mcp_payload, "name": "Operator Static"})
     assert mcp_updated.status_code == 200
     assert mcp_updated.json()["name"] == "Operator Static"
@@ -789,6 +883,160 @@ def test_server_api_auth_requires_configured_token(tmp_path: Path, monkeypatch: 
     assert authorized.json()["ok"] is True
 
 
+def test_api_plugin_install_enable_update_require_plugin_install_flag(tmp_path: Path, monkeypatch: Any) -> None:
+    from fastapi.testclient import TestClient
+
+    plugin_repo = tmp_path / "plugin-repo"
+    plugin_repo.mkdir()
+    (plugin_repo / "kestrel.plugin.json").write_text(
+        json.dumps(
+            {
+                "id": "api-blocked",
+                "name": "API Blocked",
+                "description": "Must not install without plugin enablement.",
+                "skills": [{"id": "hello", "description": "Hello.", "instructions": "Hello."}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_fetch(self: object, source: object, destination: Path, ref: str | None = None) -> str:
+        del self, source, ref
+        shutil.copytree(plugin_repo, destination)
+        return "e" * 40
+
+    monkeypatch.setattr("nested_memvid_agent.plugin_manager.GitPluginFetcher.fetch", fake_fetch)
+    config = AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        state_path=tmp_path / "state.db",
+        skills_dir=tmp_path / "skills",
+        plugins_dir=tmp_path / "plugins",
+        workspace=tmp_path,
+        allow_plugin_install=False,
+    )
+    state = AgentStateStore(config.state_path)
+    state.upsert_plugin(
+        {
+            "id": "existing",
+            "name": "Existing",
+            "description": "Existing plugin.",
+            "source_url": "https://github.com/owner/repo",
+            "commit_sha": "a" * 40,
+            "install_path": str(tmp_path / "plugins" / "existing"),
+            "manifest": {"id": "existing", "skills": [], "mcp_servers": []},
+            "capabilities": ["plugin"],
+            "enabled": False,
+            "risk_report": {"risk": "medium"},
+            "install_status": "installed",
+            "format": "kestrel",
+        }
+    )
+    client = TestClient(create_app(config))
+
+    install = client.post("/api/plugins/install", json={"source": "owner/repo"})
+    enable = client.post("/api/plugins/existing/enable")
+    update = client.post("/api/plugins/existing/update", json={})
+
+    assert install.status_code == 403
+    assert install.json()["detail"] == "plugin_install_disabled"
+    assert enable.status_code == 403
+    assert update.status_code == 403
+    assert not (tmp_path / "plugins" / "api-blocked").exists()
+    assert state.get_plugin("existing")["enabled"] is False
+
+
+def test_api_mcp_invoke_uses_unified_approval_gate(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    config = AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        state_path=tmp_path / "state.db",
+        skills_dir=tmp_path / "skills",
+        workspace=tmp_path,
+    )
+    client = TestClient(create_app(config))
+    add = client.post(
+        "/api/mcp/servers",
+        json={
+            "id": "static",
+            "transport": "stdio",
+            "enabled": True,
+            "tools": [{"name": "echo", "description": "Echo", "parameters": {"type": "object", "properties": {}}}],
+        },
+    )
+    assert add.status_code == 200
+
+    invoked = client.post("/api/mcp/servers/static/tools/echo/invoke", json={"arguments": {"message": "hello"}})
+
+    assert invoked.status_code == 200
+    assert invoked.json()["success"] is False
+    assert invoked.json()["error"] == "approval_required"
+
+
+def test_get_plugin_routes_do_not_materialize_extensions(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    install_path = tmp_path / "plugins" / "readonly"
+    install_path.mkdir(parents=True)
+    state = AgentStateStore(tmp_path / "state.db")
+    state.upsert_plugin(
+        {
+            "id": "readonly",
+            "name": "Readonly",
+            "description": "Readonly plugin.",
+            "source_url": "https://github.com/owner/readonly",
+            "commit_sha": "f" * 40,
+            "install_path": str(install_path),
+            "manifest": {
+                "id": "readonly",
+                "skills": [
+                    {
+                        "id": "hello",
+                        "namespaced_id": "plugin.readonly.hello",
+                        "name": "Hello",
+                        "description": "Hello.",
+                        "enabled": True,
+                        "manifest": {"id": "plugin.readonly.hello", "description": "Hello.", "runtime": {"type": "instruction"}},
+                        "instructions": "Hello.",
+                    }
+                ],
+                "mcp_servers": [],
+            },
+            "capabilities": ["skill"],
+            "enabled": True,
+            "risk_report": {"risk": "medium"},
+            "install_status": "installed",
+            "format": "kestrel",
+        }
+    )
+    config = AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        state_path=tmp_path / "state.db",
+        skills_dir=tmp_path / "skills",
+        plugins_dir=tmp_path / "plugins",
+        workspace=tmp_path,
+    )
+    client = TestClient(create_app(config))
+
+    assert client.get("/api/plugins").status_code == 200
+    assert client.get("/api/plugins/readonly").status_code == 200
+
+    with pytest.raises(KeyError):
+        state.get_skill("plugin.readonly.hello")
+
+
 def test_skill_discovery_exposes_nested_learning_skill(tmp_path: Path) -> None:
     state = AgentStateStore(tmp_path / "state.db")
     skill_dir = tmp_path / "skills" / "review"
@@ -853,6 +1101,27 @@ def test_skill_manifest_validation_records_provenance_and_rejects_invalid_skill(
     assert manager.tool_adapters()[0].spec.risk == "low"
 
 
+def test_skill_discovery_skips_symlinked_directories_outside_root(tmp_path: Path) -> None:
+    outside = tmp_path / "outside-skill"
+    outside.mkdir()
+    (outside / "skill.json").write_text(
+        json.dumps({"id": "outside", "name": "Outside", "description": "Outside skill.", "risk": "low"}),
+        encoding="utf-8",
+    )
+    (outside / "SKILL.md").write_text("Do not load through symlink.", encoding="utf-8")
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    (skills_root / "outside").symlink_to(outside, target_is_directory=True)
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = SkillManager(skills_root, state)
+
+    discovered = manager.discover()
+
+    assert discovered == []
+    with pytest.raises(KeyError):
+        state.get_skill("outside")
+
+
 def test_python_skill_runtime_executes_in_skill_directory(tmp_path: Path) -> None:
     state = AgentStateStore(tmp_path / "state.db")
     skill_dir = tmp_path / "skills" / "python-review"
@@ -879,7 +1148,26 @@ def test_python_skill_runtime_executes_in_skill_directory(tmp_path: Path) -> Non
     adapter = manager.tool_adapters()[0]
     memory = build_memory_system("memory", tmp_path / "memory")
 
-    result = adapter.run({"task": "scheduler output"}, ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path))
+    assert adapter.spec.risk == "high"
+    assert adapter.spec.requires_approval is True
+    registry = build_default_tools()
+    registry.register(adapter)
+    call = ToolCall(name=adapter.spec.name, arguments={"task": "scheduler output"}, id="python_skill")
+
+    blocked = registry.execute(call, ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path))
+    assert blocked.success is False
+    assert blocked.error == "tool_disabled"
+
+    result = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_executable_skills=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"python_skill"}),
+            approved_tool_call_arguments={"python_skill": {"task": "scheduler output"}},
+        ),
+    )
 
     assert result.success is True
     assert "skill saw scheduler output" in result.content
@@ -1025,6 +1313,54 @@ def test_full_agent_flow_blocks_approves_resumes_traces_and_capsules(tmp_path: P
     assert "run.completed" in event_types
     assert trace["run"]["status"] == "completed"
     assert (manager.config.memory_dir.parent / "runs" / run.run_id / "complete.mv2").exists()
+
+
+def test_approval_decision_cannot_replace_requested_arguments(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.config = AgentConfig(**{**manager.config.__dict__, "allow_shell": True})
+    manager.state.create_run(
+        run_id="run_changed_args",
+        message="approval argument change",
+        session_id="session",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+    approval = manager.state.create_approval(
+        approval_id="approval_changed_args",
+        run_id="run_changed_args",
+        tool_call_id="tool_shell",
+        tool_name="shell.run",
+        arguments={"command": ["echo", "safe"]},
+        risk="high",
+    )
+
+    with pytest.raises(ValueError, match="exact requested arguments"):
+        manager.decide_approval(
+            approval["approval_id"],
+            approved=True,
+            arguments={"command": ["echo", "changed"]},
+        )
+
+    assert manager.state.get_approval("approval_changed_args")["status"] == "pending"
+
+
+def test_manual_run_tool_invocation_uses_run_workspace(tmp_path: Path) -> None:
+    manager = _manager(tmp_path / "manager")
+    run_workspace = tmp_path / "run-workspace"
+    run_workspace.mkdir()
+    (run_workspace / "note.txt").write_text("run workspace only", encoding="utf-8")
+    run = manager.state.create_run(
+        run_id="run_workspace_tool",
+        message="manual tool",
+        session_id="session",
+        workspace=str(run_workspace),
+        model="mock",
+    )
+
+    result = manager.invoke_tool(tool_name="file.read", arguments={"path": "note.txt"}, run_id=run.run_id)
+
+    assert result.success is True
+    assert result.content == "run workspace only"
 
 
 def test_run_manager_creates_durable_child_plan_for_multi_step_goal(tmp_path: Path) -> None:

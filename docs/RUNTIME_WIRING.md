@@ -143,7 +143,7 @@ Examples of high-risk tools:
 
 `git.commit` never pushes. On repair branches, it also requires a current `repair.review` artifact tied to successful validation and the current diff hash.
 
-The plugin registry can fetch public GitHub repositories and materialize plugin-declared skills/MCP servers. CLI/API plugin installs are operator actions; agent-initiated `plugin.install` requires `NEST_AGENT_ALLOW_PLUGIN_INSTALL=true` or `--allow-plugin-install` plus exact-call approval, and installed plugins remain disabled unless explicitly enabled.
+The plugin registry can fetch public GitHub repositories and materialize plugin-declared skills/MCP servers. CLI/API plugin install, update, enable, and sync/materialization routes require `NEST_AGENT_ALLOW_PLUGIN_INSTALL=true` or `--allow-plugin-install`. Agent-initiated `plugin.install` uses the same enablement gate plus exact-call approval, and installed plugins remain disabled unless explicitly enabled.
 
 ## Memory Wiring
 
@@ -201,7 +201,7 @@ Worker isolation paths are controlled by `worker_worktree_dir` / `NEST_AGENT_WOR
 
 Plugins are stored under `.nest/plugins` by default and persisted in the `plugin_registry` table. The CLI exposes list/install/inspect/enable/disable/update/remove commands. Enabled plugins can materialize namespaced skills and MCP server records into the same registry surfaces used by native Kestrel skills and MCP servers.
 
-Plugin installation is a high-risk surface because it fetches repository content. Treat dependency isolation, install approval, and shared-runtime security review as remaining hardening work.
+Plugin installation is a high-risk surface because it fetches repository content. Manifest ID drift is rejected on update, plugin-provided MCP trust flags cannot downgrade the default approval policy, and read-only API routes do not materialize plugin state.
 
 ## MCP Wiring
 
@@ -215,6 +215,10 @@ MCP stdio servers use a managed lazy lifecycle:
 - disconnect/restart on request
 - tear down on config changes, delete, or shutdown
 
-Newly discovered MCP tools default to approval-by-default unless the server is explicitly configured to trust its manifest. Dangerous tool names or descriptions are promoted to high risk during vetting.
+Newly discovered MCP tools default to approval-by-default. Manifest `trusted` and `allow_autonomous` fields are ignored unless the operator explicitly configures `risk_policy=trust_manifest`; dangerous tool names or descriptions are promoted to high risk during vetting.
+
+Manual API MCP invocations route through the same tool registry as agent tool calls, so MCP approval and risk policies produce the same `approval_required`, `tool_disabled`, and exact-call approval behavior. MCP GET routes return stored state only; live health checks, discovery, and sync are POST actions.
+
+MCP `secret_env` values are redacted in API responses, included in configuration fingerprints, and resolved from `os.environ` only when launching a process. Raw secret-looking keys in MCP `env` are rejected.
 
 SSE and streamable HTTP transports share manager concepts but still need real fixtures and soak testing.

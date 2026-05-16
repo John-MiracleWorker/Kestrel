@@ -129,6 +129,60 @@ def test_agent_stops_on_direct_approval_required(tmp_path: Path) -> None:
     assert failures[0].metadata["frame_type"] == "failure_note"
 
 
+def test_agent_direct_approval_requires_exact_arguments(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    call = ToolCall(name="shell.run", arguments={"command": ["echo", "direct-exact"]}, id="direct_shell")
+    llm = MockLLMProvider(
+        [
+            LLMResponse(content="I will run the approved command.", tool_calls=(call,)),
+            LLMResponse(content="Tool finished."),
+        ]
+    )
+    agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=memory,
+            llm=llm,
+            tools=build_default_tools(),
+            config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs", allow_shell=True),
+        )
+    )
+
+    id_only = agent.chat(
+        "run approved command",
+        session_id="test",
+        approved_tool_call_ids=frozenset({"direct_shell"}),
+    )
+
+    assert id_only.stop_reason == "approval_required"
+    assert id_only.tool_executions[0].error == "approval_required"
+
+    exact_memory = build_memory_system("memory", tmp_path / "memory-exact")
+    exact_llm = MockLLMProvider(
+        [
+            LLMResponse(content="I will run the approved command.", tool_calls=(call,)),
+            LLMResponse(content="Tool finished."),
+        ]
+    )
+    exact_agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=exact_memory,
+            llm=exact_llm,
+            tools=build_default_tools(),
+            config=AgentConfig(memory_dir=tmp_path / "memory-exact", log_dir=tmp_path / "logs-exact", allow_shell=True),
+        )
+    )
+
+    exact = exact_agent.chat(
+        "run approved command",
+        session_id="test",
+        approved_tool_call_ids=frozenset({"direct_shell"}),
+        approved_tool_call_arguments={"direct_shell": {"command": ["echo", "direct-exact"]}},
+    )
+
+    assert exact.stop_reason == "complete"
+    assert exact.tool_executions[0].success is True
+
+
 def test_agent_streams_mock_tokens_without_losing_final_message(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     agent = NestedMV2Agent(

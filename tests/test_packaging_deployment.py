@@ -28,7 +28,13 @@ def test_dockerfile_keeps_safe_runtime_defaults() -> None:
     assert "NEST_AGENT_ALLOW_FILE_WRITE=false" in dockerfile
     assert "NEST_AGENT_ALLOW_POLICY_WRITES=false" in dockerfile
     assert "NEST_AGENT_ALLOW_CODEX_CLI=false" in dockerfile
+    assert "NEST_AGENT_ALLOW_PLUGIN_INSTALL=false" in dockerfile
+    assert "NEST_AGENT_ALLOW_EXECUTABLE_SKILLS=false" in dockerfile
+    assert "NEST_AGENT_ALLOW_MCP_NETWORK_ENDPOINTS=false" in dockerfile
+    assert "NEST_AGENT_REQUIRE_API_AUTH=true" in dockerfile
+    assert "NEST_AGENT_API_TOKEN" in dockerfile
     assert "--backend\", \"memvid\"" in dockerfile
+    assert "\"--require-api-auth\"" in dockerfile
 
 
 def test_compose_binds_localhost_and_persists_data_volume() -> None:
@@ -40,6 +46,12 @@ def test_compose_binds_localhost_and_persists_data_volume() -> None:
     assert 'NEST_AGENT_ALLOW_SHELL: "false"' in compose
     assert 'NEST_AGENT_ALLOW_FILE_WRITE: "false"' in compose
     assert 'NEST_AGENT_ALLOW_POLICY_WRITES: "false"' in compose
+    assert 'NEST_AGENT_ALLOW_PLUGIN_INSTALL: "false"' in compose
+    assert 'NEST_AGENT_ALLOW_EXECUTABLE_SKILLS: "false"' in compose
+    assert 'NEST_AGENT_ALLOW_MCP_NETWORK_ENDPOINTS: "false"' in compose
+    assert 'NEST_AGENT_REQUIRE_API_AUTH: "true"' in compose
+    assert "NEST_AGENT_API_TOKEN: ${NEST_AGENT_API_TOKEN:?Set NEST_AGENT_API_TOKEN for Kestrel API auth}" in compose
+    assert "--require-api-auth" in compose
     assert "env_file:" not in compose
 
 

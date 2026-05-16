@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import hashlib
+import ipaddress
 import json
+import os
 import threading
 import time
 from collections.abc import Coroutine
@@ -11,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import import_module
 from typing import Any, Literal, cast
+from urllib.parse import urlparse
 
 from .runtime_models import ToolCall, ToolExecution, ToolSpec
 from .state_store import AgentStateStore
@@ -41,14 +44,22 @@ class MCPServerConfig:
 class MCPManager:
     """Discovers and invokes MCP tools while owning live server sessions."""
 
-    def __init__(self, state: AgentStateStore, *, timeout_seconds: float = MCP_TIMEOUT_SECONDS) -> None:
+    def __init__(
+        self,
+        state: AgentStateStore,
+        *,
+        timeout_seconds: float = MCP_TIMEOUT_SECONDS,
+        allow_network_endpoints: bool = False,
+    ) -> None:
         self.state = state
         self.timeout_seconds = timeout_seconds
+        self.allow_network_endpoints = allow_network_endpoints
         self._lock = threading.RLock()
         self._sessions: dict[str, _MCPSessionWorker] = {}
 
     def add_server(self, payload: dict[str, Any]) -> dict[str, Any]:
         server = _normalize_server(payload)
+        _validate_server_endpoint(server, allow_network_endpoints=self.allow_network_endpoints)
         next_row = _server_to_dict(server)
         try:
             current_row = self.state.get_mcp_server(server.id)
@@ -408,7 +419,7 @@ def _session_context(server: MCPServerConfig) -> Any:
         params = client_mod.StdioServerParameters(
             command=server.command or "",
             args=list(server.args),
-            env=server.env or None,
+            env=_runtime_env(server) or None,
         )
         return _ClientSessionContext(stdio_mod.stdio_client(params))
     if server.transport == "streamable_http":
@@ -445,14 +456,22 @@ def _normalize_server(payload: dict[str, Any]) -> MCPServerConfig:
     transport = str(payload.get("transport", "stdio"))
     if transport == "http":
         transport = "streamable_http"
+    env = {str(k): str(v) for k, v in dict(payload.get("env", {})).items()}
+    secret_env = {str(k): str(v) for k, v in dict(payload.get("secret_env", {})).items()}
+    for key in env:
+        if _looks_secret(key):
+            raise ValueError(f"MCP secret-looking environment variable {key} must be configured via secret_env.")
+    for target, source in secret_env.items():
+        if not _valid_env_name(target) or not _valid_env_name(source):
+            raise ValueError("MCP secret_env keys and values must be environment variable names.")
     return MCPServerConfig(
         id=str(payload["id"]),
         name=str(payload.get("name") or payload["id"]),
         transport=transport,
         command=None if payload.get("command") is None else str(payload.get("command")),
         args=tuple(str(item) for item in payload.get("args", [])),
-        env={str(k): str(v) for k, v in dict(payload.get("env", {})).items()},
-        secret_env={str(k): str(v) for k, v in dict(payload.get("secret_env", {})).items()},
+        env=env,
+        secret_env=secret_env,
         url=None if payload.get("url") is None else str(payload.get("url")),
         enabled=bool(payload.get("enabled", True)),
         tools=tuple(dict(item) for item in payload.get("tools", [])),
@@ -552,7 +571,7 @@ def _normalize_sdk_tool(server: MCPServerConfig, tool: Any) -> dict[str, Any]:
 
 def _risk_fields(server: MCPServerConfig, tool: dict[str, Any]) -> tuple[RiskLevel, bool]:
     inferred = _infer_tool_risk(tool)
-    if server.risk_policy == MCP_TRUST_MANIFEST_POLICY or bool(tool.get("trusted") or tool.get("allow_autonomous")):
+    if server.risk_policy == MCP_TRUST_MANIFEST_POLICY:
         risk = _max_risk(_risk_level(tool.get("risk", "low")), inferred)
         return risk, bool(tool.get("requires_approval", risk in {"medium", "high"}))
     risk = _max_risk(_risk_level(tool.get("risk", "medium")), inferred)
@@ -596,7 +615,8 @@ def _max_risk(left: RiskLevel, right: RiskLevel) -> RiskLevel:
 
 
 def _vetting_for_server(server: MCPServerConfig, tools: list[dict[str, Any]]) -> dict[str, Any]:
-    secrets = sorted(key for key in (server.env or {}) if _looks_secret(key))
+    secret_refs = dict(server.secret_env or {})
+    secrets = sorted(set(secret_refs) | {key for key in (server.env or {}) if _looks_secret(key)})
     network_access = server.transport in {"sse", "streamable_http"} or bool(server.url)
     risk_reasons: list[str] = []
     if network_access:
@@ -615,6 +635,10 @@ def _vetting_for_server(server: MCPServerConfig, tools: list[dict[str, Any]]) ->
         "transport": server.transport,
         "network_access": network_access,
         "secrets_required": secrets,
+        "secret_env": {
+            target: {"source_env": source, "configured": bool(os.getenv(source, "").strip())}
+            for target, source in sorted(secret_refs.items())
+        },
         "risk_policy": server.risk_policy,
         "recommended_trust": recommended_trust,
         "risk_reasons": sorted(set(risk_reasons)),
@@ -634,6 +658,13 @@ def _vetting_for_server(server: MCPServerConfig, tools: list[dict[str, Any]]) ->
 def _looks_secret(name: str) -> bool:
     upper = name.upper()
     return any(marker in upper for marker in ("TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL"))
+
+
+def _valid_env_name(name: str) -> bool:
+    if not name:
+        return False
+    first = name[0]
+    return (first == "_" or first.isalpha()) and all(char == "_" or char.isalnum() for char in name)
 
 
 def _risk_level(value: object) -> RiskLevel:
@@ -670,11 +701,61 @@ def _config_fingerprint(row: dict[str, Any]) -> str:
         "command": row.get("command"),
         "args": list(row.get("args", [])),
         "env": dict(row.get("env", {})),
+        "secret_env": dict(row.get("secret_env", {})),
         "url": row.get("url"),
         "enabled": bool(row.get("enabled", True)),
         "risk_policy": _normalize_risk_policy(row.get("risk_policy", MCP_DEFAULT_RISK_POLICY)),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _runtime_env(server: MCPServerConfig) -> dict[str, str]:
+    env = dict(server.env or {})
+    for target, source in dict(server.secret_env or {}).items():
+        value = os.getenv(source, "")
+        if not value:
+            raise ValueError(f"Missing MCP secret environment variable: {source}")
+        env[target] = value
+    return env
+
+
+def _validate_server_endpoint(server: MCPServerConfig, *, allow_network_endpoints: bool) -> None:
+    if server.transport not in {"stdio", "sse", "streamable_http"}:
+        raise ValueError(f"Unsupported MCP transport: {server.transport}")
+    if server.transport == "stdio":
+        _validate_stdio_command(server)
+        return
+    if not allow_network_endpoints:
+        raise ValueError("MCP network endpoints are disabled. Enable allow_mcp_network_endpoints first.")
+    _validate_network_url(server.url or "")
+
+
+def _validate_stdio_command(server: MCPServerConfig) -> None:
+    if not server.command:
+        return
+    command_name = server.command.rsplit("/", 1)[-1].lower()
+    shell_names = {"sh", "bash", "zsh", "fish", "csh", "tcsh", "ksh", "dash", "pwsh", "powershell", "cmd"}
+    if command_name in shell_names:
+        raise ValueError("MCP stdio shell launchers are not allowed.")
+
+
+def _validate_network_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError("MCP network endpoints must use https URLs.")
+    if parsed.username or parsed.password:
+        raise ValueError("MCP endpoint URLs cannot include credentials.")
+    if parsed.fragment:
+        raise ValueError("MCP endpoint URLs cannot include fragments.")
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("MCP endpoint URL must include a host.")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return
+    if address.is_link_local or address.is_loopback or address.is_private or address.is_reserved or address.is_multicast:
+        raise ValueError("MCP endpoint URL host is not allowed by default.")
 
 
 def _tool_result_to_text(result: Any) -> str:

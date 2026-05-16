@@ -120,6 +120,7 @@ class PluginManager:
         ref: str | None = None,
         enable: bool = False,
         overwrite: bool = False,
+        expected_plugin_id: str | None = None,
     ) -> dict[str, Any]:
         parsed_source = parse_github_plugin_source(source)
         normalized_ref = _normalize_ref(ref)
@@ -129,6 +130,8 @@ class PluginManager:
             repo_path = Path(tmp_name) / "repo"
             commit_sha = self.fetcher.fetch(parsed_source, repo_path, normalized_ref)
             initial_manifest = load_plugin_manifest(repo_path)
+            if expected_plugin_id is not None and initial_manifest.id != expected_plugin_id:
+                raise PluginError(f"Plugin manifest id changed during update: expected {expected_plugin_id}, got {initial_manifest.id}")
             plugin_dir = _safe_plugin_dir(self.root, initial_manifest.id)
             if plugin_dir.exists() and not overwrite:
                 raise FileExistsError(f"Plugin already installed: {initial_manifest.id}")
@@ -172,6 +175,7 @@ class PluginManager:
             ref=ref or current.get("source_ref"),
             enable=bool(current["enabled"]),
             overwrite=True,
+            expected_plugin_id=plugin_id,
         )
 
     def list_plugins(self) -> list[dict[str, Any]]:
@@ -472,7 +476,7 @@ def _normalize_mcp_server(plugin_id: str, raw: dict[str, Any]) -> dict[str, Any]
     config.setdefault("args", [])
     config.setdefault("env", {})
     config.setdefault("enabled", True)
-    config.setdefault("risk_policy", "approval_by_default")
+    config["risk_policy"] = "approval_by_default"
     tools = _dict_list(config.get("tools", []), "mcp_servers.tools")
     config["tools"] = [_normalize_mcp_tool(namespaced_id, tool, str(config["risk_policy"])) for tool in tools]
     return {"id": server_id, "namespaced_id": namespaced_id, "config": config}
@@ -484,7 +488,7 @@ def _normalize_mcp_tool(server_id: str, raw: dict[str, Any], risk_policy: str) -
         raise PluginError("MCP tool names are required.")
     risk = _risk(str(raw.get("risk", "medium")))
     requires_approval = bool(raw.get("requires_approval", risk in {"medium", "high"}))
-    if risk_policy != "trust_manifest" and not bool(raw.get("trusted") or raw.get("allow_autonomous")):
+    if risk_policy != "trust_manifest":
         if risk == "low":
             risk = "medium"
         requires_approval = True

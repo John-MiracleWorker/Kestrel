@@ -23,8 +23,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     NEST_AGENT_ALLOW_FILE_WRITE=false \
     NEST_AGENT_ALLOW_POLICY_WRITES=false \
     NEST_AGENT_ALLOW_CODEX_CLI=false \
+    NEST_AGENT_ALLOW_PLUGIN_INSTALL=false \
+    NEST_AGENT_ALLOW_GIT_COMMIT=false \
+    NEST_AGENT_ALLOW_MEMORY_IMPORT=false \
+    NEST_AGENT_ALLOW_EXECUTABLE_SKILLS=false \
+    NEST_AGENT_ALLOW_MCP_NETWORK_ENDPOINTS=false \
     NEST_AGENT_ENABLE_AUTO_CONSOLIDATION=false \
-    NEST_AGENT_AUTO_CONSOLIDATION_DRY_RUN=true
+    NEST_AGENT_AUTO_CONSOLIDATION_DRY_RUN=true \
+    NEST_AGENT_REQUIRE_API_AUTH=true
 
 ARG INSTALL_EXTRAS=server,mcp,memvid,openai
 
@@ -47,6 +53,6 @@ VOLUME ["/data"]
 EXPOSE 8765
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=3).read()" || exit 1
+  CMD python -c "import os, urllib.request; token=os.environ.get('NEST_AGENT_API_TOKEN','').strip(); req=urllib.request.Request('http://127.0.0.1:8765/api/health', headers={'Authorization':'Bearer '+token}); urllib.request.urlopen(req, timeout=3).read()" || exit 1
 
-CMD ["nest-agent", "server", "--host", "0.0.0.0", "--port", "8765", "--backend", "memvid", "--memory-dir", "/data/memory", "--provider", "mock", "--log-dir", "/data/logs", "--state-path", "/data/state/agent.db", "--skills-dir", "/data/skills", "--mcp-config", "/data/config/mcp_servers.json", "--channels-config", "/data/config/channels.json"]
+CMD ["nest-agent", "server", "--host", "0.0.0.0", "--port", "8765", "--backend", "memvid", "--memory-dir", "/data/memory", "--provider", "mock", "--log-dir", "/data/logs", "--state-path", "/data/state/agent.db", "--skills-dir", "/data/skills", "--mcp-config", "/data/config/mcp_servers.json", "--channels-config", "/data/config/channels.json", "--require-api-auth"]

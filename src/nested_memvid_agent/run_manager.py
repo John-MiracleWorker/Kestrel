@@ -189,7 +189,10 @@ class RunManager:
     ) -> dict[str, Any]:
         approval = self.state.get_approval(approval_id)
         status = "approved" if approved else "denied"
-        approved_arguments = arguments or dict(approval["arguments"])
+        requested_arguments = dict(approval["arguments"])
+        if approved and arguments is not None and arguments != requested_arguments:
+            raise ValueError("Approval decisions must match the exact requested arguments.")
+        approved_arguments = requested_arguments
         decision = {"approved": approved, "arguments": approved_arguments}
         updated = self.state.decide_approval(approval_id, status=status, decision=decision)
         self.events.publish(updated["run_id"], f"approval.{status}", updated)
@@ -208,8 +211,17 @@ class RunManager:
         session_id: str = "manual",
         run_id: str | None = None,
     ) -> ToolExecution:
+        active_config = self.config
+        if run_id:
+            run = self.state.get_run(run_id)
+            active_config = replace(
+                self.config,
+                workspace=Path(run.workspace),
+                provider=run.provider,
+                model=run.model,
+            )
         registry = self.build_registry()
-        agent = build_agent(self.config, tools=registry)
+        agent = build_agent(active_config, tools=registry)
         try:
             call = ToolCall(name=tool_name, arguments=arguments)
             spans = SpanRecorder(state=self.state, events=self.events)

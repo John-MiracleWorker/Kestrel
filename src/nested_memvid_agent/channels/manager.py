@@ -122,7 +122,7 @@ class ChannelManager:
             channel = self.channels.get(channel_id)
             if channel is not None:
                 return channel
-            return ChannelEndpointConfig(id=channel_id, provider=provider)
+            raise ChannelPayloadError(f"Unknown channel: {channel_id}")
         channel = self.channels.get(provider)
         if channel is not None:
             return channel

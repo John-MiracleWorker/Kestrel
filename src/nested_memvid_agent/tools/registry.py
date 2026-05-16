@@ -35,10 +35,11 @@ class ToolRegistry:
         if getattr(tool, "needs_call_id", False):
             arguments.setdefault("_tool_call_id", call.id)
 
+        enabled, disabled_reason = _capability_enabled(tool, context)
+        if not enabled:
+            return _failure(call, content=disabled_reason, error="tool_disabled")
+
         if tool.spec.requires_approval and context.config.require_approval_for_high_risk_tools:
-            enabled, disabled_reason = _capability_enabled(tool, context)
-            if not enabled:
-                return _failure(call, content=disabled_reason, error="tool_disabled")
             if _is_exact_call_approved(call, arguments, context):
                 return _run_tool(tool, call, arguments, context)
             if context.approval_handler is not None:
@@ -53,6 +54,13 @@ class ToolRegistry:
 
 
 def _capability_enabled(tool: AgentTool, context: ToolContext) -> tuple[bool, str]:
+    if tool.spec.source == "skill" and "executable-skill" in tool.spec.capabilities:
+        if context.config.allow_executable_skills:
+            return True, ""
+        return (
+            False,
+            f"Tool {tool.spec.name} is disabled. Enable allow_executable_skills before requesting approval.",
+        )
     enablement_attr = _ENABLEMENT_BY_TOOL.get(tool.spec.name)
     if not enablement_attr:
         return True, ""
@@ -65,10 +73,16 @@ def _is_exact_call_approved(call: ToolCall, arguments: dict[str, Any], context: 
     if call.id not in context.approved_tool_call_ids:
         return False
     approved_arguments = context.approved_tool_call_arguments
-    if approved_arguments is None:
-        # Backwards-compatible path for internal callers that only track approved IDs.
+    if approved_arguments is None or call.id not in approved_arguments:
+        return False
+    return _arguments_match(approved_arguments[call.id], arguments)
+
+
+def _arguments_match(approved: dict[str, Any], actual: dict[str, Any]) -> bool:
+    if approved == actual:
         return True
-    return approved_arguments.get(call.id) == arguments
+    public_actual = {key: value for key, value in actual.items() if not str(key).startswith("_")}
+    return approved == public_actual
 
 
 def _run_tool(tool: AgentTool, call: ToolCall, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
@@ -111,4 +125,6 @@ _ENABLEMENT_BY_TOOL = {
     "codex.exec": "allow_codex_cli",
     "skill.install": "allow_file_write",
     "plugin.install": "allow_plugin_install",
+    "git.commit": "allow_git_commit",
+    "memory.import": "allow_memory_import",
 }
