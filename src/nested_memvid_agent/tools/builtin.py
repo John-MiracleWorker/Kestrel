@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -1198,6 +1199,66 @@ class RepairOrchestrateValidateTool(AgentTool):
             return self._result(call, success=False, content=str(exc), error="repair_orchestration_failed")
 
 
+class RepairReviewTool(AgentTool):
+    spec = ToolSpec(
+        name="repair.review",
+        description="Create a durable reviewer gate artifact for a validated repair diff before commit.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "validation": {"type": "object"},
+                "summary": {"type": "string"},
+                "risks": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["validation"],
+        },
+        risk="medium",
+        capabilities=("safe-repair", "review-gate"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        validation = arguments.get("validation")
+        if not isinstance(validation, dict):
+            return self._result(call, success=False, content="validation must be an object", error="bad_validation")
+        if validation.get("success") is not True:
+            return self._result(call, success=False, content="Repair review requires successful validation.", error="validation_not_successful")
+        try:
+            branch = _git_output(context.workspace, ["git", "branch", "--show-current"])
+            if not _is_repair_branch(branch):
+                return self._result(call, success=False, content=f"Not on a repair branch: {branch}", error="not_repair_branch", data={"branch": branch})
+            diff = _git_output(context.workspace, ["git", "diff", "HEAD", "--"])
+            if not diff.strip():
+                return self._result(call, success=False, content="No repair diff found to review.", error="empty_repair_diff", data={"branch": branch})
+            status = _git_output(context.workspace, ["git", "status", "--porcelain"])
+            head = _git_output(context.workspace, ["git", "rev-parse", "HEAD"])
+            diff_hash = hashlib.sha256(diff.encode("utf-8")).hexdigest()
+            review_id = f"repair_review_{diff_hash[:16]}"
+            risks_arg = arguments.get("risks")
+            risks = [str(item) for item in risks_arg] if isinstance(risks_arg, list) else []
+            payload = {
+                "review_id": review_id,
+                "branch": branch,
+                "head_sha": head,
+                "diff_hash": diff_hash,
+                "changed_files": _changed_files_from_status(status),
+                "summary": str(arguments.get("summary", "")).strip(),
+                "risks": risks,
+                "validation": validation,
+                "commit_gate": {
+                    "commit_allowed": True,
+                    "approval_required_before_commit": True,
+                    "reason": "Successful validation and reviewer artifact are present; commit still requires exact-call approval.",
+                },
+            }
+            review_dir = context.workspace / ".nest" / "repair_reviews"
+            review_dir.mkdir(parents=True, exist_ok=True)
+            (review_dir / f"{review_id}.json").write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="repair_review_failed")
+
+
 class RepairRollbackTool(AgentTool):
     spec = ToolSpec(
         name="repair.rollback",
@@ -1292,7 +1353,7 @@ class GitCommitTool(AgentTool):
         description="Commit already-staged workspace changes. Requires explicit approval and never pushes.",
         parameters={
             "type": "object",
-            "properties": {"message": {"type": "string"}},
+            "properties": {"message": {"type": "string"}, "repair_review_id": {"type": "string"}},
             "required": ["message"],
         },
         risk="high",
@@ -1305,6 +1366,19 @@ class GitCommitTool(AgentTool):
         if not message:
             return self._result(call, success=False, content="Missing commit message", error="missing_message")
         try:
+            repair_review_id: str | None = None
+            branch = _git_output(context.workspace, ["git", "branch", "--show-current"])
+            if _is_repair_branch(branch):
+                review_check = _validate_repair_review_gate(context.workspace, branch, str(arguments.get("repair_review_id", "")).strip())
+                if not review_check["ok"]:
+                    return self._result(
+                        call,
+                        success=False,
+                        content=str(review_check["content"]),
+                        error=str(review_check["error"]),
+                        data={key: value for key, value in review_check.items() if key not in {"ok", "content", "error"}},
+                    )
+                repair_review_id = str(review_check["review_id"])
             completed = subprocess.run(  # noqa: S603 - fixed executable and arguments
                 ["git", "commit", "-m", message],
                 cwd=context.workspace,
@@ -1314,11 +1388,14 @@ class GitCommitTool(AgentTool):
                 check=False,
             )
             content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            data: dict[str, Any] = {"returncode": completed.returncode}
+            if repair_review_id:
+                data["repair_review_id"] = repair_review_id
             return self._result(
                 call,
                 success=completed.returncode == 0,
                 content=content,
-                data={"returncode": completed.returncode},
+                data=data,
                 error=None if completed.returncode == 0 else "git_commit_failed",
             )
         except Exception as exc:  # noqa: BLE001
@@ -1716,6 +1793,7 @@ def build_default_tools() -> ToolRegistry:
     registry.register(RepairApplyPatchTool())
     registry.register(RepairValidateTool())
     registry.register(RepairOrchestrateValidateTool())
+    registry.register(RepairReviewTool())
     registry.register(RepairRollbackTool())
     registry.register(MemorySearchTool())
     registry.register(MemoryWriteTool())
@@ -1806,6 +1884,54 @@ def _git_output(workspace: Path, command: list[str]) -> str:
     if completed.returncode != 0:
         raise RuntimeError(f"git command failed ({completed.returncode}): {' '.join(command)}\n{completed.stderr}")
     return completed.stdout.strip()
+
+
+def _validate_repair_review_gate(workspace: Path, branch: str, review_id: str) -> dict[str, Any]:
+    if not review_id:
+        return {
+            "ok": False,
+            "error": "repair_review_required",
+            "content": "Repair branch commits require a repair_review_id from repair.review.",
+            "branch": branch,
+        }
+    if not review_id.startswith("repair_review_") or "/" in review_id or ".." in review_id:
+        return {"ok": False, "error": "invalid_repair_review_id", "content": f"Invalid repair_review_id: {review_id}", "branch": branch}
+    path = workspace / ".nest" / "repair_reviews" / f"{review_id}.json"
+    if not path.exists():
+        return {"ok": False, "error": "repair_review_not_found", "content": f"Repair review artifact not found: {review_id}", "branch": branch}
+    try:
+        review = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return {"ok": False, "error": "repair_review_invalid", "content": f"Repair review artifact is invalid JSON: {exc}", "branch": branch}
+    if review.get("branch") != branch:
+        return {
+            "ok": False,
+            "error": "repair_review_branch_mismatch",
+            "content": f"Repair review was created for {review.get('branch')}, not {branch}.",
+            "branch": branch,
+            "review_id": review_id,
+        }
+    if review.get("validation", {}).get("success") is not True or review.get("commit_gate", {}).get("commit_allowed") is not True:
+        return {
+            "ok": False,
+            "error": "repair_review_not_approved",
+            "content": "Repair review does not contain a successful validation commit gate.",
+            "branch": branch,
+            "review_id": review_id,
+        }
+    diff = _git_output(workspace, ["git", "diff", "HEAD", "--"])
+    diff_hash = hashlib.sha256(diff.encode("utf-8")).hexdigest()
+    if review.get("diff_hash") != diff_hash:
+        return {
+            "ok": False,
+            "error": "repair_review_stale",
+            "content": "Repair diff changed after review; run repair.review again before committing.",
+            "branch": branch,
+            "review_id": review_id,
+            "expected_diff_hash": review.get("diff_hash"),
+            "actual_diff_hash": diff_hash,
+        }
+    return {"ok": True, "review_id": review_id, "diff_hash": diff_hash, "branch": branch}
 
 
 def _changed_files_from_status(status: str) -> list[str]:

@@ -35,6 +35,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Provider failures emit structured `diagnosis.classified` events so traces can explain the failure category and suggested playbook.
 - Repair mutation tools are high-risk, approval-gated, covered by exact-call approvals, disabled unless the matching capability is enabled, and refuse non-repair branches for patch/validate/rollback operations.
 - Diagnosis-gated repair validation must remain approval-gated, refuse non-repair branches, recall similar lessons on failure, and block repeated validation retries when prior lessons exist unless a changed strategy is supplied.
+- Repair commits on repair branches now require a durable `repair.review` artifact tied to a successful validation result and the current diff hash; `git.commit` refuses repair-branch commits when the review is missing, stale, or for a different branch.
 - Terminal run records and approval decisions are replay-safe: late duplicate terminal transitions cannot overwrite original run results, and already-decided approval records cannot be flipped by replayed decisions.
 - Approval resume flow now records the executed tool result back onto the already-approved approval record without reopening or flipping the decision, and a full-flow smoke test covers run creation, approval blocking, exact-call approval, resume, tool result persistence, traces, task graph, and capsule creation together.
 
