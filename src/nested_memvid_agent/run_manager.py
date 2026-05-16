@@ -10,6 +10,7 @@ from uuid import uuid4
 from .agent import NestedMV2Agent
 from .app_factory import build_agent
 from .config import AgentConfig
+from .diagnosis import classify_failure
 from .event_bus import RunEventBus
 from .mcp_manager import MCPManager
 from .models import MemoryLayer
@@ -395,9 +396,28 @@ class RunManager:
                 )
             self.events.publish(run_id, "subagent.completed", asdict(updated))
         except Exception as exc:  # noqa: BLE001
-            updated = self.state.update_subagent_run(subagent_id, status="failed", error=f"{type(exc).__name__}: {exc}")
+            error_text = f"{type(exc).__name__}: {exc}"
+            updated = self.state.update_subagent_run(subagent_id, status="failed", error=error_text)
             if subagent.task_id:
-                self.state.update_task_node(subagent.task_id, status="failed", result={"error": updated.error})
+                diagnosis = classify_failure(error_text, source="subagent")
+                diagnosis_payload = diagnosis.to_payload()
+                failed_task = self.state.record_task_failure(
+                    subagent.task_id,
+                    failure_reason=error_text,
+                    diagnosis=diagnosis_payload,
+                    retry_strategy={
+                        "requires_changed_strategy": True,
+                        "retry_allowed": False,
+                        "reason": "subagent failure must be diagnosed and strategy must change before retry",
+                    },
+                    result={"error": updated.error},
+                )
+                self.events.publish(run_id, "task.failed", _task_payload(failed_task))
+                self.events.publish(
+                    run_id,
+                    "diagnosis.classified",
+                    {"task_id": subagent.task_id, "source": "subagent", **diagnosis_payload},
+                )
             self.events.publish(run_id, "subagent.failed", asdict(updated))
         finally:
             agent.close()

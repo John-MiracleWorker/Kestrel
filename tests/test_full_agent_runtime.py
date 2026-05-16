@@ -194,6 +194,75 @@ def test_state_store_persists_durable_task_graph_metadata(tmp_path: Path) -> Non
     assert updated.failure_reason == "test failure"
 
 
+def test_state_store_persists_task_diagnosis_and_retry_strategy(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    state.create_run(
+        run_id="run_retry",
+        message="fix failing tests",
+        session_id="session",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+    state.create_task_node(
+        task_id="task_retry",
+        run_id="run_retry",
+        title="Validate repair",
+        goal="Run targeted validation",
+        profile="reviewer",
+        status="running",
+    )
+
+    failed = state.record_task_failure(
+        "task_retry",
+        failure_reason="pytest failed",
+        diagnosis={"classification": "test_failure", "confidence": 0.9},
+        retry_strategy={
+            "previous_command": "pytest tests/test_widget.py -q",
+            "next_command": "pytest tests/test_widget.py::test_edge -q",
+            "changed_strategy": "narrow to failing edge case",
+            "retry_allowed": True,
+        },
+    )
+
+    assert failed.status == "failed"
+    assert failed.attempt_count == 1
+    assert failed.failure_reason == "pytest failed"
+    assert failed.diagnosis == {"classification": "test_failure", "confidence": 0.9}
+    assert failed.retry_strategy["previous_command"] == "pytest tests/test_widget.py -q"
+    assert failed.retry_strategy["changed_strategy"] == "narrow to failing edge case"
+
+
+def test_state_store_record_task_failure_increments_attempts_and_preserves_latest_strategy(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    state.create_run(
+        run_id="run_retry_twice",
+        message="fix failing tests",
+        session_id="session",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+    state.create_task_node(
+        task_id="task_retry_twice",
+        run_id="run_retry_twice",
+        title="Validate repair",
+        goal="Run targeted validation",
+        profile="reviewer",
+        status="running",
+        attempt_count=2,
+    )
+
+    failed = state.record_task_failure(
+        "task_retry_twice",
+        failure_reason="pytest still failed",
+        diagnosis={"classification": "test_failure"},
+        retry_strategy={"changed_strategy": "inspect fixture setup", "retry_allowed": False},
+    )
+
+    assert failed.attempt_count == 3
+    assert failed.diagnosis == {"classification": "test_failure"}
+    assert failed.retry_strategy == {"changed_strategy": "inspect fixture setup", "retry_allowed": False}
+
+
 def test_run_event_bus_redacts_persistent_and_live_payloads(tmp_path: Path) -> None:
     state = AgentStateStore(tmp_path / "state.db")
     state.create_run(
@@ -225,13 +294,14 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     state = AgentStateStore(db_path)
 
-    assert state.schema_version() == 5
+    assert state.schema_version() == 6
     with sqlite3.connect(db_path) as conn:
         run_indexes = {row[1] for row in conn.execute("PRAGMA index_list('runs')").fetchall()}
         approval_indexes = {row[1] for row in conn.execute("PRAGMA index_list('approval_requests')").fetchall()}
         step_indexes = {row[1] for row in conn.execute("PRAGMA index_list('run_steps')").fetchall()}
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
         mcp_columns = {row[1] for row in conn.execute("PRAGMA table_info('mcp_servers')").fetchall()}
+        task_columns = {row[1] for row in conn.execute("PRAGMA table_info('task_nodes')").fetchall()}
 
     assert "idx_runs_status" in run_indexes
     assert "idx_approval_requests_status" in approval_indexes
@@ -248,6 +318,7 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
         "last_latency_ms",
         "vetting_json",
     } <= mcp_columns
+    assert {"diagnosis_json", "retry_strategy_json"} <= task_columns
 
 
 def test_mcp_static_tools_enter_unified_registry(tmp_path: Path) -> None:
@@ -686,6 +757,48 @@ def test_run_manager_runs_mock_subagent(tmp_path: Path) -> None:
     assert "Mock response" in str(final["result"])
     graph = manager.task_graph(run.run_id)
     assert graph["subagents"]
+
+
+def test_run_manager_records_subagent_failure_diagnosis_on_task_node(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    run = manager.create_run(message="main run", session_id="session")
+    task = manager.state.create_task_node(
+        task_id="task_subagent_failure",
+        run_id=run.run_id,
+        title="Failing reviewer",
+        goal="Run failing validation",
+        profile="reviewer",
+        status="queued",
+        approved=True,
+    )
+    subagent = manager.state.create_subagent_run(
+        subagent_id="subagent_failure",
+        run_id=run.run_id,
+        task_id=task.task_id,
+        profile="reviewer",
+        goal="Run failing validation",
+        status="queued",
+    )
+
+    class FailingAgent:
+        def chat(self, *args: object, **kwargs: object) -> AgentTurnResult:
+            raise AssertionError("pytest failed for widget edge case")
+
+        def close(self) -> None:
+            return None
+
+    manager._build_agent = lambda config: FailingAgent()  # type: ignore[method-assign]
+
+    manager._run_subagent("thread", manager.config, subagent.subagent_id, run.run_id, "session")
+
+    failed_task = manager.state.get_task_node(task.task_id)
+    assert failed_task.status == "failed"
+    assert failed_task.attempt_count == 1
+    assert failed_task.diagnosis is not None
+    assert failed_task.diagnosis["classification"] == "test_failure"
+    assert failed_task.retry_strategy is not None
+    assert failed_task.retry_strategy["requires_changed_strategy"] is True
+    assert "AssertionError" in failed_task.failure_reason
 
 
 def test_run_manager_publishes_stream_tokens(tmp_path: Path) -> None:

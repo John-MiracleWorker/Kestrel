@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 
 
@@ -53,6 +53,8 @@ class TaskNodeRecord:
     acceptance_criteria: tuple[str, ...] = ()
     attempt_count: int = 0
     failure_reason: str = ""
+    diagnosis: dict[str, Any] | None = None
+    retry_strategy: dict[str, Any] | None = None
     created_at: str = ""
     updated_at: str = ""
 
@@ -443,6 +445,8 @@ class AgentStateStore:
         acceptance_criteria: list[str] | tuple[str, ...] = (),
         attempt_count: int = 0,
         failure_reason: str = "",
+        diagnosis: dict[str, Any] | None = None,
+        retry_strategy: dict[str, Any] | None = None,
     ) -> TaskNodeRecord:
         now = utc_now()
         with self._connect() as conn:
@@ -451,8 +455,9 @@ class AgentStateStore:
                 INSERT INTO task_nodes (
                     task_id, run_id, parent_id, title, goal, profile, status, approved,
                     plan_json, result_json, dependencies_json, required_tools_json, risk,
-                    acceptance_criteria_json, attempt_count, failure_reason, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+                    acceptance_criteria_json, attempt_count, failure_reason, diagnosis_json,
+                    retry_strategy_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -470,6 +475,8 @@ class AgentStateStore:
                     json.dumps(list(acceptance_criteria)),
                     attempt_count,
                     failure_reason,
+                    json.dumps(diagnosis) if diagnosis is not None else None,
+                    json.dumps(retry_strategy) if retry_strategy is not None else None,
                     now,
                     now,
                 ),
@@ -486,6 +493,26 @@ class AgentStateStore:
         with self._connect() as conn:
             conn.execute(f"UPDATE task_nodes SET {assignments} WHERE task_id = ?", values)
         return self.get_task_node(task_id)
+
+    def record_task_failure(
+        self,
+        task_id: str,
+        *,
+        failure_reason: str,
+        diagnosis: dict[str, Any] | None = None,
+        retry_strategy: dict[str, Any] | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> TaskNodeRecord:
+        task = self.get_task_node(task_id)
+        return self.update_task_node(
+            task_id,
+            status="failed",
+            attempt_count=task.attempt_count + 1,
+            failure_reason=failure_reason,
+            diagnosis=diagnosis or {},
+            retry_strategy=retry_strategy or {},
+            result=result or task.result,
+        )
 
     def get_task_node(self, task_id: str) -> TaskNodeRecord:
         with self._connect() as conn:
@@ -584,6 +611,9 @@ class AgentStateStore:
             if current < 5:
                 _apply_schema_v5(conn)
                 current = 5
+            if current < 6:
+                _apply_schema_v6(conn)
+                current = 6
             if current < SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported schema migration target: {current} -> {SCHEMA_VERSION}")
             if current == SCHEMA_VERSION:
@@ -771,6 +801,16 @@ def _apply_schema_v5(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE mcp_servers ADD COLUMN vetting_json TEXT NOT NULL DEFAULT '{}'")
 
 
+def _apply_schema_v6(conn: sqlite3.Connection) -> None:
+    existing = _columns(conn, "task_nodes")
+    for name, definition in {
+        "diagnosis_json": "TEXT",
+        "retry_strategy_json": "TEXT",
+    }.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE task_nodes ADD COLUMN {name} {definition}")
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -882,6 +922,8 @@ def _task_from_row(row: sqlite3.Row) -> TaskNodeRecord:
         acceptance_criteria=tuple(json.loads(str(_row_get(row, "acceptance_criteria_json", "[]") or "[]"))),
         attempt_count=int(str(_row_get(row, "attempt_count", 0) or 0)),
         failure_reason=str(_row_get(row, "failure_reason", "") or ""),
+        diagnosis=_json_or_none(_row_get(row, "diagnosis_json")),
+        retry_strategy=_json_or_none(_row_get(row, "retry_strategy_json")),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
@@ -929,4 +971,8 @@ def _task_column(field: str) -> str:
         return "required_tools_json"
     if field == "acceptance_criteria":
         return "acceptance_criteria_json"
+    if field == "diagnosis":
+        return "diagnosis_json"
+    if field == "retry_strategy":
+        return "retry_strategy_json"
     return field
