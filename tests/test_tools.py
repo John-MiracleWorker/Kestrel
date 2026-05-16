@@ -181,10 +181,58 @@ def test_tool_exception_returns_structured_failure(tmp_path: Path) -> None:
     assert "RuntimeError: boom" in result.content
 
 
+def test_diagnosis_classify_identifies_test_failures(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+
+    result = registry.execute(
+        ToolCall(
+            name="diagnosis.classify",
+            arguments={
+                "failure_text": "FAILED tests/test_api.py::test_login - AssertionError: expected 200 got 500",
+                "source": "pytest",
+            },
+        ),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.success
+    assert result.data["classification"] == "test_failure"
+    assert "test failure playbook" in result.content.lower()
+    assert result.data["playbook"]["next_actions"]
+
+
+def test_diagnosis_recall_searches_prior_failure_lessons(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    memory.put(
+        MemoryRecord(
+            layer=MemoryLayer.PROCEDURAL,
+            kind=MemoryKind.PROCEDURE,
+            title="ImportError repair recipe",
+            content="When pytest reports ModuleNotFoundError for nested_memvid_agent, set PYTHONPATH=src before retrying.",
+            confidence=0.9,
+        )
+    )
+    registry = build_default_tools()
+
+    result = registry.execute(
+        ToolCall(name="diagnosis.recall", arguments={"failure_text": "ModuleNotFoundError: nested_memvid_agent", "k": 3}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.success
+    assert result.data["classification"] == "missing_dependency"
+    assert result.data["hits"]
+    assert result.data["hits"][0]["layer"] == "procedural"
+    assert "PYTHONPATH=src" in result.content
+
+
 def test_default_registry_includes_spec_tools() -> None:
     registry = build_default_tools()
     names = {spec.name for spec in registry.specs()}
     assert {
+        "diagnosis.classify",
+        "diagnosis.recall",
         "repo.search",
         "repo.map",
         "patch.apply",

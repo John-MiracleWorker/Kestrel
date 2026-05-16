@@ -176,6 +176,9 @@ def test_provider_failure_is_structured_logged_and_remembered(tmp_path: Path) ->
     event_types = [event.type for event in event_log.tail(limit=50)]
     assert "llm.error" in event_types
     assert "runtime.error" in event_types
+    diagnosis_events = [event for event in event_log.tail(limit=50) if event.type == "diagnosis.classified"]
+    assert diagnosis_events
+    assert diagnosis_events[0].payload["classification"] == "provider_failure"
 
 
 class FailingProvider(LLMProvider):

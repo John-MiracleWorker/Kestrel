@@ -9,6 +9,7 @@ from uuid import uuid4
 from .config import AgentConfig
 from .context_compiler import ContextCompiler, ContextCompilerConfig
 from .context_frames import MV2ContextFrame
+from .diagnosis import classify_failure
 from .event_log import AgentEvent, JsonlEventLog
 from .layers import LayeredMemorySystem
 from .llm.base import LLMProvider, ProviderError
@@ -166,6 +167,15 @@ class NestedMV2Agent:
                 error = _provider_error_payload(exc)
                 self._event("llm.error", {"session_id": session, "run_id": active_run_id, **error})
                 self._event("runtime.error", {"session_id": session, "run_id": active_run_id, **error})
+                self._event(
+                    "diagnosis.classified",
+                    {
+                        "session_id": session,
+                        "run_id": active_run_id,
+                        "source": "provider",
+                        **classify_failure(f"Provider error {error['code']}: {error['message']}", source="provider").to_payload(),
+                    },
+                )
                 failure_frame_id = f"{turn_frame_id}_provider_error"
                 child_frame_ids.append(failure_frame_id)
                 memory_writes.append(
