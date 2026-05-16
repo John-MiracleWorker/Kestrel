@@ -6,10 +6,89 @@ from typing import Any
 import pytest
 
 from nested_memvid_agent.config import AgentConfig
+from nested_memvid_agent.llm.base import (
+    FallbackLLMProvider,
+    LLMProvider,
+    ProviderCapabilities,
+    ProviderError,
+)
 from nested_memvid_agent.llm.factory import build_llm_provider
 from nested_memvid_agent.llm.openai_compatible_provider import OpenAICompatibleProvider
 from nested_memvid_agent.llm.openai_provider import OpenAIResponsesProvider
-from nested_memvid_agent.runtime_models import ChatMessage, LLMOptions, ToolSpec
+from nested_memvid_agent.runtime_models import ChatMessage, LLMOptions, LLMResponse, ToolSpec
+
+
+class RecordingProvider(LLMProvider):
+    def __init__(self, response: LLMResponse | None = None, error: ProviderError | None = None) -> None:
+        self.response = response or LLMResponse(content="ok")
+        self.error = error
+        self.calls = 0
+
+    def generate(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec],
+        options: LLMOptions | None = None,
+    ) -> LLMResponse:
+        del messages, tools, options
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+def test_provider_capabilities_have_serializable_metadata() -> None:
+    caps = ProviderCapabilities(
+        name="test-provider",
+        supports_native_tools=True,
+        supports_streaming=True,
+        supports_json_mode=False,
+        supports_system_messages=True,
+        max_context_tokens=8192,
+        token_usage_available=True,
+    )
+
+    assert caps.to_payload() == {
+        "name": "test-provider",
+        "supports_native_tools": True,
+        "supports_streaming": True,
+        "supports_json_mode": False,
+        "supports_system_messages": True,
+        "max_context_tokens": 8192,
+        "token_usage_available": True,
+    }
+
+
+def test_fallback_provider_uses_secondary_for_retryable_primary_error() -> None:
+    primary = RecordingProvider(error=ProviderError("temporary", code="rate_limit", retryable=True))
+    secondary = RecordingProvider(response=LLMResponse(content="secondary ok"))
+    provider = FallbackLLMProvider(primary, secondary)
+
+    response = provider.generate([ChatMessage(role="user", content="hello")], tools=[])
+
+    assert response.content == "secondary ok"
+    assert primary.calls == 1
+    assert secondary.calls == 1
+    assert response.raw["provider_fallback"]["from_error_code"] == "rate_limit"
+
+
+def test_fallback_provider_does_not_fallback_for_non_retryable_error() -> None:
+    primary = RecordingProvider(error=ProviderError("bad key", code="auth_error", retryable=False))
+    secondary = RecordingProvider(response=LLMResponse(content="should not run"))
+    provider = FallbackLLMProvider(primary, secondary)
+
+    with pytest.raises(ProviderError):
+        provider.generate([ChatMessage(role="user", content="hello")], tools=[])
+
+    assert primary.calls == 1
+    assert secondary.calls == 0
+
+
+def test_factory_wraps_configured_fallback_provider() -> None:
+    provider = build_llm_provider(AgentConfig(provider="mock", fallback_provider="mock"))
+
+    assert isinstance(provider, FallbackLLMProvider)
+    assert provider.capabilities.name == "fallback:mock->mock"
 
 
 def test_factory_builds_openai_compatible_provider() -> None:

@@ -14,6 +14,10 @@ class AgentConfig:
     model: str = "mock"
     base_url: str | None = None
     api_key_env: str | None = None
+    fallback_provider: str | None = None
+    fallback_model: str | None = None
+    fallback_base_url: str | None = None
+    fallback_api_key_env: str | None = None
     timeout_seconds: int = 60
     max_retries: int = 2
     temperature: float = 0.2
@@ -53,6 +57,10 @@ class AgentConfig:
             model=os.getenv("NEST_AGENT_MODEL", "mock"),
             base_url=_env_str_or_none("NEST_AGENT_BASE_URL"),
             api_key_env=_env_str_or_none("NEST_AGENT_API_KEY_ENV"),
+            fallback_provider=_env_str_or_none("NEST_AGENT_FALLBACK_PROVIDER"),
+            fallback_model=_env_str_or_none("NEST_AGENT_FALLBACK_MODEL"),
+            fallback_base_url=_env_str_or_none("NEST_AGENT_FALLBACK_BASE_URL"),
+            fallback_api_key_env=_env_str_or_none("NEST_AGENT_FALLBACK_API_KEY_ENV"),
             timeout_seconds=_env_int("NEST_AGENT_TIMEOUT_SECONDS", 60),
             max_retries=_env_int("NEST_AGENT_MAX_RETRIES", 2),
             temperature=_env_float("NEST_AGENT_TEMPERATURE", 0.2),

@@ -5,7 +5,7 @@ from importlib import import_module
 from typing import Any
 
 from ..runtime_models import ChatMessage, LLMOptions, LLMResponse, ToolSpec
-from .base import LLMProvider, ProviderError
+from .base import LLMProvider, ProviderCapabilities, ProviderError
 from .parser import parse_agent_response
 
 
@@ -29,6 +29,17 @@ class OpenAICompatibleProvider(LLMProvider):
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.temperature = temperature
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            name="openai-compatible",
+            supports_native_tools=False,
+            supports_streaming=False,
+            supports_json_mode=True,
+            supports_system_messages=True,
+            token_usage_available=False,
+        )
 
     def generate(
         self,

@@ -14,6 +14,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - OpenAI Responses provider adapter using the portable JSON tool envelope.
 - OpenAI-compatible chat completions provider for local/model-server endpoints.
 - Codex CLI provider that can use local `codex exec` as the normal response engine.
+- Provider capability metadata is exposed on built-in providers, and a retryable-error fallback wrapper can route from a primary provider to a configured secondary provider.
 - Built-in tool registry with structured exception boundaries, timeout enforcement, and exact-call approval gates for shell, file writes, patch application, tests, and Codex CLI delegation.
 - Self-diagnosis primitives can classify common provider/tool/test/import/permission/MCP/sandbox failures and recall similar procedural/episodic failure lessons before retry.
 - Safe self-repair now has branch-isolated repair primitives: `repair.prepare`, `repair.status`, `repair.apply_patch`, `repair.validate`, and `repair.rollback`.
@@ -30,7 +31,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 
 ## Partially Implemented
 
-- Streaming: the runtime, CLI, and web run event bus accept stream events. Providers without native streaming use the compatibility wrapper around `generate()`.
+- Streaming/provider parity: the runtime, CLI, and web run event bus accept stream events, and provider capability metadata exists. Native streaming deltas and richer per-provider context/JSON-mode details still need hardening.
 - MCP: stdio live sessions are hardened and covered by a flag-gated integration test. SSE and streamable HTTP use the same manager path but still need real transport fixtures and production soak testing.
 - Skills: filesystem discovery and skill tool adapters exist. Sandboxed skill execution and richer skill manifests remain incomplete.
 - Codex CLI: `codex-cli` can drive responses and `codex.exec` is available as a high-risk approval-gated tool. It is not yet a branch-isolated autonomous repair loop.
@@ -43,7 +44,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 
 ## Not Done Yet
 
-- Native OpenAI function/tool calling and native streaming deltas.
+- Native OpenAI streaming deltas and broader provider integration tests for OpenRouter/Anthropic/Ollama-style adapters.
 - Full durable multi-step planner/executor/reviewer loop with resumable goals, retries, and review gates.
 - Production authentication, authorization, and user/session isolation for the UI/API.
 - Production webhook signature verification and secret rotation for external channel endpoints.
@@ -63,6 +64,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - `complete.mv2` is a run artifact under `.nest/runs/{run_id}/`, not a permanent memory layer.
 - SQLite is control-plane state only. It is not the retrieval memory substrate.
 - Mock-provider tests are the default fast validation path; Memvid integration remains behind `RUN_MEMVID_INTEGRATION=1`.
+- Provider fallback only runs for `ProviderError(retryable=True)` failures; non-retryable errors fail fast and preserve the original provider error.
 
 ## Validation Commands
 
