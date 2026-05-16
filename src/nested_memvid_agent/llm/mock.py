@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from ..runtime_models import ChatMessage, LLMOptions, LLMResponse, ToolCall, ToolSpec
-from .base import LLMProvider
+from .base import LLMProvider, ProviderCapabilities
 
 
 class MockLLMProvider(LLMProvider):
@@ -16,6 +16,17 @@ class MockLLMProvider(LLMProvider):
 
     def __init__(self, canned: Iterable[LLMResponse] | None = None) -> None:
         self._responses = list(canned or [])
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            name="mock",
+            supports_native_tools=True,
+            supports_streaming=True,
+            supports_json_mode=True,
+            supports_system_messages=True,
+            token_usage_available=False,
+        )
 
     def generate(
         self,

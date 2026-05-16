@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from ..runtime_models import ChatMessage, LLMOptions, LLMResponse, ToolSpec
-from .base import LLMProvider, ProviderError
+from .base import LLMProvider, ProviderCapabilities, ProviderError
 from .parser import parse_agent_response
 
 
@@ -33,6 +33,17 @@ class CodexCLIProvider(LLMProvider):
         self.profile = profile
         self.skip_git_repo_check = skip_git_repo_check
         self.ephemeral = ephemeral
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            name="codex-cli",
+            supports_native_tools=False,
+            supports_streaming=False,
+            supports_json_mode=True,
+            supports_system_messages=True,
+            token_usage_available=False,
+        )
 
     def generate(
         self,
