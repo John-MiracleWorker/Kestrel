@@ -15,6 +15,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - OpenAI-compatible chat completions provider for local/model-server endpoints.
 - Codex CLI provider that can use local `codex exec` as the normal response engine.
 - Built-in tool registry with structured exception boundaries, timeout enforcement, and exact-call approval gates for shell, file writes, patch application, tests, and Codex CLI delegation.
+- Self-diagnosis primitives can classify common provider/tool/test/import/permission/MCP/sandbox failures and recall similar procedural/episodic failure lessons before retry.
 - Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry, and memory search.
 - Multi-channel ingress for Telegram Bot API updates, Discord message/interaction-shaped payloads, and generic/custom webhooks, with CLI and API routes.
 - SQLite state store for runs, run steps, approvals, MCP servers, skills, task nodes, and subagent runs, now initialized through schema version `4`.
@@ -23,6 +24,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - MCP server records now track health metadata, tool counts, capabilities, last sync/seen/call/error timestamps, session state, failure counts, and latency.
 - MCP stdio servers now have a managed lazy session lifecycle with connect/disconnect/restart/health API routes, bounded operation timeouts, config-change teardown, and approval-by-default tool risk normalization.
 - First task-graph and subagent run records exist, with durable task metadata, deterministic starter plan decomposition, in-process planner/worker/reviewer profiles, and UI/API surfaces.
+- Provider failures emit structured `diagnosis.classified` events so traces can explain the failure category and suggested playbook.
 
 ## Partially Implemented
 
@@ -31,6 +33,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Skills: filesystem discovery and skill tool adapters exist. Sandboxed skill execution and richer skill manifests remain incomplete.
 - Codex CLI: `codex-cli` can drive responses and `codex.exec` is available as a high-risk approval-gated tool. It is not yet a branch-isolated autonomous repair loop.
 - Consolidation: capsule extraction and Nested Learning decisions exist, but auto-consolidation remains disabled by default and validation loops are still basic.
+- Self-diagnosis: first-pass classification and memory recall tools exist. A full executor retry gate that forces changed strategy before every retry is still incomplete.
 - Self-modification: the runtime can record validated self-improvement signals and policy candidates, but code changes and policy writes still require explicit gates.
 - Subagents: local subagent runs can be queued and tracked. True branch/worktree isolation and Codex-backed worker fan-out are still next steps.
 - Channels: inbound normalization and dry-run reply payloads are implemented. Production bot identity verification, Discord Gateway reads, and channel-specific rate-limit handling still need hardening.
