@@ -10,6 +10,7 @@ from .app_factory import build_agent
 from .channels import ChannelManager, ChannelPayloadError
 from .config import AgentConfig
 from .event_bus import RunEventBus
+from .event_log import JsonlEventLog
 from .mcp_manager import MCPManager
 from .models import MemoryLayer, RetrievalQuery
 from .run_manager import RunManager
@@ -192,6 +193,10 @@ def create_app(config: AgentConfig | None = None) -> Any:
     def list_runs() -> list[dict[str, object]]:
         return runs.list_runs()
 
+    @app.get("/api/sessions")  # type: ignore[untyped-decorator]
+    def list_sessions() -> list[dict[str, object]]:
+        return runs.list_sessions()
+
     @app.get("/api/runs/{run_id}")  # type: ignore[untyped-decorator]
     def get_run(run_id: str) -> dict[str, object]:
         try:
@@ -240,6 +245,18 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 events.unsubscribe(run_id, subscriber)
 
         return StreamingResponse(stream(), media_type="text/event-stream")
+
+    @app.get("/api/runs/{run_id}/trace")  # type: ignore[untyped-decorator]
+    def run_trace(run_id: str, limit: int = 1000) -> dict[str, object]:
+        try:
+            return runs.run_trace(run_id, limit=_bounded_limit(limit, default=1000, maximum=5000))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/logs")  # type: ignore[untyped-decorator]
+    def logs(limit: int = 100) -> list[dict[str, object]]:
+        event_log = JsonlEventLog(active_config.log_dir / "events.jsonl")
+        return [asdict(event) for event in event_log.tail(limit=_bounded_limit(limit, default=100, maximum=500))]
 
     @app.get("/api/tools")  # type: ignore[untyped-decorator]
     def list_tools() -> list[dict[str, object]]:
@@ -386,12 +403,15 @@ def create_app(config: AgentConfig | None = None) -> Any:
         result: dict[str, object] = invoke_tool(f"skill.{skill_id}.run", request)
         return result
 
-    @app.post("/api/memory/search")  # type: ignore[untyped-decorator]
-    def search_memory(request: MemorySearchRequest) -> list[dict[str, object]]:
+    def _search_memory(query: str, layers: list[str] | None = None, k: int = 8) -> list[dict[str, object]]:
+        if k < 1 or k > 50:
+            raise HTTPException(status_code=400, detail="k must be between 1 and 50")
         agent = build_agent(active_config, tools=runs.build_registry())
         try:
-            layers = tuple(MemoryLayer(layer) for layer in request.layers) if request.layers else tuple(MemoryLayer)
-            hits = agent.memory.retrieve(RetrievalQuery(query=request.query, layers=layers, k_per_layer=request.k))
+            selected_layers = tuple(MemoryLayer(layer) for layer in layers) if layers else tuple(MemoryLayer)
+            hits = agent.memory.retrieve(
+                RetrievalQuery(query=query, layers=selected_layers, k_per_layer=k)
+            )
             return [
                 {
                     "layer": hit.record.layer.value,
@@ -401,10 +421,20 @@ def create_app(config: AgentConfig | None = None) -> Any:
                     "snippet": hit.snippet or hit.record.content[:500],
                     "record_id": hit.record.id,
                 }
-                for hit in hits[: request.k]
+                for hit in hits[:k]
             ]
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         finally:
             agent.close()
+
+    @app.get("/api/memory/search")  # type: ignore[untyped-decorator]
+    def search_memory_get(query: str, layers: str | None = None, k: int = 8) -> list[dict[str, object]]:
+        return _search_memory(query=query, layers=_csv_layers(layers), k=k)
+
+    @app.post("/api/memory/search")  # type: ignore[untyped-decorator]
+    def search_memory(request: MemorySearchRequest) -> list[dict[str, object]]:
+        return _search_memory(query=request.query, layers=request.layers, k=request.k)
 
     @app.get("/api/memory/verify")  # type: ignore[untyped-decorator]
     def verify_memory() -> dict[str, bool]:
@@ -451,6 +481,30 @@ def create_app(config: AgentConfig | None = None) -> Any:
         arguments = request.model_dump(exclude_none=True)
         execution = runs.invoke_tool(tool_name="context.expand", arguments=arguments, session_id="api")
         return _tool_response_payload(execution)
+
+    @app.get("/api/context")  # type: ignore[untyped-decorator]
+    def get_context(
+        query: str,
+        token_budget: int | None = None,
+        layers: str | None = None,
+        expand_raw: bool = False,
+        include_telemetry: bool = True,
+    ) -> dict[str, object]:
+        arguments: dict[str, object] = {
+            "query": query,
+            "expand_raw": expand_raw,
+            "include_telemetry": include_telemetry,
+        }
+        if token_budget is not None:
+            arguments["token_budget"] = token_budget
+        parsed_layers = _csv_layers(layers)
+        if parsed_layers is not None:
+            arguments["layers"] = parsed_layers
+        execution = runs.invoke_tool(tool_name="context.pack", arguments=arguments, session_id="api")
+        payload = _tool_response_payload(execution)
+        if not execution.success:
+            raise HTTPException(status_code=400, detail=payload)
+        return payload
 
     @app.post("/api/capsules/{run_id}/summarize")  # type: ignore[untyped-decorator]
     def summarize_capsule(run_id: str, request: CapsuleSummarizeAPIRequest) -> dict[str, object]:
@@ -499,6 +553,18 @@ def create_app(config: AgentConfig | None = None) -> Any:
             return FileResponse(web_dist / "index.html")
 
     return app
+
+
+def _csv_layers(value: str | None) -> list[str] | None:
+    if value is None or not value.strip():
+        return None
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _bounded_limit(value: int, *, default: int, maximum: int) -> int:
+    if value < 1:
+        return default
+    return min(value, maximum)
 
 
 def _tool_response_payload(execution: Any) -> dict[str, object]:

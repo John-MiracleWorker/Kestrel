@@ -65,7 +65,7 @@ def from_memory_record(record: MemoryRecord, frame_type: str = "raw_chunk") -> M
     """Build a context frame from the canonical memory record shape."""
 
     metadata = dict(record.metadata)
-    resolved_frame_type = str(metadata.get("frame_type") or frame_type)
+    resolved_frame_type = str(metadata.get("frame_type") or default_frame_type_for_memory(record.kind, record.layer, fallback=frame_type))
     frame_id = str(metadata.get("frame_id") or record.id)
     return MV2ContextFrame(
         id=frame_id,
@@ -142,6 +142,27 @@ def estimate_tokens(text: str, model_hint: str | None = None) -> int:
 
 def content_hash_for(text: str) -> str:
     return sha256(text.encode("utf-8")).hexdigest()
+
+
+def default_frame_type_for_memory(
+    kind: MemoryKind,
+    layer: MemoryLayer,
+    *,
+    fallback: str = "raw_chunk",
+) -> str:
+    if kind == MemoryKind.CORRECTION:
+        return "correction"
+    if kind == MemoryKind.FAILURE:
+        return "failure_note"
+    if kind == MemoryKind.PROCEDURE or layer == MemoryLayer.PROCEDURAL:
+        return "skill_card"
+    if kind == MemoryKind.SUMMARY:
+        return "session_summary" if layer == MemoryLayer.EPISODIC else "section_summary"
+    if kind == MemoryKind.FACT or layer == MemoryLayer.SEMANTIC:
+        return "section_summary"
+    if layer == MemoryLayer.POLICY:
+        return "trace_stub"
+    return fallback
 
 
 def _bounded(value: float, name: str) -> float:

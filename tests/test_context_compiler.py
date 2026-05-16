@@ -39,3 +39,25 @@ def test_context_compiler_respects_total_budget(tmp_path: Path) -> None:
     compiled = ContextCompiler(memory, config=ContextCompilerConfig(total_budget_chars=500)).compile("auth")
     assert compiled.total_chars <= 540
     assert "TRUNCATED_BY_CONTEXT_COMPILER" in compiled.prompt
+
+
+def test_context_compiler_uses_pack_token_budget_before_char_ceiling(tmp_path: Path) -> None:
+    memory = LayeredMemorySystem.from_backend_factory(tmp_path, InMemoryBackend)
+    memory.put(
+        MemoryRecord(
+            title="Long pack memory",
+            content="packbudget " + ("long content " * 1000),
+            layer=MemoryLayer.SEMANTIC,
+            kind=MemoryKind.FACT,
+            confidence=0.9,
+            metadata={"frame_type": "section_summary"},
+        )
+    )
+
+    compiled = ContextCompiler(
+        memory,
+        config=ContextCompilerConfig(total_budget_chars=20_000, context_pack_token_budget=180),
+    ).compile("packbudget")
+
+    assert "TRUNCATED_BY_CONTEXT_PACKER" in compiled.prompt
+    assert "TRUNCATED_BY_CONTEXT_COMPILER" not in compiled.prompt

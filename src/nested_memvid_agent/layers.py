@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .backends.base import MemoryBackend
+from .context_frames import MV2ContextFrame, to_memory_record
 from .models import MemoryHit, MemoryLayer, MemoryRecord, RetrievalQuery
 
 
@@ -127,6 +128,20 @@ class LayeredMemorySystem:
                 f"{spec.min_write_confidence:.2f}"
             )
         return self.backends[record.layer].put(record)
+
+    def put_frame(self, frame: MV2ContextFrame) -> str:
+        spec = self.specs[frame.layer]
+        if frame.confidence < spec.min_write_confidence:
+            raise ValueError(
+                f"Frame confidence {frame.confidence:.2f} is below {frame.layer} write threshold "
+                f"{spec.min_write_confidence:.2f}"
+            )
+        backend = self.backends[frame.layer]
+        put_frame = getattr(backend, "put_frame", None)
+        if callable(put_frame):
+            result = put_frame(frame)
+            return str(result)
+        return backend.put(to_memory_record(frame))
 
     def retrieve(self, query: RetrievalQuery) -> list[MemoryHit]:
         hits: list[MemoryHit] = []

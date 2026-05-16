@@ -132,6 +132,7 @@ class CompiledContext:
     hits: tuple[MemoryHit, ...]
     total_chars: int
     budget_chars: int
+    warnings: tuple[str, ...] = ()
 
 
 def _bounded(value: float, name: str) -> float:

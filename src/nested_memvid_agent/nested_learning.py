@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from .context_frames import default_frame_type_for_memory
 from .models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord
 
 LearningAction = Literal["reject", "write", "promote"]
@@ -212,11 +213,13 @@ class NestedLearningKernel:
         return self.decide(signal, action="promote")
 
     def to_memory_record(self, signal: LearningSignal, decision: LearningDecision) -> MemoryRecord:
-        if decision.target_layer is None:
+        target_layer = decision.target_layer
+        if target_layer is None:
             raise ValueError("Cannot create memory record from rejected learning decision")
         evidence = [EvidenceRef(source=signal.source, locator=signal.locator, quote=decision.reason)]
         metadata = {
             **(signal.metadata or {}),
+            "frame_type": default_frame_type_for_memory(decision.target_kind, target_layer),
             "nested_learning": {
                 "context_flow": decision.flow.to_metadata(),
                 "optimizer_trace": decision.optimizer_trace.to_metadata(),
@@ -230,7 +233,7 @@ class NestedLearningKernel:
         return MemoryRecord(
             title=signal.title,
             content=signal.content,
-            layer=decision.target_layer,
+            layer=target_layer,
             kind=decision.target_kind,
             tags=dict(signal.tags or {}),
             metadata=metadata,

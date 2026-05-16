@@ -17,6 +17,13 @@ class ToolRegistry:
         return [tool.spec for tool in self._tools.values()]
 
     def execute(self, call: ToolCall, context: ToolContext) -> ToolExecution:
+        if not isinstance(call.arguments, dict):
+            return ToolExecution(
+                call=call,
+                success=False,
+                content=f"Tool {call.name} arguments must be a JSON object.",
+                error="invalid_tool_arguments",
+            )
         tool = self._tools.get(call.name)
         if tool is None:
             return ToolExecution(
@@ -50,5 +57,6 @@ _ENABLEMENT_BY_TOOL = {
     "patch.apply": "allow_file_write",
     "shell.run": "allow_shell",
     "test.run": "allow_shell",
+    "lint.run": "allow_shell",
     "codex.exec": "allow_codex_cli",
 }

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from .context_frames import default_frame_type_for_memory
 from .models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord
 from .nested_learning import ContextFlow, NestedLearningKernel, OptimizerTrace
 
@@ -66,6 +67,7 @@ class Consolidator:
             tags={**src.tags, "promoted_from": src.layer.value},
             metadata={
                 **src.metadata,
+                "frame_type": default_frame_type_for_memory(_target_kind(src.kind, candidate.target_layer), candidate.target_layer),
                 "source_record_ids": [src.id],
                 "source_layer": src.layer.value,
                 "destination_layer": candidate.target_layer.value,

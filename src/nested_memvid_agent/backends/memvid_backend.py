@@ -6,7 +6,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
-from ..context_frames import MV2ContextFrame, to_memory_record
+from ..context_frames import MV2ContextFrame, default_frame_type_for_memory, to_memory_record
 from ..models import MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
 from .base import MemoryBackend
 
@@ -48,11 +48,21 @@ class MemvidBackend(MemoryBackend):
             kwargs: dict[str, Any] = {}
             if self.read_only:
                 kwargs["read_only"] = True
-            self.mem = use("basic", str(self.path), **kwargs)
+            try:
+                self.mem = use("basic", str(self.path), **kwargs)
+            except TypeError:
+                if not self.read_only:
+                    raise
+                self.mem = use("basic", str(self.path))
+            except Exception as exc:  # noqa: BLE001 - backend boundary reports corrupt/unreadable memory
+                raise RuntimeError(f"Failed to open existing Memvid memory {self.path}: {exc}") from exc
         else:
             if self.read_only:
                 raise FileNotFoundError(f"Cannot open missing memory read-only: {self.path}")
-            self.mem = create(str(self.path), enable_vec=self.enable_vec, enable_lex=self.enable_lex)
+            try:
+                self.mem = create(str(self.path), enable_vec=self.enable_vec, enable_lex=self.enable_lex)
+            except Exception as exc:  # noqa: BLE001 - backend boundary maps SDK failures
+                raise RuntimeError(f"Failed to create Memvid memory {self.path}: {exc}") from exc
 
     def put(self, record: MemoryRecord) -> str:
         mem = self._require_mem()
@@ -246,9 +256,9 @@ def _metadata_from_embedded_text(text: str) -> dict[str, Any]:
         if value is not None and value != "null":
             metadata[key] = value
     for key in ("confidence", "importance", "nested_confidence", "nested_importance"):
-        value = _number_value(text, key)
-        if value is not None:
-            metadata[key] = value
+        number_value = _number_value(text, key)
+        if number_value is not None:
+            metadata[key] = number_value
     token_count = _int_value(text, "token_count")
     if token_count is not None:
         metadata["token_count"] = token_count
@@ -330,7 +340,7 @@ def _context_metadata_for_record(record: MemoryRecord) -> dict[str, Any]:
         trace = nested_learning.get("optimizer_trace")
         if isinstance(trace, dict):
             optimizer_trace = trace
-    frame_type = str(metadata.get("frame_type") or "raw_chunk")
+    frame_type = str(metadata.get("frame_type") or default_frame_type_for_memory(record.kind, record.layer))
     frame_id = str(metadata.get("frame_id") or record.id)
     return {
         "mv2_ctx_version": metadata.get("mv2_ctx_version", "0.1"),

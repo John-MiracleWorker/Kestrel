@@ -3,14 +3,16 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from .config import AgentConfig
 from .context_compiler import ContextCompiler, ContextCompilerConfig
+from .context_frames import MV2ContextFrame
 from .event_log import AgentEvent, JsonlEventLog
 from .layers import LayeredMemorySystem
 from .llm.base import LLMProvider, ProviderError
-from .models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord
+from .models import MemoryKind, MemoryLayer
 from .runtime_models import (
     AgentTurnResult,
     ChatMessage,
@@ -46,7 +48,14 @@ class NestedMV2Agent:
         self.tools = deps.tools
         self.config = deps.config
         self.event_log = deps.event_log
-        self.compiler = ContextCompiler(self.memory, config=ContextCompilerConfig(total_budget_chars=deps.config.context_budget_chars))
+        self.compiler = ContextCompiler(
+            self.memory,
+            config=ContextCompilerConfig(
+                total_budget_chars=deps.config.context_budget_chars,
+                context_pack_token_budget=deps.config.context_pack_token_budget,
+                expand_raw=deps.config.context_pack_expand_raw,
+            ),
+        )
         self.system_prompt = _load_system_prompt()
 
     def chat(
@@ -61,30 +70,74 @@ class NestedMV2Agent:
         source: TurnSource | None = None,
     ) -> AgentTurnResult:
         session = session_id or f"session_{uuid4().hex}"
+        active_run_id = run_id or f"run_{uuid4().hex}"
+        turn_frame_id = f"turn_{uuid4().hex}"
+        summary_frame_id = f"{turn_frame_id}_summary"
+        user_frame_id = f"{turn_frame_id}_user"
+        child_frame_ids = [user_frame_id]
         memory_writes: list[str] = []
         executions: list[ToolExecution] = []
+        tool_frame_index = 0
+        error: dict[str, Any] | None = None
 
         self._event(
             "turn.start",
             {
                 "session_id": session,
+                "run_id": active_run_id,
                 "user_message": user_message,
                 "source": source.to_public_dict() if source is not None else None,
             },
         )
         memory_writes.append(
-            self._write_memory(
+            self._write_frame(
                 layer=MemoryLayer.WORKING,
                 kind=MemoryKind.OBSERVATION,
                 title="User message",
                 content=user_message,
+                frame_type="raw_chunk",
+                frame_id=user_frame_id,
                 confidence=0.6,
                 session_id=session,
+                parent_ids=(summary_frame_id,),
+                source_uri=f"agent_runtime://sessions/{session}/turns/{turn_frame_id}/user",
+                source_span={"role": "user"},
                 source=source,
+                channel_evidence=True,
             )
         )
+        if _looks_like_correction(user_message):
+            correction_frame_id = f"{turn_frame_id}_correction"
+            child_frame_ids.append(correction_frame_id)
+            memory_writes.append(
+                self._write_frame(
+                    layer=MemoryLayer.WORKING,
+                    kind=MemoryKind.CORRECTION,
+                    title="User correction",
+                    content=user_message,
+                    frame_type="correction",
+                    frame_id=correction_frame_id,
+                    confidence=0.68,
+                    session_id=session,
+                    parent_ids=(summary_frame_id,),
+                    source_uri=f"agent_runtime://sessions/{session}/turns/{turn_frame_id}/correction",
+                    source_span={"role": "user", "classification": "correction"},
+                    source=source,
+                    channel_evidence=True,
+                )
+            )
 
         compiled = self.compiler.compile(objective=user_message, query=user_message)
+        self._event(
+            "context.compile",
+            {
+                "session_id": session,
+                "run_id": active_run_id,
+                "context_chars": compiled.total_chars,
+                "hits": len(compiled.hits),
+                "warnings": compiled.warnings,
+            },
+        )
         tool_block = "\n\n".join(spec.to_prompt_block() for spec in self.tools.specs())
         messages = [
             ChatMessage(role="system", content=self.system_prompt),
@@ -96,7 +149,56 @@ class NestedMV2Agent:
         final_content = ""
         stop_reason = "complete"
         for round_index in range(self.config.max_tool_rounds + 1):
-            response = self._generate_response(messages, self.tools.specs(), stream_handler)
+            self._event(
+                "llm.request",
+                {
+                    "session_id": session,
+                    "run_id": active_run_id,
+                    "round_index": round_index,
+                    "message_count": len(messages),
+                    "tool_count": len(self.tools.specs()),
+                    "stream": self.config.stream,
+                },
+            )
+            try:
+                response = self._generate_response(messages, self.tools.specs(), stream_handler)
+            except ProviderError as exc:
+                error = _provider_error_payload(exc)
+                self._event("llm.error", {"session_id": session, "run_id": active_run_id, **error})
+                self._event("runtime.error", {"session_id": session, "run_id": active_run_id, **error})
+                failure_frame_id = f"{turn_frame_id}_provider_error"
+                child_frame_ids.append(failure_frame_id)
+                memory_writes.append(
+                    self._write_frame(
+                        layer=MemoryLayer.WORKING,
+                        kind=MemoryKind.FAILURE,
+                        title="Provider failure",
+                        content=f"{error['code']}: {error['message']}",
+                        frame_type="failure_note",
+                        frame_id=failure_frame_id,
+                        confidence=0.72,
+                        session_id=session,
+                        parent_ids=(summary_frame_id,),
+                        source_uri=f"provider://{self.config.provider}/{self.config.model}",
+                        source_span={"round_index": round_index, "retryable": error["retryable"]},
+                        source=source,
+                    )
+                )
+                final_content = f"Provider error ({error['code']}): {error['message']}"
+                stop_reason = "provider_error"
+                break
+            self._event(
+                "llm.response",
+                {
+                    "session_id": session,
+                    "run_id": active_run_id,
+                    "round_index": round_index,
+                    "content_chars": len(response.content),
+                    "tool_calls": len(response.tool_calls),
+                    "finish_reason": response.finish_reason,
+                    "usage": response.usage,
+                },
+            )
             if not response.tool_calls:
                 final_content = response.content
                 break
@@ -114,21 +216,58 @@ class NestedMV2Agent:
                 workspace=self.config.workspace,
                 event_log=self.event_log,
                 session_id=session,
-                run_id=run_id,
+                run_id=active_run_id,
                 approval_handler=approval_handler,
                 approved_tool_call_ids=approved_tool_call_ids,
             )
             approval_pending = False
             for call in response.tool_calls:
+                self._event(
+                    "tool.request",
+                    {
+                        "session_id": session,
+                        "run_id": active_run_id,
+                        "tool": call.name,
+                        "tool_call_id": call.id,
+                    },
+                )
+                if call.id in approved_tool_call_ids:
+                    self._event(
+                        "approval.resolved",
+                        {
+                            "session_id": session,
+                            "run_id": active_run_id,
+                            "tool": call.name,
+                            "tool_call_id": call.id,
+                            "decision": "approved",
+                        },
+                    )
                 execution = self.tools.execute(call, tool_context)
                 executions.append(execution)
+                tool_frame_index += 1
+                tool_frame_id = f"{turn_frame_id}_tool_{tool_frame_index}"
+                child_frame_ids.append(tool_frame_id)
                 self._event(
                     "tool.execute",
                     {
                         "session_id": session,
+                        "run_id": active_run_id,
                         "tool": call.name,
+                        "tool_call_id": call.id,
                         "success": execution.success,
                         "error": execution.error,
+                    },
+                )
+                self._event(
+                    "tool.result" if execution.success else "tool.error",
+                    {
+                        "session_id": session,
+                        "run_id": active_run_id,
+                        "tool": call.name,
+                        "tool_call_id": call.id,
+                        "success": execution.success,
+                        "error": execution.error,
+                        "content_chars": len(execution.content),
                     },
                 )
                 messages.append(
@@ -140,17 +279,37 @@ class NestedMV2Agent:
                     )
                 )
                 memory_writes.append(
-                    self._write_memory(
+                    self._write_frame(
                         layer=MemoryLayer.WORKING,
                         kind=MemoryKind.EVENT if execution.success else MemoryKind.FAILURE,
                         title=f"Tool result: {call.name}",
                         content=execution.content[:4000],
+                        frame_type="raw_chunk" if execution.success else "failure_note",
+                        frame_id=tool_frame_id,
                         confidence=0.7 if execution.success else 0.65,
                         session_id=session,
+                        parent_ids=(summary_frame_id,),
+                        source_uri=f"tool://{call.name}/{call.id}",
+                        source_span={
+                            "round_index": round_index,
+                            "tool_call_id": call.id,
+                            "success": execution.success,
+                            "error": execution.error,
+                        },
                         source=source,
                     )
                 )
                 if execution.error in {"approval_pending", "approval_required"}:
+                    self._event(
+                        "approval.required",
+                        {
+                            "session_id": session,
+                            "run_id": active_run_id,
+                            "tool": call.name,
+                            "tool_call_id": call.id,
+                            "error": execution.error,
+                        },
+                    )
                     approval_pending = True
             if approval_pending:
                 final_content = response.content or "Waiting for approval before continuing."
@@ -164,13 +323,18 @@ class NestedMV2Agent:
             stop_reason = "empty_response"
 
         memory_writes.append(
-            self._write_memory(
+            self._write_frame(
                 layer=MemoryLayer.EPISODIC,
                 kind=MemoryKind.SUMMARY,
                 title="Conversation turn summary",
                 content=f"User: {user_message}\nAssistant: {final_content}",
+                frame_type="session_summary",
+                frame_id=summary_frame_id,
                 confidence=0.7,
                 session_id=session,
+                child_ids=tuple(child_frame_ids),
+                source_uri=f"agent_runtime://sessions/{session}/turns/{turn_frame_id}",
+                source_span={"role": "turn_summary"},
                 source=source,
             )
         )
@@ -179,6 +343,7 @@ class NestedMV2Agent:
             "turn.end",
             {
                 "session_id": session,
+                "run_id": active_run_id,
                 "stop_reason": stop_reason,
                 "memory_writes": memory_writes,
                 "tools": len(executions),
@@ -194,6 +359,8 @@ class NestedMV2Agent:
             stop_reason=stop_reason,
             context_prompt=compiled.prompt,
             source=source,
+            run_id=active_run_id,
+            error=error,
         )
 
     def _generate_response(
@@ -248,20 +415,27 @@ class NestedMV2Agent:
     def close(self) -> None:
         self.memory.close_all()
 
-    def _write_memory(
+    def _write_frame(
         self,
         *,
         layer: MemoryLayer,
         kind: MemoryKind,
         title: str,
         content: str,
+        frame_type: str,
+        frame_id: str,
         confidence: float,
         session_id: str,
+        parent_ids: tuple[str, ...] = (),
+        child_ids: tuple[str, ...] = (),
+        source_uri: str | None = None,
+        source_span: dict[str, object] | None = None,
         source: TurnSource | None = None,
+        channel_evidence: bool = False,
     ) -> str:
         metadata: dict[str, object] = {"session_id": session_id}
-        evidence_source = "agent_runtime"
-        evidence_locator = session_id
+        resolved_source_uri = source_uri
+        resolved_source_span = dict(source_span or {})
         if source is not None:
             metadata.update(
                 {
@@ -276,19 +450,42 @@ class NestedMV2Agent:
                 metadata["channel_message_id"] = source.message_id
             if source.metadata:
                 metadata["channel_metadata"] = source.metadata
-            evidence_source = f"channel:{source.channel}"
-            evidence_locator = source.message_id or source.conversation_id
-        record = MemoryRecord(
+            if channel_evidence:
+                metadata["runtime_source_uri"] = source_uri
+                resolved_source_uri = f"channel:{source.channel}"
+                resolved_source_span = {
+                    **resolved_source_span,
+                    "path": source.message_id or source.conversation_id,
+                }
+        frame = MV2ContextFrame(
+            id=frame_id,
+            frame_type=frame_type,
             layer=layer,
             kind=kind,
             title=title,
             content=content,
             confidence=confidence,
             importance=0.5,
+            parent_ids=parent_ids,
+            child_ids=child_ids,
+            source_uri=resolved_source_uri,
+            source_span=resolved_source_span,
             metadata=metadata,
-            evidence=[EvidenceRef(source=evidence_source, locator=evidence_locator)],
+            tags={"session_id": session_id},
         )
-        return self.memory.put(record)
+        record_id = self.memory.put_frame(frame)
+        self._event(
+            "memory.write",
+            {
+                "record_id": record_id,
+                "frame_id": frame_id,
+                "layer": layer.value,
+                "kind": kind.value,
+                "title": title,
+                "session_id": session_id,
+            },
+        )
+        return record_id
 
     def _event(self, event_type: str, payload: dict[str, object]) -> None:
         if self.event_log is not None:
@@ -298,3 +495,20 @@ class NestedMV2Agent:
 def _load_system_prompt() -> str:
     path = Path(__file__).parent / "prompts" / "system_prompt.md"
     return path.read_text()
+
+
+def _looks_like_correction(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    markers = ("correction:", "correcting myself", "actually,", "i meant", "remember:")
+    return any(marker in lowered for marker in markers) and "correction" in lowered
+
+
+def _provider_error_payload(exc: ProviderError) -> dict[str, object]:
+    return {
+        "message": str(exc),
+        "code": exc.code,
+        "retryable": exc.retryable,
+        "error_type": type(exc).__name__,
+    }

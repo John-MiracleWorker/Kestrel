@@ -3,11 +3,10 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any
 
 from .context_frames import MV2ContextFrame, estimate_tokens, from_memory_record
 from .layers import LayeredMemorySystem
-from .models import MemoryHit, MemoryLayer, RetrievalQuery
+from .models import MemoryHit, MemoryLayer, MemoryRecord, RetrievalQuery
 
 SUMMARY_FRAME_TYPES = frozenset({"section_summary", "task_summary", "session_summary", "skill_card", "trace_stub"})
 RAW_FRAME_TYPES = frozenset({"raw_chunk"})
@@ -138,9 +137,17 @@ class ContextPacker:
             )
             if frame.frame_type in RAW_FRAME_TYPES and not should_expand:
                 continue
-            content = hit.snippet or frame.content
+            expand_children = frame.frame_type in SUMMARY_FRAME_TYPES and (request.expand_raw or needs_exact)
+            content = frame.content if should_expand or expand_children else hit.snippet or frame.content
+            reason = _selection_reason(frame, should_expand)
             if should_expand:
                 content = frame.content
+            if expand_children:
+                expanded_content = self._content_with_child_frames(frame, content)
+                if expanded_content != content:
+                    content = expanded_content
+                    should_expand = True
+                    reason = "expanded_child_frames"
             token_count = max(estimate_tokens(content, request.model_hint), frame.token_count if should_expand else 0)
             if used_tokens + token_count > request.token_budget:
                 if selected:
@@ -154,7 +161,7 @@ class ContextPacker:
                     content=content,
                     token_count=token_count,
                     expanded=should_expand,
-                    reason=_selection_reason(frame, should_expand),
+                    reason=reason,
                 )
             )
             used_tokens += token_count
@@ -223,6 +230,37 @@ class ContextPacker:
         layer_rank = len(PACK_LAYER_ORDER) - PACK_LAYER_ORDER.index(frame.layer) if frame.layer in PACK_LAYER_ORDER else 0
         frame_rank = 3 if frame.frame_type in SUMMARY_FRAME_TYPES else 2 if frame.frame_type in CORRECTION_FRAME_TYPES else 1
         return (layer_rank, frame_rank, hit.score, frame.importance, frame.confidence)
+
+    def _content_with_child_frames(self, frame: MV2ContextFrame, base_content: str) -> str:
+        if not frame.child_ids:
+            return base_content
+        lines = [base_content.strip()]
+        for child_id in frame.child_ids:
+            record = self._find_record_by_id(child_id)
+            if record is None:
+                continue
+            child_frame = from_memory_record(record)
+            if child_frame.frame_type not in RAW_FRAME_TYPES | CORRECTION_FRAME_TYPES:
+                continue
+            lines.append(f"[expanded child {child_frame.id} / {child_frame.frame_type}]\n{record.content.strip()}")
+        return "\n\n".join(line for line in lines if line)
+
+    def _find_record_by_id(self, lookup_id: str) -> MemoryRecord | None:
+        for backend in self.memory.backends.values():
+            records = getattr(backend, "records", None)
+            if isinstance(records, list):
+                for raw_record in records:
+                    if not isinstance(raw_record, MemoryRecord):
+                        continue
+                    record = raw_record
+                    metadata = getattr(record, "metadata", {})
+                    if record.id == lookup_id or str(metadata.get("frame_id", "")) == lookup_id:
+                        return record
+        for hit in self.memory.retrieve(RetrievalQuery(query=lookup_id, k_per_layer=5)):
+            metadata = hit.record.metadata
+            if hit.record.id == lookup_id or str(metadata.get("frame_id", "")) == lookup_id or hit.frame_id == lookup_id:
+                return hit.record
+        return None
 
 
 def _frame_for(hit: MemoryHit) -> MV2ContextFrame:

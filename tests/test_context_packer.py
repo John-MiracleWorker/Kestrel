@@ -122,6 +122,35 @@ def test_packer_expands_raw_only_when_requested(tmp_path: Path) -> None:
     assert "Beta raw" in [item.frame.title for item in expanded.items]
 
 
+def test_packer_expands_child_raw_frame_from_summary_link(tmp_path: Path) -> None:
+    memory = _memory(tmp_path)
+    _put(
+        memory,
+        "Gamma summary",
+        "gamma summary points to exact supporting evidence.",
+        MemoryLayer.EPISODIC,
+        frame_type="task_summary",
+        metadata={"frame_id": "summary_gamma", "child_ids": ["raw_gamma_child"]},
+    )
+    _put(
+        memory,
+        "Gamma raw child",
+        "unique child payload with command output that does not repeat the query term.",
+        MemoryLayer.EPISODIC,
+        frame_type="raw_chunk",
+        metadata={"frame_id": "raw_gamma_child", "parent_ids": ["summary_gamma"]},
+    )
+
+    compact = ContextPacker(memory).pack(ContextPackRequest(objective="gamma", query="gamma"))
+    expanded = ContextPacker(memory).pack(
+        ContextPackRequest(objective="gamma", query="gamma", expand_raw=True)
+    )
+
+    assert "unique child payload" not in compact.prompt
+    assert "unique child payload" in expanded.prompt
+    assert expanded.items[0].reason == "expanded_child_frames"
+
+
 def _memory(tmp_path: Path) -> LayeredMemorySystem:
     return LayeredMemorySystem.from_backend_factory(tmp_path, InMemoryBackend)
 

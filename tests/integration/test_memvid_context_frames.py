@@ -8,6 +8,7 @@ import pytest
 from nested_memvid_agent.backends.memvid_backend import MemvidBackend
 from nested_memvid_agent.context_frames import MV2ContextFrame
 from nested_memvid_agent.models import MemoryKind, MemoryLayer
+from nested_memvid_agent.task_capsule import summarize_run_capsule, write_run_capsule
 
 pytestmark = pytest.mark.skipif(
     os.getenv("RUN_MEMVID_INTEGRATION") != "1",
@@ -51,3 +52,26 @@ def test_memvid_context_frame_metadata_round_trip(tmp_path: Path) -> None:
         assert metadata["source_span"] == {"line": 7}
     finally:
         reopened.close()
+
+
+def test_memvid_capsule_summary_reads_complete_mv2(tmp_path: Path) -> None:
+    path = write_run_capsule(
+        runs_dir=tmp_path / "runs",
+        run_id="run_memvid_capsule",
+        objective="Summarize real Memvid capsule.",
+        final_response="Capsule sealed.",
+        backend="memvid",
+        candidate_facts=("Memvid capsule summaries query complete.mv2 directly.",),
+        candidate_procedures=("Repeated validated capsule steps become skill cards.",),
+    )
+
+    summary = summarize_run_capsule(
+        runs_dir=tmp_path / "runs",
+        run_id="run_memvid_capsule",
+        backend="memvid",
+    )
+
+    assert path.name == "complete.mv2"
+    assert not path.with_suffix(".memory.json").exists()
+    assert "Objective: Summarize real Memvid capsule." in summary.summary
+    assert {signal.kind for signal in summary.learning_signals} >= {MemoryKind.FACT, MemoryKind.PROCEDURE}

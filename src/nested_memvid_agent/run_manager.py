@@ -12,11 +12,11 @@ from .app_factory import build_agent
 from .config import AgentConfig
 from .event_bus import RunEventBus
 from .mcp_manager import MCPManager
+from .models import MemoryLayer
+from .nested_learning import NestedLearningKernel
 from .runtime_models import AgentTurnResult, LLMStreamEvent, ToolCall, ToolExecution, ToolSpec
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore, RunRecord
-from .models import MemoryLayer
-from .nested_learning import NestedLearningKernel
 from .task_capsule import summarize_run_capsule, write_turn_capsule
 from .tools.base import ToolContext
 from .tools.builtin import build_default_tools
@@ -86,6 +86,37 @@ class RunManager:
 
     def list_runs(self) -> list[dict[str, Any]]:
         return [asdict(run) for run in self.state.list_runs()]
+
+    def list_sessions(self) -> list[dict[str, Any]]:
+        return self.state.list_sessions()
+
+    def run_trace(self, run_id: str, *, limit: int = 1000) -> dict[str, Any]:
+        run = self.get_run(run_id)
+        timeline = self.state.list_run_steps(run_id, limit=limit)
+        traces: dict[str, list[dict[str, Any]]] = {
+            "tool": [],
+            "memory": [],
+            "context": [],
+            "provider": [],
+            "approval": [],
+            "error": [],
+            "lifecycle": [],
+        }
+        for event in timeline:
+            traces[_trace_category(event)].append(event)
+        first = timeline[0]["created_at"] if timeline else None
+        last = timeline[-1]["created_at"] if timeline else None
+        return {
+            "run": run,
+            "summary": {
+                "event_count": len(timeline),
+                "first_event_at": first,
+                "last_event_at": last,
+                "trace_counts": {name: len(events) for name, events in traces.items()},
+            },
+            "timeline": timeline,
+            "traces": traces,
+        }
 
     def cancel_run(self, run_id: str) -> dict[str, Any]:
         with self._lock:
@@ -205,6 +236,7 @@ class RunManager:
                 approval_handler=self._approval_handler,
                 stream_handler=self._stream_handler(run_id),
             )
+            self._publish_turn_observability(run_id, result)
             for execution in result.tool_executions:
                 self.events.publish(run_id, "tool.executed", _execution_payload(execution))
                 self.events.publish(
@@ -280,6 +312,7 @@ class RunManager:
                 approval_handler=self._approval_handler,
                 stream_handler=self._stream_handler(run_id),
             )
+            self._publish_turn_observability(run_id, result)
             status = "blocked" if result.stop_reason == "approval_required" else "completed"
             self.state.update_run(
                 run_id,
@@ -322,6 +355,7 @@ class RunManager:
                 approval_handler=self._approval_handler,
                 stream_handler=self._stream_handler(run_id),
             )
+            self._publish_turn_observability(run_id, result)
             updated = self.state.update_subagent_run(subagent_id, status="completed", result=result.assistant_message)
             if subagent.task_id:
                 self.state.update_task_node(
@@ -423,6 +457,30 @@ class RunManager:
         except Exception as exc:  # noqa: BLE001
             self.events.publish(run_id, "capsule.failed", {"error": f"{type(exc).__name__}: {exc}"})
 
+    def _publish_turn_observability(self, run_id: str, result: AgentTurnResult) -> None:
+        self.events.publish(
+            run_id,
+            "context.compile",
+            {
+                "session_id": result.session_id,
+                "context_chars": result.context_chars,
+                "stop_reason": result.stop_reason,
+            },
+        )
+        for index, record_id in enumerate(result.memory_writes, start=1):
+            self.events.publish(
+                run_id,
+                "memory.write",
+                {
+                    "session_id": result.session_id,
+                    "record_id": record_id,
+                    "index": index,
+                    "total": len(result.memory_writes),
+                },
+            )
+        if result.error:
+            self.events.publish(run_id, "runtime.error", result.error)
+
     def _start_thread(self, run_id: str, target: Any, *args: Any) -> None:
         thread = Thread(target=target, args=(run_id, *args), daemon=True)
         with self._lock:
@@ -456,6 +514,34 @@ def _turn_payload(result: AgentTurnResult) -> dict[str, Any]:
         "memory_writes": list(result.memory_writes),
         "stop_reason": result.stop_reason,
     }
+
+
+def _trace_category(event: dict[str, Any]) -> str:
+    event_type = str(event.get("type", ""))
+    payload = event.get("payload", {})
+    if event_type.startswith("tool.") or event_type == "assistant.tool_call":
+        return "tool"
+    if event_type.startswith("memory.") or _payload_has_key(payload, "memory_writes"):
+        return "memory"
+    if event_type.startswith("context."):
+        return "context"
+    if event_type.startswith("assistant.") or event_type.startswith("llm.") or event_type.startswith("provider."):
+        return "provider"
+    if event_type.startswith("approval."):
+        return "approval"
+    if event_type.endswith(".failed") or event_type.endswith(".error") or _payload_has_key(payload, "error"):
+        return "error"
+    return "lifecycle"
+
+
+def _payload_has_key(value: Any, key: str) -> bool:
+    if isinstance(value, dict):
+        if key in value:
+            return True
+        return any(_payload_has_key(item, key) for item in value.values())
+    if isinstance(value, list | tuple):
+        return any(_payload_has_key(item, key) for item in value)
+    return False
 
 
 def _capsule_decisions(

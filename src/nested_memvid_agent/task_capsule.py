@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from .backends.base import MemoryBackend
 from .backends.in_memory import InMemoryBackend
@@ -142,7 +141,7 @@ def write_run_capsule(
     writer = TaskCapsuleWriter(runs_dir=runs_dir, run_id=run_id, backend=backend)
     writer.open()
     try:
-        payload = {
+        payload: dict[str, object] = {
             "run_id": run_id,
             "objective": objective,
             "selected_context": selected_context,
@@ -159,26 +158,29 @@ def write_run_capsule(
             "candidate_corrections": list(candidate_corrections),
             "candidate_policy_items": list(candidate_policy_items),
         }
-        writer.put_record(
-            MemoryRecord(
+        candidate_frames = _candidate_frames(payload)
+        writer.put_frame(
+            MV2ContextFrame(
                 id=f"capsule_{run_id}",
+                frame_type="task_summary",
                 title=f"Run capsule: {run_id}",
                 content=json.dumps(payload, indent=2),
                 layer=MemoryLayer.EPISODIC,
                 kind=MemoryKind.SUMMARY,
+                child_ids=tuple(frame.id for frame in candidate_frames),
+                source_uri=f"mv2://runs/{run_id}/complete.mv2",
+                source_span={"section": "root"},
                 confidence=0.8,
                 importance=0.8,
                 tags={"capsule": "complete", "run_id": run_id},
                 metadata={
                     "run_id": run_id,
-                    "frame_type": "task_summary",
-                    "mv2_ctx_version": "0.1",
                     "capsule_artifact": True,
                     "permanent_layer": False,
                 },
             )
         )
-        for frame in _candidate_frames(payload):
+        for frame in candidate_frames:
             writer.put_frame(frame)
         writer.seal()
         return writer.path
@@ -223,7 +225,7 @@ def summarize_run_capsule(
     backend: str = "memory",
 ) -> TaskCapsuleSummary:
     path = runs_dir / run_id / "complete.mv2"
-    capsule = _load_capsule_payload(path)
+    capsule = _load_capsule_payload(path, backend=backend)
     objective = str(capsule.get("objective", ""))
     signals = extract_learning_signals(capsule, run_id=run_id)
     summary = _summary_text(capsule, signals)
@@ -233,8 +235,8 @@ def summarize_run_capsule(
         capsule_path=path,
         summary=summary,
         learning_signals=tuple(signals),
-        candidate_policy_items=tuple(str(item) for item in capsule.get("candidate_policy_items", []) if str(item).strip()),
-        unresolved_questions=tuple(str(item) for item in capsule.get("unresolved_questions", []) if str(item).strip()),
+        candidate_policy_items=tuple(_string_list(capsule.get("candidate_policy_items"))),
+        unresolved_questions=tuple(_string_list(capsule.get("unresolved_questions"))),
         telemetry={
             "backend": backend,
             "is_permanent_layer": False,
@@ -247,6 +249,22 @@ def summarize_run_capsule(
 def extract_learning_signals(capsule: dict[str, object], *, run_id: str) -> list[LearningSignal]:
     signals: list[LearningSignal] = []
     source = "task_capsule"
+    for content in _string_list(capsule.get("errors_encountered")):
+        signals.append(
+            LearningSignal(
+                title=_title_for("Failure note", content),
+                content=content,
+                kind=MemoryKind.FAILURE,
+                source_layer=MemoryLayer.WORKING,
+                confidence=0.68,
+                importance=0.75,
+                validation_score=0.74,
+                repeat_count=1,
+                source=source,
+                locator=run_id,
+                metadata={"run_id": run_id, "capsule_signal": "failure"},
+            )
+        )
     for content in _string_list(capsule.get("candidate_corrections")):
         signals.append(
             LearningSignal(
@@ -337,6 +355,7 @@ def _candidate_frames(payload: dict[str, object]) -> list[MV2ContextFrame]:
     frames: list[MV2ContextFrame] = []
     candidates = [
         ("reusable_lessons", "task_summary", MemoryKind.SUMMARY),
+        ("errors_encountered", "failure_note", MemoryKind.FAILURE),
         ("candidate_facts", "section_summary", MemoryKind.FACT),
         ("candidate_procedures", "skill_card", MemoryKind.PROCEDURE),
         ("candidate_corrections", "correction", MemoryKind.CORRECTION),
@@ -364,21 +383,63 @@ def _candidate_frames(payload: dict[str, object]) -> list[MV2ContextFrame]:
     return frames
 
 
-def _load_capsule_payload(path: Path) -> dict[str, object]:
-    snapshot_path = path.with_suffix(".memory.json")
-    if not snapshot_path.exists():
+def _load_capsule_payload(path: Path, *, backend: str) -> dict[str, object]:
+    if not path.exists():
         return {"run_id": path.parent.name, "objective": "", "missing": True}
-    raw = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    if not isinstance(raw, list):
-        return {"run_id": path.parent.name, "objective": "", "malformed": True}
-    for item in raw:
-        if isinstance(item, dict) and item.get("id") == f"capsule_{path.parent.name}":
-            content = item.get("content")
-            if isinstance(content, str):
-                loaded = json.loads(content)
-                if isinstance(loaded, dict):
-                    return loaded
+    capsule_backend = _open_capsule_backend(path, backend=backend)
+    try:
+        records = getattr(capsule_backend, "records", None)
+        if isinstance(records, list):
+            for record in records:
+                payload = _payload_from_record(record, run_id=path.parent.name)
+                if payload is not None:
+                    return payload
+        for query in (
+            f"capsule_{path.parent.name}",
+            f"Run capsule: {path.parent.name}",
+            path.parent.name,
+        ):
+            for hit in capsule_backend.find(query, k=8):
+                payload = _payload_from_record(hit.record, run_id=path.parent.name)
+                if payload is not None:
+                    return payload
+    finally:
+        capsule_backend.close()
     return {"run_id": path.parent.name, "objective": "", "empty": True}
+
+
+def _open_capsule_backend(path: Path, *, backend: str) -> MemoryBackend:
+    if backend == "memvid":
+        capsule_backend: MemoryBackend = MemvidBackend(path=path, layer=MemoryLayer.EPISODIC, read_only=True)
+    elif backend == "memory":
+        capsule_backend = InMemoryBackend(path=path, layer=MemoryLayer.EPISODIC)
+    else:
+        raise ValueError(f"Unknown capsule backend: {backend}")
+    capsule_backend.open()
+    return capsule_backend
+
+
+def _payload_from_record(record: MemoryRecord, *, run_id: str) -> dict[str, object] | None:
+    payload = _json_object_from_text(record.content)
+    if payload is None:
+        return None
+    if str(payload.get("run_id", "")) != run_id:
+        return None
+    return payload
+
+
+def _json_object_from_text(text: str) -> dict[str, object] | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        loaded = json.loads(stripped)
+    except json.JSONDecodeError:
+        try:
+            loaded, _ = json.JSONDecoder().raw_decode(stripped)
+        except json.JSONDecodeError:
+            return None
+    return loaded if isinstance(loaded, dict) else None
 
 
 def _summary_text(capsule: dict[str, object], signals: list[LearningSignal]) -> str:
@@ -433,11 +494,10 @@ def _facts_from_result(result: AgentTurnResult) -> tuple[str, ...]:
 
 
 def _corrections_from_result(result: AgentTurnResult) -> tuple[str, ...]:
-    return tuple(
-        f"Tool {execution.call.name} failed during run {result.session_id}: {execution.error or execution.content[:120]}"
-        for execution in result.tool_executions
-        if not execution.success and execution.error not in {"approval_pending", "approval_required"}
-    )
+    message = result.user_message.strip()
+    if "correction" in message.lower():
+        return (message,)
+    return ()
 
 
 def hits_to_context_text(hits: tuple[MemoryHit, ...]) -> str:

@@ -12,6 +12,8 @@ import nested_memvid_agent.mcp_manager as mcp_module
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.event_bus import RunEventBus
 from nested_memvid_agent.mcp_manager import MCPManager
+from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
+from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.run_manager import RunManager
 from nested_memvid_agent.server import create_app
 from nested_memvid_agent.skill_manager import SkillManager
@@ -42,6 +44,58 @@ def test_state_store_tracks_runs_and_approvals(tmp_path: Path) -> None:
 
     decided = state.decide_approval("approval_test", status="approved", decision={"approved": True})
     assert decided["status"] == "approved"
+
+
+def test_state_store_lists_sessions_from_runs(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    state.create_run(
+        run_id="run_first",
+        message="first",
+        session_id="session-a",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+    state.create_run(
+        run_id="run_second",
+        message="second",
+        session_id="session-a",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+
+    sessions = state.list_sessions()
+
+    assert sessions[0]["session_id"] == "session-a"
+    assert sessions[0]["run_count"] == 2
+    assert sessions[0]["latest_run_id"] == "run_second"
+    assert sessions[0]["status_counts"] == {"queued": 2}
+
+
+def test_run_event_bus_redacts_persistent_and_live_payloads(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    state.create_run(
+        run_id="run_secret",
+        message="secret",
+        session_id="session",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+    bus = RunEventBus(state)
+
+    event = bus.publish(
+        "run_secret",
+        "provider.trace",
+        {
+            "authorization": "Bearer abcdefghijklmnopqrstuvwxyz",
+            "env": "OPENAI_API_KEY=sk-fakeOpenAIKey123456789",
+        },
+    )
+
+    stored = state.list_run_steps("run_secret")[0]["payload"]
+    assert "abcdefghijklmnopqrstuvwxyz" not in json.dumps(stored)
+    assert "fakeOpenAIKey" not in json.dumps(stored)
+    assert event.payload == stored
+    assert "<redacted>" in json.dumps(stored)
 
 
 def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
@@ -219,6 +273,86 @@ def test_server_exposes_mcp_lifecycle_routes(tmp_path: Path) -> None:
     assert restarted.json()["server"]["session_state"] == "static"
 
 
+def test_server_exposes_prompt_api_routes(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    memory_dir = tmp_path / "memory"
+    memory = build_memory_system("memory", memory_dir)
+    memory.put(
+        MemoryRecord(
+            layer=MemoryLayer.SEMANTIC,
+            kind=MemoryKind.FACT,
+            title="API search fact",
+            content="Compiled context API routes should expose retrieved memory.",
+            confidence=0.8,
+        )
+    )
+    memory.seal_all()
+    memory.close_all()
+
+    config = AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        memory_dir=memory_dir,
+        log_dir=tmp_path / "logs",
+        state_path=tmp_path / "state.db",
+        skills_dir=tmp_path / "skills",
+        workspace=tmp_path,
+    )
+    client = TestClient(create_app(config))
+
+    run = client.post("/api/runs", json={"message": "hello", "session_id": "api-session"})
+    assert run.status_code == 200
+    sessions = client.get("/api/sessions")
+    assert sessions.status_code == 200
+    assert sessions.json()[0]["session_id"] == "api-session"
+
+    search = client.get("/api/memory/search", params={"query": "compiled context api"})
+    assert search.status_code == 200
+    assert search.json()[0]["title"] == "API search fact"
+
+    context = client.get("/api/context", params={"query": "compiled context api", "token_budget": 1200})
+    assert context.status_code == 200
+    assert "MV2 PSEUDO-CONTEXT PACK" in context.json()["packed_prompt"]
+    assert context.json()["selected_item_count"] >= 1
+
+
+def test_server_exposes_observability_routes(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    config = AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        state_path=tmp_path / "state.db",
+        skills_dir=tmp_path / "skills",
+        workspace=tmp_path,
+    )
+    client = TestClient(create_app(config))
+
+    created = client.post("/api/runs", json={"message": "observe this", "session_id": "observability"})
+    assert created.status_code == 200
+    run_id = created.json()["run_id"]
+    final = _wait_for_client_status(client, run_id, {"completed", "failed"})
+    assert final["status"] == "completed"
+
+    trace = client.get(f"/api/runs/{run_id}/trace", params={"limit": 200})
+    assert trace.status_code == 200
+    trace_payload = trace.json()
+    assert trace_payload["summary"]["trace_counts"]["context"] >= 1
+    assert trace_payload["summary"]["trace_counts"]["memory"] >= 1
+    assert any(event["type"] == "memory.write" for event in trace_payload["traces"]["memory"])
+
+    logs = client.get("/api/logs", params={"limit": 50})
+    assert logs.status_code == 200
+    log_types = {event["type"] for event in logs.json()}
+    assert "turn.start" in log_types
+    assert "memory.write" in log_types
+
+
 def test_skill_discovery_exposes_nested_learning_skill(tmp_path: Path) -> None:
     state = AgentStateStore(tmp_path / "state.db")
     skill_dir = tmp_path / "skills" / "review"
@@ -255,6 +389,29 @@ def test_run_manager_completes_background_mock_run(tmp_path: Path) -> None:
     graph = manager.task_graph(run.run_id)
     assert graph["tasks"]
     assert graph["tasks"][0]["title"] == "Root objective"
+
+
+def test_run_manager_trace_includes_context_memory_and_tool_events(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    run = manager.create_run(message="hello", session_id="session")
+    final = _wait_for_status(manager, run.run_id, {"completed", "failed"})
+    assert final["status"] == "completed"
+
+    execution = manager.invoke_tool(
+        tool_name="memory.search",
+        arguments={"query": "hello", "k": 1},
+        session_id="session",
+        run_id=run.run_id,
+    )
+    assert execution.success is True
+
+    trace = manager.run_trace(run.run_id)
+
+    assert trace["summary"]["trace_counts"]["context"] >= 1
+    assert trace["summary"]["trace_counts"]["memory"] >= 1
+    assert trace["summary"]["trace_counts"]["tool"] >= 1
+    assert any(event["type"] == "memory.write" for event in trace["traces"]["memory"])
+    assert any(event["type"] == "tool.completed" for event in trace["traces"]["tool"])
 
 
 def test_run_manager_runs_mock_subagent(tmp_path: Path) -> None:
@@ -410,6 +567,18 @@ def _wait_for_status(manager: RunManager, run_id: str, statuses: set[str]) -> di
         run = manager.get_run(run_id)
         if str(run["status"]) in statuses:
             return run
+        sleep(0.05)
+    raise AssertionError(f"run {run_id} did not reach {statuses}")
+
+
+def _wait_for_client_status(client: Any, run_id: str, statuses: set[str]) -> dict[str, object]:
+    deadline = monotonic() + 5
+    while monotonic() < deadline:
+        response = client.get(f"/api/runs/{run_id}")
+        response.raise_for_status()
+        run = response.json()
+        if str(run["status"]) in statuses:
+            return dict(run)
         sleep(0.05)
     raise AssertionError(f"run {run_id} did not reach {statuses}")
 

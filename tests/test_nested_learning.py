@@ -56,6 +56,7 @@ def test_kernel_builds_record_with_optimizer_metadata() -> None:
 
     assert record.layer == MemoryLayer.PROCEDURAL
     assert record.kind == MemoryKind.PROCEDURE
+    assert record.metadata["frame_type"] == "skill_card"
     nested = record.metadata["nested_learning"]
     assert nested["context_flow"]["id"] == "episode_to_procedural"
     assert nested["optimizer_trace"]["repeat_count"] == 2

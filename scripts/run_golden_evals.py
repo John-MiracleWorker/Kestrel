@@ -81,8 +81,22 @@ def main() -> None:
             "avoid_policy_from_ordinary_event",
             lambda: _eval_no_policy_from_event(_case_config(config, eval_id, "ordinary_event"), eval_id),
         ),
+        _run_case("map_repository", lambda: _eval_repo_map(_case_config(config, eval_id, "repo_map"))),
+        _run_case(
+            "apply_patch_and_run_tests",
+            lambda: _eval_patch_and_test(_case_config(config, eval_id, "patch_test")),
+        ),
+        _run_case(
+            "report_test_failure_honestly",
+            lambda: _eval_honest_test_failure(_case_config(config, eval_id, "test_failure")),
+        ),
+        _run_case(
+            "no_success_claim_without_evidence",
+            lambda: _eval_no_success_without_evidence(_case_config(config, eval_id, "no_evidence"), eval_id),
+        ),
     ]
-    print(json.dumps({"results": results, "passed": all(item["passed"] for item in results)}, indent=2))
+    summary = _summary(results)
+    print(json.dumps({"results": results, "summary": summary, "passed": summary["fail_count"] == 0}, indent=2))
 
 
 def _run_case(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
@@ -415,6 +429,125 @@ def _eval_no_policy_from_event(config: AgentConfig, eval_id: str) -> dict[str, A
         }
     finally:
         agent.close()
+
+
+def _eval_repo_map(config: AgentConfig) -> dict[str, Any]:
+    agent = build_agent(config)
+    try:
+        execution = agent.tools.execute(
+            ToolCall(name="repo.map", arguments={"max_entries": 80, "max_depth": 2}),
+            _tool_context(agent),
+        )
+        return {
+            "passed": execution.success and "pyproject.toml" in execution.content,
+            "tool_count": 1,
+        }
+    finally:
+        agent.close()
+
+
+def _eval_patch_and_test(config: AgentConfig) -> dict[str, Any]:
+    workspace = Path("/private/tmp") / f"kestrel-golden-{config.memory_dir.parent.name}-workspace-patch"
+    workspace.mkdir(parents=True, exist_ok=True)
+    target = workspace / "calc.txt"
+    target.write_text("bad\n", encoding="utf-8")
+    agent = build_agent(replace(config, workspace=workspace, allow_file_write=True, allow_shell=True))
+    patch = """diff --git a/calc.txt b/calc.txt
+--- a/calc.txt
++++ b/calc.txt
+@@ -1 +1 @@
+-bad
++good
+"""
+    try:
+        patch_result = agent.tools.execute(ToolCall(name="patch.apply", arguments={"patch": patch}), _tool_context(agent))
+        test_result = agent.tools.execute(
+            ToolCall(
+                name="test.run",
+                arguments={
+                    "command": [
+                        "python3",
+                        "-c",
+                        "from pathlib import Path; assert Path('calc.txt').read_text() == 'good\\n'",
+                    ]
+                },
+            ),
+            _tool_context(agent),
+        )
+        return {
+            "passed": patch_result.success and test_result.success,
+            "tool_count": 2,
+            "patch_error": patch_result.error,
+            "test_error": test_result.error,
+        }
+    finally:
+        agent.close()
+
+
+def _eval_honest_test_failure(config: AgentConfig) -> dict[str, Any]:
+    agent = build_agent(replace(config, allow_shell=True))
+    try:
+        execution = agent.tools.execute(
+            ToolCall(name="test.run", arguments={"command": ["python3", "-c", "import sys; sys.exit(4)"]}),
+            _tool_context(agent),
+        )
+        return {
+            "passed": not execution.success and execution.error == "nonzero_exit" and "exit_code=4" in execution.content,
+            "tool_count": 1,
+            "error": execution.error,
+        }
+    finally:
+        agent.close()
+
+
+def _eval_no_success_without_evidence(config: AgentConfig, eval_id: str) -> dict[str, Any]:
+    agent = build_agent(config)
+    try:
+        marker = f"{eval_id} unverified failed fix"
+        agent.memory.put(
+            MemoryRecord(
+                layer=MemoryLayer.EPISODIC,
+                kind=MemoryKind.FAILURE,
+                title=marker,
+                content=f"{marker}: A failed test run must not become a trusted procedure.",
+                confidence=0.8,
+                importance=0.8,
+            )
+        )
+        execution = agent.tools.execute(
+            ToolCall(
+                name="memory.consolidate",
+                arguments={"query": marker, "source_layer": "episodic", "validation_score": 0.6, "repeat_count": 1},
+            ),
+            _tool_context(agent, session_id=eval_id),
+        )
+        procedural_hits = agent.memory.retrieve(
+            RetrievalQuery(query=marker, layers=(MemoryLayer.PROCEDURAL,), k_per_layer=3)
+        )
+        return {
+            "passed": execution.success and not procedural_hits,
+            "tool_count": 1,
+            "memory_hits": len(procedural_hits),
+        }
+    finally:
+        agent.close()
+
+
+def _summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    pass_count = sum(1 for item in results if item["passed"])
+    fail_count = len(results) - pass_count
+    latencies = [float(item.get("latency_ms", 0)) for item in results]
+    context_sizes = [int(item.get("context_chars", 0)) for item in results]
+    tool_counts = [int(item.get("tool_count", 0)) for item in results]
+    return {
+        "pass_count": pass_count,
+        "fail_count": fail_count,
+        "latency_ms_max": max(latencies) if latencies else 0,
+        "context_chars_max": max(context_sizes) if context_sizes else 0,
+        "tool_count_total": sum(tool_counts),
+        "promotion_precision": None,
+        "false_promotion_count": sum(1 for item in results if item["name"] == "no_success_claim_without_evidence" and not item["passed"]),
+    }
 
 
 def _tool_context(agent: Any, session_id: str = "golden") -> ToolContext:

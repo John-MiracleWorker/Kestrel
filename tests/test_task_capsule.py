@@ -67,3 +67,37 @@ def test_summarizes_completed_run_into_candidate_memories(tmp_path: Path) -> Non
 
     assert "Objective: Capture lessons" in summary.summary
     assert len(summary.learning_signals) == 3
+
+
+def test_summarizes_capsule_through_backend_without_snapshot_file(tmp_path: Path) -> None:
+    path = write_run_capsule(
+        runs_dir=tmp_path / "runs",
+        run_id="run_5",
+        objective="Read via backend",
+        final_response="Done",
+        candidate_facts=("Capsule summaries should read complete.mv2 through the backend.",),
+    )
+    path.with_suffix(".memory.json").unlink()
+
+    summary = summarize_run_capsule(runs_dir=tmp_path / "runs", run_id="run_5")
+
+    assert "Objective: Read via backend" in summary.summary
+    assert summary.learning_signals
+
+
+def test_capsule_root_links_to_candidate_frames(tmp_path: Path) -> None:
+    path = write_run_capsule(
+        runs_dir=tmp_path / "runs",
+        run_id="run_6",
+        objective="Link capsule frames",
+        errors_encountered=("Tool shell.run failed with approval_required.",),
+        candidate_procedures=("Validated repeatable steps should be stored as skill cards.",),
+    )
+
+    raw = path.with_suffix(".memory.json").read_text(encoding="utf-8")
+
+    assert '"frame_type": "task_summary"' in raw
+    assert '"frame_type": "failure_note"' in raw
+    assert '"frame_type": "skill_card"' in raw
+    assert '"parent_ids": [' in raw
+    assert '"child_ids": [' in raw

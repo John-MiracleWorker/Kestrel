@@ -122,6 +122,39 @@ class AgentStateStore:
             ).fetchall()
         return [_run_from_row(row) for row in rows]
 
+    def list_sessions(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM runs ORDER BY updated_at DESC LIMIT ?",
+                (max(limit * 20, limit),),
+            ).fetchall()
+
+        sessions: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            run = _run_from_row(row)
+            current = sessions.get(run.session_id)
+            if current is None:
+                current = {
+                    "session_id": run.session_id,
+                    "run_count": 0,
+                    "status_counts": {},
+                    "latest_run_id": run.run_id,
+                    "latest_status": run.status,
+                    "latest_message": run.message,
+                    "created_at": run.created_at,
+                    "updated_at": run.updated_at,
+                }
+                sessions[run.session_id] = current
+            current["run_count"] = int(current["run_count"]) + 1
+            status_counts = current["status_counts"]
+            if isinstance(status_counts, dict):
+                status_counts[run.status] = int(status_counts.get(run.status, 0)) + 1
+            current["created_at"] = min(str(current["created_at"]), run.created_at)
+            current["updated_at"] = max(str(current["updated_at"]), run.updated_at)
+
+        ordered = sorted(sessions.values(), key=lambda item: str(item["updated_at"]), reverse=True)
+        return ordered[:limit]
+
     def append_run_step(self, run_id: str, type: str, payload: dict[str, Any]) -> int:
         with self._connect() as conn:
             cursor = conn.execute(

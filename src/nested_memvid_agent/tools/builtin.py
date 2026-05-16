@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ..consolidation import Consolidator
-from ..context_frames import estimate_tokens, from_memory_record
+from ..context_frames import default_frame_type_for_memory, estimate_tokens, from_memory_record
 from ..context_packer import ContextPacker, ContextPackRequest
 from ..models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from ..nested_learning import LearningSignal, NestedLearningKernel
@@ -73,6 +73,9 @@ class MemoryWriteTool(AgentTool):
                 "content": {"type": "string"},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "importance": {"type": "number", "minimum": 0, "maximum": 1},
+                "frame_type": {"type": "string"},
+                "parent_ids": {"type": "array", "items": {"type": "string"}},
+                "child_ids": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["layer", "title", "content"],
         },
@@ -94,6 +97,11 @@ class MemoryWriteTool(AgentTool):
                 error="policy_write_disabled",
             )
         try:
+            frame_type = str(arguments.get("frame_type") or default_frame_type_for_memory(kind, layer))
+            parent_ids_arg = arguments.get("parent_ids")
+            child_ids_arg = arguments.get("child_ids")
+            parent_ids = [str(item) for item in parent_ids_arg] if isinstance(parent_ids_arg, list) else []
+            child_ids = [str(item) for item in child_ids_arg] if isinstance(child_ids_arg, list) else []
             record = MemoryRecord(
                 layer=layer,
                 kind=kind,
@@ -101,7 +109,13 @@ class MemoryWriteTool(AgentTool):
                 content=str(arguments.get("content", "")),
                 confidence=float(arguments.get("confidence", 0.7)),
                 importance=float(arguments.get("importance", 0.5)),
-                metadata={"session_id": context.session_id, "source": "tool.memory.write"},
+                metadata={
+                    "session_id": context.session_id,
+                    "source": "tool.memory.write",
+                    "frame_type": frame_type,
+                    "parent_ids": parent_ids,
+                    "child_ids": child_ids,
+                },
             )
             record_id = context.memory.put(record)
             return self._result(call, success=True, content=f"Wrote memory {record_id}", data={"record_id": record_id})
@@ -328,7 +342,10 @@ class CapsuleApplyTool(AgentTool):
             for item in plan:
                 if item.get("will_write") is not True:
                     continue
-                signal = summary.learning_signals[int(item["signal_index"])]
+                signal_index = item.get("signal_index")
+                if not isinstance(signal_index, int):
+                    continue
+                signal = summary.learning_signals[signal_index]
                 decision = NestedLearningKernel().decide(signal)
                 if decision.target_layer is None:
                     continue
@@ -804,6 +821,51 @@ class TestRunTool(AgentTool):
             return self._result(call, success=False, content=str(exc), error="test_run_failed")
 
 
+class LintRunTool(AgentTool):
+    spec = ToolSpec(
+        name="lint.run",
+        description="Run a bounded lint/typecheck command in the workspace. Disabled unless shell execution is enabled.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "command": {"type": "array", "items": {"type": "string"}},
+                "timeout": {"type": "integer"},
+            },
+        },
+        risk="high",
+        requires_approval=True,
+    )
+    allowed_first_tokens = {"ruff", "mypy", "python", "python3"}
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        command_raw = arguments.get("command", ["ruff", "check", "."])
+        if not isinstance(command_raw, list) or not all(isinstance(item, str) for item in command_raw):
+            return self._result(call, success=False, content="command must be list[str]", error="bad_command")
+        command = list(command_raw)
+        if not command or Path(command[0]).name not in self.allowed_first_tokens:
+            return self._result(call, success=False, content="Command is not allowlisted", error="command_not_allowlisted")
+        try:
+            completed = subprocess.run(  # noqa: S603 - intentionally allowlisted
+                command,
+                cwd=context.workspace,
+                capture_output=True,
+                text=True,
+                timeout=int(arguments.get("timeout", 120)),
+                check=False,
+            )
+            content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            return self._result(
+                call,
+                success=completed.returncode == 0,
+                content=content,
+                data={"returncode": completed.returncode},
+                error=None if completed.returncode == 0 else "nonzero_exit",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="lint_run_failed")
+
+
 class GitStatusTool(AgentTool):
     spec = ToolSpec(
         name="git.status",
@@ -844,6 +906,57 @@ class GitDiffTool(AgentTool):
                 error=result.error,
             )
         return result
+
+
+class GitBranchTool(AgentTool):
+    spec = ToolSpec(
+        name="git.branch",
+        description="Return read-only branch information for the workspace.",
+        parameters={"type": "object", "properties": {"all": {"type": "boolean"}}},
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        command = ["git", "branch", "--all"] if bool(arguments.get("all", False)) else ["git", "branch", "--show-current"]
+        return _git_read(ToolCall(name=self.spec.name, arguments=arguments), context, command, "git_branch_failed")
+
+
+class GitCommitTool(AgentTool):
+    spec = ToolSpec(
+        name="git.commit",
+        description="Commit already-staged workspace changes. Requires explicit approval and never pushes.",
+        parameters={
+            "type": "object",
+            "properties": {"message": {"type": "string"}},
+            "required": ["message"],
+        },
+        risk="high",
+        requires_approval=True,
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        message = str(arguments.get("message", "")).strip()
+        if not message:
+            return self._result(call, success=False, content="Missing commit message", error="missing_message")
+        try:
+            completed = subprocess.run(  # noqa: S603 - fixed executable and arguments
+                ["git", "commit", "-m", message],
+                cwd=context.workspace,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            return self._result(
+                call,
+                success=completed.returncode == 0,
+                content=content,
+                data={"returncode": completed.returncode},
+                error=None if completed.returncode == 0 else "git_commit_failed",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="git_commit_failed")
 
 
 class MemvidVerifyTool(AgentTool):
@@ -1062,6 +1175,114 @@ class MemoryLearnTool(AgentTool):
             return self._result(call, success=False, content=str(exc), error="memory_learn_failed")
 
 
+class MemoryInspectTool(AgentTool):
+    spec = ToolSpec(
+        name="memory.inspect",
+        description="Inspect matching memory records with provenance and metadata.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "layers": {"type": "array", "items": {"type": "string"}},
+                "k": {"type": "integer", "minimum": 1, "maximum": 50},
+            },
+            "required": ["query"],
+        },
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        query = str(arguments.get("query", "")).strip()
+        if not query:
+            return self._result(call, success=False, content="Missing query", error="missing_query")
+        layers = _layers_arg(arguments.get("layers")) or tuple(MemoryLayer)
+        hits = context.memory.retrieve(
+            RetrievalQuery(query=query, layers=layers, k_per_layer=int(arguments.get("k", 8)))
+        )
+        rows = [_memory_hit_payload(hit) for hit in hits]
+        return self._result(call, success=True, content=json.dumps(rows, indent=2), data={"hits": rows})
+
+
+class MemoryExportTool(AgentTool):
+    spec = ToolSpec(
+        name="memory.export",
+        description="Export memory records as structured JSON. Use query for backends without full record iteration.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "layers": {"type": "array", "items": {"type": "string"}},
+                "k": {"type": "integer", "minimum": 1, "maximum": 100},
+            },
+        },
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        layers = _layers_arg(arguments.get("layers")) or tuple(MemoryLayer)
+        rows: list[dict[str, object]] = []
+        query = str(arguments.get("query", "")).strip()
+        if query:
+            hits = context.memory.retrieve(
+                RetrievalQuery(query=query, layers=layers, k_per_layer=int(arguments.get("k", 20)))
+            )
+            rows = [_memory_record_payload(hit.record) for hit in hits]
+        else:
+            for layer in layers:
+                backend = context.memory.backends.get(layer)
+                records = getattr(backend, "records", None)
+                if isinstance(records, list):
+                    rows.extend(_memory_record_payload(record) for record in records)
+        return self._result(call, success=True, content=json.dumps(rows, indent=2), data={"records": rows})
+
+
+class MemoryImportTool(AgentTool):
+    spec = ToolSpec(
+        name="memory.import",
+        description="Import explicit memory records. Requires approval and keeps policy writes gated separately.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "records": {"type": "array", "items": {"type": "object"}},
+                "dry_run": {"type": "boolean"},
+            },
+            "required": ["records"],
+        },
+        risk="critical",
+        requires_approval=True,
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        raw_records = arguments.get("records")
+        if not isinstance(raw_records, list):
+            return self._result(call, success=False, content="records must be a list", error="bad_records")
+        if not all(isinstance(item, dict) for item in raw_records):
+            return self._result(call, success=False, content="Every record must be an object", error="bad_records")
+        try:
+            records = [_memory_record_from_payload(item) for item in raw_records]
+        except Exception as exc:  # noqa: BLE001 - import payload validation boundary
+            return self._result(call, success=False, content=str(exc), error="bad_records")
+        if any(record.layer == MemoryLayer.POLICY for record in records) and not context.config.allow_policy_writes:
+            return self._result(
+                call,
+                success=False,
+                content="Policy memory import is disabled by default.",
+                error="policy_write_disabled",
+            )
+        dry_run = bool(arguments.get("dry_run", False))
+        ids: list[str] = []
+        if not dry_run:
+            try:
+                for record in records:
+                    ids.append(context.memory.put(record))
+                context.memory.seal_all()
+            except Exception as exc:  # noqa: BLE001 - import should report failed writes structurally
+                return self._result(call, success=False, content=str(exc), error="memory_import_failed")
+        payload = {"dry_run": dry_run, "imported": len(records), "record_ids": ids}
+        return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+
+
 def build_default_tools() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(MemorySearchTool())
@@ -1080,13 +1301,19 @@ def build_default_tools() -> ToolRegistry:
     registry.register(RepoMapTool())
     registry.register(PatchApplyTool())
     registry.register(TestRunTool())
+    registry.register(LintRunTool())
     registry.register(GitStatusTool())
     registry.register(GitDiffTool())
+    registry.register(GitBranchTool())
+    registry.register(GitCommitTool())
     registry.register(MemvidVerifyTool())
     registry.register(MemvidDoctorTool())
     registry.register(MemvidStatsTool())
     registry.register(MemoryLearnTool())
     registry.register(MemoryConsolidateTool())
+    registry.register(MemoryInspectTool())
+    registry.register(MemoryExportTool())
+    registry.register(MemoryImportTool())
     return registry
 
 
@@ -1102,6 +1329,51 @@ def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n... truncated ..."
+
+
+def _memory_hit_payload(hit: Any) -> dict[str, object]:
+    return {
+        "score": hit.score,
+        "frame_id": hit.frame_id,
+        "source_backend": hit.source_backend,
+        "snippet": hit.snippet,
+        "record": _memory_record_payload(hit.record),
+    }
+
+
+def _memory_record_payload(record: MemoryRecord) -> dict[str, object]:
+    return {
+        "id": record.id,
+        "layer": record.layer.value,
+        "kind": record.kind.value,
+        "title": record.title,
+        "content": record.content,
+        "confidence": record.confidence,
+        "importance": record.importance,
+        "tags": record.tags,
+        "metadata": record.metadata,
+        "evidence": [
+            {"source": evidence.source, "locator": evidence.locator, "quote": evidence.quote}
+            for evidence in record.evidence
+        ],
+    }
+
+
+def _memory_record_from_payload(item: dict[str, Any]) -> MemoryRecord:
+    record = MemoryRecord(
+        layer=MemoryLayer(str(item.get("layer", MemoryLayer.WORKING.value))),
+        kind=MemoryKind(str(item.get("kind", MemoryKind.OBSERVATION.value))),
+        title=str(item.get("title", "Imported memory")),
+        content=str(item.get("content", "")),
+        confidence=float(item.get("confidence", 0.8)),
+        importance=float(item.get("importance", 0.5)),
+        tags=dict(item.get("tags", {})) if isinstance(item.get("tags"), dict) else {},
+        metadata=dict(item.get("metadata", {})) if isinstance(item.get("metadata"), dict) else {},
+    )
+    record_id = str(item.get("id") or "").strip()
+    if record_id:
+        record.id = record_id
+    return record
 
 
 def _skip_repo_name(name: str) -> bool:

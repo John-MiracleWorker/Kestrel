@@ -174,6 +174,24 @@ nest-agent server --backend memory --provider mock --host 127.0.0.1 --port 8765
 
 Open `http://127.0.0.1:8765/` to use the local workbench. It exposes background runs, SSE timeline events, human approvals, built-in tools, MCP server health/sync/connect/disconnect/restart controls, manual MCP JSON invocation, local subagent runs, skills, and memory search.
 
+## Packaging and deployment
+
+Operational docs:
+
+- `docs/DEPLOYMENT.md` covers fresh installs, Docker, Compose, provider setup, local model setup, and runtime checks.
+- `docs/MEMORY_OPERATIONS.md` covers `.mv2` backup, restore, verification, and migration.
+- `docs/SECURITY.md` documents the default local-only security posture and high-risk tool gates.
+- `docs/RELEASE_CHECKLIST.md` lists the alpha release validation commands.
+
+Common local packaging commands:
+
+```bash
+make install-dev
+make validate
+make docker-build
+make docker-doctor
+```
+
 ## Codex CLI connection
 
 The runtime exposes the local Codex CLI as a high-risk built-in tool named `codex.exec`.

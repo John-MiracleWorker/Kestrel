@@ -37,6 +37,8 @@ class LLMResponse:
     content: str
     tool_calls: tuple[ToolCall, ...] = ()
     raw: Any | None = None
+    usage: dict[str, Any] | None = None
+    finish_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -71,7 +73,7 @@ class ToolSpec:
     name: str
     description: str
     parameters: dict[str, Any]
-    risk: Literal["low", "medium", "high"] = "low"
+    risk: Literal["low", "medium", "high", "critical"] = "low"
     requires_approval: bool = False
     source: Literal["builtin", "mcp", "skill"] = "builtin"
     server_id: str | None = None
@@ -137,3 +139,5 @@ class AgentTurnResult:
     stop_reason: str
     context_prompt: str = ""
     source: TurnSource | None = None
+    run_id: str = ""
+    error: dict[str, Any] | None = None

@@ -6,9 +6,7 @@ from pathlib import Path
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.orchestrator import build_memory_system
-from nested_memvid_agent.runtime_models import ToolCall
-from nested_memvid_agent.runtime_models import ToolExecution
-from nested_memvid_agent.runtime_models import ToolSpec
+from nested_memvid_agent.runtime_models import ToolCall, ToolExecution, ToolSpec
 from nested_memvid_agent.task_capsule import write_run_capsule
 from nested_memvid_agent.tools.base import ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
