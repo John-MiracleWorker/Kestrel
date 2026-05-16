@@ -1,187 +1,201 @@
 # Full Agent Specification
 
-## Product goal
+Last updated: 2026-05-16
 
-Build a complete local-first AI agent similar in feel to OpenClaw or Hermes, but designed around a Nested Learning memory model and Memvid `.mv2` files instead of a traditional vector database.
+## Product Goal
 
-The finished agent must support:
+Kestrel is a local-first, memory-native engineering agent. It should safely work on codebases, use tools, learn from repeated validated outcomes, and explain what it remembers and why.
 
-1. Talking to the agent from a CLI.
-2. Persistent `.mv2` memory across sessions.
-3. Tool use with controlled permissions.
-4. Context compilation from nested memory layers.
-5. Learning from tool results, failures, decisions, and user corrections.
-6. Promotion of memories from fast/noisy layers into slow/trusted layers.
-7. Testable behavior with a deterministic mock LLM and in-memory backend.
-8. Memvid integration tests once `memvid-sdk` is installed.
-9. Optional FastAPI/TUI/web UI after CLI is stable.
-
-## System boundary
-
-The LLM is not the whole agent. The agent is the runtime organism:
+The differentiator is not a bigger prompt. It is a controlled memory/runtime architecture:
 
 ```text
-agent = LLM provider + tool router + memory system + context compiler + evaluator + consolidation pipeline + UI/API
+LLM provider
++ chat/runtime loop
++ tool registry
++ permission and approval gates
++ nested .mv2 memory layers
++ context compiler and pseudo-context packer
++ event and state logs
++ consolidation and task capsules
++ eval harness
++ CLI/API/web control surfaces
 ```
 
-The `.mv2` memory system replaces the normal “dump the full conversation into context” pattern. The LLM still receives a prompt, but that prompt is a compact cognitive state assembled from nested memory.
+## Non-Negotiable Design Rules
 
-## Core components
+1. Preserve the Nested Learning memory architecture.
+2. Use Memvid v2 `.mv2` files as the primary persistent memory backend.
+3. Keep one permanent `.mv2` file per nested layer unless tests prove a better layout.
+4. Never call `create(path)` on an existing `.mv2` file.
+5. Do not replace `.mv2` memory with Chroma, SQLite, Postgres, FAISS, or JSON logs.
+6. Use SQLite only for control-plane state.
+7. Keep the agent local-first by default.
+8. Keep mock backend/provider tests deterministic.
+9. Do not let a single ordinary event become semantic, procedural, or policy memory.
+10. Do not run high-risk tools without config enablement where applicable and exact-call approval.
+11. Do not dump full raw transcripts into context by default.
+12. Do not claim a feature is production-ready until it is implemented and tested.
 
-### 1. Agent runtime
+## Current Core Components
 
-Class: `NestedMV2Agent`
+### Agent Runtime
+
+Class: `NestedMV2Agent`.
 
 Responsibilities:
 
-- receive user input
-- write current turn into working memory
-- compile relevant nested context
-- call LLM provider
-- parse tool calls
-- execute tools through registry
-- write tool results to working memory
-- continue tool loop until final answer
-- write turn summary to episodic memory
+- receive user input from CLI/API/channel surfaces
+- write current turn observations into working memory
+- compile relevant nested memory context
+- call an LLM provider
+- parse final answers or portable JSON tool envelopes
+- execute tools through `ToolRegistry`
+- write tool results/failures to working memory
+- continue until final answer, approval block, failure, or tool-round limit
+- write turn summaries to episodic memory
 - seal memory layers
-- log events
 
-### 2. LLM provider layer
+### Run Manager
 
-Interfaces:
+Class: `RunManager`.
 
-- `LLMProvider.generate(messages, tools) -> LLMResponse`
-- `MockLLMProvider` for tests
-- `OpenAIResponsesProvider` for chat-capable production path
+Responsibilities:
 
-Required next hardening:
+- create and track background runs
+- persist run steps and timeline events
+- coordinate approvals and approval resume
+- create task graphs and subagent records
+- expose scheduler steps/runs
+- write task capsules on completion
+- protect terminal run transitions and immutable approval decisions
 
-- native function/tool calling support
-- streaming output
-- structured output mode
-- retry handling
-- token accounting
-- provider errors mapped to runtime errors
+### LLM Providers
 
-### 3. Tool system
+Current providers:
 
-Current built-ins:
+- deterministic mock provider
+- OpenAI Responses provider
+- OpenAI-compatible chat completions provider
+- local Codex CLI provider
 
-- `memory.search`
-- `memory.write`
-- `file.list`
-- `file.read`
-- `file.write`
-- `shell.run`
+Current provider support:
 
-Required next tools:
+- provider capability metadata
+- retryable fallback wrapper
+- portable JSON tool envelope
+- OpenAI Responses streaming deltas when available
 
-- `patch.apply`
-- `test.run`
-- `repo.search`
-- `repo.map`
-- `git.status`
-- `git.diff`
-- `git.commit` gated by approval
-- `web.search` optional
-- `memvid.verify`
-- `memvid.stats`
-- `memory.consolidate`
+Remaining provider hardening:
 
-### 4. Nested memory layers
+- native tool-calling parity across providers
+- streaming parity for OpenAI-compatible/local providers
+- broader live integration tests
+- richer provider-specific context and JSON-mode handling
+
+### Tool System
+
+Tools execute through schemas, workspace/path checks, timeout boundaries, capability gates, and exact-call approvals.
+
+Current tool families:
+
+- memory and context tools
+- task capsule tools
+- file and shell tools
+- repo search/map tools
+- patch/test/lint tools
+- git status/diff/branch/commit tools
+- Memvid verify/doctor/stats tools
+- diagnosis and failure-recall tools
+- safe repair tools
+- skill install/runtime tools
+- plugin registry and materialization commands
+- Codex CLI delegation
+- MCP-adapted tools
+
+High-risk tools are blocked unless enabled where applicable and approved for the exact call ID and arguments. `git.commit` never pushes. Repair branch commits require `repair.review`.
+
+### Nested Memory Layers
 
 | Layer | File | Purpose | Write threshold | Promotion behavior |
 |---|---|---|---:|---|
-| Working | `working.mv2` | current task state, observations, tool results | low | expires quickly; candidates move to episodic |
-| Episodic | `episodic.mv2` | session events, failures, decisions, summaries | medium | repeated/validated facts move upward |
-| Semantic | `semantic.mv2` | stable facts about projects/users/domains | high | stable factual substrate |
-| Procedural | `procedural.mv2` | reusable skills and repair recipes | very high | only after repeated success |
-| Policy | `policy.mv2` | slow behavior and safety rules | extreme | manual/strong validation only |
+| Working | `.nest/memory/working.mv2` | current task state, observations, tool results | low | expires/compacts; feeds episodic |
+| Episodic | `.nest/memory/episodic.mv2` | events, failures, decisions, summaries | medium | feeds semantic/procedural |
+| Semantic | `.nest/memory/semantic.mv2` | stable facts and preferences | high | corrected rather than casually overwritten |
+| Procedural | `.nest/memory/procedural.mv2` | reusable recipes and failure playbooks | very high | formed after repeated validated success |
+| Policy | `.nest/memory/policy.mv2` | slow behavior and safety constraints | extreme | explicit/reviewed only |
 
-### 5. Context compiler
+Run-scoped capsules live at `.nest/runs/{run_id}/complete.mv2`.
 
-The compiler must render a prompt with:
+### Context Compiler and Packer
 
-- objective
-- relevant working memory
-- relevant episodic memory
-- relevant semantic memory
-- relevant procedural memory
-- relevant policy memory
-- confidence and evidence notes
+The compiler delegates to the MV2 context packer. The packer should render:
+
+- current objective
+- policy constraints
+- relevant procedures
+- stable facts
+- recent episodic/task state
+- working memory
+- confidence and validation metadata
 - conflict warnings
+- evidence pointers
+- retrieval telemetry
 - next-step instruction
 
-It must not blindly stuff raw memory. It ranks by layer, relevancy, confidence, importance, recency, and validation status.
+It should prefer summaries and expand raw evidence through `context.expand` only when needed.
 
-### 6. Consolidation pipeline
+### Consolidation Pipeline
 
-The consolidation system is the heart of the Nested Learning design.
+The consolidation pipeline maps Nested Learning concepts onto external agent memory:
 
-Input sources:
+- `ContextFlow` describes source layers, target layers, update frequency, objective, compression, and retention.
+- `OptimizerTrace` records surprise, validation score, repeat count, compression ratio, confidence delta, and effective confidence.
+- `NestedLearningKernel` decides reject/write/promote.
+- `memory.learn`, `memory.consolidate`, `capsule.summarize`, and `capsule.apply` expose the flow.
 
-- working memory
-- tool results
-- test outcomes
-- user corrections
-- repeated patterns
-- final turn summaries
+Every accepted promotion must include evidence, provenance, confidence, validation status, and gate metadata. Policy memory is rare and strongly gated.
 
-Promotion rules:
+### API and Web
 
-- Working → Episodic: meaningful event, failure, decision, or summary.
-- Episodic → Semantic: repeated or externally verified factual claim.
-- Episodic → Procedural: repeated successful workflow.
-- Semantic/Procedural → Policy: rare, explicit, high-confidence rule.
+The FastAPI control plane and React/Vite workbench expose:
 
-Every promoted record must include:
+- background runs and SSE events
+- approval list/decision flow
+- memory search, verify, doctor, inspect
+- context pack/expand/conflict utilities
+- MCP registry, health, connect/disconnect/restart, sync, invoke
+- skill registry and install flow
+- task graph, subagent, and scheduler surfaces
+- channel ingress
+- plugin registry state where wired
 
-- source layer and source record IDs
-- evidence refs
-- confidence
-- validation method
-- promotion reason
-- timestamp
+API auth can be enabled through `NEST_AGENT_REQUIRE_API_AUTH=1` plus a token environment variable.
 
-### 7. Event log
+Plugin installation is an alpha/high-risk surface. The registry and CLI exist, but install-path allow-flag enforcement, review UX, dependency isolation, and shared-runtime security review remain hardening work.
 
-The current scaffold includes JSONL event logging. This is not a database. It is an audit trail. Codex should optionally mirror session events into `episodic.mv2` and keep JSONL for debugging/crash analysis.
+### Channels
 
-### 8. UI/API
+Inbound normalization exists for Telegram Bot API updates, Discord-shaped payloads, and generic/custom webhooks. Outbound delivery is disabled by default and must be explicitly configured.
 
-Minimum accepted UI:
+Generic/custom webhooks can require HMAC-SHA256 signatures.
 
-```bash
-nest-agent chat --backend memvid --provider openai --model <model>
-```
+## Acceptance Criteria
 
-Optional after MVP:
-
-- FastAPI `/chat`
-- Server-sent events streaming
-- Textual/Rich TUI
-- Web chat frontend
-
-## Acceptance criteria
-
-The agent is “built” when this works:
+The alpha runtime should continue to pass:
 
 ```bash
-pip install -e '.[memvid,openai,dev]'
-pytest -q
-RUN_MEMVID_INTEGRATION=1 pytest -q tests/integration
-nest-agent init --backend memvid --memory-dir .nest/memory
-nest-agent chat --backend memvid --provider openai --model <model>
+python -m compileall -q src tests scripts
+python -m pytest -q
+python scripts/run_golden_evals.py --backend memory --provider mock
+npm run test --prefix web
+npm run build --prefix web
 ```
 
-And the agent can:
+Optional integrations should pass when dependencies are installed:
 
-- answer normal chat messages
-- search memory
-- remember a user correction across sessions
-- read project files safely
-- refuse shell/file writes unless enabled
-- log tool results
-- compile nested context
-- promote a validated memory through at least one consolidation path
-- verify `.mv2` files
+```bash
+RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
+RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integration.py
+```
+
+The runtime is production-ready only when the remaining gaps in `docs/IMPLEMENTATION_STATUS.md` are closed, especially provider parity, production auth/isolation, MCP non-stdio transport fixtures, container-grade skill isolation, and isolated worker orchestration.

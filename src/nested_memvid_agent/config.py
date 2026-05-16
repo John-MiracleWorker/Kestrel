@@ -34,6 +34,7 @@ class AgentConfig:
     allow_file_write: bool = False
     allow_policy_writes: bool = False
     allow_codex_cli: bool = False
+    allow_plugin_install: bool = False
     require_approval_for_high_risk_tools: bool = True
     enable_autonomous_scheduler: bool = False
     max_scheduler_tasks: int = 3
@@ -47,6 +48,7 @@ class AgentConfig:
     log_dir: Path = Path(".nest/logs")
     state_path: Path = Path(".nest/state/agent.db")
     skills_dir: Path = Path(".nest/skills")
+    plugins_dir: Path = Path(".nest/plugins")
     mcp_config_path: Path = Path(".nest/config/mcp_servers.json")
     channel_config_path: Path = Path(".nest/config/channels.json")
     enable_channel_delivery: bool = False
@@ -79,6 +81,7 @@ class AgentConfig:
             log_dir=Path(os.getenv("NEST_AGENT_LOG_DIR", ".nest/logs")),
             state_path=Path(os.getenv("NEST_AGENT_STATE_PATH", ".nest/state/agent.db")),
             skills_dir=Path(os.getenv("NEST_AGENT_SKILLS_DIR", ".nest/skills")),
+            plugins_dir=Path(os.getenv("NEST_AGENT_PLUGINS_DIR", ".nest/plugins")),
             mcp_config_path=Path(os.getenv("NEST_AGENT_MCP_CONFIG", ".nest/config/mcp_servers.json")),
             channel_config_path=Path(os.getenv("NEST_AGENT_CHANNEL_CONFIG", ".nest/config/channels.json")),
             enable_channel_delivery=_env_bool("NEST_AGENT_ENABLE_CHANNEL_DELIVERY"),
@@ -88,6 +91,7 @@ class AgentConfig:
             allow_file_write=_env_bool("NEST_AGENT_ALLOW_FILE_WRITE"),
             allow_policy_writes=_env_bool("NEST_AGENT_ALLOW_POLICY_WRITES"),
             allow_codex_cli=_env_bool("NEST_AGENT_ALLOW_CODEX_CLI"),
+            allow_plugin_install=_env_bool("NEST_AGENT_ALLOW_PLUGIN_INSTALL"),
             enable_autonomous_scheduler=_env_bool("NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER"),
             max_scheduler_tasks=_env_int("NEST_AGENT_MAX_SCHEDULER_TASKS", 3),
             max_scheduler_cycles=_env_int("NEST_AGENT_MAX_SCHEDULER_CYCLES", 5),
@@ -115,6 +119,7 @@ class AgentConfig:
             "log_dir",
             "state_path",
             "skills_dir",
+            "plugins_dir",
             "mcp_config_path",
             "channel_config_path",
         }

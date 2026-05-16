@@ -321,7 +321,7 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     state = AgentStateStore(db_path)
 
-    assert state.schema_version() == 6
+    assert state.schema_version() == 7
     with sqlite3.connect(db_path) as conn:
         run_indexes = {row[1] for row in conn.execute("PRAGMA index_list('runs')").fetchall()}
         approval_indexes = {row[1] for row in conn.execute("PRAGMA index_list('approval_requests')").fetchall()}
@@ -333,7 +333,7 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
     assert "idx_runs_status" in run_indexes
     assert "idx_approval_requests_status" in approval_indexes
     assert "idx_run_steps_run_id_id" in step_indexes
-    assert {"task_nodes", "subagent_runs"} <= tables
+    assert {"task_nodes", "subagent_runs", "plugin_registry"} <= tables
     assert {
         "last_seen_at",
         "tool_count",

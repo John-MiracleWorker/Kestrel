@@ -143,6 +143,8 @@ python scripts/run_golden_evals.py --backend memory --provider mock
 Integration checks remain opt-in:
 
 ```bash
-RUN_MEMVID_INTEGRATION=1 pytest -q tests/integration
-RUN_MCP_INTEGRATION=1 pytest -q tests/integration
+RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
+RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integration.py
 ```
+
+Use `python -m pytest` so integration subprocesses inherit the same interpreter, environment, and installed extras.

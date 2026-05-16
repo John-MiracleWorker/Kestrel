@@ -21,6 +21,7 @@ from .event_bus import RunEventBus
 from .mcp_manager import MCPManager
 from .models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from .orchestrator import build_memory_system
+from .plugin_manager import PluginError, PluginManager
 from .run_manager import RunManager
 from .runtime_models import LLMStreamEvent, ToolCall
 from .skill_manager import SkillManager
@@ -52,6 +53,7 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--log-dir", type=Path, default=Path(".nest/logs"))
     parser.add_argument("--state-path", type=Path, default=Path(".nest/state/agent.db"))
     parser.add_argument("--skills-dir", type=Path, default=Path(".nest/skills"))
+    parser.add_argument("--plugins-dir", type=Path, default=Path(".nest/plugins"))
     parser.add_argument("--mcp-config", type=Path, default=Path(".nest/config/mcp_servers.json"))
     parser.add_argument("--channels-config", type=Path, default=Path(".nest/config/channels.json"))
     parser.add_argument("--enable-channel-delivery", action="store_true")
@@ -62,6 +64,7 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-file-write", action="store_true")
     parser.add_argument("--allow-policy-writes", action="store_true")
     parser.add_argument("--allow-codex-cli", action="store_true")
+    parser.add_argument("--allow-plugin-install", action="store_true")
     parser.add_argument("--enable-autonomous-scheduler", action="store_true")
     parser.add_argument("--max-scheduler-tasks", type=int, default=3)
     parser.add_argument("--max-scheduler-cycles", type=int, default=5)
@@ -133,6 +136,40 @@ def main() -> None:
     tools_cmd = sub.add_parser("tools")
     tools_cmd.add_argument("--json", action="store_true")
 
+    plugins_cmd = sub.add_parser("plugins")
+    plugins_sub = plugins_cmd.add_subparsers(dest="plugins_cmd", required=True)
+    plugins_list = plugins_sub.add_parser("list")
+    _add_agent_args(plugins_list)
+    plugins_list.add_argument("--json", action="store_true")
+    plugins_install = plugins_sub.add_parser("install")
+    _add_agent_args(plugins_install)
+    plugins_install.add_argument("source")
+    plugins_install.add_argument("--ref")
+    plugins_install.add_argument("--enable", action="store_true")
+    plugins_install.add_argument("--overwrite", action="store_true")
+    plugins_install.add_argument("--json", action="store_true")
+    plugins_inspect = plugins_sub.add_parser("inspect")
+    _add_agent_args(plugins_inspect)
+    plugins_inspect.add_argument("plugin_id")
+    plugins_inspect.add_argument("--json", action="store_true")
+    plugins_enable = plugins_sub.add_parser("enable")
+    _add_agent_args(plugins_enable)
+    plugins_enable.add_argument("plugin_id")
+    plugins_enable.add_argument("--json", action="store_true")
+    plugins_disable = plugins_sub.add_parser("disable")
+    _add_agent_args(plugins_disable)
+    plugins_disable.add_argument("plugin_id")
+    plugins_disable.add_argument("--json", action="store_true")
+    plugins_update = plugins_sub.add_parser("update")
+    _add_agent_args(plugins_update)
+    plugins_update.add_argument("plugin_id")
+    plugins_update.add_argument("--ref")
+    plugins_update.add_argument("--json", action="store_true")
+    plugins_remove = plugins_sub.add_parser("remove")
+    _add_agent_args(plugins_remove)
+    plugins_remove.add_argument("plugin_id")
+    plugins_remove.add_argument("--json", action="store_true")
+
     chat = sub.add_parser("chat")
     _add_agent_args(chat)
     chat.add_argument("--message", help="Run one chat turn. If omitted, enter interactive mode.")
@@ -199,7 +236,7 @@ def main() -> None:
     if args.cmd == "chat":
         config = _agent_config_from_args(args, backend=backend, memory_dir=memory_dir)
         manager = _build_run_manager(config)
-        agent = build_agent(config)
+        agent = build_agent(config, tools=manager.build_registry())
         try:
             if args.message:
                 if _handle_slash_command(agent, args.message.strip(), args.session_id, manager=manager):
@@ -305,6 +342,15 @@ def main() -> None:
             for spec in specs:
                 approval = "approval required" if spec["requires_approval"] else "allowed"
                 print(f"{spec['name']} [{spec['risk']}, {approval}] - {spec['description']}")
+        return
+
+    if args.cmd == "plugins":
+        config = _agent_config_from_args(args, backend=backend, memory_dir=memory_dir)
+        manager = _build_run_manager(config)
+        try:
+            _handle_plugins_command(args, manager, backend=backend, memory_dir=memory_dir)
+        finally:
+            manager.mcp.shutdown()
         return
 
     if args.cmd == "doctor":
@@ -433,6 +479,7 @@ def _agent_config_from_args(args: argparse.Namespace, *, backend: str, memory_di
         log_dir=args.log_dir,
         state_path=args.state_path,
         skills_dir=args.skills_dir,
+        plugins_dir=args.plugins_dir,
         mcp_config_path=args.mcp_config,
         channel_config_path=args.channels_config,
         enable_channel_delivery=args.enable_channel_delivery,
@@ -443,6 +490,7 @@ def _agent_config_from_args(args: argparse.Namespace, *, backend: str, memory_di
         allow_file_write=args.allow_file_write,
         allow_policy_writes=args.allow_policy_writes,
         allow_codex_cli=args.allow_codex_cli,
+        allow_plugin_install=args.allow_plugin_install,
         enable_autonomous_scheduler=args.enable_autonomous_scheduler,
         max_scheduler_tasks=args.max_scheduler_tasks,
         max_scheduler_cycles=args.max_scheduler_cycles,
@@ -589,6 +637,7 @@ def _doctor_tool_config(config: AgentConfig) -> dict[str, Any]:
         "allow_file_write": config.allow_file_write,
         "allow_policy_writes": config.allow_policy_writes,
         "allow_codex_cli": config.allow_codex_cli,
+        "allow_plugin_install": config.allow_plugin_install,
         "require_approval_for_high_risk_tools": config.require_approval_for_high_risk_tools,
         "max_tool_rounds": config.max_tool_rounds,
         "context_budget_chars": config.context_budget_chars,
@@ -664,7 +713,8 @@ def _build_run_manager(config: AgentConfig) -> RunManager:
     events = RunEventBus(state)
     mcp = MCPManager(state)
     skills = SkillManager(config.skills_dir, state)
-    return RunManager(config=config, state=state, events=events, mcp=mcp, skills=skills)
+    plugins = PluginManager(config.plugins_dir, state)
+    return RunManager(config=config, state=state, events=events, mcp=mcp, skills=skills, plugins=plugins)
 
 
 def _create_run_and_print(
@@ -810,6 +860,104 @@ def _print_pending_approvals(payload: dict[str, Any]) -> None:
         print(f"- {approval['approval_id']} tool={approval['tool_name']} risk={approval['risk']}")
 
 
+def _handle_plugins_command(
+    args: argparse.Namespace,
+    manager: RunManager,
+    *,
+    backend: str,
+    memory_dir: Path,
+) -> None:
+    try:
+        if args.plugins_cmd == "list":
+            manager.plugins.sync_all()
+            _print_plugins(manager.plugins.list_plugins(), json_output=args.json)
+            return
+        if args.plugins_cmd == "install":
+            plugin = manager.plugins.install(
+                args.source,
+                ref=args.ref,
+                enable=args.enable,
+                overwrite=args.overwrite,
+            )
+            _write_plugin_audit(manager, backend=backend, memory_dir=memory_dir, action="install", plugin=plugin)
+            _print_plugin(plugin, json_output=args.json)
+            return
+        if args.plugins_cmd == "inspect":
+            _print_plugin(manager.plugins.get_plugin(args.plugin_id), json_output=args.json)
+            return
+        if args.plugins_cmd == "enable":
+            plugin = manager.plugins.set_enabled(args.plugin_id, True)
+            _write_plugin_audit(manager, backend=backend, memory_dir=memory_dir, action="enable", plugin=plugin)
+            _print_plugin(plugin, json_output=args.json)
+            return
+        if args.plugins_cmd == "disable":
+            plugin = manager.plugins.set_enabled(args.plugin_id, False)
+            _write_plugin_audit(manager, backend=backend, memory_dir=memory_dir, action="disable", plugin=plugin)
+            _print_plugin(plugin, json_output=args.json)
+            return
+        if args.plugins_cmd == "update":
+            plugin = manager.plugins.update(args.plugin_id, ref=args.ref)
+            _write_plugin_audit(manager, backend=backend, memory_dir=memory_dir, action="update", plugin=plugin)
+            _print_plugin(plugin, json_output=args.json)
+            return
+        if args.plugins_cmd == "remove":
+            result = manager.plugins.remove(args.plugin_id)
+            if args.json:
+                print(json.dumps(result, indent=2))
+            else:
+                print(f"removed: {result['plugin_id']}")
+            return
+    except (PluginError, FileExistsError, KeyError) as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _write_plugin_audit(
+    manager: RunManager,
+    *,
+    backend: str,
+    memory_dir: Path,
+    action: str,
+    plugin: dict[str, Any],
+) -> None:
+    memory = build_memory_system(backend, memory_dir)
+    try:
+        manager.plugins.write_audit_memory(memory, action=action, plugin=plugin)
+    finally:
+        memory.close_all()
+
+
+def _print_plugins(plugins: list[dict[str, Any]], *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps({"plugins": plugins}, indent=2))
+        return
+    if not plugins:
+        print("No plugins installed.")
+        return
+    for plugin in plugins:
+        state = "enabled" if plugin["enabled"] else "not enabled"
+        capabilities = ", ".join(str(item) for item in plugin.get("capabilities", [])) or "none"
+        print(f"{plugin['id']} [{state}] {plugin['source_url']} @ {plugin['commit_sha'][:12]} capabilities={capabilities}")
+
+
+def _print_plugin(plugin: dict[str, Any], *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(plugin, indent=2))
+        return
+    state = "enabled" if plugin["enabled"] else "not enabled"
+    print(f"{plugin['id']} [{state}]")
+    print(f"name: {plugin['name']}")
+    print(f"source: {plugin['source_url']}")
+    print(f"commit: {plugin['commit_sha']}")
+    print(f"format: {plugin['format']}")
+    print(f"capabilities: {', '.join(str(item) for item in plugin.get('capabilities', [])) or 'none'}")
+    warnings = plugin.get("risk_report", {}).get("warnings", [])
+    unsupported = plugin.get("risk_report", {}).get("unsupported_features", [])
+    if warnings:
+        print(f"warnings: {', '.join(str(item) for item in warnings)}")
+    if unsupported:
+        print(f"unsupported: {', '.join(str(item) for item in unsupported)}")
+
+
 def _wait_for_run(manager: RunManager, run_id: str) -> dict[str, Any]:
     deadline = monotonic() + max(manager.config.timeout_seconds + 15, 15)
     terminal = {"completed", "failed", "blocked", "cancelled"}
@@ -903,6 +1051,14 @@ def _handle_slash_command(
         for spec in agent.tools.specs():
             approval = "approval required" if spec.requires_approval else "allowed"
             print(f"{spec.name} [{spec.risk}, {approval}] - {spec.description}")
+        return True
+
+    if name == "/plugins":
+        if manager is None:
+            print("Plugin status requires CLI run-manager mode.")
+            return True
+        manager.plugins.sync_all()
+        _print_plugins(manager.plugins.list_plugins(), json_output=False)
         return True
 
     if name == "/context":
@@ -1024,6 +1180,7 @@ def _slash_help() -> str:
             "Available slash commands:",
             "/help",
             "/tools",
+            "/plugins",
             "/context <query>",
             "/pack <query>",
             "/conflicts <query>",

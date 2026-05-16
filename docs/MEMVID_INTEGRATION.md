@@ -1,37 +1,61 @@
-# Memvid Integration Plan
+# Memvid Integration
 
-## Current Memvid mental model
+Last updated: 2026-05-16
 
-Use Memvid v2 `.mv2` files. Do not build against QR-code or video-frame Memvid v1 behavior.
+Kestrel uses Memvid v2 `.mv2` files as its durable retrieval-memory substrate. Do not build against deprecated QR/video-frame Memvid v1 behavior, and do not replace `.mv2` memory with SQLite, Postgres, Chroma, FAISS, or JSON logs.
 
-The scaffold uses `MemvidBackend` as a thin adapter around `memvid_sdk`:
+SQLite is used only for control-plane state such as runs, approvals, MCP servers, skills, task nodes, and subagent records.
 
-- `create(path, enable_vec=True, enable_lex=True)` for missing files.
-- `use("basic", path)` for existing files.
-- `put(title, label, metadata, text=..., uri=..., track=..., kind=...)` to store records.
-- `find(query, mode=..., k=..., scope="track:<layer>", adaptive=True, ...)` to retrieve.
-- `seal()` to commit.
-- `verify(deep=True)` to validate file integrity.
+## Current Adapter
 
-Codex should verify these calls against the installed SDK and update the adapter if names differ.
+The executable adapter is `src/nested_memvid_agent/backends/memvid_backend.py`.
 
-## Storage policy
+Current behavior:
 
-Use one `.mv2` file per nested layer:
+- Imports `memvid_sdk` lazily so unit tests can run without the Memvid extra.
+- Uses `use("basic", path, ...)` for existing `.mv2` files.
+- Calls `create(path, enable_vec=False, enable_lex=True)` only for missing files.
+- Defaults to lexical-first writes (`enable_vec=False`, `enable_lex=True`) to avoid accidental embedding/API-key requirements.
+- Writes records with `text`, `uri`, `tags`, `labels`, `track`, `kind`, and nested-memory metadata.
+- Passes `enable_embedding=self.enable_vec` on writes so embedding use is explicit.
+- Normalizes SDK `find()` result shapes into `MemoryHit`.
+- Avoids scope assumptions that can trigger lexical-index errors in installed SDKs.
+- Supports context-frame round trips through `put_frame()` and `find_frames()`.
+- Exposes `seal()`, `verify()`, `doctor(dry_run=True)`, `stats()`, and `close()`.
+
+The adapter was hardened against `memvid_sdk 2.0.159`. Re-check SDK signatures before upgrading the dependency.
+
+## Storage Layout
+
+Kestrel keeps one permanent `.mv2` file per nested layer:
 
 ```text
-working.mv2
-episodic.mv2
-semantic.mv2
-procedural.mv2
-policy.mv2
+.nest/memory/working.mv2
+.nest/memory/episodic.mv2
+.nest/memory/semantic.mv2
+.nest/memory/procedural.mv2
+.nest/memory/policy.mv2
 ```
 
-Use `track=<layer>` and `label=<layer>` even inside per-layer files. This makes future merge/export easier.
+Run capsules live separately:
 
-## Metadata contract
+```text
+.nest/runs/{run_id}/complete.mv2
+```
 
-Every Memvid frame should include:
+`complete.mv2` is a run evidence bundle, not a sixth permanent layer.
+
+## Data-Loss Rules
+
+- Never call `create(path)` when `path` already exists.
+- Open existing `.mv2` files through the SDK's safe open/use path.
+- Copy `.mv2` files for backup or migration; do not recreate them in place.
+- Seal changed memories after writes.
+- Verify important memory directories after migration, restore, or SDK upgrade.
+
+## Metadata Contract
+
+Every stored record should carry nested-memory metadata such as:
 
 ```json
 {
@@ -41,68 +65,80 @@ Every Memvid frame should include:
   "nested_confidence": 0.91,
   "nested_importance": 0.75,
   "content_hash": "sha256...",
-  "evidence": [
-    {"source": "terminal", "locator": "run_001", "quote": "..."}
-  ],
-  "created_at": "2026-05-15T...Z",
-  "updated_at": "2026-05-15T...Z"
+  "source": "tool.memory.write",
+  "frame_type": "section_summary",
+  "parent_ids": ["raw_parent"],
+  "child_ids": ["raw_child"],
+  "context_flow_id": "semantic_fact_consolidation",
+  "validation_status": "validated",
+  "created_at": "2026-05-16T..."
 }
 ```
 
-## Search modes
+For context frames, preserve frame ID, frame type, parent/child links, source URI/span, content hash, confidence, importance, provenance, and validation metadata.
 
-Use layer-specific defaults:
+## Search Modes
 
-- Working: `lex`, because active state often contains exact errors and paths.
-- Episodic: `auto`, because failures/events need both exact and semantic recall.
-- Semantic: `auto`.
-- Procedural: `auto`.
-- Policy: `lex`, because policy wording and exact constraints matter.
+Layer defaults should stay conservative:
 
-## Adaptive retrieval
+- Working: lexical, because active state often contains exact paths, errors, and command text.
+- Episodic: auto/hybrid where available, because events and failures benefit from exact and semantic recall.
+- Semantic: auto/hybrid where available.
+- Procedural: auto/hybrid where available.
+- Policy: lexical exactness preferred.
 
-Use adaptive retrieval for open-ended recall. Disable adaptive retrieval only when the context compiler requires a fixed number of chunks for a deterministic budget test.
+The current adapter uses the SDK's returned hits directly and normalizes metadata instead of forcing layer-specific scope filtering.
 
-## Memory cards / Logic Mesh
+## CLI and Tools
 
-Use Memory Cards for stable entities:
+CLI commands:
 
-- repo → framework
-- service → dependency
-- user → preference
-- agent → provider auth profile
-- procedure → required validation
+```bash
+nest-agent init --backend memvid --memory-dir .nest/memory
+nest-agent memory verify --backend memvid --memory-dir .nest/memory
+nest-agent memory doctor --backend memvid --memory-dir .nest/memory
+nest-agent memory inspect --backend memvid --memory-dir .nest/memory "policy promotion"
+```
 
-For codebase understanding, Logic Mesh can map relationships such as:
+Built-in tools:
 
-- module depends_on package
-- endpoint uses service
-- agent uses provider
-- provider requires credential
+- `memvid.verify`
+- `memvid.doctor`
+- `memvid.stats`
+- `memory.inspect`
+- `memory.export`
+- `memory.import`
+- `context.pack`
+- `context.expand`
+- `memory.conflicts`
 
-## ACL/security
+`memory.import` is high-risk and approval-gated. Policy writes remain gated separately by `allow_policy_writes`.
 
-For single-user local dev, ACL can be disabled. For team/enterprise use:
+## Integration Tests
 
-- Store tenant and role metadata on every frame.
-- Query with ACL enforcement.
-- Encrypt policy or sensitive project capsules to `.mv2e` when needed.
+Memvid tests are opt-in:
 
-## Validation hooks
+```bash
+RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
+RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
+```
 
-After each write batch:
+The integration suite covers:
 
-1. `seal()` all changed capsules.
-2. `verify(deep=True)` each changed capsule.
-3. Run golden retrieval questions.
-4. Run context compiler budget tests.
-5. Replay recorded sessions when debugging retrieval drift.
+- write -> seal -> verify -> close -> reopen -> search
+- context-frame metadata round trip
+- run-capsule `complete.mv2` summary reads
+- isolated memory directories for golden eval cases to avoid `.mv2` lock contention
 
-## Open tasks for Codex
+Use `python -m pytest` so fixture subprocesses inherit the same interpreter and installed extras.
 
-1. Install `memvid-sdk` and run the integration smoke test.
-2. Adjust import paths if the current SDK exposes `memvid` instead of `memvid_sdk`.
-3. Confirm exact shape of `find()` results.
-4. Add a skipped pytest integration test that unskips when `RUN_MEMVID_INTEGRATION=1`.
-5. Add CLI commands for `doctor`, `enrich`, `session_start`, `session_replay`, and `correct`.
-6. Add optional Memory Card extraction for semantic/procedural layers.
+## Upgrade Checklist
+
+Before changing the Memvid SDK version:
+
+1. Inspect `create`, `use`, `put`, `find`, `seal`, `verify`, `doctor`, `stats`, and `close` signatures.
+2. Confirm existing files are opened with `use(...)`, not recreated.
+3. Confirm lexical-first writes do not require an embedding API key.
+4. Confirm `find()` result metadata is still normalized into `MemoryHit`.
+5. Run the gated Memvid integration tests.
+6. Run golden evals with both memory and Memvid backends when possible.

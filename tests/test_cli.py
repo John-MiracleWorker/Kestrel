@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -67,6 +68,62 @@ def test_tools_subcommand_lists_risk_levels(monkeypatch: MonkeyPatch, capsys: ob
     output = capsys.readouterr().out
     assert "memory.search [low, allowed]" in output
     assert "git.commit [high, approval required]" in output
+
+
+def test_plugins_subcommands_install_list_and_toggle(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: object,
+) -> None:
+    plugin_repo = tmp_path / "plugin-repo"
+    plugin_repo.mkdir()
+    (plugin_repo / "kestrel.plugin.json").write_text(
+        json.dumps(
+            {
+                "id": "clip",
+                "name": "CLI Plugin",
+                "description": "CLI plugin fixture.",
+                "skills": [
+                    {
+                        "id": "hello",
+                        "description": "Say hello.",
+                        "instructions": "Return hello.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_fetch(self: object, source: object, destination: Path, ref: str | None = None) -> str:
+        del self, source, ref
+        shutil.copytree(plugin_repo, destination)
+        return "c" * 40
+
+    monkeypatch.setattr("nested_memvid_agent.plugin_manager.GitPluginFetcher.fetch", fake_fetch)
+    common_args = [
+        "--state-path",
+        str(tmp_path / "state.db"),
+        "--plugins-dir",
+        str(tmp_path / "plugins"),
+        "--memory-dir",
+        str(tmp_path / "memory"),
+    ]
+    monkeypatch.setattr(sys, "argv", ["nest-agent", "plugins", "install", "owner/repo", *common_args])
+    main()
+    assert "clip [not enabled]" in capsys.readouterr().out
+
+    monkeypatch.setattr(sys, "argv", ["nest-agent", "plugins", "list", *common_args])
+    main()
+    assert "clip [not enabled]" in capsys.readouterr().out
+
+    monkeypatch.setattr(sys, "argv", ["nest-agent", "plugins", "enable", "clip", *common_args])
+    main()
+    assert "clip [enabled]" in capsys.readouterr().out
+
+    monkeypatch.setattr(sys, "argv", ["nest-agent", "plugins", "disable", "clip", *common_args])
+    main()
+    assert "clip [not enabled]" in capsys.readouterr().out
 
 
 def test_context_subcommand_compiles_prompt(tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object) -> None:

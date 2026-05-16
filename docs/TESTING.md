@@ -1,41 +1,91 @@
 # Testing Guide
 
-## Local tests
+Last updated: 2026-05-16
+
+Kestrel's fast test path is deterministic: it uses `InMemoryBackend` plus the mock LLM provider. Memvid, MCP, provider, and platform integrations stay behind explicit environment flags.
+
+## Setup
 
 ```bash
-pip install -e .[dev]
-pytest
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e '.[memvid,openai,server,mcp,dev]'
+npm install --prefix web
 ```
 
-These tests use `InMemoryBackend`, so they do not require Memvid.
+## Core Validation
 
-## Lint/type checks
+Run these for normal development:
 
 ```bash
-ruff check .
-mypy src
+python -m compileall -q src tests scripts
+python -m pytest -q
+python scripts/run_golden_evals.py --backend memory --provider mock
+PYTHONPATH=src python -m nested_memvid_agent.cli chat --backend memory --provider mock --message "hello"
 ```
 
-## Memvid integration tests
+`python -m pytest -q` is preferred over a global `pytest` binary so subprocess fixtures use the active interpreter.
 
-Install Memvid:
+## Lint, Types, and Web
 
 ```bash
-pip install memvid-sdk
+python -m ruff check scripts src tests
+python -m mypy src
+npm run test --prefix web
+npm run build --prefix web
 ```
 
-Then run:
+`npm run test --prefix web` currently runs the TypeScript build in no-pretty mode. `npm run build --prefix web` runs TypeScript plus the Vite production build.
+
+## Optional Memvid Integration
+
+The Memvid tests require `memvid-sdk` from the `memvid` extra and are skipped unless `RUN_MEMVID_INTEGRATION=1` is set:
 
 ```bash
-python scripts/bootstrap_memory.py --backend memvid --memory-dir ./memory
-python scripts/run_validation.py --backend memvid --memory-dir ./memory
-nested-memvid search --backend memvid --query "policy promotion"
+RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
+RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
 ```
 
-## What Codex should add
+The tests create temporary `.mv2` files, write records, seal, verify, close, reopen, search, round-trip context-frame metadata, and read run-scoped `complete.mv2` capsules.
 
-- `tests/integration/test_memvid_backend.py`, skipped unless `RUN_MEMVID_INTEGRATION=1`.
-- Golden JSON loader.
-- Session replay tests once Memvid session APIs are wired.
-- Context regression snapshots.
-- Latency benchmark script.
+## Optional MCP Integration
+
+Live stdio MCP coverage is gated by `RUN_MCP_INTEGRATION=1`:
+
+```bash
+RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integration.py
+```
+
+The fixture server is `tests/integration/fixtures/stdio_mcp_server.py`. It proves managed stdio discovery and invocation through `MCPManager`.
+
+## Golden Evals
+
+Golden evals are in `scripts/run_golden_evals.py` and cover agent behavior across turns, safety gates, memory use, and consolidation expectations.
+
+Fast path:
+
+```bash
+python scripts/run_golden_evals.py --backend memory --provider mock
+```
+
+Memvid path:
+
+```bash
+RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
+```
+
+Each Memvid golden case should use its own memory/log directory to avoid `.mv2` lock contention.
+
+## Release Validation
+
+Use `docs/RELEASE_CHECKLIST.md` before tagging or publishing an alpha build. The checklist includes compile, lint, typecheck, unit tests, golden evals, web build/test, optional Memvid/MCP integration, and packaging/Docker smoke checks.
+
+## Failure Handling
+
+If a validation run fails:
+
+1. Keep the failed command and error text.
+2. Do not promote memory from that failed run unless the failure itself is useful episodic evidence.
+3. Add or update focused tests before broad refactors.
+4. For repair loops, use repair branches and keep `repair.validate`, `repair.review`, and `git.commit` gates intact.

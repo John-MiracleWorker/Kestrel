@@ -6,9 +6,9 @@ Use this before tagging or publishing an alpha build.
 
 ```bash
 python -m compileall -q src tests scripts
-ruff check scripts src tests
-mypy src
-pytest -q
+python -m ruff check scripts src tests
+python -m mypy src
+python -m pytest -q
 python scripts/run_golden_evals.py --backend memory --provider mock
 npm run test --prefix web
 npm run build --prefix web
@@ -19,8 +19,8 @@ npm run build --prefix web
 Run when dependencies and local credentials are available:
 
 ```bash
-RUN_MEMVID_INTEGRATION=1 pytest -q tests/integration
-RUN_MCP_INTEGRATION=1 pytest -q tests/integration
+RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
+RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integration.py
 RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
 ```
 

@@ -14,8 +14,10 @@ from ..context_packer import ContextPacker, ContextPackRequest
 from ..diagnosis import classify_failure
 from ..models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from ..nested_learning import LearningSignal, NestedLearningKernel
+from ..plugin_manager import PluginManager
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
 from ..skill_manager import validate_skill_manifest
+from ..state_store import AgentStateStore
 from ..task_capsule import summarize_run_capsule
 from .base import AgentTool, ToolContext
 from .registry import ToolRegistry
@@ -1824,6 +1826,46 @@ class SkillInstallTool(AgentTool):
             return self._result(call, success=False, content=str(exc), error="skill_install_failed")
 
 
+class PluginInstallTool(AgentTool):
+    spec = ToolSpec(
+        name="plugin.install",
+        description="Install a public GitHub plugin repo into the local plugin registry. Requires plugin-install enablement and exact approval.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "source": {"type": "string"},
+                "ref": {"type": "string"},
+                "enable": {"type": "boolean"},
+                "overwrite": {"type": "boolean"},
+            },
+            "required": ["source"],
+        },
+        risk="high",
+        requires_approval=True,
+        capabilities=("plugin-install", "github", "provenance"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        source = str(arguments.get("source", "")).strip()
+        if not source:
+            return self._result(call, success=False, content="source is required", error="missing_source")
+        state = AgentStateStore(context.config.state_path)
+        manager = PluginManager(context.config.plugins_dir, state)
+        try:
+            plugin = manager.install(
+                source,
+                ref=str(arguments["ref"]).strip() if arguments.get("ref") else None,
+                enable=bool(arguments.get("enable", False)),
+                overwrite=bool(arguments.get("overwrite", False)),
+            )
+            record_id = manager.write_audit_memory(context.memory, action="install", plugin=plugin)
+            payload = {**plugin, "memory_record_id": record_id}
+            return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+        except Exception as exc:  # noqa: BLE001 - plugin install boundary reports structured failure
+            return self._result(call, success=False, content=str(exc), error="plugin_install_failed")
+
+
 class DiagnosisClassifyTool(AgentTool):
     spec = ToolSpec(
         name="diagnosis.classify",
@@ -1923,6 +1965,7 @@ def build_default_tools() -> ToolRegistry:
     registry.register(MemoryExportTool())
     registry.register(MemoryImportTool())
     registry.register(SkillInstallTool())
+    registry.register(PluginInstallTool())
     return registry
 
 

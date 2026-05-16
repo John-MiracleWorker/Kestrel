@@ -110,4 +110,5 @@ _ENABLEMENT_BY_TOOL = {
     "repair.rollback": "allow_file_write",
     "codex.exec": "allow_codex_cli",
     "skill.install": "allow_file_write",
+    "plugin.install": "allow_plugin_install",
 }

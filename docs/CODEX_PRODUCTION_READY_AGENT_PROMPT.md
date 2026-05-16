@@ -362,7 +362,7 @@ confirm no accidental overwrite
 Acceptance commands:
 
 ```bash
-RUN_MEMVID_INTEGRATION=1 pytest -q tests/integration
+RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
 nest-agent memory verify --memory-dir .nest/memory
 nest-agent memory doctor --memory-dir .nest/memory
 ```
@@ -1094,7 +1094,7 @@ ruff check .
 mypy src
 pytest -q
 python scripts/run_golden_evals.py --backend memory
-RUN_MEMVID_INTEGRATION=1 pytest -q tests/integration
+RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
 RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid
 ```
 

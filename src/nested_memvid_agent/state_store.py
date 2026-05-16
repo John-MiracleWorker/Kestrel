@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 
 
@@ -74,7 +74,7 @@ class SubagentRunRecord:
 
 
 class AgentStateStore:
-    """SQLite control-plane state for runs, approvals, MCP servers, and skills."""
+    """SQLite control-plane state for runs, approvals, MCP servers, skills, and plugins."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -449,6 +449,84 @@ class AgentStateStore:
             )
         return self.get_skill(skill_id)
 
+    def delete_skill(self, skill_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM skill_registry WHERE id = ?", (skill_id,))
+
+    def upsert_plugin(self, plugin: dict[str, Any]) -> dict[str, Any]:
+        plugin_id = str(plugin["id"])
+        now = utc_now()
+        created_at = str(plugin.get("created_at") or now)
+        with self._connect() as conn:
+            current = conn.execute("SELECT created_at FROM plugin_registry WHERE id = ?", (plugin_id,)).fetchone()
+            if current is not None:
+                created_at = str(current["created_at"])
+            conn.execute(
+                """
+                INSERT INTO plugin_registry (
+                    id, name, description, source_url, source_ref, commit_sha, install_path,
+                    manifest_json, capabilities_json, enabled, risk_report_json,
+                    install_status, format, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    description = excluded.description,
+                    source_url = excluded.source_url,
+                    source_ref = excluded.source_ref,
+                    commit_sha = excluded.commit_sha,
+                    install_path = excluded.install_path,
+                    manifest_json = excluded.manifest_json,
+                    capabilities_json = excluded.capabilities_json,
+                    enabled = excluded.enabled,
+                    risk_report_json = excluded.risk_report_json,
+                    install_status = excluded.install_status,
+                    format = excluded.format,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    plugin_id,
+                    plugin.get("name", plugin_id),
+                    plugin.get("description", ""),
+                    plugin.get("source_url", ""),
+                    plugin.get("source_ref"),
+                    plugin.get("commit_sha", ""),
+                    plugin.get("install_path", ""),
+                    json.dumps(plugin.get("manifest", {})),
+                    json.dumps(plugin.get("capabilities", [])),
+                    1 if plugin.get("enabled", False) else 0,
+                    json.dumps(plugin.get("risk_report", {})),
+                    plugin.get("install_status", "installed"),
+                    plugin.get("format", "kestrel"),
+                    created_at,
+                    now,
+                ),
+            )
+        return self.get_plugin(plugin_id)
+
+    def get_plugin(self, plugin_id: str) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM plugin_registry WHERE id = ?", (plugin_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown plugin: {plugin_id}")
+        return _plugin_from_row(row)
+
+    def list_plugins(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM plugin_registry ORDER BY name ASC").fetchall()
+        return [_plugin_from_row(row) for row in rows]
+
+    def set_plugin_enabled(self, plugin_id: str, enabled: bool) -> dict[str, Any]:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE plugin_registry SET enabled = ?, updated_at = ? WHERE id = ?",
+                (1 if enabled else 0, utc_now(), plugin_id),
+            )
+        return self.get_plugin(plugin_id)
+
+    def delete_plugin(self, plugin_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM plugin_registry WHERE id = ?", (plugin_id,))
+
     def create_task_node(
         self,
         *,
@@ -636,6 +714,9 @@ class AgentStateStore:
             if current < 6:
                 _apply_schema_v6(conn)
                 current = 6
+            if current < 7:
+                _apply_schema_v7(conn)
+                current = 7
             if current < SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported schema migration target: {current} -> {SCHEMA_VERSION}")
             if current == SCHEMA_VERSION:
@@ -833,6 +914,32 @@ def _apply_schema_v6(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE task_nodes ADD COLUMN {name} {definition}")
 
 
+def _apply_schema_v7(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS plugin_registry (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            source_ref TEXT,
+            commit_sha TEXT NOT NULL,
+            install_path TEXT NOT NULL,
+            manifest_json TEXT NOT NULL,
+            capabilities_json TEXT NOT NULL,
+            enabled INTEGER NOT NULL,
+            risk_report_json TEXT NOT NULL,
+            install_status TEXT NOT NULL,
+            format TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_plugin_registry_enabled ON plugin_registry(enabled);
+        """
+    )
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -922,6 +1029,26 @@ def _skill_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "path": str(row["path"]),
         "manifest": json.loads(str(row["manifest_json"])),
         "enabled": bool(row["enabled"]),
+        "updated_at": str(row["updated_at"]),
+    }
+
+
+def _plugin_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "name": str(row["name"]),
+        "description": str(row["description"]),
+        "source_url": str(row["source_url"]),
+        "source_ref": None if row["source_ref"] is None else str(row["source_ref"]),
+        "commit_sha": str(row["commit_sha"]),
+        "install_path": str(row["install_path"]),
+        "manifest": json.loads(str(row["manifest_json"])),
+        "capabilities": json.loads(str(row["capabilities_json"])),
+        "enabled": bool(row["enabled"]),
+        "risk_report": json.loads(str(row["risk_report_json"])),
+        "install_status": str(row["install_status"]),
+        "format": str(row["format"]),
+        "created_at": str(row["created_at"]),
         "updated_at": str(row["updated_at"]),
     }
 

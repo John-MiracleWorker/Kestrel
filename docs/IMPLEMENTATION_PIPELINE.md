@@ -1,141 +1,228 @@
 # Implementation Pipeline
 
-## Phase 0 — Baseline verification
+Last updated: 2026-05-16
 
-Commands:
+This file records what has landed and what should be hardened next. `docs/IMPLEMENTATION_STATUS.md` is the authoritative current truth table.
+
+## Phase 0 - Baseline Verification
+
+Status: implemented.
+
+Current fast baseline:
 
 ```bash
-pytest -q
-python -m compileall -q src tests
+python -m compileall -q src tests scripts
+python -m pytest -q
+python scripts/run_golden_evals.py --backend memory --provider mock
+nest-agent chat --backend memory --provider mock --message "hello"
 ```
 
-Expected: pass.
+## Phase 1 - Memvid SDK Hardening
 
-## Phase 1 — Memvid SDK hardening
+Status: implemented for the current adapter.
 
-Goals:
+Landed:
 
-- install `memvid-sdk`
-- verify `create`, `use`, `put`, `find`, `seal`, `verify`, `close`
-- ensure `create(path)` is never called on existing files
-- test read-only mode
-- test lock behavior if available
-- normalize returned hit shapes
+- Lazy `memvid_sdk` import.
+- Safe existing-file open path through `use(...)`.
+- Missing-file creation only.
+- Lexical-first defaults to avoid accidental embedding/API-key calls.
+- Hit normalization into `MemoryHit`.
+- `seal`, `verify`, `doctor`, `stats`, and `close` surfaces.
+- Context-frame and run-capsule Memvid integration coverage.
+- Gated tests behind `RUN_MEMVID_INTEGRATION=1`.
 
-Deliverables:
+Remaining:
 
-- hardened `MemvidBackend`
-- `tests/integration/test_memvid_backend_integration.py`
-- test gated by `RUN_MEMVID_INTEGRATION=1`
+- Re-check SDK signatures on each dependency upgrade.
+- Add coverage for encrypted `.mv2e` if that becomes a supported runtime target.
 
-## Phase 2 — Chat-capable runtime
+## Phase 2 - Conversational CLI Runtime
 
-Goals:
+Status: implemented.
 
-- confirm `nest-agent chat --backend memory --provider mock` works
-- confirm `nest-agent chat --backend memvid --provider openai` works
-- add persistent session ID support
-- add `/memory`, `/context`, `/tools`, `/exit` chat commands
+Landed:
 
-Deliverables:
+- `nest-agent chat` one-shot and interactive modes.
+- `--session-id`.
+- Slash commands: `/exit`, `/tools`, `/context`, `/memory`, `/doctor`, `/session`.
+- Background run/status/approval CLI surfaces.
+- Deterministic mock provider path.
 
-- CLI integration tests
-- transcript smoke test
+Remaining:
 
-## Phase 3 — Native tool calling
+- Improve human-facing transcript rendering for long tool traces.
+- Add richer resumable multi-turn CLI ergonomics.
 
-Goals:
+## Phase 3 - Provider Hardening
 
-- upgrade OpenAI provider to native tool/function calling
-- keep JSON envelope fallback
-- add provider error/retry handling
-- add streaming option
+Status: partially implemented.
 
-Deliverables:
+Landed:
 
-- `OpenAIResponsesProvider` native tool support
-- tests with mocked OpenAI response objects
+- Mock provider.
+- OpenAI Responses provider.
+- OpenAI-compatible chat completions provider.
+- Codex CLI provider.
+- Provider capability metadata.
+- Retryable provider fallback wrapper.
+- OpenAI Responses streaming deltas when the SDK stream surface is available.
+- Portable JSON tool envelope.
 
-## Phase 4 — Tool expansion
+Remaining:
 
-Add tools:
+- Native tool-calling parity across providers.
+- Streaming parity for OpenAI-compatible/local providers.
+- Broader live integration tests for real provider variants.
+- Richer context/JSON-mode handling per provider.
 
+## Phase 4 - Tool Expansion and Safety
+
+Status: implemented for the first serious local-agent slice.
+
+Landed built-ins include:
+
+- `memory.search`
+- `memory.write`
+- `memory.consolidate`
+- `memory.learn`
+- `memory.conflicts`
+- `memory.inspect`
+- `memory.export`
+- `memory.import`
+- `context.pack`
+- `context.expand`
+- `capsule.summarize`
+- `capsule.apply`
+- `file.list`
+- `file.read`
+- `file.write`
+- `shell.run`
 - `repo.search`
 - `repo.map`
 - `patch.apply`
 - `test.run`
+- `lint.run`
 - `git.status`
 - `git.diff`
-- `memory.consolidate`
+- `git.branch`
+- `git.commit`
 - `memvid.verify`
 - `memvid.doctor`
+- `memvid.stats`
+- `skill.install`
+- `diagnosis.classify`
+- `diagnosis.recall`
+- `codex.exec`
+- repair tools
 
-Every high-risk tool must have:
+Landed safety behavior:
 
-- schema
-- risk classification
-- permission gate
-- unit tests
-- event log entry
+- Workspace/path boundaries.
+- Timeout enforcement.
+- Config enablement gates.
+- Exact-call approval gates.
+- Repair branch reviewer gate before repair commits.
+- Structured failures at tool boundaries.
 
-## Phase 5 — Consolidation engine
+Remaining:
 
-Goals:
+- More production-grade UX around approval review.
+- Stronger sandboxing for skill runtimes and tool side effects.
 
-- identify candidates from working/episodic memory
-- score candidates
-- detect duplicate/conflicting memories
-- create promotion records
-- require evidence refs
-- write promoted records to upper layer
+## Phase 5 - Consolidation and Nested Learning
 
-Tests:
+Status: partially implemented.
 
-- failure does not become procedure
-- repeated success becomes procedure
-- single correction does not become policy
-- validated user preference can become semantic memory
-- manual high-confidence rule can become policy only when enabled
+Landed:
 
-## Phase 6 — Evaluation harness
+- `NestedLearningKernel`.
+- Context-flow and optimizer-trace metadata.
+- Promotion gate metadata for accepted/rejected decisions.
+- `memory.learn` and `memory.consolidate`.
+- Run-scoped task capsules.
+- `capsule.summarize` preview path.
+- `capsule.apply` high-risk, config-gated, approval-gated path.
+- Policy memory constraints for explicit instruction, high validation, repeat evidence, config enablement, and review.
 
-Golden scenarios:
+Remaining:
 
-1. Remember user correction across sessions.
-2. Retrieve relevant prior failure before repeating it.
-3. Use procedural recipe after repeated success.
-4. Block policy write from a single event.
-5. Refuse workspace path escape.
-6. Allow shell only with config.
-7. Verify `.mv2` files after a turn.
-8. Recover context without full transcript stuffing.
+- Stronger validation loops before auto-consolidation.
+- Richer conflict/correction lifecycle.
+- Better operator review UI for proposed learning signals.
 
-Metrics:
+## Phase 6 - Evaluation Harness
 
-- retrieval latency per layer
-- context size
-- tool-loop count
-- memory writes per turn
-- promotion precision
-- false promotion rate
-- user correction adherence
+Status: implemented for mock and optional Memvid paths.
 
-## Phase 7 — Optional server/UI
+Current commands:
 
-Implement after CLI is stable:
+```bash
+python scripts/run_golden_evals.py --backend memory --provider mock
+RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
+```
 
-- FastAPI `/chat`
-- `/memory/search`
-- `/memory/verify`
-- `/sessions/{id}`
-- streaming responses
-- small web frontend or TUI
+Remaining:
 
-## Phase 8 — Packaging
+- Add provider-specific golden suites once live provider tests are stable.
+- Add long-running regression fixtures for scheduler/repair flows.
 
-- Dockerfile
-- install script
-- `.env.example`
-- release checklist
-- project template
-- docs for memory migration/export
+## Phase 7 - API, Web, Channels, MCP, Skills
+
+Status: partially implemented.
+
+Landed:
+
+- FastAPI app and local React/Vite workbench.
+- SSE run timeline events.
+- Approval routes.
+- Memory/context routes.
+- Skills registry and upload/install path.
+- Managed stdio MCP sessions and gated integration fixture.
+- Multi-channel ingress and generic HMAC webhook verification.
+- Local bearer/API-key auth option.
+
+Remaining:
+
+- Production multi-user auth and isolation.
+- MCP SSE/streamable HTTP fixtures and soak tests.
+- Production bot identity verification and rate-limit behavior.
+- Container-grade skill isolation and dependency management.
+
+## Phase 8 - Scheduler, Subagents, and Safe Repair
+
+Status: partially implemented.
+
+Landed:
+
+- Durable task graph records.
+- Deterministic starter DAG.
+- Ready-task filtering.
+- Bounded opt-in autonomous scheduler.
+- In-process planner/worker/reviewer profiles.
+- Diagnosis metadata on failed task/subagent records.
+- Repair branch preparation.
+- Repair patch/validate/orchestrate/rollback tools.
+- Repair review artifacts.
+- Repair-branch commit gate.
+
+Remaining:
+
+- True branch/worktree isolated worker fan-out.
+- Dynamic plan revision and reviewer enforcement across isolated workers.
+- Codex-backed worker orchestration.
+- Fully autonomous patch proposal with explicit approval and rollback controls.
+
+## Phase 9 - Packaging and Release
+
+Status: implemented for alpha packaging.
+
+Landed:
+
+- `Makefile` validation/package targets.
+- Dockerfile.
+- Docker Compose.
+- `.env.example`.
+- Deployment, memory operations, security, and release checklist docs.
+
+Release validation lives in `docs/RELEASE_CHECKLIST.md`.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from time import sleep
@@ -161,6 +162,81 @@ def test_skill_install_requires_approval_and_writes_capsule_after_exact_approval
     assert approved.success is True
     assert (tmp_path / "skills" / "uploaded-review" / "skill.json").exists()
     assert approved.data["installed"] is True
+
+
+def test_plugin_install_requires_enablement_and_exact_approval(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    plugin_repo = tmp_path / "plugin-repo"
+    plugin_repo.mkdir()
+    (plugin_repo / "kestrel.plugin.json").write_text(
+        json.dumps(
+            {
+                "id": "toolplug",
+                "name": "Tool Plugin",
+                "description": "Installed through the high-risk plugin tool.",
+                "skills": [
+                    {
+                        "id": "hello",
+                        "description": "Say hello.",
+                        "instructions": "Return hello.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_fetch(self: object, source: object, destination: Path, ref: str | None = None) -> str:
+        del self, source, ref
+        shutil.copytree(plugin_repo, destination)
+        return "b" * 40
+
+    monkeypatch.setattr("nested_memvid_agent.plugin_manager.GitPluginFetcher.fetch", fake_fetch)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    arguments = {"source": "owner/repo", "enable": True}
+    call = ToolCall(name="plugin.install", arguments=arguments, id="plugin_install_exact")
+
+    disabled = registry.execute(
+        call,
+        ToolContext(memory=memory, config=AgentConfig(state_path=tmp_path / "state.db", plugins_dir=tmp_path / "plugins"), workspace=tmp_path),
+    )
+    assert disabled.error == "tool_disabled"
+
+    pending = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(
+                allow_plugin_install=True,
+                state_path=tmp_path / "state.db",
+                plugins_dir=tmp_path / "plugins",
+            ),
+            workspace=tmp_path,
+        ),
+    )
+    assert pending.error == "approval_required"
+
+    approved = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(
+                allow_plugin_install=True,
+                state_path=tmp_path / "state.db",
+                plugins_dir=tmp_path / "plugins",
+            ),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"plugin_install_exact"}),
+            approved_tool_call_arguments={"plugin_install_exact": arguments},
+        ),
+    )
+
+    assert approved.success is True
+    assert approved.data["id"] == "toolplug"
+    assert approved.data["enabled"] is True
 
 
 def test_approved_exact_tool_call_runs_once_and_changed_args_do_not_run(tmp_path: Path) -> None:

@@ -1,57 +1,38 @@
-# Nested MV2 Agent
+# Kestrel
 
-A buildable scaffold for a full conversational agent runtime designed around a Nested Learning-inspired memory architecture and Memvid `.mv2` memory files.
+Kestrel is a local-first, memory-native agent runtime built around Nested Learning-inspired memory layers and Memvid v2 `.mv2` files.
 
-This is **not just a RAG backend**. It includes the pieces required for a real agent:
+It is not only a memory library and not only a chatbot wrapper. The current repo contains a conversational CLI, a FastAPI/web control plane, provider adapters, a tool registry with approval gates, managed MCP stdio sessions, skill loading, task capsules, a conservative consolidation pipeline, and a deterministic test path.
 
-- interactive CLI chat runtime
-- provider abstraction for LLMs
-- OpenAI Responses API adapter scaffold
-- OpenAI-compatible chat completions adapter for local/model-server endpoints
-- deterministic mock LLM for tests
-- tool registry and built-in tools
-- safety gates for shell and file writes
-- layered nested memory system
-- Memvid `.mv2` backend adapter
-- in-memory backend for tests and Codex iteration
-- context compiler
-- token-aware MV2 pseudo-context packer
-- run-scoped task capsules
-- multi-channel ingress for Telegram, Discord, and generic webhooks
-- paper-guided nested learning kernel
-- consolidation and learning-signal tools
-- event logging
-- validation plan and golden test pipeline
+Kestrel is still an alpha runtime. It is useful for local development and hardening work, but it is not yet a production multi-user agent platform.
 
-The previous memory scaffold becomes the memory subsystem. This package is the full agent scaffold.
+## What Works Now
 
-## Target architecture
+- CLI chat with in-memory or Memvid `.mv2` memory.
+- Deterministic mock provider for tests and golden evals.
+- OpenAI Responses provider with streaming deltas when the SDK stream surface is available.
+- OpenAI-compatible chat completions provider for local/model-server endpoints.
+- Local Codex CLI provider for using `codex exec` as the response engine.
+- Retryable provider fallback wrapper and provider capability metadata.
+- One permanent `.mv2` file per memory layer: working, episodic, semantic, procedural, and policy.
+- MV2 context frames plus a token-aware pseudo-context packer with evidence pointers, conflict warnings, and on-demand raw expansion.
+- Run-scoped `complete.mv2` task capsules for reviewable learning signals.
+- Nested Learning kernel with context-flow metadata, optimizer traces, promotion gates, and explicit policy-write constraints.
+- Built-in tools for memory, context, repo search, patching, tests, linting, git status/diff/commit, Memvid verify/doctor/stats, diagnosis, repair, skills, and Codex CLI delegation.
+- Exact-call approval gates for high-risk tools, including shell, file writes, patching, tests/lint, repair mutations, commits, skill installs, imports, and Codex CLI delegation.
+- SQLite control-plane state for runs, approvals, MCP servers, skills, plugins, task nodes, subagents, and replay-safe terminal transitions. SQLite is not the retrieval memory store.
+- Local FastAPI/web workbench with background runs, SSE timeline events, approvals, memory/context tools, MCP controls, skills, subagents, and scheduler actions.
+- Managed stdio MCP sessions with lazy connect/disconnect/restart/health, tool discovery, vetting metadata, and approval-by-default risk normalization.
+- Experimental plugin registry/CLI that can materialize plugin-provided skills and MCP server entries from GitHub plugin manifests.
+- Multi-channel ingress for Telegram-shaped, Discord-shaped, webhook, and custom payloads, with outbound delivery disabled by default.
+- Optional autonomous scheduler that drains approved ready tasks within bounded task/cycle limits.
+- Safe repair primitives with branch isolation, diagnosis-gated validation, reviewer artifacts, and commit gates for repair branches.
 
-```text
-User / CLI / API / Channels
-        ↓
-NestedMV2Agent runtime
-        ↓
-Context compiler ← layered memory retrieval
-        ↓
-MV2 pseudo-context packer ← summary-first retrieval + on-demand raw expansion
-        ↓
-LLM provider
-        ↓
-Tool router / executor
-        ↓
-Tool results + observations
-        ↓
-Working memory + event log
-        ↓
-Nested learning kernel / consolidation pipeline
-        ↓
-Episodic → Semantic → Procedural → Policy .mv2 layers
-```
+See `docs/IMPLEMENTATION_STATUS.md` for the detailed truth table.
 
-## Memory files
+## Memory Layout
 
-By default, the agent creates one Memvid file per layer:
+Kestrel uses Memvid v2 `.mv2` files as the durable memory substrate:
 
 ```text
 .nest/memory/working.mv2
@@ -63,42 +44,104 @@ By default, the agent creates one Memvid file per layer:
 
 One file per layer is intentional. The layers have different update cadences, trust thresholds, search strategies, and promotion rules.
 
-## Pseudo-context windows
-
-Kestrel does not remove LLM context limits and does not claim neural weight-level learning. It builds an on-demand pseudo-context window from `.mv2` memory by retrieving compact summaries first, expanding raw evidence only when needed, deduplicating repeated content, warning on conflicts, and packing selected material under a token budget.
-
-The packer emits sections for policy constraints, procedures, stable facts, episodic/task state, working memory, conflict warnings, evidence pointers, telemetry, and the next-step instruction. Summaries carry parent/child pointers back to raw chunks so exact evidence can be expanded with `context.expand` instead of dumping full transcripts into the prompt.
-
-See `docs/MV2_CONTEXT_PACKING.md` for the frame and packing contract.
-
-## Task capsules
-
-Completed runs can write a temporary capsule at:
+Run capsules are separate artifacts:
 
 ```text
 .nest/runs/{run_id}/complete.mv2
 ```
 
-`complete.mv2` is a run artifact, not a sixth permanent layer. It captures the objective, selected context, tool calls/results, tests, errors, final response, unresolved questions, reusable lessons, and candidate facts/procedures/corrections/policy items. `capsule.summarize` is preview-only. `capsule.apply` can write accepted signals only when auto-consolidation is explicitly enabled and the high-risk approval gate is satisfied. Policy memory still requires explicit instruction, strong validation, repeat evidence, config enablement, and human review or equivalent explicit configuration.
+`complete.mv2` is not a sixth permanent layer. It captures run evidence and candidate learning signals for reviewable consolidation.
 
-See `docs/TASK_CAPSULES.md` for the capsule lifecycle.
+Important storage rules:
 
-## Quick start with in-memory backend
+- Use Memvid v2 `.mv2` files only.
+- Do not implement QR/video-frame Memvid v1 behavior.
+- Never call `create(path)` on an existing `.mv2` file.
+- SQLite stores control-plane state only; it is not a memory replacement.
+- Policy memory writes require explicit instruction, high validation, repeat evidence, config enablement, and review or equivalent explicit configuration.
+
+## Quick Start
+
+Use Python 3.11 or newer.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .
-pytest -q
+python -m pip install --upgrade pip
+python -m pip install -e '.[memvid,openai,server,mcp,dev]'
+npm install --prefix web
+npm run build --prefix web
+```
+
+Fast local validation:
+
+```bash
+python -m compileall -q src tests scripts
+python -m pytest -q
+python scripts/run_golden_evals.py --backend memory --provider mock
 nest-agent chat --backend memory --provider mock --message "hello"
 ```
 
-## Quick start with Memvid
+The mock provider and in-memory backend are deterministic and are the default fast path for tests.
+
+## CLI Chat
+
+One-shot chat:
 
 ```bash
-pip install -e '.[memvid,openai]'
-export OPENAI_API_KEY=...
+nest-agent chat --backend memory --provider mock --message "hello"
+```
+
+Interactive chat:
+
+```bash
+nest-agent chat --backend memory --provider mock --session-id local-dev
+```
+
+Useful interactive commands:
+
+```text
+/tools
+/plugins
+/context <query>
+/memory <query>
+/doctor
+/session
+/exit
+```
+
+Background run and approval flow:
+
+```bash
+nest-agent run --backend memory --provider mock --json --events "inspect this repo"
+nest-agent approvals --backend memory --json
+nest-agent approve <approval_id> --backend memory --json
+nest-agent status <run_id> --backend memory --json --events
+```
+
+Plugin registry commands:
+
+```bash
+nest-agent plugins list --backend memory
+nest-agent plugins inspect <plugin_id> --backend memory
+```
+
+Plugin installation and updates fetch GitHub plugin sources. The config surface includes `--allow-plugin-install` / `NEST_AGENT_ALLOW_PLUGIN_INSTALL`; enforcement of that gate should be treated as a hardening item before using plugin install in a shared or exposed runtime.
+
+## Memvid Backend
+
+Initialize and verify layer files:
+
+```bash
 nest-agent init --backend memvid --memory-dir .nest/memory
+nest-agent memory verify --backend memvid --memory-dir .nest/memory
+nest-agent memory doctor --backend memvid --memory-dir .nest/memory
+```
+
+Run with Memvid and OpenAI:
+
+```bash
+export OPENAI_API_KEY=...
 nest-agent chat \
   --backend memvid \
   --memory-dir .nest/memory \
@@ -107,11 +150,13 @@ nest-agent chat \
   --message "What do you remember about this project?"
 ```
 
-If your model name differs, pass the model available in your account. The scaffold keeps provider wiring isolated so Codex can swap in your preferred model/provider without touching the runtime.
+If your account exposes a different model, pass that model name instead.
 
-## OpenAI-compatible local providers
+The Memvid adapter is lexical-first by default (`enable_vec=False`, `enable_lex=True`) so local writes do not accidentally require embeddings. Embeddings can be enabled deliberately where needed.
 
-For local servers that expose an OpenAI-compatible chat completions API:
+## Local Providers
+
+OpenAI-compatible local/model-server endpoints:
 
 ```bash
 nest-agent chat \
@@ -122,11 +167,9 @@ nest-agent chat \
   --message "hello"
 ```
 
-Use `--api-key-env NAME` when the endpoint needs a non-default API key environment variable. The runtime also accepts `--stream`, which streams token events through the CLI and web run event bus; providers without native streaming use the compatibility stream wrapper.
+Use `--api-key-env NAME` when the endpoint needs a non-default API key environment variable.
 
-## Codex CLI as response provider
-
-Kestrel can use the local Codex CLI as its normal response engine while keeping Kestrel in charge of memory, approvals, tools, MCP, and file writes:
+Codex CLI as the response provider:
 
 ```bash
 nest-agent chat \
@@ -138,52 +181,95 @@ nest-agent chat \
   --message "Help me continue this build"
 ```
 
-The provider runs `codex exec` with `--sandbox read-only`, `--ephemeral`, and `--output-last-message` by default. If Codex needs Kestrel to run a tool, it should return the existing Kestrel JSON tool envelope. Keep write-capable Codex work behind the separate approval-gated `codex.exec` tool.
+The provider runs `codex exec` in read-only, ephemeral mode by default. Write-capable Codex work belongs behind the separate high-risk `codex.exec` tool approval path.
 
-## Multi-channel gateway
+## Web Workbench
 
-Kestrel can normalize external channel payloads into the same agent turn loop used by CLI/API chat. Telegram Bot API updates, Discord message/interaction-shaped payloads, and generic webhooks are supported without adding external dependencies.
-
-Dry-run local handling:
+Build the web assets, then start the local server:
 
 ```bash
-nest-agent channel \
-  --backend memory \
-  telegram \
-  --payload-file telegram-update.json
-```
-
-Server routes:
-
-```text
-GET  /api/channels
-POST /api/channels/ingest
-POST /api/channels/{provider}/webhook
-```
-
-Outbound delivery is disabled by default. To send real replies, configure `.nest/config/channels.json` from `config/channels.example.json`, set the provider secret environment variable, set that channel's `send_enabled` or `auto_reply`, and start the runtime with `--enable-channel-delivery`.
-
-## Local web agent
-
-```bash
-pip install -e '.[memvid,openai,server,mcp,dev]'
-npm install --prefix web
 npm run build --prefix web
 nest-agent server --backend memory --provider mock --host 127.0.0.1 --port 8765
 ```
 
-Open `http://127.0.0.1:8765/` to use the local workbench. It exposes background runs, SSE timeline events, human approvals, built-in tools, MCP server health/sync/connect/disconnect/restart controls, manual MCP JSON invocation, local subagent runs, skills, and memory search.
+Open `http://127.0.0.1:8765/`.
 
-## Packaging and deployment
+The workbench exposes runs, live event streams, approvals, MCP server health/sync/connect/disconnect/restart, manual MCP invocation, memory/context utilities, skills, subagent/task graph views, and scheduler controls.
 
-Operational docs:
+To require a local bearer/API-key token:
 
-- `docs/DEPLOYMENT.md` covers fresh installs, Docker, Compose, provider setup, local model setup, and runtime checks.
-- `docs/MEMORY_OPERATIONS.md` covers `.mv2` backup, restore, verification, and migration.
-- `docs/SECURITY.md` documents the default local-only security posture and high-risk tool gates.
-- `docs/RELEASE_CHECKLIST.md` lists the alpha release validation commands.
+```bash
+export NEST_AGENT_REQUIRE_API_AUTH=1
+export NEST_AGENT_API_TOKEN='replace-with-local-secret'
+nest-agent server --backend memory --provider mock --host 127.0.0.1 --port 8765
+```
 
-Common local packaging commands:
+Clients can send `Authorization: Bearer <token>` or `X-Kestrel-API-Key: <token>`.
+
+## Channels
+
+Kestrel can normalize Telegram Bot API updates, Discord message/interaction-shaped payloads, generic webhooks, and custom JSON into the same run loop:
+
+```bash
+nest-agent channel \
+  --backend memory \
+  --provider mock \
+  telegram \
+  --payload-file telegram-update.json
+```
+
+Outbound delivery is disabled by default. To send real replies, configure `.nest/config/channels.json` from `config/channels.example.json`, set the relevant secret environment variable, enable that channel's `send_enabled` or `auto_reply`, and start with `--enable-channel-delivery`.
+
+Generic/custom webhooks can require HMAC-SHA256 signatures through the channel `settings.signature_secret_env` setting.
+
+## Safety Model
+
+Kestrel defaults to local, conservative behavior:
+
+```text
+NEST_AGENT_ALLOW_SHELL=false
+NEST_AGENT_ALLOW_FILE_WRITE=false
+NEST_AGENT_ALLOW_POLICY_WRITES=false
+NEST_AGENT_ALLOW_CODEX_CLI=false
+NEST_AGENT_ALLOW_PLUGIN_INSTALL=false
+NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER=false
+NEST_AGENT_ENABLE_CHANNEL_DELIVERY=false
+NEST_AGENT_ENABLE_AUTO_CONSOLIDATION=false
+NEST_AGENT_AUTO_CONSOLIDATION_DRY_RUN=true
+NEST_AGENT_REQUIRE_API_AUTH=false
+```
+
+High-risk tools need capability enablement where applicable and exact-call approval before execution. Approval is bound to the requested tool call ID and arguments; changed arguments require a new approval.
+
+Repair branch commits also require a current `repair.review` artifact tied to a successful validation result and the current diff hash.
+
+## Validation
+
+Core validation:
+
+```bash
+python -m compileall -q src tests scripts
+python -m ruff check scripts src tests
+python -m mypy src
+python -m pytest -q
+python scripts/run_golden_evals.py --backend memory --provider mock
+npm run test --prefix web
+npm run build --prefix web
+```
+
+Optional integration checks:
+
+```bash
+RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integration.py
+RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
+RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
+```
+
+Use `python -m pytest` for optional integration tests so fixture subprocesses inherit the same interpreter, environment, and installed extras.
+
+## Packaging and Deployment
+
+Common commands:
 
 ```bash
 make install-dev
@@ -192,37 +278,25 @@ make docker-build
 make docker-doctor
 ```
 
-## Codex CLI connection
+Operational docs:
 
-The runtime exposes the local Codex CLI as a high-risk built-in tool named `codex.exec`.
+- `docs/DEPLOYMENT.md` covers local installs, Docker, Compose, providers, and runtime checks.
+- `docs/MEMORY_OPERATIONS.md` covers `.mv2` backup, restore, verification, and migration.
+- `docs/SECURITY.md` documents the local-first posture, API token gate, webhook signatures, and high-risk tool gates.
+- `docs/RELEASE_CHECKLIST.md` lists alpha release validation commands.
 
-Example tool arguments:
+## Current Gaps
 
-```json
-{
-  "prompt": "Review the current repository and summarize the riskiest files.",
-  "sandbox": "read-only",
-  "model": "gpt-5.5",
-  "timeout": 600
-}
-```
+Kestrel is not yet production-complete. The main remaining hardening areas are:
 
-By default, `codex.exec` requires the web approval flow before it runs. To allow it without per-call approval in a trusted local session:
+- Native tool-calling parity across providers beyond the portable JSON envelope.
+- Streaming parity for OpenAI-compatible/local providers.
+- Production-grade auth, user/session isolation, and deployment boundaries.
+- Real MCP SSE/streamable HTTP fixtures and soak testing.
+- Container-grade skill isolation and package dependency management.
+- Plugin install gate enforcement, approval UX, dependency isolation, and security review.
+- More capable planner/executor/reviewer loops with isolated worker branches or worktrees.
+- Production bot identity verification and platform-specific rate-limit handling.
+- Fully autonomous self-improvement with diff review, test gates, rollback, and explicit human approval.
 
-```bash
-nest-agent server --backend memory --provider openai --allow-codex-cli
-```
-
-The alternate MCP route is also available through the MCP server registry by configuring a stdio server with command `codex` and args `["mcp-server"]`.
-
-## Current build status
-
-The scaffold is runnable with the in-memory backend, mock provider, local web UI, approval-gated built-in tools, managed MCP stdio sessions, MCP/skill registry surfaces, Codex CLI bridge, Memvid `.mv2` backend, OpenAI/OpenAI-compatible provider adapters, MV2 context packing, run-scoped task capsules, and dry-run multi-channel ingress.
-
-It is **not yet a complete Hermes/OpenClaw agent**. Native provider tool-calling, durable multi-step planning, production auth, MCP SSE/streamable HTTP soak testing, richer skill sandboxing, and autonomous self-improvement controls still need hardening. See `docs/IMPLEMENTATION_STATUS.md` for the current truth table.
-
-The nested learning pass records context-flow and optimizer-trace metadata for validated memory updates via `memory.learn`, `memory.consolidate`, and capsule summaries. The MCP/subagent pass adds durable MCP health metadata, normalized tool lifecycle events, task graph records, and in-process planner/worker/reviewer subagents. This is still the runtime-memory analogue of the paper’s nested context-flow idea, not a claim of neural weight-level HOPE/self-modifying model training.
-
-## Critical next Codex task
-
-Give Codex `docs/CODEX_FULL_AGENT_HANDOFF_PROMPT.md`. That prompt tells it exactly how to harden this into a complete OpenClaw/Hermes-style agent with `.mv2` memory.
+The authoritative status page is `docs/IMPLEMENTATION_STATUS.md`.

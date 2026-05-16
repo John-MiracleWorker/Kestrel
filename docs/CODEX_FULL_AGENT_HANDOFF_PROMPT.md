@@ -1,214 +1,179 @@
 # Codex Full Agent Handoff Prompt
 
-You are implementing a full local-first agent runtime named **Nested MV2 Agent**.
+Last updated: 2026-05-16
 
-This is not just a RAG layer. The target is an OpenClaw/Hermes-style conversational agent with tools, state, memory, validation, and a nested-learning consolidation pipeline. The storage device for memory must be Memvid v2 `.mv2` files.
+You are working inside the Kestrel repository. Kestrel is a local-first, memory-native agent runtime built around Nested Learning-inspired memory layers and Memvid v2 `.mv2` files.
 
-## Non-negotiable architecture
+This is not just a RAG layer. The runtime already includes CLI chat, provider adapters, deterministic mock mode, tools, approvals, state, task capsules, a FastAPI/web control plane, managed MCP stdio sessions, skills, scheduler slices, and safe repair gates. Your job is to harden the next slice without regressing the current contract.
 
-The agent is:
+## Read First
 
-```text
-LLM provider + chat runtime + tool registry + nested memory + context compiler + event log + consolidation pipeline + eval harness
-```
-
-Use one `.mv2` file per nested layer:
+Before changing code, inspect:
 
 ```text
-working.mv2
-episodic.mv2
-semantic.mv2
-procedural.mv2
-policy.mv2
+README.md
+AGENTS.md
+PROJECT_MANIFEST.md
+docs/IMPLEMENTATION_STATUS.md
+docs/FULL_AGENT_SPEC.md
+docs/RUNTIME_WIRING.md
+docs/MEMVID_INTEGRATION.md
+docs/TESTING.md
+pyproject.toml
+src/nested_memvid_agent/agent.py
+src/nested_memvid_agent/run_manager.py
+src/nested_memvid_agent/cli.py
+src/nested_memvid_agent/server.py
+src/nested_memvid_agent/backends/memvid_backend.py
+src/nested_memvid_agent/tools/builtin.py
+src/nested_memvid_agent/state_store.py
+tests/
 ```
 
-Do not use deprecated Memvid v1 QR/video behavior. Do not build around vector databases. Do not replace `.mv2` with SQLite/Postgres/Chroma. JSONL logs are allowed only as audit/debug logs, not as the memory database.
+## Non-Negotiable Architecture
 
-## Immediate baseline
+Kestrel is:
 
-Run:
+```text
+LLM provider
++ chat/runtime loop
++ tool registry
++ approval and permission gates
++ nested .mv2 memory
++ context compiler and pseudo-context packer
++ event/state logs
++ task capsules
++ consolidation/eval harness
++ CLI/API/web control surface
+```
+
+Use one permanent Memvid v2 `.mv2` file per nested layer:
+
+```text
+.nest/memory/working.mv2
+.nest/memory/episodic.mv2
+.nest/memory/semantic.mv2
+.nest/memory/procedural.mv2
+.nest/memory/policy.mv2
+```
+
+Run capsules live separately:
+
+```text
+.nest/runs/{run_id}/complete.mv2
+```
+
+Do not use Memvid v1 QR/video behavior. Do not build around vector databases. Do not replace `.mv2` memory with SQLite/Postgres/Chroma/FAISS/JSON. SQLite is control-plane state only.
+
+Never call `create(path)` on an existing `.mv2` file.
+
+## Baseline Before Work
+
+Run at least:
 
 ```bash
-pytest -q
-python -m compileall -q src tests
+python -m compileall -q src tests scripts
+python -m pytest -q
+python scripts/run_golden_evals.py --backend memory --provider mock
 nest-agent chat --backend memory --provider mock --message "hello"
 ```
 
-Do not proceed until these pass.
-
-## Phase 1: Harden Memvid backend
-
-1. Install `memvid-sdk`.
-2. Inspect the installed SDK signatures for `create`, `use`, `put`, `find`, `seal`, `verify`, `doctor`, and `close`.
-3. Update `src/nested_memvid_agent/backends/memvid_backend.py` to match the installed SDK exactly.
-4. Preserve the data-loss rule: never call `create(path)` if the file already exists.
-5. Normalize all result shapes into `MemoryHit`.
-6. Add `tests/integration/test_memvid_backend_integration.py` gated by `RUN_MEMVID_INTEGRATION=1`.
-7. Test write → seal → verify → close → reopen → search.
-
-## Phase 2: Make CLI chat production-usable
-
-Current command:
+If the phase touches web UI or server assets, also run:
 
 ```bash
-nest-agent chat --backend memory --provider mock
+npm run test --prefix web
+npm run build --prefix web
 ```
 
-Add slash commands:
+If the phase touches Memvid or MCP integration, run the matching gated tests:
 
-- `/exit`
-- `/tools`
-- `/context <query>`
-- `/memory <query>`
-- `/doctor`
-- `/session`
+```bash
+RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
+RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integration.py
+```
 
-Add session persistence:
+Use `python -m pytest` so subprocess fixtures inherit the active interpreter and installed extras.
 
-- default session ID if omitted
-- explicit `--session-id`
-- session events written to event log and episodic memory
+## Current Working Surface
 
-## Phase 3: Provider hardening
+Treat these as implemented unless current verification proves otherwise:
 
-Current providers:
+- CLI chat with in-memory and Memvid backends.
+- Deterministic mock provider.
+- OpenAI Responses provider.
+- OpenAI-compatible local provider.
+- Codex CLI response provider.
+- Provider fallback on retryable failures.
+- MV2 context frames and token-aware pseudo-context packing.
+- Task capsules and conservative learning-signal extraction.
+- `memory.learn`, `memory.consolidate`, and promotion gate metadata.
+- Exact-call approval gates for high-risk tools.
+- SQLite state schema version 7.
+- Replay-safe terminal run and approval decisions.
+- Managed stdio MCP sessions.
+- Skills with manifest validation, provenance hashes, and local runtimes.
+- Alpha plugin registry/CLI with GitHub source fetch, manifest parsing, and materialization of plugin-declared skills/MCP server entries.
+- API token gate and generic HMAC webhook verification.
+- Opt-in autonomous scheduler.
+- Branch-isolated repair primitives, diagnosis-gated validation, `repair.review`, and repair-branch commit gate.
+- Docker/Compose alpha packaging.
 
-- `MockLLMProvider`
-- `OpenAIResponsesProvider`
+## Current Partial Areas
 
-Tasks:
+The next useful hardening work should usually target one of these:
 
-1. Keep `MockLLMProvider` deterministic.
-2. Make OpenAI provider chat-capable.
-3. Add native tool calling for OpenAI Responses API.
-4. Keep JSON-envelope fallback for portability.
-5. Add retries, timeout config, and structured error mapping.
-6. Add streaming support behind `--stream`.
-7. Add mocked provider tests. Do not require real API keys for unit tests.
+- Native provider tool-calling parity beyond the portable JSON envelope.
+- Streaming parity for OpenAI-compatible/local providers.
+- Production-grade auth, user/session isolation, and deployment boundaries.
+- MCP SSE/streamable HTTP fixtures and failure-recovery soak tests.
+- Container-grade skill isolation and package dependency management.
+- Plugin install allow-flag enforcement, approval UX, dependency isolation, and security review.
+- Stronger consolidation validation loops and review UI.
+- Dynamic planner/executor/reviewer orchestration across isolated workers.
+- Codex-backed worker fan-out with branch/worktree isolation.
+- Production bot identity verification and channel-specific rate-limit handling.
+- Fully autonomous self-improvement with diff review, tests, rollback, and explicit human approval.
 
-## Phase 4: Tooling expansion
+## Tool and Approval Rules
 
-Existing tools:
+High-risk tools require capability enablement where applicable and exact-call approval before execution. Approval is tied to the tool-call ID and exact arguments.
 
-- `memory.search`
-- `memory.write`
-- `file.list`
-- `file.read`
-- `file.write`
-- `shell.run`
+Examples:
 
-Add:
+- `shell.run` requires shell enablement and approval.
+- `file.write`, `patch.apply`, `skill.install`, and repair patch tools require file-write enablement and approval.
+- `codex.exec` requires Codex CLI enablement and approval.
+- `capsule.apply` requires auto-consolidation enablement, write mode, and approval.
+- `memory.import` requires approval and still respects policy-write gating.
+- `git.commit` requires approval and never pushes.
+- Repair branch commits require a fresh `repair.review` artifact tied to successful validation and the current diff hash.
 
-- `repo.search`
-- `repo.map`
-- `patch.apply`
-- `test.run`
-- `git.status`
-- `git.diff`
-- `memvid.verify`
-- `memvid.doctor`
-- `memory.consolidate`
+Do not weaken gates to make tests pass.
 
-For every tool:
+## Memory Promotion Rules
 
-- define schema
-- define risk level
-- enforce workspace boundaries
-- log execution
-- write result/failure to working memory
-- unit test success and failure path
+Every accepted promotion must carry:
 
-High-risk tools must require config enablement first. Later add interactive approval.
-
-## Phase 5: Nested Learning consolidation
-
-Implement the consolidation pipeline as a controlled learning loop.
-
-Candidate extraction:
-
-- scan working memory and recent episodic memory
-- identify failures, decisions, corrections, facts, and repeated procedures
-- deduplicate by content hash/semantic similarity where Memvid supports it
-
-Promotion rules:
-
-- Working → Episodic for meaningful events and summaries
-- Episodic → Semantic for validated facts
-- Episodic → Procedural for repeated successful procedures
-- Semantic/Procedural → Policy only with explicit permission and extreme confidence
-
-Every promoted record must include:
-
-- source record IDs
-- source layer
-- destination layer
-- evidence refs
+- source evidence or record IDs
+- provenance
+- target layer
 - confidence
-- validation method
-- promotion reason
-- timestamp
+- validation status
+- validation score
+- repeat count where relevant
+- promotion/rejection reason
+- context-flow and optimizer-trace metadata when using `NestedLearningKernel`
 
-Tests:
+Do not write policy memory from a single ordinary event. Policy writes require explicit instruction or reviewed rule, high validation, repeat evidence, config enablement, and review or equivalent explicit configuration.
 
-- one random success cannot become a procedure
-- one random correction cannot become policy
-- repeated validated success becomes procedural memory
-- conflicting facts are flagged, not merged silently
-- low-confidence memory is not promoted
+## Expected Work Style
 
-## Phase 6: Evaluation harness
+1. Pick one coherent hardening slice.
+2. Inspect the existing implementation first.
+3. Keep changes scoped.
+4. Add or update focused tests.
+5. Run `python -m pytest -q` after the phase, plus any relevant targeted validations.
+6. Update docs when behavior or commands change.
+7. Report what changed, what was verified, and what remains risky.
 
-Build `scripts/run_golden_evals.py` and golden cases under `golden/`.
-
-Required evals:
-
-1. The agent remembers a correction across sessions.
-2. The agent retrieves a previous failure before repeating it.
-3. The agent uses a procedural recipe after repeated successes.
-4. The agent refuses a path escape.
-5. The agent blocks shell without enablement.
-6. The agent verifies `.mv2` files.
-7. The agent compiles useful context under budget.
-8. The agent avoids writing policy from an ordinary event.
-
-Each eval should output JSON with pass/fail, latency, memory hits, context chars, and tool count.
-
-## Phase 7: Optional API/UI
-
-After CLI is solid:
-
-- add FastAPI app
-- `/chat`
-- `/memory/search`
-- `/memory/verify`
-- `/sessions/{session_id}`
-- SSE streaming
-- optional Textual/Rich TUI
-
-Do not start here. CLI first. Agent first. Pretty UI later.
-
-## Phase 8: Final acceptance test
-
-The final project should pass:
-
-```bash
-pip install -e '.[memvid,openai,dev]'
-pytest -q
-RUN_MEMVID_INTEGRATION=1 pytest -q tests/integration
-nest-agent init --backend memvid --memory-dir .nest/memory
-nest-agent chat --backend memvid --provider openai --model <available-model> --message "Remember that I prefer concise answers."
-nest-agent chat --backend memvid --provider openai --model <available-model> --message "What do you remember about my answer style?"
-```
-
-Expected behavior:
-
-- memory persists across turns
-- memory persists across process restarts
-- model gets compiled nested context
-- relevant memory is used without dumping whole transcript
-- `.mv2` files verify successfully
-- no high-risk tool runs without permission
-
-## Definition of done
-
-The agent is built when a user can talk to it from CLI, it can call tools, it persists memory in `.mv2` files, it can retrieve and compile nested context, it learns via controlled consolidation, and the test/eval suite proves the behavior.
+Do not present roadmap items as done. Keep partial work marked partial.

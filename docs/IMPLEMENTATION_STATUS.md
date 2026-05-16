@@ -23,7 +23,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Skills now have a first manifest validation gate plus persisted validation/provenance metadata for discovered instruction capsules.
 - Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry, and memory search.
 - Multi-channel ingress for Telegram Bot API updates, Discord message/interaction-shaped payloads, and generic/custom webhooks, with CLI and API routes.
-- SQLite state store for runs, run steps, approvals, MCP servers, skills, task nodes, and subagent runs, now initialized through schema version `6`.
+- SQLite state store for runs, run steps, approvals, MCP servers, skills, plugins, task nodes, and subagent runs, now initialized through schema version `7`.
 - Paper-guided nested learning kernel with context-flow metadata, optimizer traces, conservative continuum-memory routing, and a `memory.learn` tool/API path.
 - Memory learning decisions now expose explicit promotion gate metadata so rejected/accepted decisions can explain target layer, observed evidence, repeat-count thresholds, validation thresholds, and explicit-instruction requirements.
 - Run-scoped `complete.mv2` task capsules, preview-only capsule summaries, dry-run consolidation decisions, and approval-gated capsule apply.
@@ -45,6 +45,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Approval resume flow now records the executed tool result back onto the already-approved approval record without reopening or flipping the decision, and a full-flow smoke test covers run creation, approval blocking, exact-call approval, resume, tool result persistence, traces, task graph, and capsule creation together.
 - Skills can now run instruction, Python, and shell-list runtimes from their skill directory with path checks, JSON stdin, timeout bounds, and provenance-backed episodic records; container runtime remains intentionally unavailable.
 - `skill.install` provides an approval-gated local upload/install path for new skill capsules under the configured skills directory, with manifest validation and content hashes.
+- A first plugin registry slice exists with GitHub source parsing, plugin manifest loading, plugin state records, CLI list/install/inspect/enable/disable/update/remove commands, and materialization of plugin-declared skills/MCP server entries.
 - The FastAPI control plane can require bearer/API-key auth via `NEST_AGENT_REQUIRE_API_AUTH=1` and a token environment variable.
 - Generic/custom channel endpoints can require HMAC-SHA256 webhook signatures using a per-channel secret environment variable.
 - Shell/test/repair validation commands normalize `python`/`python3` to the active interpreter so autonomous validation is stable across local environments.
@@ -54,6 +55,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Streaming/provider parity: OpenAI Responses streaming deltas are implemented. OpenAI-compatible/local provider streaming and richer per-provider context/JSON-mode details still need hardening.
 - MCP: stdio live sessions are hardened and covered by a flag-gated integration test. SSE and streamable HTTP use the same manager path but still need real transport fixtures and production soak testing.
 - Skills: filesystem discovery, manifest validation, provenance metadata, upload/install, and instruction/Python/shell-list runtimes exist. Container-grade isolation and package dependency management remain incomplete.
+- Plugins: registry, GitHub fetch, manifest parsing, CLI commands, and skill/MCP materialization exist. Install-path allow-flag enforcement, approval UX, dependency isolation, and network/security review still need hardening before shared use.
 - Codex CLI: `codex-cli` can drive responses and `codex.exec` is available as a high-risk approval-gated tool. It is not yet a branch-isolated autonomous repair loop.
 - Consolidation: capsule extraction and Nested Learning decisions exist, but auto-consolidation remains disabled by default and validation loops are still basic.
 - Self-diagnosis: first-pass classification and memory recall tools exist. A full executor retry gate that forces changed strategy before every retry is still incomplete.

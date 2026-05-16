@@ -11,6 +11,7 @@ NEST_AGENT_ALLOW_SHELL=false
 NEST_AGENT_ALLOW_FILE_WRITE=false
 NEST_AGENT_ALLOW_POLICY_WRITES=false
 NEST_AGENT_ALLOW_CODEX_CLI=false
+NEST_AGENT_ALLOW_PLUGIN_INSTALL=false
 NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER=false
 NEST_AGENT_MAX_SCHEDULER_TASKS=3
 NEST_AGENT_MAX_SCHEDULER_CYCLES=5
@@ -52,11 +53,15 @@ Logs and run events redact common API key, bearer token, password, authorization
 
 ## Tool Risk
 
-High-risk tools require explicit config enablement and approval flow integration. Shell execution, file writes, git commits, Codex CLI execution, channel delivery, and policy memory writes are not production-safe defaults.
+High-risk tools require explicit config enablement where applicable and exact-call approval. Approval is tied to the requested tool-call ID and arguments; changed arguments require a new approval. Shell execution, file writes, patching, repair mutations, git commits, Codex CLI execution, channel delivery, and policy memory writes are not production-safe defaults.
 
 Skill installation is a high-risk file-write action. Uploaded skill capsules are confined to the configured skills directory, validated by manifest shape, and still require approval before installation.
 
+Plugin installation is newer and should be treated as high risk: it fetches GitHub repositories and materializes skills/MCP entries. Keep `NEST_AGENT_ALLOW_PLUGIN_INSTALL=false` in shared or exposed runtimes until the install path has the same explicit enforcement and approval guarantees as other high-risk mutation paths.
+
 Autonomous scheduling is disabled by default. When enabled, it is bounded by per-cycle task and cycle limits, and it stops at task approval or exact-call tool approval boundaries instead of silently crossing into high-risk work.
+
+Repair branch commits require a current `repair.review` artifact tied to a successful validation result and the current diff hash. `git.commit` never pushes.
 
 ## Webhooks
 

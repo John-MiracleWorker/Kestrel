@@ -1,91 +1,122 @@
 # Validation Plan
 
-## Test pyramid
+Last updated: 2026-05-16
 
-### Unit tests
+## Test Pyramid
+
+### Core Tests
 
 Run:
 
 ```bash
-pytest
+python -m pytest -q
 ```
 
 Coverage goals:
 
-- Model validation.
-- Layer confidence gates.
-- Retrieval contract.
-- Context compiler budget behavior.
-- Consolidation promotion thresholds.
-- Golden retrieval validator.
+- model validation
+- memory layer contracts
+- context compiler/packer budget behavior
+- consolidation and promotion gates
+- provider parsing/fallback behavior
+- tool schemas, timeouts, enablement, and approvals
+- state-store lifecycle and migration behavior
+- CLI and run-manager smoke paths
+- scheduler, subagent, skill, repair, and task-capsule slices
 
-### Memvid smoke test
-
-Run after installing Memvid:
+### Compile, Lint, and Types
 
 ```bash
-pip install -e .[dev,memvid]
-python scripts/bootstrap_memory.py --backend memvid --memory-dir ./memory
-python scripts/run_validation.py --backend memvid --memory-dir ./memory
-nested-memvid compile-context --backend memvid --objective "Explain how policy promotion works"
+python -m compileall -q src tests scripts
+python -m ruff check scripts src tests
+python -m mypy src
 ```
 
-### Golden retrieval tests
+### Runtime Smoke
 
-Use `scripts/run_validation.py` for basic smoke validation. Expand this into a `golden/` directory with JSON cases:
-
-```json
-{
-  "name": "auth profile failure",
-  "query": "provider specific auth startup failure",
-  "expected_terms": ["auth profile", "provider"],
-  "layers": ["episodic", "semantic", "procedural"]
-}
+```bash
+nest-agent doctor --backend memory --provider mock
+nest-agent chat --backend memory --provider mock --message "hello"
+nest-agent run --backend memory --provider mock --json --events "hello run"
 ```
 
-### Promotion validation
+### Memvid Integration
+
+Run after installing the `memvid` extra:
+
+```bash
+RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
+RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
+```
+
+This validates temporary `.mv2` creation, writes, sealing, verification, reopening, search, context-frame metadata, and run capsule summaries.
+
+### MCP Integration
+
+```bash
+RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integration.py
+```
+
+This validates managed stdio server connection, discovery, invocation, and shutdown.
+
+### Golden Evals
+
+Fast path:
+
+```bash
+python scripts/run_golden_evals.py --backend memory --provider mock
+```
+
+Golden evals should stay deterministic under the mock provider. They should prove behavior across turns, including recall, prior-failure use, procedural promotion gates, workspace safety, shell blocking, `.mv2` verification, context packing, and policy-write refusal.
+
+## Promotion Validation
 
 Every proposed promotion must include:
 
-- source memory id,
-- target layer,
-- validation score,
-- repeat count,
-- evidence refs,
-- reason.
+- source memory IDs or capsule/run evidence
+- source and target layers
+- validation score
+- repeat count
+- confidence
+- evidence refs
+- provenance
+- validation status
+- promotion or rejection reason
+- context-flow and optimizer-trace metadata where the Nested Learning kernel is used
 
-Policy promotions require repeat_count >= 5 and validation_score >= 0.95.
+Policy promotions require explicit instruction or reviewed rule, repeat evidence, high validation, config enablement, and human review or equivalent explicit configuration.
 
-### Context validation
+## Context Validation
 
-The compiled context should be checked for:
+Compiled context should be checked for:
 
-- objective present,
-- relevant memories included,
-- scores/confidence present,
-- evidence present when available,
-- total budget respected,
-- no unrelated layers bloating the prompt.
+- objective present
+- relevant memories included
+- token/character budget respected
+- source/evidence pointers preserved
+- confidence and validation metadata present where available
+- conflict warnings present for contradictory high-confidence memories
+- no full transcript dump by default
+- raw evidence expanded only when requested or necessary
 
-### Performance validation
+## Repair Validation
 
-Track:
+Repair tools must preserve these gates:
 
-- retrieval latency per layer,
-- context compile latency,
-- number of hits per layer,
-- context chars per layer,
-- cache hit rate,
-- failed golden questions.
+- mutation tools require approval and file-write enablement where applicable
+- patch/validate/rollback refuse non-repair branches
+- repeated validation retries are blocked unless the strategy changes when prior lessons exist
+- successful validation points to `create_repair_review_before_commit`
+- repair branch commits require a current `repair.review` artifact and exact-call approval
+- `git.commit` never pushes
 
-For local dev, target sub-100ms retrieval across warmed local capsules before LLM calls. That target is not a law of physics; it is a useful smell test.
-
-## Failure handling
+## Failure Handling
 
 If validation fails:
 
-1. Do not promote new memory.
-2. Write an episodic failure memory.
-3. Add or update a golden question.
-4. Re-run retrieval with fixed top-k and adaptive mode.
-5. Inspect source frames before changing policy/procedural memory.
+1. Keep the exact command and error output.
+2. Classify the failure when possible.
+3. Recall similar procedural/episodic lessons before retrying.
+4. Change strategy before repeating the same validation loop.
+5. Do not promote new semantic/procedural/policy memory from a failed run unless the failure itself is useful evidence.
+6. Add or update a focused regression test when the failure reveals a real gap.

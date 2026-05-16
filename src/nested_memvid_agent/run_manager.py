@@ -15,6 +15,7 @@ from .event_bus import RunEventBus
 from .mcp_manager import MCPManager
 from .models import MemoryLayer
 from .nested_learning import NestedLearningKernel
+from .plugin_manager import PluginManager
 from .runtime_models import AgentTurnResult, LLMStreamEvent, ToolCall, ToolExecution, ToolSpec
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore, RunRecord, TaskNodeRecord
@@ -35,12 +36,14 @@ class RunManager:
         events: RunEventBus,
         mcp: MCPManager,
         skills: SkillManager,
+        plugins: PluginManager | None = None,
     ) -> None:
         self.config = config
         self.state = state
         self.events = events
         self.mcp = mcp
         self.skills = skills
+        self.plugins = plugins or PluginManager(config.plugins_dir, state)
         self._lock = Lock()
         self._threads: dict[str, Thread] = {}
         self._cancelled: set[str] = set()
@@ -705,6 +708,7 @@ class RunManager:
 
     def build_registry(self) -> ToolRegistry:
         registry = build_default_tools()
+        self.plugins.sync_all()
         self.skills.discover()
         for adapter in [*self.mcp.tool_adapters(), *self.skills.tool_adapters()]:
             registry.register(adapter)

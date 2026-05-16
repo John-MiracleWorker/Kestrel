@@ -16,6 +16,8 @@ from .event_bus import RunEventBus
 from .event_log import JsonlEventLog
 from .mcp_manager import MCPManager
 from .models import MemoryLayer, RetrievalQuery
+from .orchestrator import build_memory_system
+from .plugin_manager import PluginError, PluginManager
 from .run_manager import RunManager
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore
@@ -48,7 +50,8 @@ def create_app(config: AgentConfig | None = None) -> Any:
     events = RunEventBus(state)
     mcp = MCPManager(state)
     skills = SkillManager(active_config.skills_dir, state)
-    runs = RunManager(config=active_config, state=state, events=events, mcp=mcp, skills=skills)
+    plugins = PluginManager(active_config.plugins_dir, state)
+    runs = RunManager(config=active_config, state=state, events=events, mcp=mcp, skills=skills, plugins=plugins)
     channels = ChannelManager(active_config)
 
     def require_api_auth(
@@ -68,6 +71,13 @@ def create_app(config: AgentConfig | None = None) -> Any:
         if not candidate or not secrets.compare_digest(candidate, expected):
             raise HTTPException(status_code=401, detail="Invalid or missing Kestrel API token.")
         return True
+
+    def audit_plugin(action: str, plugin: dict[str, Any]) -> None:
+        memory = build_memory_system(active_config.backend, active_config.memory_dir)
+        try:
+            plugins.write_audit_memory(memory, action=action, plugin=plugin)
+        finally:
+            memory.close_all()
 
     def request_headers(request: object) -> Mapping[str, str]:
         headers = getattr(request, "headers", {})
@@ -186,6 +196,15 @@ def create_app(config: AgentConfig | None = None) -> Any:
         instructions: str
         overwrite: bool = False
         dry_run: bool = False
+
+    class PluginInstallRequest(BaseModel):  # type: ignore[valid-type,misc]
+        source: str
+        ref: str | None = None
+        enable: bool = False
+        overwrite: bool = False
+
+    class PluginUpdateRequest(BaseModel):  # type: ignore[valid-type,misc]
+        ref: str | None = None
 
     @app.get("/api/health")  # type: ignore[untyped-decorator]
     def health() -> dict[str, object]:
@@ -425,6 +444,61 @@ def create_app(config: AgentConfig | None = None) -> Any:
             "data": execution.data,
             "error": execution.error,
         }
+
+    @app.get("/api/plugins")  # type: ignore[untyped-decorator]
+    def list_plugins() -> list[dict[str, object]]:
+        plugins.sync_all()
+        return plugins.list_plugins()
+
+    @app.post("/api/plugins/install")  # type: ignore[untyped-decorator]
+    def install_plugin(request: PluginInstallRequest) -> dict[str, object]:
+        try:
+            plugin = plugins.install(
+                request.source,
+                ref=request.ref,
+                enable=request.enable,
+                overwrite=request.overwrite,
+            )
+            audit_plugin("install", plugin)
+            return plugin
+        except (PluginError, FileExistsError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/plugins/{plugin_id}/enable")  # type: ignore[untyped-decorator]
+    def enable_plugin(plugin_id: str) -> dict[str, object]:
+        try:
+            plugin = plugins.set_enabled(plugin_id, True)
+            audit_plugin("enable", plugin)
+            return plugin
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/plugins/{plugin_id}/disable")  # type: ignore[untyped-decorator]
+    def disable_plugin(plugin_id: str) -> dict[str, object]:
+        try:
+            plugin = plugins.set_enabled(plugin_id, False)
+            audit_plugin("disable", plugin)
+            return plugin
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/plugins/{plugin_id}/update")  # type: ignore[untyped-decorator]
+    def update_plugin(plugin_id: str, request: PluginUpdateRequest | None = None) -> dict[str, object]:
+        try:
+            plugin = plugins.update(plugin_id, ref=request.ref if request else None)
+            audit_plugin("update", plugin)
+            return plugin
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PluginError, FileExistsError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/plugins/{plugin_id}")  # type: ignore[untyped-decorator]
+    def remove_plugin(plugin_id: str) -> dict[str, object]:
+        try:
+            return plugins.remove(plugin_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/subagents")  # type: ignore[untyped-decorator]
     def create_subagent(request: SubagentRequest) -> dict[str, object]:

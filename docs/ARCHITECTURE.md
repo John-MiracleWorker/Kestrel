@@ -1,91 +1,130 @@
-# Architecture: Nested Learning Agent Memory with Memvid
+# Architecture
+
+Last updated: 2026-05-16
 
 ## Goal
 
-Replace slow, flat agentic RAG with a nested memory system where each layer has its own update rule, confidence gate, retention policy, and Memvid `.mv2` capsule.
+Kestrel is a local-first agent runtime where memory is not a flat RAG index. It uses nested memory layers with separate update rules, confidence gates, retention behavior, and Memvid v2 `.mv2` files.
 
-This does not remove the LLM context window. It replaces the context window as the **main memory strategy**. The context window becomes a compiled workbench, not the whole brain.
+The LLM context window is still finite. Kestrel treats it as a compiled workbench: retrieve relevant memory, compress it into structured context frames, expand raw evidence only when needed, and pass a bounded pseudo-context prompt to the model.
 
-## Core loop
-
-```text
-User / Repo / Tool Output
-        ↓
-Raw Event Log JSONL
-        ↓
-Memory Extractor
-        ↓
-Nested Memory Layers (.mv2 capsules)
-        ↓
-Retriever + Context Compiler
-        ↓
-LLM / Agent Executor
-        ↓
-Evaluator / Tests / User Feedback
-        ↓
-Consolidator
-        ↓
-Promotions / Corrections / Forgetting
-```
-
-## Layer files
+## Runtime Shape
 
 ```text
-memory/working.mv2      fast scratch state
-memory/episodic.mv2     events, failures, decisions
-memory/semantic.mv2     stable facts
-memory/procedural.mv2   reusable skills and recipes
-memory/policy.mv2       slow-changing behavior rules
-logs/events.jsonl       raw audit trail
+CLI / API / Web / Channels
+        ↓
+RunManager / EventBus / StateStore
+        ↓
+NestedMV2Agent
+        ↓
+ContextCompiler + MV2 ContextPacker ← layered .mv2 retrieval
+        ↓
+LLM Provider
+        ↓
+ToolRegistry / MCP / Skills / Built-ins
+        ↓
+Tool results, approvals, diagnosis, repair gates
+        ↓
+Working memory + run events + task capsule
+        ↓
+NestedLearningKernel / Consolidator
+        ↓
+Episodic → Semantic → Procedural → Policy .mv2 layers
 ```
 
-## Why one `.mv2` per layer?
+## Memory Layers
 
-Memvid can use tracks inside one file, but one file per nested layer is cleaner for an agent runtime:
+```text
+.nest/memory/working.mv2      active task state and observations
+.nest/memory/episodic.mv2     events, failures, decisions, summaries
+.nest/memory/semantic.mv2     validated facts and preferences
+.nest/memory/procedural.mv2   reusable recipes and failure playbooks
+.nest/memory/policy.mv2       rare, explicit behavior/safety constraints
+.nest/runs/{run_id}/complete.mv2  run-scoped evidence bundle
+.nest/state/agent.db          control-plane state, not retrieval memory
+.nest/logs/                   local audit/debug logs
+```
 
-- Different write rates: working memory updates constantly; policy memory barely changes.
-- Different safety gates: policy should be locked down and optionally encrypted.
-- Different compaction/retention: working memory can expire; procedural memory persists.
-- Faster small-layer reads: retrieve from the layers that matter instead of waking one giant capsule.
-- Easier debugging: inspect or replay one layer at a time.
+## Why One `.mv2` Per Layer?
 
-A future optimization can create a `unified.mv2` for distribution while retaining per-layer source capsules during development.
+Memvid can carry multiple labels/tracks, but Kestrel keeps one file per permanent layer because:
 
-## Nested Learning mapping
+- Working memory changes frequently; policy memory changes rarely.
+- Each layer has different validation and promotion gates.
+- Policy and procedural memory need stronger review boundaries.
+- Small layer files are easier to verify, doctor, back up, and reason about.
+- Tests can isolate `.mv2` lock contention by isolating memory directories.
 
-The Nested Learning idea is translated into external agent loops:
+A distribution/export optimization can be explored later, but the source-of-truth layout is one permanent `.mv2` file per layer.
 
-| Nested Learning concept | Agent implementation |
+## Nested Learning Mapping
+
+| Nested Learning concept | Kestrel implementation |
 |---|---|
-| Context flow | Raw events, tool outputs, user turns, retrieved evidence |
-| Fast memory | Working `.mv2` + current task state |
-| Slower memory | Episodic and semantic `.mv2` capsules |
-| Continuum memory | Multiple layers with different update frequencies |
-| Self-modifying module | Consolidator updates procedural/policy memory after validation |
-| Expressive optimizer | Promotion rules, scoring, corrections, retrieval feedback |
+| Context flow | User turns, tool outputs, validation results, event logs, retrieved evidence |
+| Fast memory | Working `.mv2` plus current run/task state |
+| Slower memory | Episodic and semantic `.mv2` layers |
+| Continuum memory | Multiple layers with different write frequency and trust thresholds |
+| Self-modifying module | Controlled consolidation into procedural/policy memory after validation |
+| Expressive optimizer | Promotion gates, optimizer traces, correction/conflict handling, retrieval feedback |
 
-## Read path
+This is an agent-runtime analogue of Nested Learning. It is not neural weight-level HOPE training or unrestricted self-modification.
 
-1. Start with an objective.
-2. Generate a retrieval query from objective + active task state.
-3. Search layers using layer-specific modes and budgets.
-4. Rank hits by score, confidence, importance, and layer priority.
-5. Compile a compact prompt with evidence and conflict warnings.
-6. Hand only the compiled cognitive state to the LLM.
+## Read Path
 
-## Write path
+1. Start with objective, run state, and current user message.
+2. Build retrieval queries from the objective and active task context.
+3. Search relevant layers under layer-appropriate budgets.
+4. Convert hits into `MV2ContextFrame` records.
+5. Rank by layer priority, relevance, confidence, importance, and validation metadata.
+6. Deduplicate by content hash and overlap.
+7. Emit conflict warnings instead of smoothing disagreements away.
+8. Pack selected summaries/evidence under the token budget.
+9. Use `context.expand` for exact raw evidence when needed.
 
-1. Every raw event goes to `logs/events.jsonl`.
-2. Useful observations go to working memory.
-3. Validated events go to episodic memory.
-4. Stable facts go to semantic memory.
-5. Repeated successful procedures go to procedural memory.
-6. Rare, highly validated rules go to policy memory.
+## Write Path
 
-## Anti-patterns
+1. User messages and tool results become working-memory observations.
+2. Final turn summaries and meaningful outcomes become episodic evidence.
+3. Validated stable facts can become semantic memory.
+4. Repeated validated workflows can become procedural memory.
+5. Policy memory remains rare and requires explicit instruction, high validation, repeat evidence, config enablement, and review or equivalent explicit configuration.
+6. Promotions carry evidence, provenance, confidence, validation status, context-flow metadata, and optimizer traces.
+
+## Control Plane
+
+The SQLite state store tracks operational state:
+
+- runs and run steps
+- approvals and tool results
+- MCP servers/tools
+- skills and validation/provenance hashes
+- plugins and plugin enablement metadata
+- task nodes
+- subagent runs
+
+Terminal run statuses and approval decisions are replay-safe. State migrations currently initialize schema version 7.
+
+## Tooling Boundary
+
+Tool execution goes through `ToolRegistry`:
+
+- argument validation
+- workspace/path safety
+- timeout enforcement
+- capability enablement gates
+- exact-call approvals for high-risk tools
+- structured success/failure results
+- failure diagnosis where applicable
+
+MCP tools are adapted into the same registry surface and default to approval-by-default unless explicitly trusted.
+
+## Anti-Patterns
 
 - Do not save everything as policy.
 - Do not summarize away primary evidence without keeping provenance.
-- Do not use semantic vector search for exact config/file-path facts when lexical search is better.
-- Do not let the LLM self-promote rules without validation.
-- Do not treat memory hits as truth; treat them as hypotheses with provenance.
+- Do not use SQLite as the primary memory store.
+- Do not call `create(path)` on an existing `.mv2` file.
+- Do not treat retrieved memory as unquestioned truth.
+- Do not run high-risk tools without enablement and exact-call approval.
+- Do not dump full transcripts into context by default.
