@@ -31,6 +31,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - MCP stdio servers now have a managed lazy session lifecycle with connect/disconnect/restart/health API routes, bounded operation timeouts, config-change teardown, and approval-by-default tool risk normalization.
 - First task-graph and subagent run records exist, with durable task metadata, deterministic starter plan decomposition, in-process planner/worker/reviewer profiles, and UI/API surfaces.
 - Task nodes can now persist latest failure diagnosis and retry strategy metadata; failed subagents classify the failure, record a retry gate that requires changed strategy, and emit a diagnosis event tied back to the task.
+- The task graph now exposes deterministic `ready_tasks` for scheduler/resume work: only approved queued/approved tasks with completed dependencies are eligible, and failed retry tasks remain blocked until their retry strategy explicitly allows a changed strategy.
 - Provider failures emit structured `diagnosis.classified` events so traces can explain the failure category and suggested playbook.
 - Repair mutation tools are high-risk, approval-gated, covered by exact-call approvals, disabled unless the matching capability is enabled, and refuse non-repair branches for patch/validate/rollback operations.
 - Diagnosis-gated repair validation must remain approval-gated, refuse non-repair branches, recall similar lessons on failure, and block repeated validation retries when prior lessons exist unless a changed strategy is supplied.
@@ -53,7 +54,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 ## Not Done Yet
 
 - Native OpenAI streaming deltas and broader provider integration tests for OpenRouter/Anthropic/Ollama-style adapters.
-- Full durable multi-step planner/executor/reviewer loop with resumable goals, retries, and review gates.
+- Full durable multi-step planner/executor/reviewer loop with automated execution of scheduler-selected tasks and reviewer gates.
 - Production authentication, authorization, and user/session isolation for the UI/API.
 - Production webhook signature verification and secret rotation for external channel endpoints.
 - Robust MCP SSE/streamable HTTP transport fixtures and failure-recovery soak testing.

@@ -816,6 +816,95 @@ def test_run_manager_creates_durable_child_plan_for_multi_step_goal(tmp_path: Pa
     assert child_tasks[1]["required_tools"]
 
 
+def test_run_manager_ready_tasks_respect_dependencies_and_approval(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    run = manager.state.create_run(
+        run_id="run_ready_dependencies",
+        message="Schedule dependent tasks",
+        session_id="session",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+    root = manager.state.create_task_node(
+        task_id="task_root_ready",
+        run_id=run.run_id,
+        title="Ready root",
+        goal="No dependencies",
+        profile="worker",
+        status="queued",
+        approved=True,
+    )
+    dependent = manager.state.create_task_node(
+        task_id="task_dependent_ready",
+        run_id=run.run_id,
+        title="Dependent task",
+        goal="Waits for root",
+        profile="worker",
+        status="queued",
+        approved=True,
+        dependencies=[root.task_id],
+    )
+    manager.state.create_task_node(
+        task_id="task_unapproved",
+        run_id=run.run_id,
+        title="Needs approval",
+        goal="Risky task",
+        profile="worker",
+        status="queued",
+        approved=False,
+    )
+
+    ready = manager.ready_tasks(run.run_id)
+    assert [task["task_id"] for task in ready] == [root.task_id]
+
+    manager.state.update_task_node(root.task_id, status="completed")
+    ready_after_dependency = manager.ready_tasks(run.run_id)
+    assert dependent.task_id in [task["task_id"] for task in ready_after_dependency]
+    assert "task_unapproved" not in [task["task_id"] for task in ready_after_dependency]
+
+
+def test_run_manager_ready_tasks_block_failed_retries_until_strategy_changes(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    run = manager.state.create_run(
+        run_id="run_retry_gate",
+        message="Retry failed validation",
+        session_id="session",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+    task = manager.state.create_task_node(
+        task_id="task_retry_gate",
+        run_id=run.run_id,
+        title="Retry gated task",
+        goal="Validate repair",
+        profile="worker",
+        status="failed",
+        approved=True,
+        retry_strategy={
+            "requires_changed_strategy": True,
+            "retry_allowed": False,
+            "reason": "same validation command already failed",
+        },
+    )
+
+    assert task.task_id not in [candidate["task_id"] for candidate in manager.ready_tasks(run.run_id)]
+
+    manager.state.update_task_node(
+        task.task_id,
+        status="queued",
+        retry_strategy={
+            "requires_changed_strategy": True,
+            "retry_allowed": True,
+            "changed_strategy": "narrow validation to failing test before full suite",
+        },
+    )
+
+    ready = manager.ready_tasks(run.run_id)
+    assert task.task_id in [candidate["task_id"] for candidate in ready]
+    retry_candidate = next(candidate for candidate in ready if candidate["task_id"] == task.task_id)
+    assert retry_candidate["scheduler_reason"] == "retry_strategy_changed"
+
+
 def test_run_manager_trace_includes_context_memory_and_tool_events(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     run = manager.create_run(message="hello", session_id="session")
