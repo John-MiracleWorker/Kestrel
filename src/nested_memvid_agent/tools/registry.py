@@ -103,5 +103,6 @@ _ENABLEMENT_BY_TOOL = {
     "shell.run": "allow_shell",
     "test.run": "allow_shell",
     "lint.run": "allow_shell",
+    "repair.prepare": "allow_file_write",
     "codex.exec": "allow_codex_cli",
 }
