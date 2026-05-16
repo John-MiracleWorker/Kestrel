@@ -17,7 +17,7 @@ from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.run_manager import RunManager
 from nested_memvid_agent.runtime_models import AgentTurnResult
 from nested_memvid_agent.server import create_app
-from nested_memvid_agent.skill_manager import SkillManager
+from nested_memvid_agent.skill_manager import SkillManager, validate_skill_manifest
 from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.tools.builtin import build_default_tools
 
@@ -474,6 +474,59 @@ def test_skill_discovery_exposes_nested_learning_skill(tmp_path: Path) -> None:
     assert adapters[0].spec.source == "skill"
     disabled = manager.set_enabled("review", False)
     assert disabled["enabled"] is False
+
+
+def test_skill_manifest_validation_records_provenance_and_rejects_invalid_skill(tmp_path: Path) -> None:
+    valid_dir = tmp_path / "skills" / "safe"
+    valid_dir.mkdir(parents=True)
+    (valid_dir / "skill.json").write_text(
+        json.dumps(
+            {
+                "id": "safe",
+                "name": "Safe Skill",
+                "description": "Safe instruction-only skill.",
+                "version": "1.0.0",
+                "risk": "low",
+                "capabilities": ["skill"],
+                "permissions": [],
+                "runtime": {"type": "instruction"},
+                "tests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (valid_dir / "SKILL.md").write_text("Do safe things only.", encoding="utf-8")
+    invalid_dir = tmp_path / "skills" / "invalid"
+    invalid_dir.mkdir()
+    (invalid_dir / "skill.json").write_text(json.dumps({"id": "invalid", "risk": "spicy"}), encoding="utf-8")
+    (invalid_dir / "SKILL.md").write_text("No description.", encoding="utf-8")
+
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = SkillManager(tmp_path / "skills", state)
+    discovered = manager.discover()
+
+    assert [skill["id"] for skill in discovered] == ["safe"]
+    manifest = discovered[0]["manifest"]
+    assert manifest["validation"]["ok"] is True
+    assert len(manifest["provenance"]["manifest_sha256"]) == 64
+    assert manager.validation_errors[0]["errors"] == ["missing_description", "invalid_risk"]
+    assert manager.tool_adapters()[0].spec.risk == "low"
+
+
+def test_validate_skill_manifest_rejects_bad_shapes() -> None:
+    result = validate_skill_manifest(
+        {
+            "id": "bad",
+            "description": "Bad shape",
+            "risk": "medium",
+            "capabilities": "skill",
+            "permissions": {},
+            "runtime": {"type": "spaceship"},
+        }
+    )
+
+    assert result["ok"] is False
+    assert {"invalid_capabilities", "invalid_permissions", "unsupported_runtime"} <= set(result["errors"])
 
 
 def test_cancelled_run_cannot_be_overwritten_completed_after_agent_returns(tmp_path: Path) -> None:

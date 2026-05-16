@@ -18,6 +18,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Built-in tool registry with structured exception boundaries, timeout enforcement, and exact-call approval gates for shell, file writes, patch application, tests, and Codex CLI delegation.
 - Self-diagnosis primitives can classify common provider/tool/test/import/permission/MCP/sandbox failures and recall similar procedural/episodic failure lessons before retry.
 - Safe self-repair now has branch-isolated repair primitives: `repair.prepare`, `repair.status`, `repair.apply_patch`, `repair.validate`, and `repair.rollback`.
+- Skills now have a first manifest validation gate plus persisted validation/provenance metadata for discovered instruction capsules.
 - Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry, and memory search.
 - Multi-channel ingress for Telegram Bot API updates, Discord message/interaction-shaped payloads, and generic/custom webhooks, with CLI and API routes.
 - SQLite state store for runs, run steps, approvals, MCP servers, skills, task nodes, and subagent runs, now initialized through schema version `5`.
@@ -34,7 +35,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 
 - Streaming/provider parity: the runtime, CLI, and web run event bus accept stream events, and provider capability metadata exists. Native streaming deltas and richer per-provider context/JSON-mode details still need hardening.
 - MCP: stdio live sessions are hardened and covered by a flag-gated integration test. SSE and streamable HTTP use the same manager path but still need real transport fixtures and production soak testing.
-- Skills: filesystem discovery and skill tool adapters exist. Sandboxed skill execution and richer skill manifests remain incomplete.
+- Skills: filesystem discovery, manifest validation, provenance metadata, and skill tool adapters exist. Sandboxed skill execution remains incomplete.
 - Codex CLI: `codex-cli` can drive responses and `codex.exec` is available as a high-risk approval-gated tool. It is not yet a branch-isolated autonomous repair loop.
 - Consolidation: capsule extraction and Nested Learning decisions exist, but auto-consolidation remains disabled by default and validation loops are still basic.
 - Self-diagnosis: first-pass classification and memory recall tools exist. A full executor retry gate that forces changed strategy before every retry is still incomplete.
@@ -67,6 +68,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Mock-provider tests are the default fast validation path; Memvid integration remains behind `RUN_MEMVID_INTEGRATION=1`.
 - Provider fallback only runs for `ProviderError(retryable=True)` failures; non-retryable errors fail fast and preserve the original provider error.
 - MCP tools remain approval-by-default unless a server is explicitly configured to trust its manifest; dangerous tool names/descriptions such as file writes, deletes, shell execution, patching, committing, or secrets are promoted to high risk during vetting.
+- Invalid skill manifests are rejected during discovery; accepted skill manifests record validation status plus manifest/SKILL.md content hashes for provenance.
 
 ## Validation Commands
 
