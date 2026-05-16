@@ -7,7 +7,8 @@ import pytest
 
 from nested_memvid_agent.backends.memvid_backend import MemvidBackend
 from nested_memvid_agent.cognition import FailureEpisode, LessonCard
-from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
+from nested_memvid_agent.layers import LayeredMemorySystem
+from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.runtime_models import StrategyProposal, ToolCall, ToolExecution
 
 pytestmark = pytest.mark.skipif(
@@ -41,6 +42,35 @@ def test_memvid_backend_write_seal_verify_reopen_search(tmp_path: Path) -> None:
         assert any("Integration fact" in hit.record.title for hit in hits)
     finally:
         reopened.close()
+
+
+def test_memvid_self_layer_write_verify_reopen_search(tmp_path: Path) -> None:
+    memory = LayeredMemorySystem.from_backend_factory(tmp_path, MemvidBackend)
+    try:
+        assert (tmp_path / "self.mv2").exists()
+        memory.put(
+            MemoryRecord(
+                layer=MemoryLayer.SELF,
+                kind=MemoryKind.FACT,
+                title="Soul identity",
+                content="Kestrel's Soul layer stores validated self-model records.",
+                confidence=0.9,
+                metadata={"self_schema": "identity_summary", "validation_status": "integration_test"},
+            )
+        )
+        memory.seal_all()
+        assert memory.verify_all()[MemoryLayer.SELF] is True
+    finally:
+        memory.close_all()
+
+    reopened = LayeredMemorySystem.from_backend_factory(tmp_path, MemvidBackend)
+    try:
+        hits = reopened.retrieve(
+            RetrievalQuery(query="Soul layer self-model", layers=(MemoryLayer.SELF,), k_per_layer=5)
+        )
+        assert any("Soul identity" in hit.record.title for hit in hits)
+    finally:
+        reopened.close_all()
 
 
 def test_memvid_backend_persists_cognition_failure_and_lesson_records(tmp_path: Path) -> None:

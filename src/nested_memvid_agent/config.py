@@ -39,6 +39,12 @@ class AgentConfig:
     allow_memory_import: bool = False
     allow_executable_skills: bool = False
     allow_mcp_network_endpoints: bool = False
+    allow_web: bool = False
+    allow_self_modification: bool = False
+    web_backend: str = "direct"
+    web_timeout_seconds: int = 10
+    web_max_results: int = 5
+    web_max_bytes: int = 200_000
     require_approval_for_high_risk_tools: bool = True
     enable_agentic_cycle: bool = True
     enable_autonomous_scheduler: bool = False
@@ -104,6 +110,12 @@ class AgentConfig:
             allow_memory_import=_env_bool("NEST_AGENT_ALLOW_MEMORY_IMPORT"),
             allow_executable_skills=_env_bool("NEST_AGENT_ALLOW_EXECUTABLE_SKILLS"),
             allow_mcp_network_endpoints=_env_bool("NEST_AGENT_ALLOW_MCP_NETWORK_ENDPOINTS"),
+            allow_web=_env_bool("NEST_AGENT_ALLOW_WEB"),
+            allow_self_modification=_env_bool("NEST_AGENT_ALLOW_SELF_MODIFICATION"),
+            web_backend=os.getenv("NEST_AGENT_WEB_BACKEND", "direct"),
+            web_timeout_seconds=_env_int("NEST_AGENT_WEB_TIMEOUT_SECONDS", 10),
+            web_max_results=_env_int("NEST_AGENT_WEB_MAX_RESULTS", 5),
+            web_max_bytes=_env_int("NEST_AGENT_WEB_MAX_BYTES", 200_000),
             enable_agentic_cycle=not _env_bool("NEST_AGENT_DISABLE_AGENTIC_CYCLE"),
             enable_autonomous_scheduler=_env_bool("NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER"),
             max_scheduler_tasks=_env_int("NEST_AGENT_MAX_SCHEDULER_TASKS", 3),

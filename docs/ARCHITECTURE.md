@@ -29,7 +29,7 @@ Working memory + run events + task capsule
         ↓
 NestedLearningKernel / Consolidator
         ↓
-Episodic → Semantic → Procedural → Policy .mv2 layers
+Episodic → Semantic/Procedural/Self → Policy .mv2 layers
 ```
 
 ## Memory Layers
@@ -39,6 +39,7 @@ Episodic → Semantic → Procedural → Policy .mv2 layers
 .nest/memory/episodic.mv2     events, failures, decisions, summaries
 .nest/memory/semantic.mv2     validated facts and preferences
 .nest/memory/procedural.mv2   reusable recipes and failure playbooks
+.nest/memory/self.mv2         identity, capability, workflow, and self-change records
 .nest/memory/policy.mv2       rare, explicit behavior/safety constraints
 .nest/runs/{run_id}/complete.mv2  run-scoped evidence bundle
 .nest/state/agent.db          control-plane state, not retrieval memory
@@ -65,7 +66,7 @@ A distribution/export optimization can be explored later, but the source-of-trut
 | Fast memory | Working `.mv2` plus current run/task state |
 | Slower memory | Episodic and semantic `.mv2` layers |
 | Continuum memory | Multiple layers with different write frequency and trust thresholds |
-| Self-modifying module | Controlled consolidation into procedural/policy memory after validation |
+| Self-modifying module | Controlled consolidation into procedural/self/policy memory after validation |
 | Expressive optimizer | Promotion gates, optimizer traces, correction/conflict handling, retrieval feedback |
 
 This is an agent-runtime analogue of Nested Learning. It is not neural weight-level HOPE training or unrestricted self-modification.
@@ -88,8 +89,9 @@ This is an agent-runtime analogue of Nested Learning. It is not neural weight-le
 2. Final turn summaries and meaningful outcomes become episodic evidence.
 3. Validated stable facts can become semantic memory.
 4. Repeated validated workflows can become procedural memory.
-5. Policy memory remains rare and requires explicit instruction, high validation, repeat evidence, config enablement, and review or equivalent explicit configuration.
-6. Promotions carry evidence, provenance, confidence, validation status, context-flow metadata, and optimizer traces.
+5. Validated identity, capability, workflow preference, and self-change signals can become self memory.
+6. Policy memory remains rare and requires explicit instruction, high validation, repeat evidence, config enablement, and review or equivalent explicit configuration.
+7. Promotions carry evidence, provenance, confidence, validation status, context-flow metadata, and optimizer traces.
 
 ## Control Plane
 

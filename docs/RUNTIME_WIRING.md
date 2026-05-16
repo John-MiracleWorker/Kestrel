@@ -53,6 +53,8 @@ nest-agent approve <approval_id> --backend memory --json
 
 The FastAPI server exposes the same state through run, event, approval, scheduler, memory, context, skill, MCP, and channel routes.
 
+Soul/self routes expose the same non-secret runtime model as the CLI: `/api/self`, `/api/self/remember`, `/api/self/propose-change`, `/api/web/search`, and `/api/web/fetch`.
+
 ## State Store
 
 `AgentStateStore` is SQLite control-plane storage, currently schema version 9.
@@ -140,8 +142,13 @@ Examples of high-risk tools:
 - `memory.import`
 - `skill.install`
 - `capsule.apply`
+- `self.propose_change`
 
 `git.commit` never pushes. On repair branches, it also requires a current `repair.review` artifact tied to successful validation and the current diff hash.
+
+`self.propose_change` is disabled unless `allow_self_modification` is enabled, still requires exact-call approval, and only records the requested self-change. Any actual code edit must use `repair.prepare`, `repair.apply_patch`, `repair.validate`, `repair.review`, and `git.commit`.
+
+`web.search` and `web.fetch` are disabled unless `allow_web` is enabled. They are read-only context tools; `web.fetch` rejects private, local, link-local, multicast, reserved, and unspecified addresses and applies timeout/byte limits.
 
 The plugin registry can fetch public GitHub repositories and materialize plugin-declared skills/MCP servers. CLI/API plugin install, update, enable, and sync/materialization routes require `NEST_AGENT_ALLOW_PLUGIN_INSTALL=true` or `--allow-plugin-install`. Agent-initiated `plugin.install` uses the same enablement gate plus exact-call approval, and installed plugins remain disabled unless explicitly enabled.
 
@@ -154,6 +161,7 @@ Permanent memory layers:
 .nest/memory/episodic.mv2
 .nest/memory/semantic.mv2
 .nest/memory/procedural.mv2
+.nest/memory/self.mv2
 .nest/memory/policy.mv2
 ```
 
@@ -171,6 +179,7 @@ The context compiler now uses the MV2 context packer. The packer emits:
 
 - objective
 - policy constraints
+- Soul/self model
 - relevant procedures
 - stable facts
 - recent episodic/task state

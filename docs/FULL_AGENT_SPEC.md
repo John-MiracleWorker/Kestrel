@@ -14,6 +14,7 @@ LLM provider
 + tool registry
 + permission and approval gates
 + nested .mv2 memory layers
++ inspectable Soul/self model
 + context compiler and pseudo-context packer
 + event and state logs
 + consolidation and task capsules
@@ -112,6 +113,8 @@ Current tool families:
 - Memvid verify/doctor/stats tools
 - diagnosis and failure-recall tools
 - safe repair tools
+- Soul/self inspection, reflection, memory, and change-proposal tools
+- gated read-only web search/fetch tools
 - skill install/runtime tools
 - plugin registry and materialization commands
 - Codex CLI delegation
@@ -127,6 +130,7 @@ High-risk tools are blocked unless enabled where applicable and approved for the
 | Episodic | `.nest/memory/episodic.mv2` | events, failures, decisions, summaries | medium | feeds semantic/procedural |
 | Semantic | `.nest/memory/semantic.mv2` | stable facts and preferences | high | corrected rather than casually overwritten |
 | Procedural | `.nest/memory/procedural.mv2` | reusable recipes and failure playbooks | very high | formed after repeated validated success |
+| Self | `.nest/memory/self.mv2` | identity, capability snapshots, user/workflow preferences, self-change requests, and validation metadata | high | written only with evidence, provenance, confidence, validation status, and context-flow metadata |
 | Policy | `.nest/memory/policy.mv2` | slow behavior and safety constraints | extreme | explicit/reviewed only |
 
 Run-scoped capsules live at `.nest/runs/{run_id}/complete.mv2`.
@@ -137,6 +141,7 @@ The compiler delegates to the MV2 context packer. The packer should render:
 
 - current objective
 - policy constraints
+- Soul/self model
 - relevant procedures
 - stable facts
 - recent episodic/task state
@@ -166,6 +171,8 @@ The FastAPI control plane and React/Vite workbench expose:
 
 - background runs and SSE events
 - approval list/decision flow
+- Soul/self inspection, remember, and self-change proposal routes
+- gated read-only web search/fetch routes
 - memory search, verify, doctor, inspect
 - context pack/expand/conflict utilities
 - MCP registry, health, connect/disconnect/restart, sync, invoke

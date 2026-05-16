@@ -40,6 +40,7 @@ LLM provider
 + tool registry
 + approval and permission gates
 + nested .mv2 memory
++ Soul/self runtime model
 + context compiler and pseudo-context packer
 + event/state logs
 + task capsules
@@ -54,6 +55,7 @@ Use one permanent Memvid v2 `.mv2` file per nested layer:
 .nest/memory/episodic.mv2
 .nest/memory/semantic.mv2
 .nest/memory/procedural.mv2
+.nest/memory/self.mv2
 .nest/memory/policy.mv2
 ```
 
@@ -113,8 +115,10 @@ Treat these as implemented unless current verification proves otherwise:
 - Provider fallback on retryable failures.
 - Durable graph runtime above the chat loop: `PlannerNode`, `ExecutorNode`, `ReviewerNode`, `RecoveryNode`, `MemoryPromotionNode`, and `FinalizerNode`.
 - MV2 context frames and token-aware pseudo-context packing.
+- Soul/self layer, self-model context frames, and CLI/API/web self-inspection surfaces.
 - Task capsules and conservative learning-signal extraction.
 - `memory.learn`, `memory.consolidate`, and promotion gate metadata.
+- `web.search` and `web.fetch` behind `NEST_AGENT_ALLOW_WEB`, with deterministic mock backend support and public-network fetch checks.
 - Exact-call approval gates for high-risk tools.
 - SQLite state schema version 9, including durable trace spans and persisted run provider.
 - Replay-safe terminal run and approval decisions.
@@ -136,6 +140,7 @@ The next useful hardening work should usually target one of these:
 - Container-grade skill isolation and package dependency management.
 - Plugin install allow-flag enforcement, approval UX, dependency isolation, and security review.
 - Stronger consolidation validation loops and review UI.
+- Richer self-change execution UX beyond approval-gated proposal capture and the existing repair gates.
 - Fully dynamic planner/executor/reviewer plan rewriting across worker branches.
 - Codex-backed worker fan-out with merge/review handling for isolated worker branches.
 - Production bot identity verification and channel-specific rate-limit handling.
@@ -151,6 +156,8 @@ Examples:
 - `file.write`, `patch.apply`, `skill.install`, and repair patch tools require file-write enablement and approval.
 - `codex.exec` requires Codex CLI enablement and approval.
 - `capsule.apply` requires auto-consolidation enablement, write mode, and approval.
+- `self.propose_change` requires self-modification enablement and approval, and must not patch directly.
+- `web.search` and `web.fetch` require web enablement and must remain read-only.
 - `memory.import` requires approval and still respects policy-write gating.
 - `git.commit` requires approval and never pushes.
 - Repair branch commits require a fresh `repair.review` artifact tied to successful validation and the current diff hash.

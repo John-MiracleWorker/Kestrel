@@ -34,6 +34,7 @@ Kestrel keeps one permanent `.mv2` file per nested layer:
 .nest/memory/episodic.mv2
 .nest/memory/semantic.mv2
 .nest/memory/procedural.mv2
+.nest/memory/self.mv2
 .nest/memory/policy.mv2
 ```
 
@@ -43,7 +44,7 @@ Run capsules live separately:
 .nest/runs/{run_id}/complete.mv2
 ```
 
-`complete.mv2` is a run evidence bundle, not a sixth permanent layer.
+`complete.mv2` is a run evidence bundle, not a permanent memory layer.
 
 ## Data-Loss Rules
 

@@ -233,4 +233,16 @@ export type RuntimeConfig = {
   validation_commands: string[];
 };
 
+export type SelfState = {
+  identity: Record<string, unknown>;
+  provider: Record<string, unknown>;
+  config: Record<string, unknown>;
+  memory_layers: Array<Record<string, unknown>>;
+  tools?: Tool[];
+  tool_count?: number;
+  skills?: Skill[];
+  plugins?: Plugin[];
+  mcp_servers?: McpServer[];
+};
+
 export type ApiResult = Record<string, unknown>;

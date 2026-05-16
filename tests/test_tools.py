@@ -246,6 +246,165 @@ def test_skill_install_requires_approval_and_writes_capsule_after_exact_approval
     assert approved.data["installed"] is True
 
 
+def test_default_registry_includes_self_and_web_tools() -> None:
+    names = {spec.name for spec in build_default_tools().specs()}
+
+    assert {"self.inspect", "self.reflect", "self.remember", "self.propose_change", "web.search", "web.fetch"} <= names
+
+
+def test_self_inspect_returns_redacted_runtime_snapshot(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("KESTREL_SELF_TEST_TOKEN", "secret-token")
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    config = AgentConfig(
+        api_key_env="KESTREL_SELF_TEST_TOKEN",
+        state_path=tmp_path / "state.db",
+        skills_dir=tmp_path / "skills",
+        plugins_dir=tmp_path / "plugins",
+        workspace=tmp_path,
+    )
+
+    result = registry.execute(
+        ToolCall(name="self.inspect", arguments={"include_tools": True}),
+        ToolContext(memory=memory, config=config, workspace=tmp_path),
+    )
+
+    assert result.success
+    assert result.data["identity"]["name"] == "Kestrel"
+    assert "self" in {layer["layer"] for layer in result.data["memory_layers"]}
+    assert "self.inspect" in {tool["name"] for tool in result.data["tools"]}
+    assert result.data["provider"]["api_key_env"] == "KESTREL_SELF_TEST_TOKEN"
+    assert result.data["provider"]["api_key_configured"] is True
+    assert "secret-token" not in json.dumps(result.data)
+
+
+def test_self_remember_writes_validated_self_memory(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    arguments = {
+        "title": "User workflow preference",
+        "content": "The user prefers implementation over analysis once a plan is agreed.",
+        "schema": "user_workflow_preference",
+        "validation_status": "user_confirmed",
+        "confidence": 0.88,
+    }
+
+    result = registry.execute(
+        ToolCall(name="self.remember", arguments=arguments),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.success
+    hits = memory.retrieve(RetrievalQuery(query="implementation over analysis", layers=(MemoryLayer.SELF,), k_per_layer=3))
+    assert hits
+    record = hits[0].record
+    assert record.metadata["self_schema"] == "user_workflow_preference"
+    assert record.metadata["validation_status"] == "user_confirmed"
+    assert record.evidence[0].source == "self.remember"
+
+
+def test_self_remember_rejects_low_confidence_self_memory(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+
+    result = registry.execute(
+        ToolCall(
+            name="self.remember",
+            arguments={
+                "title": "Unvalidated preference",
+                "content": "Maybe the user likes this workflow.",
+                "schema": "user_workflow_preference",
+                "validation_status": "unverified",
+                "confidence": 0.5,
+            },
+        ),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.success is False
+    assert result.error == "self_memory_rejected"
+    assert result.data["promotion_requirements"]["min_validation_score"] == 0.78
+
+
+def test_self_propose_change_requires_self_modification_enablement(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+
+    result = registry.execute(
+        ToolCall(name="self.propose_change", arguments={"request": "Change Kestrel's tool registry."}),
+        ToolContext(memory=memory, config=AgentConfig(allow_self_modification=False), workspace=tmp_path),
+    )
+
+    assert result.error == "tool_disabled"
+
+
+def test_self_propose_change_requires_exact_approval_when_enabled(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    arguments = {"request": "Teach Kestrel to expose a richer Soul summary."}
+    call = ToolCall(name="self.propose_change", arguments=arguments, id="self_change_1")
+    config = AgentConfig(allow_self_modification=True, state_path=tmp_path / "state.db")
+
+    pending = registry.execute(
+        call,
+        ToolContext(memory=memory, config=config, workspace=tmp_path),
+    )
+
+    assert pending.error == "approval_required"
+
+    approved = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=config,
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"self_change_1"}),
+            approved_tool_call_arguments={"self_change_1": arguments},
+        ),
+    )
+
+    assert approved.success
+    assert approved.data["required_gates"] == [
+        "repair.prepare",
+        "repair.apply_patch",
+        "repair.validate",
+        "repair.review",
+        "git.commit",
+    ]
+    assert approved.data["push_or_merge_allowed"] is False
+
+
+def test_web_tools_are_gated_and_mockable(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+
+    disabled = registry.execute(
+        ToolCall(name="web.search", arguments={"query": "Kestrel self awareness"}),
+        ToolContext(memory=memory, config=AgentConfig(allow_web=False), workspace=tmp_path),
+    )
+    assert disabled.error == "tool_disabled"
+
+    searched = registry.execute(
+        ToolCall(name="web.search", arguments={"query": "Kestrel self awareness"}),
+        ToolContext(memory=memory, config=AgentConfig(allow_web=True, web_backend="mock"), workspace=tmp_path),
+    )
+    assert searched.success
+    assert searched.data["results"][0]["url"].startswith("https://mock.kestrel.local/search/")
+
+    fetched = registry.execute(
+        ToolCall(name="web.fetch", arguments={"url": searched.data["results"][0]["url"]}),
+        ToolContext(memory=memory, config=AgentConfig(allow_web=True, web_backend="mock"), workspace=tmp_path),
+    )
+    assert fetched.success
+    assert "Mock web page for Kestrel" in fetched.content
+
+    private = registry.execute(
+        ToolCall(name="web.fetch", arguments={"url": "http://127.0.0.1/private"}),
+        ToolContext(memory=memory, config=AgentConfig(allow_web=True, web_backend="mock"), workspace=tmp_path),
+    )
+    assert private.error == "unsafe_url"
+
+
 def test_plugin_install_requires_enablement_and_exact_approval(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

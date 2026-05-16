@@ -13,6 +13,7 @@ class MemoryLayer(StrEnum):
     EPISODIC = "episodic"
     SEMANTIC = "semantic"
     PROCEDURAL = "procedural"
+    SELF = "self"
     POLICY = "policy"
 
 

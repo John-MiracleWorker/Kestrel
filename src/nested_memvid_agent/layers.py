@@ -72,6 +72,18 @@ DEFAULT_LAYER_SPECS: dict[MemoryLayer, LayerSpec] = {
         retention_days=365,
         search_mode="auto",
     ),
+    MemoryLayer.SELF: LayerSpec(
+        layer=MemoryLayer.SELF,
+        description="Validated self-model, identity, capability snapshots, and user-specific workflow preferences.",
+        mv2_file="self.mv2",
+        update_cadence="validated_self_reflection",
+        retrieval_k=6,
+        context_budget_chars=3500,
+        min_write_confidence=0.78,
+        promotion_threshold=0.88,
+        retention_days=365,
+        search_mode="auto",
+    ),
     MemoryLayer.POLICY: LayerSpec(
         layer=MemoryLayer.POLICY,
         description="Slow-changing behavior rules and safety constraints. Write rarely.",

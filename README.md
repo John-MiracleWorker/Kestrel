@@ -14,14 +14,14 @@ Kestrel is still an alpha runtime. It is useful for local development and harden
 - OpenAI-compatible chat completions provider for local/model-server endpoints.
 - Local Codex CLI provider for using `codex exec` as the response engine.
 - Retryable provider fallback wrapper and provider capability metadata.
-- One permanent `.mv2` file per memory layer: working, episodic, semantic, procedural, and policy.
+- One permanent `.mv2` file per memory layer: working, episodic, semantic, procedural, self, and policy.
 - MV2 context frames plus a token-aware pseudo-context packer with evidence pointers, conflict warnings, and on-demand raw expansion.
 - Run-scoped `complete.mv2` task capsules for reviewable learning signals.
 - Nested Learning kernel with context-flow metadata, optimizer traces, promotion gates, and explicit policy-write constraints.
-- Built-in tools for memory, context, repo search, patching, tests, linting, git status/diff/commit, Memvid verify/doctor/stats, diagnosis, repair, skills, and Codex CLI delegation.
+- Built-in tools for memory, context, repo search, patching, tests, linting, git status/diff/commit, Memvid verify/doctor/stats, diagnosis, repair, Soul/self inspection, gated web context, skills, and Codex CLI delegation.
 - Exact-call approval gates for high-risk tools, including shell, file writes, patching, tests/lint, repair mutations, commits, skill installs, imports, and Codex CLI delegation.
 - SQLite control-plane state for runs, approvals, MCP servers, skills, plugins, task nodes, subagents, and replay-safe terminal transitions. SQLite is not the retrieval memory store.
-- Local FastAPI/web workbench with background runs, SSE timeline events, approvals, memory/context tools, MCP controls, skills, subagents, and scheduler actions.
+- Local FastAPI/web workbench with background runs, SSE timeline events, approvals, Soul/self views, gated web search, memory/context tools, MCP controls, skills, subagents, and scheduler actions.
 - Managed stdio MCP sessions with lazy connect/disconnect/restart/health, tool discovery, vetting metadata, and approval-by-default risk normalization.
 - Experimental plugin registry/CLI that can materialize plugin-provided skills and MCP server entries from GitHub plugin manifests.
 - Multi-channel ingress for Telegram-shaped, Discord-shaped, webhook, and custom payloads, with outbound delivery disabled by default.
@@ -39,6 +39,7 @@ Kestrel uses Memvid v2 `.mv2` files as the durable memory substrate:
 .nest/memory/episodic.mv2
 .nest/memory/semantic.mv2
 .nest/memory/procedural.mv2
+.nest/memory/self.mv2
 .nest/memory/policy.mv2
 ```
 
@@ -50,7 +51,7 @@ Run capsules are separate artifacts:
 .nest/runs/{run_id}/complete.mv2
 ```
 
-`complete.mv2` is not a sixth permanent layer. It captures run evidence and candidate learning signals for reviewable consolidation.
+`complete.mv2` is not a permanent memory layer. It captures run evidence and candidate learning signals for reviewable consolidation.
 
 Important storage rules:
 
@@ -103,6 +104,10 @@ Useful interactive commands:
 ```text
 /tools
 /plugins
+/self
+/soul
+/capabilities
+/web <query>
 /context <query>
 /memory <query>
 /doctor
@@ -200,6 +205,8 @@ Open `http://127.0.0.1:8765/`.
 
 The workbench exposes runs, live event streams, approvals, MCP server health/sync/connect/disconnect/restart, manual MCP invocation, memory/context utilities, skills, subagent/task graph views, and scheduler controls.
 
+The Soul tab surfaces Kestrel's non-secret self model: identity, memory layers, available tools, skills, plugins, MCP state, validated self-memory capture, and gated web search.
+
 To require a local bearer/API-key token:
 
 ```bash
@@ -240,6 +247,8 @@ NEST_AGENT_ALLOW_GIT_COMMIT=false
 NEST_AGENT_ALLOW_MEMORY_IMPORT=false
 NEST_AGENT_ALLOW_EXECUTABLE_SKILLS=false
 NEST_AGENT_ALLOW_MCP_NETWORK_ENDPOINTS=false
+NEST_AGENT_ALLOW_WEB=false
+NEST_AGENT_ALLOW_SELF_MODIFICATION=false
 NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER=false
 NEST_AGENT_ENABLE_CHANNEL_DELIVERY=false
 NEST_AGENT_ENABLE_AUTO_CONSOLIDATION=false
@@ -250,6 +259,8 @@ NEST_AGENT_REQUIRE_API_AUTH=false
 High-risk tools need capability enablement where applicable and exact-call approval before execution. Approval is bound to the requested tool call ID and arguments; changed arguments require a new approval.
 
 Repair branch commits also require a current `repair.review` artifact tied to a successful validation result and the current diff hash.
+
+Web access is read-only context gathering. `web.search` and `web.fetch` stay disabled unless `--allow-web` / `NEST_AGENT_ALLOW_WEB=1` is set; fetches reject private, local, link-local, multicast, reserved, and unspecified addresses. Self-change requests stay behind `--allow-self-modification` / `NEST_AGENT_ALLOW_SELF_MODIFICATION=1`, exact-call approval, and the existing repair/commit path.
 
 ## Validation
 

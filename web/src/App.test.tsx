@@ -45,6 +45,7 @@ describe("App", () => {
 
     expect(await screen.findByRole("heading", { name: "Agent Workspace" })).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Run Agent" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Soul" })).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Settings & Health" })).toBeInTheDocument();
     await waitFor(() => expect(screen.getByText(/schema_version/)).toBeInTheDocument());
 
@@ -96,6 +97,22 @@ function payloadFor(path: string): unknown {
         risk: "low",
         requires_approval: false,
         source: "builtin"
+      },
+      {
+        name: "self.inspect",
+        description: "Inspect Soul state",
+        parameters: { type: "object", properties: {} },
+        risk: "low",
+        requires_approval: false,
+        source: "builtin"
+      },
+      {
+        name: "web.search",
+        description: "Search web",
+        parameters: { type: "object", properties: { query: { type: "string" } } },
+        risk: "medium",
+        requires_approval: false,
+        source: "builtin"
       }
     ];
   }
@@ -107,8 +124,46 @@ function payloadFor(path: string): unknown {
   if (path === "/api/memory/layers") {
     return [
       { layer: "working", path: "/tmp/working.mv2", exists: true, ok: true, backend: "InMemoryBackend" },
+      { layer: "self", path: "/tmp/self.mv2", exists: true, ok: true, backend: "InMemoryBackend" },
       { layer: "episodic", path: "/tmp/episodic.mv2", exists: true, ok: true, backend: "InMemoryBackend" }
     ];
+  }
+  if (path === "/api/self") {
+    return {
+      identity: {
+        name: "Kestrel",
+        display_name: "Soul",
+        description: "A local-first, memory-native engineering agent runtime."
+      },
+      provider: { provider: "mock", model: "mock", api_key_env: null, api_key_configured: false },
+      config: { allow_self_modification: false, allow_web: false },
+      memory_layers: [
+        { layer: "policy", mv2_file: "policy.mv2" },
+        { layer: "self", mv2_file: "self.mv2" },
+        { layer: "working", mv2_file: "working.mv2" }
+      ],
+      tools: [
+        {
+          name: "self.inspect",
+          description: "Inspect Soul state",
+          parameters: { type: "object", properties: {} },
+          risk: "low",
+          requires_approval: false,
+          source: "builtin"
+        },
+        {
+          name: "web.search",
+          description: "Search web",
+          parameters: { type: "object", properties: { query: { type: "string" } } },
+          risk: "medium",
+          requires_approval: false,
+          source: "builtin"
+        }
+      ],
+      skills: [],
+      plugins: [],
+      mcp_servers: []
+    };
   }
   if (path === "/api/runtime/config") {
     return {

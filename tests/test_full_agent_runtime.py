@@ -667,6 +667,61 @@ def test_server_exposes_prompt_api_routes(tmp_path: Path) -> None:
     assert context.json()["selected_item_count"] >= 1
 
 
+def test_server_exposes_self_and_web_routes(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    config = AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        state_path=tmp_path / "state.db",
+        skills_dir=tmp_path / "skills",
+        plugins_dir=tmp_path / "plugins",
+        workspace=tmp_path,
+        allow_web=True,
+        web_backend="mock",
+    )
+    client = TestClient(create_app(config))
+
+    inspected = client.get("/api/self")
+    assert inspected.status_code == 200
+    assert inspected.json()["identity"]["display_name"] == "Soul"
+    assert "self" in {layer["layer"] for layer in inspected.json()["memory_layers"]}
+
+    remembered = client.post(
+        "/api/self/remember",
+        json={
+            "title": "API user preference",
+            "content": "The user wants visible self-awareness controls.",
+            "schema": "user_workflow_preference",
+            "validation_status": "user_confirmed",
+            "confidence": 0.9,
+        },
+    )
+    assert remembered.status_code == 200
+    assert remembered.json()["success"] is True
+
+    proposed = client.post("/api/self/propose-change", json={"request": "Rewrite Kestrel without approval."})
+    assert proposed.status_code == 200
+    assert proposed.json()["success"] is False
+    assert proposed.json()["error"] == "tool_disabled"
+
+    searched = client.post("/api/web/search", json={"query": "kestrel soul"})
+    assert searched.status_code == 200
+    assert searched.json()["success"] is True
+    assert searched.json()["data"]["results"][0]["url"].startswith("https://mock.kestrel.local/search/")
+
+    fetched = client.post("/api/web/fetch", json={"url": searched.json()["data"]["results"][0]["url"]})
+    assert fetched.status_code == 200
+    assert fetched.json()["success"] is True
+
+    unsafe = client.post("/api/web/fetch", json={"url": "http://169.254.169.254/latest/meta-data"})
+    assert unsafe.status_code == 200
+    assert unsafe.json()["error"] == "unsafe_url"
+
+
 def test_server_exposes_local_operator_api_parity(tmp_path: Path, monkeypatch: Any) -> None:
     from fastapi.testclient import TestClient
 

@@ -46,4 +46,9 @@ class MockLLMProvider(LLMProvider):
                 content="I’ll check memory for that.",
                 tool_calls=(ToolCall(name="memory.search", arguments={"query": query, "k": 5}),),
             )
+        lowered = latest_user.lower()
+        if "who are you" in lowered or "what are you" in lowered:
+            return LLMResponse(content="I am Kestrel, a local-first nested-learning agent runtime with a Soul/self memory layer.")
+        if "capabilities" in lowered or "what can you do" in lowered:
+            return LLMResponse(content="I can chat, inspect memory, use approved tools, summarize my capabilities, and request gated self-changes.")
         return LLMResponse(content=f"Mock response: {latest_user}")

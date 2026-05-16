@@ -62,6 +62,22 @@ def test_packer_includes_policy_and_procedural_first(tmp_path: Path) -> None:
     assert [item.frame.layer for item in packed.items[:2]] == [MemoryLayer.POLICY, MemoryLayer.PROCEDURAL]
 
 
+def test_packer_places_self_layer_between_policy_and_procedural(tmp_path: Path) -> None:
+    memory = _memory(tmp_path)
+    _put(memory, "Procedure", "identity procedure says inspect tools before self-editing.", MemoryLayer.PROCEDURAL, confidence=0.9)
+    _put(memory, "Policy", "identity policy says do not bypass approval gates.", MemoryLayer.POLICY, confidence=0.98)
+    _put(memory, "Soul identity", "Kestrel's self model says it is a local-first engineering agent.", MemoryLayer.SELF, confidence=0.88)
+
+    packed = ContextPacker(memory).pack(ContextPackRequest(objective="identity", query="identity"))
+
+    assert [item.frame.layer for item in packed.items[:3]] == [
+        MemoryLayer.POLICY,
+        MemoryLayer.SELF,
+        MemoryLayer.PROCEDURAL,
+    ]
+    assert "SELF MEMORY" in packed.prompt
+
+
 def test_packer_detects_conflict_metadata(tmp_path: Path) -> None:
     memory = _memory(tmp_path)
     _put(

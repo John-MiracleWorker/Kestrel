@@ -7,9 +7,10 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 ## Working Now
 
 - CLI chat loop with in-memory and Memvid `.mv2` memory backends.
-- Layered memory files for working, episodic, semantic, procedural, and policy layers.
+- Layered memory files for working, episodic, semantic, procedural, self, and policy layers.
 - Context compiler that retrieves nested memory and builds the model prompt.
 - MV2 context-frame model and token-aware pseudo-context packer that retrieves summaries first, deduplicates content, flags conflict metadata, and expands raw evidence on demand.
+- Soul/self memory layer backed by `.nest/memory/self.mv2`, packed after policy and before procedural memory, with `self_model` context frames and conservative promotion gates.
 - Deterministic mock provider for fast tests and reproducible golden evals.
 - OpenAI Responses provider adapter using the portable JSON tool envelope.
 - OpenAI Responses provider now exposes native streaming deltas when the SDK stream surface is available, while preserving the non-streaming fallback path.
@@ -22,10 +23,12 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Self-diagnosis primitives can classify common provider/tool/test/import/permission/MCP/sandbox failures and recall similar procedural/episodic failure lessons before retry.
 - The default-on agentic failure cycle retrieves prior failure lessons before tool planning, records failed tool attempts as episodic `FailureEpisode` records, blocks unchanged same-action retries until a meaningful changed strategy is supplied, and returns a structured proof-of-work summary on agent turns. It can be disabled with `NEST_AGENT_DISABLE_AGENTIC_CYCLE=1`.
 - Safe self-repair now has branch-isolated repair primitives: `repair.prepare`, `repair.status`, `repair.apply_patch`, `repair.validate`, `repair.orchestrate_validate`, and `repair.rollback`.
+- Self-awareness tools now expose non-secret identity, runtime config, provider capability, memory layer, tool, skill, plugin, MCP, and state snapshots through `self.inspect`, `self.reflect`, `self.remember`, and approval-gated `self.propose_change`.
+- Gated web context tools now provide read-only `web.search` and `web.fetch`, disabled by default behind `NEST_AGENT_ALLOW_WEB`, with deterministic mock backend support, citations, byte/time/result limits, redaction boundaries, and private/local network URL rejection.
 - The first diagnosis-gated repair orchestration slice can run validation on an active repair branch, classify failures, recall prior lessons, and block repeated validation retries until the strategy changes.
 - Skills now have a first manifest validation gate plus persisted validation/provenance metadata for discovered instruction capsules.
-- Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry, memory search, non-secret runtime config, channel CRUD, plugin/skill detail, memory inspect, cognition lesson/failure lists, and diagnosis classify/recall routes.
-- Local operator web UI now exposes the implemented Kestrel runtime surfaces: provider/model/workspace run controls, real task graph and scheduler controls, approvals/history, memory/context/lesson/failure views, tool invocation, MCP create/edit/lifecycle/manual invoke, skills/plugins, channels, observability, and non-secret runtime settings.
+- Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry, memory search, Soul/self routes, gated web routes, non-secret runtime config, channel CRUD, plugin/skill detail, memory inspect, cognition lesson/failure lists, and diagnosis classify/recall routes.
+- Local operator web UI now exposes the implemented Kestrel runtime surfaces: provider/model/workspace run controls, real task graph and scheduler controls, approvals/history, Soul/self inspection and memory capture, gated web search, memory/context/lesson/failure views, tool invocation, MCP create/edit/lifecycle/manual invoke, skills/plugins, channels, observability, and non-secret runtime settings.
 - Multi-channel ingress for Telegram Bot API updates, Discord message/interaction-shaped payloads, and generic/custom webhooks, with CLI and API routes.
 - SQLite state store for runs, run steps, approvals, MCP servers, skills, plugins, task nodes, subagent runs, and trace spans, now initialized through schema version `9`.
 - Paper-guided nested learning kernel with context-flow metadata, optimizer traces, conservative continuum-memory routing, and a `memory.learn` tool/API path.
@@ -67,7 +70,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Codex CLI: `codex-cli` can drive responses and `codex.exec` is available as a high-risk approval-gated tool. It is not yet a branch-isolated autonomous repair loop.
 - Consolidation: capsule extraction and Nested Learning decisions exist, but auto-consolidation remains disabled by default and validation loops are still basic.
 - Self-diagnosis: first-pass classification, memory recall tools, and the default chat-loop retry gate exist. Hybrid LLM diagnosis, reviewer-confirmed diagnosis, and cross-run retry-state matching are still next steps.
-- Self-modification: the runtime can record validated self-improvement signals and policy candidates, but code changes and policy writes still require explicit gates.
+- Self-modification: the runtime can inspect itself, record validated Soul/self memories, and capture approval-gated self-change requests. Actual code changes still have to flow through existing repair and commit gates; policy writes still require explicit policy gates.
 - Safe repair: branch preparation, patch application, targeted validation, diagnosis-gated retry assessment, status reporting, and rollback primitives exist. Full autonomous patch proposal, reviewer gating, and approval-before-commit orchestration are still incomplete.
 - Subagents: local subagent runs can be queued, tracked, and executed by scheduler runs until idle. The graph runtime can assign work to task/subagent records, and scheduler/subagent task execution can opt into git worktree isolation. Codex-backed worker fan-out, merge/review handling for worker branches, and fully dynamic DAG rewriting are still next steps.
 - Channels: inbound normalization, dry-run reply payloads, and generic HMAC webhook verification are implemented. Production bot identity verification, Discord Gateway reads, and channel-specific rate-limit handling still need hardening.
@@ -80,12 +83,14 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Bot-platform-native signature/identity verification and secret rotation workflows for external channel endpoints.
 - Robust MCP SSE/streamable HTTP transport fixtures and failure-recovery soak testing.
 - Container-grade sandboxed skill execution.
-- Autonomous self-improvement with diff review, test gates, rollback, and explicit human approval.
+- Autonomous self-improvement beyond self-change proposal capture, repair diff review, test gates, rollback, and explicit human approval.
 - Hosted multi-user UI behavior, production authorization, and role-scoped operator permissions.
 
 ## Current Contract
 
 - High-risk tools require both capability enablement (matching allow flag, where applicable) and explicit approval for the exact tool-call ID and arguments before execution.
+- `NEST_AGENT_ALLOW_WEB` / `--allow-web` enables read-only web tools; web fetches reject private, local, link-local, multicast, reserved, and unspecified addresses.
+- `NEST_AGENT_ALLOW_SELF_MODIFICATION` / `--allow-self-modification` only enables the high-risk `self.propose_change` request path. It does not bypass exact-call approval or the repair/commit gates.
 - The agentic failure cycle is default-on through `enable_agentic_cycle`; disable it only for debugging with `NEST_AGENT_DISABLE_AGENTIC_CYCLE=1`.
 - Autonomous scheduling is opt-in and bounded by `max_scheduler_tasks` / `NEST_AGENT_MAX_SCHEDULER_TASKS` per cycle and `max_scheduler_cycles` / `NEST_AGENT_MAX_SCHEDULER_CYCLES` per drain run.
 - Git worktree isolation for scheduler/subagent execution is opt-in through `enable_worker_isolation` / `NEST_AGENT_ENABLE_WORKER_ISOLATION`; isolated worker branches use `worker_branch_prefix` and `worker_worktree_dir`.
@@ -94,7 +99,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Tool execution is bounded by `tool_timeout_seconds` / `NEST_AGENT_TOOL_TIMEOUT_SECONDS` and timeout failures are returned as structured tool errors.
 - New background runs persist a root task plus a small starter DAG with dependencies, required tools, risk, acceptance criteria, attempt count, failure reason, diagnosis, retry-strategy fields, and graph-runtime plan metadata.
 - Ordinary conversation and observations must not write policy memory directly.
-- The Memvid backend must use `.mv2` files and preserve one file per memory layer.
+- The Memvid backend must use `.mv2` files and preserve one file per memory layer, including `.nest/memory/self.mv2`.
 - `complete.mv2` is a run artifact under `.nest/runs/{run_id}/`, not a permanent memory layer.
 - SQLite is control-plane state only. It is not the retrieval memory substrate.
 - Mock-provider tests are the default fast validation path; Memvid integration remains behind `RUN_MEMVID_INTEGRATION=1`.

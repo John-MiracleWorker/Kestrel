@@ -158,6 +158,8 @@ def default_frame_type_for_memory(
         return "skill_card"
     if kind == MemoryKind.SUMMARY:
         return "session_summary" if layer == MemoryLayer.EPISODIC else "section_summary"
+    if layer == MemoryLayer.SELF:
+        return "self_model"
     if kind == MemoryKind.FACT or layer == MemoryLayer.SEMANTIC:
         return "section_summary"
     if layer == MemoryLayer.POLICY:

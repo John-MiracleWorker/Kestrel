@@ -11,6 +11,7 @@ One permanent `.mv2` file is kept per layer:
 .nest/memory/episodic.mv2
 .nest/memory/semantic.mv2
 .nest/memory/procedural.mv2
+.nest/memory/self.mv2
 .nest/memory/policy.mv2
 ```
 
@@ -68,4 +69,4 @@ Never call `create(path)` on an existing `.mv2` file. The backend must use exist
 
 ## Retention Notes
 
-Working memory can be compacted or promoted through the nested learning pipeline, but semantic/procedural/policy layers require validation evidence. Policy memory requires explicit configuration and explicit user instruction.
+Working memory can be compacted or promoted through the nested learning pipeline, but semantic/procedural/self/policy layers require validation evidence. Policy memory requires explicit configuration and explicit user instruction.

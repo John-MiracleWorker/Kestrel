@@ -9,6 +9,7 @@ Kestrel uses Memvid v2 `.mv2` files as the durable memory substrate. Context pac
 - `raw_chunk`: exact source text, tool output, code excerpt, or raw evidence.
 - `section_summary`, `task_summary`, `session_summary`: compact summaries that point back to raw chunks.
 - `skill_card`: reusable procedural recipe.
+- `self_model`: identity, capability, preference, or self-change context from the Soul/self layer.
 - `failure_note`: validated failure or pitfall.
 - `correction`: memory correction that should override stale assumptions.
 - `conflict_set`: explicit conflict grouping.
@@ -21,10 +22,11 @@ Every frame carries layer, kind, parent/child ids, source URI/span, content hash
 The packer prefers memory layers in this order:
 
 1. policy
-2. procedural
-3. semantic
-4. episodic
-5. working
+2. self
+3. procedural
+4. semantic
+5. episodic
+6. working
 
 Within those layers, summaries are preferred before raw chunks. Raw chunks are expanded only when the request asks for it, confidence is low, the item is a correction/failure/conflict, or exact evidence/code is required.
 
@@ -34,6 +36,7 @@ The packed prompt contains:
 
 - Current objective
 - Hard policy constraints
+- Soul/self model
 - Relevant procedures
 - Stable facts
 - Recent episodic/task state

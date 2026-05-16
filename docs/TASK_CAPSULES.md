@@ -6,12 +6,13 @@ Task capsules capture completed run evidence into a run-scoped Memvid v2 artifac
 .nest/runs/{run_id}/complete.mv2
 ```
 
-`complete.mv2` is not a sixth permanent memory layer. The durable nested layers remain:
+`complete.mv2` is not a permanent memory layer. The durable nested layers remain:
 
 - `working.mv2`
 - `episodic.mv2`
 - `semantic.mv2`
 - `procedural.mv2`
+- `self.mv2`
 - `policy.mv2`
 
 The capsule is a temporary evidence bundle that can be summarized and used to propose learning signals.

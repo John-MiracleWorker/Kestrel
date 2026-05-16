@@ -42,3 +42,10 @@ def test_retrieve_across_layers(tmp_path: Path) -> None:
     )
     hits = memory.retrieve(RetrievalQuery(query="auth profiles"))
     assert {hit.record.layer for hit in hits} == {MemoryLayer.WORKING, MemoryLayer.SEMANTIC}
+
+
+def test_default_memory_system_includes_self_layer(tmp_path: Path) -> None:
+    memory = LayeredMemorySystem.from_backend_factory(tmp_path, InMemoryBackend)
+
+    assert MemoryLayer.SELF in memory.backends
+    assert memory.specs[MemoryLayer.SELF].mv2_file == "self.mv2"

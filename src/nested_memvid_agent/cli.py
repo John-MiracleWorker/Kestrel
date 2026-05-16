@@ -74,6 +74,12 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-memory-import", action="store_true")
     parser.add_argument("--allow-executable-skills", action="store_true")
     parser.add_argument("--allow-mcp-network-endpoints", action="store_true")
+    parser.add_argument("--allow-web", action="store_true")
+    parser.add_argument("--allow-self-modification", action="store_true")
+    parser.add_argument("--web-backend", choices=["direct", "mock"], default="direct")
+    parser.add_argument("--web-timeout-seconds", type=int, default=10)
+    parser.add_argument("--web-max-results", type=int, default=5)
+    parser.add_argument("--web-max-bytes", type=int, default=200_000)
     parser.add_argument("--enable-autonomous-scheduler", action="store_true")
     parser.add_argument("--max-scheduler-tasks", type=int, default=3)
     parser.add_argument("--max-scheduler-cycles", type=int, default=5)
@@ -512,6 +518,12 @@ def _agent_config_from_args(args: argparse.Namespace, *, backend: str, memory_di
         allow_memory_import=args.allow_memory_import,
         allow_executable_skills=args.allow_executable_skills,
         allow_mcp_network_endpoints=args.allow_mcp_network_endpoints,
+        allow_web=args.allow_web,
+        allow_self_modification=args.allow_self_modification,
+        web_backend=args.web_backend,
+        web_timeout_seconds=args.web_timeout_seconds,
+        web_max_results=args.web_max_results,
+        web_max_bytes=args.web_max_bytes,
         enable_autonomous_scheduler=args.enable_autonomous_scheduler,
         max_scheduler_tasks=args.max_scheduler_tasks,
         max_scheduler_cycles=args.max_scheduler_cycles,
@@ -686,7 +698,10 @@ def _doctor_tool_config(config: AgentConfig) -> dict[str, Any]:
         "allow_memory_import": config.allow_memory_import,
         "allow_executable_skills": config.allow_executable_skills,
         "allow_mcp_network_endpoints": config.allow_mcp_network_endpoints,
+        "allow_web": config.allow_web,
+        "allow_self_modification": config.allow_self_modification,
         "require_approval_for_high_risk_tools": config.require_approval_for_high_risk_tools,
+        "web_backend": config.web_backend,
         "max_tool_rounds": config.max_tool_rounds,
         "context_budget_chars": config.context_budget_chars,
     }
@@ -1102,6 +1117,73 @@ def _handle_slash_command(
         print(_slash_help())
         return True
 
+    if name in {"/self", "/soul"}:
+        execution = agent.tools.execute(
+            ToolCall(name="self.inspect", arguments={"include_tools": True}),
+            ToolContext(
+                memory=agent.memory,
+                config=agent.config,
+                workspace=agent.config.workspace,
+                event_log=agent.event_log,
+                session_id=session_id,
+            ),
+        )
+        if not execution.success:
+            print(execution.content)
+            return True
+        data = execution.data
+        identity = data.get("identity", {}) if isinstance(data.get("identity"), dict) else {}
+        print(f"{identity.get('display_name', 'Soul')} ({identity.get('name', 'Kestrel')})")
+        print(identity.get("description", ""))
+        print("Memory layers:")
+        for layer in data.get("memory_layers", []):
+            if isinstance(layer, dict):
+                print(f"- {layer.get('layer')}: {layer.get('mv2_file')}")
+        print(f"Tools: {len(data.get('tools', []))}")
+        return True
+
+    if name == "/capabilities":
+        execution = agent.tools.execute(
+            ToolCall(name="self.inspect", arguments={"include_tools": True}),
+            ToolContext(
+                memory=agent.memory,
+                config=agent.config,
+                workspace=agent.config.workspace,
+                event_log=agent.event_log,
+                session_id=session_id,
+            ),
+        )
+        if not execution.success:
+            print(execution.content)
+            return True
+        for spec in execution.data.get("tools", []):
+            if isinstance(spec, dict):
+                approval = "approval required" if spec.get("requires_approval") else "allowed"
+                print(f"{spec.get('name')} [{spec.get('risk')}, {approval}] - {spec.get('description')}")
+        return True
+
+    if name == "/web":
+        if not query:
+            print("Usage: /web <query>")
+            return True
+        execution = agent.tools.execute(
+            ToolCall(name="web.search", arguments={"query": query, "max_results": agent.config.web_max_results}),
+            ToolContext(
+                memory=agent.memory,
+                config=agent.config,
+                workspace=agent.config.workspace,
+                event_log=agent.event_log,
+                session_id=session_id,
+            ),
+        )
+        if not execution.success:
+            print(execution.content)
+            return True
+        for item in execution.data.get("results", []):
+            if isinstance(item, dict):
+                print(f"{item.get('title')}\n{item.get('url')}\n{item.get('snippet')}\n")
+        return True
+
     if name == "/tools":
         for spec in agent.tools.specs():
             approval = "approval required" if spec.requires_approval else "allowed"
@@ -1233,6 +1315,10 @@ def _slash_help() -> str:
         [
             "Available slash commands:",
             "/help",
+            "/self",
+            "/soul",
+            "/capabilities",
+            "/web <query>",
             "/tools",
             "/plugins",
             "/context <query>",

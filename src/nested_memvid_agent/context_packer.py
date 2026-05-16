@@ -8,11 +8,12 @@ from .context_frames import MV2ContextFrame, estimate_tokens, from_memory_record
 from .layers import LayeredMemorySystem
 from .models import MemoryHit, MemoryLayer, MemoryRecord, RetrievalQuery
 
-SUMMARY_FRAME_TYPES = frozenset({"section_summary", "task_summary", "session_summary", "skill_card", "trace_stub"})
+SUMMARY_FRAME_TYPES = frozenset({"section_summary", "task_summary", "session_summary", "skill_card", "trace_stub", "self_model"})
 RAW_FRAME_TYPES = frozenset({"raw_chunk"})
 CORRECTION_FRAME_TYPES = frozenset({"correction", "failure_note", "conflict_set"})
 PACK_LAYER_ORDER = (
     MemoryLayer.POLICY,
+    MemoryLayer.SELF,
     MemoryLayer.PROCEDURAL,
     MemoryLayer.SEMANTIC,
     MemoryLayer.EPISODIC,
@@ -192,6 +193,8 @@ class ContextPacker:
             "POLICY MEMORY",
         ]
         lines.extend(_section_lines(by_layer.get(MemoryLayer.POLICY, []), empty="No matching policy memory retrieved."))
+        lines.extend(["", "## Soul / Self Model", "SELF MEMORY"])
+        lines.extend(_section_lines(by_layer.get(MemoryLayer.SELF, []), empty="No matching self memory retrieved."))
         lines.extend(["", "## Relevant Procedures", "PROCEDURAL MEMORY"])
         lines.extend(_section_lines(by_layer.get(MemoryLayer.PROCEDURAL, []), empty="No matching procedural memory retrieved."))
         lines.extend(["", "## Stable Facts", "SEMANTIC MEMORY"])

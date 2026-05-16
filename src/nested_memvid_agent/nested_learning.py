@@ -147,6 +147,16 @@ DEFAULT_CONTEXT_FLOWS: dict[str, ContextFlow] = {
         compression="Validated failures/successes -> procedure.",
         retention="long",
     ),
+    "episode_to_self": ContextFlow(
+        id="episode_to_self",
+        level=4,
+        update_frequency="after-self-validation",
+        source_layers=(MemoryLayer.EPISODIC, MemoryLayer.SEMANTIC, MemoryLayer.PROCEDURAL),
+        target_layer=MemoryLayer.SELF,
+        objective="Compress validated identity, capability, preference, and self-change evidence into self memory.",
+        compression="Auditable evidence -> bounded self-model record.",
+        retention="long",
+    ),
     "procedure_to_policy": ContextFlow(
         id="procedure_to_policy",
         level=5,
@@ -260,6 +270,9 @@ class NestedLearningKernel:
             return MemoryLayer.EPISODIC, "Working context survived validation and became an episodic event."
 
         if signal.source_layer == MemoryLayer.EPISODIC:
+            if signal.kind == MemoryKind.FACT and str((signal.metadata or {}).get("self_schema", "")).strip():
+                if signal.validation_score >= 0.78:
+                    return MemoryLayer.SELF, "Validated self-model signal became self memory."
             if signal.kind in {MemoryKind.FAILURE, MemoryKind.PROCEDURE} and signal.repeat_count >= 2 and signal.validation_score >= 0.78:
                 return MemoryLayer.PROCEDURAL, "Repeated validated outcome became a reusable procedure."
             if signal.validation_score >= 0.78:
@@ -276,6 +289,9 @@ class NestedLearningKernel:
                 return MemoryLayer.PROCEDURAL, "Semantic procedure cleared repeated-use gate."
             return None, "Rejected: semantic memory is already stable and needs correction, not promotion."
 
+        if signal.source_layer == MemoryLayer.SELF:
+            return None, "Rejected: self memory is already part of the self-model and needs correction, not promotion."
+
         return None, "Rejected: policy memory cannot self-promote."
 
 
@@ -291,6 +307,9 @@ def _requested_target_allowed(signal: LearningSignal, target: MemoryLayer) -> tu
     if target == MemoryLayer.PROCEDURAL:
         ok = signal.validation_score >= 0.78 and signal.repeat_count >= 2
         return ok, "Requested procedural memory cleared repeated validation gate." if ok else "Rejected: procedural writes require validation >= 0.78 and repeat_count >= 2."
+    if target == MemoryLayer.SELF:
+        ok = signal.validation_score >= 0.78
+        return ok, "Requested self memory cleared validation gate." if ok else "Rejected: self memory writes require validation >= 0.78."
     if target == MemoryLayer.SEMANTIC:
         ok = signal.validation_score >= 0.78
         return ok, "Requested semantic memory cleared validation gate." if ok else "Rejected: semantic writes require validation >= 0.78."
@@ -308,6 +327,8 @@ def _flow_for(source: MemoryLayer, target: MemoryLayer | None) -> ContextFlow:
         return DEFAULT_CONTEXT_FLOWS["episode_to_procedural"]
     if target == MemoryLayer.POLICY:
         return DEFAULT_CONTEXT_FLOWS["procedure_to_policy"]
+    if target == MemoryLayer.SELF:
+        return DEFAULT_CONTEXT_FLOWS["episode_to_self"]
     if source == MemoryLayer.WORKING:
         return DEFAULT_CONTEXT_FLOWS["interaction_to_working"]
     return DEFAULT_CONTEXT_FLOWS["episode_to_semantic"]
@@ -333,6 +354,14 @@ def _promotion_requirements(signal: LearningSignal, target: MemoryLayer | None) 
             {
                 "min_validation_score": 0.78,
                 "min_repeat_count": 2,
+                "requires_explicit_instruction": False,
+            }
+        )
+    elif target == MemoryLayer.SELF:
+        payload.update(
+            {
+                "min_validation_score": 0.78,
+                "min_repeat_count": 1,
                 "requires_explicit_instruction": False,
             }
         )
@@ -387,6 +416,8 @@ def _target_kind(kind: MemoryKind, target_layer: MemoryLayer) -> MemoryKind:
         return MemoryKind.POLICY
     if target_layer == MemoryLayer.PROCEDURAL:
         return MemoryKind.PROCEDURE
+    if target_layer == MemoryLayer.SELF:
+        return MemoryKind.FACT
     if target_layer == MemoryLayer.SEMANTIC:
         return MemoryKind.FACT
     if target_layer == MemoryLayer.EPISODIC:
@@ -400,5 +431,6 @@ def _layer_level(layer: MemoryLayer) -> int:
         MemoryLayer.EPISODIC: 2,
         MemoryLayer.SEMANTIC: 3,
         MemoryLayer.PROCEDURAL: 4,
+        MemoryLayer.SELF: 4,
         MemoryLayer.POLICY: 5,
     }[layer]

@@ -71,6 +71,37 @@ def test_tools_subcommand_lists_risk_levels(monkeypatch: MonkeyPatch, capsys: ob
     assert "git.commit [high, approval required]" in output
 
 
+def test_chat_self_and_web_slash_commands(tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object) -> None:
+    common = [
+        "nest-agent",
+        "chat",
+        "--backend",
+        "memory",
+        "--memory-dir",
+        str(tmp_path / "memory"),
+        "--state-path",
+        str(tmp_path / "state.db"),
+        "--workspace",
+        str(tmp_path),
+    ]
+
+    monkeypatch.setattr(sys, "argv", [*common, "--message", "/self"])
+    main()
+    self_output = capsys.readouterr().out
+    assert "Soul" in self_output
+    assert "self.mv2" in self_output
+
+    monkeypatch.setattr(sys, "argv", [*common, "--message", "/capabilities"])
+    main()
+    capabilities_output = capsys.readouterr().out
+    assert "self.inspect" in capabilities_output
+
+    monkeypatch.setattr(sys, "argv", [*common, "--allow-web", "--web-backend", "mock", "--message", "/web kestrel soul"])
+    main()
+    web_output = capsys.readouterr().out
+    assert "https://mock.kestrel.local/search/" in web_output
+
+
 def test_plugins_subcommands_install_list_and_toggle(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

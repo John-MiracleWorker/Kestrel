@@ -42,6 +42,7 @@ import type {
   Run,
   RunTrace,
   RuntimeConfig,
+  SelfState,
   Session,
   Skill,
   TaskGraph,
@@ -61,6 +62,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [runtime, setRuntime] = useState<Record<string, unknown> | null>(null);
+  const [selfState, setSelfState] = useState<SelfState | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [tools, setTools] = useState<Tool[]>([]);
@@ -96,7 +98,7 @@ export function App() {
   const [memoryHits, setMemoryHits] = useState<MemoryHit[]>([]);
   const [memoryInspect, setMemoryInspect] = useState<Record<string, unknown> | null>(null);
   const [contextQuery, setContextQuery] = useState("");
-  const [contextLayers, setContextLayers] = useState("policy,procedural,semantic,episodic,working");
+  const [contextLayers, setContextLayers] = useState("policy,self,procedural,semantic,episodic,working");
   const [contextBudget, setContextBudget] = useState("6000");
   const [contextExpandRaw, setContextExpandRaw] = useState(false);
   const [contextResult, setContextResult] = useState<ContextPackResult | null>(null);
@@ -150,6 +152,12 @@ export function App() {
 
   const [diagnosisText, setDiagnosisText] = useState("");
   const [diagnosisResult, setDiagnosisResult] = useState<Record<string, unknown> | null>(null);
+  const [selfTitle, setSelfTitle] = useState("");
+  const [selfContent, setSelfContent] = useState("");
+  const [selfSchema, setSelfSchema] = useState("user_workflow_preference");
+  const [selfRememberResult, setSelfRememberResult] = useState<Record<string, unknown> | null>(null);
+  const [webQuery, setWebQuery] = useState("");
+  const [webResult, setWebResult] = useState<Record<string, unknown> | null>(null);
 
   const activeRun = useMemo(() => runs.find((run) => run.run_id === activeRunId) ?? runs[0] ?? null, [runs, activeRunId]);
   const streamedAssistant = useMemo(
@@ -249,13 +257,15 @@ export function App() {
 
   async function refreshAll() {
     await refreshSummary();
-    const [runtimeConfig, logList, lessonList, failureList] = await Promise.all([
+    const [runtimeConfig, selfSnapshot, logList, lessonList, failureList] = await Promise.all([
       getJson<RuntimeConfig>("/api/runtime/config"),
+      getJson<SelfState>("/api/self"),
       getJson<AgentLogEvent[]>("/api/logs?limit=120"),
       getJson<{ items: Array<Record<string, unknown>> }>("/api/cognition/lessons?k=20"),
       getJson<{ items: Array<Record<string, unknown>> }>("/api/cognition/failures?k=20")
     ]);
     setRuntime(runtimeConfig);
+    setSelfState(selfSnapshot);
     setProvider(String(runtimeConfig.provider?.name ?? "mock"));
     setModel(String(runtimeConfig.provider?.model ?? "mock"));
     setLogs(logList);
@@ -630,6 +640,32 @@ export function App() {
     });
   }
 
+  async function rememberSelf(event: FormEvent) {
+    event.preventDefault();
+    await guarded(async () => {
+      const result = await postJson<Record<string, unknown>>("/api/self/remember", {
+        title: selfTitle,
+        content: selfContent,
+        schema: selfSchema,
+        validation_status: "user_confirmed",
+        confidence: 0.88
+      });
+      setSelfRememberResult(result);
+      await refreshAll();
+    }, "Soul memory reviewed.");
+  }
+
+  async function searchWeb(event: FormEvent) {
+    event.preventDefault();
+    await guarded(async () => {
+      const result = await postJson<Record<string, unknown>>("/api/web/search", {
+        query: webQuery,
+        max_results: 5
+      });
+      setWebResult(result);
+    });
+  }
+
   return (
     <div className="app-shell">
       <a className="skip-link" href="#workspace">Skip to workspace</a>
@@ -647,6 +683,7 @@ export function App() {
           <a href="#workspace"><Home size={17} /> Workspace</a>
           <a href="#runs"><Route size={17} /> Runs</a>
           <a href="#approvals"><ShieldCheck size={17} /> Approvals</a>
+          <a href="#soul"><Brain size={17} /> Soul</a>
           <a href="#memory"><Database size={17} /> Memory</a>
           <a href="#tools"><Wrench size={17} /> Tools</a>
           <a href="#mcp"><PlugZap size={17} /> MCP</a>
@@ -873,6 +910,86 @@ export function App() {
                 </div>
               ))}
             </div>
+          </Panel>
+        </section>
+
+        <section id="soul" className="content-grid wide-left">
+          <Panel title="Soul" icon={<Brain size={19} />}>
+            {selfState ? (
+              <div className="run-detail">
+                <div className="run-title">
+                  <h3>{String(selfState.identity.display_name ?? "Soul")} / {String(selfState.identity.name ?? "Kestrel")}</h3>
+                  <StatusBadge value={Boolean(selfState.config.allow_self_modification) ? "self-edit gated" : "self-edit off"} />
+                </div>
+                <p className="muted">{String(selfState.identity.description ?? "")}</p>
+                <div className="metric-grid">
+                  <Metric label="Memory Layers" value={selfState.memory_layers.length} />
+                  <Metric label="Tools" value={selfState.tools?.length ?? selfState.tool_count ?? tools.length} />
+                  <Metric label="Skills" value={selfState.skills?.length ?? skills.length} />
+                  <Metric label="Plugins" value={selfState.plugins?.length ?? plugins.length} />
+                </div>
+                <h3>Soul Memory Layers</h3>
+                <div className="layer-grid">
+                  {selfState.memory_layers.map((layer) => (
+                    <div className="layer-chip" key={String(layer.layer)}>
+                      <strong>{String(layer.layer)}</strong>
+                      <small>{String(layer.mv2_file ?? "")}</small>
+                    </div>
+                  ))}
+                </div>
+                <h3>Self-Awareness Tools</h3>
+                <div className="tool-grid">
+                  {(selfState.tools ?? tools)
+                    .filter((tool) => tool.name.startsWith("self.") || tool.name.startsWith("web."))
+                    .map((tool) => (
+                      <button
+                        type="button"
+                        className="tool-card"
+                        key={tool.name}
+                        onClick={() => {
+                          setToolName(tool.name);
+                          setToolArgs(JSON.stringify(schemaDefault(tool.parameters), null, 2));
+                        }}
+                      >
+                        <strong>{tool.name}</strong>
+                        <InlineMeta items={[tool.risk, tool.requires_approval ? "approval" : "direct"]} />
+                        <span>{tool.description}</span>
+                      </button>
+                    ))}
+                </div>
+              </div>
+            ) : (
+              <EmptyState>Soul snapshot is loading.</EmptyState>
+            )}
+          </Panel>
+
+          <Panel title="Soul Memory & Web Context" icon={<Search size={19} />}>
+            <form onSubmit={rememberSelf} className="stack-form">
+              <Field label="Validated self-memory title">
+                <input value={selfTitle} onChange={(event) => setSelfTitle(event.target.value)} />
+              </Field>
+              <Field label="Validated self-memory content">
+                <textarea value={selfContent} onChange={(event) => setSelfContent(event.target.value)} rows={4} />
+              </Field>
+              <Field label="Schema">
+                <select value={selfSchema} onChange={(event) => setSelfSchema(event.target.value)}>
+                  <option value="identity_summary">identity_summary</option>
+                  <option value="capability_snapshot">capability_snapshot</option>
+                  <option value="user_workflow_preference">user_workflow_preference</option>
+                  <option value="self_change_request">self_change_request</option>
+                  <option value="validation_metadata">validation_metadata</option>
+                </select>
+              </Field>
+              <button type="submit" disabled={!selfTitle.trim() || !selfContent.trim()}>Remember in Soul</button>
+            </form>
+            {selfRememberResult && <JsonBlock value={selfRememberResult} />}
+            <form onSubmit={searchWeb} className="stack-form separated">
+              <Field label="Gated web query">
+                <input value={webQuery} onChange={(event) => setWebQuery(event.target.value)} />
+              </Field>
+              <button type="submit" disabled={!webQuery.trim()}>Search Web</button>
+            </form>
+            {webResult && <JsonBlock value={webResult} />}
           </Panel>
         </section>
 

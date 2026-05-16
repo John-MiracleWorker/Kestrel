@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
+import re
+import socket
 import subprocess
 import sys
+from html import unescape
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 from ..cognition import RetryPolicy
 from ..consolidation import Consolidator
@@ -1915,6 +1921,264 @@ class PluginInstallTool(AgentTool):
             return self._result(call, success=False, content=str(exc), error="plugin_install_failed")
 
 
+class SelfInspectTool(AgentTool):
+    spec = ToolSpec(
+        name="self.inspect",
+        description="Inspect Kestrel's non-secret self model, capabilities, tools, memory layers, skills, plugins, and MCP state.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "include_tools": {"type": "boolean"},
+                "include_state": {"type": "boolean"},
+            },
+        },
+        capabilities=("self-model", "introspection", "soul"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        payload = _self_snapshot(
+            context,
+            include_tools=bool(arguments.get("include_tools", False)),
+            include_state=bool(arguments.get("include_state", True)),
+        )
+        return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+
+
+class SelfReflectTool(AgentTool):
+    spec = ToolSpec(
+        name="self.reflect",
+        description="Summarize what Kestrel knows about itself and the user from the Soul/self memory layer.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "k": {"type": "integer", "minimum": 1, "maximum": 12},
+            },
+        },
+        risk="medium",
+        capabilities=("self-model", "reflection", "soul"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        query = str(arguments.get("query") or "Kestrel identity capabilities user workflow preferences").strip()
+        k = max(1, min(int(arguments.get("k", 6)), 12))
+        hits = context.memory.retrieve(RetrievalQuery(query=query, layers=(MemoryLayer.SELF,), k_per_layer=k))
+        rows = [_memory_hit_payload(hit) for hit in hits[:k]]
+        payload = {
+            "identity": _self_identity(),
+            "query": query,
+            "self_memory_hits": rows,
+            "reflection": _self_reflection_text(rows),
+        }
+        return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+
+
+class SelfRememberTool(AgentTool):
+    spec = ToolSpec(
+        name="self.remember",
+        description="Write a validated self-model record to the Soul/self .mv2 layer with provenance and nested-learning metadata.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "content": {"type": "string"},
+                "schema": {"type": "string"},
+                "validation_status": {"type": "string"},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "importance": {"type": "number", "minimum": 0, "maximum": 1},
+                "source": {"type": "string"},
+                "locator": {"type": "string"},
+            },
+            "required": ["title", "content", "schema", "validation_status"],
+        },
+        risk="medium",
+        capabilities=("self-model", "memory-write", "soul"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        title = str(arguments.get("title", "")).strip()
+        content = str(arguments.get("content", "")).strip()
+        schema = str(arguments.get("schema", "")).strip()
+        validation_status = str(arguments.get("validation_status", "")).strip()
+        if not title:
+            return self._result(call, success=False, content="Missing title", error="missing_title")
+        if not content:
+            return self._result(call, success=False, content="Missing content", error="missing_content")
+        if schema not in _SELF_SCHEMAS:
+            return self._result(call, success=False, content=f"Unknown self schema: {schema}", error="invalid_self_schema")
+        if not validation_status:
+            return self._result(call, success=False, content="Missing validation_status", error="missing_validation_status")
+        confidence = float(arguments.get("confidence", 0.82))
+        importance = float(arguments.get("importance", 0.72))
+        source = str(arguments.get("source") or "self.remember")
+        locator = str(arguments.get("locator") or context.run_id or context.session_id)
+        signal = LearningSignal(
+            title=title,
+            content=content,
+            kind=MemoryKind.FACT,
+            source_layer=MemoryLayer.EPISODIC,
+            confidence=confidence,
+            importance=importance,
+            validation_score=confidence,
+            repeat_count=1,
+            explicit_instruction=validation_status in {"user_confirmed", "operator_confirmed", "explicit_request"},
+            source=source,
+            locator=locator,
+            tags={"self_schema": schema},
+            metadata={
+                "self_schema": schema,
+                "validation_status": validation_status,
+                "provenance": source,
+                "session_id": context.session_id,
+                "run_id": context.run_id,
+            },
+            requested_target_layer=MemoryLayer.SELF,
+        )
+        kernel = NestedLearningKernel()
+        decision = kernel.decide(signal, action="write")
+        if not decision.accepted:
+            return self._result(call, success=False, content=decision.reason, data=decision.to_payload(), error="self_memory_rejected")
+        record = kernel.to_memory_record(signal, decision)
+        record.metadata.update(
+            {
+                "self_schema": schema,
+                "validation_status": validation_status,
+                "provenance": source,
+                "frame_type": "self_model",
+            }
+        )
+        try:
+            record_id = context.memory.put(record)
+            context.memory.seal_all()
+        except Exception as exc:  # noqa: BLE001 - tool boundary
+            return self._result(call, success=False, content=str(exc), data=decision.to_payload(), error="self_remember_failed")
+        payload = {"record_id": record_id, "decision": decision.to_payload(), "self_schema": schema}
+        return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+
+
+class SelfProposeChangeTool(AgentTool):
+    spec = ToolSpec(
+        name="self.propose_change",
+        description="Record an approval-gated self-change request for Kestrel without applying code changes directly.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "request": {"type": "string"},
+                "rationale": {"type": "string"},
+            },
+            "required": ["request"],
+        },
+        risk="high",
+        requires_approval=True,
+        capabilities=("self-modification", "safe-repair", "soul"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        request = str(arguments.get("request", "")).strip()
+        if not request:
+            return self._result(call, success=False, content="Missing request", error="missing_request")
+        payload = {
+            "request": request,
+            "rationale": str(arguments.get("rationale", "")).strip(),
+            "target_workspace": str(context.workspace),
+            "required_gates": [
+                "repair.prepare",
+                "repair.apply_patch",
+                "repair.validate",
+                "repair.review",
+                "git.commit",
+            ],
+            "approval_required_before_execution": True,
+            "push_or_merge_allowed": False,
+        }
+        remember = SelfRememberTool().run(
+            {
+                "title": "Self-change request",
+                "content": json.dumps(payload, indent=2),
+                "schema": "self_change_request",
+                "validation_status": "operator_requested",
+                "confidence": 0.86,
+                "source": "self.propose_change",
+                "locator": call.id,
+            },
+            context,
+        )
+        data = {**payload, "memory_record_id": remember.data.get("record_id"), "memory_error": remember.error}
+        return self._result(call, success=remember.success, content=json.dumps(data, indent=2), data=data, error=remember.error)
+
+
+class WebSearchTool(AgentTool):
+    spec = ToolSpec(
+        name="web.search",
+        description="Search the public web for read-only outside context. Disabled unless allow_web is enabled.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+            },
+            "required": ["query"],
+        },
+        risk="medium",
+        capabilities=("web", "outside-context", "read-only"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        query = str(arguments.get("query", "")).strip()
+        if not query:
+            return self._result(call, success=False, content="Missing query", error="missing_query")
+        max_results = max(1, min(int(arguments.get("max_results", context.config.web_max_results)), 10))
+        try:
+            results = _mock_search_results(query, max_results) if context.config.web_backend == "mock" else _direct_web_search(query, context, max_results)
+        except Exception as exc:  # noqa: BLE001 - web boundary
+            return self._result(call, success=False, content=str(exc), error="web_search_failed")
+        payload = {"query": query, "backend": context.config.web_backend, "results": results}
+        return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+
+
+class WebFetchTool(AgentTool):
+    spec = ToolSpec(
+        name="web.fetch",
+        description="Fetch a public HTTP(S) page for read-only outside context. Private and local network URLs are rejected.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "max_bytes": {"type": "integer", "minimum": 1024, "maximum": 1000000},
+            },
+            "required": ["url"],
+        },
+        risk="medium",
+        capabilities=("web", "outside-context", "read-only"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        url = str(arguments.get("url", "")).strip()
+        if not url:
+            return self._result(call, success=False, content="Missing url", error="missing_url")
+        max_bytes = max(1024, min(int(arguments.get("max_bytes", context.config.web_max_bytes)), 1_000_000))
+        parsed = urlparse(url)
+        if context.config.web_backend == "mock" and parsed.hostname == "mock.kestrel.local":
+            content = _mock_fetch_content(url)
+            payload = {"url": url, "backend": "mock", "bytes": len(content.encode("utf-8")), "citation": url}
+            return self._result(call, success=True, content=content, data=payload)
+        safe, reason = _public_web_url_allowed(url)
+        if not safe:
+            return self._result(call, success=False, content=reason, error="unsafe_url")
+        try:
+            content, final_url = _fetch_public_text(url, timeout=context.config.web_timeout_seconds, max_bytes=max_bytes)
+        except Exception as exc:  # noqa: BLE001 - web boundary
+            return self._result(call, success=False, content=str(exc), error="web_fetch_failed")
+        payload = {"url": final_url, "backend": context.config.web_backend, "bytes": len(content.encode("utf-8")), "citation": final_url}
+        return self._result(call, success=True, content=content, data=payload)
+
+
 class DiagnosisClassifyTool(AgentTool):
     spec = ToolSpec(
         name="diagnosis.classify",
@@ -1984,6 +2248,12 @@ def build_default_tools() -> ToolRegistry:
     registry.register(RepairOrchestrateValidateTool())
     registry.register(RepairReviewTool())
     registry.register(RepairRollbackTool())
+    registry.register(SelfInspectTool())
+    registry.register(SelfReflectTool())
+    registry.register(SelfRememberTool())
+    registry.register(SelfProposeChangeTool())
+    registry.register(WebSearchTool())
+    registry.register(WebFetchTool())
     registry.register(MemorySearchTool())
     registry.register(MemoryWriteTool())
     registry.register(ContextPackTool())
@@ -2016,6 +2286,209 @@ def build_default_tools() -> ToolRegistry:
     registry.register(SkillInstallTool())
     registry.register(PluginInstallTool())
     return registry
+
+
+_SELF_SCHEMAS = {
+    "identity_summary",
+    "capability_snapshot",
+    "user_workflow_preference",
+    "self_change_request",
+    "validation_metadata",
+}
+
+
+def _self_identity() -> dict[str, str]:
+    return {
+        "name": "Kestrel",
+        "display_name": "Soul",
+        "description": "A local-first, memory-native engineering agent runtime with nested .mv2 memory layers.",
+    }
+
+
+def _self_snapshot(context: ToolContext, *, include_tools: bool, include_state: bool) -> dict[str, Any]:
+    config = context.config
+    state = AgentStateStore(config.state_path)
+    memory_layers = [
+        {
+            "layer": layer.value,
+            "mv2_file": spec.mv2_file,
+            "description": spec.description,
+            "update_cadence": spec.update_cadence,
+            "min_write_confidence": spec.min_write_confidence,
+            "promotion_threshold": spec.promotion_threshold,
+        }
+        for layer, spec in context.memory.iter_layers()
+    ]
+    payload: dict[str, Any] = {
+        "identity": _self_identity(),
+        "provider": {
+            "provider": config.provider,
+            "model": config.model,
+            "fallback_provider": config.fallback_provider,
+            "fallback_model": config.fallback_model,
+            "base_url_configured": bool(config.base_url),
+            "api_key_env": config.api_key_env,
+            "api_key_configured": bool(config.api_key_env and os.getenv(config.api_key_env)),
+        },
+        "config": {
+            "backend": config.backend,
+            "workspace": str(config.workspace),
+            "memory_dir": str(config.memory_dir),
+            "allow_shell": config.allow_shell,
+            "allow_file_write": config.allow_file_write,
+            "allow_policy_writes": config.allow_policy_writes,
+            "allow_codex_cli": config.allow_codex_cli,
+            "allow_plugin_install": config.allow_plugin_install,
+            "allow_git_commit": config.allow_git_commit,
+            "allow_memory_import": config.allow_memory_import,
+            "allow_executable_skills": config.allow_executable_skills,
+            "allow_mcp_network_endpoints": config.allow_mcp_network_endpoints,
+            "allow_web": config.allow_web,
+            "allow_self_modification": config.allow_self_modification,
+            "require_approval_for_high_risk_tools": config.require_approval_for_high_risk_tools,
+            "web_backend": config.web_backend,
+            "web_timeout_seconds": config.web_timeout_seconds,
+            "web_max_results": config.web_max_results,
+            "web_max_bytes": config.web_max_bytes,
+        },
+        "memory_layers": memory_layers,
+    }
+    if include_tools:
+        payload["tools"] = [spec.to_public_dict() for spec in build_default_tools().specs()]
+    else:
+        payload["tool_count"] = len(build_default_tools().specs())
+    if include_state:
+        payload["skills"] = _safe_state_list(state.list_skills)
+        payload["plugins"] = _safe_state_list(state.list_plugins)
+        payload["mcp_servers"] = [_redact_mcp_server(server) for server in _safe_state_list(state.list_mcp_servers)]
+    return payload
+
+
+def _safe_state_list(loader: Any) -> list[dict[str, Any]]:
+    try:
+        rows = loader()
+    except Exception:
+        return []
+    return [dict(row) for row in rows if isinstance(row, dict)]
+
+
+def _redact_mcp_server(server: dict[str, Any]) -> dict[str, Any]:
+    safe = dict(server)
+    safe.pop("env", None)
+    secret_env = safe.pop("secret_env", {})
+    if isinstance(secret_env, dict):
+        safe["secret_env_status"] = {str(key): {"env": str(value), "configured": bool(os.getenv(str(value)))} for key, value in secret_env.items()}
+    return safe
+
+
+def _self_reflection_text(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return "No validated Soul/self memory matched the query yet."
+    titles = [str(row.get("record", {}).get("title") or row.get("title") or "self memory") for row in rows[:5]]
+    return "Relevant Soul/self memory: " + "; ".join(titles)
+
+
+def _mock_search_results(query: str, max_results: int) -> list[dict[str, Any]]:
+    slug = re.sub(r"[^a-z0-9]+", "-", query.lower()).strip("-") or "query"
+    return [
+        {
+            "title": f"Mock web result {index + 1}: {query}",
+            "url": f"https://mock.kestrel.local/search/{slug}/{index + 1}",
+            "snippet": f"Deterministic outside context for {query}.",
+            "source": "mock",
+            "citation": f"https://mock.kestrel.local/search/{slug}/{index + 1}",
+        }
+        for index in range(max_results)
+    ]
+
+
+def _mock_fetch_content(url: str) -> str:
+    return f"Mock web page for Kestrel\nURL: {url}\nThis deterministic page supplies outside context without network access."
+
+
+def _direct_web_search(query: str, context: ToolContext, max_results: int) -> list[dict[str, Any]]:
+    search_url = "https://duckduckgo.com/html/?" + urlencode({"q": query})
+    html, final_url = _fetch_public_text(search_url, timeout=context.config.web_timeout_seconds, max_bytes=context.config.web_max_bytes)
+    del final_url
+    results: list[dict[str, Any]] = []
+    pattern = re.compile(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+    for match in pattern.finditer(html):
+        href = unescape(match.group(1))
+        title = _strip_html(match.group(2))
+        url = _unwrap_duckduckgo_url(href)
+        safe, _reason = _public_web_url_allowed(url)
+        if not safe:
+            continue
+        results.append({"title": title, "url": url, "snippet": "", "source": "duckduckgo", "citation": url})
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _fetch_public_text(url: str, *, timeout: int, max_bytes: int) -> tuple[str, str]:
+    safe, reason = _public_web_url_allowed(url)
+    if not safe:
+        raise ValueError(reason)
+    request = Request(url, headers={"User-Agent": "Kestrel/0.1 (+local-first-agent)"})
+    with urlopen(request, timeout=max(timeout, 1)) as response:  # noqa: S310 - URL is validated before fetching.
+        raw = response.read(max_bytes + 1)
+        final_url = str(response.geturl())
+        if len(raw) > max_bytes:
+            raw = raw[:max_bytes]
+    safe_final, final_reason = _public_web_url_allowed(final_url)
+    if not safe_final:
+        raise ValueError(final_reason)
+    encoding = response.headers.get_content_charset() or "utf-8"
+    return raw.decode(encoding, errors="replace"), final_url
+
+
+def _public_web_url_allowed(url: str) -> tuple[bool, str]:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False, "Only http:// and https:// URLs are allowed."
+    host = parsed.hostname
+    if not host:
+        return False, "URL must include a host."
+    lowered = host.lower()
+    if lowered in {"localhost"} or lowered.endswith(".localhost") or lowered.endswith(".local"):
+        return False, "Local hostnames are not allowed."
+    try:
+        ip = ipaddress.ip_address(lowered)
+        return _public_ip_allowed(ip)
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(lowered, None, proto=socket.IPPROTO_TCP)
+    except OSError as exc:
+        return False, f"Unable to resolve host: {exc}"
+    for info in infos:
+        address = info[4][0]
+        try:
+            allowed, reason = _public_ip_allowed(ipaddress.ip_address(address))
+        except ValueError:
+            return False, f"Resolved invalid IP address: {address}"
+        if not allowed:
+            return False, reason
+    return True, ""
+
+
+def _public_ip_allowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> tuple[bool, str]:
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+        return False, "Private, local, link-local, multicast, reserved, and unspecified addresses are not allowed."
+    return True, ""
+
+
+def _unwrap_duckduckgo_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+        values = parse_qs(parsed.query).get("uddg")
+        if values:
+            return values[0]
+    return url
+
+
+def _strip_html(value: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", unescape(value))).strip()
 
 
 def _recall_failure_lessons(context: ToolContext, category: str, failure_text: str, k: int) -> dict[str, Any]:

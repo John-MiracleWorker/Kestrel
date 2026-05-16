@@ -118,5 +118,5 @@ If validation fails:
 2. Classify the failure when possible.
 3. Recall similar procedural/episodic lessons before retrying.
 4. Change strategy before repeating the same validation loop.
-5. Do not promote new semantic/procedural/policy memory from a failed run unless the failure itself is useful evidence.
+5. Do not promote new semantic/procedural/self/policy memory from a failed run unless the failure itself is useful evidence.
 6. Add or update a focused regression test when the failure reveals a real gap.

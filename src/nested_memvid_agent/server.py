@@ -251,6 +251,26 @@ def create_app(config: AgentConfig | None = None) -> Any:
         explicit_instruction: bool = False
         dry_run: bool = False
 
+    class SelfRememberRequest(BaseModel):  # type: ignore[valid-type,misc]
+        title: str
+        content: str
+        schema_: str = Field(alias="schema")
+        validation_status: str
+        confidence: float = 0.82
+        importance: float = 0.72
+
+    class SelfChangeRequest(BaseModel):  # type: ignore[valid-type,misc]
+        request: str
+        rationale: str = ""
+
+    class WebSearchRequest(BaseModel):  # type: ignore[valid-type,misc]
+        query: str
+        max_results: int | None = None
+
+    class WebFetchRequest(BaseModel):  # type: ignore[valid-type,misc]
+        url: str
+        max_bytes: int | None = None
+
     class ContextPackAPIRequest(BaseModel):  # type: ignore[valid-type,misc]
         query: str
         token_budget: int | None = None
@@ -333,6 +353,8 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 "allow_memory_import": active_config.allow_memory_import,
                 "allow_executable_skills": active_config.allow_executable_skills,
                 "allow_mcp_network_endpoints": active_config.allow_mcp_network_endpoints,
+                "allow_web": active_config.allow_web,
+                "allow_self_modification": active_config.allow_self_modification,
                 "require_approval_for_high_risk_tools": active_config.require_approval_for_high_risk_tools,
                 "enable_agentic_cycle": active_config.enable_agentic_cycle,
                 "enable_autonomous_scheduler": active_config.enable_autonomous_scheduler,
@@ -350,6 +372,10 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 "max_scheduler_tasks": active_config.max_scheduler_tasks,
                 "max_scheduler_cycles": active_config.max_scheduler_cycles,
                 "tool_timeout_seconds": active_config.tool_timeout_seconds,
+                "web_timeout_seconds": active_config.web_timeout_seconds,
+                "web_max_results": active_config.web_max_results,
+                "web_max_bytes": active_config.web_max_bytes,
+                "web_backend": active_config.web_backend,
             },
             "paths": {
                 "workspace": str(active_config.workspace),
@@ -548,6 +574,51 @@ def create_app(config: AgentConfig | None = None) -> Any:
             "data": execution.data,
             "error": execution.error,
         }
+
+    @app.get("/api/self")  # type: ignore[untyped-decorator]
+    def inspect_self() -> dict[str, object]:
+        execution = runs.invoke_tool(
+            tool_name="self.inspect",
+            arguments={"include_tools": True},
+            session_id="api",
+        )
+        if execution.success:
+            return execution.data
+        return _execution_response(execution)
+
+    @app.post("/api/self/remember")  # type: ignore[untyped-decorator]
+    def remember_self(request: SelfRememberRequest) -> dict[str, object]:
+        execution = runs.invoke_tool(
+            tool_name="self.remember",
+            arguments=request.model_dump(by_alias=True),
+            session_id="api",
+        )
+        return _execution_response(execution)
+
+    @app.post("/api/self/propose-change")  # type: ignore[untyped-decorator]
+    def propose_self_change(request: SelfChangeRequest) -> dict[str, object]:
+        execution = runs.invoke_tool(
+            tool_name="self.propose_change",
+            arguments=request.model_dump(),
+            session_id="api",
+        )
+        return _execution_response(execution)
+
+    @app.post("/api/web/search")  # type: ignore[untyped-decorator]
+    def search_web(request: WebSearchRequest) -> dict[str, object]:
+        arguments: dict[str, object] = {"query": request.query}
+        if request.max_results is not None:
+            arguments["max_results"] = request.max_results
+        execution = runs.invoke_tool(tool_name="web.search", arguments=arguments, session_id="api")
+        return _execution_response(execution)
+
+    @app.post("/api/web/fetch")  # type: ignore[untyped-decorator]
+    def fetch_web(request: WebFetchRequest) -> dict[str, object]:
+        arguments: dict[str, object] = {"url": request.url}
+        if request.max_bytes is not None:
+            arguments["max_bytes"] = request.max_bytes
+        execution = runs.invoke_tool(tool_name="web.fetch", arguments=arguments, session_id="api")
+        return _execution_response(execution)
 
     @app.get("/api/approvals")  # type: ignore[untyped-decorator]
     def list_approvals(status: str | None = None) -> list[dict[str, object]]:
@@ -1025,6 +1096,17 @@ def _bounded_limit(value: int, *, default: int, maximum: int) -> int:
     if value < 1:
         return default
     return min(value, maximum)
+
+
+def _execution_response(execution: Any) -> dict[str, object]:
+    return {
+        "tool": execution.call.name,
+        "tool_call_id": execution.call.id,
+        "success": execution.success,
+        "content": execution.content,
+        "data": execution.data,
+        "error": execution.error,
+    }
 
 
 def _tool_response_payload(execution: Any) -> dict[str, object]:

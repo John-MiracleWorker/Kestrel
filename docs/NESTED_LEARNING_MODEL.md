@@ -65,7 +65,15 @@ This is not a claim that the repo implements HOPE or neural self-modifying weigh
 - Retrieval mode: hybrid.
 - Promotion: to policy only after repeated high-confidence validation.
 
-### L5: Policy memory
+### L5: Self/Soul memory
+
+- Storage: `self.mv2`.
+- Update cadence: validated self-model and user/workflow preference changes.
+- Purpose: identity summaries, capability snapshots, user workflow preferences, self-change requests, and validation metadata.
+- Retrieval mode: hybrid with strong provenance.
+- Promotion: usually none; self-change execution remains gated through repair and approval tools.
+
+### L6: Policy memory
 
 - Storage: `policy.mv2`, optionally encrypted `.mv2e`.
 - Update cadence: rare.
@@ -80,6 +88,7 @@ This is not a claim that the repo implements HOPE or neural self-modifying weigh
 | Working | Episodic | validation_score >= 0.65 |
 | Episodic | Semantic | validation_score >= 0.78 and fact-like |
 | Episodic | Procedural | validation_score >= 0.78 and repeat_count >= 2 for failure/procedure |
+| Episodic | Self | validation_score >= 0.78 and self-model evidence |
 | Procedural | Policy | validation_score >= 0.95 and repeat_count >= 5 |
 
 The implementation adds one more policy constraint: policy promotion must be based on an explicit instruction or reviewed rule. A repeated ordinary event can become semantic/procedural memory, but it must not become policy by accident.
@@ -137,6 +146,6 @@ It must not produce:
 
 ## Task capsules
 
-When enabled, a completed run can write `.nest/runs/{run_id}/complete.mv2`. This capsule is temporary run evidence, not a sixth durable memory layer. It may contain the user objective, selected context, tool calls, tool outputs, files touched, tests run, errors, final response, unresolved questions, reusable lessons, candidate facts, candidate procedures, candidate corrections, and policy candidates that require explicit human review.
+When enabled, a completed run can write `.nest/runs/{run_id}/complete.mv2`. This capsule is temporary run evidence, not a durable memory layer. It may contain the user objective, selected context, tool calls, tool outputs, files touched, tests run, errors, final response, unresolved questions, reusable lessons, candidate facts, candidate procedures, candidate corrections, and policy candidates that require explicit human review.
 
 Capsule summaries produce `LearningSignal` objects and preview Nested Learning decisions. Applying those decisions is separate: `capsule.apply` requires auto-consolidation config and approval before writing. Automatic consolidation is off by default, dry-run by default, and policy writes remain rare: explicit instruction, high validation, repeat evidence, config enablement, and human review or equivalent explicit configuration are required.

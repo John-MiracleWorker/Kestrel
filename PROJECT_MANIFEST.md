@@ -6,7 +6,7 @@ Last updated: 2026-05-16
 
 Kestrel is a concrete local-first agent runtime built around Nested Learning-inspired memory layers and Memvid v2 `.mv2` storage.
 
-The repo now goes beyond the original scaffold: it includes a conversational CLI, provider adapters, deterministic mock mode, a tool/approval system, a FastAPI and web workbench, managed MCP stdio sessions, skill capsules, task graphs, repair gates, task capsules, golden evals, packaging, and deployment docs.
+The repo now goes beyond the original scaffold: it includes a conversational CLI, provider adapters, deterministic mock mode, a tool/approval system, Soul/self memory, gated web context, a FastAPI and web workbench, managed MCP stdio sessions, skill capsules, task graphs, repair gates, task capsules, golden evals, packaging, and deployment docs.
 
 ## Important Files
 
@@ -32,7 +32,7 @@ The repo now goes beyond the original scaffold: it includes a conversational CLI
 - `src/nested_memvid_agent/mcp_manager.py` - managed MCP server sessions and tool adapters.
 - `src/nested_memvid_agent/plugin_manager.py` - alpha GitHub plugin registry and skill/MCP materialization.
 - `src/nested_memvid_agent/tools/builtin.py` - built-in tools and high-risk gates.
-- `src/nested_memvid_agent/state_store.py` - SQLite control-plane state, currently schema version 7.
+- `src/nested_memvid_agent/state_store.py` - SQLite control-plane state, currently schema version 9.
 - `scripts/run_golden_evals.py` - deterministic golden eval harness.
 - `tests/integration/test_memvid_backend_integration.py` - gated Memvid backend integration.
 - `tests/integration/test_memvid_context_frames.py` - gated Memvid context/capsule integration.
@@ -45,6 +45,8 @@ Works now:
 
 ```bash
 nest-agent chat --backend memory --provider mock --message "hello"
+nest-agent chat --backend memory --provider mock --message "who are you?"
+nest-agent chat --backend memory --provider mock --allow-web --web-backend mock --message "/web Kestrel Soul"
 nest-agent run --backend memory --provider mock --json --events "hello run"
 nest-agent server --backend memory --provider mock --host 127.0.0.1 --port 8765
 ```
@@ -58,6 +60,8 @@ nest-agent chat --backend memvid --memory-dir .nest/memory --provider openai --m
 ```
 
 The mock backend and mock LLM are deterministic. Memvid and MCP live tests are opt-in behind environment variables.
+
+Permanent memory now includes `.nest/memory/self.mv2` for the user-facing Soul layer. It stores identity, capability snapshots, user/workflow preferences, self-change requests, and validation metadata with evidence/provenance requirements.
 
 ## Validation
 

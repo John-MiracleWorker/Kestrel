@@ -18,7 +18,7 @@ docs/TASK_CAPSULES.md
 ## Current Memory Contract
 
 - Use Memvid v2 `.mv2` files as the primary persistent memory backend.
-- Keep one permanent `.mv2` file per layer: working, episodic, semantic, procedural, and policy.
+- Keep one permanent `.mv2` file per layer: working, episodic, semantic, procedural, self, and policy.
 - Keep run-scoped `complete.mv2` capsules separate from permanent layers.
 - Never call `create(path)` on an existing `.mv2` file.
 - Do not implement Memvid v1 QR/video-frame behavior.

@@ -47,7 +47,7 @@ RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backe
 RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
 ```
 
-The tests create temporary `.mv2` files, write records, seal, verify, close, reopen, search, round-trip context-frame metadata, and read run-scoped `complete.mv2` capsules.
+The tests create temporary `.mv2` files, write records, seal, verify, close, reopen, search, round-trip context-frame metadata, validate the Soul/self layer, and read run-scoped `complete.mv2` capsules.
 
 ## Optional MCP Integration
 
