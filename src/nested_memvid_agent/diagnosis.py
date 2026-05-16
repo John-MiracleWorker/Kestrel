@@ -35,7 +35,7 @@ def classify_failure(failure_text: str, *, source: str = "") -> FailureClassific
             retryable=True,
             playbook=_playbook("missing_dependency"),
         )
-    if any(marker in lowered for marker in ("failed tests/", " assertionerror", "pytest", "== failures ==")):
+    if any(marker in lowered for marker in ("failed tests/", "assertionerror", "pytest", "== failures ==")):
         signals.append("pytest/test failure marker")
         return FailureClassification(
             category="test_failure",

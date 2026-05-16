@@ -202,6 +202,25 @@ def test_diagnosis_classify_identifies_test_failures(tmp_path: Path) -> None:
     assert result.data["playbook"]["next_actions"]
 
 
+def test_diagnosis_classify_identifies_bare_assertion_errors(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+
+    result = registry.execute(
+        ToolCall(
+            name="diagnosis.classify",
+            arguments={
+                "failure_text": "Traceback (most recent call last):\nAssertionError: expected fixed",
+                "source": "repair.validate",
+            },
+        ),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.success
+    assert result.data["classification"] == "test_failure"
+
+
 def test_diagnosis_recall_searches_prior_failure_lessons(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     memory.put(
@@ -365,6 +384,88 @@ def test_repair_apply_validate_and_rollback_on_repair_branch(tmp_path: Path) -> 
     assert (tmp_path / "README.md").read_text() == "seed\n"
 
 
+def test_repair_orchestrate_validate_blocks_non_repair_branch(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(
+        name="repair.orchestrate_validate",
+        arguments={"command": ["python", "-c", "print('ok')"]},
+        id="repair_orchestrate_main",
+    )
+
+    result = registry.execute(call, _approved_context(memory, tmp_path, call, allow_shell=True))
+
+    assert not result.success
+    assert result.error == "not_repair_branch"
+
+
+def test_repair_orchestrate_validate_recalls_lessons_and_blocks_unchanged_retry(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    subprocess.run(["git", "switch", "-c", "codex/repair-loop"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    memory.put(
+        MemoryRecord(
+            layer=MemoryLayer.PROCEDURAL,
+            kind=MemoryKind.PROCEDURE,
+            title="AssertionError repair lesson",
+            content="When repair validation reports AssertionError: expected fixed, inspect the failing assertion before retrying.",
+            confidence=0.9,
+        )
+    )
+    registry = build_default_tools()
+    command = ["python", "-c", "raise AssertionError('expected fixed')"]
+    call = ToolCall(
+        name="repair.orchestrate_validate",
+        arguments={"command": command, "previous_command": command, "proposed_strategy": ""},
+        id="repair_orchestrate_retry",
+    )
+
+    result = registry.execute(call, _approved_context(memory, tmp_path, call, allow_shell=True))
+
+    assert result.success
+    assert result.data["validation"]["success"] is False
+    assert result.data["diagnosis"]["classification"] == "test_failure"
+    assert result.data["recall"]["hits"]
+    assert result.data["retry_gate"]["retry_allowed"] is False
+    assert result.data["retry_gate"]["must_change_strategy_before_retry"] is True
+    assert result.data["next_action"] == "change_strategy_before_retry"
+
+
+def test_repair_orchestrate_validate_allows_changed_strategy_after_recall(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    subprocess.run(["git", "switch", "-c", "codex/repair-loop-change"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    memory.put(
+        MemoryRecord(
+            layer=MemoryLayer.PROCEDURAL,
+            kind=MemoryKind.PROCEDURE,
+            title="AssertionError repair lesson",
+            content="When repair validation reports AssertionError: expected fixed, inspect the failing assertion before retrying.",
+            confidence=0.9,
+        )
+    )
+    registry = build_default_tools()
+    command = ["python", "-c", "raise AssertionError('expected fixed')"]
+    call = ToolCall(
+        name="repair.orchestrate_validate",
+        arguments={
+            "command": command,
+            "previous_command": command,
+            "proposed_strategy": "Inspect the failing assertion and update the expected value before retrying.",
+        },
+        id="repair_orchestrate_changed",
+    )
+
+    result = registry.execute(call, _approved_context(memory, tmp_path, call, allow_shell=True))
+
+    assert result.success
+    assert result.data["validation"]["success"] is False
+    assert result.data["recall"]["hits"]
+    assert result.data["retry_gate"]["retry_allowed"] is True
+    assert result.data["next_action"] == "apply_changed_strategy_then_retry"
+
+
 def test_default_registry_includes_spec_tools() -> None:
     registry = build_default_tools()
     names = {spec.name for spec in registry.specs()}
@@ -374,6 +475,7 @@ def test_default_registry_includes_spec_tools() -> None:
         "repair.apply_patch",
         "repair.validate",
         "repair.rollback",
+        "repair.orchestrate_validate",
         "diagnosis.classify",
         "diagnosis.recall",
         "repo.search",

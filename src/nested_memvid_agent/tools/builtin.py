@@ -1100,6 +1100,104 @@ class RepairValidateTool(AgentTool):
             return self._result(call, success=False, content=str(exc), error="repair_validation_failed")
 
 
+class RepairOrchestrateValidateTool(AgentTool):
+    spec = ToolSpec(
+        name="repair.orchestrate_validate",
+        description="Run repair validation on an active repair branch, classify failures, recall prior lessons, and gate unchanged retries.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "command": {"type": "array", "items": {"type": "string"}},
+                "timeout": {"type": "integer"},
+                "previous_command": {"type": "array", "items": {"type": "string"}},
+                "proposed_strategy": {"type": "string"},
+                "k": {"type": "integer", "minimum": 1, "maximum": 10},
+            },
+            "required": ["command"],
+        },
+        risk="high",
+        requires_approval=True,
+        capabilities=("safe-repair", "validation", "self-diagnosis", "failure-recall"),
+    )
+    allowed_first_tokens = RepairValidateTool.allowed_first_tokens
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        command_raw = arguments.get("command")
+        if not isinstance(command_raw, list) or not all(isinstance(item, str) for item in command_raw):
+            return self._result(call, success=False, content="command must be list[str]", error="bad_command")
+        command = list(command_raw)
+        if not command or Path(command[0]).name not in self.allowed_first_tokens:
+            return self._result(call, success=False, content="Command is not allowlisted", error="command_not_allowlisted")
+        try:
+            branch = _git_output(context.workspace, ["git", "branch", "--show-current"])
+            if not _is_repair_branch(branch):
+                return self._result(call, success=False, content=f"Not on a repair branch: {branch}", error="not_repair_branch", data={"branch": branch})
+            status = _git_output(context.workspace, ["git", "status", "--porcelain"])
+            completed = subprocess.run(  # noqa: S603 - intentionally allowlisted repair validation command
+                command,
+                cwd=context.workspace,
+                capture_output=True,
+                text=True,
+                timeout=int(arguments.get("timeout", 120)),
+                check=False,
+            )
+            validation_content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            validation = {
+                "success": completed.returncode == 0,
+                "returncode": completed.returncode,
+                "content": validation_content,
+            }
+            diagnosis = None
+            recall = {"hits": [], "query": "", "retry_guidance": {"must_change_strategy_before_retry": False}}
+            retry_gate = {
+                "retry_allowed": True,
+                "must_change_strategy_before_retry": False,
+                "reason": "Validation passed; no retry needed." if completed.returncode == 0 else "No similar lesson was found; follow the diagnostic playbook.",
+                "strategy_changed": True,
+            }
+            next_action = "review_and_commit_only_after_approval" if completed.returncode == 0 else "retry_with_diagnostic_playbook"
+            if completed.returncode != 0:
+                classification = classify_failure(validation_content, source="repair.orchestrate_validate")
+                diagnosis = classification.to_payload()
+                recall = _recall_failure_lessons(context, classification.category, validation_content, max(1, min(int(arguments.get("k", 5)), 10)))
+                previous = arguments.get("previous_command")
+                previous_command = previous if isinstance(previous, list) and all(isinstance(item, str) for item in previous) else []
+                proposed_strategy = str(arguments.get("proposed_strategy", "")).strip()
+                has_lessons = bool(recall["hits"])
+                command_repeated = previous_command == command
+                strategy_changed = bool(proposed_strategy)
+                must_change = has_lessons and command_repeated
+                retry_allowed = not must_change or strategy_changed
+                retry_gate = {
+                    "retry_allowed": retry_allowed,
+                    "must_change_strategy_before_retry": must_change,
+                    "strategy_changed": strategy_changed,
+                    "command_repeated": command_repeated,
+                    "reason": "Similar prior lessons were found; change strategy before repeating the validation command."
+                    if must_change and not strategy_changed
+                    else "Changed strategy supplied; retry may proceed after applying the change."
+                    if must_change
+                    else "No repeated-command lesson gate was triggered.",
+                }
+                next_action = "apply_changed_strategy_then_retry" if retry_allowed and must_change else "change_strategy_before_retry" if not retry_allowed else "retry_with_diagnostic_playbook"
+            payload = {
+                "branch": branch,
+                "active_repair_branch": True,
+                "changed_files": _changed_files_from_status(status),
+                "validation": validation,
+                "diagnosis": diagnosis,
+                "recall": recall,
+                "retry_gate": retry_gate,
+                "next_action": next_action,
+                "commit_allowed": False,
+                "approval_required_before_commit": True,
+            }
+            return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="repair_orchestration_failed")
+
+
 class RepairRollbackTool(AgentTool):
     spec = ToolSpec(
         name="repair.rollback",
@@ -1601,35 +1699,10 @@ class DiagnosisRecallTool(AgentTool):
             return self._result(call, success=False, content="Missing failure_text", error="missing_failure_text")
         classification = classify_failure(failure_text, source=str(arguments.get("source", "")))
         k = max(1, min(int(arguments.get("k", 5)), 10))
-        query = f"{classification.category} {failure_text}"
-        hits = context.memory.retrieve(
-            RetrievalQuery(
-                query=query,
-                layers=(MemoryLayer.PROCEDURAL, MemoryLayer.EPISODIC, MemoryLayer.WORKING),
-                k_per_layer=k,
-            )
-        )
-        rows = []
-        for hit in hits[:k]:
-            rows.append(
-                {
-                    "layer": hit.record.layer.value,
-                    "kind": hit.record.kind.value,
-                    "title": hit.record.title,
-                    "score": hit.score,
-                    "snippet": hit.snippet or hit.record.content[:500],
-                }
-            )
+        recall = _recall_failure_lessons(context, classification.category, failure_text, k)
         payload = {
             **classification.to_payload(),
-            "query": query,
-            "hits": rows,
-            "retry_guidance": {
-                "must_change_strategy_before_retry": bool(rows),
-                "reason": "Similar prior failures were found; use recalled lessons before repeating the action."
-                if rows
-                else "No prior lesson found; follow the diagnostic playbook and record validated findings.",
-            },
+            **recall,
         }
         return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
 
@@ -1642,6 +1715,7 @@ def build_default_tools() -> ToolRegistry:
     registry.register(RepairStatusTool())
     registry.register(RepairApplyPatchTool())
     registry.register(RepairValidateTool())
+    registry.register(RepairOrchestrateValidateTool())
     registry.register(RepairRollbackTool())
     registry.register(MemorySearchTool())
     registry.register(MemoryWriteTool())
@@ -1673,6 +1747,38 @@ def build_default_tools() -> ToolRegistry:
     registry.register(MemoryExportTool())
     registry.register(MemoryImportTool())
     return registry
+
+
+def _recall_failure_lessons(context: ToolContext, category: str, failure_text: str, k: int) -> dict[str, Any]:
+    query = f"{category} {failure_text}"
+    hits = context.memory.retrieve(
+        RetrievalQuery(
+            query=query,
+            layers=(MemoryLayer.PROCEDURAL, MemoryLayer.EPISODIC, MemoryLayer.WORKING),
+            k_per_layer=k,
+        )
+    )
+    rows = []
+    for hit in hits[:k]:
+        rows.append(
+            {
+                "layer": hit.record.layer.value,
+                "kind": hit.record.kind.value,
+                "title": hit.record.title,
+                "score": hit.score,
+                "snippet": hit.snippet or hit.record.content[:500],
+            }
+        )
+    return {
+        "query": query,
+        "hits": rows,
+        "retry_guidance": {
+            "must_change_strategy_before_retry": bool(rows),
+            "reason": "Similar prior failures were found; use recalled lessons before repeating the action."
+            if rows
+            else "No prior lesson found; follow the diagnostic playbook and record validated findings.",
+        },
+    }
 
 
 def _safe_branch_name(name: str) -> bool:
