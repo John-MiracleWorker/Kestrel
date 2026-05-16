@@ -15,10 +15,10 @@ from nested_memvid_agent.mcp_manager import MCPManager
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
 from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.run_manager import RunManager
+from nested_memvid_agent.runtime_models import AgentTurnResult
 from nested_memvid_agent.server import create_app
 from nested_memvid_agent.skill_manager import SkillManager
 from nested_memvid_agent.state_store import AgentStateStore
-from nested_memvid_agent.runtime_models import AgentTurnResult
 from nested_memvid_agent.tools.builtin import build_default_tools
 
 

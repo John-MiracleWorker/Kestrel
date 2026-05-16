@@ -9,8 +9,7 @@ from pytest import MonkeyPatch
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.orchestrator import build_memory_system
-from nested_memvid_agent.runtime_models import ToolCall
-from nested_memvid_agent.runtime_models import ToolExecution, ToolSpec
+from nested_memvid_agent.runtime_models import ToolCall, ToolExecution, ToolSpec
 from nested_memvid_agent.tools.base import AgentTool, ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
 from nested_memvid_agent.tools.registry import ToolRegistry
