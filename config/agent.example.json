@@ -2,6 +2,15 @@
   "name": "Nested MV2 Agent",
   "provider": "openai",
   "model": "gpt-5.5",
+  "base_url": null,
+  "api_key_env": "OPENAI_API_KEY",
+  "timeout_seconds": 60,
+  "max_retries": 2,
+  "temperature": 0.2,
+  "codex_sandbox": "read-only",
+  "codex_profile": null,
+  "codex_skip_git_repo_check": false,
+  "codex_ephemeral": true,
   "backend": "memvid",
   "memory_dir": ".nest/memory",
   "workspace": ".",
@@ -13,5 +22,8 @@
   "allow_codex_cli": false,
   "require_approval_for_high_risk_tools": true,
   "stream": false,
-  "log_dir": ".nest/logs"
+  "log_dir": ".nest/logs",
+  "channel_config_path": ".nest/config/channels.json",
+  "enable_channel_delivery": false,
+  "channel_send_timeout_seconds": 10
 }

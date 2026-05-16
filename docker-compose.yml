@@ -1,0 +1,65 @@
+services:
+  kestrel:
+    build:
+      context: .
+      args:
+        INSTALL_EXTRAS: server,mcp,memvid,openai
+    image: kestrel-agent:local
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      NEST_AGENT_BACKEND: memvid
+      NEST_AGENT_PROVIDER: ${NEST_AGENT_PROVIDER:-mock}
+      NEST_AGENT_MODEL: ${NEST_AGENT_MODEL:-mock}
+      NEST_AGENT_MEMORY_DIR: /data/memory
+      NEST_AGENT_LOG_DIR: /data/logs
+      NEST_AGENT_STATE_PATH: /data/state/agent.db
+      NEST_AGENT_SKILLS_DIR: /data/skills
+      NEST_AGENT_MCP_CONFIG: /data/config/mcp_servers.json
+      NEST_AGENT_CHANNEL_CONFIG: /data/config/channels.json
+      NEST_AGENT_ALLOW_SHELL: "false"
+      NEST_AGENT_ALLOW_FILE_WRITE: "false"
+      NEST_AGENT_ALLOW_POLICY_WRITES: "false"
+      NEST_AGENT_ALLOW_CODEX_CLI: "false"
+      NEST_AGENT_ENABLE_AUTO_CONSOLIDATION: "false"
+      NEST_AGENT_AUTO_CONSOLIDATION_DRY_RUN: "true"
+    volumes:
+      - kestrel-data:/data
+    command:
+      - nest-agent
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+      - --backend
+      - memvid
+      - --memory-dir
+      - /data/memory
+      - --provider
+      - ${NEST_AGENT_PROVIDER:-mock}
+      - --model
+      - ${NEST_AGENT_MODEL:-mock}
+      - --log-dir
+      - /data/logs
+      - --state-path
+      - /data/state/agent.db
+      - --skills-dir
+      - /data/skills
+      - --mcp-config
+      - /data/config/mcp_servers.json
+      - --channels-config
+      - /data/config/channels.json
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  kestrel-data:

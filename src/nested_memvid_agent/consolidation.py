@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from .context_frames import default_frame_type_for_memory
 from .models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord
+from .nested_learning import ContextFlow, NestedLearningKernel, OptimizerTrace
 
 
 @dataclass(frozen=True)
@@ -12,6 +14,8 @@ class ConsolidationCandidate:
     target_layer: MemoryLayer
     reason: str
     promoted_confidence: float
+    flow: ContextFlow
+    optimizer_trace: OptimizerTrace
 
 
 class Consolidator:
@@ -20,40 +24,30 @@ class Consolidator:
     This is deliberately conservative. Permanent memory is earned, not shoveled.
     """
 
-    def propose(self, record: MemoryRecord, validation_score: float, repeat_count: int = 1) -> ConsolidationCandidate | None:
-        if validation_score < 0.65:
+    def propose(
+        self,
+        record: MemoryRecord,
+        validation_score: float,
+        repeat_count: int = 1,
+        *,
+        explicit_instruction: bool = False,
+    ) -> ConsolidationCandidate | None:
+        decision = NestedLearningKernel().from_record(
+            record,
+            validation_score=validation_score,
+            repeat_count=repeat_count,
+            explicit_instruction=explicit_instruction,
+        )
+        if not decision.accepted or decision.target_layer is None:
             return None
-
-        if record.layer == MemoryLayer.WORKING and validation_score >= 0.65:
-            return ConsolidationCandidate(
-                source=record,
-                target_layer=MemoryLayer.EPISODIC,
-                reason="Working memory survived validation and became a meaningful event.",
-                promoted_confidence=min(max(record.confidence, validation_score), 0.9),
-            )
-
-        if record.layer == MemoryLayer.EPISODIC and validation_score >= 0.78:
-            target = MemoryLayer.SEMANTIC
-            reason = "Episodic memory produced a stable fact."
-            if record.kind in {MemoryKind.FAILURE, MemoryKind.PROCEDURE} and repeat_count >= 2:
-                target = MemoryLayer.PROCEDURAL
-                reason = "Repeated validated failure/procedure became a reusable skill."
-            return ConsolidationCandidate(
-                source=record,
-                target_layer=target,
-                reason=reason,
-                promoted_confidence=min(max(record.confidence, validation_score), 0.95),
-            )
-
-        if record.layer == MemoryLayer.PROCEDURAL and validation_score >= 0.95 and repeat_count >= 5:
-            return ConsolidationCandidate(
-                source=record,
-                target_layer=MemoryLayer.POLICY,
-                reason="Procedure succeeded repeatedly enough to become policy candidate.",
-                promoted_confidence=min(max(record.confidence, validation_score), 0.99),
-            )
-
-        return None
+        return ConsolidationCandidate(
+            source=record,
+            target_layer=decision.target_layer,
+            reason=decision.reason,
+            promoted_confidence=decision.confidence,
+            flow=decision.flow,
+            optimizer_trace=decision.optimizer_trace,
+        )
 
     def promote(self, candidate: ConsolidationCandidate) -> MemoryRecord:
         src = candidate.source
@@ -73,6 +67,7 @@ class Consolidator:
             tags={**src.tags, "promoted_from": src.layer.value},
             metadata={
                 **src.metadata,
+                "frame_type": default_frame_type_for_memory(_target_kind(src.kind, candidate.target_layer), candidate.target_layer),
                 "source_record_ids": [src.id],
                 "source_layer": src.layer.value,
                 "destination_layer": candidate.target_layer.value,
@@ -81,6 +76,11 @@ class Consolidator:
                 "validation_method": "score_threshold",
                 "promotion_reason": candidate.reason,
                 "promoted_at": datetime.now(UTC).isoformat(),
+                "nested_learning": {
+                    "context_flow": candidate.flow.to_metadata(),
+                    "optimizer_trace": candidate.optimizer_trace.to_metadata(),
+                    "source_record_ids": [src.id],
+                },
             },
             evidence=evidence,
             confidence=candidate.promoted_confidence,

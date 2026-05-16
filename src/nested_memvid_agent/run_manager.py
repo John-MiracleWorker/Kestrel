@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
 from threading import Lock, Thread
@@ -11,9 +12,12 @@ from .app_factory import build_agent
 from .config import AgentConfig
 from .event_bus import RunEventBus
 from .mcp_manager import MCPManager
-from .runtime_models import AgentTurnResult, ToolCall, ToolExecution, ToolSpec
+from .models import MemoryLayer
+from .nested_learning import NestedLearningKernel
+from .runtime_models import AgentTurnResult, LLMStreamEvent, ToolCall, ToolExecution, ToolSpec
 from .skill_manager import SkillManager
-from .state_store import AgentStateStore, RunRecord
+from .state_store import AgentStateStore, RunRecord, TaskNodeRecord
+from .task_capsule import summarize_run_capsule, write_turn_capsule
 from .tools.base import ToolContext
 from .tools.builtin import build_default_tools
 from .tools.registry import ToolRegistry
@@ -61,6 +65,33 @@ class RunManager:
             workspace=str(run_config.workspace),
             model=run_config.model,
         )
+        root = self.state.create_task_node(
+            task_id=f"task_{uuid4().hex}",
+            run_id=run_id,
+            title="Root objective",
+            goal=message,
+            profile="planner",
+            status="queued",
+            approved=True,
+            plan={"autonomy_mode": "background", "decomposition": "initial"},
+            acceptance_criteria=["User objective is addressed or explicitly blocked with next steps."],
+        )
+        for planned in _initial_task_plan(message):
+            dependencies = [root.task_id if dependency == "root" else dependency for dependency in planned["dependencies"]]
+            self.state.create_task_node(
+                task_id=str(planned["task_id"]),
+                run_id=run_id,
+                parent_id=root.task_id,
+                title=str(planned["title"]),
+                goal=str(planned["goal"]),
+                profile=str(planned["profile"]),
+                status="queued",
+                approved=planned["risk"] == "low",
+                dependencies=dependencies,
+                required_tools=planned["required_tools"],
+                risk=str(planned["risk"]),
+                acceptance_criteria=planned["acceptance_criteria"],
+            )
         self.events.publish(run_id, "run.queued", {"message": message, "session_id": run.session_id})
         self._start_thread(run_id, self._run_agent_turn, run_config, message, run.session_id)
         return run
@@ -73,10 +104,41 @@ class RunManager:
     def list_runs(self) -> list[dict[str, Any]]:
         return [asdict(run) for run in self.state.list_runs()]
 
+    def list_sessions(self) -> list[dict[str, Any]]:
+        return self.state.list_sessions()
+
+    def run_trace(self, run_id: str, *, limit: int = 1000) -> dict[str, Any]:
+        run = self.get_run(run_id)
+        timeline = self.state.list_run_steps(run_id, limit=limit)
+        traces: dict[str, list[dict[str, Any]]] = {
+            "tool": [],
+            "memory": [],
+            "context": [],
+            "provider": [],
+            "approval": [],
+            "error": [],
+            "lifecycle": [],
+        }
+        for event in timeline:
+            traces[_trace_category(event)].append(event)
+        first = timeline[0]["created_at"] if timeline else None
+        last = timeline[-1]["created_at"] if timeline else None
+        return {
+            "run": run,
+            "summary": {
+                "event_count": len(timeline),
+                "first_event_at": first,
+                "last_event_at": last,
+                "trace_counts": {name: len(events) for name, events in traces.items()},
+            },
+            "timeline": timeline,
+            "traces": traces,
+        }
+
     def cancel_run(self, run_id: str) -> dict[str, Any]:
         with self._lock:
             self._cancelled.add(run_id)
-        run = self.state.update_run(run_id, status="cancelled", stop_reason="cancelled")
+        run = self.state.transition_run(run_id, "cancelled", stop_reason="cancelled")
         self.events.publish(run_id, "run.cancelled", {})
         return asdict(run)
 
@@ -96,7 +158,7 @@ class RunManager:
         if approved:
             self._resume_after_approval(updated, approved_arguments)
         else:
-            self.state.update_run(updated["run_id"], status="failed", error="Approval denied", stop_reason="approval_denied")
+            self.state.transition_run(updated["run_id"], "failed", error="Approval denied", stop_reason="approval_denied")
             self.events.publish(updated["run_id"], "run.failed", {"error": "Approval denied"})
         return updated
 
@@ -112,6 +174,8 @@ class RunManager:
         agent = build_agent(self.config, tools=registry)
         try:
             call = ToolCall(name=tool_name, arguments=arguments)
+            if run_id:
+                self.events.publish(run_id, "tool.started", {"tool": tool_name, "tool_call_id": call.id})
             execution = registry.execute(
                 call,
                 ToolContext(
@@ -126,14 +190,59 @@ class RunManager:
             )
             if run_id:
                 self.events.publish(run_id, "tool.executed", _execution_payload(execution))
+                self.events.publish(
+                    run_id,
+                    "tool.completed" if execution.success else "tool.failed",
+                    _execution_payload(execution),
+                )
             return execution
         finally:
             agent.close()
 
+    def task_graph(self, run_id: str) -> dict[str, Any]:
+        self.state.get_run(run_id)
+        return {
+            "tasks": [_task_payload(task) for task in self.state.list_task_nodes(run_id)],
+            "subagents": [asdict(subagent) for subagent in self.state.list_subagent_runs(run_id)],
+        }
+
+    def approve_task(self, run_id: str, task_id: str) -> dict[str, Any]:
+        self.state.get_run(run_id)
+        task = self.state.update_task_node(task_id, approved=True, status="approved")
+        self.events.publish(run_id, "task.approved", asdict(task))
+        return asdict(task)
+
+    def create_subagent(self, *, run_id: str, profile: str, goal: str, task_id: str | None = None) -> dict[str, Any]:
+        run = self.state.get_run(run_id)
+        profile = profile if profile in {"planner", "worker", "reviewer"} else "worker"
+        if task_id is None:
+            task = self.state.create_task_node(
+                task_id=f"task_{uuid4().hex}",
+                run_id=run_id,
+                title=f"{profile.title()} subtask",
+                goal=goal,
+                profile=profile,
+                status="queued",
+                approved=True,
+            )
+            task_id = task.task_id
+        subagent = self.state.create_subagent_run(
+            subagent_id=f"subagent_{uuid4().hex}",
+            run_id=run_id,
+            task_id=task_id,
+            profile=profile,
+            goal=goal,
+            status="queued",
+        )
+        config = replace(self.config, workspace=Path(run.workspace), model=run.model)
+        self.events.publish(run_id, "subagent.queued", asdict(subagent))
+        self._start_thread(subagent.subagent_id, self._run_subagent, config, subagent.subagent_id, run_id, run.session_id)
+        return asdict(subagent)
+
     def _run_agent_turn(self, run_id: str, config: AgentConfig, message: str, session_id: str) -> None:
         if self._is_cancelled(run_id):
             return
-        self.state.update_run(run_id, status="running")
+        self.state.transition_run(run_id, "running")
         self.events.publish(run_id, "run.started", {"session_id": session_id})
         agent = self._build_agent(config)
         try:
@@ -142,30 +251,45 @@ class RunManager:
                 session_id=session_id,
                 run_id=run_id,
                 approval_handler=self._approval_handler,
+                stream_handler=self._stream_handler(run_id),
             )
+            if self._is_cancelled(run_id):
+                return
+            self._publish_turn_observability(run_id, result)
             for execution in result.tool_executions:
                 self.events.publish(run_id, "tool.executed", _execution_payload(execution))
+                self.events.publish(
+                    run_id,
+                    "tool.completed" if execution.success else "tool.failed",
+                    _execution_payload(execution),
+                )
             status = "blocked" if result.stop_reason == "approval_required" else "completed"
-            self.state.update_run(
+            self.state.transition_run(
                 run_id,
-                status=status,
+                status,
                 assistant_message=result.assistant_message,
                 context_chars=result.context_chars,
                 tool_count=len(result.tool_executions),
                 stop_reason=result.stop_reason,
             )
+            if status == "completed":
+                self._complete_capsule(run_id, config, agent, result)
             self.events.publish(run_id, "run.blocked" if status == "blocked" else "run.completed", _turn_payload(result))
         except Exception as exc:  # noqa: BLE001
-            self.state.update_run(run_id, status="failed", error=f"{type(exc).__name__}: {exc}", stop_reason="error")
+            if self._is_cancelled(run_id):
+                return
+            self.state.transition_run(run_id, "failed", error=f"{type(exc).__name__}: {exc}", stop_reason="error")
             self.events.publish(run_id, "run.failed", {"error": f"{type(exc).__name__}: {exc}"})
         finally:
             agent.close()
 
     def _resume_after_approval(self, approval: dict[str, Any], arguments: dict[str, Any]) -> None:
         run_id = str(approval["run_id"])
+        if self._is_cancelled(run_id):
+            return
         run = self.state.get_run(run_id)
         config = replace(self.config, workspace=Path(run.workspace), model=run.model)
-        self.state.update_run(run_id, status="running", stop_reason="resuming_after_approval")
+        self.state.transition_run(run_id, "running", stop_reason="resuming_after_approval")
         self._start_thread(run_id, self._run_approved_tool_then_continue, config, approval, arguments, run.session_id)
 
     def _run_approved_tool_then_continue(
@@ -178,6 +302,8 @@ class RunManager:
     ) -> None:
         agent = self._build_agent(config)
         try:
+            if self._is_cancelled(run_id):
+                return
             call = ToolCall(name=str(approval["tool_name"]), arguments=arguments, id=str(approval["tool_call_id"]))
             execution = agent.tools.execute(
                 call,
@@ -189,6 +315,7 @@ class RunManager:
                     session_id=session_id,
                     run_id=run_id,
                     approved_tool_call_ids=frozenset({call.id}),
+                    approved_tool_call_arguments={call.id: arguments},
                 ),
             )
             self.state.decide_approval(
@@ -198,6 +325,7 @@ class RunManager:
                 result=_execution_payload(execution),
             )
             self.events.publish(run_id, "tool.executed", _execution_payload(execution))
+            self.events.publish(run_id, "tool.completed" if execution.success else "tool.failed", _execution_payload(execution))
             continuation = (
                 f"Continue the previous run after approved tool `{call.name}`.\n\n"
                 f"Tool success: {execution.success}\n"
@@ -208,20 +336,69 @@ class RunManager:
                 session_id=session_id,
                 run_id=run_id,
                 approval_handler=self._approval_handler,
+                stream_handler=self._stream_handler(run_id),
             )
+            if self._is_cancelled(run_id):
+                return
+            self._publish_turn_observability(run_id, result)
             status = "blocked" if result.stop_reason == "approval_required" else "completed"
-            self.state.update_run(
+            self.state.transition_run(
                 run_id,
-                status=status,
+                status,
                 assistant_message=result.assistant_message,
                 context_chars=result.context_chars,
                 tool_count=len(result.tool_executions) + 1,
                 stop_reason=result.stop_reason,
             )
+            if status == "completed":
+                self._complete_capsule(run_id, config, agent, result)
             self.events.publish(run_id, "run.blocked" if status == "blocked" else "run.completed", _turn_payload(result))
         except Exception as exc:  # noqa: BLE001
-            self.state.update_run(run_id, status="failed", error=f"{type(exc).__name__}: {exc}", stop_reason="error")
+            if self._is_cancelled(run_id):
+                return
+            self.state.transition_run(run_id, "failed", error=f"{type(exc).__name__}: {exc}", stop_reason="error")
             self.events.publish(run_id, "run.failed", {"error": f"{type(exc).__name__}: {exc}"})
+        finally:
+            agent.close()
+
+    def _run_subagent(
+        self,
+        thread_key: str,
+        config: AgentConfig,
+        subagent_id: str,
+        run_id: str,
+        session_id: str,
+    ) -> None:
+        del thread_key
+        subagent = self.state.get_subagent_run(subagent_id)
+        running = self.state.update_subagent_run(subagent_id, status="running")
+        if subagent.task_id:
+            self.state.update_task_node(subagent.task_id, status="running")
+        self.events.publish(run_id, "subagent.started", asdict(running))
+        agent = self._build_agent(config)
+        try:
+            prompt = _subagent_prompt(subagent.profile, subagent.goal)
+            result = agent.chat(
+                prompt,
+                session_id=session_id,
+                run_id=run_id,
+                approval_handler=self._approval_handler,
+                stream_handler=self._stream_handler(run_id),
+            )
+            self._publish_turn_observability(run_id, result)
+            updated = self.state.update_subagent_run(subagent_id, status="completed", result=result.assistant_message)
+            if subagent.task_id:
+                self.state.update_task_node(
+                    subagent.task_id,
+                    status="completed",
+                    result={"assistant_message": result.assistant_message, "stop_reason": result.stop_reason},
+                )
+            self.events.publish(run_id, "subagent.completed", asdict(updated))
+        except Exception as exc:  # noqa: BLE001
+            updated = self.state.update_subagent_run(subagent_id, status="failed", error=f"{type(exc).__name__}: {exc}")
+            if subagent.task_id:
+                self.state.update_task_node(subagent.task_id, status="failed", result={"error": updated.error})
+            self.events.publish(run_id, "subagent.failed", asdict(updated))
         finally:
             agent.close()
 
@@ -248,12 +425,91 @@ class RunManager:
     def _build_agent(self, config: AgentConfig) -> NestedMV2Agent:
         return build_agent(config, tools=self.build_registry())
 
+    def _stream_handler(self, run_id: str) -> Callable[[LLMStreamEvent], None]:
+        def handle(event: LLMStreamEvent) -> None:
+            if event.type == "token":
+                self.events.publish(run_id, "assistant.token", {"content": event.content})
+            elif event.type == "tool_call" and event.tool_call is not None:
+                self.events.publish(
+                    run_id,
+                    "assistant.tool_call",
+                    {"tool": event.tool_call.name, "tool_call_id": event.tool_call.id, "arguments": event.tool_call.arguments},
+                )
+            elif event.type == "usage":
+                self.events.publish(run_id, "assistant.usage", event.data)
+            elif event.type == "provider_error":
+                self.events.publish(run_id, "assistant.provider_error", {"content": event.content, **event.data})
+
+        return handle
+
     def build_registry(self) -> ToolRegistry:
         registry = build_default_tools()
         self.skills.discover()
         for adapter in [*self.mcp.tool_adapters(), *self.skills.tool_adapters()]:
             registry.register(adapter)
         return registry
+
+    def _complete_capsule(
+        self,
+        run_id: str,
+        config: AgentConfig,
+        agent: NestedMV2Agent,
+        result: AgentTurnResult,
+    ) -> None:
+        if not config.enable_task_capsules:
+            return
+        runs_dir = config.memory_dir.parent / "runs"
+        try:
+            capsule_path = write_turn_capsule(
+                runs_dir=runs_dir,
+                run_id=run_id,
+                result=result,
+                backend=config.backend,
+                selected_context=result.context_prompt,
+            )
+            summary = summarize_run_capsule(runs_dir=runs_dir, run_id=run_id, backend=config.backend)
+            decisions = _capsule_decisions(
+                summary,
+                agent=agent,
+                dry_run=config.auto_consolidation_dry_run or not config.enable_auto_consolidation,
+            )
+            self.events.publish(
+                run_id,
+                "capsule.completed",
+                {
+                    "capsule_path": str(capsule_path),
+                    "summary": summary.to_payload(),
+                    "auto_consolidation_enabled": config.enable_auto_consolidation,
+                    "dry_run": config.auto_consolidation_dry_run or not config.enable_auto_consolidation,
+                    "decisions": decisions,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.events.publish(run_id, "capsule.failed", {"error": f"{type(exc).__name__}: {exc}"})
+
+    def _publish_turn_observability(self, run_id: str, result: AgentTurnResult) -> None:
+        self.events.publish(
+            run_id,
+            "context.compile",
+            {
+                "session_id": result.session_id,
+                "context_chars": result.context_chars,
+                "stop_reason": result.stop_reason,
+            },
+        )
+        for index, record_id in enumerate(result.memory_writes, start=1):
+            self.events.publish(
+                run_id,
+                "memory.write",
+                {
+                    "session_id": result.session_id,
+                    "record_id": record_id,
+                    "index": index,
+                    "total": len(result.memory_writes),
+                },
+            )
+        if result.error:
+            self.events.publish(run_id, "runtime.error", result.error)
 
     def _start_thread(self, run_id: str, target: Any, *args: Any) -> None:
         thread = Thread(target=target, args=(run_id, *args), daemon=True)
@@ -288,3 +544,122 @@ def _turn_payload(result: AgentTurnResult) -> dict[str, Any]:
         "memory_writes": list(result.memory_writes),
         "stop_reason": result.stop_reason,
     }
+
+
+def _task_payload(task: TaskNodeRecord) -> dict[str, Any]:
+    payload = asdict(task)
+    payload["dependencies"] = list(task.dependencies)
+    payload["required_tools"] = list(task.required_tools)
+    payload["acceptance_criteria"] = list(task.acceptance_criteria)
+    return payload
+
+
+def _initial_task_plan(message: str) -> list[dict[str, Any]]:
+    """Create a conservative persisted starter plan for new background runs.
+
+    The live agent still does the real work. These deterministic nodes give the
+    control plane a durable DAG skeleton for tracking, resume, and review instead
+    of leaving every run as one opaque root task.
+    """
+    objective = message.strip() or "User objective"
+    inspect_id = f"task_{uuid4().hex}"
+    validate_id = f"task_{uuid4().hex}"
+    return [
+        {
+            "task_id": inspect_id,
+            "title": "Inspect context",
+            "goal": f"Gather relevant context for: {objective}",
+            "profile": "worker",
+            "dependencies": [],
+            "required_tools": ["memory.search", "context.pack"],
+            "risk": "low",
+            "acceptance_criteria": ["Relevant memory/context is considered before acting."],
+        },
+        {
+            "task_id": validate_id,
+            "title": "Execute and validate",
+            "goal": f"Execute the approved low-risk path and validate progress for: {objective}",
+            "profile": "worker",
+            "dependencies": [inspect_id],
+            "required_tools": ["tool.registry"],
+            "risk": "low",
+            "acceptance_criteria": ["Result is checked against the objective and failures are recorded."],
+        },
+        {
+            "task_id": f"task_{uuid4().hex}",
+            "title": "Review outcome",
+            "goal": f"Review whether the result satisfies: {objective}",
+            "profile": "reviewer",
+            "dependencies": [validate_id],
+            "required_tools": [],
+            "risk": "low",
+            "acceptance_criteria": ["Remaining risks or next steps are explicit."],
+        },
+    ]
+
+
+def _trace_category(event: dict[str, Any]) -> str:
+    event_type = str(event.get("type", ""))
+    payload = event.get("payload", {})
+    if event_type.startswith("tool.") or event_type == "assistant.tool_call":
+        return "tool"
+    if event_type.startswith("memory.") or _payload_has_key(payload, "memory_writes"):
+        return "memory"
+    if event_type.startswith("context."):
+        return "context"
+    if event_type.startswith("assistant.") or event_type.startswith("llm.") or event_type.startswith("provider."):
+        return "provider"
+    if event_type.startswith("approval."):
+        return "approval"
+    if event_type.endswith(".failed") or event_type.endswith(".error") or _payload_has_key(payload, "error"):
+        return "error"
+    return "lifecycle"
+
+
+def _payload_has_key(value: Any, key: str) -> bool:
+    if isinstance(value, dict):
+        if key in value:
+            return True
+        return any(_payload_has_key(item, key) for item in value.values())
+    if isinstance(value, list | tuple):
+        return any(_payload_has_key(item, key) for item in value)
+    return False
+
+
+def _capsule_decisions(
+    summary: Any,
+    *,
+    agent: NestedMV2Agent,
+    dry_run: bool,
+) -> list[dict[str, object]]:
+    kernel = NestedLearningKernel()
+    decisions: list[dict[str, object]] = []
+    wrote = False
+    for signal in summary.learning_signals:
+        decision = kernel.decide(signal)
+        payload = decision.to_payload()
+        payload["dry_run"] = dry_run
+        payload["signal_title"] = signal.title
+        if decision.accepted and decision.target_layer is not None:
+            if decision.target_layer == MemoryLayer.POLICY and not (
+                agent.config.allow_policy_writes and signal.explicit_instruction
+            ):
+                payload["accepted"] = False
+                payload["blocked"] = "policy_write_requires_explicit_config_and_instruction"
+            elif not dry_run:
+                record = kernel.to_memory_record(signal, decision)
+                payload["record_id"] = agent.memory.put(record)
+                wrote = True
+        decisions.append(payload)
+    if wrote:
+        agent.memory.seal_all()
+    return decisions
+
+
+def _subagent_prompt(profile: str, goal: str) -> str:
+    role = {
+        "planner": "Break the goal into a concise execution plan with dependencies and checks.",
+        "worker": "Execute the bounded subtask using available low-risk tools and report concrete results.",
+        "reviewer": "Review the proposed or completed work for risks, missing tests, and next checks.",
+    }.get(profile, "Execute the bounded subtask and report concrete results.")
+    return f"Subagent profile: {profile}\nRole: {role}\nGoal:\n{goal}"

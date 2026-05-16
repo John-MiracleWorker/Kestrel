@@ -1,16 +1,51 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
+from time import sleep
 
 from pytest import MonkeyPatch
 
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.orchestrator import build_memory_system
-from nested_memvid_agent.runtime_models import ToolCall
-from nested_memvid_agent.tools.base import ToolContext
+from nested_memvid_agent.runtime_models import ToolCall, ToolExecution, ToolSpec
+from nested_memvid_agent.tools.base import AgentTool, ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
+from nested_memvid_agent.tools.registry import ToolRegistry
+
+
+class SlowTool(AgentTool):
+    spec = ToolSpec(
+        name="slow.tool",
+        description="Sleeps longer than the configured timeout.",
+        parameters={"type": "object", "properties": {}},
+    )
+
+    def run(self, arguments: dict[str, object], context: ToolContext) -> ToolExecution:
+        sleep(0.2)
+        return ToolExecution(
+            call=ToolCall(name=self.spec.name, arguments=arguments),
+            success=True,
+            content="finished",
+        )
+
+
+def test_tool_registry_times_out_slow_tools(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = ToolRegistry()
+    registry.register(SlowTool())
+    config = AgentConfig(tool_timeout_seconds=0.01)
+
+    result = registry.execute(
+        ToolCall(name="slow.tool", arguments={}),
+        ToolContext(memory=memory, config=config, workspace=tmp_path),
+    )
+
+    assert result.success is False
+    assert result.error == "tool_timeout"
+    assert "timed out" in result.content
 
 
 def test_memory_search_tool_returns_hits(tmp_path: Path) -> None:
@@ -33,6 +68,20 @@ def test_memory_search_tool_returns_hits(tmp_path: Path) -> None:
     assert "Needle fact" in result.content
 
 
+def test_memory_search_invalid_layer_returns_structured_failure(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+
+    result = registry.execute(
+        ToolCall(name="memory.search", arguments={"query": "needle", "layers": ["bogus"]}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert not result.success
+    assert result.error == "invalid_tool_arguments"
+    assert "Unknown memory layer" in result.content
+
+
 def test_file_read_rejects_path_escape(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
@@ -52,18 +101,84 @@ def test_high_risk_tool_requires_enablement(tmp_path: Path) -> None:
         ToolContext(memory=memory, config=AgentConfig(allow_shell=False), workspace=tmp_path),
     )
     assert not result.success
-    assert result.error == "approval_required"
+    assert result.error == "tool_disabled"
 
 
-def test_shell_tool_runs_when_enabled(tmp_path: Path) -> None:
+def test_malformed_tool_arguments_fail_cleanly(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+
+    result = registry.execute(
+        ToolCall(name="memory.search", arguments="not an object"),  # type: ignore[arg-type]
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert not result.success
+    assert result.error == "invalid_tool_arguments"
+
+
+def test_high_risk_tool_with_allow_flag_still_requests_approval(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
     result = registry.execute(
-        ToolCall(name="shell.run", arguments={"command": ["echo", "hi"]}),
+        ToolCall(name="shell.run", arguments={"command": ["echo", "hi"]}, id="shell1"),
         ToolContext(memory=memory, config=AgentConfig(allow_shell=True), workspace=tmp_path),
     )
-    assert result.success
-    assert "hi" in result.content
+    assert not result.success
+    assert result.error == "approval_required"
+
+
+def test_approved_exact_tool_call_runs_once_and_changed_args_do_not_run(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(name="shell.run", arguments={"command": ["echo", "hi"]}, id="shell_exact")
+
+    approved = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_shell=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"shell_exact"}),
+            approved_tool_call_arguments={"shell_exact": {"command": ["echo", "hi"]}},
+        ),
+    )
+    assert approved.success
+    assert "hi" in approved.content
+
+    changed = registry.execute(
+        ToolCall(name="shell.run", arguments={"command": ["echo", "bye"]}, id="shell_exact"),
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_shell=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"shell_exact"}),
+            approved_tool_call_arguments={"shell_exact": {"command": ["echo", "hi"]}},
+        ),
+    )
+    assert not changed.success
+    assert changed.error == "approval_required"
+
+
+def test_tool_exception_returns_structured_failure(tmp_path: Path) -> None:
+    class ExplodingTool(AgentTool):
+        spec = ToolSpec(name="test.explode", description="Explode", parameters={"type": "object"})
+
+        def run(self, arguments: dict[str, object], context: ToolContext) -> ToolExecution:
+            raise RuntimeError("boom")
+
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = ToolRegistry()
+    registry.register(ExplodingTool())
+
+    result = registry.execute(
+        ToolCall(name="test.explode", arguments={}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert not result.success
+    assert result.error == "tool_execution_failed"
+    assert "RuntimeError: boom" in result.content
 
 
 def test_default_registry_includes_spec_tools() -> None:
@@ -74,12 +189,24 @@ def test_default_registry_includes_spec_tools() -> None:
         "repo.map",
         "patch.apply",
         "test.run",
+        "lint.run",
         "git.status",
         "git.diff",
+        "git.branch",
+        "git.commit",
         "memvid.verify",
         "memvid.doctor",
         "memvid.stats",
+        "memory.inspect",
+        "memory.export",
+        "memory.import",
+        "memory.learn",
         "memory.consolidate",
+        "context.pack",
+        "context.expand",
+        "capsule.summarize",
+        "capsule.apply",
+        "memory.conflicts",
         "codex.exec",
     } <= names
 
@@ -92,7 +219,7 @@ def test_codex_exec_requires_approval_by_default(tmp_path: Path) -> None:
         ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
     )
     assert not result.success
-    assert result.error == "approval_required"
+    assert result.error == "tool_disabled"
 
 
 def test_codex_exec_runs_when_enabled(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -116,8 +243,22 @@ def test_codex_exec_runs_when_enabled(tmp_path: Path, monkeypatch: MonkeyPatch) 
                 "sandbox": "workspace-write",
                 "timeout": 45,
             },
+            id="codex1",
         ),
-        ToolContext(memory=memory, config=AgentConfig(allow_codex_cli=True), workspace=tmp_path),
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_codex_cli=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"codex1"}),
+            approved_tool_call_arguments={
+                "codex1": {
+                    "prompt": "summarize this repo",
+                    "model": "gpt-test",
+                    "sandbox": "workspace-write",
+                    "timeout": 45,
+                }
+            },
+        ),
     )
 
     assert result.success
@@ -151,7 +292,177 @@ def test_patch_apply_requires_file_write_enablement(tmp_path: Path) -> None:
         ToolContext(memory=memory, config=AgentConfig(allow_file_write=False), workspace=tmp_path),
     )
     assert not result.success
-    assert result.error == "approval_required"
+    assert result.error == "tool_disabled"
+
+
+def test_file_write_still_blocks_path_escape_when_enabled(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+
+    result = registry.execute(
+        ToolCall(name="file.write", arguments={"path": "../outside.txt", "content": "no"}, id="write1"),
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_file_write=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"write1"}),
+            approved_tool_call_arguments={"write1": {"path": "../outside.txt", "content": "no"}},
+        ),
+    )
+
+    assert not result.success
+    assert result.error == "file_write_failed"
+    assert not (tmp_path.parent / "outside.txt").exists()
+
+
+def test_lint_run_uses_shell_enablement_and_allowlist(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+
+    blocked = registry.execute(
+        ToolCall(name="lint.run", arguments={"command": ["ruff", "check", "."]}),
+        ToolContext(memory=memory, config=AgentConfig(allow_shell=False), workspace=tmp_path),
+    )
+    assert blocked.error == "tool_disabled"
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command == ["ruff", "check", "."]
+        assert kwargs["cwd"] == tmp_path
+        return subprocess.CompletedProcess(command, 0, stdout="clean", stderr="")
+
+    monkeypatch.setattr("nested_memvid_agent.tools.builtin.subprocess.run", fake_run)
+    allowed = registry.execute(
+        ToolCall(name="lint.run", arguments={"command": ["ruff", "check", "."]}, id="lint1"),
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_shell=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"lint1"}),
+            approved_tool_call_arguments={"lint1": {"command": ["ruff", "check", "."]}},
+        ),
+    )
+
+    assert allowed.success
+    assert "clean" in allowed.content
+
+
+def test_git_commit_requires_approval_and_never_pushes(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(name="git.commit", arguments={"message": "test commit"}, id="commit1")
+
+    blocked = registry.execute(call, ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path))
+    assert blocked.error == "approval_required"
+
+    captured: dict[str, object] = {}
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(command, 0, stdout="[main abc] test commit", stderr="")
+
+    monkeypatch.setattr("nested_memvid_agent.tools.builtin.subprocess.run", fake_run)
+    approved = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"commit1"}),
+        ),
+    )
+
+    assert approved.success
+    assert captured["command"] == ["git", "commit", "-m", "test commit"]
+    assert "push" not in captured["command"]
+
+
+def test_memory_inspect_export_and_import_are_structured_and_gated(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    memory.put(
+        MemoryRecord(
+            layer=MemoryLayer.SEMANTIC,
+            kind=MemoryKind.FACT,
+            title="Structured export fact",
+            content="Memory export returns structured JSON.",
+            confidence=0.9,
+        )
+    )
+    registry = build_default_tools()
+
+    inspected = registry.execute(
+        ToolCall(name="memory.inspect", arguments={"query": "structured JSON", "layers": ["semantic"]}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+    assert inspected.success
+    assert json.loads(inspected.content)[0]["record"]["layer"] == "semantic"
+
+    exported = registry.execute(
+        ToolCall(name="memory.export", arguments={"layers": ["semantic"]}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+    assert exported.success
+    assert json.loads(exported.content)[0]["title"] == "Structured export fact"
+
+    import_call = ToolCall(
+        name="memory.import",
+        arguments={
+            "records": [
+                {
+                    "layer": "semantic",
+                    "kind": "fact",
+                    "title": "Imported fact",
+                    "content": "Approved import writes non-policy memory.",
+                }
+            ]
+        },
+        id="import1",
+    )
+    blocked = registry.execute(import_call, ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path))
+    assert blocked.error == "approval_required"
+
+    imported = registry.execute(
+        import_call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"import1"}),
+        ),
+    )
+    assert imported.success
+    assert memory.retrieve(RetrievalQuery(query="Approved import", layers=(MemoryLayer.SEMANTIC,), k_per_layer=3))
+
+
+def test_memory_import_keeps_policy_writes_separately_gated(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+
+    result = registry.execute(
+        ToolCall(
+            name="memory.import",
+            arguments={
+                "records": [
+                    {
+                        "layer": "policy",
+                        "kind": "policy",
+                        "title": "Imported policy",
+                        "content": "Never write policy memory without explicit policy enablement.",
+                    }
+                ]
+            },
+            id="import_policy",
+        ),
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_policy_writes=False),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"import_policy"}),
+        ),
+    )
+
+    assert not result.success
+    assert result.error == "policy_write_disabled"
 
 
 def test_memory_consolidate_promotes_repeated_procedure(tmp_path: Path) -> None:
@@ -184,3 +495,53 @@ def test_memory_consolidate_promotes_repeated_procedure(tmp_path: Path) -> None:
     assert memory.retrieve(
         RetrievalQuery(query="Repeatable test recipe", layers=(MemoryLayer.PROCEDURAL,), k_per_layer=3)
     )
+
+
+def test_memory_learn_routes_validated_signal(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    result = registry.execute(
+        ToolCall(
+            name="memory.learn",
+            arguments={
+                "title": "Validated project fact",
+                "content": "The agent stores one .mv2 file per memory layer.",
+                "kind": "fact",
+                "source_layer": "episodic",
+                "validation_score": 0.84,
+                "repeat_count": 1,
+            },
+        ),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.success
+    assert result.data["target_layer"] == "semantic"
+    hits = memory.retrieve(RetrievalQuery(query=".mv2 file per memory layer", layers=(MemoryLayer.SEMANTIC,), k_per_layer=3))
+    assert hits
+    assert hits[0].record.metadata["nested_learning"]["context_flow"]["id"] == "episode_to_semantic"
+
+
+def test_memory_learn_blocks_policy_without_config_enablement(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    result = registry.execute(
+        ToolCall(
+            name="memory.learn",
+            arguments={
+                "title": "Policy candidate",
+                "content": "Always require explicit review before changing policy memory.",
+                "kind": "policy",
+                "source_layer": "procedural",
+                "target_layer": "policy",
+                "validation_score": 0.99,
+                "repeat_count": 5,
+                "explicit_instruction": True,
+            },
+        ),
+        ToolContext(memory=memory, config=AgentConfig(allow_policy_writes=False), workspace=tmp_path),
+    )
+
+    assert not result.success
+    assert result.error == "policy_write_disabled"
+    assert not memory.retrieve(RetrievalQuery(query="explicit review before changing policy", layers=(MemoryLayer.POLICY,), k_per_layer=3))

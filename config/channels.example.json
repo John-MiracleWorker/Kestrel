@@ -1,0 +1,28 @@
+{
+  "channels": [
+    {
+      "id": "telegram",
+      "provider": "telegram",
+      "enabled": true,
+      "send_enabled": false,
+      "auto_reply": false,
+      "token_env": "TELEGRAM_BOT_TOKEN"
+    },
+    {
+      "id": "discord",
+      "provider": "discord",
+      "enabled": true,
+      "send_enabled": false,
+      "auto_reply": false,
+      "webhook_url_env": "DISCORD_WEBHOOK_URL"
+    },
+    {
+      "id": "webhook",
+      "provider": "webhook",
+      "enabled": true,
+      "send_enabled": false,
+      "auto_reply": false,
+      "webhook_url_env": "NEST_AGENT_CHANNEL_WEBHOOK_URL"
+    }
+  ]
+}

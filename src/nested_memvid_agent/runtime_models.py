@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import uuid4
@@ -37,6 +37,35 @@ class LLMResponse:
     content: str
     tool_calls: tuple[ToolCall, ...] = ()
     raw: Any | None = None
+    usage: dict[str, Any] | None = None
+    finish_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class LLMOptions:
+    stream: bool = False
+    timeout_seconds: int = 60
+    max_retries: int = 2
+    temperature: float = 0.2
+
+
+LLMStreamEventType = Literal[
+    "token",
+    "tool_call_delta",
+    "tool_call",
+    "message_complete",
+    "provider_error",
+    "usage",
+]
+
+
+@dataclass(frozen=True)
+class LLMStreamEvent:
+    type: LLMStreamEventType
+    content: str = ""
+    tool_call: ToolCall | None = None
+    response: LLMResponse | None = None
+    data: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -44,7 +73,7 @@ class ToolSpec:
     name: str
     description: str
     parameters: dict[str, Any]
-    risk: Literal["low", "medium", "high"] = "low"
+    risk: Literal["low", "medium", "high", "critical"] = "low"
     requires_approval: bool = False
     source: Literal["builtin", "mcp", "skill"] = "builtin"
     server_id: str | None = None
@@ -85,6 +114,21 @@ class ToolExecution:
 
 
 @dataclass(frozen=True)
+class TurnSource:
+    """Provenance for a user turn that entered outside the direct CLI/API chat path."""
+
+    channel: str
+    channel_id: str
+    conversation_id: str
+    user_id: str | None = None
+    message_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class AgentTurnResult:
     session_id: str
     user_message: str
@@ -93,3 +137,7 @@ class AgentTurnResult:
     context_chars: int
     memory_writes: tuple[str, ...]
     stop_reason: str
+    context_prompt: str = ""
+    source: TurnSource | None = None
+    run_id: str = ""
+    error: dict[str, Any] | None = None

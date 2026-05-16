@@ -3,13 +3,16 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 
+from .context_packer import ContextPacker, ContextPackRequest
 from .layers import DEFAULT_LAYER_SPECS, LayeredMemorySystem, LayerSpec
-from .models import CompiledContext, MemoryHit, MemoryLayer, RetrievalQuery
+from .models import CompiledContext, MemoryHit, MemoryLayer
 
 
 @dataclass(frozen=True)
 class ContextCompilerConfig:
     total_budget_chars: int = 18_000
+    context_pack_token_budget: int = 6000
+    expand_raw: bool = False
     include_evidence: bool = True
     include_scores: bool = True
     max_hits_per_layer: int = 8
@@ -27,17 +30,22 @@ class ContextCompiler:
         self.memory = memory
         self.specs = specs or DEFAULT_LAYER_SPECS
         self.config = config or ContextCompilerConfig()
+        self.packer = ContextPacker(memory)
 
     def compile(self, objective: str, query: str | None = None) -> CompiledContext:
-        retrieval_query = RetrievalQuery(
-            query=query or objective,
-            objective=objective,
-            k_per_layer=self.config.max_hits_per_layer,
-            min_relevancy=0.0,
+        packed = self.packer.pack(
+            ContextPackRequest(
+                objective=objective,
+                query=query,
+                token_budget=max(self.config.context_pack_token_budget, 1),
+                allowed_layers=tuple(MemoryLayer),
+                expand_raw=self.config.expand_raw,
+                include_telemetry=True,
+                k_per_layer=self.config.max_hits_per_layer,
+            )
         )
-        hits = self.memory.retrieve(retrieval_query)
-        selected = self._select_hits(hits)
-        prompt = self._render(objective, selected)
+        selected = list(packed.hits)
+        prompt = packed.prompt
         if len(prompt) > self.config.total_budget_chars:
             prompt = prompt[: self.config.total_budget_chars] + "\n\n[TRUNCATED_BY_CONTEXT_COMPILER]"
         return CompiledContext(
@@ -46,6 +54,7 @@ class ContextCompiler:
             hits=tuple(selected),
             total_chars=len(prompt),
             budget_chars=self.config.total_budget_chars,
+            warnings=packed.conflict_warnings,
         )
 
     def _select_hits(self, hits: list[MemoryHit]) -> list[MemoryHit]:

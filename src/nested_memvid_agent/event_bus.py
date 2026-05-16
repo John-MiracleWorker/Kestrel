@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Any
 
+from .event_log import redact_secrets
 from .state_store import AgentStateStore
 
 
@@ -38,8 +39,9 @@ class RunEventBus:
         self._subscribers: dict[str, list[queue.Queue[RunEvent]]] = defaultdict(list)
 
     def publish(self, run_id: str, type: str, payload: dict[str, Any]) -> RunEvent:
-        event_id = self.state.append_run_step(run_id, type, payload)
-        event = RunEvent(id=event_id, run_id=run_id, type=type, payload=payload)
+        safe_payload = redact_secrets(payload)
+        event_id = self.state.append_run_step(run_id, type, safe_payload)
+        event = RunEvent(id=event_id, run_id=run_id, type=type, payload=safe_payload)
         with self._lock:
             subscribers = list(self._subscribers.get(run_id, []))
         for subscriber in subscribers:
