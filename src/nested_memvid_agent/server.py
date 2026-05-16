@@ -5,8 +5,8 @@ import secrets
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from importlib import metadata as importlib_metadata
 from importlib import import_module
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 
