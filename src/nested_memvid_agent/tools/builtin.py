@@ -38,7 +38,15 @@ class MemorySearchTool(AgentTool):
         if not query:
             return self._result(call, success=False, content="Missing query", error="missing_query")
         layer_values = arguments.get("layers")
-        layers = tuple(MemoryLayer(value) for value in layer_values) if isinstance(layer_values, list) else tuple(MemoryLayer)
+        try:
+            layers = tuple(MemoryLayer(value) for value in layer_values) if isinstance(layer_values, list) else tuple(MemoryLayer)
+        except ValueError as exc:
+            return self._result(
+                call,
+                success=False,
+                content=f"Unknown memory layer: {exc}",
+                error="invalid_tool_arguments",
+            )
         k = int(arguments.get("k", 8))
         hits = context.memory.retrieve(RetrievalQuery(query=query, layers=layers, k_per_layer=k))
         rows = []

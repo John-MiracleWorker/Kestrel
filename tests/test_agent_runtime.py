@@ -102,7 +102,7 @@ def test_agent_stops_on_direct_approval_required(tmp_path: Path) -> None:
             memory=memory,
             llm=llm,
             tools=build_default_tools(),
-            config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
+            config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs", allow_shell=True),
             event_log=event_log,
         )
     )

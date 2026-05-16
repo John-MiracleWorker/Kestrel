@@ -9,9 +9,10 @@ from pytest import MonkeyPatch
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.orchestrator import build_memory_system
-from nested_memvid_agent.runtime_models import ToolCall
-from nested_memvid_agent.tools.base import ToolContext
+from nested_memvid_agent.runtime_models import ToolCall, ToolExecution, ToolSpec
+from nested_memvid_agent.tools.base import AgentTool, ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
+from nested_memvid_agent.tools.registry import ToolRegistry
 
 
 def test_memory_search_tool_returns_hits(tmp_path: Path) -> None:
@@ -34,6 +35,20 @@ def test_memory_search_tool_returns_hits(tmp_path: Path) -> None:
     assert "Needle fact" in result.content
 
 
+def test_memory_search_invalid_layer_returns_structured_failure(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+
+    result = registry.execute(
+        ToolCall(name="memory.search", arguments={"query": "needle", "layers": ["bogus"]}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert not result.success
+    assert result.error == "invalid_tool_arguments"
+    assert "Unknown memory layer" in result.content
+
+
 def test_file_read_rejects_path_escape(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
@@ -53,7 +68,7 @@ def test_high_risk_tool_requires_enablement(tmp_path: Path) -> None:
         ToolContext(memory=memory, config=AgentConfig(allow_shell=False), workspace=tmp_path),
     )
     assert not result.success
-    assert result.error == "approval_required"
+    assert result.error == "tool_disabled"
 
 
 def test_malformed_tool_arguments_fail_cleanly(tmp_path: Path) -> None:
@@ -69,15 +84,68 @@ def test_malformed_tool_arguments_fail_cleanly(tmp_path: Path) -> None:
     assert result.error == "invalid_tool_arguments"
 
 
-def test_shell_tool_runs_when_enabled(tmp_path: Path) -> None:
+def test_high_risk_tool_with_allow_flag_still_requests_approval(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
     result = registry.execute(
-        ToolCall(name="shell.run", arguments={"command": ["echo", "hi"]}),
+        ToolCall(name="shell.run", arguments={"command": ["echo", "hi"]}, id="shell1"),
         ToolContext(memory=memory, config=AgentConfig(allow_shell=True), workspace=tmp_path),
     )
-    assert result.success
-    assert "hi" in result.content
+    assert not result.success
+    assert result.error == "approval_required"
+
+
+def test_approved_exact_tool_call_runs_once_and_changed_args_do_not_run(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(name="shell.run", arguments={"command": ["echo", "hi"]}, id="shell_exact")
+
+    approved = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_shell=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"shell_exact"}),
+            approved_tool_call_arguments={"shell_exact": {"command": ["echo", "hi"]}},
+        ),
+    )
+    assert approved.success
+    assert "hi" in approved.content
+
+    changed = registry.execute(
+        ToolCall(name="shell.run", arguments={"command": ["echo", "bye"]}, id="shell_exact"),
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_shell=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"shell_exact"}),
+            approved_tool_call_arguments={"shell_exact": {"command": ["echo", "hi"]}},
+        ),
+    )
+    assert not changed.success
+    assert changed.error == "approval_required"
+
+
+def test_tool_exception_returns_structured_failure(tmp_path: Path) -> None:
+    class ExplodingTool(AgentTool):
+        spec = ToolSpec(name="test.explode", description="Explode", parameters={"type": "object"})
+
+        def run(self, arguments: dict[str, object], context: ToolContext) -> ToolExecution:
+            raise RuntimeError("boom")
+
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = ToolRegistry()
+    registry.register(ExplodingTool())
+
+    result = registry.execute(
+        ToolCall(name="test.explode", arguments={}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert not result.success
+    assert result.error == "tool_execution_failed"
+    assert "RuntimeError: boom" in result.content
 
 
 def test_default_registry_includes_spec_tools() -> None:
@@ -118,7 +186,7 @@ def test_codex_exec_requires_approval_by_default(tmp_path: Path) -> None:
         ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
     )
     assert not result.success
-    assert result.error == "approval_required"
+    assert result.error == "tool_disabled"
 
 
 def test_codex_exec_runs_when_enabled(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -142,8 +210,22 @@ def test_codex_exec_runs_when_enabled(tmp_path: Path, monkeypatch: MonkeyPatch) 
                 "sandbox": "workspace-write",
                 "timeout": 45,
             },
+            id="codex1",
         ),
-        ToolContext(memory=memory, config=AgentConfig(allow_codex_cli=True), workspace=tmp_path),
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_codex_cli=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"codex1"}),
+            approved_tool_call_arguments={
+                "codex1": {
+                    "prompt": "summarize this repo",
+                    "model": "gpt-test",
+                    "sandbox": "workspace-write",
+                    "timeout": 45,
+                }
+            },
+        ),
     )
 
     assert result.success
@@ -177,7 +259,7 @@ def test_patch_apply_requires_file_write_enablement(tmp_path: Path) -> None:
         ToolContext(memory=memory, config=AgentConfig(allow_file_write=False), workspace=tmp_path),
     )
     assert not result.success
-    assert result.error == "approval_required"
+    assert result.error == "tool_disabled"
 
 
 def test_file_write_still_blocks_path_escape_when_enabled(tmp_path: Path) -> None:
@@ -185,8 +267,14 @@ def test_file_write_still_blocks_path_escape_when_enabled(tmp_path: Path) -> Non
     registry = build_default_tools()
 
     result = registry.execute(
-        ToolCall(name="file.write", arguments={"path": "../outside.txt", "content": "no"}),
-        ToolContext(memory=memory, config=AgentConfig(allow_file_write=True), workspace=tmp_path),
+        ToolCall(name="file.write", arguments={"path": "../outside.txt", "content": "no"}, id="write1"),
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_file_write=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"write1"}),
+            approved_tool_call_arguments={"write1": {"path": "../outside.txt", "content": "no"}},
+        ),
     )
 
     assert not result.success
@@ -202,7 +290,7 @@ def test_lint_run_uses_shell_enablement_and_allowlist(tmp_path: Path, monkeypatc
         ToolCall(name="lint.run", arguments={"command": ["ruff", "check", "."]}),
         ToolContext(memory=memory, config=AgentConfig(allow_shell=False), workspace=tmp_path),
     )
-    assert blocked.error == "approval_required"
+    assert blocked.error == "tool_disabled"
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         assert command == ["ruff", "check", "."]
@@ -211,8 +299,14 @@ def test_lint_run_uses_shell_enablement_and_allowlist(tmp_path: Path, monkeypatc
 
     monkeypatch.setattr("nested_memvid_agent.tools.builtin.subprocess.run", fake_run)
     allowed = registry.execute(
-        ToolCall(name="lint.run", arguments={"command": ["ruff", "check", "."]}),
-        ToolContext(memory=memory, config=AgentConfig(allow_shell=True), workspace=tmp_path),
+        ToolCall(name="lint.run", arguments={"command": ["ruff", "check", "."]}, id="lint1"),
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_shell=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"lint1"}),
+            approved_tool_call_arguments={"lint1": {"command": ["ruff", "check", "."]}},
+        ),
     )
 
     assert allowed.success

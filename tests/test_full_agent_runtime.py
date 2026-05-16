@@ -15,6 +15,7 @@ from nested_memvid_agent.mcp_manager import MCPManager
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
 from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.run_manager import RunManager
+from nested_memvid_agent.runtime_models import AgentTurnResult
 from nested_memvid_agent.server import create_app
 from nested_memvid_agent.skill_manager import SkillManager
 from nested_memvid_agent.state_store import AgentStateStore
@@ -380,6 +381,44 @@ def test_skill_discovery_exposes_nested_learning_skill(tmp_path: Path) -> None:
     assert disabled["enabled"] is False
 
 
+def test_cancelled_run_cannot_be_overwritten_completed_after_agent_returns(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.state.create_run(
+        run_id="run_cancel_race",
+        message="cancel me",
+        session_id="session",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+
+    class CancellingAgent:
+        memory = None
+        config = manager.config
+
+        def chat(self, *args: object, **kwargs: object) -> AgentTurnResult:
+            manager.cancel_run("run_cancel_race")
+            return AgentTurnResult(
+                session_id="session",
+                user_message="cancel me",
+                assistant_message="done after cancel",
+                tool_executions=(),
+                context_chars=0,
+                memory_writes=(),
+                stop_reason="complete",
+            )
+
+        def close(self) -> None:
+            return None
+
+    manager._build_agent = lambda config: CancellingAgent()  # type: ignore[method-assign]
+
+    manager._run_agent_turn("run_cancel_race", manager.config, "cancel me", "session")
+
+    final = manager.get_run("run_cancel_race")
+    assert final["status"] == "cancelled"
+    assert final["stop_reason"] == "cancelled"
+
+
 def test_run_manager_completes_background_mock_run(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     run = manager.create_run(message="hello", session_id="session")
@@ -440,6 +479,9 @@ def test_run_manager_publishes_stream_tokens(tmp_path: Path) -> None:
 
 def test_run_manager_pauses_and_resumes_approved_tool(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
+    manager.config = AgentConfig(
+        **{**manager.config.__dict__, "allow_shell": True}
+    )
     manager.state.create_run(
         run_id="run_manual",
         message="manual",
@@ -465,6 +507,9 @@ def test_run_manager_pauses_and_resumes_approved_tool(tmp_path: Path) -> None:
 
 def test_run_manager_marks_denied_approval_failed(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
+    manager.config = AgentConfig(
+        **{**manager.config.__dict__, "allow_shell": True}
+    )
     manager.state.create_run(
         run_id="run_manual",
         message="manual",

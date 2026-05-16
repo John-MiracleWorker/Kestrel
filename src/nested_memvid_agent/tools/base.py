@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,7 @@ class ToolContext:
     run_id: str | None = None
     approval_handler: ApprovalHandler | None = None
     approved_tool_call_ids: frozenset[str] = frozenset()
+    approved_tool_call_arguments: Mapping[str, dict[str, Any]] | None = None
 
 
 class AgentTool(ABC):
