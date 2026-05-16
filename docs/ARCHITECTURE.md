@@ -103,7 +103,7 @@ The SQLite state store tracks operational state:
 - task nodes
 - subagent runs
 
-Terminal run statuses and approval decisions are replay-safe. State migrations currently initialize schema version 7.
+Terminal run statuses and approval decisions are replay-safe. State migrations currently initialize schema version 9.
 
 ## Tooling Boundary
 

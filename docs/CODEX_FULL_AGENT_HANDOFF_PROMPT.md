@@ -116,7 +116,7 @@ Treat these as implemented unless current verification proves otherwise:
 - Task capsules and conservative learning-signal extraction.
 - `memory.learn`, `memory.consolidate`, and promotion gate metadata.
 - Exact-call approval gates for high-risk tools.
-- SQLite state schema version 8, including durable trace spans.
+- SQLite state schema version 9, including durable trace spans and persisted run provider.
 - Replay-safe terminal run and approval decisions.
 - Managed stdio MCP sessions.
 - Skills with manifest validation, provenance hashes, and local runtimes.

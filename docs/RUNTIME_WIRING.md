@@ -55,7 +55,7 @@ The FastAPI server exposes the same state through run, event, approval, schedule
 
 ## State Store
 
-`AgentStateStore` is SQLite control-plane storage, currently schema version 8.
+`AgentStateStore` is SQLite control-plane storage, currently schema version 9.
 
 It stores:
 
@@ -67,6 +67,8 @@ It stores:
 - task nodes
 - subagent runs
 - trace spans
+
+Run records also persist the provider/model selected for the run so the local operator UI can launch and inspect runs without falling back to process-global provider assumptions.
 
 Terminal run records are replay-safe: completed, failed, and cancelled runs are immutable. Approval records are immutable after they leave `pending`, and approved tool results are recorded back onto the approval record without reopening it.
 

@@ -24,9 +24,10 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Safe self-repair now has branch-isolated repair primitives: `repair.prepare`, `repair.status`, `repair.apply_patch`, `repair.validate`, `repair.orchestrate_validate`, and `repair.rollback`.
 - The first diagnosis-gated repair orchestration slice can run validation on an active repair branch, classify failures, recall prior lessons, and block repeated validation retries until the strategy changes.
 - Skills now have a first manifest validation gate plus persisted validation/provenance metadata for discovered instruction capsules.
-- Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry, and memory search.
+- Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry, memory search, non-secret runtime config, channel CRUD, plugin/skill detail, memory inspect, cognition lesson/failure lists, and diagnosis classify/recall routes.
+- Local operator web UI now exposes the implemented Kestrel runtime surfaces: provider/model/workspace run controls, real task graph and scheduler controls, approvals/history, memory/context/lesson/failure views, tool invocation, MCP create/edit/lifecycle/manual invoke, skills/plugins, channels, observability, and non-secret runtime settings.
 - Multi-channel ingress for Telegram Bot API updates, Discord message/interaction-shaped payloads, and generic/custom webhooks, with CLI and API routes.
-- SQLite state store for runs, run steps, approvals, MCP servers, skills, plugins, task nodes, subagent runs, and trace spans, now initialized through schema version `8`.
+- SQLite state store for runs, run steps, approvals, MCP servers, skills, plugins, task nodes, subagent runs, and trace spans, now initialized through schema version `9`.
 - Paper-guided nested learning kernel with context-flow metadata, optimizer traces, conservative continuum-memory routing, and a `memory.learn` tool/API path.
 - Memory learning decisions now expose explicit promotion gate metadata so rejected/accepted decisions can explain target layer, observed evidence, repeat-count thresholds, validation thresholds, and explicit-instruction requirements.
 - Run-scoped `complete.mv2` task capsules, preview-only capsule summaries, dry-run consolidation decisions, and approval-gated capsule apply.
@@ -79,7 +80,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Robust MCP SSE/streamable HTTP transport fixtures and failure-recovery soak testing.
 - Container-grade sandboxed skill execution.
 - Autonomous self-improvement with diff review, test gates, rollback, and explicit human approval.
-- Comprehensive frontend design for model/provider settings, live tool traces, MCP configuration editing, and skill execution details.
+- Hosted multi-user UI behavior, production authorization, and role-scoped operator permissions.
 
 ## Current Contract
 

@@ -323,7 +323,7 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     state = AgentStateStore(db_path)
 
-    assert state.schema_version() == 8
+    assert state.schema_version() == 9
     with sqlite3.connect(db_path) as conn:
         run_indexes = {row[1] for row in conn.execute("PRAGMA index_list('runs')").fetchall()}
         approval_indexes = {row[1] for row in conn.execute("PRAGMA index_list('approval_requests')").fetchall()}
@@ -572,6 +572,162 @@ def test_server_exposes_prompt_api_routes(tmp_path: Path) -> None:
     assert context.status_code == 200
     assert "MV2 PSEUDO-CONTEXT PACK" in context.json()["packed_prompt"]
     assert context.json()["selected_item_count"] >= 1
+
+
+def test_server_exposes_local_operator_api_parity(tmp_path: Path, monkeypatch: Any) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("KESTREL_OPERATOR_TEST_KEY", "secret-token")
+    memory_dir = tmp_path / "memory"
+    memory = build_memory_system("memory", memory_dir)
+    memory.put(
+        MemoryRecord(
+            layer=MemoryLayer.PROCEDURAL,
+            kind=MemoryKind.PROCEDURE,
+            title="LessonCard: pytest import layout",
+            content=json.dumps({"id": "lesson_ui", "corrected_strategy": "Check PYTHONPATH first."}),
+            confidence=0.84,
+            metadata={"cognition_schema": "lesson_card.v1"},
+        )
+    )
+    memory.put(
+        MemoryRecord(
+            layer=MemoryLayer.EPISODIC,
+            kind=MemoryKind.FAILURE,
+            title="FailureEpisode: test failure",
+            content=json.dumps({"failure_id": "failure_ui", "diagnosis": "Focused test failed."}),
+            confidence=0.76,
+            metadata={"cognition_schema": "failure_episode.v1"},
+        )
+    )
+    memory.seal_all()
+    memory.close_all()
+
+    config = AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        api_key_env="KESTREL_OPERATOR_TEST_KEY",
+        memory_dir=memory_dir,
+        log_dir=tmp_path / "logs",
+        state_path=tmp_path / "state.db",
+        skills_dir=tmp_path / "skills",
+        plugins_dir=tmp_path / "plugins",
+        workspace=tmp_path,
+        channel_config_path=tmp_path / "channels.json",
+    )
+    state = AgentStateStore(config.state_path)
+    state.upsert_plugin(
+        {
+            "id": "plugin_local",
+            "name": "Local Plugin",
+            "description": "Local plugin row",
+            "source_url": "https://github.com/example/plugin",
+            "commit_sha": "abc1234",
+            "install_path": str(tmp_path / "plugins" / "plugin_local"),
+            "manifest": {"id": "plugin_local", "skills": [], "mcp_servers": []},
+            "capabilities": ["skill"],
+            "enabled": False,
+            "risk_report": {"risk": "medium"},
+            "install_status": "installed",
+            "format": "kestrel",
+        }
+    )
+    skill_dir = config.skills_dir / "review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "skill.json").write_text(
+        json.dumps({"id": "review", "name": "Review", "description": "Review skill", "risk": "medium"}),
+        encoding="utf-8",
+    )
+    (skill_dir / "SKILL.md").write_text("Review with memory.", encoding="utf-8")
+
+    client = TestClient(create_app(config))
+
+    runtime = client.get("/api/runtime/config")
+    assert runtime.status_code == 200
+    runtime_payload = runtime.json()
+    assert runtime_payload["provider"]["api_key_env"] == "KESTREL_OPERATOR_TEST_KEY"
+    assert runtime_payload["provider"]["api_key_configured"] is True
+    assert "secret-token" not in json.dumps(runtime_payload)
+
+    run = client.post(
+        "/api/runs",
+        json={"message": "operator run", "provider": "mock", "model": "ui-model", "autonomy_mode": "manual"},
+    )
+    assert run.status_code == 200
+    assert run.json()["provider"] == "mock"
+    assert run.json()["model"] == "ui-model"
+    run_id = run.json()["run_id"]
+
+    task = state.create_task_node(
+        task_id="task_operator_review",
+        run_id=run_id,
+        title="Operator review",
+        goal="Wait for human approval.",
+        profile="reviewer",
+        approved=False,
+        risk="medium",
+    )
+    graph = client.get(f"/api/runs/{run_id}/task-graph")
+    assert graph.status_code == 200
+    assert any(item["task_id"] == task.task_id for item in graph.json()["approval_blocked_tasks"])
+    approved = client.post(f"/api/runs/{run_id}/approve-task", json={"task_id": task.task_id})
+    assert approved.status_code == 200
+    assert approved.json()["approved"] is True
+
+    channel = client.post(
+        "/api/channels",
+        json={
+            "id": "signed-webhook",
+            "provider": "webhook",
+            "settings": {"signature_secret_env": "KESTREL_WEBHOOK_SECRET"},
+        },
+    )
+    assert channel.status_code == 200
+    assert channel.json()["env_status"]["signature_secret_env"] == "KESTREL_WEBHOOK_SECRET"
+    updated_channel = client.put(
+        "/api/channels/signed-webhook",
+        json={"id": "ignored", "provider": "webhook", "enabled": False},
+    )
+    assert updated_channel.status_code == 200
+    assert updated_channel.json()["id"] == "signed-webhook"
+    assert updated_channel.json()["enabled"] is False
+
+    mcp_payload = {
+        "id": "operator-static",
+        "transport": "stdio",
+        "tools": [{"name": "echo", "description": "Echo"}],
+        "secret_env": {"api_key": "MCP_API_KEY"},
+    }
+    assert client.post("/api/mcp/servers", json=mcp_payload).status_code == 200
+    mcp_detail = client.get("/api/mcp/servers/operator-static")
+    assert mcp_detail.status_code == 200
+    assert mcp_detail.json()["secret_env"] == {"api_key": "MCP_API_KEY"}
+    mcp_updated = client.put("/api/mcp/servers/operator-static", json={**mcp_payload, "name": "Operator Static"})
+    assert mcp_updated.status_code == 200
+    assert mcp_updated.json()["name"] == "Operator Static"
+
+    assert client.post("/api/skills/discover").status_code == 200
+    skill = client.get("/api/skills/review")
+    assert skill.status_code == 200
+    assert skill.json()["manifest"]["validation"]["ok"] is True
+    plugin = client.get("/api/plugins/plugin_local")
+    assert plugin.status_code == 200
+    assert plugin.json()["id"] == "plugin_local"
+
+    lessons = client.get("/api/cognition/lessons")
+    failures = client.get("/api/cognition/failures")
+    assert lessons.status_code == 200
+    assert failures.status_code == 200
+    assert lessons.json()["items"][0]["record"]["metadata"]["cognition_schema"] == "lesson_card.v1"
+    assert failures.json()["items"][0]["record"]["metadata"]["cognition_schema"] == "failure_episode.v1"
+
+    diagnosis = client.post(
+        "/api/diagnosis/classify",
+        json={"failure_text": "ModuleNotFoundError: No module named nested_memvid_agent", "source": "pytest"},
+    )
+    assert diagnosis.status_code == 200
+    assert diagnosis.json()["classification"] in {"missing_dependency", "import_error", "unknown"}
 
 
 def test_server_exposes_observability_routes(tmp_path: Path) -> None:

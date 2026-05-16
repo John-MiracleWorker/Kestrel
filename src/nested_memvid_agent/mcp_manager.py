@@ -31,6 +31,7 @@ class MCPServerConfig:
     command: str | None = None
     args: tuple[str, ...] = ()
     env: dict[str, str] | None = None
+    secret_env: dict[str, str] | None = None
     url: str | None = None
     enabled: bool = True
     tools: tuple[dict[str, Any], ...] = ()
@@ -451,6 +452,7 @@ def _normalize_server(payload: dict[str, Any]) -> MCPServerConfig:
         command=None if payload.get("command") is None else str(payload.get("command")),
         args=tuple(str(item) for item in payload.get("args", [])),
         env={str(k): str(v) for k, v in dict(payload.get("env", {})).items()},
+        secret_env={str(k): str(v) for k, v in dict(payload.get("secret_env", {})).items()},
         url=None if payload.get("url") is None else str(payload.get("url")),
         enabled=bool(payload.get("enabled", True)),
         tools=tuple(dict(item) for item in payload.get("tools", [])),
@@ -468,6 +470,7 @@ def _server_to_dict(server: MCPServerConfig) -> dict[str, Any]:
         "command": server.command,
         "args": list(server.args),
         "env": server.env or {},
+        "secret_env": server.secret_env or {},
         "url": server.url,
         "enabled": server.enabled,
         "tools": vetted_tools,
@@ -489,6 +492,7 @@ def _server_from_state(row: dict[str, Any]) -> MCPServerConfig:
         command=row.get("command"),
         args=tuple(str(item) for item in row.get("args", [])),
         env={str(k): str(v) for k, v in dict(row.get("env", {})).items()},
+        secret_env={str(k): str(v) for k, v in dict(row.get("secret_env", {})).items()},
         url=row.get("url"),
         enabled=bool(row.get("enabled", True)),
         tools=tuple(dict(item) for item in row.get("tools", [])),

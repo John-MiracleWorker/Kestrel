@@ -57,19 +57,26 @@ class RunManager:
         message: str,
         session_id: str | None = None,
         workspace: Path | None = None,
+        provider: str | None = None,
         model: str | None = None,
+        autonomy_mode: str = "background",
     ) -> RunRecord:
         run_id = f"run_{uuid4().hex}"
+        normalized_autonomy = autonomy_mode if autonomy_mode in {"background", "manual", "autonomous"} else "background"
         run_config = replace(
             self.config,
             workspace=(workspace or self.config.workspace),
+            provider=provider or self.config.provider,
             model=model or self.config.model,
+            enable_autonomous_scheduler=normalized_autonomy == "autonomous"
+            or (normalized_autonomy == "background" and self.config.enable_autonomous_scheduler),
         )
         run = self.state.create_run(
             run_id=run_id,
             message=message,
             session_id=session_id or run_id,
             workspace=str(run_config.workspace),
+            provider=run_config.provider,
             model=run_config.model,
         )
         root = self.state.create_task_node(
@@ -80,10 +87,19 @@ class RunManager:
             profile="planner",
             status="queued",
             approved=True,
-            plan={"autonomy_mode": "background", "decomposition": "initial"},
+            plan={
+                "autonomy_mode": normalized_autonomy,
+                "decomposition": "initial",
+                "provider": run_config.provider,
+                "model": run_config.model,
+            },
             acceptance_criteria=["User objective is addressed or explicitly blocked with next steps."],
         )
-        for planned in _initial_task_plan(message):
+        if normalized_autonomy != "manual":
+            planned_tasks = _initial_task_plan(message)
+        else:
+            planned_tasks = []
+        for planned in planned_tasks:
             dependencies = [root.task_id if dependency == "root" else dependency for dependency in planned["dependencies"]]
             self.state.create_task_node(
                 task_id=str(planned["task_id"]),
@@ -99,7 +115,17 @@ class RunManager:
                 risk=str(planned["risk"]),
                 acceptance_criteria=planned["acceptance_criteria"],
             )
-        self.events.publish(run_id, "run.queued", {"message": message, "session_id": run.session_id})
+        self.events.publish(
+            run_id,
+            "run.queued",
+            {
+                "message": message,
+                "session_id": run.session_id,
+                "provider": run_config.provider,
+                "model": run_config.model,
+                "autonomy_mode": normalized_autonomy,
+            },
+        )
         self._start_thread(run_id, self._run_agent_turn, run_config, message, run.session_id)
         return run
 
@@ -407,7 +433,7 @@ class RunManager:
             goal=goal,
             status="queued",
         )
-        config = replace(self.config, workspace=Path(run.workspace), model=run.model)
+        config = replace(self.config, workspace=Path(run.workspace), provider=run.provider, model=run.model)
         self.events.publish(run_id, "subagent.queued", asdict(subagent))
         self._start_thread(subagent.subagent_id, self._run_subagent, config, subagent.subagent_id, run_id, run.session_id)
         return asdict(subagent)
@@ -447,7 +473,7 @@ class RunManager:
         if self._is_cancelled(run_id):
             return
         run = self.state.get_run(run_id)
-        config = replace(self.config, workspace=Path(run.workspace), model=run.model)
+        config = replace(self.config, workspace=Path(run.workspace), provider=run.provider, model=run.model)
         self.state.transition_run(run_id, "running", stop_reason="resuming_after_approval")
         self._start_thread(run_id, self._run_approved_tool_then_continue, config, approval, arguments, run.session_id)
 
@@ -618,7 +644,7 @@ class RunManager:
         )
         self.events.publish(run.run_id, "task.started", _task_payload(running))
         self.events.publish(run.run_id, "subagent.started", asdict(subagent))
-        config = replace(self.config, workspace=Path(run.workspace), model=run.model)
+        config = replace(self.config, workspace=Path(run.workspace), provider=run.provider, model=run.model)
         worker_isolation: dict[str, str] | None = None
         agent: NestedMV2Agent | None = None
         try:
@@ -900,7 +926,7 @@ def _turn_payload(result: AgentTurnResult) -> dict[str, Any]:
 
 def _is_root_objective_task(task: TaskNodeRecord) -> bool:
     plan = task.plan or {}
-    return task.parent_id is None and task.profile == "planner" and plan.get("autonomy_mode") == "background"
+    return task.parent_id is None and task.profile == "planner" and plan.get("decomposition") == "initial"
 
 
 def _scheduler_run_outcome(scheduler: dict[str, Any]) -> tuple[str, str]:

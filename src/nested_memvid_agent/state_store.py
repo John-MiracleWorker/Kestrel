@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 _TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 
 
@@ -25,6 +25,7 @@ class RunRecord:
     message: str
     session_id: str
     workspace: str
+    provider: str
     model: str
     assistant_message: str = ""
     context_chars: int = 0
@@ -105,18 +106,19 @@ class AgentStateStore:
         session_id: str,
         workspace: str,
         model: str,
+        provider: str = "mock",
     ) -> RunRecord:
         now = utc_now()
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO runs (
-                    run_id, status, message, session_id, workspace, model,
+                    run_id, status, message, session_id, workspace, provider, model,
                     assistant_message, context_chars, tool_count, stop_reason, error,
                     created_at, updated_at
-                ) VALUES (?, 'queued', ?, ?, ?, ?, '', 0, 0, '', NULL, ?, ?)
+                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, '', 0, 0, '', NULL, ?, ?)
                 """,
-                (run_id, message, session_id, workspace, model, now, now),
+                (run_id, message, session_id, workspace, provider, model, now, now),
             )
         return self.get_run(run_id)
 
@@ -796,6 +798,9 @@ class AgentStateStore:
             if current < 8:
                 _apply_schema_v8(conn)
                 current = 8
+            if current < 9:
+                _apply_schema_v9(conn)
+                current = 9
             if current < SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported schema migration target: {current} -> {SCHEMA_VERSION}")
             if current == SCHEMA_VERSION:
@@ -831,6 +836,7 @@ def _apply_schema_v1(conn: sqlite3.Connection) -> None:
             message TEXT NOT NULL,
             session_id TEXT NOT NULL,
             workspace TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'mock',
             model TEXT NOT NULL,
             assistant_message TEXT NOT NULL DEFAULT '',
             context_chars INTEGER NOT NULL DEFAULT 0,
@@ -1043,6 +1049,12 @@ def _apply_schema_v8(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_schema_v9(conn: sqlite3.Connection) -> None:
+    existing = _columns(conn, "runs")
+    if "provider" not in existing:
+        conn.execute("ALTER TABLE runs ADD COLUMN provider TEXT NOT NULL DEFAULT 'mock'")
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -1068,6 +1080,7 @@ def _run_from_row(row: sqlite3.Row) -> RunRecord:
         message=str(row["message"]),
         session_id=str(row["session_id"]),
         workspace=str(row["workspace"]),
+        provider=str(_row_get(row, "provider", "mock") or "mock"),
         model=str(row["model"]),
         assistant_message=str(row["assistant_message"]),
         context_chars=int(row["context_chars"]),

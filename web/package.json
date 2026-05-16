@@ -6,18 +6,24 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc -b && vite build",
-    "test": "tsc -b --pretty false"
+    "test": "tsc -b --pretty false && vitest run --environment jsdom",
+    "test:typecheck": "tsc -b --pretty false"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.2",
     "lucide-react": "^0.561.0",
-    "vite": "^7.2.7",
     "react": "^19.2.1",
-    "react-dom": "^19.2.1"
+    "react-dom": "^19.2.1",
+    "vite": "^7.2.7"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
-    "typescript": "^5.9.3"
+    "axe-core": "^4.11.4",
+    "jsdom": "^29.1.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.6"
   }
 }

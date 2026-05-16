@@ -45,6 +45,24 @@ class ChannelManager:
     def list_channels(self) -> list[dict[str, Any]]:
         return [channel.to_public_dict() for channel in sorted(self.channels.values(), key=lambda item: item.id)]
 
+    def get_channel(self, channel_id: str) -> dict[str, Any]:
+        channel = self.channels.get(channel_id)
+        if channel is None:
+            raise KeyError(f"Unknown channel: {channel_id}")
+        return channel.to_public_dict()
+
+    def upsert_channel(self, payload: dict[str, Any]) -> dict[str, Any]:
+        channel = ChannelEndpointConfig.from_mapping(payload)
+        self.channels[channel.id] = channel
+        save_channel_configs(self.config.channel_config_path, list(self.channels.values()))
+        return channel.to_public_dict()
+
+    def delete_channel(self, channel_id: str) -> None:
+        if channel_id not in self.channels:
+            raise KeyError(f"Unknown channel: {channel_id}")
+        del self.channels[channel_id]
+        save_channel_configs(self.config.channel_config_path, list(self.channels.values()))
+
     def handle_payload(
         self,
         *,
@@ -141,6 +159,26 @@ def load_channel_configs(path: Path) -> list[ChannelEndpointConfig]:
         items = []
     configs = [ChannelEndpointConfig.from_mapping(item) for item in items if isinstance(item, dict)]
     return configs or default_channel_configs()
+
+
+def save_channel_configs(path: Path, channels: list[ChannelEndpointConfig]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "channels": [
+            {
+                "id": channel.id,
+                "provider": channel.provider,
+                "enabled": channel.enabled,
+                "send_enabled": channel.send_enabled,
+                "auto_reply": channel.auto_reply,
+                "token_env": channel.token_env,
+                "webhook_url_env": channel.webhook_url_env,
+                "settings": channel.settings,
+            }
+            for channel in sorted(channels, key=lambda item: item.id)
+        ]
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def default_channel_configs() -> list[ChannelEndpointConfig]:

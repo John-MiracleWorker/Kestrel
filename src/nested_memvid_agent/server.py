@@ -5,6 +5,7 @@ import secrets
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from importlib import metadata as importlib_metadata
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -83,6 +84,47 @@ def create_app(config: AgentConfig | None = None) -> Any:
         headers = getattr(request, "headers", {})
         return headers if isinstance(headers, Mapping) else {}
 
+    def inspect_memory_payload(*, query: str | None, layers: list[str] | None, k: int) -> dict[str, object]:
+        arguments: dict[str, object] = {"query": query.strip() if query and query.strip() else "memory", "k": _bounded_limit(k, default=20, maximum=100)}
+        if layers:
+            arguments["layers"] = layers
+        execution = runs.invoke_tool(tool_name="memory.inspect", arguments=arguments, session_id="api")
+        return _tool_response_payload(execution)
+
+    def filter_cognition_items(payload: dict[str, object], schema: str) -> list[dict[str, object]]:
+        raw_items = payload.get("items")
+        if not isinstance(raw_items, list):
+            return []
+        rows: list[dict[str, object]] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            record = item.get("record")
+            if not isinstance(record, dict):
+                continue
+            metadata = record.get("metadata")
+            if not isinstance(metadata, dict) or metadata.get("cognition_schema") != schema:
+                continue
+            rows.append(item)
+        return rows
+
+    def channel_public(channel: dict[str, Any]) -> dict[str, object]:
+        settings = channel.get("settings")
+        safe = dict(channel)
+        safe["settings"] = dict(settings) if isinstance(settings, dict) else {}
+        token_env = str(safe.get("token_env") or "")
+        webhook_env = str(safe.get("webhook_url_env") or "")
+        signature_env = ""
+        if isinstance(settings, dict):
+            signature_env = str(settings.get("signature_secret_env") or "")
+        safe["env_status"] = {
+            "token_env_configured": bool(token_env and os.getenv(token_env)),
+            "webhook_url_env_configured": bool(webhook_env and os.getenv(webhook_env)),
+            "signature_secret_env": signature_env or None,
+            "signature_secret_env_configured": bool(signature_env and os.getenv(signature_env)),
+        }
+        return safe
+
     @asynccontextmanager
     async def lifespan(app_instance: Any) -> Any:
         del app_instance
@@ -101,6 +143,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         message: str
         session_id: str | None = None
         workspace: str | None = None
+        provider: str | None = None
         model: str | None = None
         autonomy_mode: str = "background"
 
@@ -109,6 +152,16 @@ def create_app(config: AgentConfig | None = None) -> Any:
         payload: dict[str, Any] = Field(default_factory=dict)
         channel_id: str | None = None
         send: bool | None = None
+
+    class ChannelConfigRequest(BaseModel):  # type: ignore[valid-type,misc]
+        id: str
+        provider: str = "webhook"
+        enabled: bool = True
+        send_enabled: bool = False
+        auto_reply: bool = False
+        token_env: str | None = None
+        webhook_url_env: str | None = None
+        settings: dict[str, Any] = Field(default_factory=dict)
 
     class ToolInvokeRequest(BaseModel):  # type: ignore[valid-type,misc]
         arguments: dict[str, Any] = Field(default_factory=dict)
@@ -130,6 +183,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         enabled: bool = True
         tools: list[dict[str, Any]] = Field(default_factory=list)
         risk_policy: str = "approval_by_default"
+        secret_env: dict[str, str] = Field(default_factory=dict)
 
     class SubagentRequest(BaseModel):  # type: ignore[valid-type,misc]
         run_id: str
@@ -148,6 +202,11 @@ def create_app(config: AgentConfig | None = None) -> Any:
         query: str
         layers: list[str] | None = None
         k: int = 8
+
+    class MemoryInspectAPIRequest(BaseModel):  # type: ignore[valid-type,misc]
+        query: str | None = None
+        layers: list[str] | None = None
+        k: int = 20
 
     class MemoryConsolidateRequest(BaseModel):  # type: ignore[valid-type,misc]
         query: str
@@ -206,13 +265,115 @@ def create_app(config: AgentConfig | None = None) -> Any:
     class PluginUpdateRequest(BaseModel):  # type: ignore[valid-type,misc]
         ref: str | None = None
 
+    class DiagnosisRequest(BaseModel):  # type: ignore[valid-type,misc]
+        failure_text: str
+        source: str | None = None
+        k: int = 5
+
     @app.get("/api/health")  # type: ignore[untyped-decorator]
     def health() -> dict[str, object]:
         return {"ok": True, "name": active_config.name}
 
+    @app.get("/api/runtime/config")  # type: ignore[untyped-decorator]
+    def runtime_config() -> dict[str, object]:
+        try:
+            package_version = importlib_metadata.version("nested-memvid-agent")
+        except importlib_metadata.PackageNotFoundError:
+            package_version = None
+        provider_env = active_config.api_key_env
+        fallback_env = active_config.fallback_api_key_env
+        return {
+            "name": active_config.name,
+            "version": package_version,
+            "schema_version": state.schema_version(),
+            "provider": {
+                "name": active_config.provider,
+                "model": active_config.model,
+                "base_url_configured": bool(active_config.base_url),
+                "api_key_env": provider_env,
+                "api_key_configured": bool(provider_env and os.getenv(provider_env)),
+                "fallback_provider": active_config.fallback_provider,
+                "fallback_model": active_config.fallback_model,
+                "fallback_base_url_configured": bool(active_config.fallback_base_url),
+                "fallback_api_key_env": fallback_env,
+                "fallback_api_key_configured": bool(fallback_env and os.getenv(fallback_env)),
+                "stream": active_config.stream,
+                "timeout_seconds": active_config.timeout_seconds,
+                "max_retries": active_config.max_retries,
+            },
+            "feature_flags": {
+                "allow_shell": active_config.allow_shell,
+                "allow_file_write": active_config.allow_file_write,
+                "allow_policy_writes": active_config.allow_policy_writes,
+                "allow_codex_cli": active_config.allow_codex_cli,
+                "allow_plugin_install": active_config.allow_plugin_install,
+                "require_approval_for_high_risk_tools": active_config.require_approval_for_high_risk_tools,
+                "enable_agentic_cycle": active_config.enable_agentic_cycle,
+                "enable_autonomous_scheduler": active_config.enable_autonomous_scheduler,
+                "enable_worker_isolation": active_config.enable_worker_isolation,
+                "enable_task_capsules": active_config.enable_task_capsules,
+                "enable_auto_consolidation": active_config.enable_auto_consolidation,
+                "auto_consolidation_dry_run": active_config.auto_consolidation_dry_run,
+                "enable_channel_delivery": active_config.enable_channel_delivery,
+                "require_api_auth": active_config.require_api_auth,
+            },
+            "limits": {
+                "max_tool_rounds": active_config.max_tool_rounds,
+                "context_budget_chars": active_config.context_budget_chars,
+                "context_pack_token_budget": active_config.context_pack_token_budget,
+                "max_scheduler_tasks": active_config.max_scheduler_tasks,
+                "max_scheduler_cycles": active_config.max_scheduler_cycles,
+                "tool_timeout_seconds": active_config.tool_timeout_seconds,
+            },
+            "paths": {
+                "workspace": str(active_config.workspace),
+                "memory_dir": str(active_config.memory_dir),
+                "state_path": str(active_config.state_path),
+                "log_dir": str(active_config.log_dir),
+                "skills_dir": str(active_config.skills_dir),
+                "plugins_dir": str(active_config.plugins_dir),
+                "mcp_config_path": str(active_config.mcp_config_path),
+                "channel_config_path": str(active_config.channel_config_path),
+                "worker_worktree_dir": str(active_config.worker_worktree_dir),
+            },
+            "validation_commands": [
+                "python -m compileall -q src tests scripts",
+                "python -m pytest -q",
+                "python scripts/run_golden_evals.py --backend memory --provider mock",
+                'PYTHONPATH=src python -m nested_memvid_agent.cli chat --backend memory --provider mock --message "hello"',
+                "npm run test --prefix web",
+                "npm run build --prefix web",
+            ],
+        }
+
     @app.get("/api/channels")  # type: ignore[untyped-decorator]
     def list_channels() -> list[dict[str, object]]:
-        return channels.list_channels()
+        return [channel_public(channel) for channel in channels.list_channels()]
+
+    @app.get("/api/channels/{channel_id}")  # type: ignore[untyped-decorator]
+    def get_channel(channel_id: str) -> dict[str, object]:
+        try:
+            return channel_public(channels.get_channel(channel_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/channels")  # type: ignore[untyped-decorator]
+    def upsert_channel(request: ChannelConfigRequest) -> dict[str, object]:
+        return channel_public(channels.upsert_channel(request.model_dump()))
+
+    @app.put("/api/channels/{channel_id}")  # type: ignore[untyped-decorator]
+    def update_channel(channel_id: str, request: ChannelConfigRequest) -> dict[str, object]:
+        payload = request.model_dump()
+        payload["id"] = channel_id
+        return channel_public(channels.upsert_channel(payload))
+
+    @app.delete("/api/channels/{channel_id}")  # type: ignore[untyped-decorator]
+    def delete_channel(channel_id: str) -> dict[str, bool]:
+        try:
+            channels.delete_channel(channel_id)
+            return {"ok": True}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/channels/ingest")  # type: ignore[untyped-decorator]
     def ingest_channel(request: ChannelIngestRequest, http_request: Request) -> dict[str, object]:  # type: ignore[valid-type]
@@ -252,7 +413,9 @@ def create_app(config: AgentConfig | None = None) -> Any:
             message=request.message,
             session_id=request.session_id,
             workspace=Path(request.workspace) if request.workspace else None,
+            provider=request.provider,
             model=request.model,
+            autonomy_mode=request.autonomy_mode,
         )
         return asdict(run)
 
@@ -379,9 +542,22 @@ def create_app(config: AgentConfig | None = None) -> Any:
     def list_mcp_servers() -> list[dict[str, object]]:
         return mcp.list_servers()
 
+    @app.get("/api/mcp/servers/{server_id}")  # type: ignore[untyped-decorator]
+    def get_mcp_server(server_id: str) -> dict[str, object]:
+        try:
+            return state.get_mcp_server(server_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.post("/api/mcp/servers")  # type: ignore[untyped-decorator]
     def add_mcp_server(request: MCPServerRequest) -> dict[str, object]:
         return mcp.add_server(request.model_dump())
+
+    @app.put("/api/mcp/servers/{server_id}")  # type: ignore[untyped-decorator]
+    def update_mcp_server(server_id: str, request: MCPServerRequest) -> dict[str, object]:
+        payload = request.model_dump()
+        payload["id"] = server_id
+        return mcp.add_server(payload)
 
     @app.delete("/api/mcp/servers/{server_id}")  # type: ignore[untyped-decorator]
     def delete_mcp_server(server_id: str) -> dict[str, bool]:
@@ -450,6 +626,14 @@ def create_app(config: AgentConfig | None = None) -> Any:
         plugins.sync_all()
         return plugins.list_plugins()
 
+    @app.get("/api/plugins/{plugin_id}")  # type: ignore[untyped-decorator]
+    def get_plugin(plugin_id: str) -> dict[str, object]:
+        try:
+            plugins.sync_plugin(plugin_id)
+            return plugins.get_plugin(plugin_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.post("/api/plugins/install")  # type: ignore[untyped-decorator]
     def install_plugin(request: PluginInstallRequest) -> dict[str, object]:
         try:
@@ -515,6 +699,13 @@ def create_app(config: AgentConfig | None = None) -> Any:
     @app.get("/api/skills")  # type: ignore[untyped-decorator]
     def list_skills() -> list[dict[str, object]]:
         return skills.list_skills()
+
+    @app.get("/api/skills/{skill_id}")  # type: ignore[untyped-decorator]
+    def get_skill(skill_id: str) -> dict[str, object]:
+        try:
+            return skills.state.get_skill(skill_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/skills/discover")  # type: ignore[untyped-decorator]
     def discover_skills() -> list[dict[str, object]]:
@@ -588,6 +779,36 @@ def create_app(config: AgentConfig | None = None) -> Any:
             return {layer.value: ok for layer, ok in agent.memory.verify_all().items()}
         finally:
             agent.close()
+
+    @app.get("/api/memory/layers")  # type: ignore[untyped-decorator]
+    def memory_layers() -> list[dict[str, object]]:
+        agent = build_agent(active_config, tools=runs.build_registry())
+        try:
+            verify = agent.memory.verify_all()
+            rows: list[dict[str, object]] = []
+            for layer in MemoryLayer:
+                backend = agent.memory.backends[layer]
+                path = Path(str(getattr(backend, "path", "")))
+                rows.append(
+                    {
+                        "layer": layer.value,
+                        "path": str(path),
+                        "exists": path.exists(),
+                        "ok": bool(verify.get(layer, False)),
+                        "backend": type(backend).__name__,
+                    }
+                )
+            return rows
+        finally:
+            agent.close()
+
+    @app.get("/api/memory/inspect")  # type: ignore[untyped-decorator]
+    def inspect_memory_get(query: str | None = None, layers: str | None = None, k: int = 20) -> dict[str, object]:
+        return inspect_memory_payload(query=query, layers=_csv_layers(layers), k=k)
+
+    @app.post("/api/memory/inspect")  # type: ignore[untyped-decorator]
+    def inspect_memory(request: MemoryInspectAPIRequest) -> dict[str, object]:
+        return inspect_memory_payload(query=request.query, layers=request.layers, k=request.k)
 
     @app.post("/api/memory/consolidate")  # type: ignore[untyped-decorator]
     def consolidate_memory(request: MemoryConsolidateRequest) -> dict[str, object]:
@@ -682,6 +903,42 @@ def create_app(config: AgentConfig | None = None) -> Any:
         execution = runs.invoke_tool(tool_name="memory.conflicts", arguments=arguments, session_id="api")
         return _tool_response_payload(execution)
 
+    @app.get("/api/cognition/lessons")  # type: ignore[untyped-decorator]
+    def list_lessons(query: str | None = None, k: int = 20) -> dict[str, object]:
+        payload = inspect_memory_payload(
+            query=query or "LessonCard lesson failure corrected strategy",
+            layers=["procedural", "episodic"],
+            k=k,
+        )
+        return {"items": filter_cognition_items(payload, "lesson_card.v1")}
+
+    @app.get("/api/cognition/failures")  # type: ignore[untyped-decorator]
+    def list_failures(query: str | None = None, k: int = 20) -> dict[str, object]:
+        payload = inspect_memory_payload(
+            query=query or "FailureEpisode failure diagnosis tool failed",
+            layers=["episodic"],
+            k=k,
+        )
+        return {"items": filter_cognition_items(payload, "failure_episode.v1")}
+
+    @app.post("/api/diagnosis/classify")  # type: ignore[untyped-decorator]
+    def classify_diagnosis(request: DiagnosisRequest) -> dict[str, object]:
+        execution = runs.invoke_tool(
+            tool_name="diagnosis.classify",
+            arguments={"failure_text": request.failure_text, "source": request.source or "api"},
+            session_id="api",
+        )
+        return _tool_response_payload(execution)
+
+    @app.post("/api/diagnosis/recall")  # type: ignore[untyped-decorator]
+    def recall_diagnosis(request: DiagnosisRequest) -> dict[str, object]:
+        execution = runs.invoke_tool(
+            tool_name="diagnosis.recall",
+            arguments={"failure_text": request.failure_text, "source": request.source or "api", "k": request.k},
+            session_id="api",
+        )
+        return _tool_response_payload(execution)
+
     web_dist = Path(__file__).resolve().parents[2] / "web" / "dist"
     if web_dist.exists():
         assets = web_dist / "assets"
@@ -713,8 +970,14 @@ def _bounded_limit(value: int, *, default: int, maximum: int) -> int:
 
 
 def _tool_response_payload(execution: Any) -> dict[str, object]:
-    if execution.content.startswith("{"):
+    stripped = str(execution.content).lstrip()
+    if stripped.startswith("{") or stripped.startswith("["):
         payload = json.loads(execution.content)
         if isinstance(payload, dict):
             return dict(payload)
+        if isinstance(payload, list):
+            return {"success": execution.success, "items": payload, "error": execution.error}
+    data = getattr(execution, "data", None)
+    if isinstance(data, dict) and data:
+        return {"success": execution.success, **data, "content": execution.content, "error": execution.error}
     return {"success": execution.success, "content": execution.content, "error": execution.error}
