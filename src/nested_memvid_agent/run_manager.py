@@ -236,6 +236,8 @@ class RunManager:
                 approval_handler=self._approval_handler,
                 stream_handler=self._stream_handler(run_id),
             )
+            if self._is_cancelled(run_id):
+                return
             self._publish_turn_observability(run_id, result)
             for execution in result.tool_executions:
                 self.events.publish(run_id, "tool.executed", _execution_payload(execution))
@@ -257,6 +259,8 @@ class RunManager:
                 self._complete_capsule(run_id, config, agent, result)
             self.events.publish(run_id, "run.blocked" if status == "blocked" else "run.completed", _turn_payload(result))
         except Exception as exc:  # noqa: BLE001
+            if self._is_cancelled(run_id):
+                return
             self.state.update_run(run_id, status="failed", error=f"{type(exc).__name__}: {exc}", stop_reason="error")
             self.events.publish(run_id, "run.failed", {"error": f"{type(exc).__name__}: {exc}"})
         finally:
@@ -264,6 +268,8 @@ class RunManager:
 
     def _resume_after_approval(self, approval: dict[str, Any], arguments: dict[str, Any]) -> None:
         run_id = str(approval["run_id"])
+        if self._is_cancelled(run_id):
+            return
         run = self.state.get_run(run_id)
         config = replace(self.config, workspace=Path(run.workspace), model=run.model)
         self.state.update_run(run_id, status="running", stop_reason="resuming_after_approval")
@@ -279,6 +285,8 @@ class RunManager:
     ) -> None:
         agent = self._build_agent(config)
         try:
+            if self._is_cancelled(run_id):
+                return
             call = ToolCall(name=str(approval["tool_name"]), arguments=arguments, id=str(approval["tool_call_id"]))
             execution = agent.tools.execute(
                 call,
@@ -290,6 +298,7 @@ class RunManager:
                     session_id=session_id,
                     run_id=run_id,
                     approved_tool_call_ids=frozenset({call.id}),
+                    approved_tool_call_arguments={call.id: arguments},
                 ),
             )
             self.state.decide_approval(
@@ -312,6 +321,8 @@ class RunManager:
                 approval_handler=self._approval_handler,
                 stream_handler=self._stream_handler(run_id),
             )
+            if self._is_cancelled(run_id):
+                return
             self._publish_turn_observability(run_id, result)
             status = "blocked" if result.stop_reason == "approval_required" else "completed"
             self.state.update_run(
@@ -326,6 +337,8 @@ class RunManager:
                 self._complete_capsule(run_id, config, agent, result)
             self.events.publish(run_id, "run.blocked" if status == "blocked" else "run.completed", _turn_payload(result))
         except Exception as exc:  # noqa: BLE001
+            if self._is_cancelled(run_id):
+                return
             self.state.update_run(run_id, status="failed", error=f"{type(exc).__name__}: {exc}", stop_reason="error")
             self.events.publish(run_id, "run.failed", {"error": f"{type(exc).__name__}: {exc}"})
         finally:

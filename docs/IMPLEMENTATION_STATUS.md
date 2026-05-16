@@ -14,7 +14,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - OpenAI Responses provider adapter using the portable JSON tool envelope.
 - OpenAI-compatible chat completions provider for local/model-server endpoints.
 - Codex CLI provider that can use local `codex exec` as the normal response engine.
-- Built-in tool registry with approval gates for shell, file writes, patch application, tests, and Codex CLI delegation.
+- Built-in tool registry with structured exception boundaries and exact-call approval gates for shell, file writes, patch application, tests, and Codex CLI delegation.
 - Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry, and memory search.
 - Multi-channel ingress for Telegram Bot API updates, Discord message/interaction-shaped payloads, and generic/custom webhooks, with CLI and API routes.
 - SQLite state store for runs, run steps, approvals, MCP servers, skills, task nodes, and subagent runs, now initialized through schema version `3`.
@@ -48,7 +48,8 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 
 ## Current Contract
 
-- High-risk tools must remain blocked unless the matching allow flag is set or a human approval handler approves the exact tool call.
+- High-risk tools require both capability enablement (matching allow flag, where applicable) and explicit approval for the exact tool-call ID and arguments before execution.
+- Cancelled runs must not transition to completed, blocked, or failed after cancellation.
 - Ordinary conversation and observations must not write policy memory directly.
 - The Memvid backend must use `.mv2` files and preserve one file per memory layer.
 - `complete.mv2` is a run artifact under `.nest/runs/{run_id}/`, not a permanent memory layer.
