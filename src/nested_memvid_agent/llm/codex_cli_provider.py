@@ -79,7 +79,7 @@ class CodexCLIProvider(LLMProvider):
             if completed.returncode != 0:
                 detail = completed.stderr.strip() or completed.stdout.strip() or f"exit_code={completed.returncode}"
                 raise ProviderError(detail, code="codex_cli_nonzero_exit", retryable=True)
-            return parse_agent_response(output_text)
+            return parse_agent_response(output_text, tools=tools, strict=True)
 
     def _command(self, output_path: Path) -> list[str]:
         command = [

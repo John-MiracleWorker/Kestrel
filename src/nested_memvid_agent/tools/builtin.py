@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from ..cognition import RetryPolicy
 from ..consolidation import Consolidator
 from ..context_frames import default_frame_type_for_memory, estimate_tokens, from_memory_record
 from ..context_packer import ContextPacker, ContextPackRequest
@@ -15,7 +16,7 @@ from ..diagnosis import classify_failure
 from ..models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from ..nested_learning import LearningSignal, NestedLearningKernel
 from ..plugin_manager import PluginManager
-from ..runtime_models import ToolCall, ToolExecution, ToolSpec
+from ..runtime_models import StrategyProposal, ToolCall, ToolExecution, ToolSpec
 from ..skill_manager import validate_skill_manifest
 from ..state_store import AgentStateStore
 from ..task_capsule import summarize_run_capsule
@@ -1159,8 +1160,8 @@ class RepairOrchestrateValidateTool(AgentTool):
                 "content": validation_content,
             }
             diagnosis = None
-            recall = {"hits": [], "query": "", "retry_guidance": {"must_change_strategy_before_retry": False}}
-            retry_gate = {
+            recall: dict[str, Any] = {"hits": [], "query": "", "retry_guidance": {"must_change_strategy_before_retry": False}}
+            retry_gate: dict[str, Any] = {
                 "retry_allowed": True,
                 "must_change_strategy_before_retry": False,
                 "reason": "Validation passed; no retry needed." if completed.returncode == 0 else "No similar lesson was found; follow the diagnostic playbook.",
@@ -1177,19 +1178,33 @@ class RepairOrchestrateValidateTool(AgentTool):
                 proposed_strategy = str(arguments.get("proposed_strategy", "")).strip()
                 has_lessons = bool(recall["hits"])
                 command_repeated = previous_command == command
-                strategy_changed = bool(proposed_strategy)
                 must_change = has_lessons and command_repeated
-                retry_allowed = not must_change or strategy_changed
+                strategy = (
+                    StrategyProposal(changed_strategy=proposed_strategy)
+                    if proposed_strategy
+                    else None
+                )
+                retry_decision = RetryPolicy().assess_actions(
+                    previous_action=" ".join(previous_command),
+                    new_action=" ".join(command),
+                    strategy=strategy,
+                    require_change=must_change,
+                    similar_lessons=_recall_hit_titles(recall),
+                )
+                retry_allowed = retry_decision.retry_allowed
                 retry_gate = {
                     "retry_allowed": retry_allowed,
                     "must_change_strategy_before_retry": must_change,
-                    "strategy_changed": strategy_changed,
+                    "strategy_changed": bool(
+                        retry_decision.strategy_diff
+                        and retry_decision.strategy_diff.is_meaningfully_different
+                    ),
                     "command_repeated": command_repeated,
-                    "reason": "Similar prior lessons were found; change strategy before repeating the validation command."
-                    if must_change and not strategy_changed
-                    else "Changed strategy supplied; retry may proceed after applying the change."
-                    if must_change
-                    else "No repeated-command lesson gate was triggered.",
+                    "reason": retry_decision.reason,
+                    "required_change": retry_decision.required_change,
+                    "strategy_diff": retry_decision.strategy_diff.to_payload()
+                    if retry_decision.strategy_diff
+                    else None,
                 }
                 next_action = "apply_changed_strategy_then_retry" if retry_allowed and must_change else "change_strategy_before_retry" if not retry_allowed else "retry_with_diagnostic_playbook"
             payload = {
@@ -1999,6 +2014,13 @@ def _recall_failure_lessons(context: ToolContext, category: str, failure_text: s
             else "No prior lesson found; follow the diagnostic playbook and record validated findings.",
         },
     }
+
+
+def _recall_hit_titles(recall: dict[str, Any]) -> tuple[str, ...]:
+    hits = recall.get("hits", [])
+    if not isinstance(hits, list):
+        return ()
+    return tuple(str(hit.get("title", "")) for hit in hits if isinstance(hit, dict))
 
 
 def _safe_branch_name(name: str) -> bool:

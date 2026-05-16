@@ -16,4 +16,12 @@ Tool-call JSON envelope:
   ]
 }
 
+When retrying a failed tool action, include a strategy object:
+{
+  "changed_strategy": "what is concretely different",
+  "why_different": "why this is not the same attempt",
+  "expected_signal": "what result would validate or falsify it",
+  "fallback_if_fails": "what to do instead of repeating again"
+}
+
 After tool results arrive, synthesize a normal answer unless another tool is needed.

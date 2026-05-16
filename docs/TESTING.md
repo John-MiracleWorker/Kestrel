@@ -59,9 +59,19 @@ RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integ
 
 The fixture server is `tests/integration/fixtures/stdio_mcp_server.py`. It proves managed stdio discovery and invocation through `MCPManager`.
 
+## Optional Provider Integration
+
+Live provider coverage is gated by `RUN_PROVIDER_INTEGRATION=1`:
+
+```bash
+RUN_PROVIDER_INTEGRATION=1 python -m pytest -q tests/integration/test_provider_live_integration.py
+```
+
+Each provider case also requires its own credentials or endpoint variables. The harness covers OpenAI, Anthropic, Gemini, OpenAI-compatible endpoints, Ollama, OpenRouter, and Codex CLI, and skips cases whose required environment is missing.
+
 ## Golden Evals
 
-Golden evals are in `scripts/run_golden_evals.py` and cover agent behavior across turns, safety gates, memory use, and consolidation expectations.
+Golden evals are in `scripts/run_golden_evals.py` and cover agent behavior across turns, safety gates, memory use, consolidation expectations, provider/tool-call accuracy, durable plan completion, repair success, approval correctness, honest failure reporting, latency, cost, and repo-regression guardrails. The output includes per-case scores plus scored category summaries.
 
 Fast path:
 

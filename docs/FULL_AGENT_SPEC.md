@@ -63,6 +63,8 @@ Responsibilities:
 
 - create and track background runs
 - persist run steps and timeline events
+- execute background turns through the durable graph runtime nodes: planner, executor, reviewer, recovery, memory promotion, and finalizer
+- persist trace spans for run, plan, LLM request, tool call, memory write, approval wait, review, and eval/recovery work
 - coordinate approvals and approval resume
 - create task graphs and subagent records
 - expose scheduler steps/runs
@@ -76,6 +78,9 @@ Current providers:
 - deterministic mock provider
 - OpenAI Responses provider
 - OpenAI-compatible chat completions provider
+- OpenRouter and Ollama aliases through the OpenAI-compatible provider contract
+- Anthropic Messages provider
+- Gemini provider
 - local Codex CLI provider
 
 Current provider support:
@@ -83,13 +88,13 @@ Current provider support:
 - provider capability metadata
 - retryable fallback wrapper
 - portable JSON tool envelope
-- OpenAI Responses streaming deltas when available
+- strict control-message and native-tool-call validation against the active `ToolSpec` registry
+- OpenAI Responses, OpenAI-compatible, Anthropic, and Gemini streaming deltas when available
+- flag-gated live provider integration harness
 
 Remaining provider hardening:
 
-- native tool-calling parity across providers
-- streaming parity for OpenAI-compatible/local providers
-- broader live integration tests
+- credentialed live integration runs for all non-mock providers
 - richer provider-specific context and JSON-mode handling
 
 ### Tool System
@@ -196,6 +201,7 @@ Optional integrations should pass when dependencies are installed:
 ```bash
 RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
 RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integration.py
+RUN_PROVIDER_INTEGRATION=1 python -m pytest -q tests/integration/test_provider_live_integration.py
 ```
 
-The runtime is production-ready only when the remaining gaps in `docs/IMPLEMENTATION_STATUS.md` are closed, especially provider parity, production auth/isolation, MCP non-stdio transport fixtures, container-grade skill isolation, and isolated worker orchestration.
+The runtime is production-ready only when the remaining gaps in `docs/IMPLEMENTATION_STATUS.md` are closed, especially credentialed provider validation, production auth/isolation, MCP non-stdio transport fixtures, container-grade skill isolation, and Codex-backed isolated worker orchestration.

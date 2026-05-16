@@ -26,10 +26,27 @@ class ChatMessage:
 
 
 @dataclass(frozen=True)
+class StrategyProposal:
+    changed_strategy: str
+    why_different: str = ""
+    expected_signal: str = ""
+    fallback_if_fails: str = ""
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "changed_strategy": self.changed_strategy,
+            "why_different": self.why_different,
+            "expected_signal": self.expected_signal,
+            "fallback_if_fails": self.fallback_if_fails,
+        }
+
+
+@dataclass(frozen=True)
 class ToolCall:
     name: str
     arguments: dict[str, Any]
     id: str = field(default_factory=lambda: f"tool_{uuid4().hex}")
+    strategy: StrategyProposal | None = None
 
 
 @dataclass(frozen=True)
@@ -141,3 +158,4 @@ class AgentTurnResult:
     source: TurnSource | None = None
     run_id: str = ""
     error: dict[str, Any] | None = None
+    proof_of_work: dict[str, Any] | None = None

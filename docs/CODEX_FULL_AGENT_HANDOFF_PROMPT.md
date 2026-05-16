@@ -92,6 +92,12 @@ RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backe
 RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integration.py
 ```
 
+If the phase touches live provider wiring, run the gated provider harness with the relevant credentials/endpoints configured:
+
+```bash
+RUN_PROVIDER_INTEGRATION=1 python -m pytest -q tests/integration/test_provider_live_integration.py
+```
+
 Use `python -m pytest` so subprocess fixtures inherit the active interpreter and installed extras.
 
 ## Current Working Surface
@@ -101,14 +107,16 @@ Treat these as implemented unless current verification proves otherwise:
 - CLI chat with in-memory and Memvid backends.
 - Deterministic mock provider.
 - OpenAI Responses provider.
-- OpenAI-compatible local provider.
+- OpenAI-compatible local provider, plus OpenRouter/Ollama aliases through the same contract.
+- Anthropic Messages and Gemini provider adapters with strict tool-use/function-call normalization and stream support.
 - Codex CLI response provider.
 - Provider fallback on retryable failures.
+- Durable graph runtime above the chat loop: `PlannerNode`, `ExecutorNode`, `ReviewerNode`, `RecoveryNode`, `MemoryPromotionNode`, and `FinalizerNode`.
 - MV2 context frames and token-aware pseudo-context packing.
 - Task capsules and conservative learning-signal extraction.
 - `memory.learn`, `memory.consolidate`, and promotion gate metadata.
 - Exact-call approval gates for high-risk tools.
-- SQLite state schema version 7.
+- SQLite state schema version 8, including durable trace spans.
 - Replay-safe terminal run and approval decisions.
 - Managed stdio MCP sessions.
 - Skills with manifest validation, provenance hashes, and local runtimes.
@@ -122,15 +130,14 @@ Treat these as implemented unless current verification proves otherwise:
 
 The next useful hardening work should usually target one of these:
 
-- Native provider tool-calling parity beyond the portable JSON envelope.
-- Streaming parity for OpenAI-compatible/local providers.
+- Credentialed live provider integration runs in CI/local release validation.
 - Production-grade auth, user/session isolation, and deployment boundaries.
 - MCP SSE/streamable HTTP fixtures and failure-recovery soak tests.
 - Container-grade skill isolation and package dependency management.
 - Plugin install allow-flag enforcement, approval UX, dependency isolation, and security review.
 - Stronger consolidation validation loops and review UI.
-- Dynamic planner/executor/reviewer orchestration across isolated workers.
-- Codex-backed worker fan-out with branch/worktree isolation.
+- Fully dynamic planner/executor/reviewer plan rewriting across worker branches.
+- Codex-backed worker fan-out with merge/review handling for isolated worker branches.
 - Production bot identity verification and channel-specific rate-limit handling.
 - Fully autonomous self-improvement with diff review, tests, rollback, and explicit human approval.
 

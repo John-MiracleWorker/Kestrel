@@ -12,6 +12,7 @@ from .app_factory import build_agent
 from .config import AgentConfig
 from .diagnosis import classify_failure
 from .event_bus import RunEventBus
+from .graph_runtime import DurableOrchestrationRuntime, GraphRuntimeServices
 from .mcp_manager import MCPManager
 from .models import MemoryLayer
 from .nested_learning import NestedLearningKernel
@@ -23,6 +24,8 @@ from .task_capsule import summarize_run_capsule, write_turn_capsule
 from .tools.base import ToolContext
 from .tools.builtin import build_default_tools
 from .tools.registry import ToolRegistry
+from .tracing import SpanRecorder
+from .worker_isolation import prepare_git_worktree
 
 
 class RunManager:
@@ -121,21 +124,26 @@ class RunManager:
             "provider": [],
             "approval": [],
             "error": [],
+            "span": [],
             "lifecycle": [],
         }
         for event in timeline:
             traces[_trace_category(event)].append(event)
+        spans = [asdict(span) for span in self.state.list_trace_spans(run_id)]
         first = timeline[0]["created_at"] if timeline else None
         last = timeline[-1]["created_at"] if timeline else None
         return {
             "run": run,
             "summary": {
                 "event_count": len(timeline),
+                "span_count": len(spans),
                 "first_event_at": first,
                 "last_event_at": last,
                 "trace_counts": {name: len(events) for name, events in traces.items()},
+                "span_counts": _span_counts(spans),
             },
             "timeline": timeline,
+            "spans": spans,
             "traces": traces,
         }
 
@@ -178,20 +186,41 @@ class RunManager:
         agent = build_agent(self.config, tools=registry)
         try:
             call = ToolCall(name=tool_name, arguments=arguments)
+            spans = SpanRecorder(state=self.state, events=self.events)
             if run_id:
                 self.events.publish(run_id, "tool.started", {"tool": tool_name, "tool_call_id": call.id})
-            execution = registry.execute(
-                call,
-                ToolContext(
-                    memory=agent.memory,
-                    config=agent.config,
-                    workspace=agent.config.workspace,
-                    event_log=agent.event_log,
-                    session_id=session_id,
+            if run_id:
+                with spans.start(
                     run_id=run_id,
-                    approval_handler=self._approval_handler if run_id else None,
-                ),
-            )
+                    span_type="tool.call",
+                    name=tool_name,
+                    metadata={"tool_call_id": call.id, "manual": True},
+                ):
+                    execution = registry.execute(
+                        call,
+                        ToolContext(
+                            memory=agent.memory,
+                            config=agent.config,
+                            workspace=agent.config.workspace,
+                            event_log=agent.event_log,
+                            session_id=session_id,
+                            run_id=run_id,
+                            approval_handler=self._approval_handler if run_id else None,
+                        ),
+                    )
+            else:
+                execution = registry.execute(
+                    call,
+                    ToolContext(
+                        memory=agent.memory,
+                        config=agent.config,
+                        workspace=agent.config.workspace,
+                        event_log=agent.event_log,
+                        session_id=session_id,
+                        run_id=run_id,
+                        approval_handler=self._approval_handler if run_id else None,
+                    ),
+                )
             if run_id:
                 self.events.publish(run_id, "tool.executed", _execution_payload(execution))
                 self.events.publish(
@@ -386,35 +415,32 @@ class RunManager:
     def _run_agent_turn(self, run_id: str, config: AgentConfig, message: str, session_id: str) -> None:
         if self._is_cancelled(run_id):
             return
-        self.state.transition_run(run_id, "running")
-        self.events.publish(run_id, "run.started", {"session_id": session_id})
-        agent = self._build_agent(config)
+        run = self.state.get_run(run_id)
+        services = GraphRuntimeServices(
+            state=self.state,
+            events=self.events,
+            spans=SpanRecorder(state=self.state, events=self.events),
+            build_agent=self._build_agent,
+            approval_handler=self._approval_handler,
+            stream_handler_factory=self._stream_handler,
+            publish_turn_observability=self._publish_turn_observability,
+            publish_tool_executions=self._publish_tool_execution_events,
+            complete_capsule=self._complete_capsule,
+            run_scheduler_until_idle=lambda active_run_id, max_tasks, max_cycles: self.run_scheduler_until_idle(
+                active_run_id,
+                max_tasks=max_tasks,
+                max_cycles=max_cycles,
+            ),
+            scheduler_outcome=_scheduler_run_outcome,
+            is_cancelled=self._is_cancelled,
+        )
         try:
-            result = agent.chat(
-                message,
-                session_id=session_id,
-                run_id=run_id,
-                approval_handler=self._approval_handler,
-                stream_handler=self._stream_handler(run_id),
-            )
-            if self._is_cancelled(run_id):
-                return
-            self._publish_turn_observability(run_id, result)
-            for execution in result.tool_executions:
-                self.events.publish(run_id, "tool.executed", _execution_payload(execution))
-                self.events.publish(
-                    run_id,
-                    "tool.completed" if execution.success else "tool.failed",
-                    _execution_payload(execution),
-                )
-            self._finish_agent_turn(run_id, config, agent, result)
+            DurableOrchestrationRuntime(services).run_chat_turn(run=run, config=config, message=message)
         except Exception as exc:  # noqa: BLE001
             if self._is_cancelled(run_id):
                 return
             self.state.transition_run(run_id, "failed", error=f"{type(exc).__name__}: {exc}", stop_reason="error")
             self.events.publish(run_id, "run.failed", {"error": f"{type(exc).__name__}: {exc}"})
-        finally:
-            agent.close()
 
     def _resume_after_approval(self, approval: dict[str, Any], arguments: dict[str, Any]) -> None:
         run_id = str(approval["run_id"])
@@ -526,8 +552,11 @@ class RunManager:
         if subagent.task_id:
             self.state.update_task_node(subagent.task_id, status="running")
         self.events.publish(run_id, "subagent.started", asdict(running))
-        agent = self._build_agent(config)
+        worker_isolation: dict[str, str] | None = None
+        agent: NestedMV2Agent | None = None
         try:
+            config, worker_isolation = self._worker_config(config, run_id=run_id, worker_id=subagent_id)
+            agent = self._build_agent(config)
             prompt = _subagent_prompt(subagent.profile, subagent.goal)
             result = agent.chat(
                 prompt,
@@ -542,7 +571,11 @@ class RunManager:
                 self.state.update_task_node(
                     subagent.task_id,
                     status="completed",
-                    result={"assistant_message": result.assistant_message, "stop_reason": result.stop_reason},
+                    result={
+                        "assistant_message": result.assistant_message,
+                        "stop_reason": result.stop_reason,
+                        "worker_isolation": worker_isolation,
+                    },
                 )
             self.events.publish(run_id, "subagent.completed", asdict(updated))
         except Exception as exc:  # noqa: BLE001
@@ -567,10 +600,11 @@ class RunManager:
                     run_id,
                     "diagnosis.classified",
                     {"task_id": subagent.task_id, "source": "subagent", **diagnosis_payload},
-                )
+            )
             self.events.publish(run_id, "subagent.failed", asdict(updated))
         finally:
-            agent.close()
+            if agent is not None:
+                agent.close()
 
     def _execute_ready_task(self, run: RunRecord, task: TaskNodeRecord) -> dict[str, Any]:
         running = self.state.update_task_node(task.task_id, status="running")
@@ -585,8 +619,11 @@ class RunManager:
         self.events.publish(run.run_id, "task.started", _task_payload(running))
         self.events.publish(run.run_id, "subagent.started", asdict(subagent))
         config = replace(self.config, workspace=Path(run.workspace), model=run.model)
-        agent = self._build_agent(config)
+        worker_isolation: dict[str, str] | None = None
+        agent: NestedMV2Agent | None = None
         try:
+            config, worker_isolation = self._worker_config(config, run_id=run.run_id, worker_id=subagent.subagent_id)
+            agent = self._build_agent(config)
             result = agent.chat(
                 _task_execution_prompt(task),
                 session_id=run.session_id,
@@ -602,6 +639,7 @@ class RunManager:
                 "context_chars": result.context_chars,
                 "tool_count": len(result.tool_executions),
                 "memory_writes": list(result.memory_writes),
+                "worker_isolation": worker_isolation,
             }
             updated_task = self.state.update_task_node(task.task_id, status=status, result=task_result)
             updated_subagent = self.state.update_subagent_run(
@@ -623,7 +661,13 @@ class RunManager:
                 "subagent.blocked" if status == "blocked" else "subagent.completed",
                 asdict(updated_subagent),
             )
-            return {"task_id": task.task_id, "subagent_id": subagent.subagent_id, "status": status, "result": task_result}
+            return {
+                "task_id": task.task_id,
+                "subagent_id": subagent.subagent_id,
+                "status": status,
+                "result": task_result,
+                "worker_isolation": worker_isolation,
+            }
         except Exception as exc:  # noqa: BLE001
             error_text = f"{type(exc).__name__}: {exc}"
             diagnosis = classify_failure(error_text, source="scheduler").to_payload()
@@ -644,7 +688,33 @@ class RunManager:
             self.events.publish(run.run_id, "diagnosis.classified", {"task_id": task.task_id, "source": "scheduler", **diagnosis})
             return {"task_id": task.task_id, "subagent_id": subagent.subagent_id, "status": "failed", "error": error_text}
         finally:
-            agent.close()
+            if agent is not None:
+                agent.close()
+
+    def _worker_config(
+        self,
+        config: AgentConfig,
+        *,
+        run_id: str,
+        worker_id: str,
+    ) -> tuple[AgentConfig, dict[str, str] | None]:
+        if not config.enable_worker_isolation:
+            return config, None
+        run = self.state.get_run(run_id)
+        run_workspace = Path(run.workspace)
+        worktree_root = config.worker_worktree_dir
+        if not worktree_root.is_absolute():
+            worktree_root = run_workspace / worktree_root
+        isolation = prepare_git_worktree(
+            workspace=run_workspace,
+            worktree_root=worktree_root,
+            branch_prefix=config.worker_branch_prefix,
+            run_id=run_id,
+            worker_id=worker_id,
+        )
+        payload = isolation.to_payload()
+        self.events.publish(run_id, "worker.isolated", payload)
+        return replace(config, workspace=isolation.workspace), payload
 
     def _maybe_complete_root_task(self, run_id: str) -> None:
         tasks = self.state.list_task_nodes(run_id)
@@ -776,6 +846,22 @@ class RunManager:
         if result.error:
             self.events.publish(run_id, "runtime.error", result.error)
 
+    def _publish_tool_execution_events(self, run_id: str, executions: tuple[ToolExecution, ...]) -> None:
+        spans = SpanRecorder(state=self.state, events=self.events)
+        for execution in executions:
+            with spans.start(
+                run_id=run_id,
+                span_type="tool.call",
+                name=execution.call.name,
+                metadata={"tool_call_id": execution.call.id},
+            ):
+                self.events.publish(run_id, "tool.executed", _execution_payload(execution))
+                self.events.publish(
+                    run_id,
+                    "tool.completed" if execution.success else "tool.failed",
+                    _execution_payload(execution),
+                )
+
     def _start_thread(self, run_id: str, target: Any, *args: Any) -> None:
         thread = Thread(target=target, args=(run_id, *args), daemon=True)
         with self._lock:
@@ -808,6 +894,7 @@ def _turn_payload(result: AgentTurnResult) -> dict[str, Any]:
         "context_chars": result.context_chars,
         "memory_writes": list(result.memory_writes),
         "stop_reason": result.stop_reason,
+        "proof_of_work": result.proof_of_work,
     }
 
 
@@ -1003,6 +1090,8 @@ def _looks_like_repair_commit_request(message: str) -> bool:
 def _trace_category(event: dict[str, Any]) -> str:
     event_type = str(event.get("type", ""))
     payload = event.get("payload", {})
+    if event_type.startswith("span."):
+        return "span"
     if event_type.startswith("tool.") or event_type == "assistant.tool_call":
         return "tool"
     if event_type.startswith("memory.") or _payload_has_key(payload, "memory_writes"):
@@ -1026,6 +1115,14 @@ def _payload_has_key(value: Any, key: str) -> bool:
     if isinstance(value, list | tuple):
         return any(_payload_has_key(item, key) for item in value)
     return False
+
+
+def _span_counts(spans: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for span in spans:
+        span_type = str(span.get("span_type", "unknown"))
+        counts[span_type] = counts.get(span_type, 0) + 1
+    return counts
 
 
 def _capsule_decisions(

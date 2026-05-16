@@ -6,7 +6,9 @@ from pathlib import Path
 import pytest
 
 from nested_memvid_agent.backends.memvid_backend import MemvidBackend
+from nested_memvid_agent.cognition import FailureEpisode, LessonCard
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
+from nested_memvid_agent.runtime_models import StrategyProposal, ToolCall, ToolExecution
 
 pytestmark = pytest.mark.skipif(
     os.getenv("RUN_MEMVID_INTEGRATION") != "1",
@@ -39,3 +41,68 @@ def test_memvid_backend_write_seal_verify_reopen_search(tmp_path: Path) -> None:
         assert any("Integration fact" in hit.record.title for hit in hits)
     finally:
         reopened.close()
+
+
+def test_memvid_backend_persists_cognition_failure_and_lesson_records(tmp_path: Path) -> None:
+    failure_execution = ToolExecution(
+        call=ToolCall(name="test.run", arguments={"command": ["pytest", "-q"]}, id="failed_validation"),
+        success=False,
+        content="AssertionError: expected fixed",
+        error="test_failed",
+    )
+    failure = FailureEpisode.from_tool_failure(
+        run_id="run_cognition",
+        execution=failure_execution,
+        category="test_failure",
+        diagnosis="Test failure playbook",
+        attempted_strategy="Run the whole suite.",
+    )
+    validation = ToolExecution(
+        call=ToolCall(name="test.run", arguments={"command": ["pytest", "tests/test_one.py", "-q"]}, id="focused_validation"),
+        success=True,
+        content="1 passed",
+    )
+    lesson = LessonCard.from_resolution(
+        failure=failure,
+        validation=validation,
+        strategy=StrategyProposal(
+            changed_strategy="Run the focused failing test before expanding validation.",
+            why_different="The retry target is narrower.",
+            expected_signal="Focused test passes.",
+            fallback_if_fails="Inspect the assertion.",
+        ),
+    )
+
+    episodic = MemvidBackend(path=tmp_path / "episodic.mv2", layer=MemoryLayer.EPISODIC)
+    procedural = MemvidBackend(path=tmp_path / "procedural.mv2", layer=MemoryLayer.PROCEDURAL)
+    episodic.open()
+    procedural.open()
+    try:
+        episodic.put(failure.to_memory_record())
+        procedural.put(lesson.to_memory_record())
+        episodic.seal()
+        procedural.seal()
+        assert episodic.verify()
+        assert procedural.verify()
+    finally:
+        episodic.close()
+        procedural.close()
+
+    reopened_episodic = MemvidBackend(path=tmp_path / "episodic.mv2", layer=MemoryLayer.EPISODIC)
+    reopened_procedural = MemvidBackend(path=tmp_path / "procedural.mv2", layer=MemoryLayer.PROCEDURAL)
+    reopened_episodic.open()
+    reopened_procedural.open()
+    try:
+        failure_hits = reopened_episodic.find("FailureEpisode test_failure", k=5)
+        lesson_hits = reopened_procedural.find("LessonCard test_failure focused", k=5)
+        assert any("FailureEpisode" in hit.record.title for hit in failure_hits), [
+            (hit.record.title, hit.record.content[:160], hit.record.metadata)
+            for hit in failure_hits
+        ]
+        assert any("LessonCard" in hit.record.title for hit in lesson_hits), [
+            (hit.record.title, hit.record.content[:160], hit.record.metadata)
+            for hit in lesson_hits
+        ]
+    finally:
+        reopened_episodic.close()
+        reopened_procedural.close()

@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 _TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 
 
@@ -71,6 +71,21 @@ class SubagentRunRecord:
     error: str | None = None
     created_at: str = ""
     updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class TraceSpanRecord:
+    span_id: str
+    run_id: str
+    span_type: str
+    name: str
+    status: str
+    parent_span_id: str | None = None
+    metadata: dict[str, Any] | None = None
+    output: dict[str, Any] | None = None
+    error: str | None = None
+    started_at: str = ""
+    ended_at: str | None = None
 
 
 class AgentStateStore:
@@ -678,6 +693,67 @@ class AgentStateStore:
             ).fetchall()
         return [_subagent_from_row(row) for row in rows]
 
+    def create_trace_span(
+        self,
+        *,
+        span_id: str,
+        run_id: str,
+        span_type: str,
+        name: str,
+        parent_span_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> TraceSpanRecord:
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO trace_spans (
+                    span_id, run_id, parent_span_id, span_type, name, status,
+                    metadata_json, output_json, error, started_at, ended_at
+                ) VALUES (?, ?, ?, ?, ?, 'running', ?, NULL, NULL, ?, NULL)
+                """,
+                (span_id, run_id, parent_span_id, span_type, name, json.dumps(metadata or {}), now),
+            )
+        return self.get_trace_span(span_id)
+
+    def finish_trace_span(
+        self,
+        span_id: str,
+        *,
+        status: str,
+        output: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> TraceSpanRecord:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE trace_spans
+                SET status = ?, output_json = ?, error = ?, ended_at = ?
+                WHERE span_id = ?
+                """,
+                (status, json.dumps(output or {}), error, utc_now(), span_id),
+            )
+        return self.get_trace_span(span_id)
+
+    def get_trace_span(self, span_id: str) -> TraceSpanRecord:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM trace_spans WHERE span_id = ?", (span_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown trace span: {span_id}")
+        return _trace_span_from_row(row)
+
+    def list_trace_spans(self, run_id: str) -> list[TraceSpanRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM trace_spans
+                WHERE run_id = ?
+                ORDER BY started_at ASC, span_id ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        return [_trace_span_from_row(row) for row in rows]
+
     def schema_version(self) -> int:
         with self._connect() as conn:
             row = conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
@@ -717,6 +793,9 @@ class AgentStateStore:
             if current < 7:
                 _apply_schema_v7(conn)
                 current = 7
+            if current < 8:
+                _apply_schema_v8(conn)
+                current = 8
             if current < SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported schema migration target: {current} -> {SCHEMA_VERSION}")
             if current == SCHEMA_VERSION:
@@ -940,6 +1019,30 @@ def _apply_schema_v7(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_schema_v8(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS trace_spans (
+            span_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            parent_span_id TEXT,
+            span_type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            output_json TEXT,
+            error TEXT,
+            started_at TEXT NOT NULL,
+            ended_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_trace_spans_run_id ON trace_spans(run_id);
+        CREATE INDEX IF NOT EXISTS idx_trace_spans_type ON trace_spans(span_type);
+        CREATE INDEX IF NOT EXISTS idx_trace_spans_parent ON trace_spans(parent_span_id);
+        """
+    )
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -1090,6 +1193,22 @@ def _subagent_from_row(row: sqlite3.Row) -> SubagentRunRecord:
         error=None if row["error"] is None else str(row["error"]),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
+    )
+
+
+def _trace_span_from_row(row: sqlite3.Row) -> TraceSpanRecord:
+    return TraceSpanRecord(
+        span_id=str(row["span_id"]),
+        run_id=str(row["run_id"]),
+        parent_span_id=None if row["parent_span_id"] is None else str(row["parent_span_id"]),
+        span_type=str(row["span_type"]),
+        name=str(row["name"]),
+        status=str(row["status"]),
+        metadata=json.loads(str(row["metadata_json"])),
+        output=_json_or_none(row["output_json"]),
+        error=None if row["error"] is None else str(row["error"]),
+        started_at=str(row["started_at"]),
+        ended_at=None if row["ended_at"] is None else str(row["ended_at"]),
     )
 
 

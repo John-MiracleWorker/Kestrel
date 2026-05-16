@@ -7,25 +7,35 @@ Last updated: 2026-05-16
 ```text
 1. CLI/API/channel receives a user message.
 2. RunManager creates or resumes a run when using persistent run surfaces.
-3. Agent writes the user observation to working memory.
-4. ContextCompiler delegates to the MV2 context packer.
-5. The packer retrieves memory frames, prefers summaries, deduplicates, flags conflicts, and emits a bounded pseudo-context prompt.
-6. Agent builds messages:
+3. Persistent background runs enter the durable graph runtime: planner, executor, reviewer, recovery, memory-promotion, and finalizer nodes.
+4. The executor node keeps using the existing chat loop.
+5. Agent writes the user observation to working memory.
+6. ContextCompiler delegates to the MV2 context packer.
+7. The packer retrieves memory frames, prefers summaries, deduplicates, flags conflicts, and emits a bounded pseudo-context prompt.
+8. The default-on agentic failure cycle retrieves prior procedural/episodic failure lessons and injects a `Prior Failure Lessons` section when relevant.
+9. Agent builds messages:
    - system prompt
    - compiled nested memory context
+   - prior failure lessons when found
    - available tool specs
    - user message
-7. LLM provider returns either:
+10. LLM provider returns either:
    - final text, or
+   - native provider tool calls, or
    - the portable JSON envelope with tool calls.
-8. ToolRegistry validates schemas, enablement, timeout limits, and approval requirements.
-9. Approved/allowed tools execute and return structured results.
-10. Agent writes tool outputs or failures to working memory.
-11. Agent loops until final answer, approval block, tool-round limit, provider failure, or timeout.
-12. Agent writes turn summary to episodic memory.
-13. Task capsule writer may create `.nest/runs/{run_id}/complete.mv2`.
-14. Changed memory layers are sealed.
-15. Run state and timeline events are persisted.
+11. Provider output is validated against the active `ToolSpec` registry before tool execution.
+12. Before same-action retries, the retry gate requires a meaningful changed strategy.
+13. ToolRegistry validates schemas, enablement, timeout limits, and approval requirements.
+14. Approved/allowed tools execute and return structured results.
+15. Agent writes tool outputs or failures to working memory.
+16. Failed tool attempts are classified, linked to recalled lessons, and written as episodic `FailureEpisode` records.
+17. A successful validation after a diagnosed failure can write a procedural `LessonCard` with evidence.
+18. Agent loops until final answer, approval block, tool-round limit, provider failure, or timeout.
+19. Agent writes turn summary to episodic memory and includes a proof-of-work summary in the turn result.
+20. Reviewer/recovery nodes decide whether the run can finalize, must pause for approval, or should fail with diagnosis.
+21. Task capsule writer may create `.nest/runs/{run_id}/complete.mv2`.
+22. Changed memory layers are sealed.
+23. Run state, timeline events, and trace spans are persisted.
 ```
 
 The mock provider and in-memory backend keep this flow deterministic for tests.
@@ -45,7 +55,7 @@ The FastAPI server exposes the same state through run, event, approval, schedule
 
 ## State Store
 
-`AgentStateStore` is SQLite control-plane storage, currently schema version 7.
+`AgentStateStore` is SQLite control-plane storage, currently schema version 8.
 
 It stores:
 
@@ -56,6 +66,7 @@ It stores:
 - plugin records and enablement metadata
 - task nodes
 - subagent runs
+- trace spans
 
 Terminal run records are replay-safe: completed, failed, and cancelled runs are immutable. Approval records are immutable after they leave `pending`, and approved tool results are recorded back onto the approval record without reopening it.
 
@@ -74,7 +85,31 @@ Kestrel still supports the portable JSON envelope:
 }
 ```
 
-This keeps providers portable while native provider-specific tool calling continues to harden.
+Retries of a failed same-action tool call must include a strategy object:
+
+```json
+{
+  "message": "Retry with a narrower validation target.",
+  "tool_calls": [
+    {
+      "name": "test.run",
+      "arguments": {"command": ["pytest", "tests/test_agent_runtime.py::test_case", "-q"]},
+      "strategy": {
+        "changed_strategy": "Run the focused failing test instead of repeating the full suite.",
+        "why_different": "The command target is narrower and tests the suspected path.",
+        "expected_signal": "Focused pass/fail output.",
+        "fallback_if_fails": "Inspect the assertion and fixture setup before another retry."
+      }
+    }
+  ]
+}
+```
+
+The envelope and native provider tool calls both pass through strict schema validation against the current `ToolSpec` registry before execution.
+
+## Trace Spans
+
+The run timeline remains append-only event history. Trace spans add a durable flight-recorder model over that history. Current span types include `run`, `plan`, `llm.request`, `tool.call`, `memory.write`, `approval.wait`, `review`, and `eval`. `/api/runs/{run_id}/trace` returns both the timeline and persisted spans with counts by span type.
 
 ## Permission and Approval Model
 
@@ -147,7 +182,7 @@ Raw expansion happens through `context.expand` when needed rather than dumping f
 
 ## Scheduler and Subagents
 
-Background runs seed a root task and a small deterministic task DAG. The scheduler can execute approved ready tasks when `enable_autonomous_scheduler` or `NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER` is enabled.
+Background runs seed a root task and a small deterministic task DAG. The graph runtime records planner metadata on the root task, executes the chat loop through the executor node, gates completion through the reviewer node, and records recovery metadata when approvals or failures block progress. The scheduler can execute approved ready tasks when `enable_autonomous_scheduler` or `NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER` is enabled.
 
 Scheduler bounds:
 
@@ -156,7 +191,9 @@ Scheduler bounds:
 
 Ready tasks must be queued or approved, have completed dependencies, and pass retry-strategy gates. Tasks requiring approval remain blocked until explicitly approved.
 
-Subagents are currently in-process planner/worker/reviewer profiles with durable records. True branch/worktree isolation and Codex-backed fan-out remain future hardening.
+Subagents are currently in-process planner/worker/reviewer profiles with durable records. When `enable_worker_isolation` or `NEST_AGENT_ENABLE_WORKER_ISOLATION` is enabled, scheduler/subagent execution prepares a git worktree from the run workspace, creates a worker branch using `worker_branch_prefix`, switches the task agent workspace to that worktree, and records the isolation metadata on the task result.
+
+Worker isolation paths are controlled by `worker_worktree_dir` / `NEST_AGENT_WORKER_WORKTREE_DIR`; relative paths are resolved against the run workspace. Codex-backed fan-out plus automated merge/review handling across worker branches remain future hardening.
 
 ## Plugin Wiring
 

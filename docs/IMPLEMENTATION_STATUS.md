@@ -13,17 +13,20 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Deterministic mock provider for fast tests and reproducible golden evals.
 - OpenAI Responses provider adapter using the portable JSON tool envelope.
 - OpenAI Responses provider now exposes native streaming deltas when the SDK stream surface is available, while preserving the non-streaming fallback path.
-- OpenAI-compatible chat completions provider for local/model-server endpoints.
+- OpenAI-compatible chat completions provider for local/model-server endpoints, with native Chat Completions tool-call normalization and streaming text/tool-call assembly.
+- OpenRouter and Ollama provider aliases route through the OpenAI-compatible contract with provider-specific defaults.
+- Anthropic Messages and Gemini provider adapters now implement the same strict Kestrel response contract with native tool-use/function-call normalization and SDK-stream surface support.
 - Codex CLI provider that can use local `codex exec` as the normal response engine.
 - Provider capability metadata is exposed on built-in providers, and a retryable-error fallback wrapper can route from a primary provider to a configured secondary provider.
 - Built-in tool registry with structured exception boundaries, timeout enforcement, and exact-call approval gates for shell, file writes, patch application, tests, and Codex CLI delegation.
 - Self-diagnosis primitives can classify common provider/tool/test/import/permission/MCP/sandbox failures and recall similar procedural/episodic failure lessons before retry.
+- The default-on agentic failure cycle retrieves prior failure lessons before tool planning, records failed tool attempts as episodic `FailureEpisode` records, blocks unchanged same-action retries until a meaningful changed strategy is supplied, and returns a structured proof-of-work summary on agent turns. It can be disabled with `NEST_AGENT_DISABLE_AGENTIC_CYCLE=1`.
 - Safe self-repair now has branch-isolated repair primitives: `repair.prepare`, `repair.status`, `repair.apply_patch`, `repair.validate`, `repair.orchestrate_validate`, and `repair.rollback`.
 - The first diagnosis-gated repair orchestration slice can run validation on an active repair branch, classify failures, recall prior lessons, and block repeated validation retries until the strategy changes.
 - Skills now have a first manifest validation gate plus persisted validation/provenance metadata for discovered instruction capsules.
 - Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry, and memory search.
 - Multi-channel ingress for Telegram Bot API updates, Discord message/interaction-shaped payloads, and generic/custom webhooks, with CLI and API routes.
-- SQLite state store for runs, run steps, approvals, MCP servers, skills, plugins, task nodes, and subagent runs, now initialized through schema version `7`.
+- SQLite state store for runs, run steps, approvals, MCP servers, skills, plugins, task nodes, subagent runs, and trace spans, now initialized through schema version `8`.
 - Paper-guided nested learning kernel with context-flow metadata, optimizer traces, conservative continuum-memory routing, and a `memory.learn` tool/API path.
 - Memory learning decisions now expose explicit promotion gate metadata so rejected/accepted decisions can explain target layer, observed evidence, repeat-count thresholds, validation thresholds, and explicit-instruction requirements.
 - Run-scoped `complete.mv2` task capsules, preview-only capsule summaries, dry-run consolidation decisions, and approval-gated capsule apply.
@@ -31,10 +34,13 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - MCP server records now persist vetting metadata: transport/network exposure, secret-env requirements, per-tool risk/approval classification, risk reasons, and recommended trust posture.
 - MCP stdio servers now have a managed lazy session lifecycle with connect/disconnect/restart/health API routes, bounded operation timeouts, config-change teardown, and approval-by-default tool risk normalization.
 - First task-graph and subagent run records exist, with durable task metadata, deterministic starter plan decomposition, in-process planner/worker/reviewer profiles, and UI/API surfaces.
+- Background runs now execute through a durable graph wrapper above the chat loop: `PlannerNode`, `ExecutorNode`, `ReviewerNode`, `RecoveryNode`, `MemoryPromotionNode`, and `FinalizerNode`. The wrapper persists plan metadata, pauses for approval waits, records recovery diagnosis, enforces a reviewer gate before final completion, and keeps the existing chat/tool loop as the executor.
 - Task nodes can now persist latest failure diagnosis and retry strategy metadata; failed subagents classify the failure, record a retry gate that requires changed strategy, and emit a diagnosis event tied back to the task.
 - The task graph now exposes deterministic `ready_tasks` for scheduler/resume work: only approved queued/approved tasks with completed dependencies are eligible, and failed retry tasks remain blocked until their retry strategy explicitly allows a changed strategy.
 - An opt-in autonomous scheduler can execute approved ready task nodes through the normal agent loop, drain bounded dependency cycles until idle, publish task/subagent events, and preserve approval blocking for high-risk tool calls.
+- Scheduler and subagent task execution can opt into git worktree isolation, creating durable worker branches under a configured worktree root and recording isolation metadata on task results.
 - Provider failures emit structured `diagnosis.classified` events so traces can explain the failure category and suggested playbook.
+- Run traces now include durable span records for run, plan, `llm.request`, `tool.call`, `memory.write`, `approval.wait`, review, and eval-style recovery work.
 - Repair mutation tools are high-risk, approval-gated, covered by exact-call approvals, disabled unless the matching capability is enabled, and refuse non-repair branches for patch/validate/rollback operations.
 - Diagnosis-gated repair validation must remain approval-gated, refuse non-repair branches, recall similar lessons on failure, and block repeated validation retries when prior lessons exist unless a changed strategy is supplied.
 - Repair commits on repair branches now require a durable `repair.review` artifact tied to a successful validation result and the current diff hash; `git.commit` refuses repair-branch commits when the review is missing, stale, or for a different branch.
@@ -52,22 +58,22 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 
 ## Partially Implemented
 
-- Streaming/provider parity: OpenAI Responses streaming deltas are implemented. OpenAI-compatible/local provider streaming and richer per-provider context/JSON-mode details still need hardening.
+- Streaming/provider parity: OpenAI Responses, OpenAI-compatible, Anthropic, and Gemini streaming surfaces are implemented where the SDK exposes them. OpenRouter/Ollama aliases and Anthropic/Gemini adapters have mocked contract tests, and a flag-gated live provider integration harness exists. Credentialed CI/live runs across all providers and richer per-provider context/JSON-mode details still need hardening.
 - MCP: stdio live sessions are hardened and covered by a flag-gated integration test. SSE and streamable HTTP use the same manager path but still need real transport fixtures and production soak testing.
 - Skills: filesystem discovery, manifest validation, provenance metadata, upload/install, and instruction/Python/shell-list runtimes exist. Container-grade isolation and package dependency management remain incomplete.
 - Plugins: registry, public GitHub fetch, manifest parsing, CLI/API commands, exact-call approval for agent-initiated installs, and skill/MCP materialization exist. Dependency isolation, richer compatibility with executable Hermes hooks, and broader network/security review still need hardening before shared use.
 - Codex CLI: `codex-cli` can drive responses and `codex.exec` is available as a high-risk approval-gated tool. It is not yet a branch-isolated autonomous repair loop.
 - Consolidation: capsule extraction and Nested Learning decisions exist, but auto-consolidation remains disabled by default and validation loops are still basic.
-- Self-diagnosis: first-pass classification and memory recall tools exist. A full executor retry gate that forces changed strategy before every retry is still incomplete.
+- Self-diagnosis: first-pass classification, memory recall tools, and the default chat-loop retry gate exist. Hybrid LLM diagnosis, reviewer-confirmed diagnosis, and cross-run retry-state matching are still next steps.
 - Self-modification: the runtime can record validated self-improvement signals and policy candidates, but code changes and policy writes still require explicit gates.
 - Safe repair: branch preparation, patch application, targeted validation, diagnosis-gated retry assessment, status reporting, and rollback primitives exist. Full autonomous patch proposal, reviewer gating, and approval-before-commit orchestration are still incomplete.
-- Subagents: local subagent runs can be queued, tracked, and executed by scheduler runs until idle. True branch/worktree isolation and Codex-backed worker fan-out are still next steps.
+- Subagents: local subagent runs can be queued, tracked, and executed by scheduler runs until idle. The graph runtime can assign work to task/subagent records, and scheduler/subagent task execution can opt into git worktree isolation. Codex-backed worker fan-out, merge/review handling for worker branches, and fully dynamic DAG rewriting are still next steps.
 - Channels: inbound normalization, dry-run reply payloads, and generic HMAC webhook verification are implemented. Production bot identity verification, Discord Gateway reads, and channel-specific rate-limit handling still need hardening.
 
 ## Not Done Yet
 
-- Broader provider integration tests for OpenRouter/Anthropic/Ollama-style adapters and native streaming for non-OpenAI providers.
-- Planner/executor/reviewer loop that can revise plans dynamically, enforce reviewer gates across repair branches, and coordinate isolated workers instead of only draining the deterministic starter DAG.
+- Credentialed live provider integration runs in CI or local release validation for OpenAI, OpenRouter, Anthropic, Gemini, Ollama/OpenAI-compatible endpoints, and Codex CLI.
+- Fully dynamic plan rewriting with LLM-proposed DAG changes, reviewer gates across real repair branches, and Codex-backed worker fan-out/merge/review across isolated worker branches.
 - Production authorization and user/session isolation for the UI/API beyond the local shared-token gate.
 - Bot-platform-native signature/identity verification and secret rotation workflows for external channel endpoints.
 - Robust MCP SSE/streamable HTTP transport fixtures and failure-recovery soak testing.
@@ -78,11 +84,13 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 ## Current Contract
 
 - High-risk tools require both capability enablement (matching allow flag, where applicable) and explicit approval for the exact tool-call ID and arguments before execution.
+- The agentic failure cycle is default-on through `enable_agentic_cycle`; disable it only for debugging with `NEST_AGENT_DISABLE_AGENTIC_CYCLE=1`.
 - Autonomous scheduling is opt-in and bounded by `max_scheduler_tasks` / `NEST_AGENT_MAX_SCHEDULER_TASKS` per cycle and `max_scheduler_cycles` / `NEST_AGENT_MAX_SCHEDULER_CYCLES` per drain run.
+- Git worktree isolation for scheduler/subagent execution is opt-in through `enable_worker_isolation` / `NEST_AGENT_ENABLE_WORKER_ISOLATION`; isolated worker branches use `worker_branch_prefix` and `worker_worktree_dir`.
 - Cancelled runs must not transition to completed, blocked, or failed after cancellation; lifecycle updates should use the guarded state transition helper.
 - Completed, failed, and cancelled runs are immutable even for repeated same-status transition attempts; approval requests are immutable after leaving `pending`.
 - Tool execution is bounded by `tool_timeout_seconds` / `NEST_AGENT_TOOL_TIMEOUT_SECONDS` and timeout failures are returned as structured tool errors.
-- New background runs persist a root task plus a small starter DAG with dependencies, required tools, risk, acceptance criteria, attempt count, failure reason, diagnosis, and retry-strategy fields.
+- New background runs persist a root task plus a small starter DAG with dependencies, required tools, risk, acceptance criteria, attempt count, failure reason, diagnosis, retry-strategy fields, and graph-runtime plan metadata.
 - Ordinary conversation and observations must not write policy memory directly.
 - The Memvid backend must use `.mv2` files and preserve one file per memory layer.
 - `complete.mv2` is a run artifact under `.nest/runs/{run_id}/`, not a permanent memory layer.
@@ -100,6 +108,7 @@ python -m compileall -q src tests scripts
 python -m pytest -q
 python scripts/run_golden_evals.py --backend memory --provider mock
 PYTHONPATH=src python -m nested_memvid_agent.cli chat --backend memory --provider mock --message "hello"
+RUN_PROVIDER_INTEGRATION=1 python -m pytest -q tests/integration/test_provider_live_integration.py
 RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integration.py
 RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
 npm run test --prefix web

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from ..config import AgentConfig
+from .anthropic_provider import AnthropicMessagesProvider
 from .base import FallbackLLMProvider, LLMProvider
 from .codex_cli_provider import CodexCLIProvider
+from .gemini_provider import GeminiProvider
 from .mock import MockLLMProvider
 from .openai_compatible_provider import OpenAICompatibleProvider
 from .openai_provider import OpenAIResponsesProvider
@@ -46,6 +48,42 @@ def _build_single_provider(
         return OpenAICompatibleProvider(
             model=model,
             base_url=base_url,
+            api_key_env=api_key_env,
+            timeout_seconds=config.timeout_seconds,
+            max_retries=config.max_retries,
+            temperature=config.temperature,
+        )
+    if provider == "openrouter":
+        return OpenAICompatibleProvider(
+            model=model,
+            base_url=base_url or "https://openrouter.ai/api/v1",
+            api_key_env=api_key_env or "OPENROUTER_API_KEY",
+            timeout_seconds=config.timeout_seconds,
+            max_retries=config.max_retries,
+            temperature=config.temperature,
+            provider_name="openrouter",
+        )
+    if provider == "ollama":
+        return OpenAICompatibleProvider(
+            model=model,
+            base_url=base_url or "http://localhost:11434/v1",
+            api_key="ollama",
+            timeout_seconds=config.timeout_seconds,
+            max_retries=config.max_retries,
+            temperature=config.temperature,
+            provider_name="ollama",
+        )
+    if provider == "anthropic":
+        return AnthropicMessagesProvider(
+            model=model,
+            api_key_env=api_key_env,
+            timeout_seconds=config.timeout_seconds,
+            max_retries=config.max_retries,
+            temperature=config.temperature,
+        )
+    if provider == "gemini":
+        return GeminiProvider(
+            model=model,
             api_key_env=api_key_env,
             timeout_seconds=config.timeout_seconds,
             max_retries=config.max_retries,

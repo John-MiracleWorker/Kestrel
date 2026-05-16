@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .cognition import FailureEpisode, LessonManager, ProofOfWorkSummary, RetryPolicy
 from .config import AgentConfig
 from .context_compiler import ContextCompiler, ContextCompilerConfig
 from .context_frames import MV2ContextFrame
@@ -13,6 +15,7 @@ from .diagnosis import classify_failure
 from .event_log import AgentEvent, JsonlEventLog
 from .layers import LayeredMemorySystem
 from .llm.base import LLMProvider, ProviderError
+from .llm.parser import ControlMessageError, validate_llm_response
 from .models import MemoryKind, MemoryLayer
 from .runtime_models import (
     AgentTurnResult,
@@ -80,6 +83,10 @@ class NestedMV2Agent:
         executions: list[ToolExecution] = []
         tool_frame_index = 0
         error: dict[str, Any] | None = None
+        lesson_manager = LessonManager(self.memory) if self.config.enable_agentic_cycle else None
+        retry_policy = RetryPolicy() if self.config.enable_agentic_cycle else None
+        proof = ProofOfWorkSummary(objective=user_message) if self.config.enable_agentic_cycle else None
+        pending_failures: list[FailureEpisode] = []
 
         self._event(
             "turn.start",
@@ -129,20 +136,36 @@ class NestedMV2Agent:
             )
 
         compiled = self.compiler.compile(objective=user_message, query=user_message)
+        preflight_lessons = (
+            lesson_manager.preflight(objective=user_message) if lesson_manager is not None else []
+        )
+        context_prompt = _context_with_preflight_lessons(compiled.prompt, preflight_lessons)
+        if proof is not None:
+            proof.lessons_applied.extend(preflight_lessons)
         self._event(
             "context.compile",
             {
                 "session_id": session,
                 "run_id": active_run_id,
-                "context_chars": compiled.total_chars,
+                "context_chars": len(context_prompt),
                 "hits": len(compiled.hits),
                 "warnings": compiled.warnings,
+                "preflight_lessons": len(preflight_lessons),
             },
         )
+        if preflight_lessons:
+            self._event(
+                "lesson.preflight",
+                {
+                    "session_id": session,
+                    "run_id": active_run_id,
+                    "lessons": preflight_lessons,
+                },
+            )
         tool_block = "\n\n".join(spec.to_prompt_block() for spec in self.tools.specs())
         messages = [
             ChatMessage(role="system", content=self.system_prompt),
-            ChatMessage(role="system", content=f"Compiled nested memory context:\n{compiled.prompt}"),
+            ChatMessage(role="system", content=f"Compiled nested memory context:\n{context_prompt}"),
             ChatMessage(role="system", content=f"Available tools:\n{tool_block}"),
             ChatMessage(role="user", content=user_message),
         ]
@@ -252,11 +275,49 @@ class NestedMV2Agent:
                             "decision": "approved",
                         },
                     )
-                execution = self.tools.execute(call, tool_context)
+                retry_decision = None
+                if retry_policy is not None:
+                    retry_decision = retry_policy.assess_call(
+                        call,
+                        executions,
+                        similar_lessons=tuple(str(item.get("id", "")) for item in preflight_lessons),
+                    )
+                if retry_decision is not None and not retry_decision.retry_allowed:
+                    retry_payload = retry_decision.to_payload()
+                    execution = ToolExecution(
+                        call=call,
+                        success=False,
+                        content=json.dumps({"retry_gate": retry_payload}, indent=2),
+                        data={"retry_gate": retry_payload},
+                        error="retry_blocked",
+                    )
+                    self._event(
+                        "retry.blocked",
+                        {
+                            "session_id": session,
+                            "run_id": active_run_id,
+                            "tool": call.name,
+                            "tool_call_id": call.id,
+                            "retry_gate": retry_payload,
+                        },
+                    )
+                else:
+                    execution = self.tools.execute(call, tool_context)
                 executions.append(execution)
                 tool_frame_index += 1
                 tool_frame_id = f"{turn_frame_id}_tool_{tool_frame_index}"
                 child_frame_ids.append(tool_frame_id)
+                if proof is not None:
+                    proof.tools_used.append(
+                        {
+                            "tool": call.name,
+                            "tool_call_id": call.id,
+                            "success": execution.success,
+                            "error": execution.error,
+                        }
+                    )
+                    if execution.success:
+                        proof.completed_steps.append(f"{call.name} completed")
                 self._event(
                     "tool.execute",
                     {
@@ -309,6 +370,80 @@ class NestedMV2Agent:
                         source=source,
                     )
                 )
+                if lesson_manager is not None and proof is not None:
+                    if execution.success:
+                        if _is_validation_success(execution):
+                            proof.validation_evidence.append(_validation_evidence(execution))
+                            if pending_failures and call.strategy is not None:
+                                for failure in pending_failures:
+                                    lesson, lesson_record_id = lesson_manager.write_lesson_from_resolution(
+                                        failure=failure,
+                                        validation=execution,
+                                        strategy=call.strategy,
+                                    )
+                                    memory_writes.append(lesson_record_id)
+                                    proof.lessons_created.append(lesson.to_payload())
+                                    self._event(
+                                        "lesson.created",
+                                        {
+                                            "session_id": session,
+                                            "run_id": active_run_id,
+                                            "record_id": lesson_record_id,
+                                            "lesson": lesson.to_payload(),
+                                        },
+                                    )
+                                pending_failures.clear()
+                    else:
+                        failure_text = _tool_failure_text(execution)
+                        classification = classify_failure(failure_text, source=f"tool:{call.name}")
+                        diagnosis_payload = classification.to_payload()
+                        recall_hits = lesson_manager.recall_failure(
+                            classification=classification,
+                            failure_text=failure_text,
+                        )
+                        episode, episode_record_id = lesson_manager.record_failure(
+                            run_id=active_run_id,
+                            execution=execution,
+                            classification=classification,
+                            recall_hits=recall_hits,
+                            attempted_strategy=call.strategy.changed_strategy if call.strategy is not None else "",
+                        )
+                        pending_failures.append(episode)
+                        memory_writes.append(episode_record_id)
+                        child_frame_ids.append(episode.failure_id)
+                        proof.failures.append(episode.to_payload())
+                        proof.diagnoses.append(diagnosis_payload)
+                        if execution.error not in {"approval_pending", "approval_required", "tool_disabled"}:
+                            proof.remaining_risks.append(f"{call.name} failed: {classification.category}")
+                        self._event(
+                            "diagnosis.classified",
+                            {
+                                "session_id": session,
+                                "run_id": active_run_id,
+                                "source": f"tool:{call.name}",
+                                "tool_call_id": call.id,
+                                **diagnosis_payload,
+                            },
+                        )
+                        self._event(
+                            "lesson.recall",
+                            {
+                                "session_id": session,
+                                "run_id": active_run_id,
+                                "tool": call.name,
+                                "tool_call_id": call.id,
+                                "hits": recall_hits,
+                            },
+                        )
+                        self._event(
+                            "failure.episode",
+                            {
+                                "session_id": session,
+                                "run_id": active_run_id,
+                                "record_id": episode_record_id,
+                                "failure": episode.to_payload(),
+                            },
+                        )
                 if execution.error in {"approval_pending", "approval_required"}:
                     self._event(
                         "approval.required",
@@ -331,6 +466,10 @@ class NestedMV2Agent:
         if not final_content:
             final_content = "I ran the loop but did not get a final response. Check logs/tool results."
             stop_reason = "empty_response"
+        proof_payload = None
+        if proof is not None:
+            proof.stop_reason = stop_reason
+            proof_payload = proof.to_payload()
 
         memory_writes.append(
             self._write_frame(
@@ -357,6 +496,7 @@ class NestedMV2Agent:
                 "stop_reason": stop_reason,
                 "memory_writes": memory_writes,
                 "tools": len(executions),
+                "proof_of_work": proof_payload,
             },
         )
         return AgentTurnResult(
@@ -364,13 +504,14 @@ class NestedMV2Agent:
             user_message=user_message,
             assistant_message=final_content,
             tool_executions=tuple(executions),
-            context_chars=compiled.total_chars,
+            context_chars=len(context_prompt),
             memory_writes=tuple(memory_writes),
             stop_reason=stop_reason,
-            context_prompt=compiled.prompt,
+            context_prompt=context_prompt,
             source=source,
             run_id=active_run_id,
             error=error,
+            proof_of_work=proof_payload,
         )
 
     def _generate_response(
@@ -386,7 +527,10 @@ class NestedMV2Agent:
             temperature=self.config.temperature,
         )
         if not self.config.stream:
-            return self.llm.generate(messages, tools, options)
+            try:
+                return validate_llm_response(self.llm.generate(messages, tools, options), tools=tools)
+            except ControlMessageError as exc:
+                raise ProviderError(str(exc), code="invalid_control_message", retryable=False) from exc
 
         content_parts: list[str] = []
         tool_calls: list[ToolCall] = []
@@ -419,8 +563,17 @@ class NestedMV2Agent:
             raise
 
         if completed is not None:
-            return completed
-        return LLMResponse(content="".join(content_parts), tool_calls=tuple(tool_calls), raw={"stream_completed": False})
+            try:
+                return validate_llm_response(completed, tools=tools)
+            except ControlMessageError as exc:
+                raise ProviderError(str(exc), code="invalid_control_message", retryable=False) from exc
+        try:
+            return validate_llm_response(
+                LLMResponse(content="".join(content_parts), tool_calls=tuple(tool_calls), raw={"stream_completed": False}),
+                tools=tools,
+            )
+        except ControlMessageError as exc:
+            raise ProviderError(str(exc), code="invalid_control_message", retryable=False) from exc
 
     def close(self) -> None:
         self.memory.close_all()
@@ -513,6 +666,48 @@ def _looks_like_correction(text: str) -> bool:
         return False
     markers = ("correction:", "correcting myself", "actually,", "i meant", "remember:")
     return any(marker in lowered for marker in markers) and "correction" in lowered
+
+
+def _context_with_preflight_lessons(context_prompt: str, lessons: list[dict[str, Any]]) -> str:
+    if not lessons:
+        return context_prompt
+    lines = ["## Prior Failure Lessons"]
+    for lesson in lessons:
+        title = str(lesson.get("title", "Prior lesson"))
+        snippet = str(lesson.get("snippet", "")).strip()
+        layer = str(lesson.get("layer", "memory"))
+        lines.append(f"- [{layer}] {title}: {snippet[:500]}")
+    return f"{context_prompt}\n\n" + "\n".join(lines)
+
+
+def _tool_failure_text(execution: ToolExecution) -> str:
+    parts = []
+    if execution.error:
+        parts.append(str(execution.error))
+    if execution.content:
+        parts.append(execution.content)
+    return "\n".join(parts).strip() or "unknown tool failure"
+
+
+def _is_validation_success(execution: ToolExecution) -> bool:
+    if not execution.success:
+        return False
+    name = execution.call.name.lower()
+    if any(marker in name for marker in ("validate", "validation", "test.run", "lint.run")):
+        return True
+    validation = execution.data.get("validation")
+    return isinstance(validation, dict) and validation.get("success") is True
+
+
+def _validation_evidence(execution: ToolExecution) -> str:
+    command = execution.call.arguments.get("command")
+    if isinstance(command, list):
+        command_text = " ".join(str(item) for item in command)
+    elif isinstance(command, str):
+        command_text = command
+    else:
+        command_text = execution.call.name
+    return f"{command_text}: {execution.content[:500]}"
 
 
 def _provider_error_payload(exc: ProviderError) -> dict[str, object]:

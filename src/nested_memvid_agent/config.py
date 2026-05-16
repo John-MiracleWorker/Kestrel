@@ -36,9 +36,13 @@ class AgentConfig:
     allow_codex_cli: bool = False
     allow_plugin_install: bool = False
     require_approval_for_high_risk_tools: bool = True
+    enable_agentic_cycle: bool = True
     enable_autonomous_scheduler: bool = False
     max_scheduler_tasks: int = 3
     max_scheduler_cycles: int = 5
+    enable_worker_isolation: bool = False
+    worker_worktree_dir: Path = Path(".nest/worktrees")
+    worker_branch_prefix: str = "kestrel/worker"
     enable_task_capsules: bool = True
     enable_auto_consolidation: bool = False
     auto_consolidation_dry_run: bool = True
@@ -92,9 +96,13 @@ class AgentConfig:
             allow_policy_writes=_env_bool("NEST_AGENT_ALLOW_POLICY_WRITES"),
             allow_codex_cli=_env_bool("NEST_AGENT_ALLOW_CODEX_CLI"),
             allow_plugin_install=_env_bool("NEST_AGENT_ALLOW_PLUGIN_INSTALL"),
+            enable_agentic_cycle=not _env_bool("NEST_AGENT_DISABLE_AGENTIC_CYCLE"),
             enable_autonomous_scheduler=_env_bool("NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER"),
             max_scheduler_tasks=_env_int("NEST_AGENT_MAX_SCHEDULER_TASKS", 3),
             max_scheduler_cycles=_env_int("NEST_AGENT_MAX_SCHEDULER_CYCLES", 5),
+            enable_worker_isolation=_env_bool("NEST_AGENT_ENABLE_WORKER_ISOLATION"),
+            worker_worktree_dir=Path(os.getenv("NEST_AGENT_WORKER_WORKTREE_DIR", ".nest/worktrees")),
+            worker_branch_prefix=os.getenv("NEST_AGENT_WORKER_BRANCH_PREFIX", "kestrel/worker"),
             enable_task_capsules=not _env_bool("NEST_AGENT_DISABLE_TASK_CAPSULES")
             and _env_bool_default("NEST_AGENT_ENABLE_TASK_CAPSULES", True),
             enable_auto_consolidation=_env_bool("NEST_AGENT_ENABLE_AUTO_CONSOLIDATION"),
@@ -122,6 +130,7 @@ class AgentConfig:
             "plugins_dir",
             "mcp_config_path",
             "channel_config_path",
+            "worker_worktree_dir",
         }
         normalized: dict[str, Any] = {}
         for key, value in raw.items():

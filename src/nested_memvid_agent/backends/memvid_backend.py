@@ -248,9 +248,12 @@ def _metadata_from_embedded_text(text: str) -> dict[str, Any]:
         "source_uri",
         "content_hash",
         "context_flow_id",
+        "cognition_schema",
         "conflict_group_id",
+        "failure_category",
         "run_id",
         "session_id",
+        "validation_status",
     ):
         value = _quoted_value(text, key)
         if value is not None and value != "null":

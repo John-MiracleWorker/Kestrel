@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+import os
+import shutil
+from dataclasses import dataclass
+
+import pytest
+
+from nested_memvid_agent.config import AgentConfig
+from nested_memvid_agent.llm.factory import build_llm_provider
+from nested_memvid_agent.runtime_models import ChatMessage, LLMOptions
+
+pytestmark = pytest.mark.skipif(
+    os.getenv("RUN_PROVIDER_INTEGRATION") != "1",
+    reason="set RUN_PROVIDER_INTEGRATION=1 and provider env vars to run live provider tests",
+)
+
+
+@dataclass(frozen=True)
+class ProviderCase:
+    name: str
+    config: AgentConfig
+    available: bool
+    reason: str
+
+
+def test_live_provider_generate_smoke(provider_case: ProviderCase) -> None:
+    if not provider_case.available:
+        pytest.skip(provider_case.reason)
+    provider = build_llm_provider(provider_case.config)
+
+    response = provider.generate(
+        [ChatMessage(role="user", content="Reply with the word kestrel only.")],
+        tools=[],
+        options=LLMOptions(timeout_seconds=provider_case.config.timeout_seconds, max_retries=0, temperature=0.0),
+    )
+
+    assert response.content.strip() or response.tool_calls
+
+
+def test_live_provider_stream_smoke(provider_case: ProviderCase) -> None:
+    if not provider_case.available:
+        pytest.skip(provider_case.reason)
+    provider = build_llm_provider(provider_case.config)
+    if not provider.capabilities.supports_streaming:
+        pytest.skip(f"{provider_case.name} does not advertise streaming")
+
+    events = list(
+        provider.stream(
+            [ChatMessage(role="user", content="Reply with the word kestrel only.")],
+            tools=[],
+            options=LLMOptions(stream=True, timeout_seconds=provider_case.config.timeout_seconds, max_retries=0, temperature=0.0),
+        )
+    )
+
+    assert events
+    assert events[-1].type in {"message_complete", "provider_error"}
+    assert events[-1].type == "message_complete"
+
+
+def _provider_cases() -> list[ProviderCase]:
+    return [
+        ProviderCase(
+            name="openai",
+            config=AgentConfig(
+                provider="openai",
+                model=os.getenv("KESTREL_IT_OPENAI_MODEL", ""),
+                api_key_env="OPENAI_API_KEY",
+                timeout_seconds=_timeout(),
+            ),
+            available=bool(os.getenv("OPENAI_API_KEY") and os.getenv("KESTREL_IT_OPENAI_MODEL")),
+            reason="set OPENAI_API_KEY and KESTREL_IT_OPENAI_MODEL",
+        ),
+        ProviderCase(
+            name="anthropic",
+            config=AgentConfig(
+                provider="anthropic",
+                model=os.getenv("KESTREL_IT_ANTHROPIC_MODEL", ""),
+                api_key_env="ANTHROPIC_API_KEY",
+                timeout_seconds=_timeout(),
+            ),
+            available=bool(os.getenv("ANTHROPIC_API_KEY") and os.getenv("KESTREL_IT_ANTHROPIC_MODEL")),
+            reason="set ANTHROPIC_API_KEY and KESTREL_IT_ANTHROPIC_MODEL",
+        ),
+        ProviderCase(
+            name="gemini",
+            config=AgentConfig(
+                provider="gemini",
+                model=os.getenv("KESTREL_IT_GEMINI_MODEL", ""),
+                api_key_env="GEMINI_API_KEY",
+                timeout_seconds=_timeout(),
+            ),
+            available=bool(os.getenv("GEMINI_API_KEY") and os.getenv("KESTREL_IT_GEMINI_MODEL")),
+            reason="set GEMINI_API_KEY and KESTREL_IT_GEMINI_MODEL",
+        ),
+        ProviderCase(
+            name="openai-compatible",
+            config=AgentConfig(
+                provider="openai-compatible",
+                model=os.getenv("KESTREL_IT_OPENAI_COMPATIBLE_MODEL", ""),
+                base_url=os.getenv("KESTREL_IT_OPENAI_COMPATIBLE_BASE_URL"),
+                api_key_env=os.getenv("KESTREL_IT_OPENAI_COMPATIBLE_API_KEY_ENV"),
+                timeout_seconds=_timeout(),
+            ),
+            available=bool(
+                os.getenv("KESTREL_IT_OPENAI_COMPATIBLE_MODEL")
+                and os.getenv("KESTREL_IT_OPENAI_COMPATIBLE_BASE_URL")
+            ),
+            reason="set KESTREL_IT_OPENAI_COMPATIBLE_BASE_URL and KESTREL_IT_OPENAI_COMPATIBLE_MODEL",
+        ),
+        ProviderCase(
+            name="ollama",
+            config=AgentConfig(
+                provider="ollama",
+                model=os.getenv("KESTREL_IT_OLLAMA_MODEL", ""),
+                base_url=os.getenv("KESTREL_IT_OLLAMA_BASE_URL"),
+                timeout_seconds=_timeout(),
+            ),
+            available=bool(os.getenv("KESTREL_IT_OLLAMA_MODEL")),
+            reason="set KESTREL_IT_OLLAMA_MODEL and optionally KESTREL_IT_OLLAMA_BASE_URL",
+        ),
+        ProviderCase(
+            name="openrouter",
+            config=AgentConfig(
+                provider="openrouter",
+                model=os.getenv("KESTREL_IT_OPENROUTER_MODEL", ""),
+                api_key_env="OPENROUTER_API_KEY",
+                timeout_seconds=_timeout(),
+            ),
+            available=bool(os.getenv("OPENROUTER_API_KEY") and os.getenv("KESTREL_IT_OPENROUTER_MODEL")),
+            reason="set OPENROUTER_API_KEY and KESTREL_IT_OPENROUTER_MODEL",
+        ),
+        ProviderCase(
+            name="codex-cli",
+            config=AgentConfig(
+                provider="codex-cli",
+                model=os.getenv("KESTREL_IT_CODEX_MODEL", "mock"),
+                timeout_seconds=_timeout(default=120),
+                codex_skip_git_repo_check=True,
+            ),
+            available=os.getenv("KESTREL_IT_CODEX_CLI") == "1" and shutil.which("codex") is not None,
+            reason="set KESTREL_IT_CODEX_CLI=1 and ensure codex is on PATH",
+        ),
+    ]
+
+
+def _timeout(default: int = 30) -> int:
+    raw = os.getenv("KESTREL_IT_PROVIDER_TIMEOUT_SECONDS")
+    return default if raw is None or not raw.strip() else int(raw)
+
+
+@pytest.fixture(params=_provider_cases(), ids=lambda case: case.name)
+def provider_case(request: pytest.FixtureRequest) -> ProviderCase:
+    return request.param

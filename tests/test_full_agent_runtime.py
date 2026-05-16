@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import sqlite3
+import subprocess
 from pathlib import Path
 from time import monotonic, sleep
 from types import SimpleNamespace
@@ -321,7 +323,7 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     state = AgentStateStore(db_path)
 
-    assert state.schema_version() == 7
+    assert state.schema_version() == 8
     with sqlite3.connect(db_path) as conn:
         run_indexes = {row[1] for row in conn.execute("PRAGMA index_list('runs')").fetchall()}
         approval_indexes = {row[1] for row in conn.execute("PRAGMA index_list('approval_requests')").fetchall()}
@@ -329,11 +331,12 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
         mcp_columns = {row[1] for row in conn.execute("PRAGMA table_info('mcp_servers')").fetchall()}
         task_columns = {row[1] for row in conn.execute("PRAGMA table_info('task_nodes')").fetchall()}
+        span_columns = {row[1] for row in conn.execute("PRAGMA table_info('trace_spans')").fetchall()}
 
     assert "idx_runs_status" in run_indexes
     assert "idx_approval_requests_status" in approval_indexes
     assert "idx_run_steps_run_id_id" in step_indexes
-    assert {"task_nodes", "subagent_runs", "plugin_registry"} <= tables
+    assert {"task_nodes", "subagent_runs", "plugin_registry", "trace_spans"} <= tables
     assert {
         "last_seen_at",
         "tool_count",
@@ -346,6 +349,7 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
         "vetting_json",
     } <= mcp_columns
     assert {"diagnosis_json", "retry_strategy_json"} <= task_columns
+    assert {"span_type", "parent_span_id", "metadata_json", "output_json", "started_at", "ended_at"} <= span_columns
 
 
 def test_mcp_static_tools_enter_unified_registry(tmp_path: Path) -> None:
@@ -789,6 +793,14 @@ def test_run_manager_completes_background_mock_run(tmp_path: Path) -> None:
     graph = manager.task_graph(run.run_id)
     assert graph["tasks"]
     assert graph["tasks"][0]["title"] == "Root objective"
+    assert graph["tasks"][0]["plan"]["graph_runtime"]["reviewer_gate"] is True
+    trace = manager.run_trace(run.run_id)
+    span_types = {span["span_type"] for span in trace["spans"]}
+    assert {"run", "plan", "llm.request", "review", "memory.write"} <= span_types
+    assert trace["summary"]["span_counts"]["plan"] >= 1
+    event_types = [event["type"] for event in manager.state.list_run_steps(run.run_id)]
+    assert "orchestration.plan" in event_types
+    assert "review.completed" in event_types
 
 
 def test_full_agent_flow_blocks_approves_resumes_traces_and_capsules(tmp_path: Path) -> None:
@@ -831,6 +843,8 @@ def test_full_agent_flow_blocks_approves_resumes_traces_and_capsules(tmp_path: P
     blocked = _wait_for_status(manager, run.run_id, {"blocked", "failed"})
     assert blocked["status"] == "blocked"
     assert blocked["stop_reason"] == "approval_required"
+    blocked_trace = manager.run_trace(run.run_id)
+    assert "approval.wait" in blocked_trace["summary"]["span_counts"]
 
     approvals = manager.state.list_approvals(status="pending")
     assert len(approvals) == 1
@@ -1001,6 +1015,46 @@ def test_run_manager_scheduler_step_executes_ready_child_task(tmp_path: Path) ->
     assert graph["subagents"]
 
 
+def test_scheduler_task_uses_git_worktree_when_worker_isolation_enabled(tmp_path: Path) -> None:
+    if shutil.which("git") is None:
+        raise AssertionError("git is required for worker isolation tests")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "kestrel@example.test")
+    _git(repo, "config", "user.name", "Kestrel Test")
+    (repo / "README.md").write_text("worker isolation\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "initial")
+
+    manager = _manager(tmp_path)
+    manager.config = AgentConfig(
+        **{
+            **manager.config.__dict__,
+            "workspace": repo,
+            "enable_worker_isolation": True,
+            "worker_worktree_dir": tmp_path / "worker-worktrees",
+        }
+    )
+    run = manager.create_run(message="Complete an isolated scheduler task", session_id="session", workspace=repo)
+    final = _wait_for_status(manager, run.run_id, {"completed", "failed"})
+    assert final["status"] == "completed"
+
+    step = manager.run_scheduler_step(run.run_id, max_tasks=1)
+
+    assert step["executed"][0]["status"] == "completed"
+    isolation = step["executed"][0]["worker_isolation"]
+    assert isolation["mode"] == "git-worktree"
+    assert Path(isolation["workspace"]).exists()
+    assert (Path(isolation["workspace"]) / ".git").exists()
+    assert isolation["branch"].startswith("kestrel/worker/")
+    task = manager.state.get_task_node(str(step["executed"][0]["task_id"]))
+    assert task.result is not None
+    assert task.result["worker_isolation"]["workspace"] == isolation["workspace"]
+    event_types = [event["type"] for event in manager.state.list_run_steps(run.run_id)]
+    assert "worker.isolated" in event_types
+
+
 def test_run_manager_scheduler_step_drains_newly_ready_dependencies(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     run = manager.create_run(message="Complete a low-risk autonomous chain", session_id="session")
@@ -1095,6 +1149,8 @@ def test_run_manager_trace_includes_context_memory_and_tool_events(tmp_path: Pat
     assert trace["summary"]["trace_counts"]["context"] >= 1
     assert trace["summary"]["trace_counts"]["memory"] >= 1
     assert trace["summary"]["trace_counts"]["tool"] >= 1
+    assert trace["summary"]["span_count"] >= 1
+    assert "tool.call" in trace["summary"]["span_counts"]
     assert any(event["type"] == "memory.write" for event in trace["traces"]["memory"])
     assert any(event["type"] == "tool.completed" for event in trace["traces"]["tool"])
 
@@ -1335,3 +1391,15 @@ def _wait_for_subagent(manager: RunManager, run_id: str, subagent_id: str, statu
                 return subagent
         sleep(0.05)
     raise AssertionError(f"subagent {subagent_id} did not reach {statuses}")
+
+
+def _git(cwd: Path, *args: str) -> None:
+    completed = subprocess.run(  # noqa: S603 - fixed executable and test-controlled args
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)

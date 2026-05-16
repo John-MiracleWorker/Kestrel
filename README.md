@@ -171,6 +171,7 @@ nest-agent chat \
 ```
 
 Use `--api-key-env NAME` when the endpoint needs a non-default API key environment variable.
+Provider aliases are also available for `openrouter`, `ollama`, `anthropic`, and `gemini`. OpenRouter and Ollama use the OpenAI-compatible contract; Anthropic and Gemini use their native SDK surface when installed with the matching optional extras.
 
 Codex CLI as the response provider:
 

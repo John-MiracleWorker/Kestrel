@@ -15,7 +15,7 @@ from ..runtime_models import (
     ToolSpec,
 )
 from .base import LLMProvider, ProviderCapabilities, ProviderError
-from .parser import parse_agent_response
+from .parser import normalize_tool_calls, parse_agent_response
 
 
 class OpenAIResponsesProvider(LLMProvider):
@@ -80,7 +80,7 @@ class OpenAIResponsesProvider(LLMProvider):
             response = client.responses.create(**request)
         except Exception as exc:  # noqa: BLE001 - provider boundary maps SDK failures
             raise ProviderError(str(exc), code=type(exc).__name__, retryable=True) from exc
-        return _responses_to_llm_response(response)
+        return _responses_to_llm_response(response, tools=tools)
 
     def stream(
         self,
@@ -119,7 +119,7 @@ class OpenAIResponsesProvider(LLMProvider):
                 if callable(get_final):
                     final_response = get_final()
             if final_response is not None:
-                response = _responses_to_llm_response(final_response)
+                response = _responses_to_llm_response(final_response, tools=tools)
                 for tool_call in response.tool_calls:
                     yield LLMStreamEvent(type="tool_call", tool_call=tool_call)
                 if response.usage:
@@ -158,10 +158,10 @@ def _to_responses_tool(tool: ToolSpec) -> dict[str, Any]:
     }
 
 
-def _responses_to_llm_response(response: Any) -> LLMResponse:
+def _responses_to_llm_response(response: Any, *, tools: list[ToolSpec] | tuple[ToolSpec, ...]) -> LLMResponse:
     text = _response_text(response)
-    parsed = parse_agent_response(text)
-    native_calls = tuple(_response_tool_calls(response))
+    parsed = parse_agent_response(text, tools=tools, strict=True)
+    native_calls = normalize_tool_calls(_response_tool_calls(response), tools=tools)
     tool_calls = native_calls or parsed.tool_calls
     return LLMResponse(
         content=parsed.content if parsed.raw is not None else text.strip(),

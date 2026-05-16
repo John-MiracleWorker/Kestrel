@@ -38,7 +38,11 @@ def _add_common_args(parser: argparse.ArgumentParser, *, default: object = argpa
 
 def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     _add_common_args(parser)
-    parser.add_argument("--provider", choices=["mock", "openai", "openai-compatible", "codex-cli"], default="mock")
+    parser.add_argument(
+        "--provider",
+        choices=["mock", "openai", "openai-compatible", "openrouter", "ollama", "anthropic", "gemini", "codex-cli"],
+        default="mock",
+    )
     parser.add_argument("--model", default="mock")
     parser.add_argument("--base-url")
     parser.add_argument("--api-key-env")
@@ -68,6 +72,9 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--enable-autonomous-scheduler", action="store_true")
     parser.add_argument("--max-scheduler-tasks", type=int, default=3)
     parser.add_argument("--max-scheduler-cycles", type=int, default=5)
+    parser.add_argument("--enable-worker-isolation", action="store_true")
+    parser.add_argument("--worker-worktree-dir", type=Path, default=Path(".nest/worktrees"))
+    parser.add_argument("--worker-branch-prefix", default="kestrel/worker")
     parser.add_argument("--stream", action="store_true")
     parser.add_argument("--max-tool-rounds", type=int, default=6)
     parser.add_argument("--context-budget-chars", type=int, default=18_000)
@@ -208,7 +215,11 @@ def main() -> None:
 
     eval_cmd = sub.add_parser("eval")
     _add_common_args(eval_cmd)
-    eval_cmd.add_argument("--provider", choices=["mock", "openai"], default="mock")
+    eval_cmd.add_argument(
+        "--provider",
+        choices=["mock", "openai", "openai-compatible", "openrouter", "ollama", "anthropic", "gemini", "codex-cli"],
+        default="mock",
+    )
     eval_cmd.add_argument("--model", default="mock")
     eval_cmd.add_argument("--workspace", type=Path, default=Path("."))
 
@@ -494,6 +505,9 @@ def _agent_config_from_args(args: argparse.Namespace, *, backend: str, memory_di
         enable_autonomous_scheduler=args.enable_autonomous_scheduler,
         max_scheduler_tasks=args.max_scheduler_tasks,
         max_scheduler_cycles=args.max_scheduler_cycles,
+        enable_worker_isolation=args.enable_worker_isolation,
+        worker_worktree_dir=args.worker_worktree_dir,
+        worker_branch_prefix=args.worker_branch_prefix,
         stream=args.stream,
         max_tool_rounds=args.max_tool_rounds,
         context_budget_chars=args.context_budget_chars,
