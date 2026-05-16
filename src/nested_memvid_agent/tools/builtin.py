@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ from ..diagnosis import classify_failure
 from ..models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from ..nested_learning import LearningSignal, NestedLearningKernel
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
+from ..skill_manager import validate_skill_manifest
 from ..task_capsule import summarize_run_capsule
 from .base import AgentTool, ToolContext
 from .registry import ToolRegistry
@@ -533,6 +535,7 @@ class ShellRunTool(AgentTool):
         command = list(command_raw)
         if not command or Path(command[0]).name not in self.allowed_first_tokens:
             return self._result(call, success=False, content="Command is not allowlisted", error="command_not_allowlisted")
+        command = _normalize_python_command(command)
         try:
             completed = subprocess.run(  # noqa: S603 - intentionally allowlisted
                 command,
@@ -810,6 +813,7 @@ class TestRunTool(AgentTool):
         command = list(command_raw)
         if not command or Path(command[0]).name not in self.allowed_first_tokens:
             return self._result(call, success=False, content="Command is not allowlisted", error="command_not_allowlisted")
+        command = _normalize_python_command(command)
         try:
             completed = subprocess.run(  # noqa: S603 - intentionally allowlisted
                 command,
@@ -855,6 +859,7 @@ class LintRunTool(AgentTool):
         command = list(command_raw)
         if not command or Path(command[0]).name not in self.allowed_first_tokens:
             return self._result(call, success=False, content="Command is not allowlisted", error="command_not_allowlisted")
+        command = _normalize_python_command(command)
         try:
             completed = subprocess.run(  # noqa: S603 - intentionally allowlisted
                 command,
@@ -1076,6 +1081,7 @@ class RepairValidateTool(AgentTool):
         command = list(command_raw)
         if not command or Path(command[0]).name not in self.allowed_first_tokens:
             return self._result(call, success=False, content="Command is not allowlisted", error="command_not_allowlisted")
+        command = _normalize_python_command(command)
         try:
             branch = _git_output(context.workspace, ["git", "branch", "--show-current"])
             if not _is_repair_branch(branch):
@@ -1130,6 +1136,7 @@ class RepairOrchestrateValidateTool(AgentTool):
         command = list(command_raw)
         if not command or Path(command[0]).name not in self.allowed_first_tokens:
             return self._result(call, success=False, content="Command is not allowlisted", error="command_not_allowlisted")
+        command = _normalize_python_command(command)
         try:
             branch = _git_output(context.workspace, ["git", "branch", "--show-current"])
             if not _is_repair_branch(branch):
@@ -1164,6 +1171,7 @@ class RepairOrchestrateValidateTool(AgentTool):
                 recall = _recall_failure_lessons(context, classification.category, validation_content, max(1, min(int(arguments.get("k", 5)), 10)))
                 previous = arguments.get("previous_command")
                 previous_command = previous if isinstance(previous, list) and all(isinstance(item, str) for item in previous) else []
+                previous_command = _normalize_python_command(list(previous_command))
                 proposed_strategy = str(arguments.get("proposed_strategy", "")).strip()
                 has_lessons = bool(recall["hits"])
                 command_repeated = previous_command == command
@@ -1755,6 +1763,67 @@ class MemoryImportTool(AgentTool):
         return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
 
 
+class SkillInstallTool(AgentTool):
+    spec = ToolSpec(
+        name="skill.install",
+        description="Install or update a local skill capsule under the configured skills directory. Requires file-write enablement and approval.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "manifest": {"type": "object"},
+                "instructions": {"type": "string"},
+                "overwrite": {"type": "boolean"},
+                "dry_run": {"type": "boolean"},
+            },
+            "required": ["manifest", "instructions"],
+        },
+        risk="high",
+        requires_approval=True,
+        capabilities=("skill-install", "tool-upload", "provenance"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        manifest_raw = arguments.get("manifest")
+        instructions = str(arguments.get("instructions", ""))
+        if not isinstance(manifest_raw, dict):
+            return self._result(call, success=False, content="manifest must be an object", error="bad_manifest")
+        if not instructions.strip():
+            return self._result(call, success=False, content="instructions cannot be empty", error="missing_instructions")
+        manifest = dict(manifest_raw)
+        skill_id = str(manifest.get("id", "")).strip()
+        if not skill_id:
+            return self._result(call, success=False, content="manifest.id is required", error="missing_skill_id")
+        if not _safe_skill_id(skill_id):
+            return self._result(call, success=False, content=f"Unsafe skill id: {skill_id}", error="unsafe_skill_id")
+        validation = validate_skill_manifest(manifest)
+        manifest_text = json.dumps(manifest, indent=2, sort_keys=True)
+        payload: dict[str, Any] = {
+            "skill_id": skill_id,
+            "validation": validation,
+            "manifest_sha256": hashlib.sha256(manifest_text.encode("utf-8")).hexdigest(),
+            "instructions_sha256": hashlib.sha256(instructions.encode("utf-8")).hexdigest(),
+            "dry_run": bool(arguments.get("dry_run", False)),
+        }
+        if validation["errors"]:
+            return self._result(call, success=False, content=json.dumps(payload, indent=2), data=payload, error="invalid_skill_manifest")
+
+        try:
+            skill_dir = _safe_path(context.config.skills_dir, skill_id)
+            payload["path"] = str(skill_dir)
+            if payload["dry_run"]:
+                return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+            if skill_dir.exists() and not bool(arguments.get("overwrite", False)):
+                return self._result(call, success=False, content=json.dumps(payload, indent=2), data=payload, error="skill_exists")
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / "skill.json").write_text(manifest_text + "\n", encoding="utf-8")
+            (skill_dir / "SKILL.md").write_text(instructions, encoding="utf-8")
+            payload["installed"] = True
+            return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="skill_install_failed")
+
+
 class DiagnosisClassifyTool(AgentTool):
     spec = ToolSpec(
         name="diagnosis.classify",
@@ -1853,6 +1922,7 @@ def build_default_tools() -> ToolRegistry:
     registry.register(MemoryInspectTool())
     registry.register(MemoryExportTool())
     registry.register(MemoryImportTool())
+    registry.register(SkillInstallTool())
     return registry
 
 
@@ -1981,6 +2051,16 @@ def _safe_path(root: Path, relative: str) -> Path:
     if root_resolved not in path.parents and path != root_resolved:
         raise ValueError(f"Path escapes workspace: {relative}")
     return path
+
+
+def _safe_skill_id(skill_id: str) -> bool:
+    return skill_id.replace("_", "-").replace("-", "").isalnum()
+
+
+def _normalize_python_command(command: list[str]) -> list[str]:
+    if command and Path(command[0]).name in {"python", "python3"}:
+        return [sys.executable, *command[1:]]
+    return command
 
 
 def _truncate(text: str, max_chars: int) -> str:

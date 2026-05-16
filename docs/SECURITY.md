@@ -11,9 +11,13 @@ NEST_AGENT_ALLOW_SHELL=false
 NEST_AGENT_ALLOW_FILE_WRITE=false
 NEST_AGENT_ALLOW_POLICY_WRITES=false
 NEST_AGENT_ALLOW_CODEX_CLI=false
+NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER=false
+NEST_AGENT_MAX_SCHEDULER_TASKS=3
+NEST_AGENT_MAX_SCHEDULER_CYCLES=5
 NEST_AGENT_ENABLE_CHANNEL_DELIVERY=false
 NEST_AGENT_ENABLE_AUTO_CONSOLIDATION=false
 NEST_AGENT_AUTO_CONSOLIDATION_DRY_RUN=true
+NEST_AGENT_REQUIRE_API_AUTH=false
 ```
 
 Do not loosen these in shared deployments without a separate approval and audit story.
@@ -26,7 +30,19 @@ Bind the web/API server to `127.0.0.1` by default:
 nest-agent server --host 127.0.0.1 --port 8765
 ```
 
-If binding to `0.0.0.0`, put Kestrel behind an authenticated reverse proxy and keep dangerous tool flags disabled.
+If binding to `0.0.0.0`, enable `NEST_AGENT_REQUIRE_API_AUTH=1`, set `NEST_AGENT_API_TOKEN`, put Kestrel behind an authenticated reverse proxy, and keep dangerous tool flags disabled.
+
+## API Auth
+
+The local API can require a shared token:
+
+```bash
+export NEST_AGENT_REQUIRE_API_AUTH=1
+export NEST_AGENT_API_TOKEN='replace-with-local-secret'
+nest-agent server --host 127.0.0.1 --port 8765
+```
+
+Clients may send either `Authorization: Bearer <token>` or `X-Kestrel-API-Key: <token>`. This is a local operator gate, not multi-user authorization.
 
 ## Secrets
 
@@ -37,6 +53,14 @@ Logs and run events redact common API key, bearer token, password, authorization
 ## Tool Risk
 
 High-risk tools require explicit config enablement and approval flow integration. Shell execution, file writes, git commits, Codex CLI execution, channel delivery, and policy memory writes are not production-safe defaults.
+
+Skill installation is a high-risk file-write action. Uploaded skill capsules are confined to the configured skills directory, validated by manifest shape, and still require approval before installation.
+
+Autonomous scheduling is disabled by default. When enabled, it is bounded by per-cycle task and cycle limits, and it stops at task approval or exact-call tool approval boundaries instead of silently crossing into high-risk work.
+
+## Webhooks
+
+Generic/custom channel endpoints can require HMAC-SHA256 signatures by setting channel `settings.signature_secret_env`. The signature is computed over canonical JSON and sent in `X-Kestrel-Signature` as either a hex digest or `sha256=<digest>`.
 
 ## Memory Safety
 

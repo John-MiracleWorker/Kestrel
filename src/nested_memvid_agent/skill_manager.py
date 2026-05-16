@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -72,6 +75,48 @@ class SkillManager:
     def set_enabled(self, skill_id: str, enabled: bool) -> dict[str, Any]:
         return self.state.set_skill_enabled(skill_id, enabled)
 
+    def install_skill(
+        self,
+        *,
+        manifest: dict[str, Any],
+        instructions: str,
+        overwrite: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        validation = validate_skill_manifest(manifest)
+        skill_id = str(manifest.get("id", "")).strip()
+        if not skill_id:
+            raise ValueError("Skill manifest must include id.")
+        if not _safe_skill_id(skill_id):
+            raise ValueError(f"Unsafe skill id: {skill_id}")
+        if validation["errors"]:
+            return {"installed": False, "dry_run": dry_run, "validation": validation}
+        skill_dir = _safe_skill_dir(self.root, skill_id)
+        if skill_dir.exists() and not overwrite:
+            raise FileExistsError(f"Skill already exists: {skill_id}")
+        manifest_text = json.dumps(manifest, indent=2, sort_keys=True)
+        if dry_run:
+            return {
+                "installed": False,
+                "dry_run": True,
+                "skill_id": skill_id,
+                "path": str(skill_dir),
+                "validation": validation,
+                "provenance": _skill_provenance(skill_dir, manifest_text, instructions),
+            }
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "skill.json").write_text(manifest_text + "\n", encoding="utf-8")
+        (skill_dir / "SKILL.md").write_text(instructions, encoding="utf-8")
+        self.discover()
+        return {
+            "installed": True,
+            "dry_run": False,
+            "skill_id": skill_id,
+            "path": str(skill_dir),
+            "validation": validation,
+            "provenance": _skill_provenance(skill_dir, manifest_text, instructions),
+        }
+
     def tool_adapters(self) -> list[AgentTool]:
         adapters: list[AgentTool] = []
         for skill in self.state.list_skills():
@@ -113,11 +158,18 @@ class SkillToolAdapter(AgentTool):
         if not task:
             return self._result(call, success=False, content="Missing skill task.", error="missing_task")
 
-        content = (
-            f"Skill: {self.capsule.name}\n"
-            f"Task: {task}\n\n"
-            f"Instructions:\n{self.capsule.instructions.strip()}\n"
-        )
+        runtime = self.capsule.manifest.get("runtime", {"type": "instruction"})
+        try:
+            runtime_result = _run_skill_runtime(
+                self.capsule,
+                arguments=arguments,
+                runtime=runtime if isinstance(runtime, dict) else {"type": "instruction"},
+                task=task,
+            )
+        except Exception as exc:  # noqa: BLE001 - skill boundary returns structured failure
+            return self._result(call, success=False, content=f"{type(exc).__name__}: {exc}", error="skill_runtime_failed")
+
+        content = runtime_result["content"]
         record = MemoryRecord(
             layer=MemoryLayer.EPISODIC,
             kind=MemoryKind.EVENT,
@@ -133,9 +185,10 @@ class SkillToolAdapter(AgentTool):
         context.memory.seal_all()
         return self._result(
             call,
-            success=True,
+            success=bool(runtime_result["success"]),
             content=content,
-            data={"skill_id": self.capsule.id, "memory_record_id": record_id},
+            data={**runtime_result["data"], "skill_id": self.capsule.id, "memory_record_id": record_id},
+            error=None if runtime_result["success"] else str(runtime_result.get("error") or "skill_failed"),
         )
 
 
@@ -167,6 +220,150 @@ def validate_skill_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     if "runtime" not in manifest:
         warnings.append("default_instruction_runtime")
     return {"ok": not errors, "errors": errors, "warnings": warnings}
+
+
+def _run_skill_runtime(
+    capsule: SkillCapsule,
+    *,
+    arguments: dict[str, Any],
+    runtime: dict[str, Any],
+    task: str,
+) -> dict[str, Any]:
+    runtime_type = str(runtime.get("type", "instruction"))
+    payload = {
+        "task": task,
+        "arguments": {key: value for key, value in arguments.items() if key != "task"},
+        "context": arguments.get("context", {}),
+        "skill": {
+            "id": capsule.id,
+            "name": capsule.name,
+            "description": capsule.description,
+        },
+    }
+    if runtime_type == "instruction":
+        content = (
+            f"Skill: {capsule.name}\n"
+            f"Task: {task}\n\n"
+            f"Instructions:\n{capsule.instructions.strip()}\n"
+        )
+        return {"success": True, "content": content, "data": {"runtime": "instruction"}}
+    if runtime_type == "python":
+        entrypoint = str(runtime.get("entrypoint", "skill.py"))
+        script = _safe_skill_path(capsule.path, entrypoint)
+        if not script.exists() or not script.is_file():
+            return {
+                "success": False,
+                "content": f"Python skill entrypoint does not exist: {entrypoint}",
+                "data": {"runtime": "python", "entrypoint": entrypoint},
+                "error": "missing_entrypoint",
+            }
+        return _run_skill_process(
+            capsule,
+            command=[sys.executable, str(script)],
+            payload=payload,
+            runtime_type="python",
+            timeout_seconds=_runtime_timeout(runtime),
+        )
+    if runtime_type == "shell":
+        command = runtime.get("command")
+        if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+            return {
+                "success": False,
+                "content": "Shell skill runtime requires command as list[str].",
+                "data": {"runtime": "shell"},
+                "error": "bad_skill_command",
+            }
+        if not command:
+            return {
+                "success": False,
+                "content": "Shell skill runtime command cannot be empty.",
+                "data": {"runtime": "shell"},
+                "error": "bad_skill_command",
+            }
+        return _run_skill_process(
+            capsule,
+            command=list(command),
+            payload=payload,
+            runtime_type="shell",
+            timeout_seconds=_runtime_timeout(runtime),
+        )
+    if runtime_type == "container":
+        return {
+            "success": False,
+            "content": "Container skill runtime is not available in this local sandbox yet.",
+            "data": {"runtime": "container"},
+            "error": "container_runtime_unavailable",
+        }
+    return {
+        "success": False,
+        "content": f"Unsupported skill runtime: {runtime_type}",
+        "data": {"runtime": runtime_type},
+        "error": "unsupported_runtime",
+    }
+
+
+def _run_skill_process(
+    capsule: SkillCapsule,
+    *,
+    command: list[str],
+    payload: dict[str, Any],
+    runtime_type: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    completed = subprocess.run(  # noqa: S603 - list argv, skill cwd, timeout, no shell
+        command,
+        cwd=capsule.path,
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        check=False,
+        env={"PATH": os.defpath, "PYTHONNOUSERSITE": "1", "NEST_SKILL_SANDBOX": "1"},
+    )
+    stdout = completed.stdout.strip()
+    stderr = completed.stderr.strip()
+    content = (
+        f"Skill: {capsule.name}\n"
+        f"Runtime: {runtime_type}\n"
+        f"Exit code: {completed.returncode}\n\n"
+        f"STDOUT:\n{stdout}\n\n"
+        f"STDERR:\n{stderr}"
+    )
+    return {
+        "success": completed.returncode == 0,
+        "content": content,
+        "data": {
+            "runtime": runtime_type,
+            "returncode": completed.returncode,
+            "stdout": stdout[:4000],
+            "stderr": stderr[:4000],
+        },
+        "error": None if completed.returncode == 0 else "skill_nonzero_exit",
+    }
+
+
+def _runtime_timeout(runtime: dict[str, Any]) -> int:
+    return max(1, min(int(runtime.get("timeout", 10)), 120))
+
+
+def _safe_skill_id(skill_id: str) -> bool:
+    return skill_id.replace("_", "-").replace("-", "").isalnum()
+
+
+def _safe_skill_dir(root: Path, skill_id: str) -> Path:
+    target = (root / skill_id).resolve()
+    root_resolved = root.resolve()
+    if target != root_resolved and root_resolved not in target.parents:
+        raise ValueError(f"Skill path escapes skills root: {skill_id}")
+    return target
+
+
+def _safe_skill_path(root: Path, relative: str) -> Path:
+    target = (root / relative).resolve()
+    root_resolved = root.resolve()
+    if target != root_resolved and root_resolved not in target.parents:
+        raise ValueError(f"Skill path escapes skill root: {relative}")
+    return target
 
 
 def _skill_provenance(skill_dir: Path, manifest_text: str, instructions: str) -> dict[str, Any]:

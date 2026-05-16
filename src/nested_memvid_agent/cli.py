@@ -56,10 +56,15 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--channels-config", type=Path, default=Path(".nest/config/channels.json"))
     parser.add_argument("--enable-channel-delivery", action="store_true")
     parser.add_argument("--channel-send-timeout-seconds", type=int, default=10)
+    parser.add_argument("--require-api-auth", action="store_true")
+    parser.add_argument("--api-auth-token-env", default="NEST_AGENT_API_TOKEN")
     parser.add_argument("--allow-shell", action="store_true")
     parser.add_argument("--allow-file-write", action="store_true")
     parser.add_argument("--allow-policy-writes", action="store_true")
     parser.add_argument("--allow-codex-cli", action="store_true")
+    parser.add_argument("--enable-autonomous-scheduler", action="store_true")
+    parser.add_argument("--max-scheduler-tasks", type=int, default=3)
+    parser.add_argument("--max-scheduler-cycles", type=int, default=5)
     parser.add_argument("--stream", action="store_true")
     parser.add_argument("--max-tool-rounds", type=int, default=6)
     parser.add_argument("--context-budget-chars", type=int, default=18_000)
@@ -432,10 +437,15 @@ def _agent_config_from_args(args: argparse.Namespace, *, backend: str, memory_di
         channel_config_path=args.channels_config,
         enable_channel_delivery=args.enable_channel_delivery,
         channel_send_timeout_seconds=args.channel_send_timeout_seconds,
+        require_api_auth=args.require_api_auth,
+        api_auth_token_env=args.api_auth_token_env,
         allow_shell=args.allow_shell,
         allow_file_write=args.allow_file_write,
         allow_policy_writes=args.allow_policy_writes,
         allow_codex_cli=args.allow_codex_cli,
+        enable_autonomous_scheduler=args.enable_autonomous_scheduler,
+        max_scheduler_tasks=args.max_scheduler_tasks,
+        max_scheduler_cycles=args.max_scheduler_cycles,
         stream=args.stream,
         max_tool_rounds=args.max_tool_rounds,
         context_budget_chars=args.context_budget_chars,

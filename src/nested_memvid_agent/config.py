@@ -35,6 +35,9 @@ class AgentConfig:
     allow_policy_writes: bool = False
     allow_codex_cli: bool = False
     require_approval_for_high_risk_tools: bool = True
+    enable_autonomous_scheduler: bool = False
+    max_scheduler_tasks: int = 3
+    max_scheduler_cycles: int = 5
     enable_task_capsules: bool = True
     enable_auto_consolidation: bool = False
     auto_consolidation_dry_run: bool = True
@@ -48,6 +51,8 @@ class AgentConfig:
     channel_config_path: Path = Path(".nest/config/channels.json")
     enable_channel_delivery: bool = False
     channel_send_timeout_seconds: int = 10
+    require_api_auth: bool = False
+    api_auth_token_env: str = "NEST_AGENT_API_TOKEN"
     tool_timeout_seconds: float = 30.0
 
     @classmethod
@@ -83,6 +88,9 @@ class AgentConfig:
             allow_file_write=_env_bool("NEST_AGENT_ALLOW_FILE_WRITE"),
             allow_policy_writes=_env_bool("NEST_AGENT_ALLOW_POLICY_WRITES"),
             allow_codex_cli=_env_bool("NEST_AGENT_ALLOW_CODEX_CLI"),
+            enable_autonomous_scheduler=_env_bool("NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER"),
+            max_scheduler_tasks=_env_int("NEST_AGENT_MAX_SCHEDULER_TASKS", 3),
+            max_scheduler_cycles=_env_int("NEST_AGENT_MAX_SCHEDULER_CYCLES", 5),
             enable_task_capsules=not _env_bool("NEST_AGENT_DISABLE_TASK_CAPSULES")
             and _env_bool_default("NEST_AGENT_ENABLE_TASK_CAPSULES", True),
             enable_auto_consolidation=_env_bool("NEST_AGENT_ENABLE_AUTO_CONSOLIDATION"),
@@ -90,6 +98,8 @@ class AgentConfig:
             context_pack_token_budget=_env_int("NEST_AGENT_CONTEXT_PACK_TOKEN_BUDGET", 6000),
             context_pack_expand_raw=_env_bool("NEST_AGENT_CONTEXT_PACK_EXPAND_RAW"),
             stream=_env_bool("NEST_AGENT_STREAM"),
+            require_api_auth=_env_bool("NEST_AGENT_REQUIRE_API_AUTH"),
+            api_auth_token_env=os.getenv("NEST_AGENT_API_AUTH_TOKEN_ENV", "NEST_AGENT_API_TOKEN"),
         )
 
     @classmethod

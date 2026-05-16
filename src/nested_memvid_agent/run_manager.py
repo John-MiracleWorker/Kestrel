@@ -205,6 +205,7 @@ class RunManager:
         return {
             "tasks": [_task_payload(task) for task in self.state.list_task_nodes(run_id)],
             "ready_tasks": self.ready_tasks(run_id),
+            "approval_blocked_tasks": self.approval_blocked_tasks(run_id),
             "subagents": [asdict(subagent) for subagent in self.state.list_subagent_runs(run_id)],
         }
 
@@ -222,11 +223,135 @@ class RunManager:
             ready.append(payload)
         return ready
 
+    def approval_blocked_tasks(self, run_id: str) -> list[dict[str, Any]]:
+        self.state.get_run(run_id)
+        tasks = self.state.list_task_nodes(run_id)
+        by_id = {task.task_id: task for task in tasks}
+        blocked: list[dict[str, Any]] = []
+        for task in tasks:
+            if task.approved or task.status not in {"queued", "approved"}:
+                continue
+            if not _dependencies_completed(task, by_id):
+                continue
+            payload = _task_payload(task)
+            payload["scheduler_reason"] = "task_approval_required"
+            blocked.append(payload)
+        return blocked
+
+    def run_scheduler_step(self, run_id: str, *, max_tasks: int | None = None) -> dict[str, Any]:
+        """Execute currently ready approved task nodes through normal agent gates."""
+        run = self.state.get_run(run_id)
+        limit = max(1, max_tasks or self.config.max_scheduler_tasks)
+        executed: list[dict[str, Any]] = []
+        blocked: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+
+        while len(executed) < limit:
+            executable: TaskNodeRecord | None = None
+            for task_payload in self.ready_tasks(run_id):
+                task = self.state.get_task_node(str(task_payload["task_id"]))
+                if _is_root_objective_task(task):
+                    if not any(item["task_id"] == task.task_id for item in skipped):
+                        skipped.append({"task_id": task.task_id, "reason": "root_objective_tracking_node"})
+                    continue
+                executable = task
+                break
+            if executable is None:
+                break
+            result = self._execute_ready_task(run, executable)
+            executed.append(result)
+            if result["status"] == "blocked":
+                blocked.append(result)
+                break
+
+        self._maybe_complete_root_task(run_id)
+        payload = {
+            "run_id": run_id,
+            "executed": executed,
+            "blocked": blocked,
+            "skipped": skipped,
+            "remaining_ready_tasks": self.ready_tasks(run_id),
+            "approval_blocked_tasks": self.approval_blocked_tasks(run_id),
+        }
+        self.events.publish(run_id, "scheduler.step", payload)
+        return payload
+
+    def run_scheduler_until_idle(
+        self,
+        run_id: str,
+        *,
+        max_tasks: int | None = None,
+        max_cycles: int | None = None,
+    ) -> dict[str, Any]:
+        """Drain scheduler-selected tasks until idle, blocked, failed, or bounded."""
+        self.state.get_run(run_id)
+        cycle_limit = max(1, max_cycles or self.config.max_scheduler_cycles)
+        task_limit = max(1, max_tasks or self.config.max_scheduler_tasks)
+        steps: list[dict[str, Any]] = []
+        stop_reason = "idle"
+
+        for _ in range(cycle_limit):
+            if self.approval_blocked_tasks(run_id) and not self._executable_ready_tasks(run_id):
+                stop_reason = "task_approval_required"
+                break
+            if not self._executable_ready_tasks(run_id):
+                stop_reason = "idle"
+                break
+
+            step = self.run_scheduler_step(run_id, max_tasks=task_limit)
+            steps.append(step)
+            executed_statuses = {str(item.get("status")) for item in step["executed"]}
+            if "failed" in executed_statuses:
+                stop_reason = "task_failed"
+                break
+            if step["blocked"]:
+                stop_reason = "tool_approval_required"
+                break
+            if step["approval_blocked_tasks"] and not self._executable_ready_tasks(run_id):
+                stop_reason = "task_approval_required"
+                break
+            if not step["executed"]:
+                stop_reason = "idle"
+                break
+        else:
+            stop_reason = "cycle_limit_reached"
+
+        payload = {
+            "run_id": run_id,
+            "cycles": len(steps),
+            "max_cycles": cycle_limit,
+            "max_tasks_per_cycle": task_limit,
+            "stop_reason": stop_reason,
+            "steps": steps,
+            "executed": [item for step in steps for item in step["executed"]],
+            "blocked": [item for step in steps for item in step["blocked"]],
+            "remaining_ready_tasks": self.ready_tasks(run_id),
+            "approval_blocked_tasks": self.approval_blocked_tasks(run_id),
+        }
+        self.events.publish(run_id, "scheduler.run", payload)
+        return payload
+
+    def _executable_ready_tasks(self, run_id: str) -> list[dict[str, Any]]:
+        executable: list[dict[str, Any]] = []
+        for task_payload in self.ready_tasks(run_id):
+            task = self.state.get_task_node(str(task_payload["task_id"]))
+            if not _is_root_objective_task(task):
+                executable.append(task_payload)
+        return executable
+
     def approve_task(self, run_id: str, task_id: str) -> dict[str, Any]:
         self.state.get_run(run_id)
         task = self.state.update_task_node(task_id, approved=True, status="approved")
         self.events.publish(run_id, "task.approved", asdict(task))
-        return asdict(task)
+        payload = asdict(task)
+        if self.config.enable_autonomous_scheduler:
+            self.state.transition_run(run_id, "running", stop_reason="task_approved")
+            scheduler = self.run_scheduler_until_idle(run_id)
+            final_status, stop_reason = _scheduler_run_outcome(scheduler)
+            self.state.transition_run(run_id, final_status, stop_reason=stop_reason)
+            self.events.publish(run_id, f"run.{final_status}", {"scheduler": scheduler})
+            payload["scheduler"] = scheduler
+        return payload
 
     def create_subagent(self, *, run_id: str, profile: str, goal: str, task_id: str | None = None) -> dict[str, Any]:
         run = self.state.get_run(run_id)
@@ -279,18 +404,7 @@ class RunManager:
                     "tool.completed" if execution.success else "tool.failed",
                     _execution_payload(execution),
                 )
-            status = "blocked" if result.stop_reason == "approval_required" else "completed"
-            self.state.transition_run(
-                run_id,
-                status,
-                assistant_message=result.assistant_message,
-                context_chars=result.context_chars,
-                tool_count=len(result.tool_executions),
-                stop_reason=result.stop_reason,
-            )
-            if status == "completed":
-                self._complete_capsule(run_id, config, agent, result)
-            self.events.publish(run_id, "run.blocked" if status == "blocked" else "run.completed", _turn_payload(result))
+            self._finish_agent_turn(run_id, config, agent, result)
         except Exception as exc:  # noqa: BLE001
             if self._is_cancelled(run_id):
                 return
@@ -352,18 +466,7 @@ class RunManager:
             if self._is_cancelled(run_id):
                 return
             self._publish_turn_observability(run_id, result)
-            status = "blocked" if result.stop_reason == "approval_required" else "completed"
-            self.state.transition_run(
-                run_id,
-                status,
-                assistant_message=result.assistant_message,
-                context_chars=result.context_chars,
-                tool_count=len(result.tool_executions) + 1,
-                stop_reason=result.stop_reason,
-            )
-            if status == "completed":
-                self._complete_capsule(run_id, config, agent, result)
-            self.events.publish(run_id, "run.blocked" if status == "blocked" else "run.completed", _turn_payload(result))
+            self._finish_agent_turn(run_id, config, agent, result, tool_count_offset=1)
         except Exception as exc:  # noqa: BLE001
             if self._is_cancelled(run_id):
                 return
@@ -371,6 +474,40 @@ class RunManager:
             self.events.publish(run_id, "run.failed", {"error": f"{type(exc).__name__}: {exc}"})
         finally:
             agent.close()
+
+    def _finish_agent_turn(
+        self,
+        run_id: str,
+        config: AgentConfig,
+        agent: NestedMV2Agent,
+        result: AgentTurnResult,
+        *,
+        tool_count_offset: int = 0,
+    ) -> None:
+        status = "blocked" if result.stop_reason == "approval_required" else "completed"
+        run_status = "running" if status == "completed" and config.enable_autonomous_scheduler else status
+        stop_reason = "scheduler_running" if run_status == "running" and status == "completed" else result.stop_reason
+        self.state.transition_run(
+            run_id,
+            run_status,
+            assistant_message=result.assistant_message,
+            context_chars=result.context_chars,
+            tool_count=len(result.tool_executions) + tool_count_offset,
+            stop_reason=stop_reason,
+        )
+        if status == "completed":
+            self._complete_capsule(run_id, config, agent, result)
+        event_type = "run.blocked" if status == "blocked" else "run.turn_completed" if config.enable_autonomous_scheduler else "run.completed"
+        self.events.publish(run_id, event_type, _turn_payload(result))
+        if status == "completed" and config.enable_autonomous_scheduler:
+            scheduler = self.run_scheduler_until_idle(
+                run_id,
+                max_tasks=config.max_scheduler_tasks,
+                max_cycles=config.max_scheduler_cycles,
+            )
+            final_status, scheduler_stop_reason = _scheduler_run_outcome(scheduler)
+            self.state.transition_run(run_id, final_status, stop_reason=scheduler_stop_reason)
+            self.events.publish(run_id, f"run.{final_status}", {"scheduler": scheduler, "turn": _turn_payload(result)})
 
     def _run_subagent(
         self,
@@ -431,6 +568,100 @@ class RunManager:
             self.events.publish(run_id, "subagent.failed", asdict(updated))
         finally:
             agent.close()
+
+    def _execute_ready_task(self, run: RunRecord, task: TaskNodeRecord) -> dict[str, Any]:
+        running = self.state.update_task_node(task.task_id, status="running")
+        subagent = self.state.create_subagent_run(
+            subagent_id=f"subagent_{uuid4().hex}",
+            run_id=run.run_id,
+            task_id=task.task_id,
+            profile=task.profile,
+            goal=task.goal,
+            status="running",
+        )
+        self.events.publish(run.run_id, "task.started", _task_payload(running))
+        self.events.publish(run.run_id, "subagent.started", asdict(subagent))
+        config = replace(self.config, workspace=Path(run.workspace), model=run.model)
+        agent = self._build_agent(config)
+        try:
+            result = agent.chat(
+                _task_execution_prompt(task),
+                session_id=run.session_id,
+                run_id=run.run_id,
+                approval_handler=self._approval_handler,
+                stream_handler=self._stream_handler(run.run_id),
+            )
+            self._publish_turn_observability(run.run_id, result)
+            status = "blocked" if result.stop_reason == "approval_required" else "completed"
+            task_result = {
+                "assistant_message": result.assistant_message,
+                "stop_reason": result.stop_reason,
+                "context_chars": result.context_chars,
+                "tool_count": len(result.tool_executions),
+                "memory_writes": list(result.memory_writes),
+            }
+            updated_task = self.state.update_task_node(task.task_id, status=status, result=task_result)
+            updated_subagent = self.state.update_subagent_run(
+                subagent.subagent_id,
+                status=status,
+                result=result.assistant_message,
+            )
+            for execution in result.tool_executions:
+                self.events.publish(run.run_id, "tool.executed", _execution_payload(execution))
+                self.events.publish(
+                    run.run_id,
+                    "tool.completed" if execution.success else "tool.failed",
+                    _execution_payload(execution),
+                )
+            event_type = "task.blocked" if status == "blocked" else "task.completed"
+            self.events.publish(run.run_id, event_type, _task_payload(updated_task))
+            self.events.publish(
+                run.run_id,
+                "subagent.blocked" if status == "blocked" else "subagent.completed",
+                asdict(updated_subagent),
+            )
+            return {"task_id": task.task_id, "subagent_id": subagent.subagent_id, "status": status, "result": task_result}
+        except Exception as exc:  # noqa: BLE001
+            error_text = f"{type(exc).__name__}: {exc}"
+            diagnosis = classify_failure(error_text, source="scheduler").to_payload()
+            failed_task = self.state.record_task_failure(
+                task.task_id,
+                failure_reason=error_text,
+                diagnosis=diagnosis,
+                retry_strategy={
+                    "requires_changed_strategy": True,
+                    "retry_allowed": False,
+                    "reason": "scheduler task failed; inspect diagnosis before retry",
+                },
+                result={"error": error_text},
+            )
+            failed_subagent = self.state.update_subagent_run(subagent.subagent_id, status="failed", error=error_text)
+            self.events.publish(run.run_id, "task.failed", _task_payload(failed_task))
+            self.events.publish(run.run_id, "subagent.failed", asdict(failed_subagent))
+            self.events.publish(run.run_id, "diagnosis.classified", {"task_id": task.task_id, "source": "scheduler", **diagnosis})
+            return {"task_id": task.task_id, "subagent_id": subagent.subagent_id, "status": "failed", "error": error_text}
+        finally:
+            agent.close()
+
+    def _maybe_complete_root_task(self, run_id: str) -> None:
+        tasks = self.state.list_task_nodes(run_id)
+        roots = [task for task in tasks if _is_root_objective_task(task)]
+        if not roots:
+            return
+        root = roots[0]
+        children = [task for task in tasks if task.parent_id == root.task_id]
+        if not children:
+            return
+        child_statuses = {task.status for task in children}
+        if any(status == "failed" for status in child_statuses):
+            updated = self.state.update_task_node(root.task_id, status="failed", result={"child_statuses": sorted(child_statuses)})
+            self.events.publish(run_id, "task.failed", _task_payload(updated))
+        elif any(status == "blocked" for status in child_statuses):
+            updated = self.state.update_task_node(root.task_id, status="blocked", result={"child_statuses": sorted(child_statuses)})
+            self.events.publish(run_id, "task.blocked", _task_payload(updated))
+        elif all(status == "completed" for status in child_statuses):
+            updated = self.state.update_task_node(root.task_id, status="completed", result={"child_statuses": sorted(child_statuses)})
+            self.events.publish(run_id, "task.completed", _task_payload(updated))
 
     def _approval_handler(self, call: ToolCall, spec: ToolSpec, context: ToolContext) -> ToolExecution:
         run_id = context.run_id or f"manual_{uuid4().hex}"
@@ -576,6 +807,43 @@ def _turn_payload(result: AgentTurnResult) -> dict[str, Any]:
     }
 
 
+def _is_root_objective_task(task: TaskNodeRecord) -> bool:
+    plan = task.plan or {}
+    return task.parent_id is None and task.profile == "planner" and plan.get("autonomy_mode") == "background"
+
+
+def _scheduler_run_outcome(scheduler: dict[str, Any]) -> tuple[str, str]:
+    stop_reason = str(scheduler.get("stop_reason") or "idle")
+    executed = scheduler.get("executed", [])
+    statuses = {str(item.get("status")) for item in executed if isinstance(item, dict)}
+    if "failed" in statuses or stop_reason == "task_failed":
+        return "failed", stop_reason
+    if stop_reason in {"tool_approval_required", "task_approval_required", "cycle_limit_reached"}:
+        return "blocked", stop_reason
+    return "completed", "scheduler_idle"
+
+
+def _task_execution_prompt(task: TaskNodeRecord) -> str:
+    dependencies = "\n".join(f"- {dependency}" for dependency in task.dependencies) or "- none"
+    tools = "\n".join(f"- {tool}" for tool in task.required_tools) or "- none"
+    criteria = "\n".join(f"- {criterion}" for criterion in task.acceptance_criteria) or "- Report concrete outcome and remaining risk."
+    retry = task.retry_strategy or {}
+    retry_note = ""
+    if retry:
+        retry_note = f"\nRetry strategy metadata:\n{retry}"
+    return (
+        f"Autonomous task profile: {task.profile}\n"
+        f"Task title: {task.title}\n"
+        f"Goal:\n{task.goal}\n\n"
+        f"Dependencies:\n{dependencies}\n\n"
+        f"Expected tools:\n{tools}\n\n"
+        f"Acceptance criteria:\n{criteria}\n"
+        f"{retry_note}\n\n"
+        "Execute only the approved task scope. Use available tools when needed, respect high-risk approval gates, "
+        "and finish with a concise result plus any blocker."
+    )
+
+
 def _task_payload(task: TaskNodeRecord) -> dict[str, Any]:
     payload = asdict(task)
     payload["dependencies"] = list(task.dependencies)
@@ -589,7 +857,7 @@ def _task_scheduler_reason(task: TaskNodeRecord, by_id: dict[str, TaskNodeRecord
         return None
     if task.status not in {"queued", "approved"}:
         return None
-    if not all(by_id.get(dependency) and by_id[dependency].status == "completed" for dependency in task.dependencies):
+    if not _dependencies_completed(task, by_id):
         return None
     retry = task.retry_strategy or {}
     if retry.get("requires_changed_strategy"):
@@ -599,6 +867,10 @@ def _task_scheduler_reason(task: TaskNodeRecord, by_id: dict[str, TaskNodeRecord
     if task.attempt_count > 0:
         return "retry_ready"
     return "dependencies_satisfied"
+
+
+def _dependencies_completed(task: TaskNodeRecord, by_id: dict[str, TaskNodeRecord]) -> bool:
+    return all(by_id.get(dependency) and by_id[dependency].status == "completed" for dependency in task.dependencies)
 
 
 def _initial_task_plan(message: str) -> list[dict[str, Any]]:

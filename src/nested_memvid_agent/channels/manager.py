@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -49,10 +52,12 @@ class ChannelManager:
         payload: dict[str, Any],
         channel_id: str | None = None,
         send: bool | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> ChannelProcessResult:
         channel = self._resolve_channel(provider=provider, channel_id=channel_id)
         if not channel.enabled:
             raise ChannelPayloadError(f"Channel is disabled: {channel.id}")
+        _verify_channel_signature(channel, payload, headers or {})
         adapter = self._adapter_for(channel.provider)
         inbound = adapter.parse_inbound(channel, payload)
         self._event("channel.receive", inbound.to_public_dict())
@@ -156,3 +161,30 @@ def default_channel_configs() -> list[ChannelEndpointConfig]:
             webhook_url_env="NEST_AGENT_CHANNEL_WEBHOOK_URL",
         ),
     ]
+
+
+def _verify_channel_signature(
+    channel: ChannelEndpointConfig,
+    payload: dict[str, Any],
+    headers: Mapping[str, str],
+) -> None:
+    secret_env = channel.settings.get("signature_secret_env")
+    if not isinstance(secret_env, str) or not secret_env.strip():
+        return
+    secret = os.getenv(secret_env.strip(), "")
+    if not secret:
+        raise ChannelPayloadError(f"Missing webhook signature secret environment variable: {secret_env}")
+    header_name = str(channel.settings.get("signature_header") or "x-kestrel-signature").lower()
+    supplied = ""
+    for key, value in headers.items():
+        if str(key).lower() == header_name:
+            supplied = str(value).strip()
+            break
+    if not supplied:
+        raise ChannelPayloadError(f"Missing webhook signature header: {header_name}")
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    expected = hmac.new(secret.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
+    if supplied.startswith("sha256="):
+        supplied = supplied.removeprefix("sha256=")
+    if not hmac.compare_digest(supplied, expected):
+        raise ChannelPayloadError("Invalid webhook signature.")

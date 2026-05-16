@@ -228,3 +228,60 @@ def test_openai_responses_provider_keeps_json_envelope_fallback(monkeypatch: pyt
     assert response.content == "fallback"
     assert response.tool_calls[0].name == "memory.search"
     assert response.tool_calls[0].arguments == {"query": "fallback"}
+
+
+def test_openai_responses_provider_streams_deltas_and_final_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeStream:
+        def __enter__(self) -> FakeStream:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def __iter__(self) -> Any:
+            return iter(
+                [
+                    SimpleNamespace(type="response.output_text.delta", delta="hello "),
+                    SimpleNamespace(type="response.output_text.delta", delta="world"),
+                ]
+            )
+
+        def get_final_response(self) -> Any:
+            return SimpleNamespace(
+                output_text="hello world",
+                output=[
+                    SimpleNamespace(
+                        type="function_call",
+                        name="memory.search",
+                        arguments='{"query":"stream"}',
+                        call_id="call_stream",
+                    )
+                ],
+                usage={"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                status="completed",
+            )
+
+    class FakeResponses:
+        def stream(self, **kwargs: Any) -> FakeStream:
+            assert kwargs["model"] == "gpt-test"
+            return FakeStream()
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+            self.responses = FakeResponses()
+
+    def fake_import(name: str) -> Any:
+        assert name == "openai"
+        return SimpleNamespace(OpenAI=FakeOpenAI)
+
+    monkeypatch.setattr("nested_memvid_agent.llm.openai_provider.import_module", fake_import)
+    provider = OpenAIResponsesProvider(model="gpt-test", api_key="test-key")
+
+    events = list(provider.stream([ChatMessage(role="user", content="hello")], tools=[]))
+
+    assert [event.content for event in events if event.type == "token"] == ["hello ", "world"]
+    tool_event = next(event for event in events if event.type == "tool_call")
+    assert tool_event.tool_call is not None
+    assert tool_event.tool_call.name == "memory.search"
+    assert events[-1].type == "message_complete"

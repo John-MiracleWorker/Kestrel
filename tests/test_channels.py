@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 from pathlib import Path
 
@@ -76,6 +78,40 @@ def test_custom_provider_uses_generic_webhook_adapter(tmp_path: Path) -> None:
     assert result.inbound.channel_id == "slack-work"
     assert result.turn.session_id == "channel:slack-work:T1"
     assert result.turn.assistant_message == "Mock response: hello custom channel"
+
+
+def test_channel_webhook_signature_gate_rejects_bad_signatures(tmp_path: Path, monkeypatch: object) -> None:
+    monkeypatch.setenv("KESTREL_WEBHOOK_SECRET", "secret")  # type: ignore[attr-defined]
+    channel = ChannelEndpointConfig(
+        id="signed",
+        provider="webhook",
+        settings={"signature_secret_env": "KESTREL_WEBHOOK_SECRET"},
+    )
+    manager = ChannelManager(_config(tmp_path), channel_configs=[channel])
+    payload = {"text": "hello signed channel", "conversation_id": "thread"}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    signature = hmac.new(b"secret", canonical, hashlib.sha256).hexdigest()
+
+    result = manager.handle_payload(
+        provider="webhook",
+        channel_id="signed",
+        payload=payload,
+        headers={"x-kestrel-signature": f"sha256={signature}"},
+    )
+
+    assert result.turn.assistant_message == "Mock response: hello signed channel"
+
+    try:
+        manager.handle_payload(
+            provider="webhook",
+            channel_id="signed",
+            payload=payload,
+            headers={"x-kestrel-signature": "sha256=bad"},
+        )
+    except Exception as exc:  # noqa: BLE001 - assert channel boundary error without importing pytest
+        assert "Invalid webhook signature" in str(exc)
+    else:
+        raise AssertionError("Expected invalid signature to be rejected")
 
 
 def test_server_exposes_channel_ingest_route(tmp_path: Path) -> None:

@@ -128,6 +128,41 @@ def test_high_risk_tool_with_allow_flag_still_requests_approval(tmp_path: Path) 
     assert result.error == "approval_required"
 
 
+def test_skill_install_requires_approval_and_writes_capsule_after_exact_approval(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    manifest = {
+        "id": "uploaded-review",
+        "name": "Uploaded Review",
+        "description": "Review uploaded tool changes.",
+        "risk": "low",
+        "runtime": {"type": "instruction"},
+    }
+    arguments = {"manifest": manifest, "instructions": "Review the task and return concise notes."}
+    call = ToolCall(name="skill.install", arguments=arguments, id="skill_install_exact")
+
+    pending = registry.execute(
+        call,
+        ToolContext(memory=memory, config=AgentConfig(allow_file_write=True, skills_dir=tmp_path / "skills"), workspace=tmp_path),
+    )
+    assert pending.error == "approval_required"
+
+    approved = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_file_write=True, skills_dir=tmp_path / "skills"),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"skill_install_exact"}),
+            approved_tool_call_arguments={"skill_install_exact": arguments},
+        ),
+    )
+
+    assert approved.success is True
+    assert (tmp_path / "skills" / "uploaded-review" / "skill.json").exists()
+    assert approved.data["installed"] is True
+
+
 def test_approved_exact_tool_call_runs_once_and_changed_args_do_not_run(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()

@@ -1,5 +1,8 @@
 import json
+import os
 import queue
+import secrets
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from importlib import import_module
@@ -31,6 +34,9 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
     FastAPI = fastapi_module.FastAPI
     HTTPException = fastapi_module.HTTPException
+    Depends = fastapi_module.Depends
+    Header = fastapi_module.Header
+    Request = fastapi_module.Request
     BaseModel = pydantic_module.BaseModel
     Field = pydantic_module.Field
     StreamingResponse = responses_module.StreamingResponse
@@ -45,6 +51,28 @@ def create_app(config: AgentConfig | None = None) -> Any:
     runs = RunManager(config=active_config, state=state, events=events, mcp=mcp, skills=skills)
     channels = ChannelManager(active_config)
 
+    def require_api_auth(
+        authorization: str | None = Header(default=None),
+        x_kestrel_api_key: str | None = Header(default=None),
+    ) -> bool:
+        if not active_config.require_api_auth:
+            return True
+        expected = os.getenv(active_config.api_auth_token_env, "").strip()
+        if not expected:
+            raise HTTPException(status_code=503, detail=f"Missing API auth token env: {active_config.api_auth_token_env}")
+        candidate = ""
+        if authorization and authorization.lower().startswith("bearer "):
+            candidate = authorization[7:].strip()
+        elif x_kestrel_api_key:
+            candidate = x_kestrel_api_key.strip()
+        if not candidate or not secrets.compare_digest(candidate, expected):
+            raise HTTPException(status_code=401, detail="Invalid or missing Kestrel API token.")
+        return True
+
+    def request_headers(request: object) -> Mapping[str, str]:
+        headers = getattr(request, "headers", {})
+        return headers if isinstance(headers, Mapping) else {}
+
     @asynccontextmanager
     async def lifespan(app_instance: Any) -> Any:
         del app_instance
@@ -53,7 +81,11 @@ def create_app(config: AgentConfig | None = None) -> Any:
         finally:
             mcp.shutdown()
 
-    app = FastAPI(title="Nested MV2 Agent", lifespan=lifespan)
+    app = FastAPI(
+        title="Nested MV2 Agent",
+        lifespan=lifespan,
+        dependencies=[Depends(require_api_auth)] if active_config.require_api_auth else [],
+    )
 
     class CreateRunRequest(BaseModel):  # type: ignore[valid-type,misc]
         message: str
@@ -94,6 +126,13 @@ def create_app(config: AgentConfig | None = None) -> Any:
         profile: str = "worker"
         goal: str
         task_id: str | None = None
+
+    class SchedulerStepRequest(BaseModel):  # type: ignore[valid-type,misc]
+        max_tasks: int | None = None
+
+    class SchedulerRunRequest(BaseModel):  # type: ignore[valid-type,misc]
+        max_tasks: int | None = None
+        max_cycles: int | None = None
 
     class MemorySearchRequest(BaseModel):  # type: ignore[valid-type,misc]
         query: str
@@ -142,6 +181,12 @@ def create_app(config: AgentConfig | None = None) -> Any:
         dry_run: bool = False
         include_policy: bool = False
 
+    class SkillInstallRequest(BaseModel):  # type: ignore[valid-type,misc]
+        manifest: dict[str, Any]
+        instructions: str
+        overwrite: bool = False
+        dry_run: bool = False
+
     @app.get("/api/health")  # type: ignore[untyped-decorator]
     def health() -> dict[str, object]:
         return {"ok": True, "name": active_config.name}
@@ -151,13 +196,14 @@ def create_app(config: AgentConfig | None = None) -> Any:
         return channels.list_channels()
 
     @app.post("/api/channels/ingest")  # type: ignore[untyped-decorator]
-    def ingest_channel(request: ChannelIngestRequest) -> dict[str, object]:
+    def ingest_channel(request: ChannelIngestRequest, http_request: Request) -> dict[str, object]:  # type: ignore[valid-type]
         try:
             return channels.handle_payload(
                 provider=request.provider,
                 channel_id=request.channel_id,
                 payload=request.payload,
                 send=request.send,
+                headers=request_headers(http_request),
             ).to_public_dict()
         except ChannelPayloadError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -165,6 +211,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
     @app.post("/api/channels/{provider}/webhook")  # type: ignore[untyped-decorator]
     def channel_webhook(
         provider: str,
+        request: Request,  # type: ignore[valid-type]
         payload: dict[str, Any],
         channel_id: str | None = None,
         send: bool | None = None,
@@ -175,6 +222,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 channel_id=channel_id,
                 payload=payload,
                 send=send,
+                headers=request_headers(request),
             ).to_public_dict()
         except ChannelPayloadError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -222,6 +270,20 @@ def create_app(config: AgentConfig | None = None) -> Any:
     def approve_task(run_id: str, request: dict[str, str]) -> dict[str, object]:
         try:
             return runs.approve_task(run_id, str(request["task_id"]))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/scheduler/step")  # type: ignore[untyped-decorator]
+    def scheduler_step(run_id: str, request: SchedulerStepRequest) -> dict[str, object]:
+        try:
+            return runs.run_scheduler_step(run_id, max_tasks=request.max_tasks)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/scheduler/run")  # type: ignore[untyped-decorator]
+    def scheduler_run(run_id: str, request: SchedulerRunRequest) -> dict[str, object]:
+        try:
+            return runs.run_scheduler_until_idle(run_id, max_tasks=request.max_tasks, max_cycles=request.max_cycles)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -383,6 +445,15 @@ def create_app(config: AgentConfig | None = None) -> Any:
     @app.post("/api/skills/discover")  # type: ignore[untyped-decorator]
     def discover_skills() -> list[dict[str, object]]:
         return skills.discover()
+
+    @app.post("/api/skills/install")  # type: ignore[untyped-decorator]
+    def install_skill(request: SkillInstallRequest) -> dict[str, object]:
+        execution = runs.invoke_tool(
+            tool_name="skill.install",
+            arguments=request.model_dump(),
+            session_id="api",
+        )
+        return _tool_response_payload(execution)
 
     @app.post("/api/skills/{skill_id}/enable")  # type: ignore[untyped-decorator]
     def enable_skill(skill_id: str) -> dict[str, object]:

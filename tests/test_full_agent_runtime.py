@@ -22,6 +22,7 @@ from nested_memvid_agent.runtime_models import AgentTurnResult, LLMResponse, Too
 from nested_memvid_agent.server import create_app
 from nested_memvid_agent.skill_manager import SkillManager, validate_skill_manifest
 from nested_memvid_agent.state_store import AgentStateStore
+from nested_memvid_agent.tools.base import ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
 
 
@@ -604,6 +605,30 @@ def test_server_exposes_observability_routes(tmp_path: Path) -> None:
     assert "memory.write" in log_types
 
 
+def test_server_api_auth_requires_configured_token(tmp_path: Path, monkeypatch: Any) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("KESTREL_TEST_API_TOKEN", "secret-token")
+    config = AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        state_path=tmp_path / "state.db",
+        skills_dir=tmp_path / "skills",
+        workspace=tmp_path,
+        require_api_auth=True,
+        api_auth_token_env="KESTREL_TEST_API_TOKEN",
+    )
+    client = TestClient(create_app(config))
+
+    assert client.get("/api/health").status_code == 401
+    authorized = client.get("/api/health", headers={"Authorization": "Bearer secret-token"})
+    assert authorized.status_code == 200
+    assert authorized.json()["ok"] is True
+
+
 def test_skill_discovery_exposes_nested_learning_skill(tmp_path: Path) -> None:
     state = AgentStateStore(tmp_path / "state.db")
     skill_dir = tmp_path / "skills" / "review"
@@ -666,6 +691,39 @@ def test_skill_manifest_validation_records_provenance_and_rejects_invalid_skill(
     assert len(manifest["provenance"]["manifest_sha256"]) == 64
     assert manager.validation_errors[0]["errors"] == ["missing_description", "invalid_risk"]
     assert manager.tool_adapters()[0].spec.risk == "low"
+
+
+def test_python_skill_runtime_executes_in_skill_directory(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    skill_dir = tmp_path / "skills" / "python-review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "skill.json").write_text(
+        json.dumps(
+            {
+                "id": "python-review",
+                "name": "Python Review",
+                "description": "Run a tiny Python skill.",
+                "risk": "low",
+                "runtime": {"type": "python", "entrypoint": "skill.py", "timeout": 5},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (skill_dir / "SKILL.md").write_text("Read stdin JSON and respond.", encoding="utf-8")
+    (skill_dir / "skill.py").write_text(
+        "import json, sys\npayload=json.loads(sys.stdin.read())\nprint('skill saw ' + payload['task'])\n",
+        encoding="utf-8",
+    )
+    manager = SkillManager(tmp_path / "skills", state)
+    manager.discover()
+    adapter = manager.tool_adapters()[0]
+    memory = build_memory_system("memory", tmp_path / "memory")
+
+    result = adapter.run({"task": "scheduler output"}, ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path))
+
+    assert result.success is True
+    assert "skill saw scheduler output" in result.content
+    assert result.data["runtime"] == "python"
 
 
 def test_validate_skill_manifest_rejects_bad_shapes() -> None:
@@ -925,6 +983,99 @@ def test_run_manager_ready_tasks_block_failed_retries_until_strategy_changes(tmp
     assert retry_candidate["scheduler_reason"] == "retry_strategy_changed"
 
 
+def test_run_manager_scheduler_step_executes_ready_child_task(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    run = manager.create_run(message="Inspect the repo with the scheduler", session_id="session")
+    final = _wait_for_status(manager, run.run_id, {"completed", "failed"})
+    assert final["status"] == "completed"
+
+    step = manager.run_scheduler_step(run.run_id, max_tasks=1)
+
+    assert len(step["executed"]) == 1
+    executed = step["executed"][0]
+    assert executed["status"] == "completed"
+    task = manager.state.get_task_node(str(executed["task_id"]))
+    assert task.status == "completed"
+    assert "Mock response" in str(task.result)
+    graph = manager.task_graph(run.run_id)
+    assert graph["subagents"]
+
+
+def test_run_manager_scheduler_step_drains_newly_ready_dependencies(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    run = manager.create_run(message="Complete a low-risk autonomous chain", session_id="session")
+    final = _wait_for_status(manager, run.run_id, {"completed", "failed"})
+    assert final["status"] == "completed"
+
+    step = manager.run_scheduler_step(run.run_id, max_tasks=3)
+
+    assert [item["status"] for item in step["executed"]] == ["completed", "completed", "completed"]
+    executed_titles = [
+        manager.state.get_task_node(str(item["task_id"])).title
+        for item in step["executed"]
+    ]
+    assert executed_titles == ["Inspect context", "Execute and validate", "Review outcome"]
+    assert step["remaining_ready_tasks"] == []
+    root = next(task for task in manager.state.list_task_nodes(run.run_id) if task.parent_id is None)
+    assert root.status == "completed"
+
+
+def test_run_manager_scheduler_until_idle_spans_bounded_cycles(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    run = manager.create_run(message="Drain a low-risk chain over cycles", session_id="session")
+    final = _wait_for_status(manager, run.run_id, {"completed", "failed"})
+    assert final["status"] == "completed"
+
+    scheduler = manager.run_scheduler_until_idle(run.run_id, max_tasks=1, max_cycles=5)
+
+    assert scheduler["stop_reason"] == "idle"
+    assert scheduler["cycles"] == 3
+    assert [item["status"] for item in scheduler["executed"]] == ["completed", "completed", "completed"]
+    assert scheduler["remaining_ready_tasks"] == []
+
+
+def test_autonomous_scheduler_completes_low_risk_run_without_manual_steps(tmp_path: Path) -> None:
+    manager = _manager(
+        tmp_path,
+        enable_autonomous_scheduler=True,
+        max_scheduler_tasks=1,
+        max_scheduler_cycles=5,
+    )
+    run = manager.create_run(message="Complete the autonomous low-risk chain", session_id="session")
+    final = _wait_for_status(manager, run.run_id, {"completed", "failed", "blocked"})
+
+    assert final["status"] == "completed"
+    graph = manager.task_graph(run.run_id)
+    child_statuses = [task["status"] for task in graph["tasks"] if task["parent_id"] is not None]
+    assert child_statuses == ["completed", "completed", "completed"]
+    assert graph["approval_blocked_tasks"] == []
+
+
+def test_autonomous_scheduler_blocks_for_task_approval_and_resumes(tmp_path: Path) -> None:
+    manager = _manager(
+        tmp_path,
+        enable_autonomous_scheduler=True,
+        max_scheduler_tasks=2,
+        max_scheduler_cycles=5,
+    )
+    run = manager.create_run(message="Fix a failing test, validate it, and commit it", session_id="session")
+    blocked = _wait_for_status(manager, run.run_id, {"completed", "failed", "blocked"})
+
+    assert blocked["status"] == "blocked"
+    graph = manager.task_graph(run.run_id)
+    blocked_titles = [task["title"] for task in graph["approval_blocked_tasks"]]
+    assert blocked_titles == ["Prepare repair isolation"]
+
+    approved = manager.approve_task(run.run_id, str(graph["approval_blocked_tasks"][0]["task_id"]))
+
+    assert approved["scheduler"]["stop_reason"] == "task_approval_required"
+    resumed = manager.get_run(run.run_id)
+    assert resumed["status"] == "blocked"
+    next_graph = manager.task_graph(run.run_id)
+    next_blocked_titles = [task["title"] for task in next_graph["approval_blocked_tasks"]]
+    assert next_blocked_titles == ["Apply repair patch"]
+
+
 def test_run_manager_trace_includes_context_memory_and_tool_events(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     run = manager.create_run(message="hello", session_id="session")
@@ -1124,7 +1275,14 @@ class _SlowMCPContext:
         return None
 
 
-def _manager(tmp_path: Path, *, stream: bool = False) -> RunManager:
+def _manager(
+    tmp_path: Path,
+    *,
+    stream: bool = False,
+    enable_autonomous_scheduler: bool = False,
+    max_scheduler_tasks: int = 3,
+    max_scheduler_cycles: int = 5,
+) -> RunManager:
     config = AgentConfig(
         backend="memory",
         provider="mock",
@@ -1135,6 +1293,9 @@ def _manager(tmp_path: Path, *, stream: bool = False) -> RunManager:
         skills_dir=tmp_path / "skills",
         workspace=tmp_path,
         stream=stream,
+        enable_autonomous_scheduler=enable_autonomous_scheduler,
+        max_scheduler_tasks=max_scheduler_tasks,
+        max_scheduler_cycles=max_scheduler_cycles,
     )
     state = AgentStateStore(config.state_path)
     events = RunEventBus(state)

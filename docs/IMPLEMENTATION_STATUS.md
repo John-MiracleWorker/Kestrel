@@ -12,6 +12,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - MV2 context-frame model and token-aware pseudo-context packer that retrieves summaries first, deduplicates content, flags conflict metadata, and expands raw evidence on demand.
 - Deterministic mock provider for fast tests and reproducible golden evals.
 - OpenAI Responses provider adapter using the portable JSON tool envelope.
+- OpenAI Responses provider now exposes native streaming deltas when the SDK stream surface is available, while preserving the non-streaming fallback path.
 - OpenAI-compatible chat completions provider for local/model-server endpoints.
 - Codex CLI provider that can use local `codex exec` as the normal response engine.
 - Provider capability metadata is exposed on built-in providers, and a retryable-error fallback wrapper can route from a primary provider to a configured secondary provider.
@@ -32,6 +33,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - First task-graph and subagent run records exist, with durable task metadata, deterministic starter plan decomposition, in-process planner/worker/reviewer profiles, and UI/API surfaces.
 - Task nodes can now persist latest failure diagnosis and retry strategy metadata; failed subagents classify the failure, record a retry gate that requires changed strategy, and emit a diagnosis event tied back to the task.
 - The task graph now exposes deterministic `ready_tasks` for scheduler/resume work: only approved queued/approved tasks with completed dependencies are eligible, and failed retry tasks remain blocked until their retry strategy explicitly allows a changed strategy.
+- An opt-in autonomous scheduler can execute approved ready task nodes through the normal agent loop, drain bounded dependency cycles until idle, publish task/subagent events, and preserve approval blocking for high-risk tool calls.
 - Provider failures emit structured `diagnosis.classified` events so traces can explain the failure category and suggested playbook.
 - Repair mutation tools are high-risk, approval-gated, covered by exact-call approvals, disabled unless the matching capability is enabled, and refuse non-repair branches for patch/validate/rollback operations.
 - Diagnosis-gated repair validation must remain approval-gated, refuse non-repair branches, recall similar lessons on failure, and block repeated validation retries when prior lessons exist unless a changed strategy is supplied.
@@ -41,26 +43,31 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Exact-call approved repair commits now stage only the reviewed repair files, complete after the current `repair.review` gate, and return the resulting `commit_sha` for traceability.
 - Terminal run records and approval decisions are replay-safe: late duplicate terminal transitions cannot overwrite original run results, and already-decided approval records cannot be flipped by replayed decisions.
 - Approval resume flow now records the executed tool result back onto the already-approved approval record without reopening or flipping the decision, and a full-flow smoke test covers run creation, approval blocking, exact-call approval, resume, tool result persistence, traces, task graph, and capsule creation together.
+- Skills can now run instruction, Python, and shell-list runtimes from their skill directory with path checks, JSON stdin, timeout bounds, and provenance-backed episodic records; container runtime remains intentionally unavailable.
+- `skill.install` provides an approval-gated local upload/install path for new skill capsules under the configured skills directory, with manifest validation and content hashes.
+- The FastAPI control plane can require bearer/API-key auth via `NEST_AGENT_REQUIRE_API_AUTH=1` and a token environment variable.
+- Generic/custom channel endpoints can require HMAC-SHA256 webhook signatures using a per-channel secret environment variable.
+- Shell/test/repair validation commands normalize `python`/`python3` to the active interpreter so autonomous validation is stable across local environments.
 
 ## Partially Implemented
 
-- Streaming/provider parity: the runtime, CLI, and web run event bus accept stream events, and provider capability metadata exists. Native streaming deltas and richer per-provider context/JSON-mode details still need hardening.
+- Streaming/provider parity: OpenAI Responses streaming deltas are implemented. OpenAI-compatible/local provider streaming and richer per-provider context/JSON-mode details still need hardening.
 - MCP: stdio live sessions are hardened and covered by a flag-gated integration test. SSE and streamable HTTP use the same manager path but still need real transport fixtures and production soak testing.
-- Skills: filesystem discovery, manifest validation, provenance metadata, and skill tool adapters exist. Sandboxed skill execution remains incomplete.
+- Skills: filesystem discovery, manifest validation, provenance metadata, upload/install, and instruction/Python/shell-list runtimes exist. Container-grade isolation and package dependency management remain incomplete.
 - Codex CLI: `codex-cli` can drive responses and `codex.exec` is available as a high-risk approval-gated tool. It is not yet a branch-isolated autonomous repair loop.
 - Consolidation: capsule extraction and Nested Learning decisions exist, but auto-consolidation remains disabled by default and validation loops are still basic.
 - Self-diagnosis: first-pass classification and memory recall tools exist. A full executor retry gate that forces changed strategy before every retry is still incomplete.
 - Self-modification: the runtime can record validated self-improvement signals and policy candidates, but code changes and policy writes still require explicit gates.
 - Safe repair: branch preparation, patch application, targeted validation, diagnosis-gated retry assessment, status reporting, and rollback primitives exist. Full autonomous patch proposal, reviewer gating, and approval-before-commit orchestration are still incomplete.
-- Subagents: local subagent runs can be queued and tracked. True branch/worktree isolation and Codex-backed worker fan-out are still next steps.
-- Channels: inbound normalization and dry-run reply payloads are implemented. Production bot identity verification, Discord Gateway reads, and channel-specific rate-limit handling still need hardening.
+- Subagents: local subagent runs can be queued, tracked, and executed by scheduler runs until idle. True branch/worktree isolation and Codex-backed worker fan-out are still next steps.
+- Channels: inbound normalization, dry-run reply payloads, and generic HMAC webhook verification are implemented. Production bot identity verification, Discord Gateway reads, and channel-specific rate-limit handling still need hardening.
 
 ## Not Done Yet
 
-- Native OpenAI streaming deltas and broader provider integration tests for OpenRouter/Anthropic/Ollama-style adapters.
-- Full durable multi-step planner/executor/reviewer loop with automated execution of scheduler-selected tasks and reviewer gates.
-- Production authentication, authorization, and user/session isolation for the UI/API.
-- Production webhook signature verification and secret rotation for external channel endpoints.
+- Broader provider integration tests for OpenRouter/Anthropic/Ollama-style adapters and native streaming for non-OpenAI providers.
+- Planner/executor/reviewer loop that can revise plans dynamically, enforce reviewer gates across repair branches, and coordinate isolated workers instead of only draining the deterministic starter DAG.
+- Production authorization and user/session isolation for the UI/API beyond the local shared-token gate.
+- Bot-platform-native signature/identity verification and secret rotation workflows for external channel endpoints.
 - Robust MCP SSE/streamable HTTP transport fixtures and failure-recovery soak testing.
 - Container-grade sandboxed skill execution.
 - Autonomous self-improvement with diff review, test gates, rollback, and explicit human approval.
@@ -69,6 +76,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 ## Current Contract
 
 - High-risk tools require both capability enablement (matching allow flag, where applicable) and explicit approval for the exact tool-call ID and arguments before execution.
+- Autonomous scheduling is opt-in and bounded by `max_scheduler_tasks` / `NEST_AGENT_MAX_SCHEDULER_TASKS` per cycle and `max_scheduler_cycles` / `NEST_AGENT_MAX_SCHEDULER_CYCLES` per drain run.
 - Cancelled runs must not transition to completed, blocked, or failed after cancellation; lifecycle updates should use the guarded state transition helper.
 - Completed, failed, and cancelled runs are immutable even for repeated same-status transition attempts; approval requests are immutable after leaving `pending`.
 - Tool execution is bounded by `tool_timeout_seconds` / `NEST_AGENT_TOOL_TIMEOUT_SECONDS` and timeout failures are returned as structured tool errors.

@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
 from importlib import import_module
 from typing import Any
 
-from ..runtime_models import ChatMessage, LLMOptions, LLMResponse, ToolCall, ToolSpec
+from ..runtime_models import (
+    ChatMessage,
+    LLMOptions,
+    LLMResponse,
+    LLMStreamEvent,
+    ToolCall,
+    ToolSpec,
+)
 from .base import LLMProvider, ProviderCapabilities, ProviderError
 from .parser import parse_agent_response
 
@@ -39,7 +47,7 @@ class OpenAIResponsesProvider(LLMProvider):
         return ProviderCapabilities(
             name="openai",
             supports_native_tools=True,
-            supports_streaming=False,
+            supports_streaming=True,
             supports_json_mode=True,
             supports_system_messages=True,
             token_usage_available=True,
@@ -67,19 +75,78 @@ class OpenAIResponsesProvider(LLMProvider):
             timeout=active_options.timeout_seconds,
             max_retries=active_options.max_retries,
         )
-        input_payload: Any = [msg.to_openai_dict() for msg in messages]
-        request: dict[str, Any] = {
-            "model": self.model,
-            "input": input_payload,
-            "temperature": active_options.temperature,
-        }
-        if tools:
-            request["tools"] = [_to_responses_tool(tool) for tool in tools]
+        request = self._request_payload(messages, tools, active_options)
         try:
             response = client.responses.create(**request)
         except Exception as exc:  # noqa: BLE001 - provider boundary maps SDK failures
             raise ProviderError(str(exc), code=type(exc).__name__, retryable=True) from exc
         return _responses_to_llm_response(response)
+
+    def stream(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec],
+        options: LLMOptions | None = None,
+    ) -> Iterator[LLMStreamEvent]:
+        active_options = options or LLMOptions(
+            timeout_seconds=self.timeout_seconds,
+            max_retries=self.max_retries,
+            temperature=self.temperature,
+            stream=True,
+        )
+        try:
+            openai_module = import_module("openai")
+        except ImportError as exc:
+            raise RuntimeError("Install the OpenAI SDK with `pip install openai`.") from exc
+
+        client = openai_module.OpenAI(
+            api_key=self.api_key,
+            timeout=active_options.timeout_seconds,
+            max_retries=active_options.max_retries,
+        )
+        stream_fn = getattr(client.responses, "stream", None)
+        if not callable(stream_fn):
+            yield from super().stream(messages, tools, active_options)
+            return
+        try:
+            final_response: Any | None = None
+            with stream_fn(**self._request_payload(messages, tools, active_options)) as stream:
+                for event in stream:
+                    delta = _stream_text_delta(event)
+                    if delta:
+                        yield LLMStreamEvent(type="token", content=delta)
+                get_final = getattr(stream, "get_final_response", None)
+                if callable(get_final):
+                    final_response = get_final()
+            if final_response is not None:
+                response = _responses_to_llm_response(final_response)
+                for tool_call in response.tool_calls:
+                    yield LLMStreamEvent(type="tool_call", tool_call=tool_call)
+                if response.usage:
+                    yield LLMStreamEvent(type="usage", data=response.usage)
+                yield LLMStreamEvent(type="message_complete", response=response)
+        except Exception as exc:  # noqa: BLE001
+            yield LLMStreamEvent(
+                type="provider_error",
+                content=str(exc),
+                data={"code": type(exc).__name__, "retryable": True},
+            )
+            raise ProviderError(str(exc), code=type(exc).__name__, retryable=True) from exc
+
+    def _request_payload(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec],
+        options: LLMOptions,
+    ) -> dict[str, Any]:
+        request: dict[str, Any] = {
+            "model": self.model,
+            "input": [msg.to_openai_dict() for msg in messages],
+            "temperature": options.temperature,
+        }
+        if tools:
+            request["tools"] = [_to_responses_tool(tool) for tool in tools]
+        return request
 
 
 def _to_responses_tool(tool: ToolSpec) -> dict[str, Any]:
@@ -145,6 +212,21 @@ def _response_tool_calls(response: Any) -> list[ToolCall]:
             )
         )
     return calls
+
+
+def _stream_text_delta(event: Any) -> str:
+    event_type = str(_item_value(event, "type") or "")
+    if event_type not in {
+        "response.output_text.delta",
+        "response.refusal.delta",
+        "output_text.delta",
+        "text_delta",
+    }:
+        return ""
+    delta = _item_value(event, "delta")
+    if delta is None:
+        delta = _item_value(event, "text")
+    return "" if delta is None else str(delta)
 
 
 def _arguments_dict(raw: Any) -> dict[str, Any]:
