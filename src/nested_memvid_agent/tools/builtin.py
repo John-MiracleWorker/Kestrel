@@ -875,6 +875,98 @@ class LintRunTool(AgentTool):
             return self._result(call, success=False, content=str(exc), error="lint_run_failed")
 
 
+class RepairPrepareTool(AgentTool):
+    spec = ToolSpec(
+        name="repair.prepare",
+        description="Prepare an isolated repair branch from the current clean workspace and record the base SHA. Requires approval.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "branch": {"type": "string"},
+                "allow_dirty": {"type": "boolean"},
+            },
+            "required": ["branch"],
+        },
+        risk="high",
+        requires_approval=True,
+        capabilities=("safe-repair", "git-isolation"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        branch = str(arguments.get("branch", "")).strip()
+        if not branch:
+            return self._result(call, success=False, content="Missing branch", error="missing_branch")
+        if not _safe_branch_name(branch):
+            return self._result(call, success=False, content=f"Unsafe branch name: {branch}", error="unsafe_branch_name")
+        try:
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=context.workspace,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if base.returncode != 0:
+                return self._result(
+                    call,
+                    success=False,
+                    content=f"Unable to resolve base SHA. STDERR:\n{base.stderr}",
+                    error="git_base_failed",
+                    data={"returncode": base.returncode},
+                )
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=context.workspace,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if status.returncode != 0:
+                return self._result(
+                    call,
+                    success=False,
+                    content=f"Unable to inspect worktree. STDERR:\n{status.stderr}",
+                    error="git_status_failed",
+                    data={"returncode": status.returncode},
+                )
+            if status.stdout.strip() and not bool(arguments.get("allow_dirty", False)):
+                return self._result(
+                    call,
+                    success=False,
+                    content="Refusing to prepare repair branch with uncommitted changes.",
+                    error="dirty_worktree",
+                    data={"dirty_status": status.stdout},
+                )
+            created = subprocess.run(
+                ["git", "switch", "-c", branch],
+                cwd=context.workspace,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            content = f"exit_code={created.returncode}\nSTDOUT:\n{created.stdout}\nSTDERR:\n{created.stderr}"
+            success = created.returncode == 0
+            return self._result(
+                call,
+                success=success,
+                content=content,
+                data={
+                    "mode": "branch",
+                    "branch": branch,
+                    "base_sha": base.stdout.strip(),
+                    "returncode": created.returncode,
+                    "approval_required_before_commit": True,
+                },
+                error=None if success else "repair_prepare_failed",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="repair_prepare_failed")
+
+
 class GitStatusTool(AgentTool):
     spec = ToolSpec(
         name="git.status",
@@ -1379,6 +1471,7 @@ def build_default_tools() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(DiagnosisClassifyTool())
     registry.register(DiagnosisRecallTool())
+    registry.register(RepairPrepareTool())
     registry.register(MemorySearchTool())
     registry.register(MemoryWriteTool())
     registry.register(ContextPackTool())
@@ -1409,6 +1502,15 @@ def build_default_tools() -> ToolRegistry:
     registry.register(MemoryExportTool())
     registry.register(MemoryImportTool())
     return registry
+
+
+def _safe_branch_name(name: str) -> bool:
+    if not name or name.startswith(("-", "/")) or name.endswith(("/", ".", ".lock")):
+        return False
+    if ".." in name or "//" in name or "@{" in name or "\\" in name:
+        return False
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/-")
+    return all(char in allowed for char in name)
 
 
 def _safe_path(root: Path, relative: str) -> Path:

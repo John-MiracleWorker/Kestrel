@@ -227,10 +227,89 @@ def test_diagnosis_recall_searches_prior_failure_lessons(tmp_path: Path) -> None
     assert "PYTHONPATH=src" in result.content
 
 
+def test_repair_prepare_requires_approval_even_when_file_write_enabled(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+
+    result = registry.execute(
+        ToolCall(name="repair.prepare", arguments={"branch": "codex/repair-test"}, id="repair1"),
+        ToolContext(memory=memory, config=AgentConfig(allow_file_write=True), workspace=tmp_path),
+    )
+
+    assert not result.success
+    assert result.error == "approval_required"
+
+
+def test_repair_prepare_creates_approved_branch_from_clean_repo(tmp_path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "README.md").write_text("seed\n")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(name="repair.prepare", arguments={"branch": "codex/repair-test"}, id="repair_prepare")
+
+    result = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_file_write=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"repair_prepare"}),
+            approved_tool_call_arguments={"repair_prepare": {"branch": "codex/repair-test"}},
+        ),
+    )
+
+    assert result.success
+    assert result.data["branch"] == "codex/repair-test"
+    assert result.data["base_sha"]
+    assert result.data["mode"] == "branch"
+    current = subprocess.run(["git", "branch", "--show-current"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    assert current.stdout.strip() == "codex/repair-test"
+
+
+def test_repair_prepare_refuses_dirty_repo_by_default(tmp_path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "README.md").write_text("seed\n")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (tmp_path / "dirty.txt").write_text("uncommitted\n")
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(name="repair.prepare", arguments={"branch": "codex/dirty-test"}, id="repair_dirty")
+
+    result = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_file_write=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"repair_dirty"}),
+            approved_tool_call_arguments={"repair_dirty": {"branch": "codex/dirty-test"}},
+        ),
+    )
+
+    assert not result.success
+    assert result.error == "dirty_worktree"
+
+
 def test_default_registry_includes_spec_tools() -> None:
     registry = build_default_tools()
     names = {spec.name for spec in registry.specs()}
     assert {
+        "repair.prepare",
         "diagnosis.classify",
         "diagnosis.recall",
         "repo.search",
