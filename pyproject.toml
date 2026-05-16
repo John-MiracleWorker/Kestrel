@@ -47,3 +47,7 @@ python_version = "3.11"
 strict = true
 warn_unused_ignores = true
 exclude = ["build", "dist"]
+
+[[tool.mypy.overrides]]
+module = ["uvicorn"]
+ignore_missing_imports = true
