@@ -95,6 +95,7 @@ class MCPManager:
             row["last_synced_at"] = _now()
             row["tool_count"] = len(tools)
             row["capabilities"] = _capabilities_from_tools(tools)
+            row["vetting"] = _vetting_for_server(_server_from_state(row), tools)
             row["failure_count"] = 0
             row["last_latency_ms"] = _elapsed_ms(started)
             return {"ok": True, "message": f"Connected and discovered {len(tools)} tools.", "server": self.state.upsert_mcp_server(row)}
@@ -139,6 +140,7 @@ class MCPManager:
             row["last_seen_at"] = _now()
             row["tool_count"] = len(tools)
             row["capabilities"] = _capabilities_from_tools(tools)
+            row["vetting"] = _vetting_for_server(_server_from_state(row), tools)
             row["failure_count"] = 0
             row["last_latency_ms"] = _elapsed_ms(started)
             return {"ok": True, "message": "Live MCP session is healthy.", "server": self.state.upsert_mcp_server(row)}
@@ -161,6 +163,7 @@ class MCPManager:
             server["last_seen_at"] = _now()
             server["tool_count"] = len(tools)
             server["capabilities"] = _capabilities_from_tools(tools)
+            server["vetting"] = _vetting_for_server(_server_from_state(server), tools)
             server["failure_count"] = 0
             server["last_latency_ms"] = _elapsed_ms(started)
         except Exception as exc:  # noqa: BLE001 - stored for UI visibility
@@ -456,6 +459,8 @@ def _normalize_server(payload: dict[str, Any]) -> MCPServerConfig:
 
 
 def _server_to_dict(server: MCPServerConfig) -> dict[str, Any]:
+    vetted_tools = [_normalize_tool(server, tool) for tool in server.tools]
+    vetting = _vetting_for_server(server, vetted_tools)
     return {
         "id": server.id,
         "name": server.name,
@@ -465,12 +470,14 @@ def _server_to_dict(server: MCPServerConfig) -> dict[str, Any]:
         "env": server.env or {},
         "url": server.url,
         "enabled": server.enabled,
-        "tools": list(server.tools),
+        "tools": vetted_tools,
         "status": "configured",
         "error": None,
         "risk_policy": server.risk_policy,
         "session_state": "disconnected",
         "failure_count": 0,
+        "capabilities": _capabilities_from_tools(vetted_tools),
+        "vetting": vetting,
     }
 
 
@@ -540,13 +547,89 @@ def _normalize_sdk_tool(server: MCPServerConfig, tool: Any) -> dict[str, Any]:
 
 
 def _risk_fields(server: MCPServerConfig, tool: dict[str, Any]) -> tuple[RiskLevel, bool]:
+    inferred = _infer_tool_risk(tool)
     if server.risk_policy == MCP_TRUST_MANIFEST_POLICY or bool(tool.get("trusted") or tool.get("allow_autonomous")):
-        risk = _risk_level(tool.get("risk", "low"))
+        risk = _max_risk(_risk_level(tool.get("risk", "low")), inferred)
         return risk, bool(tool.get("requires_approval", risk in {"medium", "high"}))
-    risk = _risk_level(tool.get("risk", "medium"))
+    risk = _max_risk(_risk_level(tool.get("risk", "medium")), inferred)
     if risk == "low":
         risk = "medium"
     return risk, True
+
+
+def _infer_tool_risk(tool: dict[str, Any]) -> RiskLevel:
+    name = str(tool.get("remote_name") or tool.get("name") or "").lower()
+    description = str(tool.get("description") or "").lower()
+    haystack = f"{name} {description}"
+    high_markers = (
+        "write",
+        "delete",
+        "remove",
+        "patch",
+        "apply",
+        "commit",
+        "push",
+        "shell",
+        "exec",
+        "command",
+        "filesystem",
+        "file",
+        "secret",
+        "token",
+        "credential",
+    )
+    if any(marker in haystack for marker in high_markers):
+        return "high"
+    network_markers = ("http", "request", "fetch", "post", "send", "email", "message")
+    if any(marker in haystack for marker in network_markers):
+        return "medium"
+    return "low"
+
+
+def _max_risk(left: RiskLevel, right: RiskLevel) -> RiskLevel:
+    order = {"low": 0, "medium": 1, "high": 2}
+    return left if order[left] >= order[right] else right
+
+
+def _vetting_for_server(server: MCPServerConfig, tools: list[dict[str, Any]]) -> dict[str, Any]:
+    secrets = sorted(key for key in (server.env or {}) if _looks_secret(key))
+    network_access = server.transport in {"sse", "streamable_http"} or bool(server.url)
+    risk_reasons: list[str] = []
+    if network_access:
+        risk_reasons.append("network")
+    if secrets:
+        risk_reasons.append("secrets")
+    if server.transport not in {"stdio", "sse", "streamable_http"}:
+        risk_reasons.append("unknown_transport")
+    if any(str(tool.get("risk")) == "high" for tool in tools):
+        risk_reasons.append("high_risk_tools")
+    if server.risk_policy != MCP_TRUST_MANIFEST_POLICY:
+        risk_reasons.append("approval_by_default")
+    recommended_trust = "approval_required" if risk_reasons else "low_risk"
+    return {
+        "server_id": server.id,
+        "transport": server.transport,
+        "network_access": network_access,
+        "secrets_required": secrets,
+        "risk_policy": server.risk_policy,
+        "recommended_trust": recommended_trust,
+        "risk_reasons": sorted(set(risk_reasons)),
+        "tools": [
+            {
+                "name": str(tool.get("remote_name") or tool.get("name")),
+                "registered_name": str(tool.get("name")),
+                "risk": str(tool.get("risk", "medium")),
+                "requires_approval": bool(tool.get("requires_approval", True)),
+                "capabilities": list(tool.get("capabilities", [])),
+            }
+            for tool in tools
+        ],
+    }
+
+
+def _looks_secret(name: str) -> bool:
+    upper = name.upper()
+    return any(marker in upper for marker in ("TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL"))
 
 
 def _risk_level(value: object) -> RiskLevel:

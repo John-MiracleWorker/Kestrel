@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def utc_now() -> str:
@@ -310,6 +310,7 @@ class AgentStateStore:
             "last_error_at": server.get("last_error_at"),
             "failure_count": int(server.get("failure_count", 0)),
             "last_latency_ms": server.get("last_latency_ms"),
+            "vetting_json": json.dumps(server.get("vetting", {})),
             "updated_at": now,
         }
         with self._connect() as conn:
@@ -319,8 +320,8 @@ class AgentStateStore:
                     id, name, transport, command, args_json, env_json, url, enabled,
                     tools_json, status, error, last_synced_at, last_seen_at, tool_count,
                     capabilities_json, risk_policy, secret_env_json, session_state, last_call_at,
-                    last_error_at, failure_count, last_latency_ms, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_error_at, failure_count, last_latency_ms, vetting_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     transport = excluded.transport,
@@ -343,6 +344,7 @@ class AgentStateStore:
                     last_error_at = excluded.last_error_at,
                     failure_count = excluded.failure_count,
                     last_latency_ms = excluded.last_latency_ms,
+                    vetting_json = excluded.vetting_json,
                     updated_at = excluded.updated_at
                 """,
                 (server_id, *payload.values()),
@@ -568,6 +570,9 @@ class AgentStateStore:
             if current < 4:
                 _apply_schema_v4(conn)
                 current = 4
+            if current < 5:
+                _apply_schema_v5(conn)
+                current = 5
             if current < SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported schema migration target: {current} -> {SCHEMA_VERSION}")
             if current == SCHEMA_VERSION:
@@ -749,6 +754,12 @@ def _apply_schema_v4(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE task_nodes ADD COLUMN {name} {definition}")
 
 
+def _apply_schema_v5(conn: sqlite3.Connection) -> None:
+    existing = _columns(conn, "mcp_servers")
+    if "vetting_json" not in existing:
+        conn.execute("ALTER TABLE mcp_servers ADD COLUMN vetting_json TEXT NOT NULL DEFAULT '{}'")
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -825,6 +836,7 @@ def _mcp_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "last_error_at": _row_get(row, "last_error_at"),
         "failure_count": int(str(_row_get(row, "failure_count", 0) or 0)),
         "last_latency_ms": _row_get(row, "last_latency_ms"),
+        "vetting": json.loads(str(_row_get(row, "vetting_json", "{}") or "{}")),
         "updated_at": str(row["updated_at"]),
     }
 

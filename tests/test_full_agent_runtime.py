@@ -167,7 +167,7 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     state = AgentStateStore(db_path)
 
-    assert state.schema_version() == 4
+    assert state.schema_version() == 5
     with sqlite3.connect(db_path) as conn:
         run_indexes = {row[1] for row in conn.execute("PRAGMA index_list('runs')").fetchall()}
         approval_indexes = {row[1] for row in conn.execute("PRAGMA index_list('approval_requests')").fetchall()}
@@ -188,6 +188,7 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
         "last_error_at",
         "failure_count",
         "last_latency_ms",
+        "vetting_json",
     } <= mcp_columns
 
 
@@ -220,6 +221,36 @@ def test_mcp_static_tools_enter_unified_registry(tmp_path: Path) -> None:
     assert specs["mcp.demo.echo"].source == "mcp"
     assert specs["mcp.demo.echo"].risk == "medium"
     assert specs["mcp.demo.echo"].requires_approval is True
+
+
+def test_mcp_vetting_metadata_identifies_secrets_network_and_high_risk_tools(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = MCPManager(state)
+
+    row = manager.add_server(
+        {
+            "id": "github",
+            "transport": "sse",
+            "url": "https://mcp.example.test/sse",
+            "env": {"GITHUB_TOKEN": "dummy-token", "LOG_LEVEL": "debug"},
+            "tools": [
+                {"name": "list_issues", "description": "List issues", "risk": "low"},
+                {"name": "write_file", "description": "Write a file", "risk": "low"},
+            ],
+        }
+    )
+
+    vetting = row["vetting"]
+    assert vetting["transport"] == "sse"
+    assert vetting["network_access"] is True
+    assert vetting["secrets_required"] == ["GITHUB_TOKEN"]
+    assert vetting["recommended_trust"] == "approval_required"
+    assert "network" in vetting["risk_reasons"]
+    high_risk = {tool["name"]: tool for tool in vetting["tools"]}
+    assert high_risk["write_file"]["risk"] == "high"
+    assert high_risk["write_file"]["requires_approval"] is True
+    assert row["tools"][1]["risk"] == "high"
+    assert row["tools"][1]["requires_approval"] is True
 
 
 def test_mcp_static_server_test_updates_health(tmp_path: Path) -> None:
