@@ -17,7 +17,7 @@ from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.context_packer import ContextPacker, ContextPackRequest
 from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
-from nested_memvid_agent.nested_learning import NestedLearningKernel
+from nested_memvid_agent.nested_learning import LearningSignal, NestedLearningKernel
 from nested_memvid_agent.runtime_models import ToolCall
 from nested_memvid_agent.task_capsule import summarize_run_capsule, write_run_capsule
 from nested_memvid_agent.tools.base import ToolContext
@@ -80,6 +80,10 @@ def main() -> None:
         _run_case(
             "avoid_policy_from_ordinary_event",
             lambda: _eval_no_policy_from_event(_case_config(config, eval_id, "ordinary_event"), eval_id),
+        ),
+        _run_case(
+            "explain_memory_promotion_gates",
+            lambda: _eval_memory_promotion_gate_metadata(),
         ),
         _run_case("map_repository", lambda: _eval_repo_map(_case_config(config, eval_id, "repo_map"))),
         _run_case(
@@ -429,6 +433,32 @@ def _eval_no_policy_from_event(config: AgentConfig, eval_id: str) -> dict[str, A
         }
     finally:
         agent.close()
+
+
+def _eval_memory_promotion_gate_metadata() -> dict[str, Any]:
+    signal = LearningSignal(
+        title="One-off repair recipe",
+        content="Run pytest once after editing a file.",
+        kind=MemoryKind.PROCEDURE,
+        source_layer=MemoryLayer.EPISODIC,
+        validation_score=0.9,
+        repeat_count=1,
+        requested_target_layer=MemoryLayer.PROCEDURAL,
+    )
+    decision = NestedLearningKernel().decide(signal)
+    payload = decision.to_payload()
+    raw_requirements = payload.get("promotion_requirements", {})
+    requirements = raw_requirements if isinstance(raw_requirements, dict) else {}
+    return {
+        "passed": (
+            not decision.accepted
+            and requirements.get("target_layer") == "procedural"
+            and requirements.get("min_repeat_count") == 2
+            and requirements.get("observed_repeat_count") == 1
+        ),
+        "tool_count": 0,
+        "context_chars": len(json.dumps(payload)),
+    }
 
 
 def _eval_repo_map(config: AgentConfig) -> dict[str, Any]:

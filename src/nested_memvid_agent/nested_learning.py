@@ -85,6 +85,7 @@ class LearningDecision:
     importance: float
     flow: ContextFlow
     optimizer_trace: OptimizerTrace
+    promotion_requirements: dict[str, object]
 
     @property
     def accepted(self) -> bool:
@@ -101,6 +102,7 @@ class LearningDecision:
             "importance": self.importance,
             "context_flow": self.flow.to_metadata(),
             "optimizer_trace": self.optimizer_trace.to_metadata(),
+            "promotion_requirements": self.promotion_requirements,
         }
 
 
@@ -163,8 +165,10 @@ class NestedLearningKernel:
 
     def decide(self, signal: LearningSignal, *, action: LearningAction = "write") -> LearningDecision:
         target_layer, reason = self._target(signal)
+        requested_or_target = signal.requested_target_layer or target_layer
         flow = _flow_for(signal.source_layer, target_layer)
         trace = _optimizer_trace(signal, target_layer)
+        requirements = _promotion_requirements(signal, requested_or_target)
         if target_layer is None:
             return LearningDecision(
                 action="reject",
@@ -175,6 +179,7 @@ class NestedLearningKernel:
                 importance=signal.importance,
                 flow=flow,
                 optimizer_trace=trace,
+                promotion_requirements=requirements,
             )
         return LearningDecision(
             action=action,
@@ -185,6 +190,7 @@ class NestedLearningKernel:
             importance=max(signal.importance, 0.65 if target_layer != MemoryLayer.WORKING else signal.importance),
             flow=flow,
             optimizer_trace=trace,
+            promotion_requirements=requirements,
         )
 
     def from_record(
@@ -305,6 +311,56 @@ def _flow_for(source: MemoryLayer, target: MemoryLayer | None) -> ContextFlow:
     if source == MemoryLayer.WORKING:
         return DEFAULT_CONTEXT_FLOWS["interaction_to_working"]
     return DEFAULT_CONTEXT_FLOWS["episode_to_semantic"]
+
+
+def _promotion_requirements(signal: LearningSignal, target: MemoryLayer | None) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "target_layer": None if target is None else target.value,
+        "observed_validation_score": signal.validation_score,
+        "observed_repeat_count": signal.repeat_count,
+        "observed_explicit_instruction": signal.explicit_instruction,
+    }
+    if target == MemoryLayer.POLICY:
+        payload.update(
+            {
+                "min_validation_score": 0.97 if signal.requested_target_layer == MemoryLayer.POLICY else 0.95,
+                "min_repeat_count": 5,
+                "requires_explicit_instruction": True,
+            }
+        )
+    elif target == MemoryLayer.PROCEDURAL:
+        payload.update(
+            {
+                "min_validation_score": 0.78,
+                "min_repeat_count": 2,
+                "requires_explicit_instruction": False,
+            }
+        )
+    elif target == MemoryLayer.SEMANTIC:
+        payload.update(
+            {
+                "min_validation_score": 0.78,
+                "min_repeat_count": 1,
+                "requires_explicit_instruction": False,
+            }
+        )
+    elif target == MemoryLayer.EPISODIC:
+        payload.update(
+            {
+                "min_validation_score": 0.65,
+                "min_repeat_count": 1,
+                "requires_explicit_instruction": False,
+            }
+        )
+    else:
+        payload.update(
+            {
+                "min_validation_score": 0.65,
+                "min_repeat_count": 1,
+                "requires_explicit_instruction": False,
+            }
+        )
+    return payload
 
 
 def _optimizer_trace(signal: LearningSignal, target: MemoryLayer | None) -> OptimizerTrace:

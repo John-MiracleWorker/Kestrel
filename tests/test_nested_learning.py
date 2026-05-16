@@ -34,10 +34,36 @@ def test_kernel_rejects_policy_request_without_explicit_repeated_validation() ->
     )
 
     decision = NestedLearningKernel().decide(signal)
+    payload = decision.to_payload()
 
     assert not decision.accepted
     assert decision.target_layer is None
     assert decision.action == "reject"
+    assert payload["promotion_requirements"]["target_layer"] == "policy"
+    assert payload["promotion_requirements"]["requires_explicit_instruction"] is True
+    assert payload["promotion_requirements"]["min_repeat_count"] == 5
+    assert payload["promotion_requirements"]["observed_repeat_count"] == 1
+
+
+def test_kernel_exposes_procedural_gate_requirements_for_one_off_success() -> None:
+    signal = LearningSignal(
+        title="One-off repair recipe",
+        content="Run pytest once after editing a file.",
+        kind=MemoryKind.PROCEDURE,
+        source_layer=MemoryLayer.EPISODIC,
+        validation_score=0.9,
+        repeat_count=1,
+        requested_target_layer=MemoryLayer.PROCEDURAL,
+    )
+
+    decision = NestedLearningKernel().decide(signal)
+    requirements = decision.to_payload()["promotion_requirements"]
+
+    assert not decision.accepted
+    assert requirements["target_layer"] == "procedural"
+    assert requirements["min_validation_score"] == 0.78
+    assert requirements["min_repeat_count"] == 2
+    assert requirements["observed_repeat_count"] == 1
 
 
 def test_kernel_builds_record_with_optimizer_metadata() -> None:
