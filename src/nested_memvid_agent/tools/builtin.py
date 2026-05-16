@@ -1379,6 +1379,24 @@ class GitCommitTool(AgentTool):
                         data={key: value for key, value in review_check.items() if key not in {"ok", "content", "error"}},
                     )
                 repair_review_id = str(review_check["review_id"])
+                changed_files = [str(path) for path in review_check.get("changed_files", []) if str(path).strip()]
+                if changed_files:
+                    staged = subprocess.run(
+                        ["git", "add", "--", *changed_files],
+                        cwd=context.workspace,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=False,
+                    )
+                    if staged.returncode != 0:
+                        return self._result(
+                            call,
+                            success=False,
+                            content=f"Unable to stage reviewed repair files. STDERR:\n{staged.stderr}",
+                            error="repair_stage_failed",
+                            data={"branch": branch, "repair_review_id": repair_review_id, "changed_files": changed_files, "returncode": staged.returncode},
+                        )
             completed = subprocess.run(  # noqa: S603 - fixed executable and arguments
                 ["git", "commit", "-m", message],
                 cwd=context.workspace,
@@ -1389,6 +1407,17 @@ class GitCommitTool(AgentTool):
             )
             content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
             data: dict[str, Any] = {"returncode": completed.returncode}
+            if completed.returncode == 0:
+                sha = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=context.workspace,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                if sha.returncode == 0:
+                    data["commit_sha"] = sha.stdout.strip()
             if repair_review_id:
                 data["repair_review_id"] = repair_review_id
             return self._result(
@@ -1931,7 +1960,7 @@ def _validate_repair_review_gate(workspace: Path, branch: str, review_id: str) -
             "expected_diff_hash": review.get("diff_hash"),
             "actual_diff_hash": diff_hash,
         }
-    return {"ok": True, "review_id": review_id, "diff_hash": diff_hash, "branch": branch}
+    return {"ok": True, "review_id": review_id, "diff_hash": diff_hash, "branch": branch, "changed_files": review.get("changed_files", [])}
 
 
 def _changed_files_from_status(status: str) -> list[str]:
