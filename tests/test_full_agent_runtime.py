@@ -47,6 +47,32 @@ def test_state_store_tracks_runs_and_approvals(tmp_path: Path) -> None:
     assert decided["status"] == "approved"
 
 
+def test_state_store_approval_decisions_are_immutable_after_first_decision(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    state.create_run(
+        run_id="run_approval_once",
+        message="hello",
+        session_id="session",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+    state.create_approval(
+        approval_id="approval_once",
+        run_id="run_approval_once",
+        tool_call_id="tool_shell",
+        tool_name="shell.run",
+        arguments={"command": ["echo", "hi"]},
+        risk="high",
+    )
+
+    approved = state.decide_approval("approval_once", status="approved", decision={"approved": True})
+    replayed_denial = state.decide_approval("approval_once", status="denied", decision={"approved": False})
+
+    assert approved["status"] == "approved"
+    assert replayed_denial["status"] == "approved"
+    assert replayed_denial["decision"] == {"approved": True}
+
+
 def test_state_store_enforces_run_lifecycle_transitions(tmp_path: Path) -> None:
     state = AgentStateStore(tmp_path / "state.db")
     state.create_run(
@@ -71,6 +97,38 @@ def test_state_store_enforces_run_lifecycle_transitions(tmp_path: Path) -> None:
     completed_after_cancel = state.transition_run("run_lifecycle", "completed", stop_reason="complete")
     assert completed_after_cancel.status == "cancelled"
     assert completed_after_cancel.stop_reason == "cancelled"
+
+
+def test_state_store_terminal_run_states_are_immutable_even_for_same_status(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    for terminal_status in ("completed", "failed", "cancelled"):
+        run_id = f"run_{terminal_status}"
+        state.create_run(
+            run_id=run_id,
+            message="hello",
+            session_id="session",
+            workspace=str(tmp_path),
+            model="mock",
+        )
+        if terminal_status == "completed":
+            state.transition_run(run_id, "running")
+            terminal = state.transition_run(run_id, terminal_status, stop_reason="original", assistant_message="original message")
+        else:
+            terminal = state.transition_run(run_id, terminal_status, stop_reason="original", error="original error")
+        assert terminal.status == terminal_status
+
+        late_same_status = state.transition_run(
+            run_id,
+            terminal_status,
+            stop_reason="late overwrite",
+            assistant_message="late message",
+            error="late error",
+        )
+
+        assert late_same_status.status == terminal_status
+        assert late_same_status.stop_reason == "original"
+        assert late_same_status.assistant_message != "late message"
+        assert late_same_status.error != "late error"
 
 
 def test_state_store_lists_sessions_from_runs(tmp_path: Path) -> None:

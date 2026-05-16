@@ -33,6 +33,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Provider failures emit structured `diagnosis.classified` events so traces can explain the failure category and suggested playbook.
 - Repair mutation tools are high-risk, approval-gated, covered by exact-call approvals, disabled unless the matching capability is enabled, and refuse non-repair branches for patch/validate/rollback operations.
 - Diagnosis-gated repair validation must remain approval-gated, refuse non-repair branches, recall similar lessons on failure, and block repeated validation retries when prior lessons exist unless a changed strategy is supplied.
+- Terminal run records and approval decisions are replay-safe: late duplicate terminal transitions cannot overwrite original run results, and already-decided approval records cannot be flipped by replayed decisions.
 
 ## Partially Implemented
 
@@ -62,6 +63,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 
 - High-risk tools require both capability enablement (matching allow flag, where applicable) and explicit approval for the exact tool-call ID and arguments before execution.
 - Cancelled runs must not transition to completed, blocked, or failed after cancellation; lifecycle updates should use the guarded state transition helper.
+- Completed, failed, and cancelled runs are immutable even for repeated same-status transition attempts; approval requests are immutable after leaving `pending`.
 - Tool execution is bounded by `tool_timeout_seconds` / `NEST_AGENT_TOOL_TIMEOUT_SECONDS` and timeout failures are returned as structured tool errors.
 - New background runs persist a root task plus a small starter DAG with dependencies, required tools, risk, acceptance criteria, attempt count, and failure reason fields.
 - Ordinary conversation and observations must not write policy memory directly.
