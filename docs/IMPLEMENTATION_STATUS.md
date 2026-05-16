@@ -35,6 +35,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Repair mutation tools are high-risk, approval-gated, covered by exact-call approvals, disabled unless the matching capability is enabled, and refuse non-repair branches for patch/validate/rollback operations.
 - Diagnosis-gated repair validation must remain approval-gated, refuse non-repair branches, recall similar lessons on failure, and block repeated validation retries when prior lessons exist unless a changed strategy is supplied.
 - Terminal run records and approval decisions are replay-safe: late duplicate terminal transitions cannot overwrite original run results, and already-decided approval records cannot be flipped by replayed decisions.
+- Approval resume flow now records the executed tool result back onto the already-approved approval record without reopening or flipping the decision, and a full-flow smoke test covers run creation, approval blocking, exact-call approval, resume, tool result persistence, traces, task graph, and capsule creation together.
 
 ## Partially Implemented
 
@@ -80,11 +81,14 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 ## Validation Commands
 
 ```bash
-python -m compileall -q src scripts
-pytest -q
-RUN_MCP_INTEGRATION=1 pytest -q tests/integration
-RUN_MEMVID_INTEGRATION=1 pytest -q tests/integration
+python -m compileall -q src tests scripts
+python -m pytest -q
 python scripts/run_golden_evals.py --backend memory --provider mock
+PYTHONPATH=src python -m nested_memvid_agent.cli chat --backend memory --provider mock --message "hello"
+RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integration.py
+RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
 npm run test --prefix web
 npm run build --prefix web
 ```
+
+Use `python -m pytest` instead of a global `pytest` binary for optional integration tests so the fixture subprocesses inherit the same environment and installed extras (`mcp`, `memvid-sdk`).

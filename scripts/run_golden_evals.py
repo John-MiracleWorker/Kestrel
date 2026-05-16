@@ -231,7 +231,7 @@ def _eval_shell_block(config: AgentConfig) -> dict[str, Any]:
             ToolCall(name="shell.run", arguments={"command": ["echo", "hi"]}),
             _tool_context(agent),
         )
-        return {"passed": not execution.success and execution.error == "approval_required", "tool_count": 1}
+        return {"passed": not execution.success and execution.error == "tool_disabled", "tool_count": 1}
     finally:
         agent.close()
 
@@ -490,19 +490,32 @@ def _eval_patch_and_test(config: AgentConfig) -> dict[str, Any]:
 +good
 """
     try:
-        patch_result = agent.tools.execute(ToolCall(name="patch.apply", arguments={"patch": patch}), _tool_context(agent))
-        test_result = agent.tools.execute(
-            ToolCall(
-                name="test.run",
-                arguments={
-                    "command": [
-                        "python3",
-                        "-c",
-                        "from pathlib import Path; assert Path('calc.txt').read_text() == 'good\\n'",
-                    ]
-                },
+        patch_call = ToolCall(name="patch.apply", arguments={"patch": patch})
+        patch_result = agent.tools.execute(
+            patch_call,
+            _tool_context(
+                agent,
+                approved_tool_call_ids=frozenset({patch_call.id}),
+                approved_tool_call_arguments={patch_call.id: patch_call.arguments},
             ),
-            _tool_context(agent),
+        )
+        test_call = ToolCall(
+            name="test.run",
+            arguments={
+                "command": [
+                    "python3",
+                    "-c",
+                    "from pathlib import Path; assert Path('calc.txt').read_text() == 'good\\n'",
+                ]
+            },
+        )
+        test_result = agent.tools.execute(
+            test_call,
+            _tool_context(
+                agent,
+                approved_tool_call_ids=frozenset({test_call.id}),
+                approved_tool_call_arguments={test_call.id: test_call.arguments},
+            ),
         )
         return {
             "passed": patch_result.success and test_result.success,
@@ -517,9 +530,14 @@ def _eval_patch_and_test(config: AgentConfig) -> dict[str, Any]:
 def _eval_honest_test_failure(config: AgentConfig) -> dict[str, Any]:
     agent = build_agent(replace(config, allow_shell=True))
     try:
+        call = ToolCall(name="test.run", arguments={"command": ["python3", "-c", "import sys; sys.exit(4)"]})
         execution = agent.tools.execute(
-            ToolCall(name="test.run", arguments={"command": ["python3", "-c", "import sys; sys.exit(4)"]}),
-            _tool_context(agent),
+            call,
+            _tool_context(
+                agent,
+                approved_tool_call_ids=frozenset({call.id}),
+                approved_tool_call_arguments={call.id: call.arguments},
+            ),
         )
         return {
             "passed": not execution.success and execution.error == "nonzero_exit" and "exit_code=4" in execution.content,
@@ -580,13 +598,21 @@ def _summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _tool_context(agent: Any, session_id: str = "golden") -> ToolContext:
+def _tool_context(
+    agent: Any,
+    session_id: str = "golden",
+    *,
+    approved_tool_call_ids: frozenset[str] = frozenset(),
+    approved_tool_call_arguments: dict[str, dict[str, Any]] | None = None,
+) -> ToolContext:
     return ToolContext(
         memory=agent.memory,
         config=agent.config,
         workspace=agent.config.workspace,
         event_log=agent.event_log,
         session_id=session_id,
+        approved_tool_call_ids=approved_tool_call_ids,
+        approved_tool_call_arguments=approved_tool_call_arguments,
     )
 
 

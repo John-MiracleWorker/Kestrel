@@ -290,6 +290,28 @@ class AgentStateStore:
             )
         return self.get_approval(approval_id)
 
+    def record_approval_result(self, approval_id: str, result: dict[str, Any]) -> dict[str, Any]:
+        with self._connect() as conn:
+            current = conn.execute(
+                "SELECT status, result_json FROM approval_requests WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Unknown approval: {approval_id}")
+            if str(current["status"]) == "pending":
+                return self.get_approval(approval_id)
+            if current["result_json"] is not None:
+                return self.get_approval(approval_id)
+            conn.execute(
+                """
+                UPDATE approval_requests
+                SET result_json = ?, updated_at = ?
+                WHERE approval_id = ?
+                """,
+                (json.dumps(result), utc_now(), approval_id),
+            )
+        return self.get_approval(approval_id)
+
     def upsert_mcp_server(self, server: dict[str, Any]) -> dict[str, Any]:
         server_id = str(server["id"])
         now = utc_now()
