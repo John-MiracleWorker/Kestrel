@@ -1288,7 +1288,13 @@ class RepairRollbackTool(AgentTool):
     spec = ToolSpec(
         name="repair.rollback",
         description="Rollback uncommitted changes on an active repair branch. Requires approval and never runs on main/master.",
-        parameters={"type": "object", "properties": {}},
+        parameters={
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string"},
+                "review_id": {"type": "string"},
+            },
+        },
         risk="high",
         requires_approval=True,
         capabilities=("safe-repair", "rollback"),
@@ -1300,18 +1306,56 @@ class RepairRollbackTool(AgentTool):
             branch = _git_output(context.workspace, ["git", "branch", "--show-current"])
             if not _is_repair_branch(branch):
                 return self._result(call, success=False, content=f"Not on a repair branch: {branch}", error="not_repair_branch")
+            before_status = _git_output(context.workspace, ["git", "status", "--porcelain"])
+            before_diff = _git_output(context.workspace, ["git", "diff", "HEAD", "--"])
+            before_payload = {
+                "status": before_status,
+                "changed_files": [path for path in _changed_files_from_status(before_status) if not path.startswith(".nest/") and path != ".nest"],
+                "diff_hash": hashlib.sha256(before_diff.encode("utf-8")).hexdigest() if before_diff else "",
+            }
             reset = subprocess.run(["git", "checkout", "--", "."], cwd=context.workspace, capture_output=True, text=True, timeout=30, check=False)
             clean = subprocess.run(["git", "clean", "-fd"], cwd=context.workspace, capture_output=True, text=True, timeout=30, check=False)
+            after_status = _git_output(context.workspace, ["git", "status", "--porcelain"])
             success = reset.returncode == 0 and clean.returncode == 0
+            reason = str(arguments.get("reason", "manual_rollback")).strip() or "manual_rollback"
+            review_id = str(arguments.get("review_id", "")).strip()
+            artifact_payload = {
+                "branch": branch,
+                "reason": reason,
+                "review_id": review_id or None,
+                "before": before_payload,
+                "after": {"status": after_status, "changed_files": _changed_files_from_status(after_status)},
+                "commands": {
+                    "reset": {"returncode": reset.returncode, "stdout": reset.stdout, "stderr": reset.stderr},
+                    "clean": {"returncode": clean.returncode, "stdout": clean.stdout, "stderr": clean.stderr},
+                },
+                "success": success,
+            }
+            artifact_seed = json.dumps({"branch": branch, "reason": reason, "review_id": review_id, "before": before_payload}, sort_keys=True)
+            artifact_id = f"repair_rollback_{hashlib.sha256(artifact_seed.encode('utf-8')).hexdigest()[:16]}"
+            artifact_relpath = Path(".nest") / "repair_rollbacks" / f"{artifact_id}.json"
+            artifact_path = context.workspace / artifact_relpath
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact_path.write_text(json.dumps(artifact_payload, indent=2, sort_keys=True), encoding="utf-8")
             content = (
                 f"reset_exit_code={reset.returncode}\nRESET_STDOUT:\n{reset.stdout}\nRESET_STDERR:\n{reset.stderr}\n"
-                f"clean_exit_code={clean.returncode}\nCLEAN_STDOUT:\n{clean.stdout}\nCLEAN_STDERR:\n{clean.stderr}"
+                f"clean_exit_code={clean.returncode}\nCLEAN_STDOUT:\n{clean.stdout}\nCLEAN_STDERR:\n{clean.stderr}\n"
+                f"rollback_artifact={artifact_relpath.as_posix()}"
             )
             return self._result(
                 call,
                 success=success,
                 content=content,
-                data={"branch": branch, "reset_returncode": reset.returncode, "clean_returncode": clean.returncode},
+                data={
+                    "branch": branch,
+                    "reason": reason,
+                    "review_id": review_id or None,
+                    "reset_returncode": reset.returncode,
+                    "clean_returncode": clean.returncode,
+                    "rollback_artifact": artifact_relpath.as_posix(),
+                    "before": before_payload,
+                    "after": artifact_payload["after"],
+                },
                 error=None if success else "repair_rollback_failed",
             )
         except Exception as exc:  # noqa: BLE001
