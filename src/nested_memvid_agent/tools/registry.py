@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from queue import Empty, Queue
+from threading import Thread
 from typing import Any
 
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
@@ -70,10 +72,25 @@ def _is_exact_call_approved(call: ToolCall, arguments: dict[str, Any], context: 
 
 
 def _run_tool(tool: AgentTool, call: ToolCall, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+    timeout = max(float(getattr(context.config, "tool_timeout_seconds", 30.0)), 0.001)
+    results: Queue[ToolExecution] = Queue(maxsize=1)
+
+    def target() -> None:
+        try:
+            results.put(tool.run(arguments, context))
+        except Exception as exc:  # noqa: BLE001 - registry boundary must never crash agent turns
+            results.put(_failure(call, content=f"{type(exc).__name__}: {exc}", error="tool_execution_failed"))
+
+    thread = Thread(target=target, daemon=True)
+    thread.start()
     try:
-        return tool.run(arguments, context)
-    except Exception as exc:  # noqa: BLE001 - registry boundary must never crash agent turns
-        return _failure(call, content=f"{type(exc).__name__}: {exc}", error="tool_execution_failed")
+        return results.get(timeout=timeout)
+    except Empty:
+        return _failure(
+            call,
+            content=f"Tool {call.name} timed out after {timeout:g} seconds.",
+            error="tool_timeout",
+        )
 
 
 def _failure(call: ToolCall, *, content: str, error: str) -> ToolExecution:

@@ -44,6 +44,7 @@ class AgentConfig:
     channel_config_path: Path = Path(".nest/config/channels.json")
     enable_channel_delivery: bool = False
     channel_send_timeout_seconds: int = 10
+    tool_timeout_seconds: float = 30.0
 
     @classmethod
     def from_env(cls) -> AgentConfig:
@@ -69,6 +70,7 @@ class AgentConfig:
             channel_config_path=Path(os.getenv("NEST_AGENT_CHANNEL_CONFIG", ".nest/config/channels.json")),
             enable_channel_delivery=_env_bool("NEST_AGENT_ENABLE_CHANNEL_DELIVERY"),
             channel_send_timeout_seconds=_env_int("NEST_AGENT_CHANNEL_SEND_TIMEOUT_SECONDS", 10),
+            tool_timeout_seconds=_env_float("NEST_AGENT_TOOL_TIMEOUT_SECONDS", 30.0),
             allow_shell=_env_bool("NEST_AGENT_ALLOW_SHELL"),
             allow_file_write=_env_bool("NEST_AGENT_ALLOW_FILE_WRITE"),
             allow_policy_writes=_env_bool("NEST_AGENT_ALLOW_POLICY_WRITES"),

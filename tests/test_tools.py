@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from time import sleep
 
 from pytest import MonkeyPatch
 
@@ -13,6 +14,38 @@ from nested_memvid_agent.runtime_models import ToolCall, ToolExecution, ToolSpec
 from nested_memvid_agent.tools.base import AgentTool, ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
 from nested_memvid_agent.tools.registry import ToolRegistry
+
+
+class SlowTool(AgentTool):
+    spec = ToolSpec(
+        name="slow.tool",
+        description="Sleeps longer than the configured timeout.",
+        parameters={"type": "object", "properties": {}},
+    )
+
+    def run(self, arguments: dict[str, object], context: ToolContext) -> ToolExecution:
+        sleep(0.2)
+        return ToolExecution(
+            call=ToolCall(name=self.spec.name, arguments=arguments),
+            success=True,
+            content="finished",
+        )
+
+
+def test_tool_registry_times_out_slow_tools(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = ToolRegistry()
+    registry.register(SlowTool())
+    config = AgentConfig(tool_timeout_seconds=0.01)
+
+    result = registry.execute(
+        ToolCall(name="slow.tool", arguments={}),
+        ToolContext(memory=memory, config=config, workspace=tmp_path),
+    )
+
+    assert result.success is False
+    assert result.error == "tool_timeout"
+    assert "timed out" in result.content
 
 
 def test_memory_search_tool_returns_hits(tmp_path: Path) -> None:

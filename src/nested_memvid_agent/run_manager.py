@@ -121,7 +121,7 @@ class RunManager:
     def cancel_run(self, run_id: str) -> dict[str, Any]:
         with self._lock:
             self._cancelled.add(run_id)
-        run = self.state.update_run(run_id, status="cancelled", stop_reason="cancelled")
+        run = self.state.transition_run(run_id, "cancelled", stop_reason="cancelled")
         self.events.publish(run_id, "run.cancelled", {})
         return asdict(run)
 
@@ -141,7 +141,7 @@ class RunManager:
         if approved:
             self._resume_after_approval(updated, approved_arguments)
         else:
-            self.state.update_run(updated["run_id"], status="failed", error="Approval denied", stop_reason="approval_denied")
+            self.state.transition_run(updated["run_id"], "failed", error="Approval denied", stop_reason="approval_denied")
             self.events.publish(updated["run_id"], "run.failed", {"error": "Approval denied"})
         return updated
 
@@ -225,7 +225,7 @@ class RunManager:
     def _run_agent_turn(self, run_id: str, config: AgentConfig, message: str, session_id: str) -> None:
         if self._is_cancelled(run_id):
             return
-        self.state.update_run(run_id, status="running")
+        self.state.transition_run(run_id, "running")
         self.events.publish(run_id, "run.started", {"session_id": session_id})
         agent = self._build_agent(config)
         try:
@@ -247,9 +247,9 @@ class RunManager:
                     _execution_payload(execution),
                 )
             status = "blocked" if result.stop_reason == "approval_required" else "completed"
-            self.state.update_run(
+            self.state.transition_run(
                 run_id,
-                status=status,
+                status,
                 assistant_message=result.assistant_message,
                 context_chars=result.context_chars,
                 tool_count=len(result.tool_executions),
@@ -261,7 +261,7 @@ class RunManager:
         except Exception as exc:  # noqa: BLE001
             if self._is_cancelled(run_id):
                 return
-            self.state.update_run(run_id, status="failed", error=f"{type(exc).__name__}: {exc}", stop_reason="error")
+            self.state.transition_run(run_id, "failed", error=f"{type(exc).__name__}: {exc}", stop_reason="error")
             self.events.publish(run_id, "run.failed", {"error": f"{type(exc).__name__}: {exc}"})
         finally:
             agent.close()
@@ -272,7 +272,7 @@ class RunManager:
             return
         run = self.state.get_run(run_id)
         config = replace(self.config, workspace=Path(run.workspace), model=run.model)
-        self.state.update_run(run_id, status="running", stop_reason="resuming_after_approval")
+        self.state.transition_run(run_id, "running", stop_reason="resuming_after_approval")
         self._start_thread(run_id, self._run_approved_tool_then_continue, config, approval, arguments, run.session_id)
 
     def _run_approved_tool_then_continue(
@@ -325,9 +325,9 @@ class RunManager:
                 return
             self._publish_turn_observability(run_id, result)
             status = "blocked" if result.stop_reason == "approval_required" else "completed"
-            self.state.update_run(
+            self.state.transition_run(
                 run_id,
-                status=status,
+                status,
                 assistant_message=result.assistant_message,
                 context_chars=result.context_chars,
                 tool_count=len(result.tool_executions) + 1,
@@ -339,7 +339,7 @@ class RunManager:
         except Exception as exc:  # noqa: BLE001
             if self._is_cancelled(run_id):
                 return
-            self.state.update_run(run_id, status="failed", error=f"{type(exc).__name__}: {exc}", stop_reason="error")
+            self.state.transition_run(run_id, "failed", error=f"{type(exc).__name__}: {exc}", stop_reason="error")
             self.events.publish(run_id, "run.failed", {"error": f"{type(exc).__name__}: {exc}"})
         finally:
             agent.close()

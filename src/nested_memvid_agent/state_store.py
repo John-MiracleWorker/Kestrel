@@ -107,6 +107,28 @@ class AgentStateStore:
             conn.execute(f"UPDATE runs SET {assignments} WHERE run_id = ?", values)
         return self.get_run(run_id)
 
+    def transition_run(self, run_id: str, status: str, **fields: object) -> RunRecord:
+        """Apply a guarded run lifecycle transition.
+
+        Invalid transitions leave the current run untouched. This protects terminal
+        states like cancelled from late background completions or failures.
+        """
+        with self._connect() as conn:
+            current_row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if current_row is None:
+                raise KeyError(f"Unknown run: {run_id}")
+            current = _run_from_row(current_row)
+            if not _run_transition_allowed(current.status, status):
+                return current
+            updates = dict(fields)
+            updates["status"] = status
+            updates["updated_at"] = utc_now()
+            assignments = ", ".join(f"{key} = ?" for key in updates)
+            values = [_encode(value) for value in updates.values()]
+            values.append(run_id)
+            conn.execute(f"UPDATE runs SET {assignments} WHERE run_id = ?", values)
+        return self.get_run(run_id)
+
     def get_run(self, run_id: str) -> RunRecord:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
@@ -693,6 +715,20 @@ def _apply_schema_v3(conn: sqlite3.Connection) -> None:
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _run_transition_allowed(current: str, target: str) -> bool:
+    allowed = {
+        "queued": {"running", "cancelled", "failed"},
+        "running": {"blocked", "completed", "failed", "cancelled"},
+        "blocked": {"running", "cancelled", "failed"},
+        "completed": set(),
+        "failed": set(),
+        "cancelled": set(),
+    }
+    if current == target:
+        return True
+    return target in allowed.get(current, set())
 
 
 def _run_from_row(row: sqlite3.Row) -> RunRecord:
