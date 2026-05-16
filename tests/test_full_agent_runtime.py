@@ -47,6 +47,32 @@ def test_state_store_tracks_runs_and_approvals(tmp_path: Path) -> None:
     assert decided["status"] == "approved"
 
 
+def test_state_store_enforces_run_lifecycle_transitions(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    state.create_run(
+        run_id="run_lifecycle",
+        message="hello",
+        session_id="session",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+
+    running = state.transition_run("run_lifecycle", "running")
+    assert running.status == "running"
+    blocked = state.transition_run("run_lifecycle", "blocked", stop_reason="approval_required")
+    assert blocked.status == "blocked"
+    resumed = state.transition_run("run_lifecycle", "running", stop_reason="resuming_after_approval")
+    assert resumed.status == "running"
+    cancelled = state.transition_run("run_lifecycle", "cancelled", stop_reason="cancelled")
+    assert cancelled.status == "cancelled"
+
+    blocked_after_cancel = state.transition_run("run_lifecycle", "blocked", stop_reason="approval_required")
+    assert blocked_after_cancel.status == "cancelled"
+    completed_after_cancel = state.transition_run("run_lifecycle", "completed", stop_reason="complete")
+    assert completed_after_cancel.status == "cancelled"
+    assert completed_after_cancel.stop_reason == "cancelled"
+
+
 def test_state_store_lists_sessions_from_runs(tmp_path: Path) -> None:
     state = AgentStateStore(tmp_path / "state.db")
     state.create_run(
