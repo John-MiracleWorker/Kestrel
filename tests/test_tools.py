@@ -656,6 +656,8 @@ def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_
         capture_output=True,
         text=True,
     )
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True, text=True)
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
 
@@ -709,6 +711,15 @@ def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_
     )
     blocked_commit = registry.execute(commit_call, ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path))
     assert blocked_commit.error == "approval_required"
+
+    approved_commit = registry.execute(commit_call, _approved_context(memory, tmp_path, commit_call))
+    assert approved_commit.success
+    assert approved_commit.data["repair_review_id"] == review.data["review_id"]
+    assert approved_commit.data["commit_sha"]
+    log = subprocess.run(["git", "log", "-1", "--pretty=%s"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    assert log.stdout.strip() == "repair calculator add"
+    status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    assert status.stdout.strip() == ""
 
 
 def test_repair_review_creates_commit_gate_after_successful_validation(tmp_path: Path) -> None:
@@ -792,11 +803,14 @@ def test_git_commit_requires_approval_and_never_pushes(tmp_path: Path, monkeypat
     blocked = registry.execute(call, ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path))
     assert blocked.error == "approval_required"
 
-    captured: dict[str, object] = {}
+    captured: dict[str, object] = {"commands": []}
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         captured["command"] = command
+        captured["commands"].append(command)  # type: ignore[union-attr]
         captured["kwargs"] = kwargs
+        if command == ["git", "rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(command, 0, stdout="abc123\n", stderr="")
         return subprocess.CompletedProcess(command, 0, stdout="[main abc] test commit", stderr="")
 
     monkeypatch.setattr("nested_memvid_agent.tools.builtin.subprocess.run", fake_run)
@@ -811,8 +825,10 @@ def test_git_commit_requires_approval_and_never_pushes(tmp_path: Path, monkeypat
     )
 
     assert approved.success
-    assert captured["command"] == ["git", "commit", "-m", "test commit"]
-    assert "push" not in captured["command"]
+    commands = captured["commands"]
+    assert isinstance(commands, list)
+    assert ["git", "commit", "-m", "test commit"] in commands
+    assert all("push" not in command for command in commands)
 
 
 def test_memory_inspect_export_and_import_are_structured_and_gated(tmp_path: Path) -> None:
