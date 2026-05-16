@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 from pathlib import Path
+from typing import Any
 
 from .agent import NestedMV2Agent
 from .app_factory import build_agent
+from .channels import ChannelManager, ChannelPayloadError
 from .config import AgentConfig
 from .context_compiler import ContextCompiler
+from .context_packer import ContextPacker, ContextPackRequest
 from .models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from .orchestrator import build_memory_system
-from .runtime_models import LLMStreamEvent
+from .runtime_models import LLMStreamEvent, ToolCall
+from .task_capsule import summarize_run_capsule
+from .tools.base import ToolContext
 
 
 def _add_common_args(parser: argparse.ArgumentParser, *, default: object = argparse.SUPPRESS) -> None:
@@ -32,6 +39,9 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--codex-persist-session", action="store_true")
     parser.add_argument("--workspace", type=Path, default=Path("."))
     parser.add_argument("--log-dir", type=Path, default=Path(".nest/logs"))
+    parser.add_argument("--channels-config", type=Path, default=Path(".nest/config/channels.json"))
+    parser.add_argument("--enable-channel-delivery", action="store_true")
+    parser.add_argument("--channel-send-timeout-seconds", type=int, default=10)
     parser.add_argument("--allow-shell", action="store_true")
     parser.add_argument("--allow-file-write", action="store_true")
     parser.add_argument("--allow-policy-writes", action="store_true")
@@ -39,6 +49,11 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stream", action="store_true")
     parser.add_argument("--max-tool-rounds", type=int, default=6)
     parser.add_argument("--context-budget-chars", type=int, default=18_000)
+    parser.add_argument("--disable-task-capsules", action="store_true")
+    parser.add_argument("--enable-auto-consolidation", action="store_true")
+    parser.add_argument("--auto-consolidation-write", action="store_true")
+    parser.add_argument("--context-pack-token-budget", type=int, default=6000)
+    parser.add_argument("--context-pack-expand-raw", action="store_true")
 
 
 def main() -> None:
@@ -81,6 +96,15 @@ def main() -> None:
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", type=int, default=8765)
 
+    channel = sub.add_parser("channel")
+    _add_agent_args(channel)
+    channel.add_argument("channel_provider", help="Channel provider: telegram, discord, webhook, or custom.")
+    channel.add_argument("--channel-id", help="Configured channel id. Defaults to provider.")
+    channel.add_argument("--send", action="store_true", help="Request outbound delivery after the agent responds.")
+    payload = channel.add_mutually_exclusive_group(required=True)
+    payload.add_argument("--payload", help="Inbound channel payload as JSON.")
+    payload.add_argument("--payload-file", type=Path, help="Path to inbound channel payload JSON, or '-' for stdin.")
+
     args = parser.parse_args()
     backend = getattr(args, "backend", "memory")
     memory_dir = getattr(args, "memory_dir", Path("./memory"))
@@ -117,6 +141,21 @@ def main() -> None:
 
         config = _agent_config_from_args(args, backend=backend, memory_dir=memory_dir)
         uvicorn.run(create_app(config), host=args.host, port=args.port)
+        return
+
+    if args.cmd == "channel":
+        config = _agent_config_from_args(args, backend=backend, memory_dir=memory_dir)
+        manager = ChannelManager(config)
+        try:
+            result = manager.handle_payload(
+                provider=args.channel_provider,
+                channel_id=args.channel_id,
+                payload=_load_channel_payload(args),
+                send=args.send,
+            )
+        except ChannelPayloadError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(json.dumps(result.to_public_dict(), indent=2))
         return
 
     memory = build_memory_system(backend, memory_dir)
@@ -180,6 +219,9 @@ def _agent_config_from_args(args: argparse.Namespace, *, backend: str, memory_di
         memory_dir=memory_dir,
         workspace=args.workspace,
         log_dir=args.log_dir,
+        channel_config_path=args.channels_config,
+        enable_channel_delivery=args.enable_channel_delivery,
+        channel_send_timeout_seconds=args.channel_send_timeout_seconds,
         allow_shell=args.allow_shell,
         allow_file_write=args.allow_file_write,
         allow_policy_writes=args.allow_policy_writes,
@@ -187,7 +229,25 @@ def _agent_config_from_args(args: argparse.Namespace, *, backend: str, memory_di
         stream=args.stream,
         max_tool_rounds=args.max_tool_rounds,
         context_budget_chars=args.context_budget_chars,
+        enable_task_capsules=not args.disable_task_capsules,
+        enable_auto_consolidation=args.enable_auto_consolidation,
+        auto_consolidation_dry_run=not args.auto_consolidation_write,
+        context_pack_token_budget=args.context_pack_token_budget,
+        context_pack_expand_raw=args.context_pack_expand_raw,
     )
+
+
+def _load_channel_payload(args: argparse.Namespace) -> dict[str, Any]:
+    if args.payload:
+        raw = args.payload
+    elif str(args.payload_file) == "-":
+        raw = sys.stdin.read()
+    else:
+        raw = args.payload_file.read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise SystemExit("Channel payload must be a JSON object.")
+    return payload
 
 
 def _chat_and_print(agent: NestedMV2Agent, user_message: str, *, session_id: str, prefix: str = "") -> None:
@@ -238,6 +298,48 @@ def _handle_slash_command(agent: NestedMV2Agent, command: str, session_id: str) 
             return True
         compiled = agent.compiler.compile(objective=query, query=query)
         print(compiled.prompt)
+        return True
+
+    if name == "/pack":
+        if not query:
+            print("Usage: /pack <query>")
+            return True
+        packed = ContextPacker(agent.memory).pack(
+            ContextPackRequest(
+                objective=query,
+                query=query,
+                token_budget=agent.config.context_pack_token_budget,
+                expand_raw=agent.config.context_pack_expand_raw,
+            )
+        )
+        print(packed.prompt)
+        return True
+
+    if name == "/conflicts":
+        if not query:
+            print("Usage: /conflicts <query>")
+            return True
+        execution = agent.tools.execute(
+            ToolCall(name="memory.conflicts", arguments={"query": query, "k": 8}),
+            ToolContext(
+                memory=agent.memory,
+                config=agent.config,
+                workspace=agent.config.workspace,
+                event_log=agent.event_log,
+                session_id=session_id,
+            ),
+        )
+        print(execution.content)
+        return True
+
+    if name == "/capsule":
+        run_id = query or session_id
+        summary = summarize_run_capsule(
+            runs_dir=agent.config.memory_dir.parent / "runs",
+            run_id=run_id,
+            backend=agent.config.backend,
+        )
+        print(json.dumps(summary.to_payload(), indent=2))
         return True
 
     if name == "/memory":

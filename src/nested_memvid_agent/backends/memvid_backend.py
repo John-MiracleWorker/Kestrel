@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
+import re
 from importlib import import_module
 from pathlib import Path
 from typing import Any
 
+from ..context_frames import MV2ContextFrame, to_memory_record
 from ..models import MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
 from .base import MemoryBackend
 
@@ -56,14 +59,7 @@ class MemvidBackend(MemoryBackend):
         if record.layer != self.layer:
             raise ValueError(f"Cannot write {record.layer} record to {self.layer} backend")
         metadata = record.to_metadata()
-        metadata.update(
-            {
-                "nested_layer": record.layer.value,
-                "nested_kind": record.kind.value,
-                "nested_confidence": record.confidence,
-                "nested_importance": record.importance,
-            }
-        )
+        metadata.update(_context_metadata_for_record(record))
         uri = f"mv2://{record.layer.value}/{record.kind.value}/{record.id}"
         result = mem.put(
             record.title,
@@ -83,6 +79,11 @@ class MemvidBackend(MemoryBackend):
             return str(result[0])
         return record.id
 
+    def put_frame(self, frame: MV2ContextFrame) -> str:
+        """Store a structured context frame through the existing record path."""
+
+        return self.put(to_memory_record(frame))
+
     def find(self, query: str, k: int = 8, mode: str = "auto", min_relevancy: float = 0.0) -> list[MemoryHit]:
         mem = self._require_mem()
         raw = mem.find(
@@ -100,19 +101,40 @@ class MemvidBackend(MemoryBackend):
         for item in hits:
             if not isinstance(item, dict):
                 continue
-            metadata = item.get("metadata") or item.get("extra_metadata") or {}
+            embedded_metadata = _metadata_from_embedded_text(str(item.get("text") or item.get("snippet") or ""))
+            raw_metadata = item.get("metadata") or item.get("extra_metadata") or {}
+            metadata = {**embedded_metadata, **raw_metadata}
             record = _record_from_hit(item=item, metadata=metadata, layer=self.layer)
             raw_score = item.get("score", item.get("relevance", 0.0))
+            frame_id = item.get("frame_id") or item.get("id") or metadata.get("frame_id") or metadata.get("id")
             converted.append(
                 MemoryHit(
                     record=record,
                     score=float(raw_score) if raw_score is not None else 0.0,
                     source_backend="memvid",
-                    frame_id=str(item.get("frame_id") or item.get("id") or ""),
+                    frame_id=str(frame_id) if frame_id else None,
                     snippet=str(item.get("snippet") or item.get("text") or ""),
                 )
             )
         return converted
+
+    def find_frames(
+        self,
+        query: str,
+        k: int = 8,
+        layers: tuple[MemoryLayer, ...] | None = None,
+        frame_types: tuple[str, ...] | None = None,
+        mode: str = "auto",
+    ) -> list[MemoryHit]:
+        """Find frame-backed records while keeping the backend interface stable."""
+
+        if layers is not None and self.layer not in layers:
+            return []
+        hits = self.find(query=query, k=k, mode=mode)
+        if frame_types is None:
+            return hits
+        allowed = set(frame_types)
+        return [hit for hit in hits if str(hit.record.metadata.get("frame_type", "raw_chunk")) in allowed]
 
     def seal(self) -> None:
         mem = self._require_mem()
@@ -184,10 +206,10 @@ def _record_from_hit(item: dict[str, Any], metadata: dict[str, Any], layer: Memo
         kind = MemoryKind.OBSERVATION
     confidence = float(metadata.get("nested_confidence", metadata.get("confidence", 0.5)))
     importance = float(metadata.get("nested_importance", metadata.get("importance", 0.5)))
-    content = item.get("text") or item.get("snippet") or ""
+    content = _clean_hit_text(str(item.get("text") or item.get("snippet") or ""))
     title = item.get("title") or metadata.get("title") or "Memvid hit"
     return MemoryRecord(
-        id=str(metadata.get("id") or item.get("frame_id") or item.get("id") or "memvid_hit"),
+        id=str(metadata.get("id") or metadata.get("frame_id") or item.get("frame_id") or item.get("id") or "memvid_hit"),
         title=str(title),
         content=str(content),
         layer=layer,
@@ -196,6 +218,83 @@ def _record_from_hit(item: dict[str, Any], metadata: dict[str, Any], layer: Memo
         importance=max(0.0, min(importance, 1.0)),
         metadata=dict(metadata),
     )
+
+
+def _metadata_from_embedded_text(text: str) -> dict[str, Any]:
+    """Recover metadata from SDKs that index metadata into result text only."""
+
+    if not text:
+        return {}
+    metadata: dict[str, Any] = {}
+    for key in (
+        "frame_id",
+        "frame_type",
+        "id",
+        "kind",
+        "layer",
+        "mv2_ctx_version",
+        "nested_kind",
+        "nested_layer",
+        "source_uri",
+        "content_hash",
+        "context_flow_id",
+        "conflict_group_id",
+        "run_id",
+        "session_id",
+    ):
+        value = _quoted_value(text, key)
+        if value is not None and value != "null":
+            metadata[key] = value
+    for key in ("confidence", "importance", "nested_confidence", "nested_importance"):
+        value = _number_value(text, key)
+        if value is not None:
+            metadata[key] = value
+    token_count = _int_value(text, "token_count")
+    if token_count is not None:
+        metadata["token_count"] = token_count
+    for key in ("parent_ids", "child_ids"):
+        value = _json_value(text, key)
+        if isinstance(value, list):
+            metadata[key] = value
+    source_span = _json_value(text, "source_span")
+    if isinstance(source_span, dict):
+        metadata["source_span"] = source_span
+    return metadata
+
+
+def _clean_hit_text(text: str) -> str:
+    marker = " title: "
+    if marker in text:
+        return text.split(marker, maxsplit=1)[0].strip()
+    return text
+
+
+def _quoted_value(text: str, key: str) -> str | None:
+    match = re.search(rf"\b{re.escape(key)}:\s+\"([^\"]*)\"", text)
+    if match:
+        return match.group(1)
+    match = re.search(rf"\b{re.escape(key)}:\s+(null)\b", text)
+    return match.group(1) if match else None
+
+
+def _number_value(text: str, key: str) -> float | None:
+    match = re.search(rf"\b{re.escape(key)}:\s+([0-9]+(?:\.[0-9]+)?)", text)
+    return float(match.group(1)) if match else None
+
+
+def _int_value(text: str, key: str) -> int | None:
+    match = re.search(rf"\b{re.escape(key)}:\s+([0-9]+)", text)
+    return int(match.group(1)) if match else None
+
+
+def _json_value(text: str, key: str) -> Any | None:
+    match = re.search(rf"\b{re.escape(key)}:\s+(\[[^\n]*\]|\{{[^\n]*\}})", text)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
 
 
 def _kind_from_hit_collections(item: dict[str, Any]) -> str | None:
@@ -213,4 +312,51 @@ def _kind_from_hit_collections(item: dict[str, Any]) -> str | None:
 def _record_tags(record: MemoryRecord) -> list[str]:
     tags = {record.layer.value, record.kind.value}
     tags.update(str(value) for value in record.tags.values())
+    frame_type = record.metadata.get("frame_type")
+    if frame_type:
+        tags.add(str(frame_type))
     return sorted(tags)
+
+
+def _context_metadata_for_record(record: MemoryRecord) -> dict[str, Any]:
+    metadata = dict(record.metadata)
+    nested_learning = metadata.get("nested_learning")
+    context_flow_id = metadata.get("context_flow_id")
+    optimizer_trace = metadata.get("optimizer_trace")
+    if isinstance(nested_learning, dict):
+        context_flow = nested_learning.get("context_flow")
+        if isinstance(context_flow, dict) and context_flow.get("id"):
+            context_flow_id = context_flow["id"]
+        trace = nested_learning.get("optimizer_trace")
+        if isinstance(trace, dict):
+            optimizer_trace = trace
+    frame_type = str(metadata.get("frame_type") or "raw_chunk")
+    frame_id = str(metadata.get("frame_id") or record.id)
+    return {
+        "mv2_ctx_version": metadata.get("mv2_ctx_version", "0.1"),
+        "frame_type": frame_type,
+        "frame_id": frame_id,
+        "parent_ids": list(_list_str(metadata.get("parent_ids"))),
+        "child_ids": list(_list_str(metadata.get("child_ids"))),
+        "source_uri": metadata.get("source_uri"),
+        "source_span": metadata.get("source_span", {}),
+        "token_count": metadata.get("token_count"),
+        "content_hash": metadata.get("content_hash", record.content_hash),
+        "nested_layer": record.layer.value,
+        "nested_kind": record.kind.value,
+        "nested_confidence": record.confidence,
+        "nested_importance": record.importance,
+        "context_flow_id": context_flow_id,
+        "optimizer_trace": optimizer_trace,
+        "conflict_group_id": metadata.get("conflict_group_id"),
+        "run_id": metadata.get("run_id"),
+        "session_id": metadata.get("session_id"),
+    }
+
+
+def _list_str(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, list | tuple):
+        return tuple(str(item) for item in value)
+    return (str(value),)

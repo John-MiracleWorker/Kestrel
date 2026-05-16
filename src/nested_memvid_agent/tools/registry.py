@@ -39,7 +39,10 @@ class ToolRegistry:
                 content=f"Tool {call.name} requires approval or config enablement.",
                 error="approval_required",
             )
-        return tool.run(call.arguments, context)
+        arguments = dict(call.arguments)
+        if getattr(tool, "needs_call_id", False):
+            arguments.setdefault("_tool_call_id", call.id)
+        return tool.run(arguments, context)
 
 
 _ENABLEMENT_BY_TOOL = {

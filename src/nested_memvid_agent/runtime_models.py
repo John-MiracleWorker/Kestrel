@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import uuid4
@@ -112,6 +112,21 @@ class ToolExecution:
 
 
 @dataclass(frozen=True)
+class TurnSource:
+    """Provenance for a user turn that entered outside the direct CLI/API chat path."""
+
+    channel: str
+    channel_id: str
+    conversation_id: str
+    user_id: str | None = None
+    message_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class AgentTurnResult:
     session_id: str
     user_message: str
@@ -120,3 +135,5 @@ class AgentTurnResult:
     context_chars: int
     memory_writes: tuple[str, ...]
     stop_reason: str
+    context_prompt: str = ""
+    source: TurnSource | None = None

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .app_factory import build_agent
+from .channels import ChannelManager, ChannelPayloadError
 from .config import AgentConfig
 from .event_bus import RunEventBus
 from .mcp_manager import MCPManager
@@ -41,6 +42,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
     mcp = MCPManager(state)
     skills = SkillManager(active_config.skills_dir, state)
     runs = RunManager(config=active_config, state=state, events=events, mcp=mcp, skills=skills)
+    channels = ChannelManager(active_config)
 
     @asynccontextmanager
     async def lifespan(app_instance: Any) -> Any:
@@ -58,6 +60,12 @@ def create_app(config: AgentConfig | None = None) -> Any:
         workspace: str | None = None
         model: str | None = None
         autonomy_mode: str = "background"
+
+    class ChannelIngestRequest(BaseModel):  # type: ignore[valid-type,misc]
+        provider: str
+        payload: dict[str, Any] = Field(default_factory=dict)
+        channel_id: str | None = None
+        send: bool | None = None
 
     class ToolInvokeRequest(BaseModel):  # type: ignore[valid-type,misc]
         arguments: dict[str, Any] = Field(default_factory=dict)
@@ -112,9 +120,63 @@ def create_app(config: AgentConfig | None = None) -> Any:
         explicit_instruction: bool = False
         dry_run: bool = False
 
+    class ContextPackAPIRequest(BaseModel):  # type: ignore[valid-type,misc]
+        query: str
+        token_budget: int | None = None
+        layers: list[str] | None = None
+        expand_raw: bool | None = None
+        include_telemetry: bool = True
+
+    class ContextExpandAPIRequest(BaseModel):  # type: ignore[valid-type,misc]
+        frame_id: str | None = None
+        record_id: str | None = None
+        max_tokens: int = 2000
+        include_children: bool = False
+        include_parents: bool = False
+
+    class CapsuleSummarizeAPIRequest(BaseModel):  # type: ignore[valid-type,misc]
+        dry_run: bool = True
+
+    class CapsuleApplyAPIRequest(BaseModel):  # type: ignore[valid-type,misc]
+        dry_run: bool = False
+        include_policy: bool = False
+
     @app.get("/api/health")  # type: ignore[untyped-decorator]
     def health() -> dict[str, object]:
         return {"ok": True, "name": active_config.name}
+
+    @app.get("/api/channels")  # type: ignore[untyped-decorator]
+    def list_channels() -> list[dict[str, object]]:
+        return channels.list_channels()
+
+    @app.post("/api/channels/ingest")  # type: ignore[untyped-decorator]
+    def ingest_channel(request: ChannelIngestRequest) -> dict[str, object]:
+        try:
+            return channels.handle_payload(
+                provider=request.provider,
+                channel_id=request.channel_id,
+                payload=request.payload,
+                send=request.send,
+            ).to_public_dict()
+        except ChannelPayloadError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/channels/{provider}/webhook")  # type: ignore[untyped-decorator]
+    def channel_webhook(
+        provider: str,
+        payload: dict[str, Any],
+        channel_id: str | None = None,
+        send: bool | None = None,
+    ) -> dict[str, object]:
+        try:
+            return channels.handle_payload(
+                provider=provider,
+                channel_id=channel_id,
+                payload=payload,
+                send=send,
+            ).to_public_dict()
+        except ChannelPayloadError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/runs")  # type: ignore[untyped-decorator]
     def create_run(request: CreateRunRequest) -> dict[str, object]:
@@ -378,6 +440,49 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 return dict(payload)
         return {"success": execution.success, "content": execution.content, "error": execution.error}
 
+    @app.post("/api/context/pack")  # type: ignore[untyped-decorator]
+    def pack_context(request: ContextPackAPIRequest) -> dict[str, object]:
+        arguments = request.model_dump(exclude_none=True)
+        execution = runs.invoke_tool(tool_name="context.pack", arguments=arguments, session_id="api")
+        return _tool_response_payload(execution)
+
+    @app.post("/api/context/expand")  # type: ignore[untyped-decorator]
+    def expand_context(request: ContextExpandAPIRequest) -> dict[str, object]:
+        arguments = request.model_dump(exclude_none=True)
+        execution = runs.invoke_tool(tool_name="context.expand", arguments=arguments, session_id="api")
+        return _tool_response_payload(execution)
+
+    @app.post("/api/capsules/{run_id}/summarize")  # type: ignore[untyped-decorator]
+    def summarize_capsule(run_id: str, request: CapsuleSummarizeAPIRequest) -> dict[str, object]:
+        execution = runs.invoke_tool(
+            tool_name="capsule.summarize",
+            arguments={"run_id": run_id, "dry_run": request.dry_run},
+            session_id="api",
+        )
+        return _tool_response_payload(execution)
+
+    @app.post("/api/capsules/{run_id}/apply")  # type: ignore[untyped-decorator]
+    def apply_capsule(run_id: str, request: CapsuleApplyAPIRequest) -> dict[str, object]:
+        execution = runs.invoke_tool(
+            tool_name="capsule.apply",
+            arguments={
+                "run_id": run_id,
+                "dry_run": request.dry_run,
+                "include_policy": request.include_policy,
+            },
+            session_id="api",
+            run_id=run_id,
+        )
+        return _tool_response_payload(execution)
+
+    @app.get("/api/memory/conflicts")  # type: ignore[untyped-decorator]
+    def memory_conflicts(query: str, layers: str | None = None, k: int = 8) -> dict[str, object]:
+        arguments: dict[str, object] = {"query": query, "k": k}
+        if layers:
+            arguments["layers"] = [layer.strip() for layer in layers.split(",") if layer.strip()]
+        execution = runs.invoke_tool(tool_name="memory.conflicts", arguments=arguments, session_id="api")
+        return _tool_response_payload(execution)
+
     web_dist = Path(__file__).resolve().parents[2] / "web" / "dist"
     if web_dist.exists():
         assets = web_dist / "assets"
@@ -394,3 +499,11 @@ def create_app(config: AgentConfig | None = None) -> Any:
             return FileResponse(web_dist / "index.html")
 
     return app
+
+
+def _tool_response_payload(execution: Any) -> dict[str, object]:
+    if execution.content.startswith("{"):
+        payload = json.loads(execution.content)
+        if isinstance(payload, dict):
+            return dict(payload)
+    return {"success": execution.success, "content": execution.content, "error": execution.error}

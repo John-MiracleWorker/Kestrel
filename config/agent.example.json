@@ -22,5 +22,8 @@
   "allow_codex_cli": false,
   "require_approval_for_high_risk_tools": true,
   "stream": false,
-  "log_dir": ".nest/logs"
+  "log_dir": ".nest/logs",
+  "channel_config_path": ".nest/config/channels.json",
+  "enable_channel_delivery": false,
+  "channel_send_timeout_seconds": 10
 }

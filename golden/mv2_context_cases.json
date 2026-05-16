@@ -1,0 +1,42 @@
+[
+  {
+    "name": "remembers_correction_across_sessions",
+    "assertion": "Correction memory remains searchable after reopening the memory system."
+  },
+  {
+    "name": "retrieves_previous_failure",
+    "assertion": "A prior failure is included before repeating a risky action."
+  },
+  {
+    "name": "uses_procedural_recipe_after_repeated_success",
+    "assertion": "Validated repeated procedure is promoted to procedural memory."
+  },
+  {
+    "name": "blocks_policy_write_from_ordinary_event",
+    "assertion": "A single ordinary event cannot become policy memory."
+  },
+  {
+    "name": "compiles_context_under_budget",
+    "assertion": "The context pack is useful and bounded."
+  },
+  {
+    "name": "prefers_summary_then_expands_raw",
+    "assertion": "Summary frames are selected first and raw frames appear only on demand."
+  },
+  {
+    "name": "flags_conflicting_facts",
+    "assertion": "Conflicting memories are reported instead of merged silently."
+  },
+  {
+    "name": "verifies_mv2_files",
+    "assertion": "Memory layers can be verified."
+  },
+  {
+    "name": "creates_complete_mv2_capsule",
+    "assertion": "A completed run writes complete.mv2 and consolidates only validated non-policy lessons."
+  },
+  {
+    "name": "mv2_not_sqlite_or_vector_db_substrate",
+    "assertion": "The memory substrate remains layered .mv2 files; SQLite is control-plane only."
+  }
+]

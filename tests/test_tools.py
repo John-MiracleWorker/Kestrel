@@ -81,6 +81,11 @@ def test_default_registry_includes_spec_tools() -> None:
         "memvid.stats",
         "memory.learn",
         "memory.consolidate",
+        "context.pack",
+        "context.expand",
+        "capsule.summarize",
+        "capsule.apply",
+        "memory.conflicts",
         "codex.exec",
     } <= names
 

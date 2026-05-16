@@ -20,6 +20,7 @@ from .runtime_models import (
     ToolCall,
     ToolExecution,
     ToolSpec,
+    TurnSource,
 )
 from .tools.base import ApprovalHandler, ToolContext
 from .tools.registry import ToolRegistry
@@ -57,12 +58,20 @@ class NestedMV2Agent:
         approval_handler: ApprovalHandler | None = None,
         approved_tool_call_ids: frozenset[str] = frozenset(),
         stream_handler: StreamHandler | None = None,
+        source: TurnSource | None = None,
     ) -> AgentTurnResult:
         session = session_id or f"session_{uuid4().hex}"
         memory_writes: list[str] = []
         executions: list[ToolExecution] = []
 
-        self._event("turn.start", {"session_id": session, "user_message": user_message})
+        self._event(
+            "turn.start",
+            {
+                "session_id": session,
+                "user_message": user_message,
+                "source": source.to_public_dict() if source is not None else None,
+            },
+        )
         memory_writes.append(
             self._write_memory(
                 layer=MemoryLayer.WORKING,
@@ -71,6 +80,7 @@ class NestedMV2Agent:
                 content=user_message,
                 confidence=0.6,
                 session_id=session,
+                source=source,
             )
         )
 
@@ -137,6 +147,7 @@ class NestedMV2Agent:
                         content=execution.content[:4000],
                         confidence=0.7 if execution.success else 0.65,
                         session_id=session,
+                        source=source,
                     )
                 )
                 if execution.error in {"approval_pending", "approval_required"}:
@@ -160,6 +171,7 @@ class NestedMV2Agent:
                 content=f"User: {user_message}\nAssistant: {final_content}",
                 confidence=0.7,
                 session_id=session,
+                source=source,
             )
         )
         self.memory.seal_all()
@@ -180,6 +192,8 @@ class NestedMV2Agent:
             context_chars=compiled.total_chars,
             memory_writes=tuple(memory_writes),
             stop_reason=stop_reason,
+            context_prompt=compiled.prompt,
+            source=source,
         )
 
     def _generate_response(
@@ -243,7 +257,27 @@ class NestedMV2Agent:
         content: str,
         confidence: float,
         session_id: str,
+        source: TurnSource | None = None,
     ) -> str:
+        metadata: dict[str, object] = {"session_id": session_id}
+        evidence_source = "agent_runtime"
+        evidence_locator = session_id
+        if source is not None:
+            metadata.update(
+                {
+                    "channel": source.channel,
+                    "channel_id": source.channel_id,
+                    "conversation_id": source.conversation_id,
+                }
+            )
+            if source.user_id is not None:
+                metadata["channel_user_id"] = source.user_id
+            if source.message_id is not None:
+                metadata["channel_message_id"] = source.message_id
+            if source.metadata:
+                metadata["channel_metadata"] = source.metadata
+            evidence_source = f"channel:{source.channel}"
+            evidence_locator = source.message_id or source.conversation_id
         record = MemoryRecord(
             layer=layer,
             kind=kind,
@@ -251,8 +285,8 @@ class NestedMV2Agent:
             content=content,
             confidence=confidence,
             importance=0.5,
-            metadata={"session_id": session_id},
-            evidence=[EvidenceRef(source="agent_runtime", locator=session_id)],
+            metadata=metadata,
+            evidence=[EvidenceRef(source=evidence_source, locator=evidence_locator)],
         )
         return self.memory.put(record)
 

@@ -132,6 +132,10 @@ export function App() {
   const [learningRepeat, setLearningRepeat] = useState("1");
   const [learningExplicit, setLearningExplicit] = useState(false);
   const [learningResult, setLearningResult] = useState<Record<string, unknown> | null>(null);
+  const [contextQuery, setContextQuery] = useState("");
+  const [contextPackResult, setContextPackResult] = useState<Record<string, unknown> | null>(null);
+  const [conflictResult, setConflictResult] = useState<Record<string, unknown> | null>(null);
+  const [capsuleResult, setCapsuleResult] = useState<Record<string, unknown> | null>(null);
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
   const [mcpId, setMcpId] = useState("");
   const [mcpCommand, setMcpCommand] = useState("");
@@ -209,6 +213,8 @@ export function App() {
       "assistant.tool_call",
       "assistant.usage",
       "assistant.provider_error",
+      "capsule.completed",
+      "capsule.failed",
       "task.approved",
       "subagent.queued",
       "subagent.started",
@@ -262,6 +268,42 @@ export function App() {
       explicit_instruction: learningExplicit
     });
     setLearningResult(result);
+    await refresh();
+  }
+
+  async function packContext(event: FormEvent) {
+    event.preventDefault();
+    const query = contextQuery.trim() || memoryQuery.trim();
+    if (!query) return;
+    const result = await api.post<Record<string, unknown>>("/api/context/pack", {
+      query,
+      token_budget: 6000,
+      include_telemetry: true
+    });
+    setContextPackResult(result);
+  }
+
+  async function findConflicts() {
+    const query = contextQuery.trim() || memoryQuery.trim();
+    if (!query) return;
+    const params = new URLSearchParams({ query, k: "8" });
+    const result = await api.get<Record<string, unknown>>(`/api/memory/conflicts?${params.toString()}`);
+    setConflictResult(result);
+  }
+
+  async function summarizeActiveCapsule() {
+    if (!activeRun?.run_id) return;
+    const result = await api.post<Record<string, unknown>>(`/api/capsules/${activeRun.run_id}/summarize`, { dry_run: true });
+    setCapsuleResult(result);
+  }
+
+  async function applyActiveCapsule() {
+    if (!activeRun?.run_id) return;
+    const result = await api.post<Record<string, unknown>>(`/api/capsules/${activeRun.run_id}/apply`, {
+      dry_run: false,
+      include_policy: false
+    });
+    setCapsuleResult(result);
     await refresh();
   }
 
@@ -495,6 +537,17 @@ export function App() {
             <input value={memoryQuery} onChange={(event) => setMemoryQuery(event.target.value)} placeholder="Search nested memory..." />
             <button type="submit">Search</button>
           </form>
+          <form onSubmit={packContext} className="memory-search">
+            <div className="section-title"><Database size={18} /> Context Pack Preview</div>
+            <input value={contextQuery} onChange={(event) => setContextQuery(event.target.value)} placeholder="Objective or claim..." />
+            <div className="actions">
+              <button type="submit">Pack Context</button>
+              <button type="button" onClick={findConflicts}>Find Conflicts</button>
+              <button type="button" onClick={summarizeActiveCapsule} disabled={!activeRun}>Capsule Summary</button>
+              <button type="button" onClick={applyActiveCapsule} disabled={!activeRun}>Request Apply</button>
+            </div>
+            {contextPackResult && <code>{JSON.stringify(contextPackResult).slice(0, 900)}</code>}
+          </form>
           <div className="learning-panel">
             <form onSubmit={submitLearning} className="memory-search">
               <div className="section-title"><Brain size={18} /> Learning Signal</div>
@@ -519,6 +572,12 @@ export function App() {
               <button type="submit">Learn</button>
             </form>
             {learningResult && <code>{JSON.stringify(learningResult).slice(0, 420)}</code>}
+          </div>
+          <div className="learning-panel">
+            <div className="section-title"><ShieldCheck size={18} /> Conflict Warnings</div>
+            {conflictResult ? <code>{JSON.stringify(conflictResult).slice(0, 720)}</code> : <p className="muted">No conflict query run.</p>}
+            <div className="section-title"><Activity size={18} /> Consolidation Decisions</div>
+            {capsuleResult ? <code>{JSON.stringify(capsuleResult).slice(0, 720)}</code> : <p className="muted">No capsule summary loaded.</p>}
           </div>
           <div className="hits wide">
             {memoryHits.map((hit, index) => (

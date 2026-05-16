@@ -7,9 +7,12 @@ from pathlib import Path
 from typing import Any
 
 from ..consolidation import Consolidator
+from ..context_frames import estimate_tokens, from_memory_record
+from ..context_packer import ContextPacker, ContextPackRequest
 from ..models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from ..nested_learning import LearningSignal, NestedLearningKernel
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
+from ..task_capsule import summarize_run_capsule
 from .base import AgentTool, ToolContext
 from .registry import ToolRegistry
 
@@ -104,6 +107,309 @@ class MemoryWriteTool(AgentTool):
             return self._result(call, success=True, content=f"Wrote memory {record_id}", data={"record_id": record_id})
         except Exception as exc:  # noqa: BLE001 - tool boundary must report errors to agent
             return self._result(call, success=False, content=str(exc), error="memory_write_failed")
+
+
+class ContextPackTool(AgentTool):
+    spec = ToolSpec(
+        name="context.pack",
+        description="Compile an on-demand pseudo-context window for the current objective.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "token_budget": {"type": "integer", "minimum": 256, "maximum": 50000},
+                "layers": {"type": "array", "items": {"type": "string"}},
+                "expand_raw": {"type": "boolean"},
+                "include_telemetry": {"type": "boolean"},
+            },
+            "required": ["query"],
+        },
+        capabilities=("pseudo-context", "mv2-context"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        query = str(arguments.get("query", "")).strip()
+        if not query:
+            return self._result(call, success=False, content="Missing query", error="missing_query")
+        try:
+            layers = _layers_arg(arguments.get("layers")) or tuple(MemoryLayer)
+            packed = ContextPacker(context.memory).pack(
+                ContextPackRequest(
+                    objective=query,
+                    query=query,
+                    token_budget=int(arguments.get("token_budget", context.config.context_pack_token_budget)),
+                    allowed_layers=layers,
+                    expand_raw=bool(arguments.get("expand_raw", context.config.context_pack_expand_raw)),
+                    include_telemetry=bool(arguments.get("include_telemetry", True)),
+                )
+            )
+            payload = {
+                "packed_prompt": packed.prompt,
+                "token_estimate": packed.token_estimate,
+                "selected_item_count": len(packed.items),
+                "selected_layers": sorted({item.frame.layer.value for item in packed.items}),
+                "conflict_warnings": list(packed.conflict_warnings),
+                "evidence_refs": list(packed.evidence_refs),
+                "telemetry": packed.telemetry,
+            }
+            return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="context_pack_failed")
+
+
+class ContextExpandTool(AgentTool):
+    spec = ToolSpec(
+        name="context.expand",
+        description="Expand a specific memory/frame into raw supporting context.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "frame_id": {"type": "string"},
+                "record_id": {"type": "string"},
+                "max_tokens": {"type": "integer", "minimum": 64, "maximum": 50000},
+                "include_children": {"type": "boolean"},
+                "include_parents": {"type": "boolean"},
+            },
+        },
+        capabilities=("pseudo-context", "mv2-context"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        lookup_id = str(arguments.get("frame_id") or arguments.get("record_id") or "").strip()
+        if not lookup_id:
+            return self._result(call, success=False, content="Missing frame_id or record_id", error="missing_id")
+        try:
+            hit = _find_memory_by_id(context, lookup_id)
+            if hit is None:
+                return self._result(call, success=False, content=f"No memory found for {lookup_id}", error="not_found")
+            frame = from_memory_record(hit.record)
+            related = _related_frames(
+                context,
+                frame,
+                include_children=bool(arguments.get("include_children", False)),
+                include_parents=bool(arguments.get("include_parents", False)),
+            )
+            max_tokens = int(arguments.get("max_tokens", 2000))
+            raw_content = _truncate_by_tokens(hit.record.content, max_tokens)
+            payload = {
+                "frame_id": frame.id,
+                "record_id": hit.record.id,
+                "raw_content": raw_content,
+                "token_estimate": estimate_tokens(raw_content),
+                "parent_ids": list(frame.parent_ids),
+                "child_ids": list(frame.child_ids),
+                "related": related,
+                "evidence_metadata": {
+                    "source_uri": frame.source_uri,
+                    "source_span": frame.source_span,
+                    "content_hash": frame.content_hash,
+                    "layer": frame.layer.value,
+                    "kind": frame.kind.value,
+                },
+            }
+            return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="context_expand_failed")
+
+
+class CapsuleSummarizeTool(AgentTool):
+    spec = ToolSpec(
+        name="capsule.summarize",
+        description="Summarize a completed run capsule and show candidate learning signals.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "dry_run": {"type": "boolean"},
+            },
+            "required": ["run_id"],
+        },
+        risk="medium",
+        capabilities=("task-capsule", "nested-learning"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        run_id = str(arguments.get("run_id", "")).strip()
+        if not run_id:
+            return self._result(call, success=False, content="Missing run_id", error="missing_run_id")
+        try:
+            summary = summarize_run_capsule(
+                runs_dir=context.config.memory_dir.parent / "runs",
+                run_id=run_id,
+                backend=context.config.backend,
+            )
+            kernel = NestedLearningKernel()
+            decisions = []
+            for signal in summary.learning_signals:
+                decision = kernel.decide(signal)
+                payload = decision.to_payload()
+                payload["signal_title"] = signal.title
+                payload["dry_run"] = True
+                decisions.append(payload)
+            payload = {**summary.to_payload(), "dry_run": True, "nested_learning_decisions": decisions}
+            return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="capsule_summarize_failed")
+
+
+class CapsuleApplyTool(AgentTool):
+    needs_call_id = True
+    spec = ToolSpec(
+        name="capsule.apply",
+        description="Apply accepted learning signals from a completed run capsule. Requires auto-consolidation config and approval before writing.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "dry_run": {"type": "boolean"},
+                "include_policy": {"type": "boolean"},
+            },
+            "required": ["run_id"],
+        },
+        risk="high",
+        capabilities=("task-capsule", "nested-learning", "memory-write"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        public_arguments = {key: value for key, value in arguments.items() if not str(key).startswith("_")}
+        call_id = str(arguments.get("_tool_call_id") or "")
+        call = (
+            ToolCall(name=self.spec.name, arguments=public_arguments, id=call_id)
+            if call_id
+            else ToolCall(name=self.spec.name, arguments=public_arguments)
+        )
+        run_id = str(arguments.get("run_id", "")).strip()
+        if not run_id:
+            return self._result(call, success=False, content="Missing run_id", error="missing_run_id")
+        dry_run = bool(arguments.get("dry_run", False))
+        include_policy = bool(arguments.get("include_policy", False))
+        try:
+            summary = summarize_run_capsule(
+                runs_dir=context.config.memory_dir.parent / "runs",
+                run_id=run_id,
+                backend=context.config.backend,
+            )
+            plan = _capsule_apply_plan(summary, context=context, include_policy=include_policy)
+            if dry_run:
+                payload = {**summary.to_payload(), "dry_run": True, "applied": False, "decisions": plan}
+                return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+
+            if not context.config.enable_auto_consolidation:
+                payload = {
+                    **summary.to_payload(),
+                    "dry_run": False,
+                    "applied": False,
+                    "decisions": plan,
+                    "auto_consolidation_enabled": False,
+                }
+                return self._result(
+                    call,
+                    success=False,
+                    content=json.dumps(payload, indent=2),
+                    data=payload,
+                    error="auto_consolidation_disabled",
+                )
+
+            if context.config.require_approval_for_high_risk_tools and call.id not in context.approved_tool_call_ids:
+                if context.approval_handler is not None:
+                    return context.approval_handler(call, self.spec, context)
+                return self._result(
+                    call,
+                    success=False,
+                    content="Capsule apply requires approval before writing memory.",
+                    data={"status": "approval_required"},
+                    error="approval_required",
+                )
+
+            wrote = False
+            for item in plan:
+                if item.get("will_write") is not True:
+                    continue
+                signal = summary.learning_signals[int(item["signal_index"])]
+                decision = NestedLearningKernel().decide(signal)
+                if decision.target_layer is None:
+                    continue
+                record = NestedLearningKernel().to_memory_record(signal, decision)
+                if _memory_has_content_hash(context, record.layer, record.content_hash):
+                    item["skipped"] = "duplicate_content_hash"
+                    item["will_write"] = False
+                    continue
+                item["record_id"] = context.memory.put(record)
+                wrote = True
+            if wrote:
+                context.memory.seal_all()
+            payload = {**summary.to_payload(), "dry_run": False, "applied": wrote, "decisions": plan}
+            return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="capsule_apply_failed")
+
+
+class MemoryConflictsTool(AgentTool):
+    spec = ToolSpec(
+        name="memory.conflicts",
+        description="Search for conflicting memories around a claim/query.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "layers": {"type": "array", "items": {"type": "string"}},
+                "k": {"type": "integer", "minimum": 1, "maximum": 50},
+            },
+            "required": ["query"],
+        },
+        capabilities=("pseudo-context", "conflict-detection"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        query = str(arguments.get("query", "")).strip()
+        if not query:
+            return self._result(call, success=False, content="Missing query", error="missing_query")
+        try:
+            layers = _layers_arg(arguments.get("layers")) or tuple(MemoryLayer)
+            k = int(arguments.get("k", 8))
+            packed = ContextPacker(context.memory).pack(
+                ContextPackRequest(
+                    objective=f"Find conflicting memories for: {query}",
+                    query=query,
+                    allowed_layers=layers,
+                    token_budget=context.config.context_pack_token_budget,
+                    k_per_layer=k,
+                    include_telemetry=True,
+                )
+            )
+            hits = context.memory.retrieve(RetrievalQuery(query=query, layers=layers, k_per_layer=k))
+            possible_conflicts = []
+            for hit in hits[:k]:
+                metadata = hit.record.metadata
+                possible_conflicts.append(
+                    {
+                        "record_id": hit.record.id,
+                        "frame_id": metadata.get("frame_id") or hit.frame_id,
+                        "layer": hit.record.layer.value,
+                        "kind": hit.record.kind.value,
+                        "title": hit.record.title,
+                        "confidence": hit.record.confidence,
+                        "importance": hit.record.importance,
+                        "score": hit.score,
+                        "conflict_group_id": metadata.get("conflict_group_id"),
+                        "snippet": hit.snippet or hit.record.content[:500],
+                    }
+                )
+            payload = {
+                "query": query,
+                "conflict_warnings": list(packed.conflict_warnings),
+                "possible_conflicts": possible_conflicts,
+                "recommended_action": "Expand raw evidence and validate the conflicting claim before writing or promoting memory."
+                if packed.conflict_warnings
+                else "No conflict metadata detected; still validate high-impact claims against evidence.",
+            }
+            return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="memory_conflicts_failed")
 
 
 class ListFilesTool(AgentTool):
@@ -760,6 +1066,11 @@ def build_default_tools() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(MemorySearchTool())
     registry.register(MemoryWriteTool())
+    registry.register(ContextPackTool())
+    registry.register(ContextExpandTool())
+    registry.register(CapsuleSummarizeTool())
+    registry.register(CapsuleApplyTool())
+    registry.register(MemoryConflictsTool())
     registry.register(ListFilesTool())
     registry.register(ReadFileTool())
     registry.register(WriteFileTool())
@@ -861,3 +1172,118 @@ def _layer_arg(value: object) -> MemoryLayer | None:
     if not text:
         return None
     return MemoryLayer(text)
+
+
+def _layers_arg(value: object) -> tuple[MemoryLayer, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return None
+    layers: list[MemoryLayer] = []
+    for item in value:
+        text = str(item).strip()
+        if text:
+            layers.append(MemoryLayer(text))
+    return tuple(layers) if layers else None
+
+
+def _find_memory_by_id(context: ToolContext, lookup_id: str) -> Any | None:
+    for backend in context.memory.backends.values():
+        records = getattr(backend, "records", None)
+        if isinstance(records, list):
+            for record in records:
+                metadata = getattr(record, "metadata", {})
+                if record.id == lookup_id or str(metadata.get("frame_id", "")) == lookup_id:
+                    return type("_Hit", (), {"record": record})()
+    hits = context.memory.retrieve(RetrievalQuery(query=lookup_id, k_per_layer=5))
+    for hit in hits:
+        metadata = hit.record.metadata
+        if hit.record.id == lookup_id or str(metadata.get("frame_id", "")) == lookup_id or hit.frame_id == lookup_id:
+            return hit
+    return None
+
+
+def _related_frames(
+    context: ToolContext,
+    frame: Any,
+    *,
+    include_children: bool,
+    include_parents: bool,
+) -> list[dict[str, object]]:
+    wanted: set[str] = set()
+    if include_children:
+        wanted.update(frame.child_ids)
+    if include_parents:
+        wanted.update(frame.parent_ids)
+    if not wanted:
+        return []
+    related: list[dict[str, object]] = []
+    for item_id in sorted(wanted):
+        hit = _find_memory_by_id(context, item_id)
+        if hit is None:
+            related.append({"id": item_id, "found": False})
+            continue
+        record = hit.record
+        related.append(
+            {
+                "id": item_id,
+                "found": True,
+                "title": record.title,
+                "layer": record.layer.value,
+                "kind": record.kind.value,
+                "snippet": record.content[:500],
+            }
+        )
+    return related
+
+
+def _truncate_by_tokens(text: str, max_tokens: int) -> str:
+    max_chars = max(max_tokens * 4, 0)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "\n[TRUNCATED_BY_CONTEXT_EXPAND]"
+
+
+def _capsule_apply_plan(summary: Any, *, context: ToolContext, include_policy: bool) -> list[dict[str, object]]:
+    kernel = NestedLearningKernel()
+    plan: list[dict[str, object]] = []
+    for index, signal in enumerate(summary.learning_signals):
+        decision = kernel.decide(signal)
+        payload = decision.to_payload()
+        payload["signal_index"] = index
+        payload["signal_title"] = signal.title
+        payload["signal_kind"] = signal.kind.value
+        payload["requested_target_layer"] = signal.requested_target_layer.value if signal.requested_target_layer else None
+        payload["will_write"] = False
+        if not decision.accepted or decision.target_layer is None:
+            payload["blocked"] = (
+                "policy_requires_explicit_instruction"
+                if signal.requested_target_layer == MemoryLayer.POLICY and not signal.explicit_instruction
+                else "nested_learning_rejected"
+            )
+        elif decision.target_layer == MemoryLayer.POLICY:
+            if not include_policy:
+                payload["blocked"] = "policy_excluded_from_capsule_apply"
+            elif not context.config.allow_policy_writes:
+                payload["blocked"] = "policy_write_disabled"
+            elif not signal.explicit_instruction:
+                payload["blocked"] = "policy_requires_explicit_instruction"
+            else:
+                payload["will_write"] = True
+        else:
+            record = kernel.to_memory_record(signal, decision)
+            if _memory_has_content_hash(context, decision.target_layer, record.content_hash):
+                payload["blocked"] = "duplicate_content_hash"
+            else:
+                payload["will_write"] = True
+        plan.append(payload)
+    return plan
+
+
+def _memory_has_content_hash(context: ToolContext, layer: MemoryLayer, content_hash: str) -> bool:
+    backend = context.memory.backends.get(layer)
+    records = getattr(backend, "records", None)
+    if isinstance(records, list):
+        return any(getattr(record, "content_hash", None) == content_hash for record in records)
+    hits = context.memory.retrieve(RetrievalQuery(query=content_hash, layers=(layer,), k_per_layer=3))
+    return any(hit.record.content_hash == content_hash or hit.record.metadata.get("content_hash") == content_hash for hit in hits)

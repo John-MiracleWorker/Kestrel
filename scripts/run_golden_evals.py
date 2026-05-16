@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -9,10 +10,16 @@ from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 from nested_memvid_agent.app_factory import build_agent
 from nested_memvid_agent.config import AgentConfig
+from nested_memvid_agent.context_packer import ContextPacker, ContextPackRequest
+from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
+from nested_memvid_agent.nested_learning import NestedLearningKernel
 from nested_memvid_agent.runtime_models import ToolCall
+from nested_memvid_agent.task_capsule import summarize_run_capsule, write_run_capsule
 from nested_memvid_agent.tools.base import ToolContext
 
 
@@ -53,6 +60,22 @@ def main() -> None:
         _run_case(
             "compile_context_under_budget",
             lambda: _eval_context_budget(_case_config(config, eval_id, "context_budget"), eval_id),
+        ),
+        _run_case(
+            "summary_first_expand_raw_on_demand",
+            lambda: _eval_summary_first_expand_raw(_case_config(config, eval_id, "summary_expand"), eval_id),
+        ),
+        _run_case(
+            "flag_conflicting_facts",
+            lambda: _eval_conflict_warning(_case_config(config, eval_id, "conflicts"), eval_id),
+        ),
+        _run_case(
+            "create_capsule_and_consolidate_validated_lessons",
+            lambda: _eval_task_capsule_consolidation(_case_config(config, eval_id, "capsule"), eval_id),
+        ),
+        _run_case(
+            "mv2_not_sqlite_or_vector_db_substrate",
+            lambda: _eval_mv2_substrate_contract(_case_config(config, eval_id, "substrate")),
         ),
         _run_case(
             "avoid_policy_from_ordinary_event",
@@ -225,6 +248,132 @@ def _eval_context_budget(config: AgentConfig, eval_id: str) -> dict[str, Any]:
             "passed": marker in compiled.prompt and compiled.total_chars <= config.context_budget_chars,
             "memory_hits": len(compiled.hits),
             "context_chars": compiled.total_chars,
+        }
+    finally:
+        agent.close()
+
+
+def _eval_summary_first_expand_raw(config: AgentConfig, eval_id: str) -> dict[str, Any]:
+    agent = build_agent(config)
+    try:
+        marker = f"{eval_id} summary expand"
+        agent.memory.put(
+            MemoryRecord(
+                layer=MemoryLayer.EPISODIC,
+                kind=MemoryKind.SUMMARY,
+                title=f"{marker} summary",
+                content=f"{marker}: Summary says the fix is to pack summaries before raw evidence.",
+                confidence=0.8,
+                importance=0.8,
+                metadata={"frame_type": "task_summary"},
+            )
+        )
+        agent.memory.put(
+            MemoryRecord(
+                layer=MemoryLayer.EPISODIC,
+                kind=MemoryKind.EVENT,
+                title=f"{marker} raw",
+                content=f"{marker}: Raw exact evidence includes verbose logs and complete command output.",
+                confidence=0.8,
+                importance=0.7,
+                metadata={"frame_type": "raw_chunk"},
+            )
+        )
+        compact = ContextPacker(agent.memory).pack(ContextPackRequest(objective=marker, query=marker, expand_raw=False))
+        expanded = ContextPacker(agent.memory).pack(ContextPackRequest(objective=marker, query=marker, expand_raw=True))
+        compact_titles = {item.frame.title for item in compact.items}
+        expanded_titles = {item.frame.title for item in expanded.items}
+        return {
+            "passed": f"{marker} summary" in compact_titles
+            and f"{marker} raw" not in compact_titles
+            and f"{marker} raw" in expanded_titles,
+            "memory_hits": len(expanded.items),
+            "context_chars": len(expanded.prompt),
+        }
+    finally:
+        agent.close()
+
+
+def _eval_conflict_warning(config: AgentConfig, eval_id: str) -> dict[str, Any]:
+    agent = build_agent(config)
+    try:
+        marker = f"{eval_id} conflict"
+        for title, content in [
+            (f"{marker} enabled", f"{marker}: Feature gamma is enabled."),
+            (f"{marker} disabled", f"{marker}: Feature gamma is not enabled."),
+        ]:
+            agent.memory.put(
+                MemoryRecord(
+                    layer=MemoryLayer.SEMANTIC,
+                    kind=MemoryKind.FACT,
+                    title=title,
+                    content=content,
+                    confidence=0.88,
+                    importance=0.8,
+                    metadata={"conflict_group_id": marker},
+                )
+            )
+        packed = ContextPacker(agent.memory).pack(ContextPackRequest(objective=marker, query=marker))
+        return {
+            "passed": bool(packed.conflict_warnings),
+            "memory_hits": len(packed.items),
+            "context_chars": len(packed.prompt),
+            "warnings": list(packed.conflict_warnings),
+        }
+    finally:
+        agent.close()
+
+
+def _eval_task_capsule_consolidation(config: AgentConfig, eval_id: str) -> dict[str, Any]:
+    agent = build_agent(config)
+    try:
+        runs_dir = config.memory_dir.parent / "runs"
+        write_run_capsule(
+            runs_dir=runs_dir,
+            run_id=eval_id,
+            objective="Create a run-scoped complete.mv2 capsule.",
+            final_response="Capsule created.",
+            candidate_facts=(f"{eval_id}: complete.mv2 is a run artifact, not a permanent layer.",),
+            candidate_policy_items=(f"{eval_id}: Ordinary run policy candidate still needs human review.",),
+        )
+        summary = summarize_run_capsule(runs_dir=runs_dir, run_id=eval_id)
+        kernel = NestedLearningKernel()
+        writes = 0
+        policy_writes = 0
+        for signal in summary.learning_signals:
+            decision = kernel.decide(signal)
+            if not decision.accepted or decision.target_layer is None:
+                continue
+            if decision.target_layer == MemoryLayer.POLICY:
+                policy_writes += 1
+                continue
+            agent.memory.put(kernel.to_memory_record(signal, decision))
+            writes += 1
+        agent.memory.seal_all()
+        hits = agent.memory.retrieve(
+            RetrievalQuery(query=f"{eval_id} complete.mv2 run artifact", layers=(MemoryLayer.SEMANTIC,), k_per_layer=3)
+        )
+        return {
+            "passed": summary.capsule_path.name == "complete.mv2" and writes >= 1 and bool(hits) and policy_writes == 0,
+            "memory_hits": len(hits),
+            "tool_count": 0,
+        }
+    finally:
+        agent.close()
+
+
+def _eval_mv2_substrate_contract(config: AgentConfig) -> dict[str, Any]:
+    agent = build_agent(config)
+    try:
+        agent.memory.seal_all()
+        mv2_specs = [spec.mv2_file for spec in DEFAULT_LAYER_SPECS.values()]
+        forbidden_names = {"chroma", "qdrant", "lancedb", "postgres"}
+        memory_text = " ".join(str(path).lower() for path in config.memory_dir.rglob("*"))
+        return {
+            "passed": all(name.endswith(".mv2") for name in mv2_specs)
+            and not any(name in memory_text for name in forbidden_names)
+            and config.backend in {"memory", "memvid"},
+            "memory_hits": 0,
         }
     finally:
         agent.close()

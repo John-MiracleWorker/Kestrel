@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-05-15
+Last updated: 2026-05-16
 
 This repository is a working local agent scaffold, not a finished Hermes/OpenClaw agent. The status below is intentionally literal so future Codex passes can harden the right layers without treating roadmap items as done.
 
@@ -9,14 +9,17 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - CLI chat loop with in-memory and Memvid `.mv2` memory backends.
 - Layered memory files for working, episodic, semantic, procedural, and policy layers.
 - Context compiler that retrieves nested memory and builds the model prompt.
+- MV2 context-frame model and token-aware pseudo-context packer that retrieves summaries first, deduplicates content, flags conflict metadata, and expands raw evidence on demand.
 - Deterministic mock provider for fast tests and reproducible golden evals.
 - OpenAI Responses provider adapter using the portable JSON tool envelope.
 - OpenAI-compatible chat completions provider for local/model-server endpoints.
 - Codex CLI provider that can use local `codex exec` as the normal response engine.
 - Built-in tool registry with approval gates for shell, file writes, patch application, tests, and Codex CLI delegation.
 - Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry, and memory search.
+- Multi-channel ingress for Telegram Bot API updates, Discord message/interaction-shaped payloads, and generic/custom webhooks, with CLI and API routes.
 - SQLite state store for runs, run steps, approvals, MCP servers, skills, task nodes, and subagent runs, now initialized through schema version `3`.
 - Paper-guided nested learning kernel with context-flow metadata, optimizer traces, conservative continuum-memory routing, and a `memory.learn` tool/API path.
+- Run-scoped `complete.mv2` task capsules, preview-only capsule summaries, dry-run consolidation decisions, and approval-gated capsule apply.
 - MCP server records now track health metadata, tool counts, capabilities, last sync/seen/call/error timestamps, session state, failure counts, and latency.
 - MCP stdio servers now have a managed lazy session lifecycle with connect/disconnect/restart/health API routes, bounded operation timeouts, config-change teardown, and approval-by-default tool risk normalization.
 - First task-graph and subagent run records exist, with in-process planner/worker/reviewer profiles and UI/API surfaces.
@@ -27,15 +30,17 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - MCP: stdio live sessions are hardened and covered by a flag-gated integration test. SSE and streamable HTTP use the same manager path but still need real transport fixtures and production soak testing.
 - Skills: filesystem discovery and skill tool adapters exist. Sandboxed skill execution and richer skill manifests remain incomplete.
 - Codex CLI: `codex-cli` can drive responses and `codex.exec` is available as a high-risk approval-gated tool. It is not yet a branch-isolated autonomous repair loop.
-- Consolidation: memory consolidation scaffolding exists, but promotion policy, evidence thresholds, and validation loops are still basic.
+- Consolidation: capsule extraction and Nested Learning decisions exist, but auto-consolidation remains disabled by default and validation loops are still basic.
 - Self-modification: the runtime can record validated self-improvement signals and policy candidates, but code changes and policy writes still require explicit gates.
 - Subagents: local subagent runs can be queued and tracked. True branch/worktree isolation and Codex-backed worker fan-out are still next steps.
+- Channels: inbound normalization and dry-run reply payloads are implemented. Production bot identity verification, Discord Gateway reads, and channel-specific rate-limit handling still need hardening.
 
 ## Not Done Yet
 
 - Native OpenAI function/tool calling and native streaming deltas.
 - Durable multi-step planner with resumable goals and explicit task graphs.
 - Production authentication, authorization, and user/session isolation for the UI/API.
+- Production webhook signature verification and secret rotation for external channel endpoints.
 - Robust MCP SSE/streamable HTTP transport fixtures and failure-recovery soak testing.
 - Container-grade sandboxed skill execution.
 - Autonomous self-improvement with diff review, test gates, rollback, and explicit human approval.
@@ -46,6 +51,8 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - High-risk tools must remain blocked unless the matching allow flag is set or a human approval handler approves the exact tool call.
 - Ordinary conversation and observations must not write policy memory directly.
 - The Memvid backend must use `.mv2` files and preserve one file per memory layer.
+- `complete.mv2` is a run artifact under `.nest/runs/{run_id}/`, not a permanent memory layer.
+- SQLite is control-plane state only. It is not the retrieval memory substrate.
 - Mock-provider tests are the default fast validation path; Memvid integration remains behind `RUN_MEMVID_INTEGRATION=1`.
 
 ## Validation Commands
@@ -54,6 +61,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 python -m compileall -q src scripts
 pytest -q
 RUN_MCP_INTEGRATION=1 pytest -q tests/integration
+RUN_MEMVID_INTEGRATION=1 pytest -q tests/integration
 python scripts/run_golden_evals.py --backend memory --provider mock
 npm run test --prefix web
 npm run build --prefix web

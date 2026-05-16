@@ -15,6 +15,9 @@ The executable bridge lives in `src/nested_memvid_agent/nested_learning.py`.
 - `ContextFlow` represents a nested optimization loop with a level, update frequency, source layers, target layer, objective, compression rule, and retention behavior.
 - `OptimizerTrace` records the associative-memory update trace for a learning decision: surprise, validation score, repeat count, compression ratio, confidence delta, and effective confidence.
 - `NestedLearningKernel` decides whether a validated signal should be rejected, written, or promoted, and attaches context-flow metadata to the resulting memory record.
+- `MV2ContextFrame` records raw chunks, summaries, task/session capsules, corrections, conflict sets, and trace stubs with evidence pointers, parent/child links, confidence, importance, validation metadata, and token estimates.
+- `ContextPacker` builds a pseudo-context window by retrieving summaries first, expanding raw evidence only on demand, deduplicating redundant chunks, and warning on conflicts.
+- `TaskCapsuleWriter` writes run-scoped `complete.mv2` artifacts that summarize completed work and feed controlled learning-signal extraction.
 - `memory.learn` compresses a validated learning signal into the appropriate layer. Policy writes are still blocked unless the policy gate and config enablement both pass.
 - `memory.consolidate` now uses the same kernel so promotion metadata includes the context flow and optimizer trace.
 
@@ -111,11 +114,17 @@ Forgetting is not deleting blindly. Recommended behavior:
 
 ## Context compiler contract
 
-The compiler must produce:
+The compiler now delegates to the MV2 context packer. This is a pseudo-context window, not infinite context: the system retrieves, compresses, ranks, and packs selected memory under a budget before calling the model.
+
+The compiler/packer must produce:
 
 - Current objective.
-- Relevant policy/procedural/semantic/episodic/working memories.
-- Scores and confidence.
+- Hard policy constraints.
+- Relevant procedures.
+- Stable facts.
+- Recent episodic/task state.
+- Working memory.
+- Scores, confidence, and retrieval telemetry.
 - Evidence pointers.
 - Conflict warnings where applicable.
 - Next-step instruction.
@@ -125,3 +134,9 @@ It must not produce:
 - Full conversation dump by default.
 - Uncited claims as if they are facts.
 - Permanent-memory updates inside the prompt without validation.
+
+## Task capsules
+
+When enabled, a completed run can write `.nest/runs/{run_id}/complete.mv2`. This capsule is temporary run evidence, not a sixth durable memory layer. It may contain the user objective, selected context, tool calls, tool outputs, files touched, tests run, errors, final response, unresolved questions, reusable lessons, candidate facts, candidate procedures, candidate corrections, and policy candidates that require explicit human review.
+
+Capsule summaries produce `LearningSignal` objects and preview Nested Learning decisions. Applying those decisions is separate: `capsule.apply` requires auto-consolidation config and approval before writing. Automatic consolidation is off by default, dry-run by default, and policy writes remain rare: explicit instruction, high validation, repeat evidence, config enablement, and human review or equivalent explicit configuration are required.

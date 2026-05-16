@@ -15,6 +15,9 @@ from .mcp_manager import MCPManager
 from .runtime_models import AgentTurnResult, LLMStreamEvent, ToolCall, ToolExecution, ToolSpec
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore, RunRecord
+from .models import MemoryLayer
+from .nested_learning import NestedLearningKernel
+from .task_capsule import summarize_run_capsule, write_turn_capsule
 from .tools.base import ToolContext
 from .tools.builtin import build_default_tools
 from .tools.registry import ToolRegistry
@@ -218,6 +221,8 @@ class RunManager:
                 tool_count=len(result.tool_executions),
                 stop_reason=result.stop_reason,
             )
+            if status == "completed":
+                self._complete_capsule(run_id, config, agent, result)
             self.events.publish(run_id, "run.blocked" if status == "blocked" else "run.completed", _turn_payload(result))
         except Exception as exc:  # noqa: BLE001
             self.state.update_run(run_id, status="failed", error=f"{type(exc).__name__}: {exc}", stop_reason="error")
@@ -284,6 +289,8 @@ class RunManager:
                 tool_count=len(result.tool_executions) + 1,
                 stop_reason=result.stop_reason,
             )
+            if status == "completed":
+                self._complete_capsule(run_id, config, agent, result)
             self.events.publish(run_id, "run.blocked" if status == "blocked" else "run.completed", _turn_payload(result))
         except Exception as exc:  # noqa: BLE001
             self.state.update_run(run_id, status="failed", error=f"{type(exc).__name__}: {exc}", stop_reason="error")
@@ -378,6 +385,44 @@ class RunManager:
             registry.register(adapter)
         return registry
 
+    def _complete_capsule(
+        self,
+        run_id: str,
+        config: AgentConfig,
+        agent: NestedMV2Agent,
+        result: AgentTurnResult,
+    ) -> None:
+        if not config.enable_task_capsules:
+            return
+        runs_dir = config.memory_dir.parent / "runs"
+        try:
+            capsule_path = write_turn_capsule(
+                runs_dir=runs_dir,
+                run_id=run_id,
+                result=result,
+                backend=config.backend,
+                selected_context=result.context_prompt,
+            )
+            summary = summarize_run_capsule(runs_dir=runs_dir, run_id=run_id, backend=config.backend)
+            decisions = _capsule_decisions(
+                summary,
+                agent=agent,
+                dry_run=config.auto_consolidation_dry_run or not config.enable_auto_consolidation,
+            )
+            self.events.publish(
+                run_id,
+                "capsule.completed",
+                {
+                    "capsule_path": str(capsule_path),
+                    "summary": summary.to_payload(),
+                    "auto_consolidation_enabled": config.enable_auto_consolidation,
+                    "dry_run": config.auto_consolidation_dry_run or not config.enable_auto_consolidation,
+                    "decisions": decisions,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.events.publish(run_id, "capsule.failed", {"error": f"{type(exc).__name__}: {exc}"})
+
     def _start_thread(self, run_id: str, target: Any, *args: Any) -> None:
         thread = Thread(target=target, args=(run_id, *args), daemon=True)
         with self._lock:
@@ -411,6 +456,36 @@ def _turn_payload(result: AgentTurnResult) -> dict[str, Any]:
         "memory_writes": list(result.memory_writes),
         "stop_reason": result.stop_reason,
     }
+
+
+def _capsule_decisions(
+    summary: Any,
+    *,
+    agent: NestedMV2Agent,
+    dry_run: bool,
+) -> list[dict[str, object]]:
+    kernel = NestedLearningKernel()
+    decisions: list[dict[str, object]] = []
+    wrote = False
+    for signal in summary.learning_signals:
+        decision = kernel.decide(signal)
+        payload = decision.to_payload()
+        payload["dry_run"] = dry_run
+        payload["signal_title"] = signal.title
+        if decision.accepted and decision.target_layer is not None:
+            if decision.target_layer == MemoryLayer.POLICY and not (
+                agent.config.allow_policy_writes and signal.explicit_instruction
+            ):
+                payload["accepted"] = False
+                payload["blocked"] = "policy_write_requires_explicit_config_and_instruction"
+            elif not dry_run:
+                record = kernel.to_memory_record(signal, decision)
+                payload["record_id"] = agent.memory.put(record)
+                wrote = True
+        decisions.append(payload)
+    if wrote:
+        agent.memory.seal_all()
+    return decisions
 
 
 def _subagent_prompt(profile: str, goal: str) -> str:

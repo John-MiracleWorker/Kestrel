@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ..context_frames import MV2ContextFrame, to_memory_record
 from ..models import MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
 from .base import MemoryBackend
 
@@ -40,6 +41,9 @@ class InMemoryBackend(MemoryBackend):
         self.records.append(record)
         return record.id
 
+    def put_frame(self, frame: MV2ContextFrame) -> str:
+        return self.put(to_memory_record(frame))
+
     def find(self, query: str, k: int = 8, mode: str = "auto", min_relevancy: float = 0.0) -> list[MemoryHit]:
         del mode
         query_tokens = set(_tokens(query))
@@ -68,6 +72,22 @@ class InMemoryBackend(MemoryBackend):
                 )
         return sorted(hits, key=lambda hit: hit.score, reverse=True)[:k]
 
+    def find_frames(
+        self,
+        query: str,
+        k: int = 8,
+        layers: tuple[MemoryLayer, ...] | None = None,
+        frame_types: tuple[str, ...] | None = None,
+        mode: str = "auto",
+    ) -> list[MemoryHit]:
+        if layers is not None and self.layer not in layers:
+            return []
+        hits = self.find(query=query, k=k, mode=mode)
+        if frame_types is None:
+            return hits
+        allowed = set(frame_types)
+        return [hit for hit in hits if str(hit.record.metadata.get("frame_type", "raw_chunk")) in allowed]
+
     def seal(self) -> None:
         # Write a readable snapshot to disk to aid debugging. This is not a database.
         snapshot = [
@@ -81,6 +101,7 @@ class InMemoryBackend(MemoryBackend):
                 "importance": rec.importance,
                 "tags": rec.tags,
                 "metadata": rec.metadata,
+                "evidence": [ref.__dict__ for ref in rec.evidence],
             }
             for rec in self.records
         ]

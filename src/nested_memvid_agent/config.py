@@ -31,11 +31,19 @@ class AgentConfig:
     allow_policy_writes: bool = False
     allow_codex_cli: bool = False
     require_approval_for_high_risk_tools: bool = True
+    enable_task_capsules: bool = True
+    enable_auto_consolidation: bool = False
+    auto_consolidation_dry_run: bool = True
+    context_pack_token_budget: int = 6000
+    context_pack_expand_raw: bool = False
     stream: bool = False
     log_dir: Path = Path(".nest/logs")
     state_path: Path = Path(".nest/state/agent.db")
     skills_dir: Path = Path(".nest/skills")
     mcp_config_path: Path = Path(".nest/config/mcp_servers.json")
+    channel_config_path: Path = Path(".nest/config/channels.json")
+    enable_channel_delivery: bool = False
+    channel_send_timeout_seconds: int = 10
 
     @classmethod
     def from_env(cls) -> AgentConfig:
@@ -58,10 +66,19 @@ class AgentConfig:
             state_path=Path(os.getenv("NEST_AGENT_STATE_PATH", ".nest/state/agent.db")),
             skills_dir=Path(os.getenv("NEST_AGENT_SKILLS_DIR", ".nest/skills")),
             mcp_config_path=Path(os.getenv("NEST_AGENT_MCP_CONFIG", ".nest/config/mcp_servers.json")),
+            channel_config_path=Path(os.getenv("NEST_AGENT_CHANNEL_CONFIG", ".nest/config/channels.json")),
+            enable_channel_delivery=_env_bool("NEST_AGENT_ENABLE_CHANNEL_DELIVERY"),
+            channel_send_timeout_seconds=_env_int("NEST_AGENT_CHANNEL_SEND_TIMEOUT_SECONDS", 10),
             allow_shell=_env_bool("NEST_AGENT_ALLOW_SHELL"),
             allow_file_write=_env_bool("NEST_AGENT_ALLOW_FILE_WRITE"),
             allow_policy_writes=_env_bool("NEST_AGENT_ALLOW_POLICY_WRITES"),
             allow_codex_cli=_env_bool("NEST_AGENT_ALLOW_CODEX_CLI"),
+            enable_task_capsules=not _env_bool("NEST_AGENT_DISABLE_TASK_CAPSULES")
+            and _env_bool_default("NEST_AGENT_ENABLE_TASK_CAPSULES", True),
+            enable_auto_consolidation=_env_bool("NEST_AGENT_ENABLE_AUTO_CONSOLIDATION"),
+            auto_consolidation_dry_run=_env_bool_default("NEST_AGENT_AUTO_CONSOLIDATION_DRY_RUN", True),
+            context_pack_token_budget=_env_int("NEST_AGENT_CONTEXT_PACK_TOKEN_BUDGET", 6000),
+            context_pack_expand_raw=_env_bool("NEST_AGENT_CONTEXT_PACK_EXPAND_RAW"),
             stream=_env_bool("NEST_AGENT_STREAM"),
         )
 
@@ -72,7 +89,15 @@ class AgentConfig:
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any]) -> AgentConfig:
-        path_fields = {"memory_dir", "workspace", "log_dir", "state_path", "skills_dir", "mcp_config_path"}
+        path_fields = {
+            "memory_dir",
+            "workspace",
+            "log_dir",
+            "state_path",
+            "skills_dir",
+            "mcp_config_path",
+            "channel_config_path",
+        }
         normalized: dict[str, Any] = {}
         for key, value in raw.items():
             normalized[key] = Path(value) if key in path_fields and value is not None else value
@@ -81,6 +106,13 @@ class AgentConfig:
 
 def _env_bool(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_bool_default(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _env_int(name: str, default: int) -> int:
