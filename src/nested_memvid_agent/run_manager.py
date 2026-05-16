@@ -204,8 +204,23 @@ class RunManager:
         self.state.get_run(run_id)
         return {
             "tasks": [_task_payload(task) for task in self.state.list_task_nodes(run_id)],
+            "ready_tasks": self.ready_tasks(run_id),
             "subagents": [asdict(subagent) for subagent in self.state.list_subagent_runs(run_id)],
         }
+
+    def ready_tasks(self, run_id: str) -> list[dict[str, Any]]:
+        self.state.get_run(run_id)
+        tasks = self.state.list_task_nodes(run_id)
+        by_id = {task.task_id: task for task in tasks}
+        ready: list[dict[str, Any]] = []
+        for task in tasks:
+            reason = _task_scheduler_reason(task, by_id)
+            if reason is None:
+                continue
+            payload = _task_payload(task)
+            payload["scheduler_reason"] = reason
+            ready.append(payload)
+        return ready
 
     def approve_task(self, run_id: str, task_id: str) -> dict[str, Any]:
         self.state.get_run(run_id)
@@ -567,6 +582,23 @@ def _task_payload(task: TaskNodeRecord) -> dict[str, Any]:
     payload["required_tools"] = list(task.required_tools)
     payload["acceptance_criteria"] = list(task.acceptance_criteria)
     return payload
+
+
+def _task_scheduler_reason(task: TaskNodeRecord, by_id: dict[str, TaskNodeRecord]) -> str | None:
+    if not task.approved:
+        return None
+    if task.status not in {"queued", "approved"}:
+        return None
+    if not all(by_id.get(dependency) and by_id[dependency].status == "completed" for dependency in task.dependencies):
+        return None
+    retry = task.retry_strategy or {}
+    if retry.get("requires_changed_strategy"):
+        if retry.get("retry_allowed") is not True or not str(retry.get("changed_strategy") or "").strip():
+            return None
+        return "retry_strategy_changed"
+    if task.attempt_count > 0:
+        return "retry_ready"
+    return "dependencies_satisfied"
 
 
 def _initial_task_plan(message: str) -> list[dict[str, Any]]:
