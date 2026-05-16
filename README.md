@@ -123,10 +123,13 @@ Plugin registry commands:
 
 ```bash
 nest-agent plugins list --backend memory
+nest-agent plugins install owner/repo --backend memory
 nest-agent plugins inspect <plugin_id> --backend memory
+nest-agent plugins enable <plugin_id> --backend memory
+nest-agent plugins disable <plugin_id> --backend memory
 ```
 
-Plugin installation and updates fetch GitHub plugin sources. The config surface includes `--allow-plugin-install` / `NEST_AGENT_ALLOW_PLUGIN_INSTALL`; enforcement of that gate should be treated as a hardening item before using plugin install in a shared or exposed runtime.
+Plugin installation and updates fetch public GitHub plugin sources, accept `kestrel.plugin.json` plus limited Hermes-style `plugin.yaml`, and materialize plugin-declared skills/MCP servers disabled by default. Agent-initiated `plugin.install` is high risk: it requires `--allow-plugin-install` / `NEST_AGENT_ALLOW_PLUGIN_INSTALL` plus exact-call approval before execution.
 
 ## Memvid Backend
 

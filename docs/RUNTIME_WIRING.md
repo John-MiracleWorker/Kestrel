@@ -106,7 +106,7 @@ Examples of high-risk tools:
 
 `git.commit` never pushes. On repair branches, it also requires a current `repair.review` artifact tied to successful validation and the current diff hash.
 
-The plugin registry is newer than the skill install path. Plugin commands can fetch GitHub repositories and materialize plugin-declared skills/MCP servers; keep plugin installation disabled outside trusted local development until its allow-flag and approval enforcement are hardened.
+The plugin registry can fetch public GitHub repositories and materialize plugin-declared skills/MCP servers. CLI/API plugin installs are operator actions; agent-initiated `plugin.install` requires `NEST_AGENT_ALLOW_PLUGIN_INSTALL=true` or `--allow-plugin-install` plus exact-call approval, and installed plugins remain disabled unless explicitly enabled.
 
 ## Memory Wiring
 

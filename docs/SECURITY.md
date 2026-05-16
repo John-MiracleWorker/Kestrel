@@ -57,7 +57,7 @@ High-risk tools require explicit config enablement where applicable and exact-ca
 
 Skill installation is a high-risk file-write action. Uploaded skill capsules are confined to the configured skills directory, validated by manifest shape, and still require approval before installation.
 
-Plugin installation is newer and should be treated as high risk: it fetches GitHub repositories and materializes skills/MCP entries. Keep `NEST_AGENT_ALLOW_PLUGIN_INSTALL=false` in shared or exposed runtimes until the install path has the same explicit enforcement and approval guarantees as other high-risk mutation paths.
+Plugin installation is high risk: it fetches public GitHub repositories and materializes skills/MCP entries. Agent-initiated `plugin.install` is disabled unless `NEST_AGENT_ALLOW_PLUGIN_INSTALL=true` or `--allow-plugin-install` is set, and it still requires exact-call approval before execution. Installed plugins are not enabled by default unless explicitly requested.
 
 Autonomous scheduling is disabled by default. When enabled, it is bounded by per-cycle task and cycle limits, and it stops at task approval or exact-call tool approval boundaries instead of silently crossing into high-risk work.
 
