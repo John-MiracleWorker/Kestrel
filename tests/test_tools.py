@@ -833,6 +833,59 @@ def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_
     assert status.stdout.strip() == ""
 
 
+def test_stale_repair_review_blocks_commit_and_rollback_preserves_artifact(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    (tmp_path / "calculator.py").write_text("def add(a, b):\n    return a - b\n")
+    subprocess.run(["git", "add", "calculator.py"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed calculator"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+
+    prepare = ToolCall(name="repair.prepare", arguments={"branch": "codex/repair-stale-review"}, id="prepare_stale")
+    assert registry.execute(prepare, _approved_context(memory, tmp_path, prepare)).success
+    (tmp_path / "calculator.py").write_text("def add(a, b):\n    return a + b\n")
+    validation = {"success": True, "returncode": 0, "command": ["pytest", "-q"], "content": "passed"}
+    review = registry.execute(
+        ToolCall(name="repair.review", arguments={"validation": validation, "summary": "Calculator fix reviewed."}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+    assert review.success
+
+    (tmp_path / "calculator.py").write_text("def add(a, b):\n    return a + b + 1\n")
+    commit_call = ToolCall(
+        name="git.commit",
+        arguments={"message": "repair calculator", "repair_review_id": review.data["review_id"]},
+        id="commit_stale",
+    )
+    stale_commit = registry.execute(commit_call, _approved_context(memory, tmp_path, commit_call))
+    assert stale_commit.error == "repair_review_stale"
+
+    rollback_call = ToolCall(
+        name="repair.rollback",
+        arguments={"reason": "stale_repair_review", "review_id": review.data["review_id"]},
+        id="rollback_stale",
+    )
+    rolled_back = registry.execute(rollback_call, _approved_context(memory, tmp_path, rollback_call))
+    assert rolled_back.success
+    assert (tmp_path / "calculator.py").read_text() == "def add(a, b):\n    return a - b\n"
+    artifact_path = tmp_path / rolled_back.data["rollback_artifact"]
+    assert artifact_path.exists()
+    artifact = json.loads(artifact_path.read_text())
+    assert artifact["reason"] == "stale_repair_review"
+    assert artifact["review_id"] == review.data["review_id"]
+    assert artifact["before"]["changed_files"] == ["calculator.py"]
+    status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    assert status.stdout.strip() == ""
+
+
 def test_repair_review_creates_commit_gate_after_successful_validation(tmp_path: Path) -> None:
     _init_git_repo(tmp_path)
     subprocess.run(["git", "switch", "-c", "codex/repair-review"], cwd=tmp_path, check=True, capture_output=True, text=True)
