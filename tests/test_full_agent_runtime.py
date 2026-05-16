@@ -816,6 +816,26 @@ def test_run_manager_creates_durable_child_plan_for_multi_step_goal(tmp_path: Pa
     assert child_tasks[1]["required_tools"]
 
 
+def test_run_manager_repair_plan_inserts_review_gate_before_commit(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    run = manager.create_run(message="Fix the failing test, validate it, review the repair, and commit it", session_id="session")
+
+    graph = manager.task_graph(run.run_id)
+    child_tasks = graph["tasks"][1:]
+    titles = [task["title"] for task in child_tasks]
+
+    assert "Review repair before commit" in titles
+    assert "Commit reviewed repair" in titles
+    review_task = child_tasks[titles.index("Review repair before commit")]
+    commit_task = child_tasks[titles.index("Commit reviewed repair")]
+    validate_task = next(task for task in child_tasks if task["title"] == "Validate repair")
+    assert "repair.review" in review_task["required_tools"]
+    assert "git.commit" in commit_task["required_tools"]
+    assert validate_task["task_id"] in review_task["dependencies"]
+    assert review_task["task_id"] in commit_task["dependencies"]
+    assert any("repair.review" in criterion for criterion in commit_task["acceptance_criteria"])
+
+
 def test_run_manager_ready_tasks_respect_dependencies_and_approval(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     run = manager.state.create_run(

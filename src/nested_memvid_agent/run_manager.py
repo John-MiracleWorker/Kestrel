@@ -611,6 +611,73 @@ def _initial_task_plan(message: str) -> list[dict[str, Any]]:
     objective = message.strip() or "User objective"
     inspect_id = f"task_{uuid4().hex}"
     validate_id = f"task_{uuid4().hex}"
+    if _looks_like_repair_commit_request(objective):
+        prepare_id = f"task_{uuid4().hex}"
+        patch_id = f"task_{uuid4().hex}"
+        review_id = f"task_{uuid4().hex}"
+        commit_id = f"task_{uuid4().hex}"
+        return [
+            {
+                "task_id": inspect_id,
+                "title": "Inspect repair context",
+                "goal": f"Gather repository context and failure evidence for: {objective}",
+                "profile": "worker",
+                "dependencies": [],
+                "required_tools": ["repo.search", "repo.map", "memory.search", "context.pack"],
+                "risk": "low",
+                "acceptance_criteria": ["Relevant code, tests, and prior repair lessons are identified before mutation."],
+            },
+            {
+                "task_id": prepare_id,
+                "title": "Prepare repair isolation",
+                "goal": f"Create or confirm an isolated repair branch/worktree before changing files for: {objective}",
+                "profile": "worker",
+                "dependencies": [inspect_id],
+                "required_tools": ["repair.prepare", "repair.status"],
+                "risk": "high",
+                "acceptance_criteria": ["Mutation happens only on an approved repair branch/worktree."],
+            },
+            {
+                "task_id": patch_id,
+                "title": "Apply repair patch",
+                "goal": f"Apply the smallest repair patch for: {objective}",
+                "profile": "worker",
+                "dependencies": [prepare_id],
+                "required_tools": ["repair.apply_patch", "patch.apply"],
+                "risk": "high",
+                "acceptance_criteria": ["Patch is scoped to the diagnosed repair and path-safe."],
+            },
+            {
+                "task_id": validate_id,
+                "title": "Validate repair",
+                "goal": f"Run targeted validation and classify failures for: {objective}",
+                "profile": "worker",
+                "dependencies": [patch_id],
+                "required_tools": ["repair.orchestrate_validate", "repair.validate", "test.run", "lint.run"],
+                "risk": "high",
+                "acceptance_criteria": ["Targeted validation passes, or retry guidance records a changed strategy."],
+            },
+            {
+                "task_id": review_id,
+                "title": "Review repair before commit",
+                "goal": f"Create the durable repair.review artifact after successful validation for: {objective}",
+                "profile": "reviewer",
+                "dependencies": [validate_id],
+                "required_tools": ["repair.review", "git.diff", "repair.status"],
+                "risk": "medium",
+                "acceptance_criteria": ["repair.review records successful validation, current branch, changed files, and current diff hash."],
+            },
+            {
+                "task_id": commit_id,
+                "title": "Commit reviewed repair",
+                "goal": f"Commit only after repair.review created a current reviewer gate for: {objective}",
+                "profile": "worker",
+                "dependencies": [review_id],
+                "required_tools": ["git.commit"],
+                "risk": "high",
+                "acceptance_criteria": ["git.commit includes the current repair.review id and still requires exact-call approval."],
+            },
+        ]
     return [
         {
             "task_id": inspect_id,
@@ -643,6 +710,18 @@ def _initial_task_plan(message: str) -> list[dict[str, Any]]:
             "acceptance_criteria": ["Remaining risks or next steps are explicit."],
         },
     ]
+
+
+def _looks_like_repair_commit_request(message: str) -> bool:
+    normalized = message.lower()
+    repair_terms = ("repair", "fix", "patch", "failing", "failure", "bug")
+    commit_terms = ("commit", "merge", "pr", "pull request")
+    validation_terms = ("validate", "test", "lint", "check")
+    return (
+        any(term in normalized for term in repair_terms)
+        and any(term in normalized for term in commit_terms)
+        and any(term in normalized for term in validation_terms)
+    )
 
 
 def _trace_category(event: dict[str, Any]) -> str:
