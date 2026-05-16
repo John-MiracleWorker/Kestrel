@@ -106,6 +106,7 @@ _ENABLEMENT_BY_TOOL = {
     "repair.prepare": "allow_file_write",
     "repair.apply_patch": "allow_file_write",
     "repair.validate": "allow_shell",
+    "repair.orchestrate_validate": "allow_shell",
     "repair.rollback": "allow_file_write",
     "codex.exec": "allow_codex_cli",
 }

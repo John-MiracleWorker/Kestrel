@@ -17,7 +17,8 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Provider capability metadata is exposed on built-in providers, and a retryable-error fallback wrapper can route from a primary provider to a configured secondary provider.
 - Built-in tool registry with structured exception boundaries, timeout enforcement, and exact-call approval gates for shell, file writes, patch application, tests, and Codex CLI delegation.
 - Self-diagnosis primitives can classify common provider/tool/test/import/permission/MCP/sandbox failures and recall similar procedural/episodic failure lessons before retry.
-- Safe self-repair now has branch-isolated repair primitives: `repair.prepare`, `repair.status`, `repair.apply_patch`, `repair.validate`, and `repair.rollback`.
+- Safe self-repair now has branch-isolated repair primitives: `repair.prepare`, `repair.status`, `repair.apply_patch`, `repair.validate`, `repair.orchestrate_validate`, and `repair.rollback`.
+- The first diagnosis-gated repair orchestration slice can run validation on an active repair branch, classify failures, recall prior lessons, and block repeated validation retries until the strategy changes.
 - Skills now have a first manifest validation gate plus persisted validation/provenance metadata for discovered instruction capsules.
 - Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry, and memory search.
 - Multi-channel ingress for Telegram Bot API updates, Discord message/interaction-shaped payloads, and generic/custom webhooks, with CLI and API routes.
@@ -31,6 +32,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - First task-graph and subagent run records exist, with durable task metadata, deterministic starter plan decomposition, in-process planner/worker/reviewer profiles, and UI/API surfaces.
 - Provider failures emit structured `diagnosis.classified` events so traces can explain the failure category and suggested playbook.
 - Repair mutation tools are high-risk, approval-gated, covered by exact-call approvals, disabled unless the matching capability is enabled, and refuse non-repair branches for patch/validate/rollback operations.
+- Diagnosis-gated repair validation must remain approval-gated, refuse non-repair branches, recall similar lessons on failure, and block repeated validation retries when prior lessons exist unless a changed strategy is supplied.
 
 ## Partially Implemented
 
@@ -41,7 +43,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Consolidation: capsule extraction and Nested Learning decisions exist, but auto-consolidation remains disabled by default and validation loops are still basic.
 - Self-diagnosis: first-pass classification and memory recall tools exist. A full executor retry gate that forces changed strategy before every retry is still incomplete.
 - Self-modification: the runtime can record validated self-improvement signals and policy candidates, but code changes and policy writes still require explicit gates.
-- Safe repair: branch preparation, patch application, targeted validation, status reporting, and rollback primitives exist. Full autonomous patch proposal, reviewer gating, and approval-before-commit orchestration are still incomplete.
+- Safe repair: branch preparation, patch application, targeted validation, diagnosis-gated retry assessment, status reporting, and rollback primitives exist. Full autonomous patch proposal, reviewer gating, and approval-before-commit orchestration are still incomplete.
 - Subagents: local subagent runs can be queued and tracked. True branch/worktree isolation and Codex-backed worker fan-out are still next steps.
 - Channels: inbound normalization and dry-run reply payloads are implemented. Production bot identity verification, Discord Gateway reads, and channel-specific rate-limit handling still need hardening.
 
