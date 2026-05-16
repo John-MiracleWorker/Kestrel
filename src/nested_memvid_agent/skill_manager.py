@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,23 +29,38 @@ class SkillManager:
     def __init__(self, root: Path, state: AgentStateStore) -> None:
         self.root = root
         self.state = state
+        self.validation_errors: list[dict[str, Any]] = []
         self.root.mkdir(parents=True, exist_ok=True)
 
     def discover(self) -> list[dict[str, Any]]:
         found: list[dict[str, Any]] = []
+        self.validation_errors = []
         for skill_dir in sorted(path for path in self.root.iterdir() if path.is_dir()):
             manifest_path = skill_dir / "skill.json"
             instructions_path = skill_dir / "SKILL.md"
             if not manifest_path.exists() or not instructions_path.exists():
                 continue
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            try:
+                manifest_text = manifest_path.read_text(encoding="utf-8")
+                instructions = instructions_path.read_text(encoding="utf-8")
+                manifest = json.loads(manifest_text)
+            except (OSError, json.JSONDecodeError) as exc:
+                self.validation_errors.append({"path": str(skill_dir), "errors": [f"manifest_read_failed:{type(exc).__name__}"]})
+                continue
+            validation = validate_skill_manifest(manifest)
+            if validation["errors"]:
+                self.validation_errors.append({"path": str(skill_dir), **validation})
+                continue
+            manifest = dict(manifest)
+            manifest["validation"] = validation
+            manifest["provenance"] = _skill_provenance(skill_dir, manifest_text, instructions)
             capsule = SkillCapsule(
                 id=str(manifest.get("id", skill_dir.name)),
                 name=str(manifest.get("name", skill_dir.name)),
                 description=str(manifest.get("description", "")),
                 path=skill_dir,
                 manifest=manifest,
-                instructions=instructions_path.read_text(encoding="utf-8"),
+                instructions=instructions,
                 enabled=bool(manifest.get("enabled", True)),
             )
             found.append(self.state.upsert_skill(_capsule_to_state(capsule)))
@@ -121,6 +137,44 @@ class SkillToolAdapter(AgentTool):
             content=content,
             data={"skill_id": self.capsule.id, "memory_record_id": record_id},
         )
+
+
+def validate_skill_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not str(manifest.get("id", "")).strip():
+        errors.append("missing_id")
+    if not str(manifest.get("description", "")).strip():
+        errors.append("missing_description")
+    risk = str(manifest.get("risk", "medium")).strip().lower()
+    if risk not in {"low", "medium", "high"}:
+        errors.append("invalid_risk")
+    runtime = manifest.get("runtime", {"type": "instruction"})
+    if not isinstance(runtime, dict):
+        errors.append("invalid_runtime")
+    elif str(runtime.get("type", "instruction")) not in {"instruction", "python", "shell", "container"}:
+        errors.append("unsupported_runtime")
+    for field in ("capabilities", "permissions", "tests"):
+        if field in manifest and not isinstance(manifest[field], list):
+            errors.append(f"invalid_{field}")
+    for field in ("parameters", "inputs", "outputs"):
+        if field in manifest and not isinstance(manifest[field], dict):
+            errors.append(f"invalid_{field}")
+    if "version" not in manifest:
+        warnings.append("missing_version")
+    if "permissions" not in manifest:
+        warnings.append("missing_permissions")
+    if "runtime" not in manifest:
+        warnings.append("default_instruction_runtime")
+    return {"ok": not errors, "errors": errors, "warnings": warnings}
+
+
+def _skill_provenance(skill_dir: Path, manifest_text: str, instructions: str) -> dict[str, Any]:
+    return {
+        "path": str(skill_dir),
+        "manifest_sha256": hashlib.sha256(manifest_text.encode("utf-8")).hexdigest(),
+        "instructions_sha256": hashlib.sha256(instructions.encode("utf-8")).hexdigest(),
+    }
 
 
 def _capsule_to_state(capsule: SkillCapsule) -> dict[str, Any]:
