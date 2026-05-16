@@ -16,7 +16,7 @@ from .models import MemoryLayer
 from .nested_learning import NestedLearningKernel
 from .runtime_models import AgentTurnResult, LLMStreamEvent, ToolCall, ToolExecution, ToolSpec
 from .skill_manager import SkillManager
-from .state_store import AgentStateStore, RunRecord
+from .state_store import AgentStateStore, RunRecord, TaskNodeRecord
 from .task_capsule import summarize_run_capsule, write_turn_capsule
 from .tools.base import ToolContext
 from .tools.builtin import build_default_tools
@@ -65,7 +65,7 @@ class RunManager:
             workspace=str(run_config.workspace),
             model=run_config.model,
         )
-        self.state.create_task_node(
+        root = self.state.create_task_node(
             task_id=f"task_{uuid4().hex}",
             run_id=run_id,
             title="Root objective",
@@ -73,8 +73,25 @@ class RunManager:
             profile="planner",
             status="queued",
             approved=True,
-            plan={"autonomy_mode": "background"},
+            plan={"autonomy_mode": "background", "decomposition": "initial"},
+            acceptance_criteria=["User objective is addressed or explicitly blocked with next steps."],
         )
+        for planned in _initial_task_plan(message):
+            dependencies = [root.task_id if dependency == "root" else dependency for dependency in planned["dependencies"]]
+            self.state.create_task_node(
+                task_id=str(planned["task_id"]),
+                run_id=run_id,
+                parent_id=root.task_id,
+                title=str(planned["title"]),
+                goal=str(planned["goal"]),
+                profile=str(planned["profile"]),
+                status="queued",
+                approved=planned["risk"] == "low",
+                dependencies=dependencies,
+                required_tools=planned["required_tools"],
+                risk=str(planned["risk"]),
+                acceptance_criteria=planned["acceptance_criteria"],
+            )
         self.events.publish(run_id, "run.queued", {"message": message, "session_id": run.session_id})
         self._start_thread(run_id, self._run_agent_turn, run_config, message, run.session_id)
         return run
@@ -185,7 +202,7 @@ class RunManager:
     def task_graph(self, run_id: str) -> dict[str, Any]:
         self.state.get_run(run_id)
         return {
-            "tasks": [asdict(task) for task in self.state.list_task_nodes(run_id)],
+            "tasks": [_task_payload(task) for task in self.state.list_task_nodes(run_id)],
             "subagents": [asdict(subagent) for subagent in self.state.list_subagent_runs(run_id)],
         }
 
@@ -527,6 +544,58 @@ def _turn_payload(result: AgentTurnResult) -> dict[str, Any]:
         "memory_writes": list(result.memory_writes),
         "stop_reason": result.stop_reason,
     }
+
+
+def _task_payload(task: TaskNodeRecord) -> dict[str, Any]:
+    payload = asdict(task)
+    payload["dependencies"] = list(task.dependencies)
+    payload["required_tools"] = list(task.required_tools)
+    payload["acceptance_criteria"] = list(task.acceptance_criteria)
+    return payload
+
+
+def _initial_task_plan(message: str) -> list[dict[str, Any]]:
+    """Create a conservative persisted starter plan for new background runs.
+
+    The live agent still does the real work. These deterministic nodes give the
+    control plane a durable DAG skeleton for tracking, resume, and review instead
+    of leaving every run as one opaque root task.
+    """
+    objective = message.strip() or "User objective"
+    inspect_id = f"task_{uuid4().hex}"
+    validate_id = f"task_{uuid4().hex}"
+    return [
+        {
+            "task_id": inspect_id,
+            "title": "Inspect context",
+            "goal": f"Gather relevant context for: {objective}",
+            "profile": "worker",
+            "dependencies": [],
+            "required_tools": ["memory.search", "context.pack"],
+            "risk": "low",
+            "acceptance_criteria": ["Relevant memory/context is considered before acting."],
+        },
+        {
+            "task_id": validate_id,
+            "title": "Execute and validate",
+            "goal": f"Execute the approved low-risk path and validate progress for: {objective}",
+            "profile": "worker",
+            "dependencies": [inspect_id],
+            "required_tools": ["tool.registry"],
+            "risk": "low",
+            "acceptance_criteria": ["Result is checked against the objective and failures are recorded."],
+        },
+        {
+            "task_id": f"task_{uuid4().hex}",
+            "title": "Review outcome",
+            "goal": f"Review whether the result satisfies: {objective}",
+            "profile": "reviewer",
+            "dependencies": [validate_id],
+            "required_tools": [],
+            "risk": "low",
+            "acceptance_criteria": ["Remaining risks or next steps are explicit."],
+        },
+    ]
 
 
 def _trace_category(event: dict[str, Any]) -> str:

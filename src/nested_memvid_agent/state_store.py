@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def utc_now() -> str:
@@ -46,6 +46,12 @@ class TaskNodeRecord:
     approved: bool = False
     plan: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
+    dependencies: tuple[str, ...] = ()
+    required_tools: tuple[str, ...] = ()
+    risk: str = "low"
+    acceptance_criteria: tuple[str, ...] = ()
+    attempt_count: int = 0
+    failure_reason: str = ""
     created_at: str = ""
     updated_at: str = ""
 
@@ -418,6 +424,12 @@ class AgentStateStore:
         parent_id: str | None = None,
         approved: bool = False,
         plan: dict[str, Any] | None = None,
+        dependencies: list[str] | tuple[str, ...] = (),
+        required_tools: list[str] | tuple[str, ...] = (),
+        risk: str = "low",
+        acceptance_criteria: list[str] | tuple[str, ...] = (),
+        attempt_count: int = 0,
+        failure_reason: str = "",
     ) -> TaskNodeRecord:
         now = utc_now()
         with self._connect() as conn:
@@ -425,8 +437,9 @@ class AgentStateStore:
                 """
                 INSERT INTO task_nodes (
                     task_id, run_id, parent_id, title, goal, profile, status, approved,
-                    plan_json, result_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                    plan_json, result_json, dependencies_json, required_tools_json, risk,
+                    acceptance_criteria_json, attempt_count, failure_reason, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -438,6 +451,12 @@ class AgentStateStore:
                     status,
                     1 if approved else 0,
                     json.dumps(plan or {}),
+                    json.dumps(list(dependencies)),
+                    json.dumps(list(required_tools)),
+                    risk,
+                    json.dumps(list(acceptance_criteria)),
+                    attempt_count,
+                    failure_reason,
                     now,
                     now,
                 ),
@@ -546,6 +565,9 @@ class AgentStateStore:
             if current < 3:
                 _apply_schema_v3(conn)
                 current = 3
+            if current < 4:
+                _apply_schema_v4(conn)
+                current = 4
             if current < SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported schema migration target: {current} -> {SCHEMA_VERSION}")
             if current == SCHEMA_VERSION:
@@ -713,6 +735,20 @@ def _apply_schema_v3(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE mcp_servers ADD COLUMN {name} {definition}")
 
 
+def _apply_schema_v4(conn: sqlite3.Connection) -> None:
+    existing = _columns(conn, "task_nodes")
+    for name, definition in {
+        "dependencies_json": "TEXT NOT NULL DEFAULT '[]'",
+        "required_tools_json": "TEXT NOT NULL DEFAULT '[]'",
+        "risk": "TEXT NOT NULL DEFAULT 'low'",
+        "acceptance_criteria_json": "TEXT NOT NULL DEFAULT '[]'",
+        "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+        "failure_reason": "TEXT NOT NULL DEFAULT ''",
+    }.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE task_nodes ADD COLUMN {name} {definition}")
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -817,6 +853,12 @@ def _task_from_row(row: sqlite3.Row) -> TaskNodeRecord:
         approved=bool(row["approved"]),
         plan=json.loads(str(row["plan_json"])),
         result=_json_or_none(row["result_json"]),
+        dependencies=tuple(json.loads(str(_row_get(row, "dependencies_json", "[]") or "[]"))),
+        required_tools=tuple(json.loads(str(_row_get(row, "required_tools_json", "[]") or "[]"))),
+        risk=str(_row_get(row, "risk", "low") or "low"),
+        acceptance_criteria=tuple(json.loads(str(_row_get(row, "acceptance_criteria_json", "[]") or "[]"))),
+        attempt_count=int(str(_row_get(row, "attempt_count", 0) or 0)),
+        failure_reason=str(_row_get(row, "failure_reason", "") or ""),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
@@ -858,4 +900,10 @@ def _task_column(field: str) -> str:
         return "plan_json"
     if field == "result":
         return "result_json"
+    if field == "dependencies":
+        return "dependencies_json"
+    if field == "required_tools":
+        return "required_tools_json"
+    if field == "acceptance_criteria":
+        return "acceptance_criteria_json"
     return field

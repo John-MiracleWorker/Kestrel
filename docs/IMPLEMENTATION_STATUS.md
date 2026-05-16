@@ -17,12 +17,12 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Built-in tool registry with structured exception boundaries, timeout enforcement, and exact-call approval gates for shell, file writes, patch application, tests, and Codex CLI delegation.
 - Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry, and memory search.
 - Multi-channel ingress for Telegram Bot API updates, Discord message/interaction-shaped payloads, and generic/custom webhooks, with CLI and API routes.
-- SQLite state store for runs, run steps, approvals, MCP servers, skills, task nodes, and subagent runs, now initialized through schema version `3`.
+- SQLite state store for runs, run steps, approvals, MCP servers, skills, task nodes, and subagent runs, now initialized through schema version `4`.
 - Paper-guided nested learning kernel with context-flow metadata, optimizer traces, conservative continuum-memory routing, and a `memory.learn` tool/API path.
 - Run-scoped `complete.mv2` task capsules, preview-only capsule summaries, dry-run consolidation decisions, and approval-gated capsule apply.
 - MCP server records now track health metadata, tool counts, capabilities, last sync/seen/call/error timestamps, session state, failure counts, and latency.
 - MCP stdio servers now have a managed lazy session lifecycle with connect/disconnect/restart/health API routes, bounded operation timeouts, config-change teardown, and approval-by-default tool risk normalization.
-- First task-graph and subagent run records exist, with in-process planner/worker/reviewer profiles and UI/API surfaces.
+- First task-graph and subagent run records exist, with durable task metadata, deterministic starter plan decomposition, in-process planner/worker/reviewer profiles, and UI/API surfaces.
 
 ## Partially Implemented
 
@@ -38,7 +38,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 ## Not Done Yet
 
 - Native OpenAI function/tool calling and native streaming deltas.
-- Durable multi-step planner with resumable goals and explicit task graphs.
+- Full durable multi-step planner/executor/reviewer loop with resumable goals, retries, and review gates.
 - Production authentication, authorization, and user/session isolation for the UI/API.
 - Production webhook signature verification and secret rotation for external channel endpoints.
 - Robust MCP SSE/streamable HTTP transport fixtures and failure-recovery soak testing.
@@ -51,6 +51,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - High-risk tools require both capability enablement (matching allow flag, where applicable) and explicit approval for the exact tool-call ID and arguments before execution.
 - Cancelled runs must not transition to completed, blocked, or failed after cancellation; lifecycle updates should use the guarded state transition helper.
 - Tool execution is bounded by `tool_timeout_seconds` / `NEST_AGENT_TOOL_TIMEOUT_SECONDS` and timeout failures are returned as structured tool errors.
+- New background runs persist a root task plus a small starter DAG with dependencies, required tools, risk, acceptance criteria, attempt count, and failure reason fields.
 - Ordinary conversation and observations must not write policy memory directly.
 - The Memvid backend must use `.mv2` files and preserve one file per memory layer.
 - `complete.mv2` is a run artifact under `.nest/runs/{run_id}/`, not a permanent memory layer.

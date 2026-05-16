@@ -98,6 +98,44 @@ def test_state_store_lists_sessions_from_runs(tmp_path: Path) -> None:
     assert sessions[0]["status_counts"] == {"queued": 2}
 
 
+def test_state_store_persists_durable_task_graph_metadata(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    state.create_run(
+        run_id="run_tasks",
+        message="inspect repo",
+        session_id="session",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+
+    task = state.create_task_node(
+        task_id="task_one",
+        run_id="run_tasks",
+        title="Inspect repo",
+        goal="Map source files",
+        profile="worker",
+        status="queued",
+        approved=False,
+        dependencies=["task_root"],
+        required_tools=["repo.map", "repo.search"],
+        risk="medium",
+        acceptance_criteria=["source map is attached", "risky tools are not used"],
+        attempt_count=2,
+        failure_reason="previous timeout",
+    )
+
+    assert task.dependencies == ("task_root",)
+    assert task.required_tools == ("repo.map", "repo.search")
+    assert task.risk == "medium"
+    assert task.acceptance_criteria == ("source map is attached", "risky tools are not used")
+    assert task.attempt_count == 2
+    assert task.failure_reason == "previous timeout"
+
+    updated = state.update_task_node("task_one", attempt_count=3, failure_reason="test failure")
+    assert updated.attempt_count == 3
+    assert updated.failure_reason == "test failure"
+
+
 def test_run_event_bus_redacts_persistent_and_live_payloads(tmp_path: Path) -> None:
     state = AgentStateStore(tmp_path / "state.db")
     state.create_run(
@@ -129,7 +167,7 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     state = AgentStateStore(db_path)
 
-    assert state.schema_version() == 3
+    assert state.schema_version() == 4
     with sqlite3.connect(db_path) as conn:
         run_indexes = {row[1] for row in conn.execute("PRAGMA index_list('runs')").fetchall()}
         approval_indexes = {row[1] for row in conn.execute("PRAGMA index_list('approval_requests')").fetchall()}
@@ -454,6 +492,23 @@ def test_run_manager_completes_background_mock_run(tmp_path: Path) -> None:
     graph = manager.task_graph(run.run_id)
     assert graph["tasks"]
     assert graph["tasks"][0]["title"] == "Root objective"
+
+
+def test_run_manager_creates_durable_child_plan_for_multi_step_goal(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    run = manager.create_run(message="Inspect the repo and run targeted tests", session_id="session")
+
+    graph = manager.task_graph(run.run_id)
+    tasks = graph["tasks"]
+
+    assert len(tasks) >= 3
+    root_id = tasks[0]["task_id"]
+    child_tasks = tasks[1:]
+    assert {task["parent_id"] for task in child_tasks} == {root_id}
+    assert child_tasks[0]["dependencies"] == []
+    assert child_tasks[1]["dependencies"] == [child_tasks[0]["task_id"]]
+    assert child_tasks[0]["acceptance_criteria"]
+    assert child_tasks[1]["required_tools"]
 
 
 def test_run_manager_trace_includes_context_memory_and_tool_events(tmp_path: Path) -> None:
