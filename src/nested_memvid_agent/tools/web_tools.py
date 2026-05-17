@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import re
+import socket
+from contextlib import contextmanager
 from html import unescape
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from ..net_safety import public_url_allowed
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
@@ -118,20 +120,69 @@ def _direct_web_search(query: str, context: ToolContext, max_results: int) -> li
 
 
 def _fetch_public_text(url: str, *, timeout: int, max_bytes: int) -> tuple[str, str]:
-    safe, reason = _public_web_url_allowed(url)
-    if not safe:
-        raise ValueError(reason)
+    vetted_addresses = _resolve_public_addresses(url)
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        raise ValueError("URL must include a host.")
     request = Request(url, headers={"User-Agent": "Kestrel/0.1 (+local-first-agent)"})
-    with urlopen(request, timeout=max(timeout, 1)) as response:  # nosec
-        raw = response.read(max_bytes + 1)
-        final_url = str(response.geturl())
-        if len(raw) > max_bytes:
-            raw = raw[:max_bytes]
+    opener = build_opener(_NoRedirectHandler())
+    with _pin_host_resolution(parsed.hostname, vetted_addresses):
+        with opener.open(request, timeout=max(timeout, 1)) as response:  # nosec
+            raw = response.read(max_bytes + 1)
+            final_url = str(response.geturl())
+            if len(raw) > max_bytes:
+                raw = raw[:max_bytes]
+            encoding = response.headers.get_content_charset() or "utf-8"
     safe_final, final_reason = _public_web_url_allowed(final_url)
     if not safe_final:
         raise ValueError(final_reason)
-    encoding = response.headers.get_content_charset() or "utf-8"
     return raw.decode(encoding, errors="replace"), final_url
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req: Request, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:  # noqa: ANN401
+        del req, fp, code, msg, headers, newurl
+        raise ValueError("Redirects are not allowed for web.fetch.")
+
+
+def _resolve_public_addresses(url: str) -> set[str]:
+    safe, reason = _public_web_url_allowed(url)
+    if not safe:
+        raise ValueError(reason)
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        raise ValueError("URL must include a host.")
+    host = parsed.hostname.lower().rstrip(".")
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return set()
+    return {str(info[4][0]) for info in infos if info and info[4]}
+
+
+@contextmanager
+def _pin_host_resolution(host: str, vetted_addresses: set[str]):
+    if not vetted_addresses:
+        yield
+        return
+    original_getaddrinfo = socket.getaddrinfo
+    normalized_host = host.lower().rstrip(".")
+
+    def _pinned_getaddrinfo(target_host: str, port: Any, *args: Any, **kwargs: Any) -> Any:
+        lowered = str(target_host).lower().rstrip(".")
+        if lowered != normalized_host:
+            return original_getaddrinfo(target_host, port, *args, **kwargs)
+        results = original_getaddrinfo(target_host, port, *args, **kwargs)
+        filtered = [info for info in results if info[4] and str(info[4][0]) in vetted_addresses]
+        if not filtered:
+            raise OSError(f"Host resolution changed for {target_host}.")
+        return filtered
+
+    socket.getaddrinfo = _pinned_getaddrinfo
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = original_getaddrinfo
 
 
 def _public_web_url_allowed(url: str) -> tuple[bool, str]:
