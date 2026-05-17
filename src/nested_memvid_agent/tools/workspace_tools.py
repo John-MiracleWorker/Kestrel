@@ -49,6 +49,7 @@ class ReadFileTool(AgentTool):
         call = ToolCall(name=self.spec.name, arguments=arguments)
         try:
             path = _safe_path(context.workspace, str(arguments.get("path", "")))
+            _assert_not_secret_store_path(context.workspace, path)
             max_chars = int(arguments.get("max_chars", 20_000))
             text = path.read_text(errors="replace")[:max_chars]
             return self._result(call, success=True, content=text, data={"path": str(path), "chars": len(text)})
@@ -180,6 +181,13 @@ def _safe_path(root: Path, relative: str) -> Path:
     if root_resolved not in path.parents and path != root_resolved:
         raise ValueError(f"Path escapes workspace: {relative}")
     return path
+
+
+def _assert_not_secret_store_path(workspace: Path, path: Path) -> None:
+    workspace_root = workspace.resolve()
+    secrets_root = (workspace_root / ".nest" / "secrets").resolve()
+    if path == secrets_root or secrets_root in path.parents:
+        raise ValueError("Reading broker secret files is not allowed.")
 
 
 def _skip_repo_name(name: str) -> bool:
