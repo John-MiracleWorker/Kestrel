@@ -59,6 +59,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         staticfiles_module = import_module("starlette.staticfiles")
         cors_module = import_module("starlette.middleware.cors")
         from .server_channel_routes import register_channel_routes
+        from .server_diagnosis_routes import register_diagnosis_routes
         from .server_mcp_routes import register_mcp_routes
         from .server_models import (
             ApprovalDecisionRequest,
@@ -67,7 +68,6 @@ def create_app(config: AgentConfig | None = None) -> Any:
             ContextExpandAPIRequest,
             ContextPackAPIRequest,
             CreateRunRequest,
-            DiagnosisRequest,
             MemoryCompactRequest,
             MemoryConsolidateRequest,
             MemoryCorrectRequest,
@@ -934,27 +934,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         )
         return {"items": filter_cognition_items(payload, "failure_episode.v1")}
 
-    @app.post("/api/diagnosis/classify")  # type: ignore[untyped-decorator]
-    def classify_diagnosis(request: DiagnosisRequest) -> dict[str, object]:
-        execution = runs.invoke_tool(
-            tool_name="diagnosis.classify",
-            arguments={"failure_text": request.failure_text, "source": request.source or "api"},
-            session_id="api",
-        )
-        return _tool_response_payload(execution)
-
-    @app.post("/api/diagnosis/recall")  # type: ignore[untyped-decorator]
-    def recall_diagnosis(request: DiagnosisRequest) -> dict[str, object]:
-        execution = runs.invoke_tool(
-            tool_name="diagnosis.recall",
-            arguments={
-                "failure_text": request.failure_text,
-                "source": request.source or "api",
-                "k": request.k,
-            },
-            session_id="api",
-        )
-        return _tool_response_payload(execution)
+    register_diagnosis_routes(app, runs=runs)
 
     web_dist = Path(__file__).resolve().parents[2] / "web" / "dist"
     if web_dist.exists():
