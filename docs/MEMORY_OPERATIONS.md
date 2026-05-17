@@ -47,24 +47,42 @@ nest-agent memory compact --layer episodic --apply --backend memvid --memory-dir
 
 TTL compaction only targets working and episodic layers by default. Stable layers are skipped except for correction-driven tombstones. Automatic compaction is off unless `NEST_AGENT_ENABLE_AUTO_COMPACT=1`; it still runs dry-run unless `NEST_AGENT_AUTO_COMPACT_APPLY=1`.
 
+Compaction records `never_retrieved` promotion outcomes for promoted records that are summarized away before any `last_retrieved_at` write-back. Normal retrieval updates `last_retrieved_at` at most once per hour per hit, so this is a coarse operator signal rather than a complete retrieval log.
+
+## Promotion Ledger
+
+Use the ledger to inspect whether past promotion decisions held up:
+
+```bash
+nest-agent memory ledger
+nest-agent memory ledger --since 7d --layer procedural
+nest-agent memory ledger --outcome corrected
+nest-agent memory ledger --json
+```
+
+The ledger lives in the existing AgentStateStore SQLite database at `.nest/state/agent.db` by default. It records the promotion decision separately from `.mv2` memory content and appends outcomes for corrections, contradictions, tombstones, supersession, useful confirmations, and never-retrieved compaction.
+
+Recommendations in this command are deterministic heuristics only. Kestrel never edits thresholds automatically.
+
 ## Layer Config And Hybrid Search
 
 `--layer-config` / `NEST_AGENT_LAYER_CONFIG` can load a JSON layer spec file. Hybrid/vector retrieval is only enabled when the layer explicitly provides local vector settings:
 
 ```json
 {
-  "semantic": {
-    "search_mode": "hybrid",
+  "procedural": {
     "vector": {
       "enabled": true,
       "embedding_provider": "local",
-      "index_path": "semantic.vec"
+      "index_path": "procedural.vec"
     }
   }
 }
 ```
 
-Policy memory remains lexical even if vector fields are present.
+Procedural lesson recall asks for hybrid retrieval when local vector settings are available, then falls back to lexical record iteration when they are not. This is intentionally scoped to procedural lessons so equivalent failure lessons with different wording can merge without changing working, episodic, semantic, self, or policy defaults.
+
+Local embeddings require the optional `sentence-transformers` dependency supported by the Memvid SDK path, plus `vector.embedding_provider: "local"` and a `vector.index_path` in the procedural layer config. Policy memory remains lexical even if vector fields are present.
 
 ## Backup
 
@@ -123,3 +141,5 @@ Stable layers must use paths that preserve validation, provenance, confidence, a
 - Use approval-gated `memory.import` or an admin path for migrations and bulk restoration.
 
 Policy writes are stricter than other stable writes. They remain disabled unless `allow_policy_writes` is explicitly enabled, and even then direct `memory.write` does not write policy records; use the nested-learning or admin path so policy evidence, repeat count, explicit instruction, and approval gates stay intact.
+
+Near-miss promotions use `promotion_status: provisional`. Provisional records are visible to retrieval, have half retention, and cannot be promoted further until later full-threshold evidence confirms them.

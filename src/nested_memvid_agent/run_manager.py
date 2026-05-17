@@ -228,7 +228,7 @@ class RunManager:
                 model=run.model,
             )
         registry = self.build_registry()
-        agent = build_agent(active_config, tools=registry)
+        agent = build_agent(active_config, tools=registry, state=self.state)
         try:
             call = ToolCall(name=tool_name, arguments=arguments)
             spans = SpanRecorder(state=self.state, events=self.events)
@@ -846,7 +846,7 @@ class RunManager:
         )
 
     def _build_agent(self, config: AgentConfig) -> NestedMV2Agent:
-        return build_agent(config, tools=self.build_registry())
+        return build_agent(config, tools=self.build_registry(), state=self.state)
 
     def _stream_handler(self, run_id: str) -> Callable[[LLMStreamEvent], None]:
         def handle(event: LLMStreamEvent) -> None:

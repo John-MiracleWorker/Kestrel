@@ -677,7 +677,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
     ) -> list[dict[str, object]]:
         if k < 1 or k > 50:
             raise HTTPException(status_code=400, detail="k must be between 1 and 50")
-        agent = build_agent(active_config, tools=runs.build_registry())
+        agent = build_agent(active_config, tools=runs.build_registry(), state=state)
         try:
             selected_layers = (
                 tuple(MemoryLayer(layer) for layer in layers) if layers else tuple(MemoryLayer)
@@ -725,7 +725,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
     @app.get("/api/memory/verify")  # type: ignore[untyped-decorator]
     def verify_memory() -> dict[str, bool]:
-        agent = build_agent(active_config, tools=runs.build_registry())
+        agent = build_agent(active_config, tools=runs.build_registry(), state=state)
         try:
             return {layer.value: ok for layer, ok in agent.memory.verify_all().items()}
         finally:
@@ -733,7 +733,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
     @app.get("/api/memory/layers")  # type: ignore[untyped-decorator]
     def memory_layers() -> list[dict[str, object]]:
-        agent = build_agent(active_config, tools=runs.build_registry())
+        agent = build_agent(active_config, tools=runs.build_registry(), state=state)
         try:
             verify = agent.memory.verify_all()
             rows: list[dict[str, object]] = []

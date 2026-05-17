@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Any, Literal
+from uuid import uuid4
 
 from .context_frames import default_frame_type_for_memory
 from .layers import DEFAULT_LAYER_SPECS, LayerSpec
 from .models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord
 
-LearningAction = Literal["reject", "write", "promote"]
+LearningAction = Literal["reject", "write", "promote", "promote_provisional"]
 
 
 @dataclass(frozen=True)
@@ -151,7 +153,7 @@ class LearningDecision:
 
     @property
     def accepted(self) -> bool:
-        return self.action in {"write", "promote"} and self.target_layer is not None
+        return self.action in {"write", "promote", "promote_provisional"} and self.target_layer is not None
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -246,6 +248,7 @@ class NestedLearningKernel:
 
     def decide(self, signal: LearningSignal, *, action: LearningAction = "write") -> LearningDecision:
         target_layer, reason = self._target(signal)
+        decision_action = "promote_provisional" if _is_provisional_reason(reason) else action
         requested_or_target = signal.requested_target_layer or target_layer
         flow = _flow_for(signal.source_layer, target_layer)
         trace = self._optimizer_trace(signal, target_layer)
@@ -263,7 +266,7 @@ class NestedLearningKernel:
                 promotion_requirements=requirements,
             )
         return LearningDecision(
-            action=action,
+            action=decision_action,
             target_layer=target_layer,
             target_kind=_target_kind(signal.kind, target_layer),
             reason=reason,
@@ -304,6 +307,16 @@ class NestedLearningKernel:
         target_layer = decision.target_layer
         if target_layer is None:
             raise ValueError("Cannot create memory record from rejected learning decision")
+        target_spec = self.specs[target_layer]
+        now = datetime.now(UTC)
+        is_provisional = decision.action == "promote_provisional"
+        confidence = decision.confidence
+        expires_at = None
+        promotion_status = "confirmed"
+        if is_provisional:
+            promotion_status = "provisional"
+            confidence = max(target_spec.min_write_confidence, decision.confidence * 0.8)
+            expires_at = now + timedelta(days=max(target_spec.retention_days * 0.5, 0.0))
         evidence = [EvidenceRef(source=signal.source, locator=signal.locator, quote=decision.reason)]
         if signal.validation_evidence is not None:
             evidence.extend(signal.validation_evidence.all_refs())
@@ -333,7 +346,12 @@ class NestedLearningKernel:
             "validation_evidence": validation_evidence_metadata,
             "repeat_count": signal.repeat_count,
             "explicit_instruction": signal.explicit_instruction,
+            "source_layer": signal.source_layer.value,
+            "promotion_id": uuid4().hex,
+            "promotion_status": promotion_status,
         }
+        if is_provisional:
+            metadata["provisional_admitted_at"] = now.isoformat()
         return MemoryRecord(
             title=signal.title,
             content=signal.content,
@@ -342,27 +360,42 @@ class NestedLearningKernel:
             tags=dict(signal.tags or {}),
             metadata=metadata,
             evidence=evidence,
-            confidence=decision.confidence,
+            confidence=confidence,
             importance=decision.importance,
+            created_at=now,
+            updated_at=now,
+            expires_at=expires_at,
         )
 
     def _target(self, signal: LearningSignal) -> tuple[MemoryLayer | None, str]:
         score = signal.computed_validation_score
         episodic_spec = self.specs[MemoryLayer.EPISODIC]
-        if score < episodic_spec.promotion_threshold:
-            return None, "Rejected: validation score is below the working-to-episodic gate."
+        if (
+            signal.source_layer != MemoryLayer.WORKING
+            and str((signal.metadata or {}).get("promotion_status", "")) == "provisional"
+        ):
+            return None, "Cannot promote from provisional record; await confirmation evidence."
+        if signal.source_layer == MemoryLayer.WORKING and score < _provisional_threshold(episodic_spec):
+            return None, "Rejected: below provisional gate."
 
         if signal.requested_target_layer is not None:
             allowed, reason = self._requested_target_allowed(signal, signal.requested_target_layer)
             return (signal.requested_target_layer, reason) if allowed else (None, reason)
 
         if signal.source_layer == MemoryLayer.WORKING:
-            return MemoryLayer.EPISODIC, "Working context survived validation and became an episodic event."
+            if score >= episodic_spec.promotion_threshold:
+                return MemoryLayer.EPISODIC, "Working context survived validation and became an episodic event."
+            if score >= _provisional_threshold(episodic_spec) and signal.repeat_count >= episodic_spec.min_repeat_count_for_promotion:
+                return MemoryLayer.EPISODIC, "Provisional: working context nearly cleared the episodic gate."
+            return None, "Rejected: below provisional gate."
 
         if signal.source_layer == MemoryLayer.EPISODIC:
             if signal.kind == MemoryKind.FACT and str((signal.metadata or {}).get("self_schema", "")).strip():
-                if score >= self.specs[MemoryLayer.SELF].promotion_threshold:
+                self_spec = self.specs[MemoryLayer.SELF]
+                if score >= self_spec.promotion_threshold:
                     return MemoryLayer.SELF, "Validated self-model signal became self memory."
+                if score >= _provisional_threshold(self_spec) and signal.repeat_count >= self_spec.min_repeat_count_for_promotion:
+                    return MemoryLayer.SELF, "Provisional: self-model signal nearly cleared the self-memory gate."
             procedural_spec = self.specs[MemoryLayer.PROCEDURAL]
             if (
                 signal.kind in {MemoryKind.FAILURE, MemoryKind.PROCEDURE}
@@ -370,8 +403,17 @@ class NestedLearningKernel:
                 and score >= procedural_spec.promotion_threshold
             ):
                 return MemoryLayer.PROCEDURAL, "Repeated validated outcome became a reusable procedure."
-            if score >= self.specs[MemoryLayer.SEMANTIC].promotion_threshold:
+            if (
+                signal.kind in {MemoryKind.FAILURE, MemoryKind.PROCEDURE}
+                and signal.repeat_count >= procedural_spec.min_repeat_count_for_promotion
+                and score >= _provisional_threshold(procedural_spec)
+            ):
+                return MemoryLayer.PROCEDURAL, "Provisional: repeated outcome nearly cleared the procedural gate."
+            semantic_spec = self.specs[MemoryLayer.SEMANTIC]
+            if score >= semantic_spec.promotion_threshold:
                 return MemoryLayer.SEMANTIC, "Validated episode became stable semantic memory."
+            if score >= _provisional_threshold(semantic_spec) and signal.repeat_count >= semantic_spec.min_repeat_count_for_promotion:
+                return MemoryLayer.SEMANTIC, "Provisional: episode nearly cleared the semantic gate."
             return None, "Rejected: episodic signal did not clear semantic/procedural gates."
 
         if signal.source_layer == MemoryLayer.PROCEDURAL:
@@ -382,6 +424,12 @@ class NestedLearningKernel:
                 and signal.explicit_instruction
             ):
                 return MemoryLayer.POLICY, "Explicit repeated procedure cleared the policy-candidate gate."
+            if (
+                score >= _provisional_threshold(policy_spec)
+                and signal.repeat_count >= policy_spec.min_repeat_count_for_promotion
+                and signal.explicit_instruction
+            ):
+                return MemoryLayer.POLICY, "Provisional: explicit repeated procedure nearly cleared the policy-candidate gate."
             return None, "Rejected: policy promotion requires explicit instruction, high validation, and repeated evidence."
 
         if signal.source_layer == MemoryLayer.SEMANTIC:
@@ -392,6 +440,12 @@ class NestedLearningKernel:
                 and score >= procedural_spec.promotion_threshold
             ):
                 return MemoryLayer.PROCEDURAL, "Semantic procedure cleared repeated-use gate."
+            if (
+                signal.kind == MemoryKind.PROCEDURE
+                and signal.repeat_count >= procedural_spec.min_repeat_count_for_promotion
+                and score >= _provisional_threshold(procedural_spec)
+            ):
+                return MemoryLayer.PROCEDURAL, "Provisional: semantic procedure nearly cleared repeated-use gate."
             return None, "Rejected: semantic memory is already stable and needs correction, not promotion."
 
         if signal.source_layer == MemoryLayer.SELF:
@@ -402,40 +456,40 @@ class NestedLearningKernel:
     def _requested_target_allowed(self, signal: LearningSignal, target: MemoryLayer) -> tuple[bool, str]:
         spec = self.specs[target]
         score = signal.computed_validation_score
+        repeat_ok = signal.repeat_count >= spec.min_repeat_count_for_promotion
         if target == MemoryLayer.POLICY:
             ok = (
                 signal.explicit_instruction
                 and score >= spec.promotion_threshold
-                and signal.repeat_count >= spec.min_repeat_count_for_promotion
+                and repeat_ok
             )
+            if ok:
+                return True, "Explicit repeated signal requested policy memory and cleared the policy gate."
+            if signal.explicit_instruction and repeat_ok and score >= _provisional_threshold(spec):
+                return True, "Provisional: requested policy memory nearly cleared the policy gate."
             return (
-                ok,
-                "Explicit repeated signal requested policy memory and cleared the policy gate."
-                if ok
-                else (
-                    "Rejected: requested policy writes require explicit instruction, "
-                    f"validation >= {spec.promotion_threshold:.2f}, and repeat_count >= {spec.min_repeat_count_for_promotion}."
-                ),
+                False,
+                "Rejected: requested policy writes require explicit instruction, "
+                f"validation >= {spec.promotion_threshold:.2f}, and repeat_count >= {spec.min_repeat_count_for_promotion}.",
             )
         if target == MemoryLayer.PROCEDURAL:
-            ok = score >= spec.promotion_threshold and signal.repeat_count >= spec.min_repeat_count_for_promotion
+            ok = score >= spec.promotion_threshold and repeat_ok
+            if ok:
+                return True, "Requested procedural memory cleared repeated validation gate."
+            if repeat_ok and score >= _provisional_threshold(spec):
+                return True, "Provisional: requested procedural memory nearly cleared repeated validation gate."
             return (
-                ok,
-                "Requested procedural memory cleared repeated validation gate."
-                if ok
-                else (
-                    "Rejected: procedural writes require "
-                    f"validation >= {spec.promotion_threshold:.2f} and repeat_count >= {spec.min_repeat_count_for_promotion}."
-                ),
+                False,
+                "Rejected: procedural writes require "
+                f"validation >= {spec.promotion_threshold:.2f} and repeat_count >= {spec.min_repeat_count_for_promotion}.",
             )
         if target in {MemoryLayer.SELF, MemoryLayer.SEMANTIC, MemoryLayer.EPISODIC}:
-            ok = score >= spec.promotion_threshold and signal.repeat_count >= spec.min_repeat_count_for_promotion
-            return (
-                ok,
-                f"Requested {target.value} memory cleared validation gate."
-                if ok
-                else f"Rejected: {target.value} writes require validation >= {spec.promotion_threshold:.2f}.",
-            )
+            ok = score >= spec.promotion_threshold and repeat_ok
+            if ok:
+                return True, f"Requested {target.value} memory cleared validation gate."
+            if repeat_ok and score >= _provisional_threshold(spec):
+                return True, f"Provisional: requested {target.value} memory nearly cleared validation gate."
+            return False, f"Rejected: {target.value} writes require validation >= {spec.promotion_threshold:.2f}."
         return True, "Requested working memory write accepted."
 
     def _promotion_requirements(self, signal: LearningSignal, target: MemoryLayer | None) -> dict[str, object]:
@@ -451,6 +505,7 @@ class NestedLearningKernel:
             payload.update(
                 {
                     "min_validation_score": spec.promotion_threshold,
+                    "provisional_validation_score": _provisional_threshold(spec),
                     "min_repeat_count": spec.min_repeat_count_for_promotion,
                     "requires_explicit_instruction": target == MemoryLayer.POLICY,
                 }
@@ -459,6 +514,7 @@ class NestedLearningKernel:
             payload.update(
                 {
                     "min_validation_score": self.specs[MemoryLayer.EPISODIC].promotion_threshold,
+                    "provisional_validation_score": _provisional_threshold(self.specs[MemoryLayer.EPISODIC]),
                     "min_repeat_count": 1,
                     "requires_explicit_instruction": False,
                 }
@@ -547,6 +603,16 @@ def _target_kind(kind: MemoryKind, target_layer: MemoryLayer) -> MemoryKind:
     if target_layer == MemoryLayer.EPISODIC:
         return MemoryKind.EVENT
     return kind
+
+
+def _is_provisional_reason(reason: str) -> bool:
+    return reason.startswith("Provisional:")
+
+
+def _provisional_threshold(spec: LayerSpec) -> float:
+    if spec.provisional_threshold is not None:
+        return spec.provisional_threshold
+    return max(0.0, spec.promotion_threshold - 0.13)
 
 
 def _layer_level(layer: MemoryLayer) -> int:

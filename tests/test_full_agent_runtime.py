@@ -355,11 +355,13 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     state = AgentStateStore(db_path)
 
-    assert state.schema_version() == 9
+    assert state.schema_version() == 10
     with sqlite3.connect(db_path) as conn:
         run_indexes = {row[1] for row in conn.execute("PRAGMA index_list('runs')").fetchall()}
         approval_indexes = {row[1] for row in conn.execute("PRAGMA index_list('approval_requests')").fetchall()}
         step_indexes = {row[1] for row in conn.execute("PRAGMA index_list('run_steps')").fetchall()}
+        promotion_indexes = {row[1] for row in conn.execute("PRAGMA index_list('promotion_ledger')").fetchall()}
+        outcome_indexes = {row[1] for row in conn.execute("PRAGMA index_list('promotion_outcomes')").fetchall()}
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
         mcp_columns = {row[1] for row in conn.execute("PRAGMA table_info('mcp_servers')").fetchall()}
         task_columns = {row[1] for row in conn.execute("PRAGMA table_info('task_nodes')").fetchall()}
@@ -368,7 +370,9 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
     assert "idx_runs_status" in run_indexes
     assert "idx_approval_requests_status" in approval_indexes
     assert "idx_run_steps_run_id_id" in step_indexes
-    assert {"task_nodes", "subagent_runs", "plugin_registry", "trace_spans"} <= tables
+    assert "idx_promotion_ledger_target_layer" in promotion_indexes
+    assert "idx_promotion_outcomes_promotion_id" in outcome_indexes
+    assert {"task_nodes", "subagent_runs", "plugin_registry", "trace_spans", "promotion_ledger", "promotion_outcomes"} <= tables
     assert {
         "last_seen_at",
         "tool_count",

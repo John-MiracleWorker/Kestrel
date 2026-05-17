@@ -75,6 +75,13 @@ class RetentionCompactor:
                         decision,
                     )
                     promoted_ids.append(self.memory.put(promoted))
+                if record.metadata.get("promotion_id") and not record.metadata.get("last_retrieved_at"):
+                    self.memory.record_promotion_outcome(
+                        str(record.metadata["promotion_id"]),
+                        "never_retrieved",
+                        evidence_record_id=summary_record_id,
+                        notes="retention compaction summarized record before any debounced retrieval write-back",
+                    )
                 if self.memory.tombstone(layer, record.id, reason="retention_compacted", superseded_by=summary_record_id):
                     tombstoned_ids.append(record.id)
         return {

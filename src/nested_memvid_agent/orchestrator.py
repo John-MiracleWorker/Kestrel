@@ -8,6 +8,7 @@ from .context_compiler import ContextCompiler
 from .event_log import AgentEvent, JsonlEventLog
 from .layers import LayeredMemorySystem, LayerSpec
 from .models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord
+from .promotion_ledger import PromotionLedger
 
 
 def build_memory_system(
@@ -15,11 +16,12 @@ def build_memory_system(
     memory_dir: Path,
     *,
     specs: dict[MemoryLayer, LayerSpec] | None = None,
+    ledger: PromotionLedger | None = None,
 ) -> LayeredMemorySystem:
     if backend == "memory":
-        return LayeredMemorySystem.from_backend_factory(memory_dir, InMemoryBackend, specs=specs)
+        return LayeredMemorySystem.from_backend_factory(memory_dir, InMemoryBackend, specs=specs, ledger=ledger)
     if backend == "memvid":
-        return LayeredMemorySystem.from_backend_factory(memory_dir, MemvidBackend, specs=specs)
+        return LayeredMemorySystem.from_backend_factory(memory_dir, MemvidBackend, specs=specs, ledger=ledger)
     raise ValueError(f"Unknown backend: {backend}")
 
 

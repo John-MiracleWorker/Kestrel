@@ -8,6 +8,7 @@ import platform
 import subprocess  # nosec B404
 import sys
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from time import monotonic, sleep
@@ -25,6 +26,7 @@ from .mcp_manager import MCPManager
 from .models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from .orchestrator import build_memory_system
 from .plugin_manager import PluginError, PluginManager
+from .promotion_ledger import OUTCOME_KINDS, PromotionLedger
 from .run_manager import RunManager
 from .runtime_models import LLMStreamEvent, ToolCall
 from .skill_manager import SkillManager
@@ -168,6 +170,12 @@ def main() -> None:
     _add_common_args(memory_compact)
     memory_compact.add_argument("--layer", choices=[layer.value for layer in MemoryLayer], default=MemoryLayer.WORKING.value)
     memory_compact.add_argument("--apply", action="store_true")
+    memory_ledger = memory_sub.add_parser("ledger")
+    memory_ledger.add_argument("--state-path", type=Path, default=Path(".nest/state/agent.db"))
+    memory_ledger.add_argument("--since", default="30d")
+    memory_ledger.add_argument("--layer", choices=[layer.value for layer in MemoryLayer])
+    memory_ledger.add_argument("--outcome", choices=list(OUTCOME_KINDS))
+    memory_ledger.add_argument("--json", action="store_true")
 
     compile_cmd = sub.add_parser("compile-context")
     _add_common_args(compile_cmd)
@@ -285,7 +293,7 @@ def main() -> None:
 
     if args.cmd == "chat":
         manager = _build_run_manager(config)
-        agent = build_agent(config, tools=manager.build_registry())
+        agent = build_agent(config, tools=manager.build_registry(), state=manager.state)
         try:
             if args.message:
                 if _handle_slash_command(agent, args.message.strip(), args.session_id, manager=manager):
@@ -404,7 +412,12 @@ def main() -> None:
         _run_eval_command(config)
         return
 
-    memory = build_memory_system(backend, memory_dir, specs=_specs_from_config(config))
+    if args.cmd == "memory" and args.memory_cmd == "ledger":
+        _print_promotion_ledger(args)
+        return
+
+    ledger = _ledger_for_memory_command(args)
+    memory = build_memory_system(backend, memory_dir, specs=_specs_from_config(config), ledger=ledger)
     try:
         if args.cmd == "memory":
             if args.memory_cmd in {"search", "inspect"}:
@@ -637,6 +650,71 @@ def _agent_config_from_args(args: argparse.Namespace) -> AgentConfig:
 def _specs_from_config(config: AgentConfig) -> dict[MemoryLayer, Any] | None:
     layer_config = config.layer_config_path
     return load_layer_specs(layer_config) if layer_config else None
+
+
+def _ledger_for_memory_command(args: argparse.Namespace) -> PromotionLedger | None:
+    if getattr(args, "cmd", "") != "memory":
+        return None
+    if getattr(args, "memory_cmd", "") not in {"consolidate", "correct", "compact"}:
+        return None
+    state_path = Path(getattr(args, "state_path", Path(".nest/state/agent.db")))
+    return PromotionLedger(AgentStateStore(state_path))
+
+
+def _print_promotion_ledger(args: argparse.Namespace) -> None:
+    ledger = PromotionLedger(AgentStateStore(args.state_path))
+    since = _parse_since(args.since)
+    target_layer = MemoryLayer(args.layer) if args.layer else None
+    summary = ledger.summarize(since=since, target_layer=target_layer, outcome=args.outcome)
+    if args.json:
+        print(json.dumps(summary.to_payload(), indent=2))
+        return
+    scope = f"last {args.since}" if since is not None else "all time"
+    layer_label = args.layer or "all layers"
+    print(f"Promotion ledger - {scope}, {layer_label}")
+    if args.outcome:
+        print(f"Outcome filter: {args.outcome}")
+    print()
+    if not summary.rows:
+        print("No promotion ledger entries.")
+        return
+    header = (
+        f"{'Layer':<18} {'Promoted':>8} {'Useful':>8} {'Corrected':>10} "
+        f"{'Contradicted':>13} {'Tombstoned':>11} {'Never-Used':>11}"
+    )
+    print(header)
+    for row in summary.rows:
+        counts = row.outcome_counts
+        print(
+            f"{row.label:<18} {row.promoted:>8} {counts.get('useful', 0):>8} "
+            f"{counts.get('corrected', 0):>10} {counts.get('contradicted', 0):>13} "
+            f"{counts.get('tombstoned', 0):>11} {counts.get('never_retrieved', 0):>11}"
+        )
+    print()
+    print("False-positive rate (corrected + contradicted) by gate:")
+    for row in summary.rows:
+        print(f"  {row.label}: {row.false_positive_rate * 100:.1f}%")
+    if summary.recommendations:
+        print()
+        for recommendation in summary.recommendations:
+            print(f"Recommendation: {recommendation}")
+
+
+def _parse_since(raw: str | None) -> datetime | None:
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value or value.lower() in {"all", "all-time", "all_time"}:
+        return None
+    now = datetime.now(UTC)
+    if value.endswith("d") and value[:-1].isdigit():
+        return now - timedelta(days=int(value[:-1]))
+    if value.endswith("h") and value[:-1].isdigit():
+        return now - timedelta(hours=int(value[:-1]))
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _validate_server_bind(host: str, config: AgentConfig) -> None:

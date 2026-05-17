@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 _TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 
 
@@ -813,6 +813,9 @@ class AgentStateStore:
             if current < 9:
                 _apply_schema_v9(conn)
                 current = 9
+            if current < 10:
+                _apply_schema_v10(conn)
+                current = 10
             if current < SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported schema migration target: {current} -> {SCHEMA_VERSION}")
             if current == SCHEMA_VERSION:
@@ -1065,6 +1068,39 @@ def _apply_schema_v9(conn: sqlite3.Connection) -> None:
     existing = _columns(conn, "runs")
     if "provider" not in existing:
         conn.execute("ALTER TABLE runs ADD COLUMN provider TEXT NOT NULL DEFAULT 'mock'")
+
+
+def _apply_schema_v10(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS promotion_ledger (
+            promotion_id TEXT PRIMARY KEY,
+            record_id TEXT NOT NULL,
+            source_layer TEXT NOT NULL,
+            target_layer TEXT NOT NULL,
+            decision_reason TEXT NOT NULL,
+            validation_score REAL NOT NULL,
+            repeat_count INTEGER NOT NULL,
+            explicit_instruction INTEGER NOT NULL,
+            optimizer_trace_json TEXT NOT NULL,
+            promoted_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS promotion_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            promotion_id TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            evidence_record_id TEXT,
+            notes TEXT NOT NULL DEFAULT '',
+            recorded_at TEXT NOT NULL,
+            FOREIGN KEY (promotion_id) REFERENCES promotion_ledger(promotion_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_promotion_ledger_target_layer ON promotion_ledger(target_layer);
+        CREATE INDEX IF NOT EXISTS idx_promotion_ledger_promoted_at ON promotion_ledger(promoted_at);
+        CREATE INDEX IF NOT EXISTS idx_promotion_outcomes_promotion_id ON promotion_outcomes(promotion_id);
+        """
+    )
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:

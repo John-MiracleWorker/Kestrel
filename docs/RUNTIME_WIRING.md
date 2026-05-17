@@ -57,7 +57,7 @@ Soul/self routes expose the same non-secret runtime model as the CLI: `/api/self
 
 ## State Store
 
-`AgentStateStore` is SQLite control-plane storage, currently schema version 9.
+`AgentStateStore` is SQLite control-plane storage, currently schema version 10.
 
 It stores:
 
@@ -66,6 +66,7 @@ It stores:
 - MCP server records and discovered tools
 - skill records and validation/provenance metadata
 - plugin records and enablement metadata
+- promotion ledger and promotion outcome records
 - task nodes
 - subagent runs
 - trace spans
