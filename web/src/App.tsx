@@ -112,6 +112,7 @@ export function App() {
   const activeSessionIdRef = useRef<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [activeSection, setActiveSection] = useState<"chat" | "advanced" | "settings">("chat");
 
   const [message, setMessage] = useState("");
   const [sessionId, setSessionId] = useState("");
@@ -923,16 +924,16 @@ export function App() {
             </span>
           </a>
           <nav className="primary-nav" aria-label="Primary">
-            <a href="#workspace" className="active">Chat</a>
-            <a href="#advanced">Advanced</a>
-            <a href="#settings">Settings</a>
+            <button type="button" className={activeSection === "chat" ? "active" : ""} onClick={() => setActiveSection("chat")}>Chat</button>
+            <button type="button" className={activeSection === "advanced" ? "active" : ""} onClick={() => setActiveSection("advanced")}>Advanced</button>
+            <button type="button" className={activeSection === "settings" ? "active" : ""} onClick={() => setActiveSection("settings")}>Settings</button>
           </nav>
           <div className="topbar-meta">
             <span className="status-pill"><span className="status-dot"></span>Runtime ready</span>
           </div>
         </div>
       </header>
-      <div className={`chat-shell ${inspectorOpen ? "" : "no-inspector"}`}>
+      <div className={`chat-shell ${inspectorOpen ? "" : "no-inspector"}`} data-active-section={activeSection}>
       <a className="skip-link" href="#workspace">Skip to workspace</a>
       <aside className="rail" aria-label="Threads">
         <div className="rail-head">
@@ -965,18 +966,17 @@ export function App() {
       </aside>
 
       <main className="conversation" id="workspace">
-        <header className="topbar">
+        {activeSection === "chat" && (
+          <>
+        <header className="topbar" data-section="chat">
           <div>
-            <p className="eyebrow">Local-first agent</p>
+            <p className="page-eyebrow">Local-first agent</p>
             <h1>Ask Kestrel</h1>
           </div>
-          <div className="topbar-actions">
+          <div className="conv-tools">
             <StatusBadge value={activeRun?.status ?? "ready"} />
             <button type="button" onClick={() => setInspectorOpen((open) => !open)}>
               <PanelRightOpen size={15} /> Inspector
-            </button>
-            <button type="button" onClick={() => setAdvancedOpen((open) => !open)}>
-              <TerminalSquare size={15} /> Advanced
             </button>
             <button type="button" onClick={() => refreshAll().catch(reportError)}>
               <RefreshCw size={15} /> Refresh
@@ -997,7 +997,7 @@ export function App() {
           </div>
         )}
 
-        <section className={`conversation-layout ${inspectorOpen ? "with-inspector" : ""}`}>
+        <section className={`conversation-layout ${inspectorOpen ? "with-inspector" : ""}`} data-section="chat">
           <div className="transcript-inner">
             <div className="transcript" aria-label="Conversation transcript">
               {sortedThreadRuns.length === 0 ? (
@@ -1105,14 +1105,16 @@ export function App() {
           )}
         </section>
 
-        {advancedOpen && (
-          <section id="advanced" className="shell" aria-label="Advanced Operator Console">
+          </>
+        )}
+        {activeSection === "advanced" && (
+          <section id="advanced" className="shell" data-section="advanced" aria-label="Advanced Operator Console">
             <div className="page-head">
               <div>
-                <p className="eyebrow">Advanced / Debug</p>
+                <p className="page-eyebrow">Advanced / Debug</p>
                 <h2>Advanced Operator Console</h2>
               </div>
-              <button type="button" onClick={() => setAdvancedOpen(false)}>
+              <button type="button" onClick={() => setActiveSection("chat")}>
                 <X size={15} /> Close Advanced
               </button>
             </div>
@@ -1122,7 +1124,6 @@ export function App() {
             title="Run Agent"
             icon={<TerminalSquare size={19} />}
             actions={<StatusBadge value={runtime ? "runtime loaded" : "loading"} />}
-            className="card"
           >
             <form className="stack-form" onSubmit={submitRun}>
               <Field label="Objective">
@@ -1182,7 +1183,7 @@ export function App() {
             </form>
           </Panel>
 
-          <Panel title="Active Run" icon={<Activity size={19} />} className="card">
+          <Panel title="Active Run" icon={<Activity size={19} />}>
             {activeRun ? (
               <div className="run-detail">
                 <div className="run-title">
@@ -1794,8 +1795,11 @@ export function App() {
             </div>
           </Panel>
         </section>
-
-        <section id="settings" className="section">
+      </section>
+      )}
+        {activeSection === "settings" && (
+          <>
+        <section id="settings" className="section" data-section="settings">
           <Panel title="Settings & Health" icon={<Settings size={19} />}>
             {runtime ? (
               <>
@@ -1820,7 +1824,7 @@ export function App() {
             {runtime && <JsonBlock value={runtime} maxHeight="680px" />}
           </Panel>
         </section>
-          </section>
+          </>
         )}
       </main>
     </div>
@@ -1895,24 +1899,22 @@ function LiveRunActivity({ events }: { events: TraceEvent[] }) {
   if (items.length === 0) return null;
   return (
     <div className="activity" aria-label="Live run activity" aria-live="polite">
-      <div className="run-activity-heading">
+      <div className="act-heading">
         <Brain size={15} />
         <strong>Thinking</strong>
       </div>
-      <div className="activity-list">
-        {items.map((item) => (
-          <div className={`activity-row ${item.kind} ${item.status}`} key={item.id}>
-            <span className="activity-icon" aria-hidden="true">
-              {activityIcon(item)}
-            </span>
-            <span>
-              <strong>{item.label}</strong>
-              {item.meta && <small>{item.meta}</small>}
-              {item.detail && <small>{item.detail}</small>}
-            </span>
-          </div>
-        ))}
-      </div>
+      {items.map((item) => (
+        <div className={`act-row ${item.status === "completed" ? "done" : item.status === "running" ? "run" : item.status === "failed" ? "fail" : "info"}`} key={item.id}>
+          <span className="act-icon" aria-hidden="true">
+            {activityIcon(item)}
+          </span>
+          <span className="text">
+            <strong>{item.label}</strong>
+            {item.meta && <code>{item.meta}</code>}
+            {item.detail && <span className="detail">{item.detail}</span>}
+          </span>
+        </div>
+      ))}
     </div>
   );
 }
