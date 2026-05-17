@@ -103,7 +103,8 @@ def apply_runtime_settings(config: AgentConfig, settings: RuntimeSettings) -> Ag
         memory_dir=Path(settings.memory_dir),
         workspace=Path(settings.workspace),
         stream=settings.stream,
-        require_api_auth=settings.require_api_auth,
+        # `require_api_auth` is launch-time security policy and must not be
+        # overridden by persisted runtime settings.
     )
 
 
@@ -116,7 +117,6 @@ def merge_runtime_settings(config: AgentConfig, current: RuntimeSettings, raw: d
         "memory_dir",
         "workspace",
         "stream",
-        "require_api_auth",
         "autonomy_mode",
     }:
         if key in raw:

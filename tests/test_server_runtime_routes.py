@@ -93,6 +93,7 @@ def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> 
     assert active_config.model == "gpt-5.4"
     assert active_config.backend == "memvid"
     assert active_config.stream is True
+    assert active_config.require_api_auth is config.require_api_auth
 
     runtime = client.get("/api/runtime/config")
     assert runtime.status_code == 200
@@ -104,8 +105,8 @@ def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> 
     assert runtime_payload["settings"]["runtime"]["persisted"] is True
 
 
-def test_runtime_settings_rejects_api_auth_without_configured_token(tmp_path) -> None:
-    config = AgentConfig(api_auth_token_env="KESTREL_MISSING_TOKEN")
+def test_runtime_settings_rejects_launch_controlled_api_auth_toggle(tmp_path) -> None:
+    config = AgentConfig(require_api_auth=False, api_auth_token_env="KESTREL_MISSING_TOKEN")
     store = RuntimeSettingsStore(tmp_path / "runtime_settings.json")
     app = FastAPI()
     register_runtime_routes(
@@ -120,7 +121,7 @@ def test_runtime_settings_rejects_api_auth_without_configured_token(tmp_path) ->
     response = client.put("/api/runtime/settings", json={"require_api_auth": True})
 
     assert response.status_code == 400
-    assert "api_auth_token_unconfigured:KESTREL_MISSING_TOKEN" in response.text
+    assert "require_api_auth_is_launch_controlled" in response.text
     assert not store.exists()
 
 
@@ -149,3 +150,4 @@ def test_runtime_settings_store_loads_saved_config_on_restart(tmp_path) -> None:
     assert restarted_config.backend == "memvid"
     assert restarted_config.memory_dir == tmp_path / "mv2"
     assert restarted_config.stream is True
+    assert restarted_config.require_api_auth is config.require_api_auth

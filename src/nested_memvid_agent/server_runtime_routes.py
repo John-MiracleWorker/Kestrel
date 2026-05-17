@@ -135,8 +135,8 @@ def register_runtime_routes(
             settings = merge_runtime_settings(config, current, request)
         except ValueError as exc:
             _raise(http_exception, 400, str(exc))
-        if settings.require_api_auth and not os.getenv(config.api_auth_token_env):
-            _raise(http_exception, 400, f"api_auth_token_unconfigured:{config.api_auth_token_env}")
+        if not config.require_api_auth and settings.require_api_auth:
+            _raise(http_exception, 400, "require_api_auth_is_launch_controlled")
         saved = store.save(settings)
         next_config = apply_runtime_settings(config, saved)
         if on_config_update is not None:
