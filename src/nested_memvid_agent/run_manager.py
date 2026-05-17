@@ -140,6 +140,9 @@ class RunManager:
     def list_runs(self) -> list[dict[str, Any]]:
         return [asdict(run) for run in self.state.list_runs()]
 
+    def list_runs_for_session(self, session_id: str) -> list[dict[str, Any]]:
+        return [asdict(run) for run in self.state.list_runs_for_session(session_id)]
+
     def list_sessions(self) -> list[dict[str, Any]]:
         return self.state.list_sessions()
 

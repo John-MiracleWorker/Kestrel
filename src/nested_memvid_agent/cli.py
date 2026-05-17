@@ -57,6 +57,7 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--workspace", type=Path, default=Path("."))
     parser.add_argument("--log-dir", type=Path, default=Path(".nest/logs"))
     parser.add_argument("--state-path", type=Path, default=Path(".nest/state/agent.db"))
+    parser.add_argument("--secret-store-path", type=Path, default=Path(".nest/secrets/local_vault.json"))
     parser.add_argument("--skills-dir", type=Path, default=Path(".nest/skills"))
     parser.add_argument("--plugins-dir", type=Path, default=Path(".nest/plugins"))
     parser.add_argument("--mcp-config", type=Path, default=Path(".nest/config/mcp_servers.json"))
@@ -71,6 +72,10 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-codex-cli", action="store_true")
     parser.add_argument("--allow-plugin-install", action="store_true")
     parser.add_argument("--allow-git-commit", action="store_true")
+    parser.add_argument("--allow-git-push", action="store_true")
+    parser.add_argument("--allow-remote-mutation", action="store_true")
+    parser.add_argument("--git-write-mode", default="local_branch")
+    parser.add_argument("--protected-branches", default="main,master,release/*")
     parser.add_argument("--allow-memory-import", action="store_true")
     parser.add_argument("--allow-executable-skills", action="store_true")
     parser.add_argument("--allow-mcp-network-endpoints", action="store_true")
@@ -501,6 +506,7 @@ def _agent_config_from_args(args: argparse.Namespace, *, backend: str, memory_di
         workspace=args.workspace,
         log_dir=args.log_dir,
         state_path=args.state_path,
+        secret_store_path=args.secret_store_path,
         skills_dir=args.skills_dir,
         plugins_dir=args.plugins_dir,
         mcp_config_path=args.mcp_config,
@@ -515,6 +521,10 @@ def _agent_config_from_args(args: argparse.Namespace, *, backend: str, memory_di
         allow_codex_cli=args.allow_codex_cli,
         allow_plugin_install=args.allow_plugin_install,
         allow_git_commit=args.allow_git_commit,
+        allow_git_push=args.allow_git_push,
+        allow_remote_mutation=args.allow_remote_mutation,
+        git_write_mode=args.git_write_mode,
+        protected_branches=tuple(part.strip() for part in args.protected_branches.split(",") if part.strip()),
         allow_memory_import=args.allow_memory_import,
         allow_executable_skills=args.allow_executable_skills,
         allow_mcp_network_endpoints=args.allow_mcp_network_endpoints,
@@ -695,6 +705,11 @@ def _doctor_tool_config(config: AgentConfig) -> dict[str, Any]:
         "allow_codex_cli": config.allow_codex_cli,
         "allow_plugin_install": config.allow_plugin_install,
         "allow_git_commit": config.allow_git_commit,
+        "allow_git_push": config.allow_git_push,
+        "allow_remote_mutation": config.allow_remote_mutation,
+        "git_write_mode": config.git_write_mode,
+        "protected_branches": list(config.protected_branches),
+        "secret_store_path": str(config.secret_store_path),
         "allow_memory_import": config.allow_memory_import,
         "allow_executable_skills": config.allow_executable_skills,
         "allow_mcp_network_endpoints": config.allow_mcp_network_endpoints,

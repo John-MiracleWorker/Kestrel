@@ -13,6 +13,11 @@ NEST_AGENT_ALLOW_POLICY_WRITES=false
 NEST_AGENT_ALLOW_CODEX_CLI=false
 NEST_AGENT_ALLOW_PLUGIN_INSTALL=false
 NEST_AGENT_ALLOW_GIT_COMMIT=false
+NEST_AGENT_ALLOW_GIT_PUSH=false
+NEST_AGENT_ALLOW_REMOTE_MUTATION=false
+NEST_AGENT_GIT_WRITE_MODE=local_branch
+NEST_AGENT_PROTECTED_BRANCHES=main,master,release/*
+NEST_AGENT_SECRET_STORE_PATH=.nest/secrets/local_vault.json
 NEST_AGENT_ALLOW_MEMORY_IMPORT=false
 NEST_AGENT_ALLOW_EXECUTABLE_SKILLS=false
 NEST_AGENT_ALLOW_MCP_NETWORK_ENDPOINTS=false
@@ -51,9 +56,11 @@ Clients may send either `Authorization: Bearer <token>` or `X-Kestrel-API-Key: <
 
 ## Secrets
 
-Use environment variables for provider keys. Do not store secrets in `.mv2` files, `.nest/config`, checked-in fixtures, or MCP server manifests.
+Use environment variables or the Secret Broker for provider/channel/tool credentials. Do not store secrets in `.mv2` files, `.nest/config`, checked-in fixtures, prompts, chat history, tool arguments visible to the model, traces, or MCP server manifests.
 
-MCP manifests must reference secret material through `secret_env`, where each target process variable maps to a host environment variable. Raw secret-looking keys in MCP `env` are rejected, API responses redact `secret_env`, and values are resolved into the child process environment only at launch.
+The Secret Broker lets a trusted backend/UI flow collect values through `POST /api/secrets` and returns metadata only: name, purpose, `secret://...` reference, configured state, validation status, timestamps, and a non-reversible fingerprint. No GET route returns raw values. The local file vault is owner-readable only (`0600`) and is a local-first development substrate; production deployments should back the same broker contract with an OS keychain or managed vault.
+
+MCP manifests must reference secret material through `secret_env`, where each target process variable maps to a host environment variable or `secret://...` reference. Raw secret-looking keys in MCP `env` are rejected, API responses redact `secret_env`, and values are resolved into the child process environment only at launch.
 
 Logs and run events redact common API key, bearer token, password, authorization header, GitHub token, OpenAI key, Anthropic key, OpenRouter key, and private-key shapes. Redaction is defense-in-depth, not permission to log secrets deliberately.
 
@@ -61,13 +68,15 @@ Logs and run events redact common API key, bearer token, password, authorization
 
 High-risk tools require explicit config enablement where applicable and exact-call approval. Approval is tied to the requested tool-call ID and arguments; changed arguments require a new approval. Shell execution, file writes, patching, repair mutations, git commits, Codex CLI execution, channel delivery, executable skills, memory imports, plugin install/update/enable, and policy memory writes are not production-safe defaults.
 
+Self-improvement is local-first. Kestrel may write validated lessons to local `.mv2` memory, prepare local branches/worktrees, create patches, and run validation. `git.create_local_branch` and `git.export_patch` are approval-gated local-only primitives. Remote publishing is a separate lane: direct commits to protected branches, direct pushes to upstream `main`, force pushes, tag pushes, remote rewrites, repo setting edits, GitHub secrets, and workflow enablement are disabled by default. The default tool registry does not include `git.push`; shell execution also blocks common remote-publishing escape routes such as `git push`, `git tag`, `git remote set-url`, `gh repo edit`, `gh secret set`, `gh workflow enable`, `rm -rf .git`, and writes to `.git/config`.
+
 Skill installation is a high-risk file-write action. Uploaded skill capsules are confined to the configured skills directory, validated by manifest shape, and still require approval before installation. Executable skill runtimes such as `python`, `shell`, and future `container` runtimes are always forced to high risk, require exact approval, and require `NEST_AGENT_ALLOW_EXECUTABLE_SKILLS=true` or `--allow-executable-skills`; a manifest cannot downgrade that policy.
 
 Plugin installation is high risk: it fetches public GitHub repositories and materializes skills/MCP entries. CLI/API install, update, enable, and sync/materialization routes are disabled unless `NEST_AGENT_ALLOW_PLUGIN_INSTALL=true` or `--allow-plugin-install` is set. Agent-initiated `plugin.install` has the same enablement gate and still requires exact-call approval before execution. Installed plugins are not enabled by default unless explicitly requested, and plugin updates reject manifest ID drift.
 
 Autonomous scheduling is disabled by default. When enabled, it is bounded by per-cycle task and cycle limits, and it stops at task approval or exact-call tool approval boundaries instead of silently crossing into high-risk work.
 
-Repair branch commits require a current `repair.review` artifact tied to a successful validation result and the current diff hash. `git.commit` never pushes.
+Repair branch commits require a current `repair.review` artifact tied to a successful validation result and the current diff hash. `git.commit` never pushes and refuses protected branches from `NEST_AGENT_PROTECTED_BRANCHES`.
 
 ## Webhooks
 

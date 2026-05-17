@@ -42,6 +42,7 @@ class ChannelEndpointConfig:
         settings = {
             key: ("<configured>" if "url" in key.lower() or "token" in key.lower() else value)
             for key, value in self.settings.items()
+            if not key.startswith("_")
         }
         return {
             **asdict(self),

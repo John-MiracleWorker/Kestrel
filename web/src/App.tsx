@@ -9,8 +9,11 @@ import {
   FileText,
   GitBranch,
   Home,
+  KeyRound,
   Layers,
   LineChart,
+  MessageCircle,
+  PanelRightOpen,
   PlugZap,
   RefreshCw,
   Route,
@@ -44,18 +47,30 @@ import type {
   RuntimeConfig,
   SelfState,
   Session,
+  SecretRef,
   Skill,
   TaskGraph,
   TaskNode,
+  ThreadSummary,
   Tool,
   TraceEvent
 } from "./types";
 
 const providerOptions = ["mock", "openai", "openai-compatible", "openrouter", "ollama", "anthropic", "gemini", "codex-cli"];
+const modelSuggestionsByProvider: Record<string, string[]> = {
+  mock: ["mock"],
+  openai: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
+  "openai-compatible": ["local-model"],
+  openrouter: ["openai/gpt-5.5", "anthropic/claude-sonnet-4.5"],
+  ollama: ["llama3.1", "qwen2.5-coder", "mistral"],
+  anthropic: ["claude-sonnet-4.5", "claude-opus-4.1"],
+  gemini: ["gemini-2.5-pro", "gemini-2.5-flash"],
+  "codex-cli": ["gpt-5.5", "gpt-5.4"]
+};
 const autonomyOptions = [
-  { value: "background", label: "Background run" },
-  { value: "manual", label: "Manual review" },
-  { value: "autonomous", label: "Autonomous scheduler" }
+  { value: "background", label: "Safe Auto" },
+  { value: "manual", label: "Manual" },
+  { value: "autonomous", label: "Autopilot" }
 ];
 
 export function App() {
@@ -72,6 +87,7 @@ export function App() {
   const [skills, setSkills] = useState<Skill[]>([]);
   const [plugins, setPlugins] = useState<Plugin[]>([]);
   const [channels, setChannels] = useState<Channel[]>([]);
+  const [secrets, setSecrets] = useState<SecretRef[]>([]);
   const [memoryLayers, setMemoryLayers] = useState<MemoryLayerStatus[]>([]);
   const [lessons, setLessons] = useState<Array<Record<string, unknown>>>([]);
   const [failures, setFailures] = useState<Array<Record<string, unknown>>>([]);
@@ -80,6 +96,11 @@ export function App() {
   const [runTrace, setRunTrace] = useState<RunTrace | null>(null);
   const [taskGraph, setTaskGraph] = useState<TaskGraph | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [threadRuns, setThreadRuns] = useState<Run[]>([]);
+  const [localThreads, setLocalThreads] = useState<ThreadSummary[]>([]);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [inspectorOpen, setInspectorOpen] = useState(true);
 
   const [message, setMessage] = useState("");
   const [sessionId, setSessionId] = useState("");
@@ -149,6 +170,11 @@ export function App() {
   const [channelSettings, setChannelSettings] = useState("{}");
   const [channelPayload, setChannelPayload] = useState('{\n  "conversation_id": "local-thread",\n  "text": "hello from the UI"\n}');
   const [channelResult, setChannelResult] = useState<Record<string, unknown> | null>(null);
+  const [secretName, setSecretName] = useState("TELEGRAM_BOT_TOKEN");
+  const [secretPurpose, setSecretPurpose] = useState("Enable Telegram channel delivery.");
+  const [secretValue, setSecretValue] = useState("");
+  const [secretValidate, setSecretValidate] = useState(true);
+  const [secretResult, setSecretResult] = useState<SecretRef | null>(null);
 
   const [diagnosisText, setDiagnosisText] = useState("");
   const [diagnosisResult, setDiagnosisResult] = useState<Record<string, unknown> | null>(null);
@@ -159,7 +185,40 @@ export function App() {
   const [webQuery, setWebQuery] = useState("");
   const [webResult, setWebResult] = useState<Record<string, unknown> | null>(null);
 
-  const activeRun = useMemo(() => runs.find((run) => run.run_id === activeRunId) ?? runs[0] ?? null, [runs, activeRunId]);
+  const sortedThreadRuns = useMemo(
+    () => [...threadRuns].sort((left, right) => left.created_at.localeCompare(right.created_at)),
+    [threadRuns]
+  );
+  const activeRun = useMemo(
+    () =>
+      sortedThreadRuns.find((run) => run.run_id === activeRunId) ??
+      runs.find((run) => run.run_id === activeRunId) ??
+      sortedThreadRuns[sortedThreadRuns.length - 1] ??
+      runs[0] ??
+      null,
+    [runs, sortedThreadRuns, activeRunId]
+  );
+  const threadSummaries = useMemo(() => {
+    const remoteThreads = sessions.map((session) => ({
+      session_id: session.session_id,
+      title: deriveThreadTitle(session.latest_message || session.session_id),
+      latest_message: session.latest_message,
+      latest_status: session.latest_status,
+      latest_run_id: session.latest_run_id,
+      run_count: session.run_count,
+      updated_at: session.updated_at
+    }));
+    const remoteIds = new Set(remoteThreads.map((thread) => thread.session_id));
+    return [...localThreads.filter((thread) => !remoteIds.has(thread.session_id)), ...remoteThreads].sort((left, right) =>
+      right.updated_at.localeCompare(left.updated_at)
+    );
+  }, [sessions, localThreads]);
+  const activeRunIds = useMemo(() => new Set(sortedThreadRuns.map((run) => run.run_id)), [sortedThreadRuns]);
+  const activeApprovals = useMemo(
+    () => approvals.filter((approval) => activeRunIds.has(approval.run_id) || approval.run_id === activeRun?.run_id),
+    [approvals, activeRunIds, activeRun?.run_id]
+  );
+  const modelSuggestions = modelSuggestionsByProvider[provider] ?? [];
   const streamedAssistant = useMemo(
     () =>
       events
@@ -188,6 +247,14 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (!activeSessionId) {
+      setThreadRuns([]);
+      return;
+    }
+    refreshThreadRuns(activeSessionId).catch(reportError);
+  }, [activeSessionId]);
+
+  useEffect(() => {
     if (!activeRun?.run_id) return;
     setEvents([]);
     refreshRunDetails(activeRun.run_id).catch(reportError);
@@ -198,6 +265,7 @@ export function App() {
       if (parsed.type !== "assistant.token") {
         refreshSummary().catch(reportError);
         refreshRunDetails(activeRun.run_id).catch(reportError);
+        refreshThreadRuns(activeRun.session_id).catch(reportError);
       }
     };
     source.onmessage = appendEvent;
@@ -229,7 +297,7 @@ export function App() {
   }, [activeRun?.run_id]);
 
   async function refreshSummary() {
-    const [runList, sessionList, toolList, pendingApprovalList, approvalList, mcpList, skillList, pluginList, channelList, layerList] =
+    const [runList, sessionList, toolList, pendingApprovalList, approvalList, mcpList, skillList, pluginList, channelList, secretList, layerList] =
       await Promise.all([
         getJson<Run[]>("/api/runs"),
         getJson<Session[]>("/api/sessions"),
@@ -240,6 +308,7 @@ export function App() {
         getJson<Skill[]>("/api/skills"),
         getJson<Plugin[]>("/api/plugins"),
         getJson<Channel[]>("/api/channels"),
+        getJson<SecretRef[]>("/api/secrets"),
         getJson<MemoryLayerStatus[]>("/api/memory/layers")
       ]);
     setRuns(runList);
@@ -251,8 +320,19 @@ export function App() {
     setSkills(skillList);
     setPlugins(pluginList);
     setChannels(channelList);
+    setSecrets(secretList);
     setMemoryLayers(layerList);
-    if (!activeRunId && runList.length > 0) setActiveRunId(runList[0].run_id);
+    if (!activeSessionId && sessionList.length > 0) {
+      const pendingRunIds = new Set(pendingApprovalList.map((approval) => approval.run_id));
+      const attentionRun = runList.find((run) => pendingRunIds.has(run.run_id));
+      const initialSession = attentionRun
+        ? sessionList.find((session) => session.session_id === attentionRun.session_id) ?? sessionList[0]
+        : sessionList[0];
+      setActiveSessionId(initialSession.session_id);
+      setActiveRunId(attentionRun?.run_id ?? initialSession.latest_run_id);
+    } else if (!activeRunId && runList.length > 0) {
+      setActiveRunId(runList[0].run_id);
+    }
   }
 
   async function refreshAll() {
@@ -271,6 +351,26 @@ export function App() {
     setLogs(logList);
     setLessons(lessonList.items);
     setFailures(failureList.items);
+  }
+
+  async function refreshThreadRuns(sessionId: string) {
+    const runList = await getJson<Run[]>(`/api/sessions/${encodeURIComponent(sessionId)}/runs`);
+    setThreadRuns(runList);
+    setLocalThreads((threads) =>
+      threads.map((thread) =>
+        thread.session_id === sessionId && runList.length > 0
+          ? {
+              ...thread,
+              latest_message: runList[runList.length - 1].message,
+              latest_run_id: runList[runList.length - 1].run_id,
+              latest_status: runList[runList.length - 1].status,
+              run_count: runList.length,
+              title: deriveThreadTitle(runList[0].message || runList[runList.length - 1].message),
+              updated_at: runList[runList.length - 1].updated_at
+            }
+          : thread
+      )
+    );
   }
 
   async function refreshRunDetails(runId: string) {
@@ -300,19 +400,73 @@ export function App() {
     event.preventDefault();
     await guarded(async () => {
       if (!message.trim()) return;
-      const run = await postJson<Run>("/api/runs", {
+      const targetSessionId = sessionId.trim() || activeSessionId || createThreadId();
+      if (!activeSessionId) setActiveSessionId(targetSessionId);
+      const payload: Record<string, unknown> = {
         message,
-        session_id: sessionId.trim() || null,
-        workspace: workspace.trim() || null,
-        provider: provider.trim() || null,
-        model: model.trim() || null,
+        session_id: targetSessionId,
         autonomy_mode: autonomyMode
-      });
+      };
+      if (workspace.trim()) payload.workspace = workspace.trim();
+      const runtimeProvider = String((runtime as RuntimeConfig | null)?.provider?.name ?? "");
+      const runtimeModel = String((runtime as RuntimeConfig | null)?.provider?.model ?? "");
+      if (provider.trim() && provider.trim() !== runtimeProvider) payload.provider = provider.trim();
+      if (model.trim() && model.trim() !== runtimeModel) payload.model = model.trim();
+      const run = await postJson<Run>("/api/runs", payload);
       setMessage("");
       setActiveRunId(run.run_id);
+      setThreadRuns((rows) => [...rows.filter((row) => row.run_id !== run.run_id), run]);
+      setLocalThreads((threads) => [
+        {
+          session_id: run.session_id,
+          title: deriveThreadTitle(run.message),
+          latest_message: run.message,
+          latest_status: run.status,
+          latest_run_id: run.run_id,
+          run_count: Math.max(1, (threads.find((thread) => thread.session_id === run.session_id)?.run_count ?? 0) + 1),
+          updated_at: run.updated_at,
+          is_local: true
+        },
+        ...threads.filter((thread) => thread.session_id !== run.session_id)
+      ]);
       await refreshSummary();
+      await refreshThreadRuns(run.session_id);
       await refreshRunDetails(run.run_id);
     }, "Run queued.");
+  }
+
+  function createNewThread() {
+    const threadId = createThreadId();
+    const now = new Date().toISOString();
+    setActiveSessionId(threadId);
+    setActiveRunId(null);
+    setThreadRuns([]);
+    setEvents([]);
+    setRunTrace(null);
+    setTaskGraph(null);
+    setLocalThreads((threads) => [
+      {
+        session_id: threadId,
+        title: "New chat",
+        latest_message: "New chat",
+        latest_run_id: "",
+        latest_status: "ready",
+        run_count: 0,
+        updated_at: now,
+        is_local: true
+      },
+      ...threads
+    ]);
+  }
+
+  async function selectThread(thread: ThreadSummary) {
+    setActiveSessionId(thread.session_id);
+    setActiveRunId(thread.latest_run_id || null);
+    setEvents([]);
+    await guarded(async () => {
+      await refreshThreadRuns(thread.session_id);
+      if (thread.latest_run_id) await refreshRunDetails(thread.latest_run_id);
+    });
   }
 
   async function selectRun(runId: string) {
@@ -628,6 +782,37 @@ export function App() {
     });
   }
 
+  async function saveSecret(event: FormEvent) {
+    event.preventDefault();
+    await guarded(async () => {
+      const saved = await postJson<SecretRef>("/api/secrets", {
+        name: secretName,
+        purpose: secretPurpose,
+        value: secretValue,
+        validate: secretValidate
+      });
+      setSecretResult(saved);
+      setSecretValue("");
+      await refreshSummary();
+    }, "Secret stored.");
+  }
+
+  async function validateSecret(secret: SecretRef) {
+    await guarded(async () => {
+      const result = await postJson<SecretRef>(`/api/secrets/${encodeURIComponent(secret.id)}/validate`);
+      setSecretResult(result);
+      await refreshSummary();
+    }, "Secret validated.");
+  }
+
+  async function deleteSecret(secret: SecretRef) {
+    await guarded(async () => {
+      await deleteJson(`/api/secrets/${encodeURIComponent(secret.id)}`);
+      setSecretResult(null);
+      await refreshSummary();
+    }, "Secret removed.");
+  }
+
   async function diagnose(event: FormEvent) {
     event.preventDefault();
     await guarded(async () => {
@@ -672,36 +857,54 @@ export function App() {
       <aside className="sidebar" aria-label="Kestrel sections">
         <div className="brand">
           <span className="brand-mark" aria-hidden="true">
-            <Bot size={24} />
+            <MessageCircle size={24} />
           </span>
           <div>
             <strong>Kestrel</strong>
-            <span>Local operator console</span>
+            <span>Conversation workspace</span>
           </div>
         </div>
-        <nav>
-          <a href="#workspace"><Home size={17} /> Workspace</a>
-          <a href="#runs"><Route size={17} /> Runs</a>
-          <a href="#approvals"><ShieldCheck size={17} /> Approvals</a>
-          <a href="#soul"><Brain size={17} /> Soul</a>
-          <a href="#memory"><Database size={17} /> Memory</a>
-          <a href="#tools"><Wrench size={17} /> Tools</a>
-          <a href="#mcp"><PlugZap size={17} /> MCP</a>
-          <a href="#skills"><Sparkles size={17} /> Skills</a>
-          <a href="#channels"><Bell size={17} /> Channels</a>
-          <a href="#observability"><LineChart size={17} /> Traces</a>
+        <button type="button" className="new-thread-button" onClick={createNewThread}>
+          <MessageCircle size={16} /> New Chat
+        </button>
+        <nav aria-label="Primary">
+          <a href="#workspace"><MessageCircle size={17} /> Threads</a>
+          <a href="#advanced"><TerminalSquare size={17} /> Advanced</a>
           <a href="#settings"><Settings size={17} /> Settings</a>
         </nav>
+        <div className="thread-list" aria-label="Conversation threads">
+          {threadSummaries.map((thread) => (
+            <button
+              type="button"
+              className={`thread-button ${thread.session_id === activeSessionId ? "active" : ""}`}
+              key={thread.session_id}
+              onClick={() => selectThread(thread)}
+            >
+              <span>
+                <strong>{thread.title}</strong>
+                <small>{thread.latest_message !== thread.title ? thread.latest_message : `${thread.run_count} runs`}</small>
+              </span>
+              <StatusBadge value={thread.run_count ? thread.latest_status : "ready"} />
+            </button>
+          ))}
+          {threadSummaries.length === 0 && <EmptyState>No threads yet.</EmptyState>}
+        </div>
       </aside>
 
       <main className="workspace" id="workspace">
         <header className="topbar">
           <div>
-            <p className="eyebrow">Local-first runtime</p>
-            <h1>Agent Workspace</h1>
+            <p className="eyebrow">Local-first agent</p>
+            <h1>Ask Kestrel</h1>
           </div>
           <div className="topbar-actions">
             <StatusBadge value={activeRun?.status ?? "ready"} />
+            <button type="button" onClick={() => setInspectorOpen((open) => !open)}>
+              <PanelRightOpen size={15} /> Inspector
+            </button>
+            <button type="button" onClick={() => setAdvancedOpen((open) => !open)}>
+              <TerminalSquare size={15} /> Advanced
+            </button>
             <button type="button" onClick={() => refreshAll().catch(reportError)}>
               <RefreshCw size={15} /> Refresh
             </button>
@@ -720,6 +923,136 @@ export function App() {
             </button>
           </div>
         )}
+
+        <section className={`conversation-layout ${inspectorOpen ? "with-inspector" : ""}`}>
+          <div className="chat-workspace">
+            <div className="chat-scroll" aria-label="Conversation transcript">
+              {sortedThreadRuns.length === 0 ? (
+                <div className="empty-thread">
+                  <MessageCircle size={28} />
+                  <h2>Tell Kestrel what to do.</h2>
+                  <p>Start with a build, fix, research, inspection, or continuation request. Kestrel will keep the work in this thread.</p>
+                </div>
+              ) : (
+                sortedThreadRuns.map((run) => (
+                  <div className="chat-turn" key={run.run_id}>
+                    <article className="bubble user">
+                      <strong>You</strong>
+                      <p>{run.message}</p>
+                    </article>
+                    <article className="bubble assistant">
+                      <strong>Kestrel</strong>
+                      <p>{assistantTextForRun(run, activeRun?.run_id, streamedAssistant)}</p>
+                    </article>
+                  </div>
+                ))
+              )}
+              {events.some((event) => event.type !== "assistant.token") && (
+                <div className="progress-timeline" aria-label="Run progress">
+                  {events
+                    .filter((event) => event.type !== "assistant.token")
+                    .slice(-8)
+                    .map((event) => (
+                      <span className="progress-chip" key={event.id}>
+                        {friendlyEventLabel(event.type)}
+                      </span>
+                    ))}
+                </div>
+              )}
+              {activeApprovals.map((approval) => (
+                <ApprovalCardInline key={approval.approval_id} approval={approval} onApprove={decideApproval} />
+              ))}
+            </div>
+            <form className="chat-composer" onSubmit={submitRun}>
+              <label className="composer-field">
+                <span>Ask Kestrel</span>
+                <textarea
+                  value={message}
+                  onChange={(event) => setMessage(event.target.value)}
+                  placeholder="Ask Kestrel to build, fix, research, inspect, or continue something..."
+                  rows={3}
+                />
+              </label>
+              <div className="composer-actions">
+                <label className="mode-select">
+                  <span>Mode</span>
+                  <select value={autonomyMode} onChange={(event) => setAutonomyMode(event.target.value)}>
+                    {autonomyOptions
+                      .filter((option) => option.value !== "autonomous" || Boolean((runtime as RuntimeConfig | null)?.feature_flags?.enable_autonomous_scheduler))
+                      .map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+                <button type="submit" disabled={!message.trim()}>
+                  <Send size={15} /> Send
+                </button>
+              </div>
+            </form>
+          </div>
+
+          {inspectorOpen && (
+            <aside className="inspector-drawer" aria-label="Inspector">
+              <div className="inspector-head">
+                <h2>Inspector</h2>
+                <button type="button" aria-label="Close panel" onClick={() => setInspectorOpen(false)}>
+                  <X size={15} />
+                </button>
+              </div>
+              {activeRun ? (
+                <>
+                  <section>
+                    <h3>Current run</h3>
+                    <StatusBadge value={activeRun.status} />
+                    <InlineMeta items={[activeRun.run_id, activeRun.session_id, activeRun.model]} />
+                    {activeRun.error && <p className="danger-text">{activeRun.error}</p>}
+                  </section>
+                  <section>
+                    <h3>Plan</h3>
+                    <TaskList title="Needs You" tasks={taskGraph?.approval_blocked_tasks ?? []} onApprove={approveTask} />
+                    <TaskList title="Ready" tasks={taskGraph?.ready_tasks ?? []} onApprove={approveTask} />
+                  </section>
+                  {proofOfWork && (
+                    <section>
+                      <h3>Validation</h3>
+                      <SummaryList title="Completed" values={asStringArray(proofOfWork.completed_steps)} />
+                      <SummaryList title="Evidence" values={asStringArray(proofOfWork.validation_evidence)} />
+                      <SummaryList title="Risks" values={asStringArray(proofOfWork.remaining_risks)} />
+                    </section>
+                  )}
+                  <section>
+                    <h3>Activity</h3>
+                    <div className="trace-list compact-trace">
+                      {(runTrace?.timeline ?? events).slice(-12).map((event) => (
+                        <div className="trace-row" key={`${event.id}-${event.type}`}>
+                          <strong>{friendlyEventLabel(event.type)}</strong>
+                          <small>{event.created_at}</small>
+                          <code>{JSON.stringify(event.payload).slice(0, 220)}</code>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                </>
+              ) : (
+                <EmptyState>No run selected.</EmptyState>
+              )}
+            </aside>
+          )}
+        </section>
+
+        {advancedOpen && (
+          <section id="advanced" className="advanced-console" aria-label="Advanced Operator Console">
+            <div className="advanced-head">
+              <div>
+                <p className="eyebrow">Advanced / Debug</p>
+                <h2>Advanced Operator Console</h2>
+              </div>
+              <button type="button" onClick={() => setAdvancedOpen(false)}>
+                <X size={15} /> Close Advanced
+              </button>
+            </div>
 
         <section className="workspace-grid">
           <Panel
@@ -740,10 +1073,16 @@ export function App() {
                   <input value={workspace} onChange={(event) => setWorkspace(event.target.value)} />
                 </Field>
                 <Field label="Provider">
-                  <input list="providers" value={provider} onChange={(event) => setProvider(event.target.value)} />
+                  <select value={provider} onChange={(event) => setProvider(event.target.value)}>
+                    {providerOptions.map((item) => (
+                      <option key={item} value={item}>
+                        {item}
+                      </option>
+                    ))}
+                  </select>
                 </Field>
                 <Field label="Model">
-                  <input value={model} onChange={(event) => setModel(event.target.value)} />
+                  <input list="models" value={model} onChange={(event) => setModel(event.target.value)} />
                 </Field>
                 <Field label="Autonomy">
                   <select value={autonomyMode} onChange={(event) => setAutonomyMode(event.target.value)}>
@@ -755,9 +1094,9 @@ export function App() {
                   </select>
                 </Field>
               </div>
-              <datalist id="providers">
-                {providerOptions.map((item) => (
-                  <option key={item} value={item} />
+              <datalist id="models">
+                {modelSuggestions.map((item) => (
+                  <option key={`${provider}-${item}`} value={item} />
                 ))}
               </datalist>
               <div className="button-row">
@@ -1096,7 +1435,7 @@ export function App() {
         </section>
 
         <section id="tools" className="content-grid">
-          <Panel title="Tool Inventory" icon={<Wrench size={19} />}>
+          <Panel title="Connected Tools" icon={<Wrench size={19} />}>
             <form onSubmit={invokeTool} className="stack-form">
               <Field label="Tool">
                 <select
@@ -1138,6 +1477,51 @@ export function App() {
           </Panel>
           <Panel title="Tool Result" icon={<Activity size={19} />}>
             {toolResult ? <JsonBlock value={toolResult} maxHeight="520px" /> : <EmptyState>No tool invoked from the UI yet.</EmptyState>}
+          </Panel>
+          <Panel title="Secret Broker" icon={<KeyRound size={19} />}>
+            <form onSubmit={saveSecret} className="stack-form">
+              <div className="form-grid">
+                <Field label="Secret name">
+                  <input value={secretName} onChange={(event) => setSecretName(event.target.value)} autoComplete="off" />
+                </Field>
+                <Field label="Purpose">
+                  <input value={secretPurpose} onChange={(event) => setSecretPurpose(event.target.value)} />
+                </Field>
+              </div>
+              <Field label="Secret value" hint="Value is stored by the backend and never returned in API payloads.">
+                <input
+                  type="password"
+                  value={secretValue}
+                  onChange={(event) => setSecretValue(event.target.value)}
+                  autoComplete="new-password"
+                />
+              </Field>
+              <label className="check-row">
+                <input type="checkbox" checked={secretValidate} onChange={(event) => setSecretValidate(event.target.checked)} />
+                <span>Validate after save</span>
+              </label>
+              <button type="submit" disabled={!secretName.trim() || !secretValue.trim()}>
+                <KeyRound size={15} /> Store Secret
+              </button>
+            </form>
+            <div className="list separated">
+              {secrets.length === 0 ? (
+                <EmptyState>No brokered secrets configured.</EmptyState>
+              ) : (
+                secrets.map((secret) => (
+                  <div className="data-row" key={secret.id}>
+                    <strong>{secret.name}</strong>
+                    <InlineMeta items={[secret.secret_ref, secret.configured ? "configured" : "missing", secret.validated ? "validated" : "unvalidated"]} />
+                    {secret.purpose && <p>{secret.purpose}</p>}
+                    <div className="button-row">
+                      <button type="button" onClick={() => validateSecret(secret)}>Validate</button>
+                      <button type="button" className="danger" onClick={() => deleteSecret(secret)}>Delete</button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+            {secretResult && <JsonBlock value={secretResult} maxHeight="220px" />}
           </Panel>
         </section>
 
@@ -1372,6 +1756,8 @@ export function App() {
             {runtime && <JsonBlock value={runtime} maxHeight="680px" />}
           </Panel>
         </section>
+          </section>
+        )}
       </main>
     </div>
   );
@@ -1416,6 +1802,26 @@ function ApprovalCard({ approval, onApprove }: { approval: Approval; onApprove: 
         <button type="button" className="danger" onClick={() => onApprove(approval, false)}><X size={15} /> Deny</button>
       </div>
     </article>
+  );
+}
+
+function ApprovalCardInline({ approval, onApprove }: { approval: Approval; onApprove: (approval: Approval, approved: boolean) => void }) {
+  return (
+    <div className="approval-card inline-approval" role="group" aria-label={`Approval for ${approval.tool_name}`}>
+      <div>
+        <span className="progress-chip">Needs approval</span>
+        <strong>{approval.tool_name}</strong>
+        <InlineMeta items={[riskLabel(approval.risk), summarizeArguments(approval.arguments)]} />
+      </div>
+      <details>
+        <summary>View raw JSON</summary>
+        <JsonBlock value={approval.arguments} maxHeight="160px" />
+      </details>
+      <div className="button-row">
+        <button type="button" onClick={() => onApprove(approval, true)}><Check size={15} /> Approve</button>
+        <button type="button" className="danger" onClick={() => onApprove(approval, false)}><X size={15} /> Deny</button>
+      </div>
+    </div>
   );
 }
 
@@ -1482,4 +1888,61 @@ function asStringArray(value: unknown): string[] {
 
 function scoreLabel(value: unknown): string {
   return typeof value === "number" ? value.toFixed(2) : "";
+}
+
+function deriveThreadTitle(message: string): string {
+  const compact = message.replace(/\s+/g, " ").trim();
+  if (!compact) return "New chat";
+  return compact.length > 54 ? `${compact.slice(0, 51)}...` : compact;
+}
+
+function createThreadId(): string {
+  return `thread_${crypto.randomUUID()}`;
+}
+
+function assistantTextForRun(run: Run, activeRunId: string | null | undefined, streamedAssistant: string): string {
+  if (run.run_id === activeRunId && !run.assistant_message && streamedAssistant) return streamedAssistant;
+  return run.assistant_message || friendlyRunStatus(run);
+}
+
+function friendlyRunStatus(run: Run): string {
+  if (run.status === "queued") return "Queued";
+  if (run.status === "running") return "Kestrel is working...";
+  if (run.status === "failed") return run.error || "Failed";
+  if (run.status === "cancelled") return "Cancelled";
+  return run.stop_reason || "Working...";
+}
+
+function friendlyEventLabel(type: string): string {
+  const labels: Record<string, string> = {
+    "run.queued": "Queued",
+    "run.started": "Started",
+    "context.compile": "Gathering context",
+    "memory.write": "Updating memory",
+    "tool.started": "Using tool",
+    "tool.completed": "Tool finished",
+    "approval.requested": "Needs approval",
+    "run.completed": "Complete",
+    "run.failed": "Failed",
+    "run.cancelled": "Cancelled",
+    "scheduler.step": "Planning",
+    "scheduler.run": "Planning",
+    "subagent.started": "Delegating",
+    "subagent.completed": "Delegation complete",
+    "task.approved": "Task approved"
+  };
+  return labels[type] ?? type;
+}
+
+function riskLabel(risk: string): string {
+  if (!risk) return "Unknown risk";
+  return `${risk.charAt(0).toUpperCase()}${risk.slice(1)} risk`;
+}
+
+function summarizeArguments(argumentsValue: Record<string, unknown>): string {
+  const command = argumentsValue.command;
+  if (Array.isArray(command)) return command.map((item) => String(item)).join(" ");
+  const path = argumentsValue.path ?? argumentsValue.file ?? argumentsValue.cwd;
+  if (path) return String(path);
+  return Object.keys(argumentsValue).slice(0, 3).join(", ") || "No arguments";
 }

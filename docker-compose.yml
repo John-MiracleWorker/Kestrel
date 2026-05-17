@@ -19,6 +19,7 @@ services:
       NEST_AGENT_LOG_DIR: /data/logs
       NEST_AGENT_STATE_PATH: /data/state/agent.db
       NEST_AGENT_SKILLS_DIR: /data/skills
+      NEST_AGENT_SECRET_STORE_PATH: /data/secrets/local_vault.json
       NEST_AGENT_MCP_CONFIG: /data/config/mcp_servers.json
       NEST_AGENT_CHANNEL_CONFIG: /data/config/channels.json
       NEST_AGENT_ALLOW_SHELL: "false"
@@ -27,6 +28,10 @@ services:
       NEST_AGENT_ALLOW_CODEX_CLI: "false"
       NEST_AGENT_ALLOW_PLUGIN_INSTALL: "false"
       NEST_AGENT_ALLOW_GIT_COMMIT: "false"
+      NEST_AGENT_ALLOW_GIT_PUSH: "false"
+      NEST_AGENT_ALLOW_REMOTE_MUTATION: "false"
+      NEST_AGENT_GIT_WRITE_MODE: local_branch
+      NEST_AGENT_PROTECTED_BRANCHES: "main,master,release/*"
       NEST_AGENT_ALLOW_MEMORY_IMPORT: "false"
       NEST_AGENT_ALLOW_EXECUTABLE_SKILLS: "false"
       NEST_AGENT_ALLOW_MCP_NETWORK_ENDPOINTS: "false"

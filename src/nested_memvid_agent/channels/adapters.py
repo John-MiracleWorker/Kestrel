@@ -96,7 +96,7 @@ class TelegramAdapter(ChannelAdapter):
         blocked_reason: str | None = None,
     ) -> ChannelDelivery:
         token_env = config.token_env or "TELEGRAM_BOT_TOKEN"
-        token = os.getenv(token_env)
+        token = _configured_secret(config, token_env)
         request_json: dict[str, Any] = {
             "chat_id": outbound.conversation_id,
             "text": outbound.text,
@@ -327,11 +327,21 @@ def _copy_delivery(
 
 def _configured_webhook_url(config: ChannelEndpointConfig, default_env: str) -> str | None:
     env_name = config.webhook_url_env or str(config.settings.get("webhook_url_env") or default_env)
-    url = os.getenv(env_name)
+    url = _configured_secret(config, env_name)
     if url:
         return url
     raw = config.settings.get("webhook_url")
     return str(raw).strip() if raw else None
+
+
+def _configured_secret(config: ChannelEndpointConfig, name: str) -> str | None:
+    resolved = config.settings.get("_resolved_secrets")
+    if isinstance(resolved, dict):
+        value = resolved.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    value = os.getenv(name, "").strip()
+    return value or None
 
 
 def _redacted_url(url: str | None) -> str:

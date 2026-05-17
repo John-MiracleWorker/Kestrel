@@ -20,6 +20,7 @@ from .models import MemoryLayer, RetrievalQuery
 from .orchestrator import build_memory_system
 from .plugin_manager import PluginError, PluginManager
 from .run_manager import RunManager
+from .secret_broker import SecretBroker, is_secret_ref
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore
 
@@ -47,13 +48,14 @@ def create_app(config: AgentConfig | None = None) -> Any:
     StaticFiles = staticfiles_module.StaticFiles
 
     active_config = config or AgentConfig.from_env()
+    secret_broker = SecretBroker(active_config.secret_store_path)
     state = AgentStateStore(active_config.state_path)
     events = RunEventBus(state)
-    mcp = MCPManager(state, allow_network_endpoints=active_config.allow_mcp_network_endpoints)
+    mcp = MCPManager(state, allow_network_endpoints=active_config.allow_mcp_network_endpoints, secret_resolver=secret_broker.resolve)
     skills = SkillManager(active_config.skills_dir, state)
     plugins = PluginManager(active_config.plugins_dir, state)
     runs = RunManager(config=active_config, state=state, events=events, mcp=mcp, skills=skills, plugins=plugins)
-    channels = ChannelManager(active_config)
+    channels = ChannelManager(active_config, secret_resolver=secret_broker.resolve)
 
     def require_api_auth(
         authorization: str | None = Header(default=None),
@@ -118,10 +120,13 @@ def create_app(config: AgentConfig | None = None) -> Any:
         if isinstance(settings, dict):
             signature_env = str(settings.get("signature_secret_env") or "")
         safe["env_status"] = {
-            "token_env_configured": bool(token_env and os.getenv(token_env)),
-            "webhook_url_env_configured": bool(webhook_env and os.getenv(webhook_env)),
+            "token_env_configured": bool(token_env and secret_broker.resolve(token_env)),
+            "token_env_status": secret_broker.status(token_env) if token_env else {"configured": False},
+            "webhook_url_env_configured": bool(webhook_env and secret_broker.resolve(webhook_env)),
+            "webhook_url_env_status": secret_broker.status(webhook_env) if webhook_env else {"configured": False},
             "signature_secret_env": signature_env or None,
-            "signature_secret_env_configured": bool(signature_env and os.getenv(signature_env)),
+            "signature_secret_env_configured": bool(signature_env and secret_broker.resolve(signature_env)),
+            "signature_secret_env_status": secret_broker.status(signature_env) if signature_env else {"configured": False},
         }
         return safe
 
@@ -131,7 +136,10 @@ def create_app(config: AgentConfig | None = None) -> Any:
         safe["secret_env_status"] = {
             str(target): {
                 "source_env": str(source),
-                "configured": bool(os.getenv(str(source), "").strip()),
+                "secret_ref": str(source) if is_secret_ref(str(source)) else None,
+                "configured": bool(secret_broker.resolve(str(source))),
+                "validated": bool(secret_broker.status(str(source)).get("validated", False)),
+                "last_validated_at": secret_broker.status(str(source)).get("last_validated_at"),
             }
             for target, source in sorted(secret_env.items())
         }
@@ -206,6 +214,13 @@ def create_app(config: AgentConfig | None = None) -> Any:
         tools: list[dict[str, Any]] = Field(default_factory=list)
         risk_policy: str = "approval_by_default"
         secret_env: dict[str, str] = Field(default_factory=dict)
+
+    class SecretStoreRequest(BaseModel):  # type: ignore[valid-type,misc]
+        name: str
+        value: str
+        purpose: str = ""
+        id: str | None = None
+        validate_now: bool = Field(default=False, alias="validate")
 
     class SubagentRequest(BaseModel):  # type: ignore[valid-type,misc]
         run_id: str
@@ -350,6 +365,8 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 "allow_codex_cli": active_config.allow_codex_cli,
                 "allow_plugin_install": active_config.allow_plugin_install,
                 "allow_git_commit": active_config.allow_git_commit,
+                "allow_git_push": active_config.allow_git_push,
+                "allow_remote_mutation": active_config.allow_remote_mutation,
                 "allow_memory_import": active_config.allow_memory_import,
                 "allow_executable_skills": active_config.allow_executable_skills,
                 "allow_mcp_network_endpoints": active_config.allow_mcp_network_endpoints,
@@ -364,6 +381,10 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 "auto_consolidation_dry_run": active_config.auto_consolidation_dry_run,
                 "enable_channel_delivery": active_config.enable_channel_delivery,
                 "require_api_auth": active_config.require_api_auth,
+            },
+            "git_safety": {
+                "git_write_mode": active_config.git_write_mode,
+                "protected_branches": list(active_config.protected_branches),
             },
             "limits": {
                 "max_tool_rounds": active_config.max_tool_rounds,
@@ -387,6 +408,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 "mcp_config_path": str(active_config.mcp_config_path),
                 "channel_config_path": str(active_config.channel_config_path),
                 "worker_worktree_dir": str(active_config.worker_worktree_dir),
+                "secret_store_path": str(active_config.secret_store_path),
             },
             "validation_commands": [
                 "python -m compileall -q src tests scripts",
@@ -397,6 +419,47 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 "npm run build --prefix web",
             ],
         }
+
+    @app.get("/api/secrets")  # type: ignore[untyped-decorator]
+    def list_secrets() -> list[dict[str, object]]:
+        return secret_broker.list_secrets()
+
+    @app.get("/api/secrets/{secret_id}")  # type: ignore[untyped-decorator]
+    def get_secret(secret_id: str) -> dict[str, object]:
+        try:
+            return secret_broker.get_secret(secret_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="secret_not_found") from exc
+
+    @app.post("/api/secrets")  # type: ignore[untyped-decorator]
+    def store_secret(request: SecretStoreRequest) -> dict[str, object]:
+        try:
+            return secret_broker.store_secret(
+                name=request.name,
+                purpose=request.purpose,
+                value=request.value,
+                secret_id=request.id,
+                validate=request.validate_now,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/secrets/{secret_id}/validate")  # type: ignore[untyped-decorator]
+    def validate_secret(secret_id: str) -> dict[str, object]:
+        try:
+            return secret_broker.validate_secret(secret_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="secret_not_found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/secrets/{secret_id}")  # type: ignore[untyped-decorator]
+    def delete_secret(secret_id: str) -> dict[str, bool]:
+        try:
+            secret_broker.delete_secret(secret_id)
+            return {"ok": True}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="secret_not_found") from exc
 
     @app.get("/api/channels")  # type: ignore[untyped-decorator]
     def list_channels() -> list[dict[str, object]]:
@@ -478,6 +541,10 @@ def create_app(config: AgentConfig | None = None) -> Any:
     @app.get("/api/sessions")  # type: ignore[untyped-decorator]
     def list_sessions() -> list[dict[str, object]]:
         return runs.list_sessions()
+
+    @app.get("/api/sessions/{session_id}/runs")  # type: ignore[untyped-decorator]
+    def list_session_runs(session_id: str) -> list[dict[str, object]]:
+        return runs.list_runs_for_session(session_id)
 
     @app.get("/api/runs/{run_id}")  # type: ignore[untyped-decorator]
     def get_run(run_id: str) -> dict[str, object]:

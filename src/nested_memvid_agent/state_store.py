@@ -172,6 +172,18 @@ class AgentStateStore:
             ).fetchall()
         return [_run_from_row(row) for row in rows]
 
+    def list_runs_for_session(self, session_id: str) -> list[RunRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM runs
+                WHERE session_id = ?
+                ORDER BY created_at ASC, run_id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+        return [_run_from_row(row) for row in rows]
+
     def list_sessions(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(

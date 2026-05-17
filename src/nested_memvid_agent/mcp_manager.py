@@ -8,7 +8,7 @@ import json
 import os
 import threading
 import time
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import import_module
@@ -16,6 +16,7 @@ from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 from .runtime_models import ToolCall, ToolExecution, ToolSpec
+from .secret_broker import is_secret_ref
 from .state_store import AgentStateStore
 from .tools.base import AgentTool, ToolContext
 
@@ -24,6 +25,7 @@ MCP_TRUST_MANIFEST_POLICY = "trust_manifest"
 MCP_TIMEOUT_SECONDS = 15.0
 
 RiskLevel = Literal["low", "medium", "high"]
+SecretResolver = Callable[[str], str | None]
 
 
 @dataclass(frozen=True)
@@ -50,10 +52,12 @@ class MCPManager:
         *,
         timeout_seconds: float = MCP_TIMEOUT_SECONDS,
         allow_network_endpoints: bool = False,
+        secret_resolver: SecretResolver | None = None,
     ) -> None:
         self.state = state
         self.timeout_seconds = timeout_seconds
         self.allow_network_endpoints = allow_network_endpoints
+        self.secret_resolver = secret_resolver
         self._lock = threading.RLock()
         self._sessions: dict[str, _MCPSessionWorker] = {}
 
@@ -261,7 +265,7 @@ class MCPManager:
                 return worker
             if worker is not None:
                 worker.close(timeout=self.timeout_seconds)
-            worker = _MCPSessionWorker(server=server, fingerprint=fingerprint)
+            worker = _MCPSessionWorker(server=server, fingerprint=fingerprint, secret_resolver=self.secret_resolver)
             self._sessions[server.id] = worker
             return worker
 
@@ -304,9 +308,10 @@ class MCPToolAdapter(AgentTool):
 
 
 class _MCPSessionWorker:
-    def __init__(self, *, server: MCPServerConfig, fingerprint: str) -> None:
+    def __init__(self, *, server: MCPServerConfig, fingerprint: str, secret_resolver: SecretResolver | None = None) -> None:
         self.server = server
         self.fingerprint = fingerprint
+        self.secret_resolver = secret_resolver
         self._lock = threading.RLock()
         self._ready = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -389,7 +394,7 @@ class _MCPSessionWorker:
     async def _connect(self) -> Any:
         if self._session is not None:
             return self._session
-        self._session_context = _session_context(self.server)
+        self._session_context = _session_context(self.server, secret_resolver=self.secret_resolver)
         self._session = await self._session_context.__aenter__()
         return self._session
 
@@ -412,14 +417,14 @@ class _MCPSessionWorker:
         return _tool_result_to_text(result)
 
 
-def _session_context(server: MCPServerConfig) -> Any:
+def _session_context(server: MCPServerConfig, *, secret_resolver: SecretResolver | None = None) -> Any:
     if server.transport == "stdio":
         stdio_mod = import_module("mcp.client.stdio")
         client_mod = import_module("mcp")
         params = client_mod.StdioServerParameters(
             command=server.command or "",
             args=list(server.args),
-            env=_runtime_env(server) or None,
+            env=_runtime_env(server, secret_resolver=secret_resolver) or None,
         )
         return _ClientSessionContext(stdio_mod.stdio_client(params))
     if server.transport == "streamable_http":
@@ -462,8 +467,8 @@ def _normalize_server(payload: dict[str, Any]) -> MCPServerConfig:
         if _looks_secret(key):
             raise ValueError(f"MCP secret-looking environment variable {key} must be configured via secret_env.")
     for target, source in secret_env.items():
-        if not _valid_env_name(target) or not _valid_env_name(source):
-            raise ValueError("MCP secret_env keys and values must be environment variable names.")
+        if not _valid_env_name(target) or not (_valid_env_name(source) or is_secret_ref(source)):
+            raise ValueError("MCP secret_env keys must be env names and values must be env names or secret:// refs.")
     return MCPServerConfig(
         id=str(payload["id"]),
         name=str(payload.get("name") or payload["id"]),
@@ -709,10 +714,13 @@ def _config_fingerprint(row: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def _runtime_env(server: MCPServerConfig) -> dict[str, str]:
+def _runtime_env(server: MCPServerConfig, *, secret_resolver: SecretResolver | None = None) -> dict[str, str]:
     env = dict(server.env or {})
     for target, source in dict(server.secret_env or {}).items():
-        value = os.getenv(source, "")
+        if is_secret_ref(source) and callable(secret_resolver):
+            value = str(secret_resolver(source) or "")
+        else:
+            value = os.getenv(source, "")
         if not value:
             raise ValueError(f"Missing MCP secret environment variable: {source}")
         env[target] = value

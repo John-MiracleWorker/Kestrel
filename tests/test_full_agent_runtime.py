@@ -187,6 +187,36 @@ def test_state_store_lists_sessions_from_runs(tmp_path: Path) -> None:
     assert sessions[0]["status_counts"] == {"queued": 2}
 
 
+def test_state_store_lists_runs_for_session_chronologically(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    state.create_run(
+        run_id="run_a_first",
+        message="first alpha",
+        session_id="session-a",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+    state.create_run(
+        run_id="run_b",
+        message="beta",
+        session_id="session-b",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+    state.create_run(
+        run_id="run_a_second",
+        message="second alpha",
+        session_id="session-a",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+
+    runs = state.list_runs_for_session("session-a")
+
+    assert [run.run_id for run in runs] == ["run_a_first", "run_a_second"]
+    assert [run.session_id for run in runs] == ["session-a", "session-a"]
+
+
 def test_state_store_persists_durable_task_graph_metadata(tmp_path: Path) -> None:
     state = AgentStateStore(tmp_path / "state.db")
     state.create_run(
@@ -503,6 +533,83 @@ def test_mcp_secret_env_is_resolved_only_at_runtime(tmp_path: Path, monkeypatch:
     assert row["secret_env"] == {"MCP_API_TOKEN": "MCP_FIXTURE_TOKEN"}
 
 
+def test_mcp_secret_ref_is_resolved_by_broker_only_at_runtime(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = MCPManager(state, secret_resolver=lambda ref: "broker-secret-token" if ref == "secret://github_pat" else None)
+    row = manager.add_server(
+        {
+            "id": "broker-secret-stdio",
+            "transport": "stdio",
+            "command": "fake-mcp",
+            "secret_env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "secret://github_pat"},
+        }
+    )
+    server = mcp_module._server_from_state(row)
+
+    runtime_env = mcp_module._runtime_env(server, secret_resolver=manager.secret_resolver)
+
+    assert runtime_env["GITHUB_PERSONAL_ACCESS_TOKEN"] == "broker-secret-token"
+    assert "broker-secret-token" not in json.dumps(row)
+    assert row["secret_env"] == {"GITHUB_PERSONAL_ACCESS_TOKEN": "secret://github_pat"}
+
+
+def test_secret_broker_api_returns_metadata_only_for_channels_and_mcp(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    config = AgentConfig(
+        state_path=tmp_path / "state.db",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        channel_config_path=tmp_path / "channels.json",
+        secret_store_path=tmp_path / "secrets.json",
+    )
+    client = TestClient(create_app(config))
+
+    created = client.post(
+        "/api/secrets",
+        json={
+            "name": "TELEGRAM_BOT_TOKEN",
+            "purpose": "Enable Telegram channel delivery.",
+            "value": "123456:ABC-super-secret",
+            "validate": True,
+        },
+    )
+    assert created.status_code == 200
+    secret_payload = created.json()
+    assert secret_payload["secret_ref"] == "secret://telegram_bot_token"
+    assert secret_payload["configured"] is True
+    assert secret_payload["validated"] is True
+    assert "123456:ABC-super-secret" not in json.dumps(secret_payload)
+
+    secrets = client.get("/api/secrets")
+    assert secrets.status_code == 200
+    assert "123456:ABC-super-secret" not in json.dumps(secrets.json())
+
+    channel = client.post(
+        "/api/channels",
+        json={"id": "telegram", "provider": "telegram", "token_env": "TELEGRAM_BOT_TOKEN"},
+    )
+    assert channel.status_code == 200
+    assert channel.json()["env_status"]["token_env_configured"] is True
+    assert "123456:ABC-super-secret" not in json.dumps(channel.json())
+
+    mcp_payload = {
+        "id": "broker-mcp",
+        "transport": "stdio",
+        "command": "fake-mcp",
+        "secret_env": {"MCP_API_TOKEN": "secret://telegram_bot_token"},
+    }
+    mcp_created = client.post("/api/mcp/servers", json=mcp_payload)
+    assert mcp_created.status_code == 200
+    mcp_detail = client.get("/api/mcp/servers/broker-mcp")
+    assert mcp_detail.status_code == 200
+    payload = mcp_detail.json()
+    assert "secret_env" not in payload
+    assert payload["secret_env_status"]["MCP_API_TOKEN"]["configured"] is True
+    assert payload["secret_env_status"]["MCP_API_TOKEN"]["secret_ref"] == "secret://telegram_bot_token"
+    assert "123456:ABC-super-secret" not in json.dumps(payload)
+
+
 def test_mcp_static_server_test_updates_health(tmp_path: Path) -> None:
     state = AgentStateStore(tmp_path / "state.db")
     manager = MCPManager(state)
@@ -665,6 +772,46 @@ def test_server_exposes_prompt_api_routes(tmp_path: Path) -> None:
     assert context.status_code == 200
     assert "MV2 PSEUDO-CONTEXT PACK" in context.json()["packed_prompt"]
     assert context.json()["selected_item_count"] >= 1
+
+
+def test_server_lists_runs_for_a_session_in_chronological_order(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    config = AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        state_path=tmp_path / "state.db",
+        skills_dir=tmp_path / "skills",
+        workspace=tmp_path,
+    )
+    client = TestClient(create_app(config))
+
+    first = client.post("/api/runs", json={"message": "first alpha", "session_id": "session-a"})
+    other = client.post("/api/runs", json={"message": "beta", "session_id": "session-b"})
+    second = client.post("/api/runs", json={"message": "second alpha", "session_id": "session-a"})
+    assert first.status_code == 200
+    assert other.status_code == 200
+    assert second.status_code == 200
+
+    session_runs = client.get("/api/sessions/session-a/runs")
+    assert session_runs.status_code == 200
+    assert [run["run_id"] for run in session_runs.json()] == [first.json()["run_id"], second.json()["run_id"]]
+    assert [run["message"] for run in session_runs.json()] == ["first alpha", "second alpha"]
+
+    empty_session = client.get("/api/sessions/missing/runs")
+    assert empty_session.status_code == 200
+    assert empty_session.json() == []
+
+    global_runs = client.get("/api/runs")
+    assert global_runs.status_code == 200
+    assert {run["run_id"] for run in global_runs.json()} >= {
+        first.json()["run_id"],
+        other.json()["run_id"],
+        second.json()["run_id"],
+    }
 
 
 def test_server_exposes_self_and_web_routes(tmp_path: Path) -> None:

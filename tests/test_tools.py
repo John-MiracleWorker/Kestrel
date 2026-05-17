@@ -105,6 +105,65 @@ def test_high_risk_tool_requires_enablement(tmp_path: Path) -> None:
     assert result.error == "tool_disabled"
 
 
+def test_shell_run_blocks_remote_publishing_escape_routes(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="should not run", stderr="")
+
+    monkeypatch.setattr("nested_memvid_agent.tools.builtin.subprocess.run", fake_run)
+    blocked_commands = [
+        ["git", "push", "origin", "main"],
+        ["git", "push", "--force", "origin", "main"],
+        ["git", "tag", "v1.0.0"],
+        ["git", "remote", "set-url", "origin", "git@github.com:evil/repo.git"],
+        ["gh", "repo", "edit", "--visibility", "public"],
+        ["gh", "secret", "set", "TOKEN"],
+        ["gh", "workflow", "enable", "deploy.yml"],
+        ["rm", "-rf", ".git"],
+        ["python", "-c", "import subprocess; subprocess.run(['git', 'push', 'origin', 'main'])"],
+    ]
+
+    for index, command in enumerate(blocked_commands):
+        call = ToolCall(name="shell.run", arguments={"command": command}, id=f"remote_escape_{index}")
+        result = registry.execute(
+            call,
+            ToolContext(
+                memory=memory,
+                config=AgentConfig(allow_shell=True),
+                workspace=tmp_path,
+                approved_tool_call_ids=frozenset({call.id}),
+                approved_tool_call_arguments={call.id: call.arguments},
+            ),
+        )
+        assert result.error == "remote_mutation_blocked", command
+
+    assert calls == []
+
+
+def test_remote_publishing_config_is_disabled_by_default_and_env_gated(monkeypatch: MonkeyPatch) -> None:
+    default_config = AgentConfig()
+    assert default_config.allow_git_push is False
+    assert default_config.allow_remote_mutation is False
+    assert default_config.git_write_mode == "local_branch"
+    assert default_config.protected_branches == ("main", "master", "release/*")
+
+    monkeypatch.setenv("NEST_AGENT_ALLOW_GIT_PUSH", "1")
+    monkeypatch.setenv("NEST_AGENT_ALLOW_REMOTE_MUTATION", "true")
+    monkeypatch.setenv("NEST_AGENT_GIT_WRITE_MODE", "fork_pr")
+    monkeypatch.setenv("NEST_AGENT_PROTECTED_BRANCHES", "main,stable/*")
+
+    env_config = AgentConfig.from_env()
+    assert env_config.allow_git_push is True
+    assert env_config.allow_remote_mutation is True
+    assert env_config.git_write_mode == "fork_pr"
+    assert env_config.protected_branches == ("main", "stable/*")
+
+
 def test_mapped_high_risk_tools_require_capability_even_when_approval_is_disabled(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -843,7 +902,9 @@ def test_default_registry_includes_spec_tools() -> None:
         "lint.run",
         "git.status",
         "git.diff",
+        "git.export_patch",
         "git.branch",
+        "git.create_local_branch",
         "git.commit",
         "memvid.verify",
         "memvid.doctor",
@@ -1246,6 +1307,87 @@ def test_git_commit_requires_approval_and_never_pushes(tmp_path: Path, monkeypat
     assert isinstance(commands, list)
     assert ["git", "commit", "-m", "test commit"] in commands
     assert all("push" not in command for command in commands)
+
+
+def test_git_create_local_branch_is_local_only_and_approval_gated(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(name="git.create_local_branch", arguments={"branch": "kestrel/self-improve/test"}, id="branch1")
+
+    blocked = registry.execute(call, ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path))
+    assert blocked.error == "approval_required"
+
+    protected_call = ToolCall(name="git.create_local_branch", arguments={"branch": "main"}, id="branch_main")
+    protected = registry.execute(protected_call, _approved_context(memory, tmp_path, protected_call))
+    assert protected.error == "protected_branch"
+
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        calls.append(command)
+        if command == ["git", "branch", "--show-current"]:
+            return subprocess.CompletedProcess(command, 0, stdout="feature\n", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout="Switched to a new branch", stderr="")
+
+    monkeypatch.setattr("nested_memvid_agent.tools.builtin.subprocess.run", fake_run)
+    result = registry.execute(call, _approved_context(memory, tmp_path, call))
+
+    assert result.success
+    assert ["git", "switch", "-c", "kestrel/self-improve/test"] in calls
+    assert all("push" not in command for command in calls)
+
+
+def test_git_export_patch_writes_local_improvement_patch(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    patch_text = "diff --git a/a.txt b/a.txt\n+hello\n"
+    call = ToolCall(
+        name="git.export_patch",
+        arguments={"path": ".kestrel/improvements/demo/diff.patch"},
+        id="export_patch",
+    )
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        assert command == ["git", "diff"]
+        return subprocess.CompletedProcess(command, 0, stdout=patch_text, stderr="")
+
+    monkeypatch.setattr("nested_memvid_agent.tools.builtin.subprocess.run", fake_run)
+    result = registry.execute(call, _approved_context(memory, tmp_path, call))
+
+    assert result.success
+    assert result.data["path"] == ".kestrel/improvements/demo/diff.patch"
+    assert (tmp_path / ".kestrel" / "improvements" / "demo" / "diff.patch").read_text() == patch_text
+
+
+def test_git_commit_refuses_protected_branches(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(name="git.commit", arguments={"message": "test commit"}, id="commit_protected")
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        calls.append(command)
+        if command == ["git", "branch", "--show-current"]:
+            return subprocess.CompletedProcess(command, 0, stdout="main\n", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout="should not commit", stderr="")
+
+    monkeypatch.setattr("nested_memvid_agent.tools.builtin.subprocess.run", fake_run)
+    result = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_git_commit=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"commit_protected"}),
+            approved_tool_call_arguments={"commit_protected": {"message": "test commit"}},
+        ),
+    )
+
+    assert result.error == "protected_branch"
+    assert ["git", "commit", "-m", "test commit"] not in calls
 
 
 def test_memory_inspect_export_and_import_are_structured_and_gated(tmp_path: Path) -> None:

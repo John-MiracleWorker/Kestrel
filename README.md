@@ -244,6 +244,11 @@ NEST_AGENT_ALLOW_POLICY_WRITES=false
 NEST_AGENT_ALLOW_CODEX_CLI=false
 NEST_AGENT_ALLOW_PLUGIN_INSTALL=false
 NEST_AGENT_ALLOW_GIT_COMMIT=false
+NEST_AGENT_ALLOW_GIT_PUSH=false
+NEST_AGENT_ALLOW_REMOTE_MUTATION=false
+NEST_AGENT_GIT_WRITE_MODE=local_branch
+NEST_AGENT_PROTECTED_BRANCHES=main,master,release/*
+NEST_AGENT_SECRET_STORE_PATH=.nest/secrets/local_vault.json
 NEST_AGENT_ALLOW_MEMORY_IMPORT=false
 NEST_AGENT_ALLOW_EXECUTABLE_SKILLS=false
 NEST_AGENT_ALLOW_MCP_NETWORK_ENDPOINTS=false
@@ -258,7 +263,9 @@ NEST_AGENT_REQUIRE_API_AUTH=false
 
 High-risk tools need capability enablement where applicable and exact-call approval before execution. Approval is bound to the requested tool call ID and arguments; changed arguments require a new approval.
 
-Repair branch commits also require a current `repair.review` artifact tied to a successful validation result and the current diff hash.
+Secrets stay out of chat. The Secret Broker stores channel/MCP/tool credentials through backend API/UI flows and returns only metadata such as `secret://...` handles, configured state, validation state, timestamps, and fingerprints. No public GET route returns raw secret values; MCP `secret_env` can point to host env names or broker refs, and channel status checks use the same metadata-only boundary.
+
+Self-improvement is local-first: Kestrel can learn into local `.mv2` memory, create approval-gated local branches with `git.create_local_branch`, export patch artifacts with `git.export_patch`, and run tests without publishing. Remote mutation is a separate gated lane. `git.commit` never pushes, refuses protected branches by default, and repair branch commits also require a current `repair.review` artifact tied to a successful validation result and the current diff hash. The shell tool blocks common remote-publishing escape routes unless a future publishing mode explicitly gates them.
 
 Web access is read-only context gathering. `web.search` and `web.fetch` stay disabled unless `--allow-web` / `NEST_AGENT_ALLOW_WEB=1` is set; fetches reject private, local, link-local, multicast, reserved, and unspecified addresses. Self-change requests stay behind `--allow-self-modification` / `NEST_AGENT_ALLOW_SELF_MODIFICATION=1`, exact-call approval, and the existing repair/commit path.
 

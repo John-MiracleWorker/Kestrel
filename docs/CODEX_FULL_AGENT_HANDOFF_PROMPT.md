@@ -164,6 +164,80 @@ Examples:
 
 Do not weaken gates to make tests pass.
 
+## Secure Secret Handling
+
+Kestrel must never ask users to paste secrets into chat. Raw secret values must not land in prompts, chat history, tool outputs visible to the model, trace logs, error text, `.mv2` memory, MCP manifests, or public API payloads.
+
+The Secret Broker is the trusted backend boundary. The agent may request a secret by name and purpose, but a backend/UI flow collects, stores, validates, and injects the value outside LLM context.
+
+The LLM may see metadata only:
+
+- secret name
+- purpose
+- configured true/false
+- validation status
+- last validated timestamp
+- `secret://...` handle
+- optional non-reversible fingerprint
+
+The LLM must never see:
+
+- raw secret values
+- full env files
+- unredacted process environments
+- unredacted tool errors
+- unredacted logs or traces
+
+Secrets should be treated as capabilities, not strings. Channels, MCP servers, subprocesses, and provider adapters should receive secret values only through backend runtime injection. Public surfaces should expose handles and configuration status, as in channel `env_status` and MCP `secret_env_status`.
+
+Current local-first implementation:
+
+- `POST /api/secrets` stores values through the backend and returns metadata only.
+- `GET /api/secrets` and `GET /api/secrets/{id}` never return raw values.
+- `NEST_AGENT_SECRET_STORE_PATH` points at the local Secret Broker vault.
+- MCP `secret_env` values can point to host env names or `secret://...` refs.
+- Channel env status checks consult the broker as well as host env vars.
+
+The local file vault is a development substrate with owner-only permissions. Production deployments should keep the same broker contract but back it with OS keychain, platform secret storage, or a managed vault.
+
+## Local-Only Self-Improvement and Git Safety
+
+Kestrel may improve itself locally by writing memory, creating local branches, producing patches, and running tests. Kestrel must not push to upstream `main`. Remote publishing requires explicit human approval and should happen through PRs or forks, never direct main mutation.
+
+Keep three lanes separate:
+
+- Self-learning memory: validated lessons, workflow preferences, repair notes, failures, and procedural memories stay in local `.mv2` memory.
+- Local code experiments: Kestrel may create local branches/worktrees, patch files, run validation, and show diffs on the user's machine.
+- Remote publishing: pushing to GitHub, opening PRs, changing remote branches, tags, releases, or repo settings is disabled by default and requires a separate explicit approval story.
+
+Protected branch policy:
+
+```text
+main = protected
+agent direct push to main = forbidden
+agent direct commit to main = forbidden
+agent force push = forbidden
+agent push tags = forbidden
+agent remote rewrite = forbidden
+agent can create local branches = allowed
+agent can create patch files = allowed
+agent can open PR from branch/fork = explicit approval only
+```
+
+Default config keeps remote publishing disabled:
+
+```text
+NEST_AGENT_ALLOW_GIT_COMMIT=0
+NEST_AGENT_ALLOW_GIT_PUSH=0
+NEST_AGENT_ALLOW_REMOTE_MUTATION=0
+NEST_AGENT_GIT_WRITE_MODE=local_branch
+NEST_AGENT_PROTECTED_BRANCHES=main,master,release/*
+```
+
+Do not add a generic `git.push` tool to the default registry. Safer git tools are read/status/diff, local branch creation through `git.create_local_branch`, commit through `git.commit`, and local patch export through `git.export_patch`. Shell execution must not be usable as a remote-publishing escape route; commands such as `git push`, `git tag`, `git remote set-url`, `gh repo edit`, `gh secret set`, `gh workflow enable`, `rm -rf .git`, or writes to `.git/config` must stay blocked unless a future remote-publishing mode deliberately gates them.
+
+A local improvement candidate should be represented as reviewer artifacts under `.kestrel/improvements/` or an equivalent local queue, with at least a summary, plan, diff/patch, validation output, risk notes, and status. The user then chooses whether to keep it local, export a patch, open a PR, or discard it.
+
 ## Memory Promotion Rules
 
 Every accepted promotion must carry:

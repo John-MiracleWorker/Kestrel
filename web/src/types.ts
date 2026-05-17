@@ -27,6 +27,17 @@ export type Session = {
   updated_at: string;
 };
 
+export type ThreadSummary = {
+  session_id: string;
+  title: string;
+  latest_message: string;
+  latest_status: string;
+  latest_run_id: string;
+  run_count: number;
+  updated_at: string;
+  is_local?: boolean;
+};
+
 export type Approval = {
   approval_id: string;
   run_id: string;
@@ -40,6 +51,50 @@ export type Approval = {
   created_at: string;
   updated_at: string;
 };
+
+export type UserAutonomyMode = "safe_auto" | "manual" | "full_auto_when_allowed";
+
+export type ChatMessage =
+  | {
+      id: string;
+      kind: "user";
+      run_id: string;
+      session_id: string;
+      content: string;
+      created_at: string;
+    }
+  | {
+      id: string;
+      kind: "assistant";
+      run_id: string;
+      session_id: string;
+      content: string;
+      status: string;
+      stop_reason?: string;
+      created_at: string;
+      updated_at: string;
+    }
+  | {
+      id: string;
+      kind: "event";
+      run_id: string;
+      session_id: string;
+      event_type: string;
+      label: string;
+      created_at: string;
+    }
+  | {
+      id: string;
+      kind: "approval";
+      run_id: string;
+      session_id: string;
+      approval_id: string;
+      tool_name: string;
+      risk: string;
+      arguments: Record<string, unknown>;
+      status: string;
+      created_at: string;
+    };
 
 export type Tool = {
   name: string;
@@ -122,6 +177,20 @@ export type Channel = {
   webhook_url_env?: string | null;
   settings: Record<string, unknown>;
   env_status?: Record<string, unknown>;
+};
+
+export type SecretRef = {
+  id: string;
+  name: string;
+  purpose: string;
+  secret_ref: string;
+  configured: boolean;
+  validated: boolean;
+  last_validated_at?: string | null;
+  fingerprint?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  source?: string;
 };
 
 export type MemoryHit = {

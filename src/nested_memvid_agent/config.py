@@ -36,6 +36,10 @@ class AgentConfig:
     allow_codex_cli: bool = False
     allow_plugin_install: bool = False
     allow_git_commit: bool = False
+    allow_git_push: bool = False
+    allow_remote_mutation: bool = False
+    git_write_mode: str = "local_branch"
+    protected_branches: tuple[str, ...] = ("main", "master", "release/*")
     allow_memory_import: bool = False
     allow_executable_skills: bool = False
     allow_mcp_network_endpoints: bool = False
@@ -61,6 +65,7 @@ class AgentConfig:
     stream: bool = False
     log_dir: Path = Path(".nest/logs")
     state_path: Path = Path(".nest/state/agent.db")
+    secret_store_path: Path = Path(".nest/secrets/local_vault.json")
     skills_dir: Path = Path(".nest/skills")
     plugins_dir: Path = Path(".nest/plugins")
     mcp_config_path: Path = Path(".nest/config/mcp_servers.json")
@@ -94,6 +99,7 @@ class AgentConfig:
             workspace=Path(os.getenv("NEST_AGENT_WORKSPACE", ".")),
             log_dir=Path(os.getenv("NEST_AGENT_LOG_DIR", ".nest/logs")),
             state_path=Path(os.getenv("NEST_AGENT_STATE_PATH", ".nest/state/agent.db")),
+            secret_store_path=Path(os.getenv("NEST_AGENT_SECRET_STORE_PATH", ".nest/secrets/local_vault.json")),
             skills_dir=Path(os.getenv("NEST_AGENT_SKILLS_DIR", ".nest/skills")),
             plugins_dir=Path(os.getenv("NEST_AGENT_PLUGINS_DIR", ".nest/plugins")),
             mcp_config_path=Path(os.getenv("NEST_AGENT_MCP_CONFIG", ".nest/config/mcp_servers.json")),
@@ -107,6 +113,10 @@ class AgentConfig:
             allow_codex_cli=_env_bool("NEST_AGENT_ALLOW_CODEX_CLI"),
             allow_plugin_install=_env_bool("NEST_AGENT_ALLOW_PLUGIN_INSTALL"),
             allow_git_commit=_env_bool("NEST_AGENT_ALLOW_GIT_COMMIT"),
+            allow_git_push=_env_bool("NEST_AGENT_ALLOW_GIT_PUSH"),
+            allow_remote_mutation=_env_bool("NEST_AGENT_ALLOW_REMOTE_MUTATION"),
+            git_write_mode=os.getenv("NEST_AGENT_GIT_WRITE_MODE", "local_branch"),
+            protected_branches=_env_csv("NEST_AGENT_PROTECTED_BRANCHES", ("main", "master", "release/*")),
             allow_memory_import=_env_bool("NEST_AGENT_ALLOW_MEMORY_IMPORT"),
             allow_executable_skills=_env_bool("NEST_AGENT_ALLOW_EXECUTABLE_SKILLS"),
             allow_mcp_network_endpoints=_env_bool("NEST_AGENT_ALLOW_MCP_NETWORK_ENDPOINTS"),
@@ -146,6 +156,7 @@ class AgentConfig:
             "workspace",
             "log_dir",
             "state_path",
+            "secret_store_path",
             "skills_dir",
             "plugins_dir",
             "mcp_config_path",
@@ -154,7 +165,12 @@ class AgentConfig:
         }
         normalized: dict[str, Any] = {}
         for key, value in raw.items():
-            normalized[key] = Path(value) if key in path_fields and value is not None else value
+            if key in path_fields and value is not None:
+                normalized[key] = Path(value)
+            elif key == "protected_branches" and isinstance(value, list):
+                normalized[key] = tuple(str(item) for item in value)
+            else:
+                normalized[key] = value
         return cls(**normalized)
 
 
@@ -181,6 +197,14 @@ def _env_float(name: str, default: float) -> float:
     if raw is None or not raw.strip():
         return default
     return float(raw)
+
+
+def _env_csv(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    values = tuple(part.strip() for part in raw.split(",") if part.strip())
+    return values or default
 
 
 def _env_str_or_none(name: str) -> str | None:

@@ -109,18 +109,19 @@ Current tool families:
 - file and shell tools
 - repo search/map tools
 - patch/test/lint tools
-- git status/diff/branch/commit tools
+- git status/diff/branch/local-branch/export-patch/commit tools
 - Memvid verify/doctor/stats tools
 - diagnosis and failure-recall tools
 - safe repair tools
 - Soul/self inspection, reflection, memory, and change-proposal tools
 - gated read-only web search/fetch tools
+- Secret Broker API/UI flow for metadata-only secret handles
 - skill install/runtime tools
 - plugin registry and materialization commands
 - Codex CLI delegation
 - MCP-adapted tools
 
-High-risk tools are blocked unless enabled where applicable and approved for the exact call ID and arguments. `git.commit` never pushes. Repair branch commits require `repair.review`.
+High-risk tools are blocked unless enabled where applicable and approved for the exact call ID and arguments. `git.commit` never pushes and refuses protected branches by default. Remote git/GitHub mutations are not in the default tool lane and shell execution blocks common publishing escape routes unless an explicit future publishing mode gates them. Repair branch commits require `repair.review`.
 
 ### Nested Memory Layers
 

@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from .models import (
 )
 
 AgentFactory = Callable[[AgentConfig], NestedMV2Agent]
+SecretResolver = Callable[[str], str | None]
 
 
 class ChannelManager:
@@ -32,9 +34,11 @@ class ChannelManager:
         agent_factory: AgentFactory = build_agent,
         adapters: Mapping[str, ChannelAdapter] | None = None,
         channel_configs: list[ChannelEndpointConfig] | None = None,
+        secret_resolver: SecretResolver | None = None,
     ) -> None:
         self.config = config
         self.agent_factory = agent_factory
+        self.secret_resolver = secret_resolver
         self.adapters = dict(adapters or default_adapters())
         self.channels = {
             channel.id: channel
@@ -75,6 +79,7 @@ class ChannelManager:
         channel = self._resolve_channel(provider=provider, channel_id=channel_id)
         if not channel.enabled:
             raise ChannelPayloadError(f"Channel is disabled: {channel.id}")
+        channel = self._with_resolved_secrets(channel)
         _verify_channel_signature(channel, payload, headers or {})
         adapter = self._adapter_for(channel.provider)
         inbound = adapter.parse_inbound(channel, payload)
@@ -146,6 +151,20 @@ class ChannelManager:
     def _event(self, event_type: str, payload: dict[str, Any]) -> None:
         self.event_log.append(AgentEvent(type=event_type, payload=payload))
 
+    def _with_resolved_secrets(self, channel: ChannelEndpointConfig) -> ChannelEndpointConfig:
+        if self.secret_resolver is None:
+            return channel
+        resolved: dict[str, str] = {}
+        for name in _channel_secret_names(channel):
+            value = self.secret_resolver(name)
+            if value:
+                resolved[name] = value
+        if not resolved:
+            return channel
+        settings = dict(channel.settings)
+        settings["_resolved_secrets"] = resolved
+        return replace(channel, settings=settings)
+
 
 def load_channel_configs(path: Path) -> list[ChannelEndpointConfig]:
     if not path.exists():
@@ -209,7 +228,7 @@ def _verify_channel_signature(
     secret_env = channel.settings.get("signature_secret_env")
     if not isinstance(secret_env, str) or not secret_env.strip():
         return
-    secret = os.getenv(secret_env.strip(), "")
+    secret = _channel_secret_value(channel, secret_env.strip())
     if not secret:
         raise ChannelPayloadError(f"Missing webhook signature secret environment variable: {secret_env}")
     header_name = str(channel.settings.get("signature_header") or "x-kestrel-signature").lower()
@@ -226,3 +245,22 @@ def _verify_channel_signature(
         supplied = supplied.removeprefix("sha256=")
     if not hmac.compare_digest(supplied, expected):
         raise ChannelPayloadError("Invalid webhook signature.")
+
+
+def _channel_secret_names(channel: ChannelEndpointConfig) -> list[str]:
+    names = [
+        channel.token_env,
+        channel.webhook_url_env,
+        channel.settings.get("webhook_url_env"),
+        channel.settings.get("signature_secret_env"),
+    ]
+    return [str(name).strip() for name in names if isinstance(name, str) and str(name).strip()]
+
+
+def _channel_secret_value(channel: ChannelEndpointConfig, name: str) -> str:
+    resolved = channel.settings.get("_resolved_secrets")
+    if isinstance(resolved, dict):
+        value = resolved.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return os.getenv(name, "")

@@ -144,7 +144,11 @@ Examples of high-risk tools:
 - `capsule.apply`
 - `self.propose_change`
 
-`git.commit` never pushes. On repair branches, it also requires a current `repair.review` artifact tied to successful validation and the current diff hash.
+`git.commit` never pushes. It refuses protected branches from `NEST_AGENT_PROTECTED_BRANCHES` (`main,master,release/*` by default). On repair branches, it also requires a current `repair.review` artifact tied to successful validation and the current diff hash.
+
+Remote publishing is not part of the default tool lane. `NEST_AGENT_ALLOW_GIT_PUSH=false`, `NEST_AGENT_ALLOW_REMOTE_MUTATION=false`, and `NEST_AGENT_GIT_WRITE_MODE=local_branch` keep self-improvement local by default. The shell tool blocks common remote-mutation escape routes such as `git push`, `git tag`, `git remote set-url`, `gh repo edit`, `gh secret set`, `gh workflow enable`, `rm -rf .git`, and writes to `.git/config` before subprocess execution.
+
+The local-only git lane includes `git.create_local_branch` for approval-gated branch creation and `git.export_patch` for approval-gated patch artifacts under `.kestrel/improvements/`. Neither tool pushes or tracks remotes.
 
 `self.propose_change` is disabled unless `allow_self_modification` is enabled, still requires exact-call approval, and only records the requested self-change. Any actual code edit must use `repair.prepare`, `repair.apply_patch`, `repair.validate`, `repair.review`, and `git.commit`.
 
@@ -228,6 +232,10 @@ Newly discovered MCP tools default to approval-by-default. Manifest `trusted` an
 
 Manual API MCP invocations route through the same tool registry as agent tool calls, so MCP approval and risk policies produce the same `approval_required`, `tool_disabled`, and exact-call approval behavior. MCP GET routes return stored state only; live health checks, discovery, and sync are POST actions.
 
-MCP `secret_env` values are redacted in API responses, included in configuration fingerprints, and resolved from `os.environ` only when launching a process. Raw secret-looking keys in MCP `env` are rejected.
+MCP `secret_env` values are redacted in API responses, included in configuration fingerprints, and resolved from `os.environ` or `secret://...` broker refs only when launching a process. Raw secret-looking keys in MCP `env` are rejected.
+
+## Secret Broker Wiring
+
+`NEST_AGENT_SECRET_STORE_PATH` points to a local Secret Broker vault. `POST /api/secrets` accepts the raw value through the trusted backend flow and returns only metadata. `GET /api/secrets`, channel `env_status`, MCP `secret_env_status`, runtime config, and self-inspection never return raw values. Channels resolve configured env names through the broker at delivery/signature-verification time; MCP stdio servers resolve `secret://...` references into child process environment variables at launch.
 
 SSE and streamable HTTP transports share manager concepts but still need real fixtures and soak testing.

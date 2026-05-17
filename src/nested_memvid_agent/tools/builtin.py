@@ -8,6 +8,7 @@ import re
 import socket
 import subprocess
 import sys
+from fnmatch import fnmatchcase
 from html import unescape
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from ..models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from ..nested_learning import LearningSignal, NestedLearningKernel
 from ..plugin_manager import PluginManager
 from ..runtime_models import StrategyProposal, ToolCall, ToolExecution, ToolSpec
+from ..secret_broker import SecretBroker, is_secret_ref
 from ..skill_manager import validate_skill_manifest
 from ..state_store import AgentStateStore
 from ..task_capsule import summarize_run_capsule
@@ -532,6 +534,20 @@ class ShellRunTool(AgentTool):
         if not isinstance(command_raw, list) or not all(isinstance(item, str) for item in command_raw):
             return self._result(call, success=False, content="command must be list[str]", error="bad_command")
         command = list(command_raw)
+        remote_mutation = _remote_mutation_violation(command)
+        git_push_blocked = remote_mutation == "git push" and not context.config.allow_git_push
+        if remote_mutation and (git_push_blocked or not context.config.allow_remote_mutation):
+            return self._result(
+                call,
+                success=False,
+                content=f"Remote mutation command blocked: {remote_mutation}",
+                error="remote_mutation_blocked",
+                data={
+                    "violation": remote_mutation,
+                    "allow_git_push": context.config.allow_git_push,
+                    "allow_remote_mutation": context.config.allow_remote_mutation,
+                },
+            )
         if not command or Path(command[0]).name not in self.allowed_first_tokens:
             return self._result(call, success=False, content="Command is not allowlisted", error="command_not_allowlisted")
         command = _normalize_python_command(command)
@@ -1400,6 +1416,71 @@ class GitDiffTool(AgentTool):
         return result
 
 
+class GitExportPatchTool(AgentTool):
+    spec = ToolSpec(
+        name="git.export_patch",
+        description="Export the current git diff to a local .kestrel/improvements patch file. Never pushes.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "staged": {"type": "boolean"},
+                "path": {"type": "string"},
+            },
+        },
+        risk="high",
+        requires_approval=True,
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        command = ["git", "diff", "--cached"] if bool(arguments.get("staged", False)) else ["git", "diff"]
+        try:
+            completed = subprocess.run(  # noqa: S603 - fixed executable and arguments
+                command,
+                cwd=context.workspace,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if completed.returncode != 0:
+                return self._result(
+                    call,
+                    success=False,
+                    content=f"Unable to export patch. STDERR:\n{completed.stderr}",
+                    error="git_export_patch_failed",
+                    data={"returncode": completed.returncode},
+                )
+            patch = completed.stdout
+            if not patch.strip():
+                return self._result(call, success=False, content="No diff to export.", error="empty_diff")
+            path_arg = str(arguments.get("path", "")).strip()
+            if path_arg:
+                patch_path = _safe_path(context.workspace, path_arg)
+                relpath = patch_path.relative_to(context.workspace.resolve())
+                if relpath.parts[:2] != (".kestrel", "improvements"):
+                    return self._result(
+                        call,
+                        success=False,
+                        content="Patch exports must stay under .kestrel/improvements/.",
+                        error="invalid_patch_path",
+                    )
+            else:
+                patch_id = hashlib.sha256(patch.encode("utf-8")).hexdigest()[:16]
+                relpath = Path(".kestrel") / "improvements" / f"improvement_{patch_id}" / "diff.patch"
+                patch_path = context.workspace.resolve() / relpath
+            patch_path.parent.mkdir(parents=True, exist_ok=True)
+            patch_path.write_text(patch, encoding="utf-8")
+            return self._result(
+                call,
+                success=True,
+                content=f"Exported patch to {relpath.as_posix()}",
+                data={"path": relpath.as_posix(), "chars": len(patch), "staged": bool(arguments.get("staged", False))},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="git_export_patch_failed")
+
+
 class GitBranchTool(AgentTool):
     spec = ToolSpec(
         name="git.branch",
@@ -1410,6 +1491,59 @@ class GitBranchTool(AgentTool):
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         command = ["git", "branch", "--all"] if bool(arguments.get("all", False)) else ["git", "branch", "--show-current"]
         return _git_read(ToolCall(name=self.spec.name, arguments=arguments), context, command, "git_branch_failed")
+
+
+class GitCreateLocalBranchTool(AgentTool):
+    spec = ToolSpec(
+        name="git.create_local_branch",
+        description="Create a local git branch in the workspace. Never pushes or tracks a remote.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "branch": {"type": "string"},
+                "checkout": {"type": "boolean", "default": True},
+            },
+            "required": ["branch"],
+        },
+        risk="high",
+        requires_approval=True,
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        branch = str(arguments.get("branch", "")).strip()
+        checkout = bool(arguments.get("checkout", True))
+        if not _safe_branch_name(branch):
+            return self._result(call, success=False, content=f"Invalid branch name: {branch}", error="invalid_branch")
+        if _is_protected_branch(branch, context.config.protected_branches):
+            return self._result(
+                call,
+                success=False,
+                content=f"Refusing to create protected branch name: {branch}",
+                error="protected_branch",
+                data={"branch": branch, "protected_branches": list(context.config.protected_branches)},
+            )
+        command = ["git", "switch", "-c", branch] if checkout else ["git", "branch", branch]
+        try:
+            before_branch = _git_output(context.workspace, ["git", "branch", "--show-current"])
+            completed = subprocess.run(  # noqa: S603 - fixed executable and arguments
+                command,
+                cwd=context.workspace,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            return self._result(
+                call,
+                success=completed.returncode == 0,
+                content=content,
+                data={"branch": branch, "checkout": checkout, "previous_branch": before_branch, "returncode": completed.returncode},
+                error=None if completed.returncode == 0 else "git_create_branch_failed",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="git_create_branch_failed")
 
 
 class GitCommitTool(AgentTool):
@@ -1433,6 +1567,14 @@ class GitCommitTool(AgentTool):
         try:
             repair_review_id: str | None = None
             branch = _git_output(context.workspace, ["git", "branch", "--show-current"])
+            if _is_protected_branch(branch, context.config.protected_branches):
+                return self._result(
+                    call,
+                    success=False,
+                    content=f"Refusing to commit on protected branch: {branch}",
+                    error="protected_branch",
+                    data={"branch": branch, "protected_branches": list(context.config.protected_branches)},
+                )
             if _is_repair_branch(branch):
                 review_check = _validate_repair_review_gate(context.workspace, branch, str(arguments.get("repair_review_id", "")).strip())
                 if not review_check["ok"]:
@@ -2273,7 +2415,9 @@ def build_default_tools() -> ToolRegistry:
     registry.register(LintRunTool())
     registry.register(GitStatusTool())
     registry.register(GitDiffTool())
+    registry.register(GitExportPatchTool())
     registry.register(GitBranchTool())
+    registry.register(GitCreateLocalBranchTool())
     registry.register(GitCommitTool())
     registry.register(MemvidVerifyTool())
     registry.register(MemvidDoctorTool())
@@ -2308,6 +2452,7 @@ def _self_identity() -> dict[str, str]:
 def _self_snapshot(context: ToolContext, *, include_tools: bool, include_state: bool) -> dict[str, Any]:
     config = context.config
     state = AgentStateStore(config.state_path)
+    secret_broker = SecretBroker(config.secret_store_path)
     memory_layers = [
         {
             "layer": layer.value,
@@ -2334,12 +2479,17 @@ def _self_snapshot(context: ToolContext, *, include_tools: bool, include_state: 
             "backend": config.backend,
             "workspace": str(config.workspace),
             "memory_dir": str(config.memory_dir),
+            "secret_store_path": str(config.secret_store_path),
             "allow_shell": config.allow_shell,
             "allow_file_write": config.allow_file_write,
             "allow_policy_writes": config.allow_policy_writes,
             "allow_codex_cli": config.allow_codex_cli,
             "allow_plugin_install": config.allow_plugin_install,
             "allow_git_commit": config.allow_git_commit,
+            "allow_git_push": config.allow_git_push,
+            "allow_remote_mutation": config.allow_remote_mutation,
+            "git_write_mode": config.git_write_mode,
+            "protected_branches": list(config.protected_branches),
             "allow_memory_import": config.allow_memory_import,
             "allow_executable_skills": config.allow_executable_skills,
             "allow_mcp_network_endpoints": config.allow_mcp_network_endpoints,
@@ -2360,7 +2510,7 @@ def _self_snapshot(context: ToolContext, *, include_tools: bool, include_state: 
     if include_state:
         payload["skills"] = _safe_state_list(state.list_skills)
         payload["plugins"] = _safe_state_list(state.list_plugins)
-        payload["mcp_servers"] = [_redact_mcp_server(server) for server in _safe_state_list(state.list_mcp_servers)]
+        payload["mcp_servers"] = [_redact_mcp_server(server, secret_broker) for server in _safe_state_list(state.list_mcp_servers)]
     return payload
 
 
@@ -2372,12 +2522,19 @@ def _safe_state_list(loader: Any) -> list[dict[str, Any]]:
     return [dict(row) for row in rows if isinstance(row, dict)]
 
 
-def _redact_mcp_server(server: dict[str, Any]) -> dict[str, Any]:
+def _redact_mcp_server(server: dict[str, Any], secret_broker: SecretBroker) -> dict[str, Any]:
     safe = dict(server)
     safe.pop("env", None)
     secret_env = safe.pop("secret_env", {})
     if isinstance(secret_env, dict):
-        safe["secret_env_status"] = {str(key): {"env": str(value), "configured": bool(os.getenv(str(value)))} for key, value in secret_env.items()}
+        safe["secret_env_status"] = {
+            str(key): {
+                "env": str(value),
+                "secret_ref": str(value) if is_secret_ref(str(value)) else None,
+                "configured": bool(secret_broker.resolve(str(value))),
+            }
+            for key, value in secret_env.items()
+        }
     return safe
 
 
@@ -2541,6 +2698,48 @@ def _safe_branch_name(name: str) -> bool:
 
 def _is_repair_branch(name: str) -> bool:
     return name.startswith(("codex/", "repair/", "fix/")) and name not in {"main", "master"}
+
+
+def _is_protected_branch(name: str, protected_patterns: tuple[str, ...]) -> bool:
+    branch = name.strip()
+    return bool(branch) and any(fnmatchcase(branch, pattern) for pattern in protected_patterns)
+
+
+def _remote_mutation_violation(command: list[str]) -> str | None:
+    if not command:
+        return None
+    lowered = [part.lower() for part in command]
+    executable = Path(lowered[0]).name
+    if executable == "git" and len(lowered) >= 2:
+        if lowered[1] == "push":
+            return "git push"
+        if lowered[1] == "tag":
+            return "git tag"
+        if lowered[1:3] == ["remote", "set-url"]:
+            return "git remote set-url"
+    if executable == "gh" and len(lowered) >= 3:
+        if lowered[1:3] == ["repo", "edit"]:
+            return "gh repo edit"
+        if lowered[1:3] == ["secret", "set"]:
+            return "gh secret set"
+        if lowered[1:3] == ["workflow", "enable"]:
+            return "gh workflow enable"
+    joined = " ".join(lowered)
+    searchable = re.sub(r"[^a-z0-9_./*-]+", " ", joined)
+    checks = (
+        ("git push", "git push"),
+        ("git tag", "git tag"),
+        ("git remote set-url", "git remote set-url"),
+        ("gh repo edit", "gh repo edit"),
+        ("gh secret set", "gh secret set"),
+        ("gh workflow enable", "gh workflow enable"),
+        ("rm -rf .git", "rm -rf .git"),
+        (".git/config", ".git/config"),
+    )
+    for needle, label in checks:
+        if needle in searchable:
+            return label
+    return None
 
 
 def _git_output(workspace: Path, command: list[str]) -> str:
