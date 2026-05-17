@@ -68,6 +68,30 @@ The command reports promoted counts, outcome counts, false-positive rates, and d
 - Never-retrieved rate above 40% suggests the gate is admitting too eagerly.
 - Useful rate above 90% on low volume suggests the gate may be too strict.
 
+## ORACLE Shadow Routing
+
+ORACLE, the Outcome-Calibrated Layer Router, is the first bridge from ledger feedback to learned routing. It does not replace the deterministic kernel. The current implementation trains a small serializable utility table from promotion outcomes, extracts the same gate inputs the kernel uses, and records counterfactual predictions in `LearningDecision` payloads when a router is injected.
+
+The default rollout posture is shadow-only:
+
+- The rule-based `NestedLearningKernel` still decides the write target.
+- ORACLE can say which admissible target it would have chosen and why it abstained.
+- Guardrails block policy writes without explicit repeated validation, block further promotion from provisional records, and keep self/procedural routing behind their hard evidence gates.
+- Replay evaluation can estimate expected utility, false-positive rate, never-retrieved rate, useful rate, abstention rate, and gate violations without changing memory writes.
+
+Run the offline replay harness against the existing control-plane state:
+
+```bash
+python scripts/eval_memory_router.py \
+  --state-db .nest/state/agent.db \
+  --mode replay \
+  --baseline rule \
+  --candidate oracle \
+  --json
+```
+
+Activation beyond shadow mode should remain narrow and reversible. Low-risk gates such as working-to-episodic or episodic-to-semantic can be evaluated first; policy routing remains recommendation-only unless a future explicit enablement gate is added.
+
 ## Tuning Playbook
 
 Every quarter:

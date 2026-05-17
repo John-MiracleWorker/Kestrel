@@ -90,7 +90,7 @@ The promotion ledger records the source layer, target layer, validation score, r
 
 `LayeredMemorySystem.retrieve()` writes back `last_retrieved_at` at most once per hour for returned hits. Retention compaction uses that field to distinguish unused promoted records from records that were actually recalled.
 
-See `docs/LEARNING_LOOP.md` for the operator playbook and tuning rules. The ledger is feedback instrumentation, not threshold auto-tuning and not a learned scoring function.
+See `docs/LEARNING_LOOP.md` for the operator playbook, ORACLE shadow-routing replay, and tuning rules. The ledger is feedback instrumentation; ORACLE currently records counterfactual learned-router evidence and offline evals, not threshold auto-tuning or automatic write authority.
 
 ## Promotion thresholds
 

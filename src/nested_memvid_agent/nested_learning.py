@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Any, Literal
@@ -150,13 +150,14 @@ class LearningDecision:
     flow: ContextFlow
     optimizer_trace: OptimizerTrace
     promotion_requirements: dict[str, object]
+    learned_routing: dict[str, object] | None = None
 
     @property
     def accepted(self) -> bool:
         return self.action in {"write", "promote", "promote_provisional"} and self.target_layer is not None
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "accepted": self.accepted,
             "action": self.action,
             "target_layer": None if self.target_layer is None else self.target_layer.value,
@@ -168,6 +169,9 @@ class LearningDecision:
             "optimizer_trace": self.optimizer_trace.to_metadata(),
             "promotion_requirements": self.promotion_requirements,
         }
+        if self.learned_routing is not None:
+            payload["learned_routing"] = self.learned_routing
+        return payload
 
 
 DEFAULT_CONTEXT_FLOWS: dict[str, ContextFlow] = {
@@ -242,9 +246,11 @@ class NestedLearningKernel:
         *,
         specs: dict[MemoryLayer, LayerSpec] | None = None,
         memory: Any | None = None,
+        router: Any | None = None,
     ) -> None:
         self.specs = specs or DEFAULT_LAYER_SPECS
         self.memory = memory
+        self.router = router
 
     def decide(self, signal: LearningSignal, *, action: LearningAction = "write") -> LearningDecision:
         target_layer, reason = self._target(signal)
@@ -254,7 +260,7 @@ class NestedLearningKernel:
         trace = self._optimizer_trace(signal, target_layer)
         requirements = self._promotion_requirements(signal, requested_or_target)
         if target_layer is None:
-            return LearningDecision(
+            decision = LearningDecision(
                 action="reject",
                 target_layer=None,
                 target_kind=signal.kind,
@@ -265,7 +271,8 @@ class NestedLearningKernel:
                 optimizer_trace=trace,
                 promotion_requirements=requirements,
             )
-        return LearningDecision(
+            return self._with_learned_routing(signal, decision)
+        decision = LearningDecision(
             action=decision_action,
             target_layer=target_layer,
             target_kind=_target_kind(signal.kind, target_layer),
@@ -276,6 +283,7 @@ class NestedLearningKernel:
             optimizer_trace=trace,
             promotion_requirements=requirements,
         )
+        return self._with_learned_routing(signal, decision)
 
     def from_record(
         self,
@@ -553,6 +561,24 @@ class NestedLearningKernel:
         similarity = max(SequenceMatcher(None, signal.content, hit.record.content).ratio() for hit in hits)
         conflict_bonus = 0.15 if any(hit.record.metadata.get("conflict_group_id") for hit in hits) else 0.0
         return max(0.0, min(1.0, (1.0 - similarity) + conflict_bonus))
+
+    def _with_learned_routing(self, signal: LearningSignal, decision: LearningDecision) -> LearningDecision:
+        if self.router is None:
+            return decision
+        try:
+            prediction = self.router.predict(signal, decision)
+            explain = self.router.explain(prediction) if hasattr(self.router, "explain") else {}
+        except Exception as exc:
+            explain = {
+                "action": "reject",
+                "target_layer": None,
+                "expected_utility": 0.0,
+                "confidence": 0.0,
+                "abstained": True,
+                "reason": f"learned router failed open in shadow metadata: {exc.__class__.__name__}",
+                "guardrail_blocks": ["router_exception"],
+            }
+        return replace(decision, learned_routing=explain)
 
 
 def _flow_for(source: MemoryLayer, target: MemoryLayer | None) -> ContextFlow:
