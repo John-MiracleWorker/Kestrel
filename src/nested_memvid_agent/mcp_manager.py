@@ -394,7 +394,12 @@ class _MCPSessionWorker:
     async def _connect(self) -> Any:
         if self._session is not None:
             return self._session
-        self._session_context = _session_context(self.server, secret_resolver=self.secret_resolver)
+        try:
+            self._session_context = _session_context(self.server, secret_resolver=self.secret_resolver)
+        except TypeError as exc:
+            if "secret_resolver" not in str(exc):
+                raise
+            self._session_context = _session_context(self.server)
         self._session = await self._session_context.__aenter__()
         return self._session
 
