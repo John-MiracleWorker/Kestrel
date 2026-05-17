@@ -195,6 +195,7 @@ Current local-first implementation:
 - `POST /api/secrets` stores values through the backend and returns metadata only.
 - `GET /api/secrets` and `GET /api/secrets/{id}` never return raw values.
 - `NEST_AGENT_SECRET_STORE_PATH` points at the local Secret Broker vault.
+- `NEST_AGENT_SECRET_BACKEND=json` uses the owner-only local vault; `keyring` stores raw values through the optional OS keyring backend and keeps only metadata in JSON.
 - MCP `secret_env` values can point to host env names or `secret://...` refs.
 - Channel env status checks consult the broker as well as host env vars.
 

@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-05-16
+Last updated: 2026-05-17
 
 This repository is a working local agent scaffold, not a finished Hermes/OpenClaw agent. The status below is intentionally literal so future Codex passes can harden the right layers without treating roadmap items as done.
 
@@ -32,7 +32,11 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Multi-channel ingress for Telegram Bot API updates, Discord message/interaction-shaped payloads, and generic/custom webhooks, with CLI and API routes.
 - SQLite state store for runs, run steps, approvals, MCP servers, skills, plugins, task nodes, subagent runs, and trace spans, now initialized through schema version `9`.
 - Paper-guided nested learning kernel with context-flow metadata, optimizer traces, conservative continuum-memory routing, and a `memory.learn` tool/API path.
-- Memory learning decisions now expose explicit promotion gate metadata so rejected/accepted decisions can explain target layer, observed evidence, repeat-count thresholds, validation thresholds, and explicit-instruction requirements.
+- Memory learning decisions now use structured `ValidationEvidence`, expose computed validation scores and observed evidence refs, read active `LayerSpec` validation/repeat thresholds, and mark legacy raw-score inputs as deprecated metadata.
+- Backend-neutral memory mutation now supports `upsert`, `tombstone`, `iter_records`, `get_record`, inactive-record filtering, correction frames, conflict-set frames, and audit retrieval with `include_inactive`.
+- Lesson cards deduplicate similar same-category procedures, merge validation evidence refs, and update cumulative success/failure repeat counts instead of creating repeated procedural duplicates.
+- Retention compaction can summarize and tombstone TTL-eligible working/episodic records through `memory.compact` / `nest-agent memory compact`; it is dry-run by default and skips stable layers by default.
+- Hybrid/vector retrieval is config-gated through layer specs and only enables local vector settings explicitly; policy memory remains lexical.
 - Run-scoped `complete.mv2` task capsules, preview-only capsule summaries, dry-run consolidation decisions, and approval-gated capsule apply.
 - MCP server records now track health metadata, tool counts, capabilities, last sync/seen/call/error timestamps, session state, failure counts, and latency.
 - MCP server records now persist vetting metadata: transport/network exposure, secret-env requirements, per-tool risk/approval classification, risk reasons, and recommended trust posture.
@@ -94,6 +98,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - `NEST_AGENT_ALLOW_SELF_MODIFICATION` / `--allow-self-modification` only enables the high-risk `self.propose_change` request path. It does not bypass exact-call approval or the repair/commit gates.
 - The agentic failure cycle is default-on through `enable_agentic_cycle`; disable it only for debugging with `NEST_AGENT_DISABLE_AGENTIC_CYCLE=1`.
 - Autonomous scheduling is opt-in and bounded by `max_scheduler_tasks` / `NEST_AGENT_MAX_SCHEDULER_TASKS` per cycle and `max_scheduler_cycles` / `NEST_AGENT_MAX_SCHEDULER_CYCLES` per drain run.
+- Automatic memory compaction is opt-in through `NEST_AGENT_ENABLE_AUTO_COMPACT=1` and dry-run unless `NEST_AGENT_AUTO_COMPACT_APPLY=1`.
 - Git worktree isolation for scheduler/subagent execution is opt-in through `enable_worker_isolation` / `NEST_AGENT_ENABLE_WORKER_ISOLATION`; isolated worker branches use `worker_branch_prefix` and `worker_worktree_dir`.
 - Cancelled runs must not transition to completed, blocked, or failed after cancellation; lifecycle updates should use the guarded state transition helper.
 - Completed, failed, and cancelled runs are immutable even for repeated same-status transition attempts; approval requests are immutable after leaving `pending`.
@@ -107,7 +112,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Provider fallback only runs for `ProviderError(retryable=True)` failures; non-retryable errors fail fast and preserve the original provider error.
 - MCP tools remain approval-by-default unless a server is explicitly configured to trust its manifest; dangerous tool names/descriptions such as file writes, deletes, shell execution, patching, committing, or secrets are promoted to high risk during vetting.
 - Invalid skill manifests are rejected during discovery; accepted skill manifests record validation status plus manifest/SKILL.md content hashes for provenance.
-- Memory promotion decisions must carry auditable gate metadata; one-off procedural successes and ordinary events can explain why they were not promoted into procedural/policy memory.
+- Memory promotion decisions must carry auditable gate metadata, validation evidence refs, provenance, confidence, and validation status; one-off procedural successes and ordinary events can explain why they were not promoted into procedural/policy memory.
 
 ## Validation Commands
 

@@ -13,12 +13,13 @@ This implementation maps the paper "Nested Learning: The Illusion of Deep Learni
 The executable bridge lives in `src/nested_memvid_agent/nested_learning.py`.
 
 - `ContextFlow` represents a nested optimization loop with a level, update frequency, source layers, target layer, objective, compression rule, and retention behavior.
-- `OptimizerTrace` records the associative-memory update trace for a learning decision: surprise, validation score, repeat count, compression ratio, confidence delta, and effective confidence.
+- `ValidationEvidence` records objective evidence refs from tests, lint/type checks, repair validation, and review artifacts. `compute_validation_score()` uses a fixed objective denominator; human explicitness is a separate policy gate and only adds a small capped bonus when objective evidence exists.
+- `OptimizerTrace` records the associative-memory update trace for a learning decision: surprise, computed validation score, repeat count, optional compression ratio, expected confidence delta, and effective confidence.
 - `NestedLearningKernel` decides whether a validated signal should be rejected, written, or promoted, and attaches context-flow metadata to the resulting memory record.
 - `MV2ContextFrame` records raw chunks, summaries, task/session capsules, corrections, conflict sets, and trace stubs with evidence pointers, parent/child links, confidence, importance, validation metadata, and token estimates.
 - `ContextPacker` builds a pseudo-context window by retrieving summaries first, expanding raw evidence only on demand, deduplicating redundant chunks, and warning on conflicts.
 - `TaskCapsuleWriter` writes run-scoped `complete.mv2` artifacts that summarize completed work and feed controlled learning-signal extraction.
-- `memory.learn` compresses a validated learning signal into the appropriate layer. Policy writes are still blocked unless the policy gate and config enablement both pass.
+- `memory.learn` compresses a validated learning signal into the appropriate layer from structured validation evidence. Legacy raw-score inputs are retained only for backward-compatible parsing and are marked deprecated in metadata.
 - `memory.consolidate` now uses the same kernel so promotion metadata includes the context flow and optimizer trace.
 
 This is not a claim that the repo implements HOPE or neural self-modifying weights. It is the agent-runtime analogue: nested context-flow optimization over durable memory layers.
@@ -46,7 +47,7 @@ This is not a claim that the repo implements HOPE or neural self-modifying weigh
 - Storage: `episodic.mv2`.
 - Update cadence: meaningful events and session summaries.
 - Purpose: what happened, what failed, what worked, what the user decided.
-- Retrieval mode: hybrid.
+- Retrieval mode: lexical/auto by default; hybrid/vector search only when layer config explicitly enables local vector settings.
 - Promotion: to semantic or procedural memory.
 
 ### L3: Semantic/project memory
@@ -54,7 +55,7 @@ This is not a claim that the repo implements HOPE or neural self-modifying weigh
 - Storage: `semantic.mv2`.
 - Update cadence: validated facts.
 - Purpose: stable repo facts, user preferences, API rules, architecture details.
-- Retrieval mode: hybrid.
+- Retrieval mode: lexical/auto by default; hybrid/vector search only when layer config explicitly enables local vector settings.
 - Promotion: usually none; can feed procedural if fact supports a recipe.
 
 ### L4: Procedural memory
@@ -62,7 +63,7 @@ This is not a claim that the repo implements HOPE or neural self-modifying weigh
 - Storage: `procedural.mv2`.
 - Update cadence: repeated validated success.
 - Purpose: recipes, checklists, debugging playbooks, tool-use skills.
-- Retrieval mode: hybrid.
+- Retrieval mode: lexical/auto by default; hybrid/vector search only when layer config explicitly enables local vector settings.
 - Promotion: to policy only after repeated high-confidence validation.
 
 ### L5: Self/Soul memory
@@ -70,7 +71,7 @@ This is not a claim that the repo implements HOPE or neural self-modifying weigh
 - Storage: `self.mv2`.
 - Update cadence: validated self-model and user/workflow preference changes.
 - Purpose: identity summaries, capability snapshots, user workflow preferences, self-change requests, and validation metadata.
-- Retrieval mode: hybrid with strong provenance.
+- Retrieval mode: lexical/auto by default; hybrid/vector search only when layer config explicitly enables local vector settings, with strong provenance.
 - Promotion: usually none; self-change execution remains gated through repair and approval tools.
 
 ### L6: Policy memory
@@ -83,13 +84,15 @@ This is not a claim that the repo implements HOPE or neural self-modifying weigh
 
 ## Promotion thresholds
 
-| Source | Target | Gate |
+Thresholds come from the active `LayerSpec` objects. The defaults are:
+
+| Source | Target | Default gate |
 |---|---|---|
 | Working | Episodic | validation_score >= 0.65 |
 | Episodic | Semantic | validation_score >= 0.78 and fact-like |
 | Episodic | Procedural | validation_score >= 0.78 and repeat_count >= 2 for failure/procedure |
 | Episodic | Self | validation_score >= 0.78 and self-model evidence |
-| Procedural | Policy | validation_score >= 0.95 and repeat_count >= 5 |
+| Procedural | Policy | validation_score >= 0.97 and repeat_count >= 5 |
 
 The implementation adds one more policy constraint: policy promotion must be based on an explicit instruction or reviewed rule. A repeated ordinary event can become semantic/procedural memory, but it must not become policy by accident.
 
@@ -105,11 +108,11 @@ Every memory has:
 
 Use confidence for write gates. Use importance for ranking. Use evidence for trust.
 
+Optimizer trace fields are descriptive metadata, not measured model-weight updates. `compression_ratio` is `len(content) / source_evidence_chars` when source evidence length is known, otherwise `null`. `surprise` uses nearest-neighbor similarity in the target layer when memory is available, with conflict metadata increasing surprise. `confidence_delta` is an expected confidence change used for routing, not an observed post-hoc measurement.
+
 ## Corrections
 
-When a memory is wrong, do not silently overwrite it. Store a correction and demote or tombstone the bad record where supported.
-
-Memvid’s correction APIs can be used for boosted retrieval once Codex hardens the backend.
+When a memory is wrong, do not silently overwrite it. `memory.correct` writes a `correction` frame in the target layer, links `corrects`/`parent_ids`, tombstones the superseded record through the backend mutation contract, and hides inactive records from normal retrieval. Audit retrieval can opt into inactive records.
 
 ## Forgetting
 
@@ -120,6 +123,8 @@ Forgetting is not deleting blindly. Recommended behavior:
 - Semantic memory is corrected rather than deleted.
 - Procedural memory is demoted when recipes fail repeatedly.
 - Policy memory requires explicit review for deletion or modification.
+
+`memory compact` and `RetentionCompactor.compact_layer()` are dry-run by default. They apply TTL only to working/episodic layers unless explicitly invoked with `--apply`; stable layers are skipped except for correction-driven tombstones.
 
 ## Context compiler contract
 
@@ -148,4 +153,4 @@ It must not produce:
 
 When enabled, a completed run can write `.nest/runs/{run_id}/complete.mv2`. This capsule is temporary run evidence, not a durable memory layer. It may contain the user objective, selected context, tool calls, tool outputs, files touched, tests run, errors, final response, unresolved questions, reusable lessons, candidate facts, candidate procedures, candidate corrections, and policy candidates that require explicit human review.
 
-Capsule summaries produce `LearningSignal` objects and preview Nested Learning decisions. Applying those decisions is separate: `capsule.apply` requires auto-consolidation config and approval before writing. Automatic consolidation is off by default, dry-run by default, and policy writes remain rare: explicit instruction, high validation, repeat evidence, config enablement, and human review or equivalent explicit configuration are required.
+Capsule summaries produce `LearningSignal` objects and preview Nested Learning decisions. Applying those decisions is separate: `capsule.apply` requires auto-consolidation config and approval before writing. Automatic consolidation and compaction are off by default, dry-run by default, and policy writes remain rare: explicit instruction, high validation, repeat evidence, config enablement, and human review or equivalent explicit configuration are required.

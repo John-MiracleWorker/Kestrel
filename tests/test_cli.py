@@ -10,7 +10,7 @@ from pytest import MonkeyPatch, raises
 
 from nested_memvid_agent.cli import _validate_server_bind, main
 from nested_memvid_agent.config import AgentConfig
-from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
+from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.state_store import AgentStateStore
 
@@ -59,6 +59,70 @@ def test_memory_doctor_subcommand_is_dry_run_by_default(
     output = capsys.readouterr().out
     assert '"working"' in output
     assert '"doctor_available": false' in output
+
+
+def test_memory_correct_subcommand_supersedes_target(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object
+) -> None:
+    memory_dir = tmp_path / "memory"
+    memory = build_memory_system("memory", memory_dir)
+    target_id = memory.put(
+        MemoryRecord(
+            id="cli-fact",
+            title="CLI fact",
+            content="CLI fact says beta is enabled.",
+            layer=MemoryLayer.SEMANTIC,
+            kind=MemoryKind.FACT,
+            confidence=0.86,
+        )
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "nest-agent",
+            "memory",
+            "correct",
+            target_id,
+            "CLI fact says beta is not enabled.",
+            "--backend",
+            "memory",
+            "--memory-dir",
+            str(memory_dir),
+        ],
+    )
+
+    main()
+
+    output = capsys.readouterr().out
+    assert '"corrected": true' in output
+    reopened = build_memory_system("memory", memory_dir)
+    assert not reopened.get_record(MemoryLayer.SEMANTIC, target_id, include_inactive=False)
+    assert reopened.retrieve(RetrievalQuery(query="beta not enabled", layers=(MemoryLayer.SEMANTIC,)))
+
+
+def test_memory_compact_subcommand_is_dry_run_by_default(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "nest-agent",
+            "memory",
+            "compact",
+            "--backend",
+            "memory",
+            "--memory-dir",
+            str(tmp_path / "memory"),
+        ],
+    )
+
+    main()
+
+    output = capsys.readouterr().out
+    assert '"dry_run": true' in output
+    assert '"layer": "working"' in output
 
 
 def test_tools_subcommand_lists_risk_levels(monkeypatch: MonkeyPatch, capsys: object) -> None:

@@ -249,16 +249,9 @@ class ContextPacker:
         return "\n\n".join(line for line in lines if line)
 
     def _find_record_by_id(self, lookup_id: str) -> MemoryRecord | None:
-        for backend in self.memory.backends.values():
-            records = getattr(backend, "records", None)
-            if isinstance(records, list):
-                for raw_record in records:
-                    if not isinstance(raw_record, MemoryRecord):
-                        continue
-                    record = raw_record
-                    metadata = getattr(record, "metadata", {})
-                    if record.id == lookup_id or str(metadata.get("frame_id", "")) == lookup_id:
-                        return record
+        record = self.memory.get_record(None, lookup_id, include_inactive=True)
+        if record is not None:
+            return record
         for hit in self.memory.retrieve(RetrievalQuery(query=lookup_id, k_per_layer=5)):
             metadata = hit.record.metadata
             if hit.record.id == lookup_id or str(metadata.get("frame_id", "")) == lookup_id or hit.frame_id == lookup_id:
@@ -280,10 +273,24 @@ def _section_lines(items: list[PackedContextItem], *, empty: str) -> list[str]:
         lines.append(
             f"{index}. {frame.title} "
             f"[layer={frame.layer.value}, kind={frame.kind.value}, frame={frame.frame_type}, "
-            f"score={item.hit.score:.3f}, confidence={frame.confidence:.2f}]"
+            f"score={item.hit.score:.3f}, confidence={frame.confidence:.2f}{_provenance_suffix(frame)}]"
         )
         lines.append(f"   {item.content.strip()}")
     return lines
+
+
+def _provenance_suffix(frame: MV2ContextFrame) -> str:
+    parts: list[str] = []
+    corrects = frame.metadata.get("corrects")
+    if isinstance(corrects, list) and corrects:
+        parts.append(f"corrects={','.join(str(item) for item in corrects[:3])}")
+    conflict_group_id = frame.metadata.get("conflict_group_id")
+    if conflict_group_id:
+        parts.append(f"conflict_group_id={conflict_group_id}")
+    superseded_by = frame.metadata.get("superseded_by")
+    if superseded_by:
+        parts.append(f"superseded_by={superseded_by}")
+    return "" if not parts else ", " + ", ".join(parts)
 
 
 def _prompt_scaffold(objective: str) -> str:

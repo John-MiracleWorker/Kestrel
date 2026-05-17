@@ -165,6 +165,123 @@ def test_plugin_mcp_trust_flags_cannot_downgrade_approval_by_default(tmp_path: P
     assert server["tools"][0]["requires_approval"] is True
 
 
+def test_plugin_mcp_stdio_command_is_allowlisted_and_hashed(tmp_path: Path) -> None:
+    bad_repo = tmp_path / "bad-repo"
+    bad_repo.mkdir()
+    _write_manifest(
+        bad_repo,
+        {
+            "id": "badmcp",
+            "name": "Bad MCP",
+            "description": "Uses a shell launcher.",
+            "mcp_servers": [{"id": "shell", "transport": "stdio", "command": "/bin/sh", "args": ["-c", "echo hi"]}],
+        },
+    )
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = PluginManager(tmp_path / "plugins", state, fetcher=FakeFetcher(bad_repo))
+
+    with pytest.raises(PluginError, match="not allowed"):
+        manager.install("owner/bad")
+
+    good_repo = tmp_path / "good-repo"
+    good_repo.mkdir()
+    _write_manifest(
+        good_repo,
+        {
+            "id": "goodmcp",
+            "name": "Good MCP",
+            "description": "Uses an allowlisted launcher.",
+            "mcp_servers": [
+                {
+                    "id": "node",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["@modelcontextprotocol/server-filesystem", "."],
+                    "tools": [{"name": "read", "description": "Read", "risk": "low"}],
+                }
+            ],
+        },
+    )
+    manager = PluginManager(tmp_path / "plugins", state, fetcher=FakeFetcher(good_repo))
+
+    manager.install("owner/good", enable=True)
+    server = state.get_mcp_server("plugin.goodmcp.node")
+
+    assert server["vetting"]["stdio_command_hash"].startswith("sha256:")
+    assert server["vetting"]["connect_requires_approval"] is True
+
+
+def test_mcp_connect_refuses_plugin_command_hash_mismatch(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_manifest(
+        repo,
+        {
+            "id": "tamper",
+            "name": "Tamper MCP",
+            "description": "Hash mismatch should block connect.",
+            "mcp_servers": [
+                {
+                    "id": "node",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["@modelcontextprotocol/server-filesystem", "."],
+                    "tools": [{"name": "read", "description": "Read", "risk": "low"}],
+                }
+            ],
+        },
+    )
+    state = AgentStateStore(tmp_path / "state.db")
+    PluginManager(tmp_path / "plugins", state, fetcher=FakeFetcher(repo)).install("owner/tamper", enable=True)
+    row = state.get_mcp_server("plugin.tamper.node")
+    row["args"] = ["@modelcontextprotocol/server-filesystem", "/tmp"]
+    state.upsert_mcp_server(row)
+
+    result = MCPManager(state).connect_server("plugin.tamper.node")
+
+    assert result["ok"] is False
+    assert "hash mismatch" in result["message"]
+
+
+def test_mcp_plugin_connect_requires_explicit_approval(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_manifest(
+        repo,
+        {
+            "id": "approvalmcp",
+            "name": "Approval MCP",
+            "description": "Connect approval should block plugin MCP startup.",
+            "mcp_servers": [
+                {
+                    "id": "node",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["@modelcontextprotocol/server-filesystem", "."],
+                    "tools": [{"name": "read", "description": "Read", "risk": "low"}],
+                }
+            ],
+        },
+    )
+    state = AgentStateStore(tmp_path / "state.db")
+    PluginManager(tmp_path / "plugins", state, fetcher=FakeFetcher(repo)).install("owner/approval", enable=True)
+    manager = MCPManager(state)
+
+    blocked = manager.connect_server("plugin.approvalmcp.node")
+
+    assert blocked["ok"] is False
+    assert blocked["message"] == "MCP connect approval required."
+    assert blocked["server"]["status"] == "approval_required"
+    assert blocked["server"]["session_state"] == "approval_required"
+
+    approved = manager.approve_server_connect("plugin.approvalmcp.node")
+    connected = manager.connect_server("plugin.approvalmcp.node")
+
+    assert approved["vetting"]["connect_approved"] is True
+    assert connected["ok"] is True
+    assert connected["server"]["session_state"] == "static"
+
+
 def test_hermes_manifest_is_supported_without_executing_python_hooks(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

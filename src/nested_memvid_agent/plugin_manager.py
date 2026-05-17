@@ -477,6 +477,15 @@ def _normalize_mcp_server(plugin_id: str, raw: dict[str, Any]) -> dict[str, Any]
     config.setdefault("env", {})
     config.setdefault("enabled", True)
     config["risk_policy"] = "approval_by_default"
+    if str(config.get("transport", "stdio")) == "stdio":
+        command = str(config.get("command") or "").strip()
+        args = [str(item) for item in config.get("args", [])]
+        _validate_plugin_stdio_command(command, args)
+        vetting = dict(config.get("vetting", {}) or {})
+        vetting["stdio_command_hash"] = _stdio_command_hash(command, args)
+        vetting["connect_requires_approval"] = True
+        vetting["plugin_source"] = plugin_id
+        config["vetting"] = vetting
     tools = _dict_list(config.get("tools", []), "mcp_servers.tools")
     config["tools"] = [_normalize_mcp_tool(namespaced_id, tool, str(config["risk_policy"])) for tool in tools]
     return {"id": server_id, "namespaced_id": namespaced_id, "config": config}
@@ -500,7 +509,46 @@ def _normalize_mcp_tool(server_id: str, raw: dict[str, Any], risk_policy: str) -
         "risk": risk,
         "requires_approval": requires_approval,
         "capabilities": list(raw.get("capabilities", ["mcp"])) if isinstance(raw.get("capabilities", ["mcp"]), list) else ["mcp"],
+        "produces_validation": bool(raw.get("produces_validation", False)),
     }
+
+
+def _validate_plugin_stdio_command(command: str, args: list[str]) -> None:
+    if not command:
+        return
+    command_name = Path(command).name
+    allowed = {"npx", "uvx", "python", "python3", "node", "bunx", "deno"}
+    if command_name not in allowed:
+        raise PluginError(f"Plugin MCP command is not allowed: {command_name}")
+    if command_name in {"python", "python3"}:
+        if len(args) < 2 or args[0] != "-m" or not _valid_python_module(args[1]):
+            raise PluginError("Plugin MCP python commands must use `python -m <module>` with a valid module name.")
+    if command_name in {"npx", "uvx", "bunx"}:
+        if not args or not _valid_package_name(args[0]):
+            raise PluginError(f"Plugin MCP {command_name} commands must name a valid package.")
+    if command_name == "node":
+        if not args or any(_has_shell_metacharacters(part) for part in args):
+            raise PluginError("Plugin MCP node args contain unsupported shell metacharacters.")
+    if command_name == "deno":
+        if not args or any(_has_shell_metacharacters(part) for part in args):
+            raise PluginError("Plugin MCP deno args contain unsupported shell metacharacters.")
+
+
+def _stdio_command_hash(command: str, args: list[str]) -> str:
+    payload = json.dumps({"command": command, "args": args}, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _valid_python_module(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*", value))
+
+
+def _valid_package_name(value: str) -> bool:
+    return bool(re.fullmatch(r"(@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+", value))
+
+
+def _has_shell_metacharacters(value: str) -> bool:
+    return any(char in value for char in ";&|`$><")
 
 
 def _load_yaml_manifest(path: Path) -> dict[str, Any]:

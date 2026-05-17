@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from pathlib import Path
 
 from ..models import MemoryHit, MemoryLayer, MemoryRecord
@@ -22,7 +23,31 @@ class MemoryBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def find(self, query: str, k: int = 8, mode: str = "auto", min_relevancy: float = 0.0) -> list[MemoryHit]:
+    def find(
+        self,
+        query: str,
+        k: int = 8,
+        mode: str = "auto",
+        min_relevancy: float = 0.0,
+        *,
+        include_inactive: bool = False,
+    ) -> list[MemoryHit]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def upsert(self, record: MemoryRecord) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def tombstone(self, record_id: str, *, reason: str, superseded_by: str | None = None) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def iter_records(self, *, include_inactive: bool = False) -> Iterable[MemoryRecord]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_record(self, record_id: str, *, include_inactive: bool = True) -> MemoryRecord | None:
         raise NotImplementedError
 
     @abstractmethod

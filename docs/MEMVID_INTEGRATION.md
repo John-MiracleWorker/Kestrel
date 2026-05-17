@@ -83,9 +83,9 @@ For context frames, preserve frame ID, frame type, parent/child links, source UR
 Layer defaults should stay conservative:
 
 - Working: lexical, because active state often contains exact paths, errors, and command text.
-- Episodic: auto/hybrid where available, because events and failures benefit from exact and semantic recall.
-- Semantic: auto/hybrid where available.
-- Procedural: auto/hybrid where available.
+- Episodic: auto by default; hybrid only with explicit local vector layer config.
+- Semantic: auto by default; hybrid only with explicit local vector layer config.
+- Procedural: auto by default; hybrid only with explicit local vector layer config.
 - Policy: lexical exactness preferred.
 
 The current adapter uses the SDK's returned hits directly and normalizes metadata instead of forcing layer-specific scope filtering.

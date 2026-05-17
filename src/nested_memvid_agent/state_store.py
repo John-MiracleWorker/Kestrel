@@ -126,7 +126,7 @@ class AgentStateStore:
         if not fields:
             return self.get_run(run_id)
         fields["updated_at"] = utc_now()
-        assignments = ", ".join(f"{key} = ?" for key in fields)
+        assignments = ", ".join(f"{_validated_column('runs', key)} = ?" for key in fields)
         values = [_encode(value) for value in fields.values()]
         values.append(run_id)
         with self._connect() as conn:
@@ -151,7 +151,7 @@ class AgentStateStore:
             updates = dict(fields)
             updates["status"] = status
             updates["updated_at"] = utc_now()
-            assignments = ", ".join(f"{key} = ?" for key in updates)
+            assignments = ", ".join(f"{_validated_column('runs', key)} = ?" for key in updates)
             values = [_encode(value) for value in updates.values()]
             values.append(run_id)
             conn.execute(f"UPDATE runs SET {assignments} WHERE run_id = ?", values)
@@ -616,7 +616,7 @@ class AgentStateStore:
         if not fields:
             return self.get_task_node(task_id)
         fields["updated_at"] = utc_now()
-        assignments = ", ".join(f"{_task_column(key)} = ?" for key in fields)
+        assignments = ", ".join(f"{_validated_column('task_nodes', _task_column(key))} = ?" for key in fields)
         values = [_encode(value) for value in fields.values()]
         values.append(task_id)
         with self._connect() as conn:
@@ -829,14 +829,14 @@ class AgentStateStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        with self._lock:
-            conn = sqlite3.connect(self.path, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            try:
-                yield conn
-                conn.commit()
-            finally:
-                conn.close()
+        conn = sqlite3.connect(self.path, check_same_thread=False, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        _apply_connection_pragmas(conn)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def _apply_schema_v1(conn: sqlite3.Connection) -> None:
@@ -1069,6 +1069,58 @@ def _apply_schema_v9(conn: sqlite3.Connection) -> None:
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _apply_connection_pragmas(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
+_ALLOWED_UPDATE_COLUMNS = {
+    "runs": {
+        "status",
+        "message",
+        "session_id",
+        "workspace",
+        "provider",
+        "model",
+        "assistant_message",
+        "context_chars",
+        "tool_count",
+        "stop_reason",
+        "error",
+        "updated_at",
+    },
+    "task_nodes": {
+        "run_id",
+        "parent_id",
+        "title",
+        "goal",
+        "profile",
+        "status",
+        "approved",
+        "plan_json",
+        "result_json",
+        "dependencies_json",
+        "required_tools_json",
+        "risk",
+        "acceptance_criteria_json",
+        "attempt_count",
+        "failure_reason",
+        "diagnosis_json",
+        "retry_strategy_json",
+        "updated_at",
+    },
+}
+
+
+def _validated_column(table: str, column: str) -> str:
+    allowed = _ALLOWED_UPDATE_COLUMNS.get(table, set())
+    if column not in allowed:
+        raise ValueError(f"Unknown {table} column: {column}")
+    return column
 
 
 def _run_transition_allowed(current: str, target: str) -> bool:

@@ -729,6 +729,47 @@ def test_server_exposes_mcp_lifecycle_routes(tmp_path: Path) -> None:
     assert restarted.json()["server"]["session_state"] == "static"
 
 
+def test_server_exposes_mcp_connect_approval_route(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    config = AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        state_path=tmp_path / "state.db",
+        skills_dir=tmp_path / "skills",
+        workspace=tmp_path,
+    )
+    state = AgentStateStore(config.state_path)
+    state.upsert_mcp_server(
+        {
+            "id": "approval-static",
+            "name": "Approval Static",
+            "transport": "stdio",
+            "command": "fake-mcp",
+            "enabled": True,
+            "tools": [{"name": "echo", "description": "Echo"}],
+            "vetting": {"connect_requires_approval": True},
+        }
+    )
+    client = TestClient(create_app(config))
+
+    blocked = client.post("/api/mcp/servers/approval-static/connect")
+    approved = client.post("/api/mcp/servers/approval-static/approve-connect")
+    connected = client.post("/api/mcp/servers/approval-static/connect")
+
+    assert blocked.status_code == 200
+    assert blocked.json()["ok"] is False
+    assert blocked.json()["server"]["session_state"] == "approval_required"
+    assert approved.status_code == 200
+    assert approved.json()["vetting"]["connect_approved"] is True
+    assert connected.status_code == 200
+    assert connected.json()["ok"] is True
+    assert connected.json()["server"]["session_state"] == "static"
+
+
 def test_server_exposes_prompt_api_routes(tmp_path: Path) -> None:
     from fastapi.testclient import TestClient
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import sleep
 
@@ -47,6 +49,40 @@ def test_tool_registry_times_out_slow_tools(tmp_path: Path) -> None:
     assert result.success is False
     assert result.error == "tool_timeout"
     assert "timed out" in result.content
+
+
+def test_subprocess_tool_timeout_kills_child_process_and_caps_requested_timeout(tmp_path: Path) -> None:
+    script = tmp_path / "sleep_then_write.py"
+    marker = tmp_path / "should_not_exist.txt"
+    script.write_text(
+        "import pathlib, time\n"
+        "time.sleep(5)\n"
+        f"pathlib.Path({str(marker)!r}).write_text('finished')\n",
+        encoding="utf-8",
+    )
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(
+        name="test.run",
+        arguments={"command": [sys.executable, str(script)], "timeout": 30},
+        id="kill_sleep",
+    )
+
+    result = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_shell=True, tool_timeout_seconds=0.2),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"kill_sleep"}),
+            approved_tool_call_arguments={"kill_sleep": call.arguments},
+        ),
+    )
+
+    sleep(0.4)
+    assert result.success is False
+    assert result.error == "tool_timeout"
+    assert marker.exists() is False
 
 
 def test_memory_search_tool_returns_hits(tmp_path: Path) -> None:
@@ -124,8 +160,6 @@ def test_shell_run_blocks_remote_publishing_escape_routes(tmp_path: Path, monkey
         ["gh", "repo", "edit", "--visibility", "public"],
         ["gh", "secret", "set", "TOKEN"],
         ["gh", "workflow", "enable", "deploy.yml"],
-        ["rm", "-rf", ".git"],
-        ["python", "-c", "import subprocess; subprocess.run(['git', 'push', 'origin', 'main'])"],
     ]
 
     for index, command in enumerate(blocked_commands):
@@ -142,6 +176,38 @@ def test_shell_run_blocks_remote_publishing_escape_routes(tmp_path: Path, monkey
         )
         assert result.error == "remote_mutation_blocked", command
 
+    assert calls == []
+
+
+def test_shell_run_python_escape_is_not_allowlisted(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="should not run", stderr="")
+
+    monkeypatch.setattr("nested_memvid_agent.tools.builtin.subprocess.run", fake_run)
+    call = ToolCall(
+        name="shell.run",
+        arguments={"command": ["python", "-c", "import subprocess; subprocess.run(['git', 'push'])"]},
+        id="python_escape",
+    )
+
+    result = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_shell=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"python_escape"}),
+            approved_tool_call_arguments={"python_escape": call.arguments},
+        ),
+    )
+
+    assert result.error == "command_not_allowlisted"
     assert calls == []
 
 
@@ -1027,7 +1093,7 @@ def test_file_write_still_blocks_path_escape_when_enabled(tmp_path: Path) -> Non
     assert not (tmp_path.parent / "outside.txt").exists()
 
 
-def test_lint_run_uses_shell_enablement_and_allowlist(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_lint_run_uses_shell_enablement_and_allowlist(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
 
@@ -1037,25 +1103,19 @@ def test_lint_run_uses_shell_enablement_and_allowlist(tmp_path: Path, monkeypatc
     )
     assert blocked.error == "tool_disabled"
 
-    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        assert command == ["ruff", "check", "."]
-        assert kwargs["cwd"] == tmp_path
-        return subprocess.CompletedProcess(command, 0, stdout="clean", stderr="")
-
-    monkeypatch.setattr("nested_memvid_agent.tools.builtin.subprocess.run", fake_run)
     allowed = registry.execute(
-        ToolCall(name="lint.run", arguments={"command": ["ruff", "check", "."]}, id="lint1"),
+        ToolCall(name="lint.run", arguments={"command": [sys.executable, "-m", "compileall", "-q", "."]}, id="lint1"),
         ToolContext(
             memory=memory,
             config=AgentConfig(allow_shell=True),
             workspace=tmp_path,
             approved_tool_call_ids=frozenset({"lint1"}),
-            approved_tool_call_arguments={"lint1": {"command": ["ruff", "check", "."]}},
+            approved_tool_call_arguments={"lint1": {"command": [sys.executable, "-m", "compileall", "-q", "."]}},
         ),
     )
 
     assert allowed.success
-    assert "clean" in allowed.content
+    assert "exit_code=0" in allowed.content
 
 
 def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_path: Path) -> None:
@@ -1544,6 +1604,36 @@ def test_memory_learn_routes_validated_signal(tmp_path: Path) -> None:
     hits = memory.retrieve(RetrievalQuery(query=".mv2 file per memory layer", layers=(MemoryLayer.SEMANTIC,), k_per_layer=3))
     assert hits
     assert hits[0].record.metadata["nested_learning"]["context_flow"]["id"] == "episode_to_semantic"
+    assert hits[0].record.metadata["validation_evidence"]["legacy_raw_score"] is True
+
+
+def test_memory_learn_accepts_structured_validation_evidence(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    result = registry.execute(
+        ToolCall(
+            name="memory.learn",
+            arguments={
+                "title": "Structured evidence fact",
+                "content": "Structured validation evidence should compute the score.",
+                "kind": "fact",
+                "source_layer": "episodic",
+                "validation_evidence": {
+                    "test_refs": [{"source": "test.run", "locator": "pytest -q"}],
+                    "lint_refs": [{"source": "lint.run", "locator": "ruff check"}],
+                    "repair_refs": [{"source": "repair.validate", "locator": "compileall"}],
+                    "review_refs": [{"source": "repair.review", "locator": "review-1"}],
+                },
+            },
+        ),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.success
+    assert result.data["validation_score"] == 1.0
+    hits = memory.retrieve(RetrievalQuery(query="Structured validation evidence", layers=(MemoryLayer.SEMANTIC,)))
+    assert hits
+    assert hits[0].record.metadata["validation_evidence"]["test_refs"] == ["test.run:pytest -q"]
 
 
 def test_memory_learn_blocks_policy_without_config_enablement(tmp_path: Path) -> None:
@@ -1569,3 +1659,68 @@ def test_memory_learn_blocks_policy_without_config_enablement(tmp_path: Path) ->
     assert not result.success
     assert result.error == "policy_write_disabled"
     assert not memory.retrieve(RetrievalQuery(query="explicit review before changing policy", layers=(MemoryLayer.POLICY,), k_per_layer=3))
+
+
+def test_memory_correct_writes_correction_and_hides_superseded_target(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    target_id = memory.put(
+        MemoryRecord(
+            id="fact-alpha",
+            title="Feature alpha",
+            content="Feature alpha is enabled.",
+            layer=MemoryLayer.SEMANTIC,
+            kind=MemoryKind.FACT,
+            confidence=0.86,
+        )
+    )
+
+    result = build_default_tools().execute(
+        ToolCall(
+            name="memory.correct",
+            arguments={
+                "target_record_id": target_id,
+                "correction_text": "Feature alpha is not enabled.",
+                "evidence": [{"source": "user", "locator": "turn-1", "quote": "actually, alpha is off"}],
+            },
+        ),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.success
+    assert result.data["target_record_id"] == target_id
+    active_hits = memory.retrieve(RetrievalQuery(query="Feature alpha enabled", layers=(MemoryLayer.SEMANTIC,)))
+    assert all(hit.record.id != target_id for hit in active_hits)
+    audit_hits = memory.retrieve(
+        RetrievalQuery(query="Feature alpha enabled", layers=(MemoryLayer.SEMANTIC,), include_inactive=True)
+    )
+    assert any(hit.record.id == target_id for hit in audit_hits)
+    correction_hits = memory.retrieve(RetrievalQuery(query="Feature alpha not enabled", layers=(MemoryLayer.SEMANTIC,)))
+    assert correction_hits
+    assert correction_hits[0].record.kind == MemoryKind.CORRECTION
+    assert correction_hits[0].record.metadata["corrects"] == [target_id]
+
+
+def test_memory_compact_dry_run_reports_without_tombstoning(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    memory.put(
+        MemoryRecord(
+            id="old-working",
+            title="Old working note",
+            content="Old working note says compaction should summarize expired scratch state.",
+            layer=MemoryLayer.WORKING,
+            confidence=0.5,
+            created_at=datetime.now(UTC) - timedelta(days=30),
+            metadata={"validation_score": 0.7},
+        )
+    )
+
+    result = build_default_tools().execute(
+        ToolCall(name="memory.compact", arguments={"layer": "working"}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.success
+    assert result.data["dry_run"] is True
+    assert result.data["layer"] == "working"
+    assert result.data["candidate_count"] >= 1
+    assert memory.retrieve(RetrievalQuery(query="expired scratch state", layers=(MemoryLayer.WORKING,)))

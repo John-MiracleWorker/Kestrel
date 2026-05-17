@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
+from datetime import UTC, datetime
 from importlib import import_module
 from pathlib import Path
 from threading import Lock
@@ -38,6 +40,8 @@ class MemvidBackend(MemoryBackend):
         self.mem: Any | None = None
         self._path_lock: Lock | None = None
         self._lock_acquired = False
+        self._records: dict[str, MemoryRecord] = {}
+        self._inactive_ids: set[str] = set()
 
     def open(self) -> None:
         self._acquire_path_lock()
@@ -98,17 +102,77 @@ class MemvidBackend(MemoryBackend):
             enable_embedding=self.enable_vec,
         )
         if isinstance(result, str):
-            return result
-        if isinstance(result, list) and result:
-            return str(result[0])
-        return record.id
+            stored_id = result
+        elif isinstance(result, list) and result:
+            stored_id = str(result[0])
+        else:
+            stored_id = record.id
+        self._records[record.id] = record
+        return stored_id
+
+    def upsert(self, record: MemoryRecord) -> str:
+        if record.id in self._inactive_ids:
+            self._inactive_ids.remove(record.id)
+        return self.put(record)
+
+    def tombstone(self, record_id: str, *, reason: str, superseded_by: str | None = None) -> bool:
+        self._inactive_ids.add(record_id)
+        record = self._records.get(record_id)
+        if record is not None:
+            record.metadata["active"] = False
+            record.metadata["tombstone_reason"] = reason
+            record.metadata["tombstoned_at"] = datetime.now(UTC).isoformat()
+            if superseded_by:
+                record.metadata["superseded_by"] = superseded_by
+            record.updated_at = datetime.now(UTC)
+        audit = MemoryRecord(
+            id=f"tombstone_{record_id}",
+            title=f"Tombstone: {record_id}",
+            content=f"Record {record_id} was tombstoned. reason={reason} superseded_by={superseded_by or ''}",
+            layer=self.layer,
+            kind=MemoryKind.CORRECTION,
+            confidence=0.8,
+            importance=0.4,
+            metadata={
+                "frame_type": "correction",
+                "active": True,
+                "tombstone_for": record_id,
+                "tombstone_reason": reason,
+                "superseded_by": superseded_by,
+            },
+        )
+        self.put(audit)
+        return True
+
+    def iter_records(self, *, include_inactive: bool = False) -> Iterable[MemoryRecord]:
+        return tuple(
+            record
+            for record in self._records.values()
+            if include_inactive or _record_active(record, inactive_ids=self._inactive_ids)
+        )
+
+    def get_record(self, record_id: str, *, include_inactive: bool = True) -> MemoryRecord | None:
+        record = self._records.get(record_id)
+        if record is not None:
+            if include_inactive or _record_active(record, inactive_ids=self._inactive_ids):
+                return record
+            return None
+        return None
 
     def put_frame(self, frame: MV2ContextFrame) -> str:
         """Store a structured context frame through the existing record path."""
 
         return self.put(to_memory_record(frame))
 
-    def find(self, query: str, k: int = 8, mode: str = "auto", min_relevancy: float = 0.0) -> list[MemoryHit]:
+    def find(
+        self,
+        query: str,
+        k: int = 8,
+        mode: str = "auto",
+        min_relevancy: float = 0.0,
+        *,
+        include_inactive: bool = False,
+    ) -> list[MemoryHit]:
         mem = self._require_mem()
         raw = mem.find(
             query,
@@ -129,6 +193,8 @@ class MemvidBackend(MemoryBackend):
             raw_metadata = item.get("metadata") or item.get("extra_metadata") or {}
             metadata = {**embedded_metadata, **raw_metadata}
             record = _record_from_hit(item=item, metadata=metadata, layer=self.layer)
+            if not include_inactive and not _record_active(record, inactive_ids=self._inactive_ids):
+                continue
             raw_score = item.get("score", item.get("relevance", 0.0))
             frame_id = item.get("frame_id") or item.get("id") or metadata.get("frame_id") or metadata.get("id")
             converted.append(
@@ -149,12 +215,13 @@ class MemvidBackend(MemoryBackend):
         layers: tuple[MemoryLayer, ...] | None = None,
         frame_types: tuple[str, ...] | None = None,
         mode: str = "auto",
+        include_inactive: bool = False,
     ) -> list[MemoryHit]:
         """Find frame-backed records while keeping the backend interface stable."""
 
         if layers is not None and self.layer not in layers:
             return []
-        hits = self.find(query=query, k=k, mode=mode)
+        hits = self.find(query=query, k=k, mode=mode, include_inactive=include_inactive)
         if frame_types is None:
             return hits
         allowed = set(frame_types)
@@ -283,6 +350,10 @@ def _record_from_hit(item: dict[str, Any], metadata: dict[str, Any], layer: Memo
         importance=max(0.0, min(importance, 1.0)),
         metadata=dict(metadata),
     )
+
+
+def _record_active(record: MemoryRecord, *, inactive_ids: set[str]) -> bool:
+    return record.id not in inactive_ids and record.metadata.get("active", True) is not False
 
 
 def _metadata_from_embedded_text(text: str) -> dict[str, Any]:

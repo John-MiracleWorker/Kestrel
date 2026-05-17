@@ -96,6 +96,7 @@ class ToolSpec:
     server_id: str | None = None
     skill_id: str | None = None
     capabilities: tuple[str, ...] = ()
+    produces_validation: bool = False
 
     def to_prompt_block(self) -> str:
         return (
@@ -118,6 +119,7 @@ class ToolSpec:
             "server_id": self.server_id,
             "skill_id": self.skill_id,
             "capabilities": list(self.capabilities),
+            "produces_validation": self.produces_validation,
         }
 
 

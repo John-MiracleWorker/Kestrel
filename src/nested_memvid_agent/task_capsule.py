@@ -38,7 +38,10 @@ class TaskCapsuleSummary:
                     "source_layer": signal.source_layer.value,
                     "confidence": signal.confidence,
                     "importance": signal.importance,
-                    "validation_score": signal.validation_score,
+                    "validation_score": signal.computed_validation_score,
+                    "validation_evidence": signal.validation_evidence.to_metadata()
+                    if signal.validation_evidence
+                    else {"legacy_raw_score": True, "computed_score": signal.computed_validation_score},
                     "repeat_count": signal.repeat_count,
                     "explicit_instruction": signal.explicit_instruction,
                     "requested_target_layer": signal.requested_target_layer.value

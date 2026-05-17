@@ -101,6 +101,24 @@ def test_packer_detects_conflict_metadata(tmp_path: Path) -> None:
 
     assert packed.conflict_warnings
     assert "flag-alpha" in packed.conflict_warnings[0]
+    assert "conflict_group_id=flag-alpha" in packed.prompt
+
+
+def test_packer_surfaces_correction_provenance(tmp_path: Path) -> None:
+    memory = _memory(tmp_path)
+    _put(
+        memory,
+        "Feature alpha correction",
+        "feature alpha is not enabled.",
+        MemoryLayer.SEMANTIC,
+        kind=MemoryKind.CORRECTION,
+        frame_type="correction",
+        metadata={"corrects": ["feature-alpha-old"]},
+    )
+
+    packed = ContextPacker(memory).pack(ContextPackRequest(objective="feature alpha", query="feature alpha"))
+
+    assert "corrects=feature-alpha-old" in packed.prompt
 
 
 def test_packer_deduplicates_repeated_content(tmp_path: Path) -> None:

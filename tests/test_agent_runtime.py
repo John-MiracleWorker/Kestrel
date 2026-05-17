@@ -52,6 +52,26 @@ def test_agent_chat_writes_working_and_episodic_memory(tmp_path: Path) -> None:
     assert user_record.id in summary_record.metadata["child_ids"]
 
 
+def test_agent_correction_detection_uses_tight_markers(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=memory,
+            llm=MockLLMProvider([LLMResponse(content="ok"), LLMResponse(content="noted")]),
+            tools=build_default_tools(),
+            config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
+        )
+    )
+
+    agent.chat("actually I think you're right", session_id="test")
+    assert not [record for record in memory.backends[MemoryLayer.WORKING].records if record.kind == MemoryKind.CORRECTION]
+
+    agent.chat("to clarify: the version is 5.5, not 5.0", session_id="test")
+    corrections = [record for record in memory.backends[MemoryLayer.WORKING].records if record.kind == MemoryKind.CORRECTION]
+    assert corrections
+    assert "version is 5.5" in corrections[-1].content
+
+
 def test_agent_executes_tool_call_and_continues(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     event_log = JsonlEventLog(tmp_path / "logs" / "events.jsonl")
@@ -87,6 +107,39 @@ def test_agent_executes_tool_call_and_continues(tmp_path: Path) -> None:
     assert "tool.request" in event_types
     assert "tool.result" in event_types
     assert "memory.write" in event_types
+
+
+def test_agent_writes_full_tool_output_and_budgeted_summary(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = ToolRegistry()
+    registry.register(LongOutputTool())
+    llm = MockLLMProvider(
+        [
+            LLMResponse(
+                content="I will run long output.",
+                tool_calls=(ToolCall(name="long.output", arguments={}),),
+            ),
+            LLMResponse(content="Long output inspected."),
+        ]
+    )
+    agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=memory,
+            llm=llm,
+            tools=registry,
+            config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
+        )
+    )
+
+    result = agent.chat("run long output", session_id="test")
+
+    assert result.stop_reason == "complete"
+    tool_record = next(record for record in memory.backends[MemoryLayer.WORKING].records if record.title == "Tool result: long.output")
+    assert "TAIL_SENTINEL" in tool_record.content
+    assert len(tool_record.content) > 12_000
+    summary_record = next(record for record in memory.backends[MemoryLayer.EPISODIC].records if record.title == "Conversation turn summary")
+    assert "long.output succeeded" in summary_record.content
+    assert len(summary_record.content) < 1600
 
 
 def test_agent_stops_on_direct_approval_required(tmp_path: Path) -> None:
@@ -354,6 +407,50 @@ def test_agent_creates_lesson_after_changed_strategy_validation(tmp_path: Path) 
     assert any(record.metadata.get("cognition_schema") == "lesson_card.v1" for record in procedural)
 
 
+def test_agent_validation_success_uses_tool_spec_contract_not_name_substring(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = ToolRegistry()
+    registry.register(FailingTool())
+    registry.register(VerifyThingTool())
+    llm = MockLLMProvider(
+        [
+            LLMResponse(
+                content="First attempt.",
+                tool_calls=(ToolCall(name="fail.tool", arguments={"target": "same"}),),
+            ),
+            LLMResponse(
+                content="Verify changed strategy.",
+                tool_calls=(
+                    ToolCall(
+                        name="verify.thing",
+                        arguments={"target": "focused"},
+                        strategy=StrategyProposal(
+                            changed_strategy="Use a focused verification tool instead of repeating the failure.",
+                            why_different="This checks a separate success signal.",
+                            expected_signal="The verification passes.",
+                            fallback_if_fails="Inspect verification details.",
+                        ),
+                    ),
+                ),
+            ),
+            LLMResponse(content="Verification passed."),
+        ]
+    )
+    agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=memory,
+            llm=llm,
+            tools=registry,
+            config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
+        )
+    )
+
+    result = agent.chat("learn with custom verification", session_id="test")
+
+    assert result.proof_of_work is not None
+    assert result.proof_of_work["lessons_created"]
+
+
 class FailingProvider(LLMProvider):
     def generate(
         self,
@@ -402,6 +499,7 @@ class ValidationCheckTool(AgentTool):
         name="validation.check",
         description="Succeeds as a validation step.",
         parameters={"type": "object", "properties": {"target": {"type": "string"}}},
+        produces_validation=True,
     )
 
     def run(self, arguments: dict[str, object], context: ToolContext) -> ToolExecution:
@@ -411,3 +509,34 @@ class ValidationCheckTool(AgentTool):
             success=True,
             content="validation passed",
         )
+
+
+class VerifyThingTool(AgentTool):
+    spec = ToolSpec(
+        name="verify.thing",
+        description="Succeeds as a validation step without validation in the name.",
+        parameters={"type": "object", "properties": {"target": {"type": "string"}}},
+        produces_validation=True,
+    )
+
+    def run(self, arguments: dict[str, object], context: ToolContext) -> ToolExecution:
+        del context
+        return ToolExecution(
+            call=ToolCall(name=self.spec.name, arguments=dict(arguments)),
+            success=True,
+            content="verified the thing",
+            data={"validation": {"success": True, "details": "focused check passed"}},
+        )
+
+
+class LongOutputTool(AgentTool):
+    spec = ToolSpec(
+        name="long.output",
+        description="Returns output longer than the old memory boundary.",
+        parameters={"type": "object", "properties": {}},
+    )
+
+    def run(self, arguments: dict[str, object], context: ToolContext) -> ToolExecution:
+        del context
+        content = "A" * 12_000 + "TAIL_SENTINEL"
+        return ToolExecution(call=ToolCall(name=self.spec.name, arguments=dict(arguments)), success=True, content=content)

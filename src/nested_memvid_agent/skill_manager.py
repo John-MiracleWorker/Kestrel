@@ -169,6 +169,7 @@ class SkillToolAdapter(AgentTool):
             source="skill",
             skill_id=capsule.id,
             capabilities=tuple(capabilities),
+            produces_validation=bool(capsule.manifest.get("produces_validation", False)),
         )
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:

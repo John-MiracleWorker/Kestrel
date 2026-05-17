@@ -5,9 +5,11 @@ import ipaddress
 import json
 import os
 import re
+import signal as signal_module
 import socket
 import subprocess
 import sys
+import threading
 from fnmatch import fnmatchcase
 from html import unescape
 from pathlib import Path
@@ -17,14 +19,25 @@ from urllib.request import Request, urlopen
 
 from ..cognition import RetryPolicy
 from ..consolidation import Consolidator
-from ..context_frames import default_frame_type_for_memory, estimate_tokens, from_memory_record
+from ..context_frames import (
+    default_frame_type_for_memory,
+    estimate_tokens,
+    from_memory_record,
+    make_correction_frame,
+)
 from ..context_packer import ContextPacker, ContextPackRequest
 from ..diagnosis import classify_failure
-from ..models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
-from ..nested_learning import LearningSignal, NestedLearningKernel
+from ..models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
+from ..nested_learning import (
+    LearningSignal,
+    NestedLearningKernel,
+    ValidationEvidence,
+    compute_validation_score,
+)
 from ..plugin_manager import PluginManager
+from ..retention import RetentionCompactor
 from ..runtime_models import StrategyProposal, ToolCall, ToolExecution, ToolSpec
-from ..secret_broker import SecretBroker, is_secret_ref
+from ..secret_broker import SecretBroker, build_secret_broker, is_secret_ref
 from ..skill_manager import validate_skill_manifest
 from ..state_store import AgentStateStore
 from ..task_capsule import summarize_run_capsule
@@ -42,6 +55,7 @@ class MemorySearchTool(AgentTool):
                 "query": {"type": "string"},
                 "layers": {"type": "array", "items": {"type": "string"}},
                 "k": {"type": "integer", "minimum": 1, "maximum": 20},
+                "include_inactive": {"type": "boolean"},
             },
             "required": ["query"],
         },
@@ -63,7 +77,14 @@ class MemorySearchTool(AgentTool):
                 error="invalid_tool_arguments",
             )
         k = int(arguments.get("k", 8))
-        hits = context.memory.retrieve(RetrievalQuery(query=query, layers=layers, k_per_layer=k))
+        hits = context.memory.retrieve(
+            RetrievalQuery(
+                query=query,
+                layers=layers,
+                k_per_layer=k,
+                include_inactive=bool(arguments.get("include_inactive", False)),
+            )
+        )
         rows = []
         for hit in hits[:k]:
             rows.append(
@@ -526,7 +547,8 @@ class ShellRunTool(AgentTool):
         risk="high",
         requires_approval=True,
     )
-    allowed_first_tokens = {"echo", "pwd", "python", "python3", "pytest", "ruff", "mypy", "ls", "cat"}
+    allowed_first_tokens = {"echo", "pwd", "ls", "cat"}
+    needs_call_id = True
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         call = ToolCall(name=self.spec.name, arguments=arguments)
@@ -534,6 +556,8 @@ class ShellRunTool(AgentTool):
         if not isinstance(command_raw, list) or not all(isinstance(item, str) for item in command_raw):
             return self._result(call, success=False, content="command must be list[str]", error="bad_command")
         command = list(command_raw)
+        if command and Path(command[0]).name in {"python", "python3"} and "-c" in command:
+            return self._result(call, success=False, content="Inline Python shell commands are not allowlisted", error="command_not_allowlisted")
         remote_mutation = _remote_mutation_violation(command)
         git_push_blocked = remote_mutation == "git push" and not context.config.allow_git_push
         if remote_mutation and (git_push_blocked or not context.config.allow_remote_mutation):
@@ -550,16 +574,8 @@ class ShellRunTool(AgentTool):
             )
         if not command or Path(command[0]).name not in self.allowed_first_tokens:
             return self._result(call, success=False, content="Command is not allowlisted", error="command_not_allowlisted")
-        command = _normalize_python_command(command)
         try:
-            completed = subprocess.run(  # noqa: S603 - intentionally allowlisted
-                command,
-                cwd=context.workspace,
-                capture_output=True,
-                text=True,
-                timeout=int(arguments.get("timeout", 30)),
-                check=False,
-            )
+            completed = _run_subprocess(command, context=context, arguments=arguments, default_timeout=30)
             content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
             return self._result(
                 call,
@@ -568,8 +584,13 @@ class ShellRunTool(AgentTool):
                 data={"returncode": completed.returncode},
                 error=None if completed.returncode == 0 else "nonzero_exit",
             )
+        except _SubprocessToolTimeout as exc:
+            return self._result(call, success=False, content=str(exc), error="tool_timeout")
         except Exception as exc:  # noqa: BLE001
             return self._result(call, success=False, content=str(exc), error="shell_failed")
+
+    def cancel(self, call_id: str) -> None:
+        _cancel_running_subprocess(call_id)
 
 
 class CodexExecTool(AgentTool):
@@ -817,8 +838,10 @@ class TestRunTool(AgentTool):
         },
         risk="high",
         requires_approval=True,
+        produces_validation=True,
     )
     allowed_first_tokens = {"pytest", "python", "python3"}
+    needs_call_id = True
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         call = ToolCall(name=self.spec.name, arguments=arguments)
@@ -830,24 +853,27 @@ class TestRunTool(AgentTool):
             return self._result(call, success=False, content="Command is not allowlisted", error="command_not_allowlisted")
         command = _normalize_python_command(command)
         try:
-            completed = subprocess.run(  # noqa: S603 - intentionally allowlisted
-                command,
-                cwd=context.workspace,
-                capture_output=True,
-                text=True,
-                timeout=int(arguments.get("timeout", 120)),
-                check=False,
-            )
+            completed = _run_subprocess(command, context=context, arguments=arguments, default_timeout=120)
             content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
             return self._result(
                 call,
                 success=completed.returncode == 0,
                 content=content,
-                data={"returncode": completed.returncode},
+                data={
+                    "returncode": completed.returncode,
+                    "validation_evidence": _tool_validation_evidence_payload(
+                        "test_refs", "test.run", command, content, completed.returncode == 0
+                    ),
+                },
                 error=None if completed.returncode == 0 else "nonzero_exit",
             )
+        except _SubprocessToolTimeout as exc:
+            return self._result(call, success=False, content=str(exc), error="tool_timeout")
         except Exception as exc:  # noqa: BLE001
             return self._result(call, success=False, content=str(exc), error="test_run_failed")
+
+    def cancel(self, call_id: str) -> None:
+        _cancel_running_subprocess(call_id)
 
 
 class LintRunTool(AgentTool):
@@ -863,8 +889,10 @@ class LintRunTool(AgentTool):
         },
         risk="high",
         requires_approval=True,
+        produces_validation=True,
     )
     allowed_first_tokens = {"ruff", "mypy", "python", "python3"}
+    needs_call_id = True
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         call = ToolCall(name=self.spec.name, arguments=arguments)
@@ -876,24 +904,27 @@ class LintRunTool(AgentTool):
             return self._result(call, success=False, content="Command is not allowlisted", error="command_not_allowlisted")
         command = _normalize_python_command(command)
         try:
-            completed = subprocess.run(  # noqa: S603 - intentionally allowlisted
-                command,
-                cwd=context.workspace,
-                capture_output=True,
-                text=True,
-                timeout=int(arguments.get("timeout", 120)),
-                check=False,
-            )
+            completed = _run_subprocess(command, context=context, arguments=arguments, default_timeout=120)
             content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
             return self._result(
                 call,
                 success=completed.returncode == 0,
                 content=content,
-                data={"returncode": completed.returncode},
+                data={
+                    "returncode": completed.returncode,
+                    "validation_evidence": _tool_validation_evidence_payload(
+                        "lint_refs", "lint.run", command, content, completed.returncode == 0
+                    ),
+                },
                 error=None if completed.returncode == 0 else "nonzero_exit",
             )
+        except _SubprocessToolTimeout as exc:
+            return self._result(call, success=False, content=str(exc), error="tool_timeout")
         except Exception as exc:  # noqa: BLE001
             return self._result(call, success=False, content=str(exc), error="lint_run_failed")
+
+    def cancel(self, call_id: str) -> None:
+        _cancel_running_subprocess(call_id)
 
 
 class RepairPrepareTool(AgentTool):
@@ -1085,8 +1116,10 @@ class RepairValidateTool(AgentTool):
         risk="high",
         requires_approval=True,
         capabilities=("safe-repair", "validation", "self-diagnosis"),
+        produces_validation=True,
     )
     allowed_first_tokens = {"pytest", "python", "python3", "ruff", "mypy"}
+    needs_call_id = True
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         call = ToolCall(name=self.spec.name, arguments=arguments)
@@ -1101,25 +1134,30 @@ class RepairValidateTool(AgentTool):
             branch = _git_output(context.workspace, ["git", "branch", "--show-current"])
             if not _is_repair_branch(branch):
                 return self._result(call, success=False, content=f"Not on a repair branch: {branch}", error="not_repair_branch")
-            completed = subprocess.run(
-                command,
-                cwd=context.workspace,
-                capture_output=True,
-                text=True,
-                timeout=int(arguments.get("timeout", 120)),
-                check=False,
-            )
+            completed = _run_subprocess(command, context=context, arguments=arguments, default_timeout=120)
             content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
             diagnosis = classify_failure(content, source="repair.validate").to_payload() if completed.returncode != 0 else None
             return self._result(
                 call,
                 success=completed.returncode == 0,
                 content=content,
-                data={"branch": branch, "returncode": completed.returncode, "diagnosis": diagnosis},
+                data={
+                    "branch": branch,
+                    "returncode": completed.returncode,
+                    "diagnosis": diagnosis,
+                    "validation_evidence": _tool_validation_evidence_payload(
+                        "repair_refs", "repair.validate", command, content, completed.returncode == 0
+                    ),
+                },
                 error=None if completed.returncode == 0 else "repair_validation_failed",
             )
+        except _SubprocessToolTimeout as exc:
+            return self._result(call, success=False, content=str(exc), error="tool_timeout")
         except Exception as exc:  # noqa: BLE001
             return self._result(call, success=False, content=str(exc), error="repair_validation_failed")
+
+    def cancel(self, call_id: str) -> None:
+        _cancel_running_subprocess(call_id)
 
 
 class RepairOrchestrateValidateTool(AgentTool):
@@ -1140,8 +1178,10 @@ class RepairOrchestrateValidateTool(AgentTool):
         risk="high",
         requires_approval=True,
         capabilities=("safe-repair", "validation", "self-diagnosis", "failure-recall"),
+        produces_validation=True,
     )
     allowed_first_tokens = RepairValidateTool.allowed_first_tokens
+    needs_call_id = True
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         call = ToolCall(name=self.spec.name, arguments=arguments)
@@ -1157,19 +1197,15 @@ class RepairOrchestrateValidateTool(AgentTool):
             if not _is_repair_branch(branch):
                 return self._result(call, success=False, content=f"Not on a repair branch: {branch}", error="not_repair_branch", data={"branch": branch})
             status = _git_output(context.workspace, ["git", "status", "--porcelain"])
-            completed = subprocess.run(  # noqa: S603 - intentionally allowlisted repair validation command
-                command,
-                cwd=context.workspace,
-                capture_output=True,
-                text=True,
-                timeout=int(arguments.get("timeout", 120)),
-                check=False,
-            )
+            completed = _run_subprocess(command, context=context, arguments=arguments, default_timeout=120)
             validation_content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
             validation = {
                 "success": completed.returncode == 0,
                 "returncode": completed.returncode,
                 "content": validation_content,
+                "validation_evidence": _tool_validation_evidence_payload(
+                    "repair_refs", "repair.orchestrate_validate", command, validation_content, completed.returncode == 0
+                ),
             }
             diagnosis = None
             recall: dict[str, Any] = {"hits": [], "query": "", "retry_guidance": {"must_change_strategy_before_retry": False}}
@@ -1232,8 +1268,13 @@ class RepairOrchestrateValidateTool(AgentTool):
                 "approval_required_before_commit": True,
             }
             return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+        except _SubprocessToolTimeout as exc:
+            return self._result(call, success=False, content=str(exc), error="tool_timeout")
         except Exception as exc:  # noqa: BLE001
             return self._result(call, success=False, content=str(exc), error="repair_orchestration_failed")
+
+    def cancel(self, call_id: str) -> None:
+        _cancel_running_subprocess(call_id)
 
 
 class RepairReviewTool(AgentTool):
@@ -1282,6 +1323,7 @@ class RepairReviewTool(AgentTool):
                 "summary": str(arguments.get("summary", "")).strip(),
                 "risks": risks,
                 "validation": validation,
+                "validation_evidence": validation.get("validation_evidence"),
                 "commit_gate": {
                     "commit_allowed": True,
                     "approval_required_before_commit": True,
@@ -1291,6 +1333,19 @@ class RepairReviewTool(AgentTool):
             review_dir = context.workspace / ".nest" / "repair_reviews"
             review_dir.mkdir(parents=True, exist_ok=True)
             (review_dir / f"{review_id}.json").write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            payload["validation_evidence"] = _merge_validation_evidence_payloads(
+                validation.get("validation_evidence"),
+                {
+                    "review_refs": [
+                        {
+                            "source": "repair.review",
+                            "locator": review_id,
+                            "quote": str(arguments.get("summary", "")).strip()[:240],
+                        }
+                    ],
+                    "source_evidence_chars": len(json.dumps(payload, sort_keys=True)),
+                },
+            )
             return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
         except Exception as exc:  # noqa: BLE001
             return self._result(call, success=False, content=str(exc), error="repair_review_failed")
@@ -1705,6 +1760,7 @@ class MemoryConsolidateTool(AgentTool):
             "properties": {
                 "query": {"type": "string"},
                 "source_layer": {"type": "string"},
+                "validation_evidence": {"type": "object"},
                 "validation_score": {"type": "number", "minimum": 0, "maximum": 1},
                 "repeat_count": {"type": "integer", "minimum": 1},
                 "explicit_instruction": {"type": "boolean"},
@@ -1726,7 +1782,12 @@ class MemoryConsolidateTool(AgentTool):
             hits = context.memory.retrieve(RetrievalQuery(query=query, layers=layers, k_per_layer=1))
             if not hits:
                 return self._result(call, success=False, content="No consolidation candidate found.", error="candidate_not_found")
-            validation_score = float(arguments.get("validation_score", 0.7))
+            validation_evidence = _validation_evidence_arg(arguments)
+            validation_score = (
+                compute_validation_score(validation_evidence)
+                if validation_evidence is not None
+                else float(arguments.get("validation_score", 0.7))
+            )
             repeat_count = int(arguments.get("repeat_count", 1))
             explicit_instruction = bool(arguments.get("explicit_instruction", False))
             candidate = Consolidator().propose(
@@ -1760,6 +1821,8 @@ class MemoryConsolidateTool(AgentTool):
                 "confidence": candidate.promoted_confidence,
                 "context_flow": candidate.flow.to_metadata(),
                 "optimizer_trace": candidate.optimizer_trace.to_metadata(),
+                "validation_score": validation_score,
+                "validation_evidence": _validation_evidence_payload_for_output(validation_evidence, validation_score),
             }
             return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
         except Exception as exc:  # noqa: BLE001
@@ -1780,6 +1843,7 @@ class MemoryLearnTool(AgentTool):
                 "target_layer": {"type": "string"},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "importance": {"type": "number", "minimum": 0, "maximum": 1},
+                "validation_evidence": {"type": "object"},
                 "validation_score": {"type": "number", "minimum": 0, "maximum": 1},
                 "repeat_count": {"type": "integer", "minimum": 1},
                 "explicit_instruction": {"type": "boolean"},
@@ -1805,6 +1869,7 @@ class MemoryLearnTool(AgentTool):
             source_layer = _layer_arg(arguments.get("source_layer")) or MemoryLayer.WORKING
             target_layer = _layer_arg(arguments.get("target_layer"))
             kind = MemoryKind(str(arguments.get("kind", MemoryKind.OBSERVATION.value)))
+            validation_evidence = _validation_evidence_arg(arguments)
             signal = LearningSignal(
                 title=title,
                 content=content,
@@ -1812,7 +1877,8 @@ class MemoryLearnTool(AgentTool):
                 source_layer=source_layer,
                 confidence=float(arguments.get("confidence", 0.6)),
                 importance=float(arguments.get("importance", 0.5)),
-                validation_score=float(arguments.get("validation_score", 0.7)),
+                validation_score=None if validation_evidence is not None else float(arguments.get("validation_score", 0.7)),
+                validation_evidence=validation_evidence,
                 repeat_count=int(arguments.get("repeat_count", 1)),
                 explicit_instruction=bool(arguments.get("explicit_instruction", False)),
                 source=str(arguments.get("source", "tool.memory.learn")),
@@ -1848,6 +1914,11 @@ class MemoryLearnTool(AgentTool):
                 **decision.to_payload(),
                 "dry_run": dry_run,
                 "record_id": record_id,
+                "validation_score": signal.computed_validation_score,
+                "validation_evidence": _validation_evidence_payload_for_output(
+                    validation_evidence,
+                    signal.computed_validation_score,
+                ),
             }
             return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
         except Exception as exc:  # noqa: BLE001
@@ -1864,6 +1935,7 @@ class MemoryInspectTool(AgentTool):
                 "query": {"type": "string"},
                 "layers": {"type": "array", "items": {"type": "string"}},
                 "k": {"type": "integer", "minimum": 1, "maximum": 50},
+                "include_inactive": {"type": "boolean"},
             },
             "required": ["query"],
         },
@@ -1876,10 +1948,94 @@ class MemoryInspectTool(AgentTool):
             return self._result(call, success=False, content="Missing query", error="missing_query")
         layers = _layers_arg(arguments.get("layers")) or tuple(MemoryLayer)
         hits = context.memory.retrieve(
-            RetrievalQuery(query=query, layers=layers, k_per_layer=int(arguments.get("k", 8)))
+            RetrievalQuery(
+                query=query,
+                layers=layers,
+                k_per_layer=int(arguments.get("k", 8)),
+                include_inactive=bool(arguments.get("include_inactive", False)),
+            )
         )
         rows = [_memory_hit_payload(hit) for hit in hits]
         return self._result(call, success=True, content=json.dumps(rows, indent=2), data={"hits": rows})
+
+
+class MemoryCorrectTool(AgentTool):
+    spec = ToolSpec(
+        name="memory.correct",
+        description="Write a correction frame for a target memory record and supersede the target by default.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "target_record_id": {"type": "string"},
+                "correction_text": {"type": "string"},
+                "evidence": {"type": "array", "items": {"type": "object"}},
+                "dry_run": {"type": "boolean"},
+            },
+            "required": ["target_record_id", "correction_text"],
+        },
+        risk="medium",
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        target_id = str(arguments.get("target_record_id", "")).strip()
+        correction_text = str(arguments.get("correction_text", "")).strip()
+        if not target_id:
+            return self._result(call, success=False, content="Missing target_record_id", error="missing_target_record_id")
+        if not correction_text:
+            return self._result(call, success=False, content="Missing correction_text", error="missing_correction_text")
+        target = context.memory.get_record(None, target_id, include_inactive=True)
+        if target is None:
+            return self._result(call, success=False, content="Target memory record not found.", error="target_not_found")
+        evidence = _evidence_refs_arg(arguments.get("evidence"))
+        dry_run = bool(arguments.get("dry_run", False))
+        frame = make_correction_frame(
+            target_record_id=target.id,
+            layer=target.layer,
+            correction_text=correction_text,
+            evidence=evidence,
+            title=f"Correction: {target.title}",
+        )
+        record_id = None
+        if not dry_run:
+            record_id = context.memory.put_frame(frame)
+            context.memory.tombstone(target.layer, target.id, reason="corrected", superseded_by=str(record_id))
+            context.memory.seal_all()
+        payload = {
+            "corrected": True,
+            "dry_run": dry_run,
+            "target_record_id": target.id,
+            "target_layer": target.layer.value,
+            "correction_record_id": record_id,
+            "correction_frame_id": frame.id,
+            "evidence": [ref.__dict__ for ref in evidence],
+        }
+        return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+
+
+class MemoryCompactTool(AgentTool):
+    spec = ToolSpec(
+        name="memory.compact",
+        description="Compact TTL-eligible working/episodic memory. Dry-run by default.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "layer": {"type": "string"},
+                "apply": {"type": "boolean"},
+                "dry_run": {"type": "boolean"},
+            },
+        },
+        risk="medium",
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        layer = _layer_arg(arguments.get("layer")) or MemoryLayer.WORKING
+        dry_run = bool(arguments.get("dry_run", not bool(arguments.get("apply", False))))
+        report = RetentionCompactor(context.memory).compact_layer(layer, dry_run=dry_run)
+        if not dry_run:
+            context.memory.seal_all()
+        return self._result(call, success=True, content=json.dumps(report, indent=2, default=str), data=report)
 
 
 class MemoryExportTool(AgentTool):
@@ -2424,6 +2580,8 @@ def build_default_tools() -> ToolRegistry:
     registry.register(MemvidStatsTool())
     registry.register(MemoryLearnTool())
     registry.register(MemoryConsolidateTool())
+    registry.register(MemoryCorrectTool())
+    registry.register(MemoryCompactTool())
     registry.register(MemoryInspectTool())
     registry.register(MemoryExportTool())
     registry.register(MemoryImportTool())
@@ -2452,7 +2610,7 @@ def _self_identity() -> dict[str, str]:
 def _self_snapshot(context: ToolContext, *, include_tools: bool, include_state: bool) -> dict[str, Any]:
     config = context.config
     state = AgentStateStore(config.state_path)
-    secret_broker = SecretBroker(config.secret_store_path)
+    secret_broker = build_secret_broker(config.secret_store_path, backend=config.secret_backend)
     memory_layers = [
         {
             "layer": layer.value,
@@ -2480,6 +2638,7 @@ def _self_snapshot(context: ToolContext, *, include_tools: bool, include_state: 
             "workspace": str(config.workspace),
             "memory_dir": str(config.memory_dir),
             "secret_store_path": str(config.secret_store_path),
+            "secret_backend": config.secret_backend,
             "allow_shell": config.allow_shell,
             "allow_file_write": config.allow_file_write,
             "allow_policy_writes": config.allow_policy_writes,
@@ -2708,37 +2867,23 @@ def _is_protected_branch(name: str, protected_patterns: tuple[str, ...]) -> bool
 def _remote_mutation_violation(command: list[str]) -> str | None:
     if not command:
         return None
-    lowered = [part.lower() for part in command]
-    executable = Path(lowered[0]).name
-    if executable == "git" and len(lowered) >= 2:
-        if lowered[1] == "push":
+    executable = Path(command[0]).name.lower()
+    rest = [part.lower() for part in command[1:]]
+    if executable == "git" and rest:
+        if rest[0] == "push":
             return "git push"
-        if lowered[1] == "tag":
+        if rest[0] == "tag":
             return "git tag"
-        if lowered[1:3] == ["remote", "set-url"]:
+        if rest[:2] == ["remote", "set-url"]:
             return "git remote set-url"
-    if executable == "gh" and len(lowered) >= 3:
-        if lowered[1:3] == ["repo", "edit"]:
+    if executable == "gh" and len(rest) >= 2:
+        pair = tuple(rest[:2])
+        if pair == ("repo", "edit"):
             return "gh repo edit"
-        if lowered[1:3] == ["secret", "set"]:
+        if pair == ("secret", "set"):
             return "gh secret set"
-        if lowered[1:3] == ["workflow", "enable"]:
+        if pair == ("workflow", "enable"):
             return "gh workflow enable"
-    joined = " ".join(lowered)
-    searchable = re.sub(r"[^a-z0-9_./*-]+", " ", joined)
-    checks = (
-        ("git push", "git push"),
-        ("git tag", "git tag"),
-        ("git remote set-url", "git remote set-url"),
-        ("gh repo edit", "gh repo edit"),
-        ("gh secret set", "gh secret set"),
-        ("gh workflow enable", "gh workflow enable"),
-        ("rm -rf .git", "rm -rf .git"),
-        (".git/config", ".git/config"),
-    )
-    for needle, label in checks:
-        if needle in searchable:
-            return label
     return None
 
 
@@ -2834,6 +2979,106 @@ def _normalize_python_command(command: list[str]) -> list[str]:
     return command
 
 
+class _SubprocessToolTimeout(RuntimeError):
+    pass
+
+
+_RUNNING_PROCESSES: dict[str, subprocess.Popen[str]] = {}
+_RUNNING_PROCESS_LOCK = threading.RLock()
+
+
+def _run_subprocess(
+    command: list[str],
+    *,
+    context: ToolContext,
+    arguments: dict[str, Any],
+    default_timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    timeout = _effective_timeout(arguments, context, default_timeout)
+    call_id = str(arguments.get("_tool_call_id") or "")
+    process = subprocess.Popen(  # noqa: S603 - caller already validated executable and argv shape
+        command,
+        cwd=context.workspace,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    if call_id:
+        with _RUNNING_PROCESS_LOCK:
+            _RUNNING_PROCESSES[call_id] = process
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode, stdout=stdout, stderr=stderr)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_group(process)
+        try:
+            stdout, stderr = process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(process)
+            stdout, stderr = process.communicate()
+        content = (
+            f"Command timed out after {timeout:g} seconds.\n"
+            f"STDOUT:\n{_process_output_text(stdout, exc.stdout)}\n"
+            f"STDERR:\n{_process_output_text(stderr, exc.stderr)}"
+        )
+        raise _SubprocessToolTimeout(content) from exc
+    finally:
+        if call_id:
+            with _RUNNING_PROCESS_LOCK:
+                if _RUNNING_PROCESSES.get(call_id) is process:
+                    del _RUNNING_PROCESSES[call_id]
+
+
+def _effective_timeout(arguments: dict[str, Any], context: ToolContext, default_timeout: int) -> float:
+    max_timeout = max(float(getattr(context.config, "tool_timeout_seconds", default_timeout)), 0.001)
+    try:
+        requested = float(arguments.get("timeout", default_timeout))
+    except (TypeError, ValueError):
+        requested = float(default_timeout)
+    requested = min(max(requested, 0.001), max_timeout)
+    return requested
+
+
+def _cancel_running_subprocess(call_id: str) -> None:
+    with _RUNNING_PROCESS_LOCK:
+        process = _RUNNING_PROCESSES.get(call_id)
+    if process is not None:
+        _terminate_process_group(process)
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(process.pid), signal_module.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception:
+        process.terminate()
+
+
+def _kill_process_group(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(process.pid), signal_module.SIGKILL)
+    except ProcessLookupError:
+        return
+    except Exception:
+        process.kill()
+
+
+def _process_output_text(primary: str | bytes | None, fallback: str | bytes | None) -> str:
+    if isinstance(primary, bytes):
+        return primary.decode("utf-8", errors="replace")
+    if primary:
+        return primary
+    if isinstance(fallback, bytes):
+        return fallback.decode("utf-8", errors="replace")
+    return fallback or ""
+
+
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
@@ -2883,6 +3128,103 @@ def _memory_record_from_payload(item: dict[str, Any]) -> MemoryRecord:
     if record_id:
         record.id = record_id
     return record
+
+
+def _tool_validation_evidence_payload(
+    bucket: str,
+    source: str,
+    command: list[str],
+    content: str,
+    success: bool,
+) -> dict[str, object]:
+    if not success:
+        return {"source_evidence_chars": len(content)}
+    return {
+        bucket: [
+            {
+                "source": source,
+                "locator": " ".join(command),
+                "quote": content[:240],
+            }
+        ],
+        "source_evidence_chars": len(content),
+    }
+
+
+def _validation_evidence_arg(arguments: dict[str, Any]) -> ValidationEvidence | None:
+    raw = arguments.get("validation_evidence")
+    if not isinstance(raw, dict):
+        return None
+    return ValidationEvidence(
+        test_refs=tuple(_evidence_refs_arg(raw.get("test_refs"))),
+        lint_refs=tuple(_evidence_refs_arg(raw.get("lint_refs"))),
+        repair_refs=tuple(_evidence_refs_arg(raw.get("repair_refs"))),
+        review_refs=tuple(_evidence_refs_arg(raw.get("review_refs"))),
+        task_refs=tuple(_evidence_refs_arg(raw.get("task_refs"))),
+        human_explicit=bool(raw.get("human_explicit", arguments.get("explicit_instruction", False))),
+        source_evidence_chars=_optional_int(raw.get("source_evidence_chars")),
+    )
+
+
+def _validation_evidence_payload_for_output(
+    evidence: ValidationEvidence | None,
+    validation_score: float,
+) -> dict[str, object]:
+    if evidence is None:
+        return {"legacy_raw_score": True, "computed_score": validation_score}
+    return evidence.to_metadata()
+
+
+def _merge_validation_evidence_payloads(*payloads: object) -> dict[str, object]:
+    merged: dict[str, list[object]] = {
+        "test_refs": [],
+        "lint_refs": [],
+        "repair_refs": [],
+        "review_refs": [],
+        "task_refs": [],
+    }
+    source_chars = 0
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        for key in ("test_refs", "lint_refs", "repair_refs", "review_refs", "task_refs"):
+            values = payload.get(key)
+            if isinstance(values, list):
+                merged[key].extend(values)
+        raw_chars = payload.get("source_evidence_chars")
+        if isinstance(raw_chars, int):
+            source_chars += raw_chars
+    if source_chars:
+        return {**merged, "source_evidence_chars": source_chars}
+    return dict(merged)
+
+
+def _evidence_refs_arg(value: object) -> list[EvidenceRef]:
+    if not isinstance(value, list):
+        return []
+    refs: list[EvidenceRef] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source", "")).strip()
+        locator = str(item.get("locator", "")).strip()
+        if source and locator:
+            quote = item.get("quote")
+            refs.append(EvidenceRef(source=source, locator=locator, quote=str(quote) if quote is not None else None))
+    return refs
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, (str, float)):
+        return None
+    try:
+        return int(str(value))
+    except ValueError:
+        return None
 
 
 def _skip_repo_name(name: str) -> bool:

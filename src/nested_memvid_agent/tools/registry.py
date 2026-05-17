@@ -20,6 +20,10 @@ class ToolRegistry:
     def specs(self) -> list[ToolSpec]:
         return [tool.spec for tool in self._tools.values()]
 
+    def spec_for(self, name: str) -> ToolSpec | None:
+        tool = self._tools.get(name)
+        return None if tool is None else tool.spec
+
     def execute(self, call: ToolCall, context: ToolContext) -> ToolExecution:
         if not isinstance(call.arguments, dict):
             return _failure(
@@ -100,6 +104,7 @@ def _run_tool(tool: AgentTool, call: ToolCall, arguments: dict[str, Any], contex
     try:
         return results.get(timeout=timeout)
     except Empty:
+        _cancel_tool(tool, call.id)
         return _failure(
             call,
             content=f"Tool {call.name} timed out after {timeout:g} seconds.",
@@ -109,6 +114,15 @@ def _run_tool(tool: AgentTool, call: ToolCall, arguments: dict[str, Any], contex
 
 def _failure(call: ToolCall, *, content: str, error: str) -> ToolExecution:
     return ToolExecution(call=call, success=False, content=content, error=error)
+
+
+def _cancel_tool(tool: AgentTool, call_id: str) -> None:
+    cancel = getattr(tool, "cancel", None)
+    if callable(cancel):
+        try:
+            cancel(call_id)
+        except Exception:
+            return
 
 
 _ENABLEMENT_BY_TOOL = {

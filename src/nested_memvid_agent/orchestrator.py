@@ -6,15 +6,20 @@ from .backends.in_memory import InMemoryBackend
 from .backends.memvid_backend import MemvidBackend
 from .context_compiler import ContextCompiler
 from .event_log import AgentEvent, JsonlEventLog
-from .layers import LayeredMemorySystem
+from .layers import LayeredMemorySystem, LayerSpec
 from .models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord
 
 
-def build_memory_system(backend: str, memory_dir: Path) -> LayeredMemorySystem:
+def build_memory_system(
+    backend: str,
+    memory_dir: Path,
+    *,
+    specs: dict[MemoryLayer, LayerSpec] | None = None,
+) -> LayeredMemorySystem:
     if backend == "memory":
-        return LayeredMemorySystem.from_backend_factory(memory_dir, InMemoryBackend)
+        return LayeredMemorySystem.from_backend_factory(memory_dir, InMemoryBackend, specs=specs)
     if backend == "memvid":
-        return LayeredMemorySystem.from_backend_factory(memory_dir, MemvidBackend)
+        return LayeredMemorySystem.from_backend_factory(memory_dir, MemvidBackend, specs=specs)
     raise ValueError(f"Unknown backend: {backend}")
 
 

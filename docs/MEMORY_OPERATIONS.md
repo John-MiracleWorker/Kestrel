@@ -26,6 +26,46 @@ nest-agent memory doctor --backend memvid --memory-dir .nest/memory
 
 `doctor` is dry-run by default. Only pass `--repair` after preserving a backup.
 
+## Corrections
+
+Use correction frames instead of overwriting durable facts in place:
+
+```bash
+nest-agent memory correct <target_record_id> "Corrected memory text" --backend memvid --memory-dir .nest/memory
+```
+
+The command writes a `correction` frame, links it to the target record, tombstones the superseded record, and leaves normal retrieval filtering inactive records out by default. Use inspect/search with inactive/audit options when reviewing tombstones.
+
+## Compaction
+
+Compaction is dry-run unless `--apply` is passed:
+
+```bash
+nest-agent memory compact --layer working --backend memvid --memory-dir .nest/memory
+nest-agent memory compact --layer episodic --apply --backend memvid --memory-dir .nest/memory
+```
+
+TTL compaction only targets working and episodic layers by default. Stable layers are skipped except for correction-driven tombstones. Automatic compaction is off unless `NEST_AGENT_ENABLE_AUTO_COMPACT=1`; it still runs dry-run unless `NEST_AGENT_AUTO_COMPACT_APPLY=1`.
+
+## Layer Config And Hybrid Search
+
+`--layer-config` / `NEST_AGENT_LAYER_CONFIG` can load a JSON layer spec file. Hybrid/vector retrieval is only enabled when the layer explicitly provides local vector settings:
+
+```json
+{
+  "semantic": {
+    "search_mode": "hybrid",
+    "vector": {
+      "enabled": true,
+      "embedding_provider": "local",
+      "index_path": "semantic.vec"
+    }
+  }
+}
+```
+
+Policy memory remains lexical even if vector fields are present.
+
 ## Backup
 
 Stop the server or pause writes first, then copy the complete runtime directory:
@@ -69,4 +109,4 @@ Never call `create(path)` on an existing `.mv2` file. The backend must use exist
 
 ## Retention Notes
 
-Working memory can be compacted or promoted through the nested learning pipeline, but semantic/procedural/self/policy layers require validation evidence. Policy memory requires explicit configuration and explicit user instruction.
+Working memory can be compacted or promoted through the nested learning pipeline, but semantic/procedural/self/policy layers require structured validation evidence. Policy memory requires explicit configuration, repeated evidence, high validation, and explicit user instruction.

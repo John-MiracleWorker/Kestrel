@@ -189,6 +189,31 @@ class LessonCard:
             updated_at=now,
         )
 
+    @classmethod
+    def from_memory_record(cls, record: MemoryRecord) -> LessonCard:
+        payload = json.loads(record.content)
+        if not isinstance(payload, dict):
+            raise ValueError("LessonCard record content must decode to an object")
+        return cls(
+            id=str(payload.get("id", record.id)),
+            title=str(payload.get("title", record.title.removeprefix("LessonCard: ").strip())),
+            failure_signature=str(payload.get("failure_signature", "")),
+            failure_category=str(payload.get("failure_category", record.metadata.get("failure_category", ""))),
+            context=str(payload.get("context", "")),
+            root_cause=str(payload.get("root_cause", "")),
+            bad_strategy=str(payload.get("bad_strategy", "")),
+            corrected_strategy=str(payload.get("corrected_strategy", "")),
+            validation_command=_optional_string(payload.get("validation_command")),
+            evidence_refs=tuple(str(item) for item in _list_value(payload.get("evidence_refs"))),
+            success_count=int(payload.get("success_count", record.metadata.get("success_count", 0)) or 0),
+            failure_count=int(payload.get("failure_count", record.metadata.get("failure_count", 0)) or 0),
+            confidence=float(payload.get("confidence", record.confidence)),
+            applies_when=tuple(str(item) for item in _list_value(payload.get("applies_when"))),
+            avoid_when=tuple(str(item) for item in _list_value(payload.get("avoid_when"))),
+            created_at=str(payload.get("created_at", record.created_at.isoformat())),
+            updated_at=str(payload.get("updated_at", record.updated_at.isoformat())),
+        )
+
     def to_payload(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -228,6 +253,7 @@ class LessonCard:
                 "validation_status": "validated_once",
                 "success_count": self.success_count,
                 "failure_count": self.failure_count,
+                "repeat_count": self.success_count + self.failure_count,
             },
             evidence=[
                 EvidenceRef(source="failure_episode", locator=self.evidence_refs[0]),
@@ -287,3 +313,18 @@ def _command_text(execution: ToolExecution) -> str | None:
 def _signature(text: str) -> str:
     compact = " ".join(text.split())
     return compact[:240] or "unknown failure"
+
+
+def _list_value(value: object) -> list[object]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return []
+
+
+def _optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None

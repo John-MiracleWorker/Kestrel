@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -41,16 +43,60 @@ class InMemoryBackend(MemoryBackend):
         self.records.append(record)
         return record.id
 
+    def upsert(self, record: MemoryRecord) -> str:
+        if record.layer != self.layer:
+            raise ValueError(f"Cannot write {record.layer} record to {self.layer} backend")
+        for index, existing in enumerate(self.records):
+            if existing.id == record.id:
+                self.records[index] = record
+                return record.id
+        self.records.append(record)
+        return record.id
+
+    def tombstone(self, record_id: str, *, reason: str, superseded_by: str | None = None) -> bool:
+        record = self.get_record(record_id, include_inactive=True)
+        if record is None:
+            return False
+        record.metadata["active"] = False
+        record.metadata["tombstone_reason"] = reason
+        record.metadata["tombstoned_at"] = datetime.now(UTC).isoformat()
+        if superseded_by:
+            record.metadata["superseded_by"] = superseded_by
+        record.updated_at = datetime.now(UTC)
+        return True
+
+    def iter_records(self, *, include_inactive: bool = False) -> Iterable[MemoryRecord]:
+        return tuple(record for record in self.records if include_inactive or _is_active(record))
+
+    def get_record(self, record_id: str, *, include_inactive: bool = True) -> MemoryRecord | None:
+        for record in self.records:
+            metadata = record.metadata
+            if record.id == record_id or str(metadata.get("frame_id", "")) == record_id:
+                if include_inactive or _is_active(record):
+                    return record
+                return None
+        return None
+
     def put_frame(self, frame: MV2ContextFrame) -> str:
         return self.put(to_memory_record(frame))
 
-    def find(self, query: str, k: int = 8, mode: str = "auto", min_relevancy: float = 0.0) -> list[MemoryHit]:
+    def find(
+        self,
+        query: str,
+        k: int = 8,
+        mode: str = "auto",
+        min_relevancy: float = 0.0,
+        *,
+        include_inactive: bool = False,
+    ) -> list[MemoryHit]:
         del mode
         query_tokens = set(_tokens(query))
         if not query_tokens:
             return []
         hits: list[MemoryHit] = []
         for record in self.records:
+            if not include_inactive and not _is_active(record):
+                continue
             record_text = f"{record.title} {record.content} {' '.join(record.tags.values())}"
             record_tokens = set(_tokens(record_text))
             overlap = query_tokens & record_tokens
@@ -79,10 +125,11 @@ class InMemoryBackend(MemoryBackend):
         layers: tuple[MemoryLayer, ...] | None = None,
         frame_types: tuple[str, ...] | None = None,
         mode: str = "auto",
+        include_inactive: bool = False,
     ) -> list[MemoryHit]:
         if layers is not None and self.layer not in layers:
             return []
-        hits = self.find(query=query, k=k, mode=mode)
+        hits = self.find(query=query, k=k, mode=mode, include_inactive=include_inactive)
         if frame_types is None:
             return hits
         allowed = set(frame_types)
@@ -102,6 +149,9 @@ class InMemoryBackend(MemoryBackend):
                 "tags": rec.tags,
                 "metadata": rec.metadata,
                 "evidence": [ref.__dict__ for ref in rec.evidence],
+                "created_at": rec.created_at.isoformat(),
+                "updated_at": rec.updated_at.isoformat(),
+                "expires_at": rec.expires_at.isoformat() if rec.expires_at else None,
             }
             for rec in self.records
         ]
@@ -124,6 +174,10 @@ def _snippet(text: str, query_tokens: set[str], window: int = 220) -> str:
     start = max(first_idx - 60, 0)
     snippet = text[start : start + window]
     return snippet.strip()
+
+
+def _is_active(record: MemoryRecord) -> bool:
+    return record.metadata.get("active", True) is not False
 
 
 def _record_from_snapshot(item: dict[str, object], expected_layer: MemoryLayer) -> MemoryRecord:

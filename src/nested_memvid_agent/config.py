@@ -27,6 +27,7 @@ class AgentConfig:
     codex_ephemeral: bool = True
     backend: str = "memory"
     memory_dir: Path = Path(".nest/memory")
+    layer_config_path: Path | None = None
     workspace: Path = Path(".")
     max_tool_rounds: int = 6
     context_budget_chars: int = 18_000
@@ -60,12 +61,15 @@ class AgentConfig:
     enable_task_capsules: bool = True
     enable_auto_consolidation: bool = False
     auto_consolidation_dry_run: bool = True
+    enable_auto_compact: bool = False
+    auto_compact_apply: bool = False
     context_pack_token_budget: int = 6000
     context_pack_expand_raw: bool = False
     stream: bool = False
     log_dir: Path = Path(".nest/logs")
     state_path: Path = Path(".nest/state/agent.db")
     secret_store_path: Path = Path(".nest/secrets/local_vault.json")
+    secret_backend: str = "json"
     skills_dir: Path = Path(".nest/skills")
     plugins_dir: Path = Path(".nest/plugins")
     mcp_config_path: Path = Path(".nest/config/mcp_servers.json")
@@ -75,6 +79,11 @@ class AgentConfig:
     require_api_auth: bool = False
     api_auth_token_env: str = "NEST_AGENT_API_TOKEN"
     tool_timeout_seconds: float = 30.0
+    trusted_hosts: tuple[str, ...] = ("127.0.0.1", "localhost", "::1", "[::1]", "testserver")
+    cors_origins: tuple[str, ...] = ()
+    llm_turn_summaries: bool = False
+    memory_seal_write_threshold: int = 50
+    memory_seal_interval_seconds: float = 10.0
 
     @classmethod
     def from_env(cls) -> AgentConfig:
@@ -96,10 +105,12 @@ class AgentConfig:
             codex_ephemeral=not _env_bool("NEST_AGENT_CODEX_PERSIST_SESSION"),
             backend=os.getenv("NEST_AGENT_BACKEND", "memory"),
             memory_dir=Path(os.getenv("NEST_AGENT_MEMORY_DIR", ".nest/memory")),
+            layer_config_path=_env_path_or_none("NEST_AGENT_LAYER_CONFIG"),
             workspace=Path(os.getenv("NEST_AGENT_WORKSPACE", ".")),
             log_dir=Path(os.getenv("NEST_AGENT_LOG_DIR", ".nest/logs")),
             state_path=Path(os.getenv("NEST_AGENT_STATE_PATH", ".nest/state/agent.db")),
             secret_store_path=Path(os.getenv("NEST_AGENT_SECRET_STORE_PATH", ".nest/secrets/local_vault.json")),
+            secret_backend=os.getenv("NEST_AGENT_SECRET_BACKEND", "json"),
             skills_dir=Path(os.getenv("NEST_AGENT_SKILLS_DIR", ".nest/skills")),
             plugins_dir=Path(os.getenv("NEST_AGENT_PLUGINS_DIR", ".nest/plugins")),
             mcp_config_path=Path(os.getenv("NEST_AGENT_MCP_CONFIG", ".nest/config/mcp_servers.json")),
@@ -137,11 +148,18 @@ class AgentConfig:
             and _env_bool_default("NEST_AGENT_ENABLE_TASK_CAPSULES", True),
             enable_auto_consolidation=_env_bool("NEST_AGENT_ENABLE_AUTO_CONSOLIDATION"),
             auto_consolidation_dry_run=_env_bool_default("NEST_AGENT_AUTO_CONSOLIDATION_DRY_RUN", True),
+            enable_auto_compact=_env_bool("NEST_AGENT_ENABLE_AUTO_COMPACT"),
+            auto_compact_apply=_env_bool("NEST_AGENT_AUTO_COMPACT_APPLY"),
             context_pack_token_budget=_env_int("NEST_AGENT_CONTEXT_PACK_TOKEN_BUDGET", 6000),
             context_pack_expand_raw=_env_bool("NEST_AGENT_CONTEXT_PACK_EXPAND_RAW"),
             stream=_env_bool("NEST_AGENT_STREAM"),
             require_api_auth=_env_bool("NEST_AGENT_REQUIRE_API_AUTH"),
             api_auth_token_env=os.getenv("NEST_AGENT_API_AUTH_TOKEN_ENV", "NEST_AGENT_API_TOKEN"),
+            trusted_hosts=_env_csv("NEST_AGENT_TRUSTED_HOSTS", ("127.0.0.1", "localhost", "::1", "[::1]", "testserver")),
+            cors_origins=_env_csv("NEST_AGENT_CORS_ORIGINS", ()),
+            llm_turn_summaries=_env_bool("NEST_AGENT_LLM_TURN_SUMMARIES"),
+            memory_seal_write_threshold=_env_int("NEST_AGENT_MEMORY_SEAL_WRITE_THRESHOLD", 50),
+            memory_seal_interval_seconds=_env_float("NEST_AGENT_MEMORY_SEAL_INTERVAL_SECONDS", 10.0),
         )
 
     @classmethod
@@ -153,6 +171,7 @@ class AgentConfig:
     def from_mapping(cls, raw: dict[str, Any]) -> AgentConfig:
         path_fields = {
             "memory_dir",
+            "layer_config_path",
             "workspace",
             "log_dir",
             "state_path",
@@ -167,7 +186,7 @@ class AgentConfig:
         for key, value in raw.items():
             if key in path_fields and value is not None:
                 normalized[key] = Path(value)
-            elif key == "protected_branches" and isinstance(value, list):
+            elif key in {"protected_branches", "trusted_hosts", "cors_origins"} and isinstance(value, list):
                 normalized[key] = tuple(str(item) for item in value)
             else:
                 normalized[key] = value
@@ -213,3 +232,8 @@ def _env_str_or_none(name: str) -> str | None:
         return None
     stripped = raw.strip()
     return stripped or None
+
+
+def _env_path_or_none(name: str) -> Path | None:
+    value = _env_str_or_none(name)
+    return Path(value) if value else None

@@ -4,9 +4,11 @@ import hashlib
 import hmac
 import json
 import os
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from ..agent import NestedMV2Agent
@@ -45,6 +47,8 @@ class ChannelManager:
             for channel in (channel_configs if channel_configs is not None else load_channel_configs(config.channel_config_path))
         }
         self.event_log = JsonlEventLog(config.log_dir / "events.jsonl")
+        self._agent: NestedMV2Agent | None = None
+        self._agent_lock = RLock()
 
     def list_channels(self) -> list[dict[str, Any]]:
         return [channel.to_public_dict() for channel in sorted(self.channels.values(), key=lambda item: item.id)]
@@ -72,23 +76,23 @@ class ChannelManager:
         *,
         provider: str,
         payload: dict[str, Any],
+        raw_body: bytes | None = None,
         channel_id: str | None = None,
         send: bool | None = None,
         headers: Mapping[str, str] | None = None,
+        require_signature: bool = False,
     ) -> ChannelProcessResult:
         channel = self._resolve_channel(provider=provider, channel_id=channel_id)
         if not channel.enabled:
             raise ChannelPayloadError(f"Channel is disabled: {channel.id}")
         channel = self._with_resolved_secrets(channel)
-        _verify_channel_signature(channel, payload, headers or {})
+        _verify_channel_signature(channel, raw_body or b"", headers or {}, require_signature=require_signature)
         adapter = self._adapter_for(channel.provider)
         inbound = adapter.parse_inbound(channel, payload)
         self._event("channel.receive", inbound.to_public_dict())
-        agent = self.agent_factory(self.config)
-        try:
+        with self._agent_lock:
+            agent = self._agent_for_hot_path()
             turn = agent.chat(inbound.text, session_id=inbound.session_id, source=inbound.to_turn_source())
-        finally:
-            agent.close()
 
         outbound = ChannelOutboundMessage(
             channel=inbound.channel,
@@ -121,6 +125,18 @@ class ChannelManager:
             },
         )
         return result
+
+    def close(self) -> None:
+        with self._agent_lock:
+            agent = self._agent
+            self._agent = None
+        if agent is not None:
+            agent.close()
+
+    def _agent_for_hot_path(self) -> NestedMV2Agent:
+        if self._agent is None:
+            self._agent = self.agent_factory(self.config)
+        return self._agent
 
     def _resolve_channel(self, *, provider: str, channel_id: str | None) -> ChannelEndpointConfig:
         if channel_id:
@@ -222,29 +238,105 @@ def default_channel_configs() -> list[ChannelEndpointConfig]:
 
 def _verify_channel_signature(
     channel: ChannelEndpointConfig,
-    payload: dict[str, Any],
+    raw_body: bytes,
     headers: Mapping[str, str],
+    *,
+    require_signature: bool = False,
 ) -> None:
     secret_env = channel.settings.get("signature_secret_env")
     if not isinstance(secret_env, str) or not secret_env.strip():
+        if require_signature and not _unsigned_allowed(channel):
+            raise ChannelPayloadError("Unsigned webhooks are disabled for this public endpoint.")
         return
     secret = _channel_secret_value(channel, secret_env.strip())
     if not secret:
         raise ChannelPayloadError(f"Missing webhook signature secret environment variable: {secret_env}")
-    header_name = str(channel.settings.get("signature_header") or "x-kestrel-signature").lower()
-    supplied = ""
-    for key, value in headers.items():
-        if str(key).lower() == header_name:
-            supplied = str(value).strip()
-            break
+    provider = str(channel.settings.get("signature_provider") or channel.provider).strip().lower()
+    if provider == "discord":
+        _verify_discord_signature(channel, raw_body, headers)
+        return
+    if provider == "stripe":
+        _verify_stripe_signature(secret, raw_body, headers, channel)
+        return
+    header_name = _signature_header_name(channel, provider)
+    supplied = _header(headers, header_name)
     if not supplied:
         raise ChannelPayloadError(f"Missing webhook signature header: {header_name}")
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    expected = hmac.new(secret.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
+    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
     if supplied.startswith("sha256="):
         supplied = supplied.removeprefix("sha256=")
     if not hmac.compare_digest(supplied, expected):
         raise ChannelPayloadError("Invalid webhook signature.")
+
+
+def _signature_header_name(channel: ChannelEndpointConfig, provider: str) -> str:
+    configured = channel.settings.get("signature_header")
+    if isinstance(configured, str) and configured.strip():
+        return configured.strip().lower()
+    if provider == "github":
+        return "x-hub-signature-256"
+    return "x-kestrel-signature"
+
+
+def _verify_stripe_signature(secret: str, raw_body: bytes, headers: Mapping[str, str], channel: ChannelEndpointConfig) -> None:
+    supplied = _header(headers, "stripe-signature")
+    if not supplied:
+        raise ChannelPayloadError("Missing webhook signature header: stripe-signature")
+    fields: dict[str, list[str]] = {}
+    for part in supplied.split(","):
+        key, _, value = part.partition("=")
+        if key and value:
+            fields.setdefault(key.strip(), []).append(value.strip())
+    timestamp_text = fields.get("t", [""])[0]
+    signatures = fields.get("v1", [])
+    try:
+        timestamp = int(timestamp_text)
+    except ValueError as exc:
+        raise ChannelPayloadError("Invalid Stripe signature timestamp.") from exc
+    tolerance = int(channel.settings.get("stripe_tolerance_seconds", 300))
+    if abs(int(time.time()) - timestamp) > tolerance:
+        raise ChannelPayloadError("Stripe signature timestamp is outside the tolerance window.")
+    signed_payload = str(timestamp).encode("utf-8") + b"." + raw_body
+    expected = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
+    if not any(hmac.compare_digest(signature, expected) for signature in signatures):
+        raise ChannelPayloadError("Invalid webhook signature.")
+
+
+def _verify_discord_signature(channel: ChannelEndpointConfig, raw_body: bytes, headers: Mapping[str, str]) -> None:
+    public_key = str(channel.settings.get("discord_public_key") or "").strip()
+    if not public_key:
+        raise ChannelPayloadError("Discord webhook signatures require settings.discord_public_key; HMAC secrets are not supported.")
+    timestamp = _header(headers, "x-signature-timestamp")
+    supplied = _header(headers, "x-signature-ed25519")
+    if not timestamp or not supplied:
+        raise ChannelPayloadError("Missing Discord Ed25519 signature headers.")
+    try:
+        signing = __import__("nacl.signing", fromlist=["VerifyKey"])
+        exceptions = __import__("nacl.exceptions", fromlist=["BadSignatureError"])
+    except ImportError as exc:
+        raise ChannelPayloadError("Discord signature verification requires the optional PyNaCl package.") from exc
+    try:
+        verify_key = signing.VerifyKey(bytes.fromhex(public_key))
+        verify_key.verify(timestamp.encode("utf-8") + raw_body, bytes.fromhex(supplied))
+    except (ValueError, exceptions.BadSignatureError) as exc:
+        raise ChannelPayloadError("Invalid webhook signature.") from exc
+
+
+def _header(headers: Mapping[str, str], name: str) -> str:
+    lowered = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == lowered:
+            return str(value).strip()
+    return ""
+
+
+def _unsigned_allowed(channel: ChannelEndpointConfig) -> bool:
+    value = channel.settings.get("unsigned_allowed", False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def _channel_secret_names(channel: ChannelEndpointConfig) -> list[str]:

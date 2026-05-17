@@ -7,6 +7,8 @@ from nested_memvid_agent.context_frames import (
     content_hash_for,
     estimate_tokens,
     from_memory_record,
+    make_conflict_set_frame,
+    make_correction_frame,
     to_memory_record,
 )
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
@@ -74,3 +76,25 @@ def test_parent_child_metadata_preserved_from_record() -> None:
     assert frame.parent_ids == ("summary_1",)
     assert frame.child_ids == ("line_1", "line_2")
     assert frame.source_uri == "tool://shell.run"
+
+
+def test_correction_and_conflict_frames_preserve_links() -> None:
+    correction = make_correction_frame(
+        target_record_id="fact-1",
+        layer=MemoryLayer.SEMANTIC,
+        correction_text="Feature alpha is not enabled.",
+        evidence=[],
+    )
+    conflict = make_conflict_set_frame(
+        layer=MemoryLayer.SEMANTIC,
+        conflict_group_id="conflict-feature-alpha",
+        member_ids=("fact-1", correction.id),
+        reason="polarity mismatch",
+    )
+
+    assert correction.frame_type == "correction"
+    assert correction.parent_ids == ("fact-1",)
+    assert correction.metadata["corrects"] == ["fact-1"]
+    assert conflict.frame_type == "conflict_set"
+    assert conflict.metadata["conflict_group_id"] == "conflict-feature-alpha"
+    assert conflict.parent_ids == ("fact-1", correction.id)

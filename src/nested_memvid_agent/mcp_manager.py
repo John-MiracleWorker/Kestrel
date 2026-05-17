@@ -41,6 +41,7 @@ class MCPServerConfig:
     enabled: bool = True
     tools: tuple[dict[str, Any], ...] = ()
     risk_policy: str = MCP_DEFAULT_RISK_POLICY
+    vetting: dict[str, Any] | None = None
 
 
 class MCPManager:
@@ -102,6 +103,10 @@ class MCPManager:
                     return {"ok": True, "message": "Static MCP tool manifest is available.", "server": self.state.upsert_mcp_server(row)}
                 raise ValueError("MCP server has no command or URL to connect.")
             prefer_static = _prefer_static_manifest(row)
+            _validate_stdio_command_hash(row)
+            approval_result = self._connect_approval_result(row, latency_ms=_elapsed_ms(started))
+            if approval_result is not None:
+                return approval_result
             tools = self._discover_tools(server, prefer_static=prefer_static)
             row["tools"] = tools
             row["status"] = "online"
@@ -119,6 +124,22 @@ class MCPManager:
             self._close_session(server_id)
             server_row = self._mark_error(row, exc, latency_ms=_elapsed_ms(started))
             return {"ok": False, "message": str(server_row["error"]), "server": server_row}
+
+    def approve_server_connect(self, server_id: str) -> dict[str, Any]:
+        row = self.state.get_mcp_server(server_id)
+        _validate_stdio_command_hash(row)
+        vetting = dict(row.get("vetting", {}) or {})
+        expected_hash = vetting.get("stdio_command_hash")
+        vetting["connect_approved"] = True
+        vetting["connect_approved_at"] = _now()
+        if isinstance(expected_hash, str) and expected_hash:
+            vetting["connect_approved_command_hash"] = expected_hash
+        row["vetting"] = vetting
+        if row.get("status") == "approval_required":
+            row["status"] = "configured"
+            row["session_state"] = "disconnected"
+            row["error"] = None
+        return self.state.upsert_mcp_server(row)
 
     def disconnect_server(self, server_id: str) -> dict[str, Any]:
         row = self.state.get_mcp_server(server_id)
@@ -148,6 +169,10 @@ class MCPManager:
                     return {"ok": True, "message": "Static manifest is healthy.", "server": self.state.upsert_mcp_server(row)}
                 raise ValueError("MCP server has no command or URL to check.")
             prefer_static = _prefer_static_manifest(row)
+            _validate_stdio_command_hash(row)
+            approval_result = self._connect_approval_result(row, latency_ms=_elapsed_ms(started))
+            if approval_result is not None:
+                return approval_result
             tools = self._discover_tools(server, prefer_static=prefer_static)
             row["tools"] = tools
             row["status"] = "online"
@@ -170,6 +195,10 @@ class MCPManager:
         started = time.monotonic()
         try:
             prefer_static = _prefer_static_manifest(server)
+            _validate_stdio_command_hash(server)
+            approval_result = self._connect_approval_result(server, latency_ms=_elapsed_ms(started))
+            if approval_result is not None:
+                return dict(approval_result["server"])
             tools = self._discover_tools(_server_from_state(server), prefer_static=prefer_static)
             server["tools"] = tools
             server["status"] = "synced"
@@ -228,6 +257,32 @@ class MCPManager:
         row = self.state.get_mcp_server(server_id)
         server = _server_from_state(row)
         remote_name = _remote_name_for(row, tool_name)
+        try:
+            _validate_stdio_command_hash(row)
+            approval_result = self._connect_approval_result(row, latency_ms=0)
+            if approval_result is not None:
+                return ToolExecution(
+                    call=ToolCall(name=f"mcp.{server.id}.{remote_name}", arguments=arguments),
+                    success=False,
+                    content="MCP connect approval required.",
+                    data={"server_id": server.id, "session_state": "approval_required"},
+                    error="mcp_connect_approval_required",
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._close_session(server_id)
+            row["last_error_at"] = _now()
+            row["status"] = "error"
+            row["session_state"] = "error"
+            row["error"] = f"{type(exc).__name__}: {exc}"
+            row["failure_count"] = int(row.get("failure_count", 0)) + 1
+            self.state.upsert_mcp_server(row)
+            return ToolExecution(
+                call=ToolCall(name=f"mcp.{server.id}.{remote_name}", arguments=arguments),
+                success=False,
+                content=str(row["error"]),
+                data={"server_id": server.id, "session_state": "error"},
+                error="mcp_tool_failed",
+            )
         execution = self.call_tool(server, remote_name, arguments)
         row["last_call_at"] = _now()
         row["last_latency_ms"] = execution.data.get("latency_ms")
@@ -245,6 +300,15 @@ class MCPManager:
             row["failure_count"] = int(row.get("failure_count", 0)) + 1
         self.state.upsert_mcp_server(row)
         return execution
+
+    def _connect_approval_result(self, row: dict[str, Any], *, latency_ms: int) -> dict[str, Any] | None:
+        if not _connect_requires_approval(row):
+            return None
+        row["status"] = "approval_required"
+        row["session_state"] = "approval_required"
+        row["error"] = "MCP connect approval required."
+        row["last_latency_ms"] = latency_ms
+        return {"ok": False, "message": "MCP connect approval required.", "server": self.state.upsert_mcp_server(row)}
 
     def _discover_tools(self, server: MCPServerConfig, *, prefer_static: bool = False) -> list[dict[str, Any]]:
         if prefer_static or not _has_live_endpoint(server):
@@ -300,6 +364,7 @@ class MCPToolAdapter(AgentTool):
             source="mcp",
             server_id=server.id,
             capabilities=tuple(str(item) for item in tool.get("capabilities", ["mcp"])),
+            produces_validation=bool(tool.get("produces_validation", False)),
         )
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
@@ -486,12 +551,13 @@ def _normalize_server(payload: dict[str, Any]) -> MCPServerConfig:
         enabled=bool(payload.get("enabled", True)),
         tools=tuple(dict(item) for item in payload.get("tools", [])),
         risk_policy=_normalize_risk_policy(payload.get("risk_policy", MCP_DEFAULT_RISK_POLICY)),
+        vetting=dict(payload.get("vetting", {}) or {}),
     )
 
 
 def _server_to_dict(server: MCPServerConfig) -> dict[str, Any]:
     vetted_tools = [_normalize_tool(server, tool) for tool in server.tools]
-    vetting = _vetting_for_server(server, vetted_tools)
+    vetting = {**dict(server.vetting or {}), **_vetting_for_server(server, vetted_tools)}
     return {
         "id": server.id,
         "name": server.name,
@@ -526,6 +592,7 @@ def _server_from_state(row: dict[str, Any]) -> MCPServerConfig:
         enabled=bool(row.get("enabled", True)),
         tools=tuple(dict(item) for item in row.get("tools", [])),
         risk_policy=_normalize_risk_policy(row.get("risk_policy", MCP_DEFAULT_RISK_POLICY)),
+        vetting=dict(row.get("vetting", {}) or {}),
     )
 
 
@@ -540,6 +607,7 @@ def _normalize_tool(server: MCPServerConfig, tool: dict[str, Any]) -> dict[str, 
         "risk": risk,
         "requires_approval": requires_approval,
         "capabilities": list(tool.get("capabilities", ["mcp"])),
+        "produces_validation": bool(tool.get("produces_validation", False)),
     }
 
 
@@ -576,6 +644,7 @@ def _normalize_sdk_tool(server: MCPServerConfig, tool: Any) -> dict[str, Any]:
         "risk": risk,
         "requires_approval": requires_approval,
         "capabilities": ["mcp"],
+        "produces_validation": False,
     }
 
 
@@ -750,6 +819,38 @@ def _validate_stdio_command(server: MCPServerConfig) -> None:
     shell_names = {"sh", "bash", "zsh", "fish", "csh", "tcsh", "ksh", "dash", "pwsh", "powershell", "cmd"}
     if command_name in shell_names:
         raise ValueError("MCP stdio shell launchers are not allowed.")
+
+
+def _validate_stdio_command_hash(row: dict[str, Any]) -> None:
+    vetting = row.get("vetting")
+    if not isinstance(vetting, dict):
+        return
+    expected = vetting.get("stdio_command_hash")
+    if not isinstance(expected, str) or not expected:
+        return
+    actual = _stdio_command_hash(row.get("command"), row.get("args", []))
+    if actual != expected:
+        raise ValueError("MCP stdio command hash mismatch; refusing to connect.")
+
+
+def _connect_requires_approval(row: dict[str, Any]) -> bool:
+    vetting = row.get("vetting")
+    if not isinstance(vetting, dict):
+        return False
+    if not bool(vetting.get("connect_requires_approval")):
+        return False
+    if not bool(vetting.get("connect_approved")):
+        return True
+    expected = vetting.get("stdio_command_hash")
+    if not isinstance(expected, str) or not expected:
+        return False
+    return vetting.get("connect_approved_command_hash") != expected
+
+
+def _stdio_command_hash(command: object, args: object) -> str:
+    arg_list = [str(item) for item in args] if isinstance(args, list) else [str(item) for item in args] if isinstance(args, tuple) else []
+    payload = json.dumps({"command": "" if command is None else str(command), "args": arg_list}, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _validate_network_url(url: str) -> None:

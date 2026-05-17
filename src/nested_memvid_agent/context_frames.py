@@ -17,6 +17,7 @@ ALLOWED_FRAME_TYPES = frozenset(
         "failure_note",
         "correction",
         "conflict_set",
+        "self_model",
         "trace_stub",
     }
 )
@@ -124,6 +125,71 @@ def to_memory_record(frame: MV2ContextFrame) -> MemoryRecord:
         importance=frame.importance,
         created_at=frame.created_at,
         updated_at=frame.updated_at,
+    )
+
+
+def make_correction_frame(
+    *,
+    target_record_id: str,
+    layer: MemoryLayer,
+    correction_text: str,
+    evidence: list[EvidenceRef],
+    title: str = "Memory correction",
+) -> MV2ContextFrame:
+    text = correction_text.strip()
+    if not text:
+        raise ValueError("correction_text cannot be empty")
+    frame_id = f"correction_{content_hash_for(target_record_id + text)[:16]}"
+    metadata = {
+        "corrects": [target_record_id],
+        "evidence_refs": [ref.__dict__ for ref in evidence],
+        "validation_status": "correction_written",
+    }
+    return MV2ContextFrame(
+        id=frame_id,
+        frame_type="correction",
+        title=title,
+        content=text,
+        layer=layer,
+        kind=MemoryKind.CORRECTION,
+        parent_ids=(target_record_id,),
+        source_uri=evidence[0].source if evidence else "memory.correct",
+        source_span={"locator": evidence[0].locator} if evidence else {},
+        confidence=0.86,
+        importance=0.82,
+        metadata=metadata,
+    )
+
+
+def make_conflict_set_frame(
+    *,
+    layer: MemoryLayer,
+    conflict_group_id: str,
+    member_ids: tuple[str, ...],
+    reason: str,
+) -> MV2ContextFrame:
+    if not member_ids:
+        raise ValueError("member_ids cannot be empty")
+    content = (
+        f"Conflict group {conflict_group_id} requires review. "
+        f"Reason: {reason}. Members: {', '.join(member_ids)}."
+    )
+    frame_id = f"conflict_set_{content_hash_for(conflict_group_id + '|'.join(member_ids))[:16]}"
+    return MV2ContextFrame(
+        id=frame_id,
+        frame_type="conflict_set",
+        title=f"Conflict set: {conflict_group_id}",
+        content=content,
+        layer=layer,
+        kind=MemoryKind.SUMMARY,
+        parent_ids=tuple(member_ids),
+        confidence=0.85,
+        importance=0.8,
+        metadata={
+            "conflict_group_id": conflict_group_id,
+            "conflict_member_ids": list(member_ids),
+            "conflict_reason": reason,
+        },
     )
 
 

@@ -28,9 +28,11 @@ NEST_AGENT_ENABLE_CHANNEL_DELIVERY=false
 NEST_AGENT_ENABLE_AUTO_CONSOLIDATION=false
 NEST_AGENT_AUTO_CONSOLIDATION_DRY_RUN=true
 NEST_AGENT_REQUIRE_API_AUTH=false
+NEST_AGENT_TRUSTED_HOSTS=127.0.0.1,localhost,::1,[::1]
+NEST_AGENT_CORS_ORIGINS=
 ```
 
-Do not loosen these in shared deployments without a separate approval and audit story.
+Do not loosen these in shared deployments without a separate approval and audit story. The local web server also rejects untrusted `Host` headers and cross-site `Origin` hosts by default; set `NEST_AGENT_TRUSTED_HOSTS` and `NEST_AGENT_CORS_ORIGINS` deliberately when running a split frontend or a non-loopback deployment.
 
 ## Network Binding
 
@@ -58,7 +60,9 @@ Clients may send either `Authorization: Bearer <token>` or `X-Kestrel-API-Key: <
 
 Use environment variables or the Secret Broker for provider/channel/tool credentials. Do not store secrets in `.mv2` files, `.nest/config`, checked-in fixtures, prompts, chat history, tool arguments visible to the model, traces, or MCP server manifests.
 
-The Secret Broker lets a trusted backend/UI flow collect values through `POST /api/secrets` and returns metadata only: name, purpose, `secret://...` reference, configured state, validation status, timestamps, and a non-reversible fingerprint. No GET route returns raw values. The local file vault is owner-readable only (`0600`) and is a local-first development substrate; production deployments should back the same broker contract with an OS keychain or managed vault.
+The Secret Broker lets a trusted backend/UI flow collect values through `POST /api/secrets` and returns metadata only: name, purpose, `secret://...` reference, configured state, validation status, timestamps, and a salted non-reversible fingerprint. No GET route returns raw values. The default local file vault is a `chmod 0600` JSON file and assumes a non-shared, single-user machine. Set `NEST_AGENT_SECRET_BACKEND=keyring` or `--secret-backend keyring` to store raw values in the OS keyring while keeping only metadata in the JSON vault; if the optional `keyring` package is unavailable, Kestrel falls back to the local JSON vault. Shared environments should back the same broker contract with an OS keychain or managed vault such as macOS Keychain, Linux Secret Service via `keyring`, Windows DPAPI, or a managed secret store.
+
+Secret status checks only report environment-variable configured state for names registered by channel or MCP configuration. They do not probe arbitrary env var names.
 
 MCP manifests must reference secret material through `secret_env`, where each target process variable maps to a host environment variable or `secret://...` reference. Raw secret-looking keys in MCP `env` are rejected, API responses redact `secret_env`, and values are resolved into the child process environment only at launch.
 
@@ -68,11 +72,11 @@ Logs and run events redact common API key, bearer token, password, authorization
 
 High-risk tools require explicit config enablement where applicable and exact-call approval. Approval is tied to the requested tool-call ID and arguments; changed arguments require a new approval. Shell execution, file writes, patching, repair mutations, git commits, Codex CLI execution, channel delivery, executable skills, memory imports, plugin install/update/enable, and policy memory writes are not production-safe defaults.
 
-Self-improvement is local-first. Kestrel may write validated lessons to local `.mv2` memory, prepare local branches/worktrees, create patches, and run validation. `git.create_local_branch` and `git.export_patch` are approval-gated local-only primitives. Remote publishing is a separate lane: direct commits to protected branches, direct pushes to upstream `main`, force pushes, tag pushes, remote rewrites, repo setting edits, GitHub secrets, and workflow enablement are disabled by default. The default tool registry does not include `git.push`; shell execution also blocks common remote-publishing escape routes such as `git push`, `git tag`, `git remote set-url`, `gh repo edit`, `gh secret set`, `gh workflow enable`, `rm -rf .git`, and writes to `.git/config`.
+Self-improvement is local-first. Kestrel may write validated lessons to local `.mv2` memory, prepare local branches/worktrees, create patches, and run validation. `git.create_local_branch` and `git.export_patch` are approval-gated local-only primitives. Remote publishing is a separate lane: direct commits to protected branches, direct pushes to upstream `main`, force pushes, tag pushes, remote rewrites, repo setting edits, GitHub secrets, and workflow enablement are disabled by default. The default tool registry does not include `git.push`; `shell.run` is limited to minimal introspection commands and structurally blocks remote-publishing argv shapes such as `git push`, `git tag`, `git remote set-url`, `gh repo edit`, `gh secret set`, and `gh workflow enable`.
 
 Skill installation is a high-risk file-write action. Uploaded skill capsules are confined to the configured skills directory, validated by manifest shape, and still require approval before installation. Executable skill runtimes such as `python`, `shell`, and future `container` runtimes are always forced to high risk, require exact approval, and require `NEST_AGENT_ALLOW_EXECUTABLE_SKILLS=true` or `--allow-executable-skills`; a manifest cannot downgrade that policy.
 
-Plugin installation is high risk: it fetches public GitHub repositories and materializes skills/MCP entries. CLI/API install, update, enable, and sync/materialization routes are disabled unless `NEST_AGENT_ALLOW_PLUGIN_INSTALL=true` or `--allow-plugin-install` is set. Agent-initiated `plugin.install` has the same enablement gate and still requires exact-call approval before execution. Installed plugins are not enabled by default unless explicitly requested, and plugin updates reject manifest ID drift.
+Plugin installation is high risk: it fetches public GitHub repositories and materializes skills/MCP entries. CLI/API install, update, enable, and sync/materialization routes are disabled unless `NEST_AGENT_ALLOW_PLUGIN_INSTALL=true` or `--allow-plugin-install` is set. Agent-initiated `plugin.install` has the same enablement gate and still requires exact-call approval before execution. Installed plugins are not enabled by default unless explicitly requested, and plugin updates reject manifest ID drift. Plugin-provided MCP stdio servers are restricted to conservative launchers (`npx`, `uvx`, `python -m`, `node`, `bunx`, `deno`) with validated args, and Kestrel stores a command/args hash so later tampering is refused before connect. Plugin-provided MCP servers also require explicit connect approval through `POST /api/mcp/servers/{server_id}/approve-connect` before the first connect/test/sync/invoke path may start the process.
 
 Autonomous scheduling is disabled by default. When enabled, it is bounded by per-cycle task and cycle limits, and it stops at task approval or exact-call tool approval boundaries instead of silently crossing into high-risk work.
 
@@ -80,7 +84,9 @@ Repair branch commits require a current `repair.review` artifact tied to a succe
 
 ## Webhooks
 
-Generic/custom channel endpoints can require HMAC-SHA256 signatures by setting channel `settings.signature_secret_env`. The signature is computed over canonical JSON and sent in `X-Kestrel-Signature` as either a hex digest or `sha256=<digest>`.
+Public channel webhook endpoints reject unsigned payloads by default. Set channel `settings.unsigned_allowed=true` only for deliberately private or already-authenticated ingress.
+
+Generic/custom channel endpoints can require HMAC-SHA256 signatures by setting channel `settings.signature_secret_env`. The signature is computed over the raw HTTP body bytes and sent in `X-Kestrel-Signature` as either a hex digest or `sha256=<digest>`. GitHub uses `X-Hub-Signature-256`; Stripe uses `Stripe-Signature` with timestamp tolerance; Discord uses Ed25519 and requires `settings.discord_public_key` plus optional PyNaCl support, not an HMAC secret.
 
 An explicit unknown `channel_id` is rejected instead of being treated as an ephemeral local channel. This keeps signed webhook configuration from being bypassed by choosing a new ID.
 

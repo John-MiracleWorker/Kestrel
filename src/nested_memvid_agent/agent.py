@@ -28,6 +28,7 @@ from .runtime_models import (
     ToolSpec,
     TurnSource,
 )
+from .summarization import HeuristicSummarizer, LLMSummarizer, TurnSummarizer
 from .tools.base import ApprovalHandler, ToolContext
 from .tools.registry import ToolRegistry
 
@@ -61,6 +62,7 @@ class NestedMV2Agent:
             ),
         )
         self.system_prompt = _load_system_prompt()
+        self.turn_summarizer: TurnSummarizer = LLMSummarizer(self.llm) if self.config.llm_turn_summaries else HeuristicSummarizer()
 
     def chat(
         self,
@@ -356,7 +358,7 @@ class NestedMV2Agent:
                         layer=MemoryLayer.WORKING,
                         kind=MemoryKind.EVENT if execution.success else MemoryKind.FAILURE,
                         title=f"Tool result: {call.name}",
-                        content=execution.content[:4000],
+                        content=_tool_memory_content(execution.content),
                         frame_type="raw_chunk" if execution.success else "failure_note",
                         frame_id=tool_frame_id,
                         confidence=0.7 if execution.success else 0.65,
@@ -374,7 +376,7 @@ class NestedMV2Agent:
                 )
                 if lesson_manager is not None and proof is not None:
                     if execution.success:
-                        if _is_validation_success(execution):
+                        if _is_validation_success(execution, self.tools.spec_for(execution.call.name)):
                             proof.validation_evidence.append(_validation_evidence(execution))
                             if pending_failures and call.strategy is not None:
                                 for failure in pending_failures:
@@ -478,7 +480,7 @@ class NestedMV2Agent:
                 layer=MemoryLayer.EPISODIC,
                 kind=MemoryKind.SUMMARY,
                 title="Conversation turn summary",
-                content=f"User: {user_message}\nAssistant: {final_content}",
+                content=self.turn_summarizer.summarize(user_message, executions, final_content),
                 frame_type="session_summary",
                 frame_id=summary_frame_id,
                 confidence=0.7,
@@ -489,7 +491,10 @@ class NestedMV2Agent:
                 source=source,
             )
         )
-        self.memory.seal_all()
+        self.memory.maybe_seal_all(
+            write_threshold=self.config.memory_seal_write_threshold,
+            interval_seconds=self.config.memory_seal_interval_seconds,
+        )
         self._event(
             "turn.end",
             {
@@ -666,8 +671,15 @@ def _looks_like_correction(text: str) -> bool:
     lowered = text.strip().lower()
     if not lowered:
         return False
-    markers = ("correction:", "correcting myself", "actually,", "i meant", "remember:")
-    return any(marker in lowered for marker in markers) and "correction" in lowered
+    markers = (
+        "correction:",
+        "correcting myself",
+        "i meant to say",
+        "let me correct that",
+        "to clarify:",
+        "remember:",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 def _context_with_preflight_lessons(context_prompt: str, lessons: list[dict[str, Any]]) -> str:
@@ -691,14 +703,15 @@ def _tool_failure_text(execution: ToolExecution) -> str:
     return "\n".join(parts).strip() or "unknown tool failure"
 
 
-def _is_validation_success(execution: ToolExecution) -> bool:
+def _is_validation_success(execution: ToolExecution, spec: ToolSpec | None = None) -> bool:
     if not execution.success:
         return False
-    name = execution.call.name.lower()
-    if any(marker in name for marker in ("validate", "validation", "test.run", "lint.run")):
-        return True
     validation = execution.data.get("validation")
-    return isinstance(validation, dict) and validation.get("success") is True
+    if isinstance(validation, dict):
+        return validation.get("success") is True
+    if spec is not None and spec.produces_validation:
+        return True
+    return False
 
 
 def _validation_evidence(execution: ToolExecution) -> str:
@@ -709,7 +722,14 @@ def _validation_evidence(execution: ToolExecution) -> str:
         command_text = command
     else:
         command_text = execution.call.name
-    return f"{command_text}: {execution.content[:500]}"
+    return f"{command_text}: success; tool_call_id={execution.call.id}; content_chars={len(execution.content)}"
+
+
+def _tool_memory_content(content: str) -> str:
+    max_chars = 1_000_000
+    if len(content) <= max_chars:
+        return content
+    return content[:max_chars] + f"\n[TRUNCATED_TOOL_OUTPUT total_chars={len(content)}]"
 
 
 def _provider_error_payload(exc: ProviderError) -> dict[str, object]:

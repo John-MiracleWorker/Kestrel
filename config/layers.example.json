@@ -7,8 +7,14 @@
     "context_budget_chars": 3500,
     "min_write_confidence": 0.2,
     "promotion_threshold": 0.65,
+    "min_repeat_count_for_promotion": 1,
     "retention_days": 2,
-    "search_mode": "lex"
+    "search_mode": "lex",
+    "vector": {
+      "enabled": false,
+      "embedding_provider": null,
+      "index_path": null
+    }
   },
   "episodic": {
     "description": "Meaningful events, tool results, failures, decisions, session summaries.",
@@ -17,9 +23,15 @@
     "retrieval_k": 8,
     "context_budget_chars": 4500,
     "min_write_confidence": 0.5,
-    "promotion_threshold": 0.75,
+    "promotion_threshold": 0.65,
+    "min_repeat_count_for_promotion": 1,
     "retention_days": 90,
-    "search_mode": "auto"
+    "search_mode": "auto",
+    "vector": {
+      "enabled": false,
+      "embedding_provider": null,
+      "index_path": null
+    }
   },
   "semantic": {
     "description": "Stable facts about codebases, APIs, users, projects, and domains.",
@@ -28,9 +40,15 @@
     "retrieval_k": 8,
     "context_budget_chars": 4500,
     "min_write_confidence": 0.75,
-    "promotion_threshold": 0.85,
+    "promotion_threshold": 0.78,
+    "min_repeat_count_for_promotion": 1,
     "retention_days": 365,
-    "search_mode": "auto"
+    "search_mode": "auto",
+    "vector": {
+      "enabled": false,
+      "embedding_provider": null,
+      "index_path": null
+    }
   },
   "procedural": {
     "description": "Reusable methods, debug recipes, known workflows, tool-use skills.",
@@ -39,9 +57,32 @@
     "retrieval_k": 6,
     "context_budget_chars": 4000,
     "min_write_confidence": 0.82,
-    "promotion_threshold": 0.9,
+    "promotion_threshold": 0.78,
+    "min_repeat_count_for_promotion": 2,
     "retention_days": 365,
-    "search_mode": "auto"
+    "search_mode": "auto",
+    "vector": {
+      "enabled": false,
+      "embedding_provider": null,
+      "index_path": null
+    }
+  },
+  "self": {
+    "description": "Validated self-model, identity, capability snapshots, and user-specific workflow preferences.",
+    "mv2_file": "self.mv2",
+    "update_cadence": "validated_self_reflection",
+    "retrieval_k": 6,
+    "context_budget_chars": 3500,
+    "min_write_confidence": 0.78,
+    "promotion_threshold": 0.78,
+    "min_repeat_count_for_promotion": 1,
+    "retention_days": 365,
+    "search_mode": "auto",
+    "vector": {
+      "enabled": false,
+      "embedding_provider": null,
+      "index_path": null
+    }
   },
   "policy": {
     "description": "Slow-changing behavior rules and safety constraints. Write rarely.",
@@ -51,7 +92,13 @@
     "context_budget_chars": 3000,
     "min_write_confidence": 0.95,
     "promotion_threshold": 0.97,
+    "min_repeat_count_for_promotion": 5,
     "retention_days": 730,
-    "search_mode": "lex"
+    "search_mode": "lex",
+    "vector": {
+      "enabled": false,
+      "embedding_provider": null,
+      "index_path": null
+    }
   }
 }

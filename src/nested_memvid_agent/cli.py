@@ -19,6 +19,7 @@ from .config import AgentConfig
 from .context_compiler import ContextCompiler
 from .context_packer import ContextPacker, ContextPackRequest
 from .event_bus import RunEventBus
+from .layers import load_layer_specs
 from .mcp_manager import MCPManager
 from .models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from .orchestrator import build_memory_system
@@ -35,6 +36,7 @@ from .tools.builtin import build_default_tools
 def _add_common_args(parser: argparse.ArgumentParser, *, default: object = argparse.SUPPRESS) -> None:
     parser.add_argument("--backend", choices=["memory", "memvid"], default=default)
     parser.add_argument("--memory-dir", type=Path, default=default)
+    parser.add_argument("--layer-config", type=Path, default=default)
 
 
 def _add_agent_args(parser: argparse.ArgumentParser) -> None:
@@ -58,6 +60,7 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--log-dir", type=Path, default=Path(".nest/logs"))
     parser.add_argument("--state-path", type=Path, default=Path(".nest/state/agent.db"))
     parser.add_argument("--secret-store-path", type=Path, default=Path(".nest/secrets/local_vault.json"))
+    parser.add_argument("--secret-backend", choices=["json", "keyring"], default="json")
     parser.add_argument("--skills-dir", type=Path, default=Path(".nest/skills"))
     parser.add_argument("--plugins-dir", type=Path, default=Path(".nest/plugins"))
     parser.add_argument("--mcp-config", type=Path, default=Path(".nest/config/mcp_servers.json"))
@@ -97,6 +100,8 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--disable-task-capsules", action="store_true")
     parser.add_argument("--enable-auto-consolidation", action="store_true")
     parser.add_argument("--auto-consolidation-write", action="store_true")
+    parser.add_argument("--enable-auto-compact", action="store_true")
+    parser.add_argument("--auto-compact-apply", action="store_true")
     parser.add_argument("--context-pack-token-budget", type=int, default=6000)
     parser.add_argument("--context-pack-expand-raw", action="store_true")
 
@@ -138,6 +143,7 @@ def main() -> None:
     _add_common_args(memory_inspect)
     memory_inspect.add_argument("query")
     memory_inspect.add_argument("--k", type=int, default=8)
+    memory_inspect.add_argument("--include-inactive", action="store_true")
     memory_consolidate = memory_sub.add_parser("consolidate")
     _add_common_args(memory_consolidate)
     memory_consolidate.add_argument("query")
@@ -146,6 +152,17 @@ def main() -> None:
     memory_consolidate.add_argument("--repeat-count", type=int, default=1)
     memory_consolidate.add_argument("--explicit-instruction", action="store_true")
     memory_consolidate.add_argument("--dry-run", action="store_true")
+    memory_correct = memory_sub.add_parser("correct")
+    _add_common_args(memory_correct)
+    memory_correct.add_argument("target_record_id")
+    memory_correct.add_argument("correction_text")
+    memory_correct.add_argument("--evidence-source", default="cli")
+    memory_correct.add_argument("--evidence-locator", default="memory.correct")
+    memory_correct.add_argument("--dry-run", action="store_true")
+    memory_compact = memory_sub.add_parser("compact")
+    _add_common_args(memory_compact)
+    memory_compact.add_argument("--layer", choices=[layer.value for layer in MemoryLayer], default=MemoryLayer.WORKING.value)
+    memory_compact.add_argument("--apply", action="store_true")
 
     compile_cmd = sub.add_parser("compile-context")
     _add_common_args(compile_cmd)
@@ -390,11 +407,17 @@ def main() -> None:
         _run_eval_command(args, backend=backend, memory_dir=memory_dir)
         return
 
-    memory = build_memory_system(backend, memory_dir)
+    memory = build_memory_system(backend, memory_dir, specs=_specs_from_args(args))
     try:
         if args.cmd == "memory":
             if args.memory_cmd in {"search", "inspect"}:
-                hits = memory.retrieve(RetrievalQuery(query=args.query, k_per_layer=args.k))
+                hits = memory.retrieve(
+                    RetrievalQuery(
+                        query=args.query,
+                        k_per_layer=args.k,
+                        include_inactive=bool(getattr(args, "include_inactive", False)),
+                    )
+                )
                 for hit in hits:
                     memory_payload: dict[str, object] = {
                         "layer": hit.record.layer.value,
@@ -431,6 +454,53 @@ def main() -> None:
                             "repeat_count": args.repeat_count,
                             "explicit_instruction": args.explicit_instruction,
                             "dry_run": args.dry_run,
+                        },
+                    ),
+                    ToolContext(
+                        memory=memory,
+                        config=AgentConfig(backend=backend, memory_dir=memory_dir, workspace=Path(".")),
+                        workspace=Path("."),
+                        session_id="cli",
+                    ),
+                )
+                print(execution.content)
+                if not execution.success:
+                    raise SystemExit(1)
+                return
+            if args.memory_cmd == "correct":
+                execution = build_default_tools().execute(
+                    ToolCall(
+                        name="memory.correct",
+                        arguments={
+                            "target_record_id": args.target_record_id,
+                            "correction_text": args.correction_text,
+                            "evidence": [
+                                {
+                                    "source": args.evidence_source,
+                                    "locator": args.evidence_locator,
+                                }
+                            ],
+                            "dry_run": args.dry_run,
+                        },
+                    ),
+                    ToolContext(
+                        memory=memory,
+                        config=AgentConfig(backend=backend, memory_dir=memory_dir, workspace=Path(".")),
+                        workspace=Path("."),
+                        session_id="cli",
+                    ),
+                )
+                print(execution.content)
+                if not execution.success:
+                    raise SystemExit(1)
+                return
+            if args.memory_cmd == "compact":
+                execution = build_default_tools().execute(
+                    ToolCall(
+                        name="memory.compact",
+                        arguments={
+                            "layer": args.layer,
+                            "apply": args.apply,
                         },
                     ),
                     ToolContext(
@@ -503,10 +573,12 @@ def _agent_config_from_args(args: argparse.Namespace, *, backend: str, memory_di
         codex_ephemeral=not args.codex_persist_session,
         backend=backend,
         memory_dir=memory_dir,
+        layer_config_path=getattr(args, "layer_config", None),
         workspace=args.workspace,
         log_dir=args.log_dir,
         state_path=args.state_path,
         secret_store_path=args.secret_store_path,
+        secret_backend=args.secret_backend,
         skills_dir=args.skills_dir,
         plugins_dir=args.plugins_dir,
         mcp_config_path=args.mcp_config,
@@ -546,9 +618,16 @@ def _agent_config_from_args(args: argparse.Namespace, *, backend: str, memory_di
         enable_task_capsules=not args.disable_task_capsules,
         enable_auto_consolidation=args.enable_auto_consolidation,
         auto_consolidation_dry_run=not args.auto_consolidation_write,
+        enable_auto_compact=args.enable_auto_compact,
+        auto_compact_apply=args.auto_compact_apply,
         context_pack_token_budget=args.context_pack_token_budget,
         context_pack_expand_raw=args.context_pack_expand_raw,
     )
+
+
+def _specs_from_args(args: argparse.Namespace) -> dict[MemoryLayer, Any] | None:
+    layer_config = getattr(args, "layer_config", None)
+    return load_layer_specs(layer_config) if layer_config else None
 
 
 def _validate_server_bind(host: str, config: AgentConfig) -> None:
@@ -710,6 +789,7 @@ def _doctor_tool_config(config: AgentConfig) -> dict[str, Any]:
         "git_write_mode": config.git_write_mode,
         "protected_branches": list(config.protected_branches),
         "secret_store_path": str(config.secret_store_path),
+        "secret_backend": config.secret_backend,
         "allow_memory_import": config.allow_memory_import,
         "allow_executable_skills": config.allow_executable_skills,
         "allow_mcp_network_endpoints": config.allow_mcp_network_endpoints,
@@ -756,7 +836,8 @@ def _doctor_memory_runtime(config: AgentConfig, *, existed_before: bool) -> dict
 
     memory = None
     try:
-        memory = build_memory_system(config.backend, config.memory_dir)
+        specs = load_layer_specs(config.layer_config_path) if config.layer_config_path else None
+        memory = build_memory_system(config.backend, config.memory_dir, specs=specs)
         verify = {layer.value: ok for layer, ok in memory.verify_all().items()}
         report["verify"] = verify
         report["ok"] = all(verify.values())

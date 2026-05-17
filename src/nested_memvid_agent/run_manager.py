@@ -17,6 +17,7 @@ from .mcp_manager import MCPManager
 from .models import MemoryLayer
 from .nested_learning import NestedLearningKernel
 from .plugin_manager import PluginManager
+from .retention import RetentionCompactor
 from .runtime_models import AgentTurnResult, LLMStreamEvent, ToolCall, ToolExecution, ToolSpec
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore, RunRecord, TaskNodeRecord
@@ -26,7 +27,6 @@ from .tools.builtin import build_default_tools
 from .tools.registry import ToolRegistry
 from .tracing import SpanRecorder
 from .worker_isolation import prepare_git_worktree
-
 
 _TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 
@@ -908,6 +908,23 @@ class RunManager:
                     "decisions": decisions,
                 },
             )
+            if config.enable_auto_compact:
+                dry_run = not config.auto_compact_apply
+                reports = [
+                    RetentionCompactor(agent.memory).compact_layer(layer, dry_run=dry_run)
+                    for layer in (MemoryLayer.WORKING, MemoryLayer.EPISODIC)
+                ]
+                if not dry_run:
+                    agent.memory.seal_all()
+                self.events.publish(
+                    run_id,
+                    "memory.compact",
+                    {
+                        "enabled": True,
+                        "dry_run": dry_run,
+                        "reports": reports,
+                    },
+                )
         except Exception as exc:  # noqa: BLE001
             self.events.publish(run_id, "capsule.failed", {"error": f"{type(exc).__name__}: {exc}"})
 

@@ -9,6 +9,7 @@ from importlib import import_module
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .app_factory import build_agent
 from .channels import ChannelManager, ChannelPayloadError
@@ -20,7 +21,7 @@ from .models import MemoryLayer, RetrievalQuery
 from .orchestrator import build_memory_system
 from .plugin_manager import PluginError, PluginManager
 from .run_manager import RunManager
-from .secret_broker import SecretBroker, is_secret_ref
+from .secret_broker import build_secret_broker, is_secret_ref
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore
 
@@ -32,6 +33,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         fastapi_module = import_module("fastapi")
         responses_module = import_module("starlette.responses")
         staticfiles_module = import_module("starlette.staticfiles")
+        cors_module = import_module("starlette.middleware.cors")
         pydantic_module = import_module("pydantic")
     except ImportError as exc:
         raise RuntimeError("Install server extras with `pip install -e '.[server]'`.") from exc
@@ -46,9 +48,10 @@ def create_app(config: AgentConfig | None = None) -> Any:
     StreamingResponse = responses_module.StreamingResponse
     FileResponse = responses_module.FileResponse
     StaticFiles = staticfiles_module.StaticFiles
+    CORSMiddleware = cors_module.CORSMiddleware
 
     active_config = config or AgentConfig.from_env()
-    secret_broker = SecretBroker(active_config.secret_store_path)
+    secret_broker = build_secret_broker(active_config.secret_store_path, backend=active_config.secret_backend)
     state = AgentStateStore(active_config.state_path)
     events = RunEventBus(state)
     mcp = MCPManager(state, allow_network_endpoints=active_config.allow_mcp_network_endpoints, secret_resolver=secret_broker.resolve)
@@ -56,6 +59,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
     plugins = PluginManager(active_config.plugins_dir, state)
     runs = RunManager(config=active_config, state=state, events=events, mcp=mcp, skills=skills, plugins=plugins)
     channels = ChannelManager(active_config, secret_resolver=secret_broker.resolve)
+    secret_broker.register_allowed_env_names(_known_secret_env_names(channels.list_channels(), mcp.list_servers()))
 
     def require_api_auth(
         authorization: str | None = Header(default=None),
@@ -86,10 +90,27 @@ def create_app(config: AgentConfig | None = None) -> Any:
         headers = getattr(request, "headers", {})
         return headers if isinstance(headers, Mapping) else {}
 
-    def inspect_memory_payload(*, query: str | None, layers: list[str] | None, k: int) -> dict[str, object]:
+    async def _request_body(request: object) -> bytes:
+        body = getattr(request, "body", None)
+        if not callable(body):
+            raise ValueError("request body is unavailable")
+        raw = await body()
+        return raw if isinstance(raw, bytes) else bytes(raw)
+
+    def parse_json_body(raw: bytes) -> dict[str, Any]:
+        if not raw:
+            return {}
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("JSON body must be an object.")
+        return parsed
+
+    def inspect_memory_payload(*, query: str | None, layers: list[str] | None, k: int, include_inactive: bool = False) -> dict[str, object]:
         arguments: dict[str, object] = {"query": query.strip() if query and query.strip() else "memory", "k": _bounded_limit(k, default=20, maximum=100)}
         if layers:
             arguments["layers"] = layers
+        if include_inactive:
+            arguments["include_inactive"] = True
         execution = runs.invoke_tool(tool_name="memory.inspect", arguments=arguments, session_id="api")
         return _tool_response_payload(execution)
 
@@ -161,6 +182,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         try:
             yield
         finally:
+            channels.close()
             mcp.shutdown()
 
     app = FastAPI(
@@ -168,6 +190,27 @@ def create_app(config: AgentConfig | None = None) -> Any:
         lifespan=lifespan,
         dependencies=[Depends(require_api_auth)] if active_config.require_api_auth else [],
     )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(active_config.cors_origins),
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.middleware("http")  # type: ignore[untyped-decorator]
+    async def local_ingress_guard(request: Any, call_next: Any) -> Any:
+        headers = request_headers(request)
+        host = _hostname_from_header(str(headers.get("host", "")))
+        trusted_hosts = set(active_config.trusted_hosts)
+        if "0.0.0.0" not in trusted_hosts and "*" not in trusted_hosts and host not in trusted_hosts:
+            return responses_module.JSONResponse({"detail": "untrusted_host"}, status_code=400)
+        origin = str(headers.get("origin", "")).strip()
+        if origin:
+            origin_host = _hostname_from_url(origin)
+            if origin_host and "0.0.0.0" not in trusted_hosts and "*" not in trusted_hosts and origin_host not in trusted_hosts:
+                return responses_module.JSONResponse({"detail": "untrusted_origin"}, status_code=403)
+        return await call_next(request)
 
     class CreateRunRequest(BaseModel):  # type: ignore[valid-type,misc]
         message: str
@@ -239,15 +282,18 @@ def create_app(config: AgentConfig | None = None) -> Any:
         query: str
         layers: list[str] | None = None
         k: int = 8
+        include_inactive: bool = False
 
     class MemoryInspectAPIRequest(BaseModel):  # type: ignore[valid-type,misc]
         query: str | None = None
         layers: list[str] | None = None
         k: int = 20
+        include_inactive: bool = False
 
     class MemoryConsolidateRequest(BaseModel):  # type: ignore[valid-type,misc]
         query: str
         source_layer: str | None = None
+        validation_evidence: dict[str, Any] | None = None
         validation_score: float = 0.7
         repeat_count: int = 1
         explicit_instruction: bool = False
@@ -261,10 +307,21 @@ def create_app(config: AgentConfig | None = None) -> Any:
         target_layer: str | None = None
         confidence: float = 0.6
         importance: float = 0.5
+        validation_evidence: dict[str, Any] | None = None
         validation_score: float = 0.7
         repeat_count: int = 1
         explicit_instruction: bool = False
         dry_run: bool = False
+
+    class MemoryCorrectRequest(BaseModel):  # type: ignore[valid-type,misc]
+        target_record_id: str
+        correction_text: str
+        evidence: list[dict[str, Any]] = Field(default_factory=list)
+        dry_run: bool = False
+
+    class MemoryCompactRequest(BaseModel):  # type: ignore[valid-type,misc]
+        layer: str = "working"
+        apply: bool = False
 
     class SelfRememberRequest(BaseModel):  # type: ignore[valid-type,misc]
         title: str
@@ -397,6 +454,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 "web_max_results": active_config.web_max_results,
                 "web_max_bytes": active_config.web_max_bytes,
                 "web_backend": active_config.web_backend,
+                "secret_backend": active_config.secret_backend,
             },
             "paths": {
                 "workspace": str(active_config.workspace),
@@ -474,13 +532,17 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
     @app.post("/api/channels")  # type: ignore[untyped-decorator]
     def upsert_channel(request: ChannelConfigRequest) -> dict[str, object]:
-        return channel_public(channels.upsert_channel(request.model_dump()))
+        channel = channels.upsert_channel(request.model_dump())
+        secret_broker.register_allowed_env_names(_known_secret_env_names([channel], mcp.list_servers()))
+        return channel_public(channel)
 
     @app.put("/api/channels/{channel_id}")  # type: ignore[untyped-decorator]
     def update_channel(channel_id: str, request: ChannelConfigRequest) -> dict[str, object]:
         payload = request.model_dump()
         payload["id"] = channel_id
-        return channel_public(channels.upsert_channel(payload))
+        channel = channels.upsert_channel(payload)
+        secret_broker.register_allowed_env_names(_known_secret_env_names([channel], mcp.list_servers()))
+        return channel_public(channel)
 
     @app.delete("/api/channels/{channel_id}")  # type: ignore[untyped-decorator]
     def delete_channel(channel_id: str) -> dict[str, bool]:
@@ -491,34 +553,45 @@ def create_app(config: AgentConfig | None = None) -> Any:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/channels/ingest")  # type: ignore[untyped-decorator]
-    def ingest_channel(request: ChannelIngestRequest, http_request: Request) -> dict[str, object]:  # type: ignore[valid-type]
+    async def ingest_channel(http_request: Request) -> dict[str, object]:  # type: ignore[valid-type]
         try:
+            raw = await _request_body(http_request)
+            body = parse_json_body(raw)
+            request = ChannelIngestRequest(**body)
             return channels.handle_payload(
                 provider=request.provider,
                 channel_id=request.channel_id,
                 payload=request.payload,
+                raw_body=raw,
                 send=request.send,
                 headers=request_headers(http_request),
             ).to_public_dict()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ChannelPayloadError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/channels/{provider}/webhook")  # type: ignore[untyped-decorator]
-    def channel_webhook(
+    async def channel_webhook(
         provider: str,
         request: Request,  # type: ignore[valid-type]
-        payload: dict[str, Any],
         channel_id: str | None = None,
         send: bool | None = None,
     ) -> dict[str, object]:
         try:
+            raw = await _request_body(request)
+            payload = parse_json_body(raw)
             return channels.handle_payload(
                 provider=provider,
                 channel_id=channel_id,
                 payload=payload,
+                raw_body=raw,
                 send=send,
                 headers=request_headers(request),
+                require_signature=True,
             ).to_public_dict()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ChannelPayloadError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -743,6 +816,15 @@ def create_app(config: AgentConfig | None = None) -> Any:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.post("/api/mcp/servers/{server_id}/approve-connect")  # type: ignore[untyped-decorator]
+    def approve_mcp_server_connect(server_id: str) -> dict[str, object]:
+        try:
+            return mcp_public(mcp.approve_server_connect(server_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/mcp/servers/{server_id}/disconnect")  # type: ignore[untyped-decorator]
     def disconnect_mcp_server(server_id: str) -> dict[str, object]:
         try:
@@ -935,14 +1017,19 @@ def create_app(config: AgentConfig | None = None) -> Any:
         result: dict[str, object] = invoke_tool(f"skill.{skill_id}.run", request)
         return result
 
-    def _search_memory(query: str, layers: list[str] | None = None, k: int = 8) -> list[dict[str, object]]:
+    def _search_memory(
+        query: str,
+        layers: list[str] | None = None,
+        k: int = 8,
+        include_inactive: bool = False,
+    ) -> list[dict[str, object]]:
         if k < 1 or k > 50:
             raise HTTPException(status_code=400, detail="k must be between 1 and 50")
         agent = build_agent(active_config, tools=runs.build_registry())
         try:
             selected_layers = tuple(MemoryLayer(layer) for layer in layers) if layers else tuple(MemoryLayer)
             hits = agent.memory.retrieve(
-                RetrievalQuery(query=query, layers=selected_layers, k_per_layer=k)
+                RetrievalQuery(query=query, layers=selected_layers, k_per_layer=k, include_inactive=include_inactive)
             )
             return [
                 {
@@ -961,12 +1048,12 @@ def create_app(config: AgentConfig | None = None) -> Any:
             agent.close()
 
     @app.get("/api/memory/search")  # type: ignore[untyped-decorator]
-    def search_memory_get(query: str, layers: str | None = None, k: int = 8) -> list[dict[str, object]]:
-        return _search_memory(query=query, layers=_csv_layers(layers), k=k)
+    def search_memory_get(query: str, layers: str | None = None, k: int = 8, include_inactive: bool = False) -> list[dict[str, object]]:
+        return _search_memory(query=query, layers=_csv_layers(layers), k=k, include_inactive=include_inactive)
 
     @app.post("/api/memory/search")  # type: ignore[untyped-decorator]
     def search_memory(request: MemorySearchRequest) -> list[dict[str, object]]:
-        return _search_memory(query=request.query, layers=request.layers, k=request.k)
+        return _search_memory(query=request.query, layers=request.layers, k=request.k, include_inactive=request.include_inactive)
 
     @app.get("/api/memory/verify")  # type: ignore[untyped-decorator]
     def verify_memory() -> dict[str, bool]:
@@ -999,12 +1086,12 @@ def create_app(config: AgentConfig | None = None) -> Any:
             agent.close()
 
     @app.get("/api/memory/inspect")  # type: ignore[untyped-decorator]
-    def inspect_memory_get(query: str | None = None, layers: str | None = None, k: int = 20) -> dict[str, object]:
-        return inspect_memory_payload(query=query, layers=_csv_layers(layers), k=k)
+    def inspect_memory_get(query: str | None = None, layers: str | None = None, k: int = 20, include_inactive: bool = False) -> dict[str, object]:
+        return inspect_memory_payload(query=query, layers=_csv_layers(layers), k=k, include_inactive=include_inactive)
 
     @app.post("/api/memory/inspect")  # type: ignore[untyped-decorator]
     def inspect_memory(request: MemoryInspectAPIRequest) -> dict[str, object]:
-        return inspect_memory_payload(query=request.query, layers=request.layers, k=request.k)
+        return inspect_memory_payload(query=request.query, layers=request.layers, k=request.k, include_inactive=request.include_inactive)
 
     @app.post("/api/memory/consolidate")  # type: ignore[untyped-decorator]
     def consolidate_memory(request: MemoryConsolidateRequest) -> dict[str, object]:
@@ -1023,6 +1110,32 @@ def create_app(config: AgentConfig | None = None) -> Any:
     def learn_memory(request: MemoryLearnRequest) -> dict[str, object]:
         execution = runs.invoke_tool(
             tool_name="memory.learn",
+            arguments=request.model_dump(),
+            session_id="api",
+        )
+        if execution.content.startswith("{"):
+            payload = json.loads(execution.content)
+            if isinstance(payload, dict):
+                return dict(payload)
+        return {"success": execution.success, "content": execution.content, "error": execution.error}
+
+    @app.post("/api/memory/correct")  # type: ignore[untyped-decorator]
+    def correct_memory(request: MemoryCorrectRequest) -> dict[str, object]:
+        execution = runs.invoke_tool(
+            tool_name="memory.correct",
+            arguments=request.model_dump(),
+            session_id="api",
+        )
+        if execution.content.startswith("{"):
+            payload = json.loads(execution.content)
+            if isinstance(payload, dict):
+                return dict(payload)
+        return {"success": execution.success, "content": execution.content, "error": execution.error}
+
+    @app.post("/api/memory/compact")  # type: ignore[untyped-decorator]
+    def compact_memory(request: MemoryCompactRequest) -> dict[str, object]:
+        execution = runs.invoke_tool(
+            tool_name="memory.compact",
             arguments=request.model_dump(),
             session_id="api",
         )
@@ -1163,6 +1276,46 @@ def _bounded_limit(value: int, *, default: int, maximum: int) -> int:
     if value < 1:
         return default
     return min(value, maximum)
+
+
+def _hostname_from_header(value: str) -> str:
+    host = value.strip()
+    if not host:
+        return ""
+    if host.startswith("["):
+        end = host.find("]")
+        return host[: end + 1] if end >= 0 else host
+    return host.split(":", 1)[0]
+
+
+def _hostname_from_url(value: str) -> str:
+    parsed = urlparse(value)
+    host = parsed.hostname or ""
+    if parsed.hostname == "::1":
+        return "::1"
+    return host
+
+
+def _known_secret_env_names(channels: list[dict[str, Any]], servers: list[dict[str, Any]]) -> set[str]:
+    names: set[str] = set()
+    for channel in channels:
+        for key in ("token_env", "webhook_url_env"):
+            value = channel.get(key)
+            if isinstance(value, str) and value.strip():
+                names.add(value.strip())
+        settings = channel.get("settings")
+        if isinstance(settings, dict):
+            for key in ("signature_secret_env", "webhook_url_env"):
+                value = settings.get(key)
+                if isinstance(value, str) and value.strip():
+                    names.add(value.strip())
+    for server in servers:
+        secret_env = server.get("secret_env")
+        if isinstance(secret_env, dict):
+            for value in secret_env.values():
+                if isinstance(value, str) and value.strip() and not is_secret_ref(value):
+                    names.add(value.strip())
+    return names
 
 
 def _execution_response(execution: Any) -> dict[str, object]:
