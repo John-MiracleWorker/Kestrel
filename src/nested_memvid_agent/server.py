@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .app_factory import build_agent
-from .channels import ChannelManager, ChannelPayloadError
+from .channels import ChannelManager
 from .config import AgentConfig
 from .event_bus import RunEventBus
 from .event_log import JsonlEventLog
@@ -58,13 +58,12 @@ def create_app(config: AgentConfig | None = None) -> Any:
         responses_module = import_module("starlette.responses")
         staticfiles_module = import_module("starlette.staticfiles")
         cors_module = import_module("starlette.middleware.cors")
+        from .server_channel_routes import register_channel_routes
         from .server_mcp_routes import register_mcp_routes
         from .server_models import (
             ApprovalDecisionRequest,
             CapsuleApplyAPIRequest,
             CapsuleSummarizeAPIRequest,
-            ChannelConfigRequest,
-            ChannelIngestRequest,
             ContextExpandAPIRequest,
             ContextPackAPIRequest,
             CreateRunRequest,
@@ -79,7 +78,6 @@ def create_app(config: AgentConfig | None = None) -> Any:
             PluginUpdateRequest,
             SchedulerRunRequest,
             SchedulerStepRequest,
-            SecretStoreRequest,
             SelfChangeRequest,
             SelfRememberRequest,
             SkillInstallRequest,
@@ -88,6 +86,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
             WebFetchRequest,
             WebSearchRequest,
         )
+        from .server_secret_routes import register_secret_routes
     except ImportError as exc:
         raise RuntimeError("Install server extras with `pip install -e '.[server]'`.") from exc
 
@@ -101,21 +100,34 @@ def create_app(config: AgentConfig | None = None) -> Any:
     CORSMiddleware = cors_module.CORSMiddleware
 
     active_config = config or AgentConfig.from_env()
-    secret_broker = build_secret_broker(active_config.secret_store_path, backend=active_config.secret_backend)
+    secret_broker = build_secret_broker(
+        active_config.secret_store_path, backend=active_config.secret_backend
+    )
     state = AgentStateStore(active_config.state_path)
     events = RunEventBus(state)
-    mcp = MCPManager(state, allow_network_endpoints=active_config.allow_mcp_network_endpoints, secret_resolver=secret_broker.resolve)
+    mcp = MCPManager(
+        state,
+        allow_network_endpoints=active_config.allow_mcp_network_endpoints,
+        secret_resolver=secret_broker.resolve,
+    )
     skills = SkillManager(active_config.skills_dir, state)
     plugins = PluginManager(active_config.plugins_dir, state)
-    runs = RunManager(config=active_config, state=state, events=events, mcp=mcp, skills=skills, plugins=plugins)
+    runs = RunManager(
+        config=active_config, state=state, events=events, mcp=mcp, skills=skills, plugins=plugins
+    )
     channels = ChannelManager(active_config, secret_resolver=secret_broker.resolve)
-    secret_broker.register_allowed_env_names(_known_secret_env_names(channels.list_channels(), mcp.list_servers()))
+    secret_broker.register_allowed_env_names(
+        _known_secret_env_names(channels.list_channels(), mcp.list_servers())
+    )
 
     def require_api_auth(
         authorization: str | None = Header(default=None),
         x_kestrel_api_key: str | None = Header(default=None),
     ) -> bool:
-        auth_error = _api_auth_error(active_config, {"authorization": authorization or "", "x-kestrel-api-key": x_kestrel_api_key or ""})
+        auth_error = _api_auth_error(
+            active_config,
+            {"authorization": authorization or "", "x-kestrel-api-key": x_kestrel_api_key or ""},
+        )
         if auth_error is not None:
             status_code, detail = auth_error
             raise HTTPException(status_code=status_code, detail=detail)
@@ -128,28 +140,20 @@ def create_app(config: AgentConfig | None = None) -> Any:
         finally:
             memory.close_all()
 
-    async def _request_body(request: object) -> bytes:
-        body = getattr(request, "body", None)
-        if not callable(body):
-            raise ValueError("request body is unavailable")
-        raw = await body()
-        return raw if isinstance(raw, bytes) else bytes(raw)
-
-    def parse_json_body(raw: bytes) -> dict[str, Any]:
-        if not raw:
-            return {}
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            raise ValueError("JSON body must be an object.")
-        return parsed
-
-    def inspect_memory_payload(*, query: str | None, layers: list[str] | None, k: int, include_inactive: bool = False) -> dict[str, object]:
-        arguments: dict[str, object] = {"query": query.strip() if query and query.strip() else "memory", "k": _bounded_limit(k, default=20, maximum=100)}
+    def inspect_memory_payload(
+        *, query: str | None, layers: list[str] | None, k: int, include_inactive: bool = False
+    ) -> dict[str, object]:
+        arguments: dict[str, object] = {
+            "query": query.strip() if query and query.strip() else "memory",
+            "k": _bounded_limit(k, default=20, maximum=100),
+        }
         if layers:
             arguments["layers"] = layers
         if include_inactive:
             arguments["include_inactive"] = True
-        execution = runs.invoke_tool(tool_name="memory.inspect", arguments=arguments, session_id="api")
+        execution = runs.invoke_tool(
+            tool_name="memory.inspect", arguments=arguments, session_id="api"
+        )
         return _tool_response_payload(execution)
 
     def filter_cognition_items(payload: dict[str, object], schema: str) -> list[dict[str, object]]:
@@ -168,26 +172,6 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 continue
             rows.append(item)
         return rows
-
-    def channel_public(channel: dict[str, Any]) -> dict[str, object]:
-        settings = channel.get("settings")
-        safe = dict(channel)
-        safe["settings"] = dict(settings) if isinstance(settings, dict) else {}
-        token_env = str(safe.get("token_env") or "")
-        webhook_env = str(safe.get("webhook_url_env") or "")
-        signature_env = ""
-        if isinstance(settings, dict):
-            signature_env = str(settings.get("signature_secret_env") or "")
-        safe["env_status"] = {
-            "token_env_configured": bool(token_env and secret_broker.resolve(token_env)),
-            "token_env_status": secret_broker.status(token_env) if token_env else {"configured": False},
-            "webhook_url_env_configured": bool(webhook_env and secret_broker.resolve(webhook_env)),
-            "webhook_url_env_status": secret_broker.status(webhook_env) if webhook_env else {"configured": False},
-            "signature_secret_env": signature_env or None,
-            "signature_secret_env_configured": bool(signature_env and secret_broker.resolve(signature_env)),
-            "signature_secret_env_status": secret_broker.status(signature_env) if signature_env else {"configured": False},
-        }
-        return safe
 
     def require_plugin_install_enabled() -> None:
         if not active_config.allow_plugin_install:
@@ -219,13 +203,24 @@ def create_app(config: AgentConfig | None = None) -> Any:
         headers = request_headers(request)
         host = _hostname_from_header(str(headers.get("host", "")))
         trusted_hosts = set(active_config.trusted_hosts)
-        if "0.0.0.0" not in trusted_hosts and "*" not in trusted_hosts and host not in trusted_hosts:  # nosec
+        if (
+            "0.0.0.0" not in trusted_hosts
+            and "*" not in trusted_hosts
+            and host not in trusted_hosts
+        ):  # nosec
             return responses_module.JSONResponse({"detail": "untrusted_host"}, status_code=400)
         origin = str(headers.get("origin", "")).strip()
         if origin:
             origin_host = _hostname_from_url(origin)
-            if origin_host and "0.0.0.0" not in trusted_hosts and "*" not in trusted_hosts and origin_host not in trusted_hosts:  # nosec
-                return responses_module.JSONResponse({"detail": "untrusted_origin"}, status_code=403)
+            if (
+                origin_host
+                and "0.0.0.0" not in trusted_hosts
+                and "*" not in trusted_hosts
+                and origin_host not in trusted_hosts
+            ):  # nosec
+                return responses_module.JSONResponse(
+                    {"detail": "untrusted_origin"}, status_code=403
+                )
         path = str(getattr(getattr(request, "url", None), "path", ""))
         if path == "/api" or path.startswith("/api/"):
             auth_error = _api_auth_error(active_config, headers)
@@ -328,122 +323,19 @@ def create_app(config: AgentConfig | None = None) -> Any:
             ],
         }
 
-    @app.get("/api/secrets")  # type: ignore[untyped-decorator]
-    def list_secrets() -> list[dict[str, object]]:
-        return secret_broker.list_secrets()
-
-    @app.get("/api/secrets/{secret_id}")  # type: ignore[untyped-decorator]
-    def get_secret(secret_id: str) -> dict[str, object]:
-        try:
-            return secret_broker.get_secret(secret_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail="secret_not_found") from exc
-
-    @app.post("/api/secrets")  # type: ignore[untyped-decorator]
-    def store_secret(request: SecretStoreRequest) -> dict[str, object]:
-        try:
-            return secret_broker.store_secret(
-                name=request.name,
-                purpose=request.purpose,
-                value=request.value,
-                secret_id=request.id,
-                validate=request.validate_now,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.post("/api/secrets/{secret_id}/validate")  # type: ignore[untyped-decorator]
-    def validate_secret(secret_id: str) -> dict[str, object]:
-        try:
-            return secret_broker.validate_secret(secret_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail="secret_not_found") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.delete("/api/secrets/{secret_id}")  # type: ignore[untyped-decorator]
-    def delete_secret(secret_id: str) -> dict[str, bool]:
-        try:
-            secret_broker.delete_secret(secret_id)
-            return {"ok": True}
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail="secret_not_found") from exc
-
-    @app.get("/api/channels")  # type: ignore[untyped-decorator]
-    def list_channels() -> list[dict[str, object]]:
-        return [channel_public(channel) for channel in channels.list_channels()]
-
-    @app.get("/api/channels/{channel_id}")  # type: ignore[untyped-decorator]
-    def get_channel(channel_id: str) -> dict[str, object]:
-        try:
-            return channel_public(channels.get_channel(channel_id))
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/channels")  # type: ignore[untyped-decorator]
-    def upsert_channel(request: ChannelConfigRequest) -> dict[str, object]:
-        channel = channels.upsert_channel(request.model_dump())
-        secret_broker.register_allowed_env_names(_known_secret_env_names([channel], mcp.list_servers()))
-        return channel_public(channel)
-
-    @app.put("/api/channels/{channel_id}")  # type: ignore[untyped-decorator]
-    def update_channel(channel_id: str, request: ChannelConfigRequest) -> dict[str, object]:
-        payload = request.model_dump()
-        payload["id"] = channel_id
-        channel = channels.upsert_channel(payload)
-        secret_broker.register_allowed_env_names(_known_secret_env_names([channel], mcp.list_servers()))
-        return channel_public(channel)
-
-    @app.delete("/api/channels/{channel_id}")  # type: ignore[untyped-decorator]
-    def delete_channel(channel_id: str) -> dict[str, bool]:
-        try:
-            channels.delete_channel(channel_id)
-            return {"ok": True}
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/channels/ingest")  # type: ignore[untyped-decorator]
-    async def ingest_channel(http_request: Request) -> dict[str, object]:  # type: ignore[valid-type]
-        try:
-            raw = await _request_body(http_request)
-            body = parse_json_body(raw)
-            request = ChannelIngestRequest(**body)
-            return channels.handle_payload(
-                provider=request.provider,
-                channel_id=request.channel_id,
-                payload=request.payload,
-                raw_body=raw,
-                send=request.send,
-                headers=request_headers(http_request),
-            ).to_public_dict()
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except ChannelPayloadError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.post("/api/channels/{provider}/webhook")  # type: ignore[untyped-decorator]
-    async def channel_webhook(
-        provider: str,
-        request: Request,  # type: ignore[valid-type]
-        channel_id: str | None = None,
-        send: bool | None = None,
-    ) -> dict[str, object]:
-        try:
-            raw = await _request_body(request)
-            payload = parse_json_body(raw)
-            return channels.handle_payload(
-                provider=provider,
-                channel_id=channel_id,
-                payload=payload,
-                raw_body=raw,
-                send=send,
-                headers=request_headers(request),
-                require_signature=True,
-            ).to_public_dict()
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except ChannelPayloadError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    register_secret_routes(
+        app,
+        http_exception=HTTPException,
+        secret_broker=secret_broker,
+    )
+    register_channel_routes(
+        app,
+        http_exception=HTTPException,
+        request_type=Request,
+        channels=channels,
+        secret_broker=secret_broker,
+        mcp=mcp,
+    )
 
     @app.post("/api/runs")  # type: ignore[untyped-decorator]
     def create_run(request: CreateRunRequest) -> dict[str, object]:
@@ -507,7 +399,9 @@ def create_app(config: AgentConfig | None = None) -> Any:
     @app.post("/api/runs/{run_id}/scheduler/run")  # type: ignore[untyped-decorator]
     def scheduler_run(run_id: str, request: SchedulerRunRequest) -> dict[str, object]:
         try:
-            return runs.run_scheduler_until_idle(run_id, max_tasks=request.max_tasks, max_cycles=request.max_cycles)
+            return runs.run_scheduler_until_idle(
+                run_id, max_tasks=request.max_tasks, max_cycles=request.max_cycles
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -542,7 +436,10 @@ def create_app(config: AgentConfig | None = None) -> Any:
     @app.get("/api/logs")  # type: ignore[untyped-decorator]
     def logs(limit: int = 100) -> list[dict[str, object]]:
         event_log = JsonlEventLog(active_config.log_dir / "events.jsonl")
-        return [asdict(event) for event in event_log.tail(limit=_bounded_limit(limit, default=100, maximum=500))]
+        return [
+            asdict(event)
+            for event in event_log.tail(limit=_bounded_limit(limit, default=100, maximum=500))
+        ]
 
     @app.get("/api/tools")  # type: ignore[untyped-decorator]
     def list_tools() -> list[dict[str, object]]:
@@ -697,7 +594,9 @@ def create_app(config: AgentConfig | None = None) -> Any:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/plugins/{plugin_id}/update")  # type: ignore[untyped-decorator]
-    def update_plugin(plugin_id: str, request: PluginUpdateRequest | None = None) -> dict[str, object]:
+    def update_plugin(
+        plugin_id: str, request: PluginUpdateRequest | None = None
+    ) -> dict[str, object]:
         require_plugin_install_enabled()
         try:
             plugin = plugins.update(plugin_id, ref=request.ref if request else None)
@@ -780,9 +679,16 @@ def create_app(config: AgentConfig | None = None) -> Any:
             raise HTTPException(status_code=400, detail="k must be between 1 and 50")
         agent = build_agent(active_config, tools=runs.build_registry())
         try:
-            selected_layers = tuple(MemoryLayer(layer) for layer in layers) if layers else tuple(MemoryLayer)
+            selected_layers = (
+                tuple(MemoryLayer(layer) for layer in layers) if layers else tuple(MemoryLayer)
+            )
             hits = agent.memory.retrieve(
-                RetrievalQuery(query=query, layers=selected_layers, k_per_layer=k, include_inactive=include_inactive)
+                RetrievalQuery(
+                    query=query,
+                    layers=selected_layers,
+                    k_per_layer=k,
+                    include_inactive=include_inactive,
+                )
             )
             return [
                 {
@@ -801,12 +707,21 @@ def create_app(config: AgentConfig | None = None) -> Any:
             agent.close()
 
     @app.get("/api/memory/search")  # type: ignore[untyped-decorator]
-    def search_memory_get(query: str, layers: str | None = None, k: int = 8, include_inactive: bool = False) -> list[dict[str, object]]:
-        return _search_memory(query=query, layers=_csv_layers(layers), k=k, include_inactive=include_inactive)
+    def search_memory_get(
+        query: str, layers: str | None = None, k: int = 8, include_inactive: bool = False
+    ) -> list[dict[str, object]]:
+        return _search_memory(
+            query=query, layers=_csv_layers(layers), k=k, include_inactive=include_inactive
+        )
 
     @app.post("/api/memory/search")  # type: ignore[untyped-decorator]
     def search_memory(request: MemorySearchRequest) -> list[dict[str, object]]:
-        return _search_memory(query=request.query, layers=request.layers, k=request.k, include_inactive=request.include_inactive)
+        return _search_memory(
+            query=request.query,
+            layers=request.layers,
+            k=request.k,
+            include_inactive=request.include_inactive,
+        )
 
     @app.get("/api/memory/verify")  # type: ignore[untyped-decorator]
     def verify_memory() -> dict[str, bool]:
@@ -839,12 +754,24 @@ def create_app(config: AgentConfig | None = None) -> Any:
             agent.close()
 
     @app.get("/api/memory/inspect")  # type: ignore[untyped-decorator]
-    def inspect_memory_get(query: str | None = None, layers: str | None = None, k: int = 20, include_inactive: bool = False) -> dict[str, object]:
-        return inspect_memory_payload(query=query, layers=_csv_layers(layers), k=k, include_inactive=include_inactive)
+    def inspect_memory_get(
+        query: str | None = None,
+        layers: str | None = None,
+        k: int = 20,
+        include_inactive: bool = False,
+    ) -> dict[str, object]:
+        return inspect_memory_payload(
+            query=query, layers=_csv_layers(layers), k=k, include_inactive=include_inactive
+        )
 
     @app.post("/api/memory/inspect")  # type: ignore[untyped-decorator]
     def inspect_memory(request: MemoryInspectAPIRequest) -> dict[str, object]:
-        return inspect_memory_payload(query=request.query, layers=request.layers, k=request.k, include_inactive=request.include_inactive)
+        return inspect_memory_payload(
+            query=request.query,
+            layers=request.layers,
+            k=request.k,
+            include_inactive=request.include_inactive,
+        )
 
     @app.post("/api/memory/consolidate")  # type: ignore[untyped-decorator]
     def consolidate_memory(request: MemoryConsolidateRequest) -> dict[str, object]:
@@ -857,7 +784,11 @@ def create_app(config: AgentConfig | None = None) -> Any:
             payload = json.loads(execution.content)
             if isinstance(payload, dict):
                 return dict(payload)
-        return {"success": execution.success, "content": execution.content, "error": execution.error}
+        return {
+            "success": execution.success,
+            "content": execution.content,
+            "error": execution.error,
+        }
 
     @app.post("/api/memory/learn")  # type: ignore[untyped-decorator]
     def learn_memory(request: MemoryLearnRequest) -> dict[str, object]:
@@ -870,7 +801,11 @@ def create_app(config: AgentConfig | None = None) -> Any:
             payload = json.loads(execution.content)
             if isinstance(payload, dict):
                 return dict(payload)
-        return {"success": execution.success, "content": execution.content, "error": execution.error}
+        return {
+            "success": execution.success,
+            "content": execution.content,
+            "error": execution.error,
+        }
 
     @app.post("/api/memory/correct")  # type: ignore[untyped-decorator]
     def correct_memory(request: MemoryCorrectRequest) -> dict[str, object]:
@@ -883,7 +818,11 @@ def create_app(config: AgentConfig | None = None) -> Any:
             payload = json.loads(execution.content)
             if isinstance(payload, dict):
                 return dict(payload)
-        return {"success": execution.success, "content": execution.content, "error": execution.error}
+        return {
+            "success": execution.success,
+            "content": execution.content,
+            "error": execution.error,
+        }
 
     @app.post("/api/memory/compact")  # type: ignore[untyped-decorator]
     def compact_memory(request: MemoryCompactRequest) -> dict[str, object]:
@@ -896,18 +835,26 @@ def create_app(config: AgentConfig | None = None) -> Any:
             payload = json.loads(execution.content)
             if isinstance(payload, dict):
                 return dict(payload)
-        return {"success": execution.success, "content": execution.content, "error": execution.error}
+        return {
+            "success": execution.success,
+            "content": execution.content,
+            "error": execution.error,
+        }
 
     @app.post("/api/context/pack")  # type: ignore[untyped-decorator]
     def pack_context(request: ContextPackAPIRequest) -> dict[str, object]:
         arguments = request.model_dump(exclude_none=True)
-        execution = runs.invoke_tool(tool_name="context.pack", arguments=arguments, session_id="api")
+        execution = runs.invoke_tool(
+            tool_name="context.pack", arguments=arguments, session_id="api"
+        )
         return _tool_response_payload(execution)
 
     @app.post("/api/context/expand")  # type: ignore[untyped-decorator]
     def expand_context(request: ContextExpandAPIRequest) -> dict[str, object]:
         arguments = request.model_dump(exclude_none=True)
-        execution = runs.invoke_tool(tool_name="context.expand", arguments=arguments, session_id="api")
+        execution = runs.invoke_tool(
+            tool_name="context.expand", arguments=arguments, session_id="api"
+        )
         return _tool_response_payload(execution)
 
     @app.get("/api/context")  # type: ignore[untyped-decorator]
@@ -928,7 +875,9 @@ def create_app(config: AgentConfig | None = None) -> Any:
         parsed_layers = _csv_layers(layers)
         if parsed_layers is not None:
             arguments["layers"] = parsed_layers
-        execution = runs.invoke_tool(tool_name="context.pack", arguments=arguments, session_id="api")
+        execution = runs.invoke_tool(
+            tool_name="context.pack", arguments=arguments, session_id="api"
+        )
         payload = _tool_response_payload(execution)
         if not execution.success:
             raise HTTPException(status_code=400, detail=payload)
@@ -962,7 +911,9 @@ def create_app(config: AgentConfig | None = None) -> Any:
         arguments: dict[str, object] = {"query": query, "k": k}
         if layers:
             arguments["layers"] = [layer.strip() for layer in layers.split(",") if layer.strip()]
-        execution = runs.invoke_tool(tool_name="memory.conflicts", arguments=arguments, session_id="api")
+        execution = runs.invoke_tool(
+            tool_name="memory.conflicts", arguments=arguments, session_id="api"
+        )
         return _tool_response_payload(execution)
 
     @app.get("/api/cognition/lessons")  # type: ignore[untyped-decorator]
@@ -996,7 +947,11 @@ def create_app(config: AgentConfig | None = None) -> Any:
     def recall_diagnosis(request: DiagnosisRequest) -> dict[str, object]:
         execution = runs.invoke_tool(
             tool_name="diagnosis.recall",
-            arguments={"failure_text": request.failure_text, "source": request.source or "api", "k": request.k},
+            arguments={
+                "failure_text": request.failure_text,
+                "source": request.source or "api",
+                "k": request.k,
+            },
             session_id="api",
         )
         return _tool_response_payload(execution)
