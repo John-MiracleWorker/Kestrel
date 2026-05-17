@@ -142,6 +142,27 @@ describe("App", () => {
     });
   });
 
+  it("keeps a new empty thread isolated from the previous active run", async () => {
+    render(<App />);
+
+    await screen.findByText("Fix parser");
+    fireEvent.click(screen.getByRole("button", { name: /new chat/i }));
+
+    expect(within(screen.getByLabelText("Conversation threads")).getByRole("button", { name: /new chat/i })).toHaveClass("active");
+    expect(screen.getByText("Tell Kestrel what to do.")).toBeInTheDocument();
+    expect(screen.getByText("No run selected.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /refresh/i }));
+    await waitFor(() => {
+      expect(within(screen.getByLabelText("Conversation threads")).getByRole("button", { name: /new chat/i })).toHaveClass("active");
+      expect(screen.getByText("No run selected.")).toBeInTheDocument();
+    });
+
+    const transcript = screen.getByLabelText("Conversation transcript");
+    expect(transcript).not.toHaveTextContent("Fix parser");
+    expect(transcript).not.toHaveTextContent("Run tests");
+  });
+
   it("switches threads and renders active session history in chronological order", async () => {
     render(<App />);
 

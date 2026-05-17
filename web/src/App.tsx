@@ -29,7 +29,7 @@ import {
   Wrench,
   X
 } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { deleteJson, getJson, postJson, putJson, queryString } from "./api";
 import { EmptyState, Field, InlineMeta, JsonBlock, Panel, StatusBadge } from "./components";
 import type {
@@ -99,6 +99,8 @@ export function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [threadRuns, setThreadRuns] = useState<Run[]>([]);
   const [localThreads, setLocalThreads] = useState<ThreadSummary[]>([]);
+  const activeRunIdRef = useRef<string | null>(null);
+  const activeSessionIdRef = useRef<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(true);
 
@@ -189,15 +191,15 @@ export function App() {
     () => [...threadRuns].sort((left, right) => left.created_at.localeCompare(right.created_at)),
     [threadRuns]
   );
-  const activeRun = useMemo(
-    () =>
-      sortedThreadRuns.find((run) => run.run_id === activeRunId) ??
-      runs.find((run) => run.run_id === activeRunId) ??
-      sortedThreadRuns[sortedThreadRuns.length - 1] ??
-      runs[0] ??
-      null,
-    [runs, sortedThreadRuns, activeRunId]
-  );
+  const activeRun = useMemo(() => {
+    if (!activeRunId) return null;
+    const threadRun = sortedThreadRuns.find((run) => run.run_id === activeRunId);
+    if (threadRun) return threadRun;
+    const globalRun = runs.find((run) => run.run_id === activeRunId);
+    if (!globalRun) return null;
+    if (activeSessionId && globalRun.session_id !== activeSessionId) return null;
+    return globalRun;
+  }, [runs, sortedThreadRuns, activeRunId, activeSessionId]);
   const threadSummaries = useMemo(() => {
     const remoteThreads = sessions.map((session) => ({
       session_id: session.session_id,
@@ -239,6 +241,24 @@ export function App() {
       ),
     [mcpServers]
   );
+
+  function selectSessionId(sessionId: string | null) {
+    activeSessionIdRef.current = sessionId;
+    setActiveSessionId(sessionId);
+  }
+
+  function selectRunId(runId: string | null) {
+    activeRunIdRef.current = runId;
+    setActiveRunId(runId);
+  }
+
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    activeRunIdRef.current = activeRunId;
+  }, [activeRunId]);
 
   useEffect(() => {
     refreshAll().catch(reportError);
@@ -322,16 +342,19 @@ export function App() {
     setChannels(channelList);
     setSecrets(secretList);
     setMemoryLayers(layerList);
-    if (!activeSessionId && sessionList.length > 0) {
+    const selectedSessionId = activeSessionIdRef.current;
+    const selectedRunId = activeRunIdRef.current;
+    if (!selectedSessionId && sessionList.length > 0) {
       const pendingRunIds = new Set(pendingApprovalList.map((approval) => approval.run_id));
       const attentionRun = runList.find((run) => pendingRunIds.has(run.run_id));
       const initialSession = attentionRun
         ? sessionList.find((session) => session.session_id === attentionRun.session_id) ?? sessionList[0]
         : sessionList[0];
-      setActiveSessionId(initialSession.session_id);
-      setActiveRunId(attentionRun?.run_id ?? initialSession.latest_run_id);
-    } else if (!activeRunId && runList.length > 0) {
-      setActiveRunId(runList[0].run_id);
+      selectSessionId(initialSession.session_id);
+      selectRunId(attentionRun?.run_id ?? initialSession.latest_run_id);
+    } else if (selectedSessionId && !selectedRunId) {
+      const selectedSession = sessionList.find((session) => session.session_id === selectedSessionId);
+      if (selectedSession?.latest_run_id) selectRunId(selectedSession.latest_run_id);
     }
   }
 
@@ -355,7 +378,12 @@ export function App() {
 
   async function refreshThreadRuns(sessionId: string) {
     const runList = await getJson<Run[]>(`/api/sessions/${encodeURIComponent(sessionId)}/runs`);
-    setThreadRuns(runList);
+    if (activeSessionIdRef.current === sessionId) {
+      setThreadRuns(runList);
+      if (!activeRunIdRef.current && runList.length > 0) {
+        selectRunId(runList[runList.length - 1].run_id);
+      }
+    }
     setLocalThreads((threads) =>
       threads.map((thread) =>
         thread.session_id === sessionId && runList.length > 0
@@ -378,6 +406,7 @@ export function App() {
       getJson<TaskGraph>(`/api/runs/${runId}/task-graph`),
       getJson<RunTrace>(`/api/runs/${runId}/trace?limit=700`)
     ]);
+    if (activeRunIdRef.current !== runId) return;
     setTaskGraph(graph);
     setRunTrace(trace);
   }
@@ -400,8 +429,7 @@ export function App() {
     event.preventDefault();
     await guarded(async () => {
       if (!message.trim()) return;
-      const targetSessionId = sessionId.trim() || activeSessionId || createThreadId();
-      if (!activeSessionId) setActiveSessionId(targetSessionId);
+      const targetSessionId = sessionId.trim() || activeSessionIdRef.current || createThreadId();
       const payload: Record<string, unknown> = {
         message,
         session_id: targetSessionId,
@@ -414,7 +442,8 @@ export function App() {
       if (model.trim() && model.trim() !== runtimeModel) payload.model = model.trim();
       const run = await postJson<Run>("/api/runs", payload);
       setMessage("");
-      setActiveRunId(run.run_id);
+      selectSessionId(run.session_id);
+      selectRunId(run.run_id);
       setThreadRuns((rows) => [...rows.filter((row) => row.run_id !== run.run_id), run]);
       setLocalThreads((threads) => [
         {
@@ -438,8 +467,8 @@ export function App() {
   function createNewThread() {
     const threadId = createThreadId();
     const now = new Date().toISOString();
-    setActiveSessionId(threadId);
-    setActiveRunId(null);
+    selectSessionId(threadId);
+    selectRunId(null);
     setThreadRuns([]);
     setEvents([]);
     setRunTrace(null);
@@ -460,9 +489,11 @@ export function App() {
   }
 
   async function selectThread(thread: ThreadSummary) {
-    setActiveSessionId(thread.session_id);
-    setActiveRunId(thread.latest_run_id || null);
+    selectSessionId(thread.session_id);
+    selectRunId(thread.latest_run_id || null);
     setEvents([]);
+    setRunTrace(null);
+    setTaskGraph(null);
     await guarded(async () => {
       await refreshThreadRuns(thread.session_id);
       if (thread.latest_run_id) await refreshRunDetails(thread.latest_run_id);
@@ -470,8 +501,14 @@ export function App() {
   }
 
   async function selectRun(runId: string) {
-    setActiveRunId(runId);
-    await guarded(async () => refreshRunDetails(runId));
+    const run = sortedThreadRuns.find((row) => row.run_id === runId) ?? runs.find((row) => row.run_id === runId);
+    if (run) selectSessionId(run.session_id);
+    selectRunId(runId);
+    setEvents([]);
+    await guarded(async () => {
+      if (run) await refreshThreadRuns(run.session_id);
+      await refreshRunDetails(runId);
+    });
   }
 
   async function decideApproval(approval: Approval, approved: boolean) {
