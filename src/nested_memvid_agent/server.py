@@ -1,5 +1,4 @@
 import json
-import queue
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from importlib import import_module
@@ -10,7 +9,6 @@ from .app_factory import build_agent
 from .channels import ChannelManager
 from .config import AgentConfig
 from .event_bus import RunEventBus
-from .event_log import JsonlEventLog
 from .mcp_manager import MCPManager
 from .models import MemoryLayer, RetrievalQuery
 from .orchestrator import build_memory_system
@@ -84,6 +82,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
             WebFetchRequest,
             WebSearchRequest,
         )
+        from .server_observability_routes import register_observability_routes
         from .server_runtime_routes import register_runtime_routes
         from .server_secret_routes import register_secret_routes
     except ImportError as exc:
@@ -316,41 +315,15 @@ def create_app(config: AgentConfig | None = None) -> Any:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.get("/api/runs/{run_id}/events")  # type: ignore[untyped-decorator]
-    def run_events(run_id: str, after_id: int = 0) -> Any:
-        try:
-            state.get_run(run_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-        def stream() -> Any:
-            subscriber = events.subscribe(run_id, after_id=after_id)
-            try:
-                while True:
-                    try:
-                        event = subscriber.get(timeout=15)
-                        yield event.to_sse()
-                    except queue.Empty:
-                        yield ": keepalive\n\n"
-            finally:
-                events.unsubscribe(run_id, subscriber)
-
-        return StreamingResponse(stream(), media_type="text/event-stream")
-
-    @app.get("/api/runs/{run_id}/trace")  # type: ignore[untyped-decorator]
-    def run_trace(run_id: str, limit: int = 1000) -> dict[str, object]:
-        try:
-            return runs.run_trace(run_id, limit=_bounded_limit(limit, default=1000, maximum=5000))
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/logs")  # type: ignore[untyped-decorator]
-    def logs(limit: int = 100) -> list[dict[str, object]]:
-        event_log = JsonlEventLog(active_config.log_dir / "events.jsonl")
-        return [
-            asdict(event)
-            for event in event_log.tail(limit=_bounded_limit(limit, default=100, maximum=500))
-        ]
+    register_observability_routes(
+        app,
+        active_config=active_config,
+        http_exception=HTTPException,
+        streaming_response=StreamingResponse,
+        state=state,
+        events=events,
+        runs=runs,
+    )
 
     @app.get("/api/tools")  # type: ignore[untyped-decorator]
     def list_tools() -> list[dict[str, object]]:
