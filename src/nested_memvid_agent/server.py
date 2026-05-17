@@ -85,6 +85,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         from .server_observability_routes import register_observability_routes
         from .server_runtime_routes import register_runtime_routes
         from .server_secret_routes import register_secret_routes
+        from .server_tool_routes import register_tool_routes, tool_invoke_response
     except ImportError as exc:
         raise RuntimeError("Install server extras with `pip install -e '.[server]'`.") from exc
 
@@ -325,26 +326,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         runs=runs,
     )
 
-    @app.get("/api/tools")  # type: ignore[untyped-decorator]
-    def list_tools() -> list[dict[str, object]]:
-        return [spec.to_public_dict() for spec in runs.build_registry().specs()]
-
-    @app.post("/api/tools/{tool_name}/invoke")  # type: ignore[untyped-decorator]
-    def invoke_tool(tool_name: str, request: ToolInvokeRequest) -> dict[str, object]:
-        execution = runs.invoke_tool(
-            tool_name=tool_name,
-            arguments=request.arguments,
-            session_id=request.session_id,
-            run_id=request.run_id,
-        )
-        return {
-            "tool": execution.call.name,
-            "tool_call_id": execution.call.id,
-            "success": execution.success,
-            "content": execution.content,
-            "data": execution.data,
-            "error": execution.error,
-        }
+    register_tool_routes(app, runs=runs)
 
     @app.get("/api/self")  # type: ignore[untyped-decorator]
     def inspect_self() -> dict[str, object]:
@@ -550,8 +532,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
     @app.post("/api/skills/{skill_id}/run")  # type: ignore[untyped-decorator]
     def run_skill(skill_id: str, request: ToolInvokeRequest) -> dict[str, object]:
-        result: dict[str, object] = invoke_tool(f"skill.{skill_id}.run", request)
-        return result
+        return tool_invoke_response(runs, f"skill.{skill_id}.run", request)
 
     def _search_memory(
         query: str,
