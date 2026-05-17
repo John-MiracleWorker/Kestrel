@@ -498,6 +498,7 @@ export function App() {
         session_id: threadId,
         title: "New chat",
         latest_message: "New chat",
+
         latest_run_id: "",
         latest_status: "ready",
         run_count: 0,
@@ -909,26 +910,41 @@ export function App() {
   }
 
   return (
-    <div className="app-shell">
-      <a className="skip-link" href="#workspace">Skip to workspace</a>
-      <aside className="sidebar" aria-label="Kestrel sections">
-        <div className="brand">
-          <span className="brand-mark" aria-hidden="true">
-            <MessageCircle size={24} />
-          </span>
-          <div>
-            <strong>Kestrel</strong>
-            <span>Conversation workspace</span>
+    <>
+      <header className="topbar">
+        <div className="topbar-inner">
+          <a className="brand" href="#workspace">
+            <span className="brand-mark" aria-hidden="true">
+              <MessageCircle size={24} />
+            </span>
+            <span>
+              <span className="brand-name">Kestrel</span>
+              <span className="brand-tag">Local-first agent</span>
+            </span>
+          </a>
+          <nav className="primary-nav" aria-label="Primary">
+            <a href="#workspace" className="active">Chat</a>
+            <a href="#advanced">Advanced</a>
+            <a href="#settings">Settings</a>
+          </nav>
+          <div className="topbar-meta">
+            <span className="status-pill"><span className="status-dot"></span>Runtime ready</span>
           </div>
         </div>
-        <button type="button" className="new-thread-button" onClick={createNewThread}>
-          <MessageCircle size={16} /> New Chat
-        </button>
-        <nav aria-label="Primary">
-          <a href="#workspace"><MessageCircle size={17} /> Threads</a>
-          <a href="#advanced"><TerminalSquare size={17} /> Advanced</a>
-          <a href="#settings"><Settings size={17} /> Settings</a>
-        </nav>
+      </header>
+      <div className={`chat-shell ${inspectorOpen ? "" : "no-inspector"}`}>
+      <a className="skip-link" href="#workspace">Skip to workspace</a>
+      <aside className="rail" aria-label="Threads">
+        <div className="rail-head">
+          <h2>Threads <small>{threadSummaries.length}</small></h2>
+          <button type="button" className="new-chat" onClick={createNewThread} title="New chat">
+            <MessageCircle size={16} />
+          </button>
+        </div>
+        <div className="rail-search">
+          <Search size={14} />
+          <input type="text" placeholder="Search threads..." />
+        </div>
         <div className="thread-list" aria-label="Conversation threads">
           {threadSummaries.map((thread) => (
             <button
@@ -948,7 +964,7 @@ export function App() {
         </div>
       </aside>
 
-      <main className="workspace" id="workspace">
+      <main className="conversation" id="workspace">
         <header className="topbar">
           <div>
             <p className="eyebrow">Local-first agent</p>
@@ -982,22 +998,23 @@ export function App() {
         )}
 
         <section className={`conversation-layout ${inspectorOpen ? "with-inspector" : ""}`}>
-          <div className="chat-workspace">
-            <div className="chat-scroll" aria-label="Conversation transcript">
+          <div className="transcript-inner">
+            <div className="transcript" aria-label="Conversation transcript">
               {sortedThreadRuns.length === 0 ? (
-                <div className="empty-thread">
+                <div className="empty-state">
                   <MessageCircle size={28} />
                   <h2>Tell Kestrel what to do.</h2>
                   <p>Start with a build, fix, research, inspection, or continuation request. Kestrel will keep the work in this thread.</p>
                 </div>
               ) : (
                 sortedThreadRuns.map((run) => (
-                  <div className="chat-turn" key={run.run_id}>
-                    <article className="bubble user">
+                  <div className="turn" key={run.run_id}>
+                    <article className="msg user">
                       <strong>You</strong>
                       <p>{run.message}</p>
                     </article>
-                    <article className="bubble assistant">
+                    <article className="msg kestrel">
+
                       <strong>Kestrel</strong>
                       <p>{assistantTextForRun(run, activeRun?.run_id, streamedAssistant)}</p>
                       {run.run_id === activeRun?.run_id && <LiveRunActivity events={activeRunEvents} />}
@@ -1009,7 +1026,7 @@ export function App() {
                 <ApprovalCardInline key={approval.approval_id} approval={approval} onApprove={decideApproval} />
               ))}
             </div>
-            <form className="chat-composer" onSubmit={submitRun}>
+            <form className="composer" onSubmit={submitRun}>
               <label className="composer-field">
                 <span>Ask Kestrel</span>
                 <textarea
@@ -1019,7 +1036,7 @@ export function App() {
                   rows={3}
                 />
               </label>
-              <div className="composer-actions">
+              <div className="composer-bar">
                 <label className="mode-select">
                   <span>Mode</span>
                   <select value={autonomyMode} onChange={(event) => setAutonomyMode(event.target.value)}>
@@ -1040,7 +1057,7 @@ export function App() {
           </div>
 
           {inspectorOpen && (
-            <aside className="inspector-drawer" aria-label="Inspector">
+            <aside className="inspector" aria-label="Inspector">
               <div className="inspector-head">
                 <h2>Inspector</h2>
                 <button type="button" aria-label="Close panel" onClick={() => setInspectorOpen(false)}>
@@ -1089,8 +1106,8 @@ export function App() {
         </section>
 
         {advancedOpen && (
-          <section id="advanced" className="advanced-console" aria-label="Advanced Operator Console">
-            <div className="advanced-head">
+          <section id="advanced" className="shell" aria-label="Advanced Operator Console">
+            <div className="page-head">
               <div>
                 <p className="eyebrow">Advanced / Debug</p>
                 <h2>Advanced Operator Console</h2>
@@ -1100,18 +1117,18 @@ export function App() {
               </button>
             </div>
 
-        <section className="workspace-grid">
+        <section className="section">
           <Panel
             title="Run Agent"
             icon={<TerminalSquare size={19} />}
             actions={<StatusBadge value={runtime ? "runtime loaded" : "loading"} />}
-            className="primary-panel"
+            className="card"
           >
-            <form className="run-form" onSubmit={submitRun}>
+            <form className="stack-form" onSubmit={submitRun}>
               <Field label="Objective">
                 <textarea value={message} onChange={(event) => setMessage(event.target.value)} rows={5} />
               </Field>
-              <div className="form-grid">
+              <div className="field-row">
                 <Field label="Session ID" hint="Leave blank to create a new session.">
                   <input value={sessionId} onChange={(event) => setSessionId(event.target.value)} />
                 </Field>
@@ -1145,14 +1162,14 @@ export function App() {
                   <option key={`${provider}-${item}`} value={item} />
                 ))}
               </datalist>
-              <div className="button-row">
+              <div className="page-actions">
                 <button type="submit" disabled={!message.trim()}>
                   <Send size={15} /> Queue Run
                 </button>
                 {activeRun?.status === "running" && (
                   <button
                     type="button"
-                    className="danger"
+                    className="btn danger"
                     onClick={() => guarded(async () => {
                       await postJson(`/api/runs/${activeRun.run_id}/cancel`);
                       await refreshSummary();
@@ -1165,7 +1182,7 @@ export function App() {
             </form>
           </Panel>
 
-          <Panel title="Active Run" icon={<Activity size={19} />} className="primary-panel">
+          <Panel title="Active Run" icon={<Activity size={19} />} className="card">
             {activeRun ? (
               <div className="run-detail">
                 <div className="run-title">
@@ -1183,11 +1200,11 @@ export function App() {
                   ]}
                 />
                 <div className="transcript" aria-live="polite">
-                  <article className="bubble user">
+                  <article className="msg user">
                     <strong>User</strong>
                     <p>{activeRun.message}</p>
                   </article>
-                  <article className="bubble assistant">
+                  <article className="msg kestrel">
                     <strong>Kestrel</strong>
                     <p>{activeRun.assistant_message || streamedAssistant || activeRun.stop_reason || "Working..."}</p>
                   </article>
@@ -1206,7 +1223,7 @@ export function App() {
           </Panel>
         </section>
 
-        <section id="runs" className="content-grid">
+        <section id="runs" className="section">
           <Panel title="Runs" icon={<Route size={19} />}>
             <div className="list compact-list">
               {runs.map((run) => (
@@ -1277,7 +1294,7 @@ export function App() {
           </Panel>
         </section>
 
-        <section id="approvals" className="content-grid">
+        <section id="approvals" className="section">
           <Panel title="Pending Approvals" icon={<ShieldCheck size={19} />}>
             {approvals.map((approval) => (
               <ApprovalCard key={approval.approval_id} approval={approval} onApprove={decideApproval} />
@@ -1421,7 +1438,7 @@ export function App() {
                 <input type="checkbox" checked={contextExpandRaw} onChange={(event) => setContextExpandRaw(event.target.checked)} />
                 <span>Expand raw evidence</span>
               </label>
-              <div className="button-row">
+              <div className="page-actions">
                 <button type="submit">Pack</button>
                 <button type="button" onClick={findConflicts}>Find Conflicts</button>
                 <button type="button" disabled={!activeRun} onClick={() => capsule("summarize")}>Capsule Preview</button>
@@ -1441,7 +1458,7 @@ export function App() {
               <Field label="Validated content">
                 <textarea value={learningContent} onChange={(event) => setLearningContent(event.target.value)} rows={4} />
               </Field>
-              <div className="form-grid">
+              <div className="field-row">
                 <Field label="Kind">
                   <select value={learningKind} onChange={(event) => setLearningKind(event.target.value)}>
                     {["observation", "fact", "event", "failure", "procedure", "policy"].map((kind) => (
@@ -1480,7 +1497,7 @@ export function App() {
           </Panel>
         </section>
 
-        <section id="tools" className="content-grid">
+        <section id="tools" className="section">
           <Panel title="Connected Tools" icon={<Wrench size={19} />}>
             <form onSubmit={invokeTool} className="stack-form">
               <Field label="Tool">
@@ -1498,6 +1515,7 @@ export function App() {
                   ))}
                 </select>
               </Field>
+
               <Field label="Arguments JSON">
                 <textarea value={toolArgs} onChange={(event) => setToolArgs(event.target.value)} rows={8} />
               </Field>
@@ -1526,7 +1544,7 @@ export function App() {
           </Panel>
           <Panel title="Secret Broker" icon={<KeyRound size={19} />}>
             <form onSubmit={saveSecret} className="stack-form">
-              <div className="form-grid">
+              <div className="field-row">
                 <Field label="Secret name">
                   <input value={secretName} onChange={(event) => setSecretName(event.target.value)} autoComplete="off" />
                 </Field>
@@ -1559,9 +1577,9 @@ export function App() {
                     <strong>{secret.name}</strong>
                     <InlineMeta items={[secret.secret_ref, secret.configured ? "configured" : "missing", secret.validated ? "validated" : "unvalidated"]} />
                     {secret.purpose && <p>{secret.purpose}</p>}
-                    <div className="button-row">
+                    <div className="page-actions">
                       <button type="button" onClick={() => validateSecret(secret)}>Validate</button>
-                      <button type="button" className="danger" onClick={() => deleteSecret(secret)}>Delete</button>
+                      <button type="button" className="btn danger" onClick={() => deleteSecret(secret)}>Delete</button>
                     </div>
                   </div>
                 ))
@@ -1574,7 +1592,7 @@ export function App() {
         <section id="mcp" className="content-grid wide-left">
           <Panel title="MCP Servers" icon={<PlugZap size={19} />}>
             <form onSubmit={saveMcp} className="stack-form">
-              <div className="form-grid">
+              <div className="field-row">
                 <Field label="Server ID"><input value={mcpId} onChange={(event) => setMcpId(event.target.value)} /></Field>
                 <Field label="Name"><input value={mcpName} onChange={(event) => setMcpName(event.target.value)} /></Field>
                 <Field label="Transport">
@@ -1609,11 +1627,11 @@ export function App() {
                 <InlineMeta items={[server.id, server.transport, server.session_state, `${server.tool_count ?? server.tools.length} tools`]} />
                 <StatusBadge value={server.status} />
                 {server.error && <p className="danger-text">{server.error}</p>}
-                <div className="button-row">
+                <div className="page-actions">
                   {(["connect", "sync", "test", "restart", "disconnect"] as const).map((action) => (
                     <button type="button" key={action} onClick={() => controlMcp(server, action)}>{action}</button>
                   ))}
-                  <button type="button" className="danger" onClick={() => deleteMcp(server)}>Delete</button>
+                  <button type="button" className="btn danger" onClick={() => deleteMcp(server)}>Delete</button>
                 </div>
               </div>
             ))}
@@ -1642,7 +1660,7 @@ export function App() {
           </Panel>
         </section>
 
-        <section id="skills" className="content-grid">
+        <section id="skills" className="section">
           <Panel title="Skills" icon={<Sparkles size={19} />} actions={<button type="button" onClick={discoverSkills}>Discover</button>}>
             <div className="list">
               {skills.map((skill) => (
@@ -1688,10 +1706,10 @@ export function App() {
                 <strong>{plugin.name}</strong>
                 <InlineMeta items={[plugin.id, plugin.format, plugin.install_status, plugin.enabled ? "enabled" : "disabled"]} />
                 <p>{plugin.description}</p>
-                <div className="button-row">
+                <div className="page-actions">
                   <button type="button" onClick={() => pluginAction(plugin, plugin.enabled ? "disable" : "enable")}>{plugin.enabled ? "Disable" : "Enable"}</button>
                   <button type="button" onClick={() => pluginAction(plugin, "update")}>Update</button>
-                  <button type="button" className="danger" onClick={() => pluginAction(plugin, "remove")}>Remove</button>
+                  <button type="button" className="btn danger" onClick={() => pluginAction(plugin, "remove")}>Remove</button>
                 </div>
               </div>
             ))}
@@ -1699,10 +1717,10 @@ export function App() {
           </Panel>
         </section>
 
-        <section id="channels" className="content-grid">
+        <section id="channels" className="section">
           <Panel title="Channels" icon={<Bell size={19} />}>
             <form onSubmit={saveChannel} className="stack-form">
-              <div className="form-grid">
+              <div className="field-row">
                 <Field label="Channel ID"><input value={channelId} onChange={(event) => setChannelId(event.target.value)} /></Field>
                 <Field label="Provider"><input value={channelProvider} onChange={(event) => setChannelProvider(event.target.value)} /></Field>
                 <Field label="Token env"><input value={channelTokenEnv} onChange={(event) => setChannelTokenEnv(event.target.value)} /></Field>
@@ -1721,8 +1739,8 @@ export function App() {
                 <button type="button" className="link-button" onClick={() => loadChannel(channel)}>{channel.id}</button>
                 <InlineMeta items={[channel.provider, channel.enabled ? "enabled" : "disabled", channel.send_enabled ? "send" : "dry-run"]} />
                 <StatusBadge value={channel.auto_reply ? "auto reply" : "manual"} />
-                <div className="button-row">
-                  <button type="button" onClick={() => deleteChannel(channel)} className="danger">Delete</button>
+                <div className="page-actions">
+                  <button type="button" onClick={() => deleteChannel(channel)} className="btn danger">Delete</button>
                 </div>
               </div>
             ))}
@@ -1777,7 +1795,7 @@ export function App() {
           </Panel>
         </section>
 
-        <section id="settings" className="content-grid">
+        <section id="settings" className="section">
           <Panel title="Settings & Health" icon={<Settings size={19} />}>
             {runtime ? (
               <>
@@ -1806,6 +1824,7 @@ export function App() {
         )}
       </main>
     </div>
+  </>
   );
 }
 
@@ -1843,9 +1862,9 @@ function ApprovalCard({ approval, onApprove }: { approval: Approval; onApprove: 
         <InlineMeta items={[approval.risk, approval.run_id, approval.tool_call_id]} />
       </div>
       <JsonBlock value={approval.arguments} maxHeight="160px" />
-      <div className="button-row">
+      <div className="page-actions">
         <button type="button" onClick={() => onApprove(approval, true)}><Check size={15} /> Approve</button>
-        <button type="button" className="danger" onClick={() => onApprove(approval, false)}><X size={15} /> Deny</button>
+        <button type="button" className="btn danger" onClick={() => onApprove(approval, false)}><X size={15} /> Deny</button>
       </div>
     </article>
   );
@@ -1863,9 +1882,9 @@ function ApprovalCardInline({ approval, onApprove }: { approval: Approval; onApp
         <summary>View raw JSON</summary>
         <JsonBlock value={approval.arguments} maxHeight="160px" />
       </details>
-      <div className="button-row">
+      <div className="page-actions">
         <button type="button" onClick={() => onApprove(approval, true)}><Check size={15} /> Approve</button>
-        <button type="button" className="danger" onClick={() => onApprove(approval, false)}><X size={15} /> Deny</button>
+        <button type="button" className="btn danger" onClick={() => onApprove(approval, false)}><X size={15} /> Deny</button>
       </div>
     </div>
   );
@@ -1875,7 +1894,7 @@ function LiveRunActivity({ events }: { events: TraceEvent[] }) {
   const items = activityItemsForEvents(events);
   if (items.length === 0) return null;
   return (
-    <div className="run-activity" aria-label="Live run activity" aria-live="polite">
+    <div className="activity" aria-label="Live run activity" aria-live="polite">
       <div className="run-activity-heading">
         <Brain size={15} />
         <strong>Thinking</strong>
@@ -1998,6 +2017,7 @@ function friendlyEventLabel(type: string): string {
     "run.queued": "Queued",
     "run.started": "Started",
     "context.compile": "Gathering context",
+
     "memory.write": "Updating memory",
     "tool.started": "Using tool",
     "tool.completed": "Tool finished",
@@ -2139,3 +2159,4 @@ function summarizeArguments(argumentsValue: Record<string, unknown>): string {
   if (path) return String(path);
   return Object.keys(argumentsValue).slice(0, 3).join(", ") || "No arguments";
 }
+
