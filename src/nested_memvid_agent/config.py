@@ -107,6 +107,8 @@ class AgentConfig:
             memory_dir=Path(os.getenv("NEST_AGENT_MEMORY_DIR", ".nest/memory")),
             layer_config_path=_env_path_or_none("NEST_AGENT_LAYER_CONFIG"),
             workspace=Path(os.getenv("NEST_AGENT_WORKSPACE", ".")),
+            max_tool_rounds=_env_int("NEST_AGENT_MAX_TOOL_ROUNDS", 6),
+            context_budget_chars=_env_int("NEST_AGENT_CONTEXT_BUDGET_CHARS", 18_000),
             log_dir=Path(os.getenv("NEST_AGENT_LOG_DIR", ".nest/logs")),
             state_path=Path(os.getenv("NEST_AGENT_STATE_PATH", ".nest/state/agent.db")),
             secret_store_path=Path(os.getenv("NEST_AGENT_SECRET_STORE_PATH", ".nest/secrets/local_vault.json")),

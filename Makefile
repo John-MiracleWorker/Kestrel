@@ -3,12 +3,7 @@ PIP ?= $(PYTHON) -m pip
 NEST_AGENT ?= $(PYTHON) -m nested_memvid_agent.cli
 RUFF ?= $(PYTHON) -m ruff
 MYPY ?= $(PYTHON) -m mypy
-BACKEND ?= memory
-PROVIDER ?= mock
-MODEL ?= mock
-MEMORY_DIR ?= .nest/memory
-LOG_DIR ?= .nest/logs
-STATE_PATH ?= .nest/state/agent.db
+NEST_AGENT_ARGS ?=
 PORT ?= 8765
 DOCKER_IMAGE ?= kestrel-agent:local
 
@@ -24,7 +19,7 @@ install-memvid:
 	$(PIP) install -e '.[dev,memvid]'
 
 test:
-	$(PYTHON) -m pytest -q
+	PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 $(PYTHON) -m pytest -q
 
 lint:
 	$(RUFF) check scripts src tests
@@ -36,10 +31,10 @@ compile:
 	$(PYTHON) -m compileall -q src tests scripts
 
 bootstrap:
-	$(NEST_AGENT) init --backend $(BACKEND) --memory-dir $(MEMORY_DIR)
+	$(NEST_AGENT) init $(NEST_AGENT_ARGS)
 
 doctor:
-	$(NEST_AGENT) doctor --backend $(BACKEND) --memory-dir $(MEMORY_DIR) --provider $(PROVIDER) --model $(MODEL) --log-dir $(LOG_DIR) --state-path $(STATE_PATH)
+	$(NEST_AGENT) doctor $(NEST_AGENT_ARGS)
 
 chat-smoke:
 	$(NEST_AGENT) chat --backend memory --provider mock --message "hello from packaging smoke"
@@ -50,7 +45,7 @@ golden:
 validate: compile lint typecheck test golden
 
 server:
-	$(NEST_AGENT) server --backend $(BACKEND) --memory-dir $(MEMORY_DIR) --provider $(PROVIDER) --model $(MODEL) --log-dir $(LOG_DIR) --state-path $(STATE_PATH) --host 127.0.0.1 --port $(PORT)
+	$(NEST_AGENT) server $(NEST_AGENT_ARGS) --host 127.0.0.1 --port $(PORT)
 
 docker-build:
 	docker build -t $(DOCKER_IMAGE) .

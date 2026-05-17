@@ -1,12 +1,23 @@
+import { apiAuthHeaders, getApiToken } from "./auth";
+
+export class ApiAuthError extends Error {
+  readonly status = 401;
+
+  constructor(message = "Kestrel API token required.") {
+    super(message);
+    this.name = "ApiAuthError";
+  }
+}
+
 export async function getJson<T>(path: string): Promise<T> {
-  const response = await fetch(path);
+  const response = await fetch(path, { headers: apiAuthHeaders() });
   return parseResponse<T>(response);
 }
 
 export async function postJson<T>(path: string, body: unknown = {}): Promise<T> {
   const response = await fetch(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...apiAuthHeaders(), "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
   return parseResponse<T>(response);
@@ -15,14 +26,14 @@ export async function postJson<T>(path: string, body: unknown = {}): Promise<T> 
 export async function putJson<T>(path: string, body: unknown = {}): Promise<T> {
   const response = await fetch(path, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...apiAuthHeaders(), "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
   return parseResponse<T>(response);
 }
 
 export async function deleteJson<T>(path: string): Promise<T> {
-  const response = await fetch(path, { method: "DELETE" });
+  const response = await fetch(path, { method: "DELETE", headers: apiAuthHeaders() });
   return parseResponse<T>(response);
 }
 
@@ -30,13 +41,26 @@ async function parseResponse<T>(response: Response): Promise<T> {
   const text = await response.text();
   const payload = text ? safeParse(text) : {};
   if (!response.ok) {
-    const message =
-      typeof payload === "object" && payload !== null && "detail" in payload
-        ? JSON.stringify((payload as { detail: unknown }).detail)
-        : text || response.statusText;
-    throw new Error(message);
+    if (response.status === 401) {
+      throw new ApiAuthError(errorMessage(payload, text, response.statusText));
+    }
+    if (response.status === 403) {
+      throw new Error(errorMessage(payload, text, response.statusText));
+    }
+    if (response.status === 503) {
+      throw new Error(errorMessage(payload, text, response.statusText));
+    }
+    throw new Error(errorMessage(payload, text, response.statusText));
   }
   return payload as T;
+}
+
+function errorMessage(payload: unknown, text: string, fallback: string): string {
+  if (typeof payload === "object" && payload !== null && "detail" in payload) {
+    const detail = (payload as { detail: unknown }).detail;
+    return typeof detail === "string" ? detail : JSON.stringify(detail);
+  }
+  return text || fallback;
 }
 
 function safeParse(text: string): unknown {
@@ -56,4 +80,57 @@ export function queryString(params: Record<string, string | number | boolean | n
   });
   const rendered = search.toString();
   return rendered ? `?${rendered}` : "";
+}
+
+export function subscribeJsonEvents<T>(
+  path: string,
+  eventTypes: string[],
+  onEvent: (event: T) => void,
+  onError: (error: unknown) => void
+): () => void {
+  if (!getApiToken() && typeof EventSource !== "undefined") {
+    const source = new EventSource(path);
+    const handleEvent = (event: MessageEvent) => onEvent(JSON.parse(event.data) as T);
+    source.onmessage = handleEvent;
+    eventTypes.forEach((type) => source.addEventListener(type, handleEvent));
+    return () => source.close();
+  }
+
+  const controller = new AbortController();
+  void readEventStream<T>(path, controller.signal, onEvent).catch((error) => {
+    if (!controller.signal.aborted) onError(error);
+  });
+  return () => controller.abort();
+}
+
+async function readEventStream<T>(path: string, signal: AbortSignal, onEvent: (event: T) => void): Promise<void> {
+  const response = await fetch(path, { headers: apiAuthHeaders(), signal });
+  if (!response.ok) {
+    await parseResponse<unknown>(response);
+    return;
+  }
+  if (!response.body) return;
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split(/\r?\n\r?\n/);
+    buffer = parts.pop() ?? "";
+    parts.forEach((part) => emitSsePart(part, onEvent));
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) emitSsePart(buffer, onEvent);
+}
+
+function emitSsePart<T>(part: string, onEvent: (event: T) => void): void {
+  const data = part
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("\n");
+  if (data) onEvent(JSON.parse(data) as T);
 }

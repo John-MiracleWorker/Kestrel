@@ -10,7 +10,7 @@ from threading import Lock
 from typing import Any
 
 from ..context_frames import MV2ContextFrame, default_frame_type_for_memory, to_memory_record
-from ..models import MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
+from ..models import EvidenceRef, MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
 from .base import MemoryBackend
 
 _PATH_LOCKS: dict[Path, Lock] = {}
@@ -42,6 +42,7 @@ class MemvidBackend(MemoryBackend):
         self._lock_acquired = False
         self._records: dict[str, MemoryRecord] = {}
         self._inactive_ids: set[str] = set()
+        self._index_path = self.path.with_suffix(f"{self.path.suffix}.records.json")
 
     def open(self) -> None:
         self._acquire_path_lock()
@@ -81,8 +82,11 @@ class MemvidBackend(MemoryBackend):
                 self.mem = create(str(self.path), enable_vec=self.enable_vec, enable_lex=self.enable_lex)
             except Exception as exc:  # noqa: BLE001 - backend boundary maps SDK failures
                 raise RuntimeError(f"Failed to create Memvid memory {self.path}: {exc}") from exc
+        self._load_exact_index()
 
     def put(self, record: MemoryRecord) -> str:
+        if self.read_only:
+            raise RuntimeError(f"Cannot write read-only Memvid memory: {self.path}")
         mem = self._require_mem()
         if record.layer != self.layer:
             raise ValueError(f"Cannot write {record.layer} record to {self.layer} backend")
@@ -107,15 +111,20 @@ class MemvidBackend(MemoryBackend):
             stored_id = str(result[0])
         else:
             stored_id = record.id
-        self._records[record.id] = record
+        self._remember_record(record)
+        self._persist_exact_index()
         return stored_id
 
     def upsert(self, record: MemoryRecord) -> str:
+        if self.read_only:
+            raise RuntimeError(f"Cannot write read-only Memvid memory: {self.path}")
         if record.id in self._inactive_ids:
             self._inactive_ids.remove(record.id)
         return self.put(record)
 
     def tombstone(self, record_id: str, *, reason: str, superseded_by: str | None = None) -> bool:
+        if self.read_only:
+            raise RuntimeError(f"Cannot write read-only Memvid memory: {self.path}")
         self._inactive_ids.add(record_id)
         record = self._records.get(record_id)
         if record is not None:
@@ -125,6 +134,7 @@ class MemvidBackend(MemoryBackend):
             if superseded_by:
                 record.metadata["superseded_by"] = superseded_by
             record.updated_at = datetime.now(UTC)
+            self._remember_record(record)
         audit = MemoryRecord(
             id=f"tombstone_{record_id}",
             title=f"Tombstone: {record_id}",
@@ -156,6 +166,12 @@ class MemvidBackend(MemoryBackend):
         if record is not None:
             if include_inactive or _record_active(record, inactive_ids=self._inactive_ids):
                 return record
+            return None
+        for indexed_record in self._records.values():
+            if str(indexed_record.metadata.get("frame_id", "")) != record_id:
+                continue
+            if include_inactive or _record_active(indexed_record, inactive_ids=self._inactive_ids):
+                return indexed_record
             return None
         return None
 
@@ -193,6 +209,7 @@ class MemvidBackend(MemoryBackend):
             raw_metadata = item.get("metadata") or item.get("extra_metadata") or {}
             metadata = {**embedded_metadata, **raw_metadata}
             record = _record_from_hit(item=item, metadata=metadata, layer=self.layer)
+            record = self._exact_record_for_hit(record) or record
             if not include_inactive and not _record_active(record, inactive_ids=self._inactive_ids):
                 continue
             raw_score = item.get("score", item.get("relevance", 0.0))
@@ -308,6 +325,62 @@ class MemvidBackend(MemoryBackend):
         if lock is not None:
             lock.release()
 
+    def _remember_record(self, record: MemoryRecord) -> None:
+        self._records[record.id] = record
+        if record.metadata.get("active", True) is False:
+            self._inactive_ids.add(record.id)
+        else:
+            self._inactive_ids.discard(record.id)
+
+    def _exact_record_for_hit(self, record: MemoryRecord) -> MemoryRecord | None:
+        indexed = self._records.get(record.id)
+        if indexed is not None:
+            return indexed
+        frame_id = str(record.metadata.get("frame_id", ""))
+        if frame_id:
+            for indexed_record in self._records.values():
+                if str(indexed_record.metadata.get("frame_id", "")) == frame_id:
+                    return indexed_record
+        return None
+
+    def _load_exact_index(self) -> None:
+        self._records = {}
+        self._inactive_ids = set()
+        if not self._index_path.exists():
+            return
+        try:
+            raw = json.loads(self._index_path.read_text(encoding="utf-8"))
+            records_payload = raw.get("records", []) if isinstance(raw, dict) else raw
+            if not isinstance(records_payload, list):
+                raise ValueError("records must be a list")
+            inactive_payload = raw.get("inactive_ids", []) if isinstance(raw, dict) else []
+            if isinstance(inactive_payload, list):
+                self._inactive_ids.update(str(item) for item in inactive_payload)
+            for item in records_payload:
+                if not isinstance(item, dict):
+                    continue
+                record = _record_from_index_payload(item, self.layer)
+                self._records[record.id] = record
+                if record.metadata.get("active", True) is False:
+                    self._inactive_ids.add(record.id)
+        except Exception as exc:  # noqa: BLE001 - exact index corruption blocks exact-record APIs
+            raise RuntimeError(f"Failed to load Memvid exact-record index {self._index_path}: {exc}") from exc
+
+    def _persist_exact_index(self) -> None:
+        if self.read_only:
+            return
+        self._index_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "mv2_path": str(self.path),
+            "layer": self.layer.value,
+            "inactive_ids": sorted(self._inactive_ids),
+            "records": [_record_to_index_payload(record) for record in self._records.values()],
+        }
+        tmp_path = self._index_path.with_name(f"{self._index_path.name}.tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        tmp_path.replace(self._index_path)
+
 
 def _verify_result_to_bool(result: Any) -> bool:
     if isinstance(result, dict):
@@ -350,6 +423,92 @@ def _record_from_hit(item: dict[str, Any], metadata: dict[str, Any], layer: Memo
         importance=max(0.0, min(importance, 1.0)),
         metadata=dict(metadata),
     )
+
+
+def _record_to_index_payload(record: MemoryRecord) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "title": record.title,
+        "content": record.content,
+        "layer": record.layer.value,
+        "kind": record.kind.value,
+        "tags": _json_safe(record.tags),
+        "metadata": _json_safe(record.metadata),
+        "evidence": [_json_safe(ref.__dict__) for ref in record.evidence],
+        "confidence": record.confidence,
+        "importance": record.importance,
+        "created_at": record.created_at.isoformat(),
+        "updated_at": record.updated_at.isoformat(),
+        "expires_at": record.expires_at.isoformat() if record.expires_at else None,
+    }
+
+
+def _record_from_index_payload(payload: dict[str, Any], backend_layer: MemoryLayer) -> MemoryRecord:
+    try:
+        layer = MemoryLayer(str(payload.get("layer") or backend_layer.value))
+    except ValueError:
+        layer = backend_layer
+    if layer != backend_layer:
+        raise ValueError(f"index record layer {layer} does not match backend layer {backend_layer}")
+    try:
+        kind = MemoryKind(str(payload.get("kind") or MemoryKind.OBSERVATION.value))
+    except ValueError:
+        kind = MemoryKind.OBSERVATION
+    evidence = []
+    raw_evidence = payload.get("evidence", [])
+    if isinstance(raw_evidence, list):
+        for item in raw_evidence:
+            if isinstance(item, dict) and item.get("source") and item.get("locator"):
+                evidence.append(
+                    EvidenceRef(
+                        source=str(item["source"]),
+                        locator=str(item["locator"]),
+                        quote=str(item["quote"]) if item.get("quote") is not None else None,
+                    )
+                )
+    tags = payload.get("tags", {})
+    metadata = payload.get("metadata", {})
+    return MemoryRecord(
+        id=str(payload["id"]),
+        title=str(payload["title"]),
+        content=str(payload["content"]),
+        layer=layer,
+        kind=kind,
+        tags={str(key): str(value) for key, value in tags.items()} if isinstance(tags, dict) else {},
+        metadata=dict(metadata) if isinstance(metadata, dict) else {},
+        evidence=evidence,
+        confidence=float(payload.get("confidence", 0.5)),
+        importance=float(payload.get("importance", 0.5)),
+        created_at=_datetime_from_index(payload.get("created_at")) or datetime.now(UTC),
+        updated_at=_datetime_from_index(payload.get("updated_at")) or datetime.now(UTC),
+        expires_at=_datetime_from_index(payload.get("expires_at")),
+    )
+
+
+def _datetime_from_index(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, MemoryLayer | MemoryKind):
+        return value.value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list | tuple | set):
+        return [_json_safe(item) for item in value]
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    return str(value)
 
 
 def _record_active(record: MemoryRecord, *, inactive_ids: set[str]) -> bool:

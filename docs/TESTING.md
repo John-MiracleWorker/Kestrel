@@ -20,12 +20,12 @@ Run these for normal development:
 
 ```bash
 python -m compileall -q src tests scripts
-python -m pytest -q
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 python scripts/run_golden_evals.py --backend memory --provider mock
 PYTHONPATH=src python -m nested_memvid_agent.cli chat --backend memory --provider mock --message "hello"
 ```
 
-`python -m pytest -q` is preferred over a global `pytest` binary so subprocess fixtures use the active interpreter.
+`python -m pytest -q` is preferred over a global `pytest` binary so subprocess fixtures use the active interpreter. CI also sets `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` so local editor or environment plugins cannot leak into deterministic mock-backed tests.
 
 ## Lint, Types, and Web
 
@@ -37,6 +37,8 @@ npm run build --prefix web
 ```
 
 `npm run test --prefix web` currently runs the TypeScript build in no-pretty mode. `npm run build --prefix web` runs TypeScript plus the Vite production build.
+
+CI runs the web app in its own Node 22 job with `npm ci`, `npm test`, and `npm run build`, then runs a Docker build smoke job after Python and web checks pass.
 
 ## Optional Memvid Integration
 

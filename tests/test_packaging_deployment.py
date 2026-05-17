@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -10,8 +11,10 @@ def test_package_includes_runtime_prompt_data() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
     package_data = pyproject["tool"]["setuptools"]["package-data"]
+    dev_deps = pyproject["project"]["optional-dependencies"]["dev"]
 
     assert "prompts/*.md" in package_data["nested_memvid_agent"]
+    assert any(str(dep).startswith("bandit>=") for dep in dev_deps)
 
 
 def test_dockerfile_keeps_safe_runtime_defaults() -> None:
@@ -60,6 +63,7 @@ def test_makefile_exposes_packaging_validation_targets() -> None:
 
     for target in ["install-dev:", "validate:", "doctor:", "chat-smoke:", "docker-build:", "docker-doctor:"]:
         assert target in makefile
+    assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 $(PYTHON) -m pytest -q" in makefile
     assert "scripts/run_golden_evals.py --backend memory --provider mock" in makefile
     assert "docker run --rm $(DOCKER_IMAGE) nest-agent doctor" in makefile
 
@@ -76,3 +80,28 @@ def test_deployment_docs_cover_release_and_memory_operations() -> None:
     assert "Never call `create(path)` on an existing `.mv2` file." in memory_ops
     assert "NEST_AGENT_ALLOW_SHELL=false" in security
     assert "RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid" in checklist
+
+
+def test_ci_runs_isolated_python_tests_and_web_build() -> None:
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD: \"1\"" in ci
+    assert "setup-node@v4" in ci
+    assert 'node-version: "22"' in ci
+    assert "cache-dependency-path: web/package-lock.json" in ci
+    assert "run: npm ci" in ci
+    assert "run: npm test" in ci
+    assert "run: npm run build" in ci
+    assert "run: docker build -t kestrel-agent:ci ." in ci
+
+
+def test_runtime_artifacts_are_not_tracked() -> None:
+    tracked = subprocess.run(
+        ["git", "ls-files", "runs", "memory", "logs"],
+        check=True,
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+    ).stdout.splitlines()
+
+    assert tracked == []

@@ -1,4 +1,5 @@
-<style>
+@import url("https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap");
+
   /* ---------- chat page shell ---------- */
   html, body { height: 100%; }
   body { overflow: hidden; }
@@ -760,10 +761,7 @@
     .rail { display: none; }
     .conv-head, .transcript-inner, .composer-wrap { padding-left: 22px; padding-right: 22px; }
   }
-</style>
 /* Kestrel — minimalist settings UI */
-
-@import url("https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap");
 
 * { box-sizing: border-box; }
 

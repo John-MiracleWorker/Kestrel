@@ -119,6 +119,8 @@ describe("App", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
+    sessionStorage.clear();
+    localStorage.clear();
   });
 
   it("opens on a conversation-first workspace with Advanced available", async () => {
@@ -210,14 +212,15 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByText("Inspect the repo");
-    eventSources[0].emit("context.compile", { query: "repo" });
-    eventSources[0].emit("assistant.token", { content: "Streaming answer" });
+    const stream = await waitForEventSource();
+    stream.emit("context.compile", { query: "repo" });
+    stream.emit("assistant.token", { content: "Streaming answer" });
     expect(await screen.findByText("Gathering context")).toBeInTheDocument();
     expect(await screen.findByText("Streaming answer")).toBeInTheDocument();
 
     sessionRuns.session_1 = [{ ...sessionRuns.session_1[0], status: "completed", assistant_message: "Streaming answer", stop_reason: "completed" }];
     runs = [sessionRuns.session_1[0], otherRun];
-    eventSources[0].emit("run.completed", {});
+    stream.emit("run.completed", {});
 
     await waitFor(() => {
       const transcript = screen.getByLabelText("Conversation transcript");
@@ -237,9 +240,10 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByText("Inspect the repo");
-    eventSources[0].emit("context.compile", { query: "repo", context_chars: 1200 });
-    eventSources[0].emit("tool.started", { tool: "shell.run", tool_call_id: "tool_1" });
-    eventSources[0].emit("tool.completed", {
+    const stream = await waitForEventSource();
+    stream.emit("context.compile", { query: "repo", context_chars: 1200 });
+    stream.emit("tool.started", { tool: "shell.run", tool_call_id: "tool_1" });
+    stream.emit("tool.completed", {
       tool: "shell.run",
       tool_call_id: "tool_1",
       arguments: { command: ["npm", "test"] },
@@ -337,6 +341,28 @@ describe("App", () => {
       expect(screen.queryByText("123456:ABC-super-secret")).not.toBeInTheDocument();
     });
   });
+
+  it("prompts for an API token after a 401 and sends it on later API calls", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    fetchSpy.mockImplementationOnce(async () => jsonResponse({ detail: "Invalid or missing Kestrel API token." }, 401));
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Kestrel API token" })).toBeInTheDocument();
+    expect(screen.queryByText("Action failed")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("API token"), { target: { value: "browser-token" } });
+    fireEvent.click(screen.getByRole("button", { name: /save token/i }));
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    await waitFor(() => {
+      expect(
+        fetchSpy.mock.calls.some(([, init]) => {
+          const headers = init?.headers as Record<string, string> | undefined;
+          return headers?.Authorization === "Bearer browser-token";
+        })
+      ).toBe(true);
+    });
+  });
 });
 
 class MockEventSource {
@@ -366,6 +392,11 @@ class MockEventSource {
       listener(message);
     }
   }
+}
+
+async function waitForEventSource(): Promise<MockEventSource> {
+  await waitFor(() => expect(eventSources[0]).toBeDefined());
+  return eventSources[0];
 }
 
 async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
@@ -506,9 +537,9 @@ function payloadFor(path: string): unknown {
   return {};
 }
 
-function jsonResponse(payload: unknown): Response {
+function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
-    status: 200,
+    status,
     headers: { "Content-Type": "application/json" }
   });
 }

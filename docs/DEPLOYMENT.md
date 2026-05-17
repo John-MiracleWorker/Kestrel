@@ -109,6 +109,8 @@ enable_auto_consolidation=false
 
 The container command binds to `0.0.0.0` inside Docker, so the image requires API auth by default. Set `NEST_AGENT_API_TOKEN` for `docker run` and `docker compose`; startup fails before serving if a non-loopback bind is requested without a configured token.
 
+When `require_api_auth=true`, the browser shell remains public so operators can load `/`, `/assets/*`, and client-side routes. All `/api/*` routes still require the token. The web app prompts for the token after a 401, stores it in browser local storage, and sends it as `Authorization: Bearer <token>` on API requests.
+
 ## Docker Compose
 
 Copy `.env.example` to `.env`, fill provider keys only where needed, then:

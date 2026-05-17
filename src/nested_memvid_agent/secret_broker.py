@@ -13,7 +13,7 @@ from typing import Any, Protocol
 from .state_store import utc_now
 
 _SECRET_ID_RE = re.compile(r"[^a-z0-9_.-]+")
-_SECRET_REF_PREFIX = "secret://"
+_SECRET_REF_PREFIX = "secret://"  # nosec B105
 
 
 @dataclass(frozen=True)
@@ -269,7 +269,7 @@ class KeyringSecretBroker(SecretBroker):
             raise KeyError(secret_id)
         try:
             self.keyring.delete_password(self.service_name, secret_id)
-        except Exception:
+        except Exception:  # nosec B110
             pass
         del records[secret_id]
         self._write(data)

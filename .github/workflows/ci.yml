@@ -10,6 +10,8 @@ on:
 jobs:
   python:
     runs-on: ubuntu-latest
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,3 +31,32 @@ jobs:
         run: pytest -q
       - name: Golden evals
         run: python scripts/run_golden_evals.py --backend memory --provider mock
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install web dependencies
+        run: npm ci
+        working-directory: web
+      - name: Test web
+        run: npm test
+        working-directory: web
+      - name: Build web
+        run: npm run build
+        working-directory: web
+
+  docker:
+    runs-on: ubuntu-latest
+    needs:
+      - python
+      - web
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker build
+        run: docker build -t kestrel-agent:ci .

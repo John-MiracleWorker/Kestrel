@@ -130,7 +130,7 @@ class AgentStateStore:
         values = [_encode(value) for value in fields.values()]
         values.append(run_id)
         with self._connect() as conn:
-            conn.execute(f"UPDATE runs SET {assignments} WHERE run_id = ?", values)
+            conn.execute(f"UPDATE runs SET {assignments} WHERE run_id = ?", values)  # nosec
         return self.get_run(run_id)
 
     def transition_run(self, run_id: str, status: str, **fields: object) -> RunRecord:
@@ -154,7 +154,7 @@ class AgentStateStore:
             assignments = ", ".join(f"{_validated_column('runs', key)} = ?" for key in updates)
             values = [_encode(value) for value in updates.values()]
             values.append(run_id)
-            conn.execute(f"UPDATE runs SET {assignments} WHERE run_id = ?", values)
+            conn.execute(f"UPDATE runs SET {assignments} WHERE run_id = ?", values)  # nosec
         return self.get_run(run_id)
 
     def get_run(self, run_id: str) -> RunRecord:
@@ -620,7 +620,7 @@ class AgentStateStore:
         values = [_encode(value) for value in fields.values()]
         values.append(task_id)
         with self._connect() as conn:
-            conn.execute(f"UPDATE task_nodes SET {assignments} WHERE task_id = ?", values)
+            conn.execute(f"UPDATE task_nodes SET {assignments} WHERE task_id = ?", values)  # nosec
         return self.get_task_node(task_id)
 
     def record_task_failure(
@@ -685,11 +685,11 @@ class AgentStateStore:
         if not fields:
             return self.get_subagent_run(subagent_id)
         fields["updated_at"] = utc_now()
-        assignments = ", ".join(f"{key} = ?" for key in fields)
+        assignments = ", ".join(f"{_validated_column('subagent_runs', key)} = ?" for key in fields)
         values = [_encode(value) for value in fields.values()]
         values.append(subagent_id)
         with self._connect() as conn:
-            conn.execute(f"UPDATE subagent_runs SET {assignments} WHERE subagent_id = ?", values)
+            conn.execute(f"UPDATE subagent_runs SET {assignments} WHERE subagent_id = ?", values)  # nosec
         return self.get_subagent_run(subagent_id)
 
     def get_subagent_run(self, subagent_id: str) -> SubagentRunRecord:
@@ -925,7 +925,7 @@ def _apply_schema_v2(conn: sqlite3.Connection) -> None:
         "tool_count": "INTEGER NOT NULL DEFAULT 0",
         "capabilities_json": "TEXT NOT NULL DEFAULT '[]'",
         "risk_policy": "TEXT NOT NULL DEFAULT 'default'",
-        "secret_env_json": "TEXT NOT NULL DEFAULT '{}'",
+        "secret_env_json": "TEXT NOT NULL DEFAULT '{}'",  # nosec B105
     }.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE mcp_servers ADD COLUMN {name} {definition}")
@@ -1111,6 +1111,16 @@ _ALLOWED_UPDATE_COLUMNS = {
         "failure_reason",
         "diagnosis_json",
         "retry_strategy_json",
+        "updated_at",
+    },
+    "subagent_runs": {
+        "run_id",
+        "task_id",
+        "profile",
+        "goal",
+        "status",
+        "result",
+        "error",
         "updated_at",
     },
 }

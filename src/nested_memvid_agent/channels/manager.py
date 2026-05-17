@@ -221,7 +221,7 @@ def default_channel_configs() -> list[ChannelEndpointConfig]:
         ChannelEndpointConfig(
             id="telegram",
             provider="telegram",
-            token_env="TELEGRAM_BOT_TOKEN",
+            token_env="TELEGRAM_BOT_TOKEN",  # nosec B106
         ),
         ChannelEndpointConfig(
             id="discord",

@@ -776,13 +776,13 @@ def _category_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     for category in _REQUIRED_CATEGORIES:
         categories[category] = {
             "case_count": 0,
-            "pass_count": 0,
+            "pass_count": 0,  # nosec B105
             "fail_count": 0,
             "score": None,
         }
     for item in results:
         category = str(item.get("category", "uncategorized"))
-        bucket = categories.setdefault(category, {"case_count": 0, "pass_count": 0, "fail_count": 0, "score": None})
+        bucket = categories.setdefault(category, {"case_count": 0, "pass_count": 0, "fail_count": 0, "score": None})  # nosec B105
         bucket["case_count"] = int(bucket["case_count"]) + 1
         if item["passed"]:
             bucket["pass_count"] = int(bucket["pass_count"]) + 1

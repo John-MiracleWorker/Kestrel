@@ -1,15 +1,12 @@
 import json
 import os
 import queue
-import secrets
-from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from importlib import import_module
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from .app_factory import build_agent
 from .channels import ChannelManager, ChannelPayloadError
@@ -21,7 +18,34 @@ from .models import MemoryLayer, RetrievalQuery
 from .orchestrator import build_memory_system
 from .plugin_manager import PluginError, PluginManager
 from .run_manager import RunManager
-from .secret_broker import build_secret_broker, is_secret_ref
+from .secret_broker import build_secret_broker
+from .server_support import (
+    api_auth_error as _api_auth_error,
+)
+from .server_support import (
+    bounded_limit as _bounded_limit,
+)
+from .server_support import (
+    csv_layers as _csv_layers,
+)
+from .server_support import (
+    execution_response as _execution_response,
+)
+from .server_support import (
+    hostname_from_header as _hostname_from_header,
+)
+from .server_support import (
+    hostname_from_url as _hostname_from_url,
+)
+from .server_support import (
+    known_secret_env_names as _known_secret_env_names,
+)
+from .server_support import (
+    request_headers,
+)
+from .server_support import (
+    tool_response_payload as _tool_response_payload,
+)
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore
 
@@ -34,17 +58,43 @@ def create_app(config: AgentConfig | None = None) -> Any:
         responses_module = import_module("starlette.responses")
         staticfiles_module = import_module("starlette.staticfiles")
         cors_module = import_module("starlette.middleware.cors")
-        pydantic_module = import_module("pydantic")
+        from .server_mcp_routes import register_mcp_routes
+        from .server_models import (
+            ApprovalDecisionRequest,
+            CapsuleApplyAPIRequest,
+            CapsuleSummarizeAPIRequest,
+            ChannelConfigRequest,
+            ChannelIngestRequest,
+            ContextExpandAPIRequest,
+            ContextPackAPIRequest,
+            CreateRunRequest,
+            DiagnosisRequest,
+            MemoryCompactRequest,
+            MemoryConsolidateRequest,
+            MemoryCorrectRequest,
+            MemoryInspectAPIRequest,
+            MemoryLearnRequest,
+            MemorySearchRequest,
+            PluginInstallRequest,
+            PluginUpdateRequest,
+            SchedulerRunRequest,
+            SchedulerStepRequest,
+            SecretStoreRequest,
+            SelfChangeRequest,
+            SelfRememberRequest,
+            SkillInstallRequest,
+            SubagentRequest,
+            ToolInvokeRequest,
+            WebFetchRequest,
+            WebSearchRequest,
+        )
     except ImportError as exc:
         raise RuntimeError("Install server extras with `pip install -e '.[server]'`.") from exc
 
     FastAPI = fastapi_module.FastAPI
     HTTPException = fastapi_module.HTTPException
-    Depends = fastapi_module.Depends
     Header = fastapi_module.Header
     Request = fastapi_module.Request
-    BaseModel = pydantic_module.BaseModel
-    Field = pydantic_module.Field
     StreamingResponse = responses_module.StreamingResponse
     FileResponse = responses_module.FileResponse
     StaticFiles = staticfiles_module.StaticFiles
@@ -65,18 +115,10 @@ def create_app(config: AgentConfig | None = None) -> Any:
         authorization: str | None = Header(default=None),
         x_kestrel_api_key: str | None = Header(default=None),
     ) -> bool:
-        if not active_config.require_api_auth:
-            return True
-        expected = os.getenv(active_config.api_auth_token_env, "").strip()
-        if not expected:
-            raise HTTPException(status_code=503, detail=f"Missing API auth token env: {active_config.api_auth_token_env}")
-        candidate = ""
-        if authorization and authorization.lower().startswith("bearer "):
-            candidate = authorization[7:].strip()
-        elif x_kestrel_api_key:
-            candidate = x_kestrel_api_key.strip()
-        if not candidate or not secrets.compare_digest(candidate, expected):
-            raise HTTPException(status_code=401, detail="Invalid or missing Kestrel API token.")
+        auth_error = _api_auth_error(active_config, {"authorization": authorization or "", "x-kestrel-api-key": x_kestrel_api_key or ""})
+        if auth_error is not None:
+            status_code, detail = auth_error
+            raise HTTPException(status_code=status_code, detail=detail)
         return True
 
     def audit_plugin(action: str, plugin: dict[str, Any]) -> None:
@@ -85,10 +127,6 @@ def create_app(config: AgentConfig | None = None) -> Any:
             plugins.write_audit_memory(memory, action=action, plugin=plugin)
         finally:
             memory.close_all()
-
-    def request_headers(request: object) -> Mapping[str, str]:
-        headers = getattr(request, "headers", {})
-        return headers if isinstance(headers, Mapping) else {}
 
     async def _request_body(request: object) -> bytes:
         body = getattr(request, "body", None)
@@ -151,27 +189,6 @@ def create_app(config: AgentConfig | None = None) -> Any:
         }
         return safe
 
-    def mcp_public(server: dict[str, Any]) -> dict[str, object]:
-        safe = dict(server)
-        secret_env = dict(safe.pop("secret_env", {}) or {})
-        safe["secret_env_status"] = {
-            str(target): {
-                "source_env": str(source),
-                "secret_ref": str(source) if is_secret_ref(str(source)) else None,
-                "configured": bool(secret_broker.resolve(str(source))),
-                "validated": bool(secret_broker.status(str(source)).get("validated", False)),
-                "last_validated_at": secret_broker.status(str(source)).get("last_validated_at"),
-            }
-            for target, source in sorted(secret_env.items())
-        }
-        return safe
-
-    def mcp_result_public(result: dict[str, Any]) -> dict[str, object]:
-        safe = dict(result)
-        if isinstance(safe.get("server"), dict):
-            safe["server"] = mcp_public(dict(safe["server"]))
-        return safe
-
     def require_plugin_install_enabled() -> None:
         if not active_config.allow_plugin_install:
             raise HTTPException(status_code=403, detail="plugin_install_disabled")
@@ -188,7 +205,6 @@ def create_app(config: AgentConfig | None = None) -> Any:
     app = FastAPI(
         title="Nested MV2 Agent",
         lifespan=lifespan,
-        dependencies=[Depends(require_api_auth)] if active_config.require_api_auth else [],
     )
     app.add_middleware(
         CORSMiddleware,
@@ -203,186 +219,20 @@ def create_app(config: AgentConfig | None = None) -> Any:
         headers = request_headers(request)
         host = _hostname_from_header(str(headers.get("host", "")))
         trusted_hosts = set(active_config.trusted_hosts)
-        if "0.0.0.0" not in trusted_hosts and "*" not in trusted_hosts and host not in trusted_hosts:
+        if "0.0.0.0" not in trusted_hosts and "*" not in trusted_hosts and host not in trusted_hosts:  # nosec
             return responses_module.JSONResponse({"detail": "untrusted_host"}, status_code=400)
         origin = str(headers.get("origin", "")).strip()
         if origin:
             origin_host = _hostname_from_url(origin)
-            if origin_host and "0.0.0.0" not in trusted_hosts and "*" not in trusted_hosts and origin_host not in trusted_hosts:
+            if origin_host and "0.0.0.0" not in trusted_hosts and "*" not in trusted_hosts and origin_host not in trusted_hosts:  # nosec
                 return responses_module.JSONResponse({"detail": "untrusted_origin"}, status_code=403)
+        path = str(getattr(getattr(request, "url", None), "path", ""))
+        if path == "/api" or path.startswith("/api/"):
+            auth_error = _api_auth_error(active_config, headers)
+            if auth_error is not None:
+                status_code, detail = auth_error
+                return responses_module.JSONResponse({"detail": detail}, status_code=status_code)
         return await call_next(request)
-
-    class CreateRunRequest(BaseModel):  # type: ignore[valid-type,misc]
-        message: str
-        session_id: str | None = None
-        workspace: str | None = None
-        provider: str | None = None
-        model: str | None = None
-        autonomy_mode: str = "background"
-
-    class ChannelIngestRequest(BaseModel):  # type: ignore[valid-type,misc]
-        provider: str
-        payload: dict[str, Any] = Field(default_factory=dict)
-        channel_id: str | None = None
-        send: bool | None = None
-
-    class ChannelConfigRequest(BaseModel):  # type: ignore[valid-type,misc]
-        id: str
-        provider: str = "webhook"
-        enabled: bool = True
-        send_enabled: bool = False
-        auto_reply: bool = False
-        token_env: str | None = None
-        webhook_url_env: str | None = None
-        settings: dict[str, Any] = Field(default_factory=dict)
-
-    class ToolInvokeRequest(BaseModel):  # type: ignore[valid-type,misc]
-        arguments: dict[str, Any] = Field(default_factory=dict)
-        session_id: str = "manual"
-        run_id: str | None = None
-
-    class ApprovalDecisionRequest(BaseModel):  # type: ignore[valid-type,misc]
-        approved: bool
-        arguments: dict[str, Any] | None = None
-
-    class MCPServerRequest(BaseModel):  # type: ignore[valid-type,misc]
-        id: str
-        name: str | None = None
-        transport: str = "stdio"
-        command: str | None = None
-        args: list[str] = Field(default_factory=list)
-        env: dict[str, str] = Field(default_factory=dict)
-        url: str | None = None
-        enabled: bool = True
-        tools: list[dict[str, Any]] = Field(default_factory=list)
-        risk_policy: str = "approval_by_default"
-        secret_env: dict[str, str] = Field(default_factory=dict)
-
-    class SecretStoreRequest(BaseModel):  # type: ignore[valid-type,misc]
-        name: str
-        value: str
-        purpose: str = ""
-        id: str | None = None
-        validate_now: bool = Field(default=False, alias="validate")
-
-    class SubagentRequest(BaseModel):  # type: ignore[valid-type,misc]
-        run_id: str
-        profile: str = "worker"
-        goal: str
-        task_id: str | None = None
-
-    class SchedulerStepRequest(BaseModel):  # type: ignore[valid-type,misc]
-        max_tasks: int | None = None
-
-    class SchedulerRunRequest(BaseModel):  # type: ignore[valid-type,misc]
-        max_tasks: int | None = None
-        max_cycles: int | None = None
-
-    class MemorySearchRequest(BaseModel):  # type: ignore[valid-type,misc]
-        query: str
-        layers: list[str] | None = None
-        k: int = 8
-        include_inactive: bool = False
-
-    class MemoryInspectAPIRequest(BaseModel):  # type: ignore[valid-type,misc]
-        query: str | None = None
-        layers: list[str] | None = None
-        k: int = 20
-        include_inactive: bool = False
-
-    class MemoryConsolidateRequest(BaseModel):  # type: ignore[valid-type,misc]
-        query: str
-        source_layer: str | None = None
-        validation_evidence: dict[str, Any] | None = None
-        validation_score: float = 0.7
-        repeat_count: int = 1
-        explicit_instruction: bool = False
-        dry_run: bool = False
-
-    class MemoryLearnRequest(BaseModel):  # type: ignore[valid-type,misc]
-        title: str
-        content: str
-        kind: str = "observation"
-        source_layer: str = "working"
-        target_layer: str | None = None
-        confidence: float = 0.6
-        importance: float = 0.5
-        validation_evidence: dict[str, Any] | None = None
-        validation_score: float = 0.7
-        repeat_count: int = 1
-        explicit_instruction: bool = False
-        dry_run: bool = False
-
-    class MemoryCorrectRequest(BaseModel):  # type: ignore[valid-type,misc]
-        target_record_id: str
-        correction_text: str
-        evidence: list[dict[str, Any]] = Field(default_factory=list)
-        dry_run: bool = False
-
-    class MemoryCompactRequest(BaseModel):  # type: ignore[valid-type,misc]
-        layer: str = "working"
-        apply: bool = False
-
-    class SelfRememberRequest(BaseModel):  # type: ignore[valid-type,misc]
-        title: str
-        content: str
-        schema_: str = Field(alias="schema")
-        validation_status: str
-        confidence: float = 0.82
-        importance: float = 0.72
-
-    class SelfChangeRequest(BaseModel):  # type: ignore[valid-type,misc]
-        request: str
-        rationale: str = ""
-
-    class WebSearchRequest(BaseModel):  # type: ignore[valid-type,misc]
-        query: str
-        max_results: int | None = None
-
-    class WebFetchRequest(BaseModel):  # type: ignore[valid-type,misc]
-        url: str
-        max_bytes: int | None = None
-
-    class ContextPackAPIRequest(BaseModel):  # type: ignore[valid-type,misc]
-        query: str
-        token_budget: int | None = None
-        layers: list[str] | None = None
-        expand_raw: bool | None = None
-        include_telemetry: bool = True
-
-    class ContextExpandAPIRequest(BaseModel):  # type: ignore[valid-type,misc]
-        frame_id: str | None = None
-        record_id: str | None = None
-        max_tokens: int = 2000
-        include_children: bool = False
-        include_parents: bool = False
-
-    class CapsuleSummarizeAPIRequest(BaseModel):  # type: ignore[valid-type,misc]
-        dry_run: bool = True
-
-    class CapsuleApplyAPIRequest(BaseModel):  # type: ignore[valid-type,misc]
-        dry_run: bool = False
-        include_policy: bool = False
-
-    class SkillInstallRequest(BaseModel):  # type: ignore[valid-type,misc]
-        manifest: dict[str, Any]
-        instructions: str
-        overwrite: bool = False
-        dry_run: bool = False
-
-    class PluginInstallRequest(BaseModel):  # type: ignore[valid-type,misc]
-        source: str
-        ref: str | None = None
-        enable: bool = False
-        overwrite: bool = False
-
-    class PluginUpdateRequest(BaseModel):  # type: ignore[valid-type,misc]
-        ref: str | None = None
-
-    class DiagnosisRequest(BaseModel):  # type: ignore[valid-type,misc]
-        failure_text: str
-        source: str | None = None
-        k: int = 5
 
     @app.get("/api/health")  # type: ignore[untyped-decorator]
     def health() -> dict[str, object]:
@@ -777,111 +627,14 @@ def create_app(config: AgentConfig | None = None) -> Any:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.get("/api/mcp/servers")  # type: ignore[untyped-decorator]
-    def list_mcp_servers() -> list[dict[str, object]]:
-        return [mcp_public(server) for server in mcp.list_servers()]
-
-    @app.get("/api/mcp/servers/{server_id}")  # type: ignore[untyped-decorator]
-    def get_mcp_server(server_id: str) -> dict[str, object]:
-        try:
-            return mcp_public(state.get_mcp_server(server_id))
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/mcp/servers")  # type: ignore[untyped-decorator]
-    def add_mcp_server(request: MCPServerRequest) -> dict[str, object]:
-        try:
-            return mcp_public(mcp.add_server(request.model_dump()))
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.put("/api/mcp/servers/{server_id}")  # type: ignore[untyped-decorator]
-    def update_mcp_server(server_id: str, request: MCPServerRequest) -> dict[str, object]:
-        payload = request.model_dump()
-        payload["id"] = server_id
-        try:
-            return mcp_public(mcp.add_server(payload))
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.delete("/api/mcp/servers/{server_id}")  # type: ignore[untyped-decorator]
-    def delete_mcp_server(server_id: str) -> dict[str, bool]:
-        mcp.delete_server(server_id)
-        return {"ok": True}
-
-    @app.post("/api/mcp/servers/{server_id}/connect")  # type: ignore[untyped-decorator]
-    def connect_mcp_server(server_id: str) -> dict[str, object]:
-        try:
-            return mcp_result_public(mcp.connect_server(server_id))
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/mcp/servers/{server_id}/approve-connect")  # type: ignore[untyped-decorator]
-    def approve_mcp_server_connect(server_id: str) -> dict[str, object]:
-        try:
-            return mcp_public(mcp.approve_server_connect(server_id))
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.post("/api/mcp/servers/{server_id}/disconnect")  # type: ignore[untyped-decorator]
-    def disconnect_mcp_server(server_id: str) -> dict[str, object]:
-        try:
-            return mcp_result_public(mcp.disconnect_server(server_id))
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/mcp/servers/{server_id}/restart")  # type: ignore[untyped-decorator]
-    def restart_mcp_server(server_id: str) -> dict[str, object]:
-        try:
-            return mcp_result_public(mcp.restart_server(server_id))
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/mcp/servers/{server_id}/health")  # type: ignore[untyped-decorator]
-    def mcp_server_health(server_id: str) -> dict[str, object]:
-        try:
-            server = state.get_mcp_server(server_id)
-            return {"ok": server.get("status") != "error", "message": "Stored MCP health snapshot.", "server": mcp_public(server)}
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/mcp/servers/{server_id}/sync")  # type: ignore[untyped-decorator]
-    def sync_mcp_server(server_id: str) -> dict[str, object]:
-        try:
-            return mcp_public(mcp.sync_server(server_id))
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/mcp/servers/{server_id}/test")  # type: ignore[untyped-decorator]
-    def test_mcp_server(server_id: str) -> dict[str, object]:
-        try:
-            return mcp_result_public(mcp.test_server(server_id))
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/mcp/servers/{server_id}/tools/{tool_name}/invoke")  # type: ignore[untyped-decorator]
-    def invoke_mcp_tool(server_id: str, tool_name: str, request: ToolInvokeRequest) -> dict[str, object]:
-        try:
-            state.get_mcp_server(server_id)
-            registered_name = tool_name if tool_name.startswith("mcp.") else f"mcp.{server_id}.{tool_name}"
-            execution = runs.invoke_tool(
-                tool_name=registered_name,
-                arguments=request.arguments,
-                session_id=request.session_id,
-                run_id=request.run_id,
-            )
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return {
-            "tool": execution.call.name,
-            "tool_call_id": execution.call.id,
-            "success": execution.success,
-            "content": execution.content,
-            "data": execution.data,
-            "error": execution.error,
-        }
+    register_mcp_routes(
+        app,
+        http_exception=HTTPException,
+        state=state,
+        mcp=mcp,
+        runs=runs,
+        secret_broker=secret_broker,
+    )
 
     @app.get("/api/plugins")  # type: ignore[untyped-decorator]
     def list_plugins() -> list[dict[str, object]]:
@@ -1260,84 +1013,8 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
         @app.get("/{path:path}")  # type: ignore[untyped-decorator]
         def spa_fallback(path: str) -> Any:
-            del path
+            if path == "api" or path.startswith("api/"):
+                raise HTTPException(status_code=404, detail="not_found")
             return FileResponse(web_dist / "index.html")
 
     return app
-
-
-def _csv_layers(value: str | None) -> list[str] | None:
-    if value is None or not value.strip():
-        return None
-    return [item.strip() for item in value.split(",") if item.strip()]
-
-
-def _bounded_limit(value: int, *, default: int, maximum: int) -> int:
-    if value < 1:
-        return default
-    return min(value, maximum)
-
-
-def _hostname_from_header(value: str) -> str:
-    host = value.strip()
-    if not host:
-        return ""
-    if host.startswith("["):
-        end = host.find("]")
-        return host[: end + 1] if end >= 0 else host
-    return host.split(":", 1)[0]
-
-
-def _hostname_from_url(value: str) -> str:
-    parsed = urlparse(value)
-    host = parsed.hostname or ""
-    if parsed.hostname == "::1":
-        return "::1"
-    return host
-
-
-def _known_secret_env_names(channels: list[dict[str, Any]], servers: list[dict[str, Any]]) -> set[str]:
-    names: set[str] = set()
-    for channel in channels:
-        for key in ("token_env", "webhook_url_env"):
-            value = channel.get(key)
-            if isinstance(value, str) and value.strip():
-                names.add(value.strip())
-        settings = channel.get("settings")
-        if isinstance(settings, dict):
-            for key in ("signature_secret_env", "webhook_url_env"):
-                value = settings.get(key)
-                if isinstance(value, str) and value.strip():
-                    names.add(value.strip())
-    for server in servers:
-        secret_env = server.get("secret_env")
-        if isinstance(secret_env, dict):
-            for value in secret_env.values():
-                if isinstance(value, str) and value.strip() and not is_secret_ref(value):
-                    names.add(value.strip())
-    return names
-
-
-def _execution_response(execution: Any) -> dict[str, object]:
-    return {
-        "tool": execution.call.name,
-        "tool_call_id": execution.call.id,
-        "success": execution.success,
-        "content": execution.content,
-        "data": execution.data,
-        "error": execution.error,
-    }
-
-
-def _tool_response_payload(execution: Any) -> dict[str, object]:
-    stripped = str(execution.content).lstrip()
-    if stripped.startswith("{") or stripped.startswith("["):
-        payload = json.loads(execution.content)
-        if isinstance(payload, dict):
-            return dict(payload)
-        if isinstance(payload, list):
-            return {"success": execution.success, "items": payload, "error": execution.error}
-    data = getattr(execution, "data", None)
-    if isinstance(data, dict) and data:
-        return {"success": execution.success, **data, "content": execution.content, "error": execution.error}
-    return {"success": execution.success, "content": execution.content, "error": execution.error}

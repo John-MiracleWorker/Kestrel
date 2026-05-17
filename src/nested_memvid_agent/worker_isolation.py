@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-import subprocess
+import subprocess  # nosec B404
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,7 +46,7 @@ def prepare_git_worktree(
 
 
 def _git_output(cwd: Path, *args: str) -> str:
-    completed = subprocess.run(  # noqa: S603 - fixed executable with argument vector
+    completed = subprocess.run(  # noqa: S603 - fixed executable with argument vector  # nosec
         ["git", *args],
         cwd=cwd,
         capture_output=True,

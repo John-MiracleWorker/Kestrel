@@ -5,8 +5,9 @@ import importlib.util
 import ipaddress
 import json
 import platform
-import subprocess
+import subprocess  # nosec B404
 import sys
+from dataclasses import replace
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from time import monotonic, sleep
@@ -44,66 +45,70 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--provider",
         choices=["mock", "openai", "openai-compatible", "openrouter", "ollama", "anthropic", "gemini", "codex-cli"],
-        default="mock",
+        default=argparse.SUPPRESS,
     )
-    parser.add_argument("--model", default="mock")
-    parser.add_argument("--base-url")
-    parser.add_argument("--api-key-env")
-    parser.add_argument("--timeout-seconds", type=int, default=60)
-    parser.add_argument("--max-retries", type=int, default=2)
-    parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--codex-sandbox", choices=["read-only", "workspace-write", "danger-full-access"], default="read-only")
-    parser.add_argument("--codex-profile")
-    parser.add_argument("--codex-skip-git-repo-check", action="store_true")
-    parser.add_argument("--codex-persist-session", action="store_true")
-    parser.add_argument("--workspace", type=Path, default=Path("."))
-    parser.add_argument("--log-dir", type=Path, default=Path(".nest/logs"))
-    parser.add_argument("--state-path", type=Path, default=Path(".nest/state/agent.db"))
-    parser.add_argument("--secret-store-path", type=Path, default=Path(".nest/secrets/local_vault.json"))
-    parser.add_argument("--secret-backend", choices=["json", "keyring"], default="json")
-    parser.add_argument("--skills-dir", type=Path, default=Path(".nest/skills"))
-    parser.add_argument("--plugins-dir", type=Path, default=Path(".nest/plugins"))
-    parser.add_argument("--mcp-config", type=Path, default=Path(".nest/config/mcp_servers.json"))
-    parser.add_argument("--channels-config", type=Path, default=Path(".nest/config/channels.json"))
-    parser.add_argument("--enable-channel-delivery", action="store_true")
-    parser.add_argument("--channel-send-timeout-seconds", type=int, default=10)
-    parser.add_argument("--require-api-auth", action="store_true")
-    parser.add_argument("--api-auth-token-env", default="NEST_AGENT_API_TOKEN")
-    parser.add_argument("--allow-shell", action="store_true")
-    parser.add_argument("--allow-file-write", action="store_true")
-    parser.add_argument("--allow-policy-writes", action="store_true")
-    parser.add_argument("--allow-codex-cli", action="store_true")
-    parser.add_argument("--allow-plugin-install", action="store_true")
-    parser.add_argument("--allow-git-commit", action="store_true")
-    parser.add_argument("--allow-git-push", action="store_true")
-    parser.add_argument("--allow-remote-mutation", action="store_true")
-    parser.add_argument("--git-write-mode", default="local_branch")
-    parser.add_argument("--protected-branches", default="main,master,release/*")
-    parser.add_argument("--allow-memory-import", action="store_true")
-    parser.add_argument("--allow-executable-skills", action="store_true")
-    parser.add_argument("--allow-mcp-network-endpoints", action="store_true")
-    parser.add_argument("--allow-web", action="store_true")
-    parser.add_argument("--allow-self-modification", action="store_true")
-    parser.add_argument("--web-backend", choices=["direct", "mock"], default="direct")
-    parser.add_argument("--web-timeout-seconds", type=int, default=10)
-    parser.add_argument("--web-max-results", type=int, default=5)
-    parser.add_argument("--web-max-bytes", type=int, default=200_000)
-    parser.add_argument("--enable-autonomous-scheduler", action="store_true")
-    parser.add_argument("--max-scheduler-tasks", type=int, default=3)
-    parser.add_argument("--max-scheduler-cycles", type=int, default=5)
-    parser.add_argument("--enable-worker-isolation", action="store_true")
-    parser.add_argument("--worker-worktree-dir", type=Path, default=Path(".nest/worktrees"))
-    parser.add_argument("--worker-branch-prefix", default="kestrel/worker")
-    parser.add_argument("--stream", action="store_true")
-    parser.add_argument("--max-tool-rounds", type=int, default=6)
-    parser.add_argument("--context-budget-chars", type=int, default=18_000)
-    parser.add_argument("--disable-task-capsules", action="store_true")
-    parser.add_argument("--enable-auto-consolidation", action="store_true")
-    parser.add_argument("--auto-consolidation-write", action="store_true")
-    parser.add_argument("--enable-auto-compact", action="store_true")
-    parser.add_argument("--auto-compact-apply", action="store_true")
-    parser.add_argument("--context-pack-token-budget", type=int, default=6000)
-    parser.add_argument("--context-pack-expand-raw", action="store_true")
+    parser.add_argument("--model", default=argparse.SUPPRESS)
+    parser.add_argument("--base-url", default=argparse.SUPPRESS)
+    parser.add_argument("--api-key-env", default=argparse.SUPPRESS)
+    parser.add_argument("--timeout-seconds", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--max-retries", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--temperature", type=float, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--codex-sandbox",
+        choices=["read-only", "workspace-write", "danger-full-access"],
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument("--codex-profile", default=argparse.SUPPRESS)
+    parser.add_argument("--codex-skip-git-repo-check", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--codex-persist-session", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--workspace", type=Path, default=argparse.SUPPRESS)
+    parser.add_argument("--log-dir", type=Path, default=argparse.SUPPRESS)
+    parser.add_argument("--state-path", type=Path, default=argparse.SUPPRESS)
+    parser.add_argument("--secret-store-path", type=Path, default=argparse.SUPPRESS)
+    parser.add_argument("--secret-backend", choices=["json", "keyring"], default=argparse.SUPPRESS)
+    parser.add_argument("--skills-dir", type=Path, default=argparse.SUPPRESS)
+    parser.add_argument("--plugins-dir", type=Path, default=argparse.SUPPRESS)
+    parser.add_argument("--mcp-config", type=Path, default=argparse.SUPPRESS)
+    parser.add_argument("--channels-config", type=Path, default=argparse.SUPPRESS)
+    parser.add_argument("--enable-channel-delivery", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--channel-send-timeout-seconds", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--require-api-auth", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--api-auth-token-env", default=argparse.SUPPRESS)
+    parser.add_argument("--allow-shell", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--allow-file-write", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--allow-policy-writes", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--allow-codex-cli", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--allow-plugin-install", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--allow-git-commit", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--allow-git-push", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--allow-remote-mutation", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--git-write-mode", default=argparse.SUPPRESS)
+    parser.add_argument("--protected-branches", default=argparse.SUPPRESS)
+    parser.add_argument("--allow-memory-import", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--allow-executable-skills", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--allow-mcp-network-endpoints", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--allow-web", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--allow-self-modification", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--web-backend", choices=["direct", "mock"], default=argparse.SUPPRESS)
+    parser.add_argument("--web-timeout-seconds", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--web-max-results", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--web-max-bytes", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--enable-autonomous-scheduler", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--max-scheduler-tasks", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--max-scheduler-cycles", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--enable-worker-isolation", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--worker-worktree-dir", type=Path, default=argparse.SUPPRESS)
+    parser.add_argument("--worker-branch-prefix", default=argparse.SUPPRESS)
+    parser.add_argument("--stream", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--max-tool-rounds", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--context-budget-chars", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--disable-task-capsules", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--enable-auto-consolidation", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--auto-consolidation-write", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--enable-auto-compact", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--auto-compact-apply", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--context-pack-token-budget", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--context-pack-expand-raw", action="store_true", default=argparse.SUPPRESS)
 
 
 def main() -> None:
@@ -251,10 +256,10 @@ def main() -> None:
     eval_cmd.add_argument(
         "--provider",
         choices=["mock", "openai", "openai-compatible", "openrouter", "ollama", "anthropic", "gemini", "codex-cli"],
-        default="mock",
+        default=argparse.SUPPRESS,
     )
-    eval_cmd.add_argument("--model", default="mock")
-    eval_cmd.add_argument("--workspace", type=Path, default=Path("."))
+    eval_cmd.add_argument("--model", default=argparse.SUPPRESS)
+    eval_cmd.add_argument("--workspace", type=Path, default=argparse.SUPPRESS)
 
     doctor = sub.add_parser("doctor")
     _add_agent_args(doctor)
@@ -274,11 +279,11 @@ def main() -> None:
     payload_group.add_argument("--payload-file", type=Path, help="Path to inbound channel payload JSON, or '-' for stdin.")
 
     args = parser.parse_args()
-    backend = getattr(args, "backend", "memory")
-    memory_dir = getattr(args, "memory_dir", Path("./memory"))
+    config = _agent_config_from_args(args)
+    backend = config.backend
+    memory_dir = config.memory_dir
 
     if args.cmd == "chat":
-        config = _agent_config_from_args(args, backend=backend, memory_dir=memory_dir)
         manager = _build_run_manager(config)
         agent = build_agent(config, tools=manager.build_registry())
         try:
@@ -303,7 +308,6 @@ def main() -> None:
         return
 
     if args.cmd == "run":
-        config = _agent_config_from_args(args, backend=backend, memory_dir=memory_dir)
         manager = _build_run_manager(config)
         try:
             _create_run_and_print(
@@ -319,7 +323,6 @@ def main() -> None:
         return
 
     if args.cmd == "status":
-        config = _agent_config_from_args(args, backend=backend, memory_dir=memory_dir)
         manager = _build_run_manager(config)
         try:
             _print_status(manager, run_id=args.run_id, json_output=args.json, include_events=args.events)
@@ -328,7 +331,6 @@ def main() -> None:
         return
 
     if args.cmd == "approvals":
-        config = _agent_config_from_args(args, backend=backend, memory_dir=memory_dir)
         manager = _build_run_manager(config)
         try:
             _print_approvals(manager, status=args.status, json_output=args.json)
@@ -337,7 +339,6 @@ def main() -> None:
         return
 
     if args.cmd in {"approve", "deny"}:
-        config = _agent_config_from_args(args, backend=backend, memory_dir=memory_dir)
         manager = _build_run_manager(config)
         try:
             _decide_approval_and_print(
@@ -359,13 +360,11 @@ def main() -> None:
             raise RuntimeError("Install server extras with `pip install -e '.[server]'`.") from exc
         from .server import create_app
 
-        config = _agent_config_from_args(args, backend=backend, memory_dir=memory_dir)
         _validate_server_bind(args.host, config)
         uvicorn.run(create_app(config), host=args.host, port=args.port)
         return
 
     if args.cmd == "channel":
-        config = _agent_config_from_args(args, backend=backend, memory_dir=memory_dir)
         channel_manager = ChannelManager(config)
         try:
             result = channel_manager.handle_payload(
@@ -390,7 +389,6 @@ def main() -> None:
         return
 
     if args.cmd == "plugins":
-        config = _agent_config_from_args(args, backend=backend, memory_dir=memory_dir)
         manager = _build_run_manager(config)
         try:
             _handle_plugins_command(args, manager, backend=backend, memory_dir=memory_dir)
@@ -399,15 +397,14 @@ def main() -> None:
         return
 
     if args.cmd == "doctor":
-        config = _agent_config_from_args(args, backend=backend, memory_dir=memory_dir)
         print(json.dumps(_doctor_runtime(config), indent=2))
         return
 
     if args.cmd == "eval":
-        _run_eval_command(args, backend=backend, memory_dir=memory_dir)
+        _run_eval_command(config)
         return
 
-    memory = build_memory_system(backend, memory_dir, specs=_specs_from_args(args))
+    memory = build_memory_system(backend, memory_dir, specs=_specs_from_config(config))
     try:
         if args.cmd == "memory":
             if args.memory_cmd in {"search", "inspect"}:
@@ -458,8 +455,8 @@ def main() -> None:
                     ),
                     ToolContext(
                         memory=memory,
-                        config=AgentConfig(backend=backend, memory_dir=memory_dir, workspace=Path(".")),
-                        workspace=Path("."),
+                        config=config,
+                        workspace=config.workspace,
                         session_id="cli",
                     ),
                 )
@@ -485,8 +482,8 @@ def main() -> None:
                     ),
                     ToolContext(
                         memory=memory,
-                        config=AgentConfig(backend=backend, memory_dir=memory_dir, workspace=Path(".")),
-                        workspace=Path("."),
+                        config=config,
+                        workspace=config.workspace,
                         session_id="cli",
                     ),
                 )
@@ -505,8 +502,8 @@ def main() -> None:
                     ),
                     ToolContext(
                         memory=memory,
-                        config=AgentConfig(backend=backend, memory_dir=memory_dir, workspace=Path(".")),
-                        workspace=Path("."),
+                        config=config,
+                        workspace=config.workspace,
                         session_id="cli",
                     ),
                 )
@@ -558,75 +555,87 @@ def main() -> None:
         memory.close_all()
 
 
-def _agent_config_from_args(args: argparse.Namespace, *, backend: str, memory_dir: Path) -> AgentConfig:
-    return AgentConfig(
-        provider=args.provider,
-        model=args.model,
-        base_url=args.base_url,
-        api_key_env=args.api_key_env,
-        timeout_seconds=args.timeout_seconds,
-        max_retries=args.max_retries,
-        temperature=args.temperature,
-        codex_sandbox=args.codex_sandbox,
-        codex_profile=args.codex_profile,
-        codex_skip_git_repo_check=args.codex_skip_git_repo_check,
-        codex_ephemeral=not args.codex_persist_session,
-        backend=backend,
-        memory_dir=memory_dir,
-        layer_config_path=getattr(args, "layer_config", None),
-        workspace=args.workspace,
-        log_dir=args.log_dir,
-        state_path=args.state_path,
-        secret_store_path=args.secret_store_path,
-        secret_backend=args.secret_backend,
-        skills_dir=args.skills_dir,
-        plugins_dir=args.plugins_dir,
-        mcp_config_path=args.mcp_config,
-        channel_config_path=args.channels_config,
-        enable_channel_delivery=args.enable_channel_delivery,
-        channel_send_timeout_seconds=args.channel_send_timeout_seconds,
-        require_api_auth=args.require_api_auth,
-        api_auth_token_env=args.api_auth_token_env,
-        allow_shell=args.allow_shell,
-        allow_file_write=args.allow_file_write,
-        allow_policy_writes=args.allow_policy_writes,
-        allow_codex_cli=args.allow_codex_cli,
-        allow_plugin_install=args.allow_plugin_install,
-        allow_git_commit=args.allow_git_commit,
-        allow_git_push=args.allow_git_push,
-        allow_remote_mutation=args.allow_remote_mutation,
-        git_write_mode=args.git_write_mode,
-        protected_branches=tuple(part.strip() for part in args.protected_branches.split(",") if part.strip()),
-        allow_memory_import=args.allow_memory_import,
-        allow_executable_skills=args.allow_executable_skills,
-        allow_mcp_network_endpoints=args.allow_mcp_network_endpoints,
-        allow_web=args.allow_web,
-        allow_self_modification=args.allow_self_modification,
-        web_backend=args.web_backend,
-        web_timeout_seconds=args.web_timeout_seconds,
-        web_max_results=args.web_max_results,
-        web_max_bytes=args.web_max_bytes,
-        enable_autonomous_scheduler=args.enable_autonomous_scheduler,
-        max_scheduler_tasks=args.max_scheduler_tasks,
-        max_scheduler_cycles=args.max_scheduler_cycles,
-        enable_worker_isolation=args.enable_worker_isolation,
-        worker_worktree_dir=args.worker_worktree_dir,
-        worker_branch_prefix=args.worker_branch_prefix,
-        stream=args.stream,
-        max_tool_rounds=args.max_tool_rounds,
-        context_budget_chars=args.context_budget_chars,
-        enable_task_capsules=not args.disable_task_capsules,
-        enable_auto_consolidation=args.enable_auto_consolidation,
-        auto_consolidation_dry_run=not args.auto_consolidation_write,
-        enable_auto_compact=args.enable_auto_compact,
-        auto_compact_apply=args.auto_compact_apply,
-        context_pack_token_budget=args.context_pack_token_budget,
-        context_pack_expand_raw=args.context_pack_expand_raw,
-    )
+_CONFIG_ARG_FIELDS = {
+    "provider": "provider",
+    "model": "model",
+    "base_url": "base_url",
+    "api_key_env": "api_key_env",
+    "timeout_seconds": "timeout_seconds",
+    "max_retries": "max_retries",
+    "temperature": "temperature",
+    "codex_sandbox": "codex_sandbox",
+    "codex_profile": "codex_profile",
+    "codex_skip_git_repo_check": "codex_skip_git_repo_check",
+    "backend": "backend",
+    "memory_dir": "memory_dir",
+    "layer_config": "layer_config_path",
+    "workspace": "workspace",
+    "log_dir": "log_dir",
+    "state_path": "state_path",
+    "secret_store_path": "secret_store_path",  # nosec B105
+    "secret_backend": "secret_backend",  # nosec B105
+    "skills_dir": "skills_dir",
+    "plugins_dir": "plugins_dir",
+    "mcp_config": "mcp_config_path",
+    "channels_config": "channel_config_path",
+    "enable_channel_delivery": "enable_channel_delivery",
+    "channel_send_timeout_seconds": "channel_send_timeout_seconds",
+    "require_api_auth": "require_api_auth",
+    "api_auth_token_env": "api_auth_token_env",  # nosec B105
+    "allow_shell": "allow_shell",
+    "allow_file_write": "allow_file_write",
+    "allow_policy_writes": "allow_policy_writes",
+    "allow_codex_cli": "allow_codex_cli",
+    "allow_plugin_install": "allow_plugin_install",
+    "allow_git_commit": "allow_git_commit",
+    "allow_git_push": "allow_git_push",
+    "allow_remote_mutation": "allow_remote_mutation",
+    "git_write_mode": "git_write_mode",
+    "allow_memory_import": "allow_memory_import",
+    "allow_executable_skills": "allow_executable_skills",
+    "allow_mcp_network_endpoints": "allow_mcp_network_endpoints",
+    "allow_web": "allow_web",
+    "allow_self_modification": "allow_self_modification",
+    "web_backend": "web_backend",
+    "web_timeout_seconds": "web_timeout_seconds",
+    "web_max_results": "web_max_results",
+    "web_max_bytes": "web_max_bytes",
+    "enable_autonomous_scheduler": "enable_autonomous_scheduler",
+    "max_scheduler_tasks": "max_scheduler_tasks",
+    "max_scheduler_cycles": "max_scheduler_cycles",
+    "enable_worker_isolation": "enable_worker_isolation",
+    "worker_worktree_dir": "worker_worktree_dir",
+    "worker_branch_prefix": "worker_branch_prefix",
+    "stream": "stream",
+    "max_tool_rounds": "max_tool_rounds",
+    "context_budget_chars": "context_budget_chars",
+    "enable_auto_consolidation": "enable_auto_consolidation",
+    "enable_auto_compact": "enable_auto_compact",
+    "auto_compact_apply": "auto_compact_apply",
+    "context_pack_token_budget": "context_pack_token_budget",  # nosec B105
+    "context_pack_expand_raw": "context_pack_expand_raw",
+}
 
 
-def _specs_from_args(args: argparse.Namespace) -> dict[MemoryLayer, Any] | None:
-    layer_config = getattr(args, "layer_config", None)
+def _agent_config_from_args(args: argparse.Namespace) -> AgentConfig:
+    config = AgentConfig.from_env()
+    overrides: dict[str, Any] = {}
+    for arg_name, field_name in _CONFIG_ARG_FIELDS.items():
+        if hasattr(args, arg_name):
+            overrides[field_name] = getattr(args, arg_name)
+    if hasattr(args, "protected_branches"):
+        overrides["protected_branches"] = tuple(part.strip() for part in args.protected_branches.split(",") if part.strip())
+    if hasattr(args, "codex_persist_session"):
+        overrides["codex_ephemeral"] = False
+    if hasattr(args, "disable_task_capsules"):
+        overrides["enable_task_capsules"] = False
+    if hasattr(args, "auto_consolidation_write"):
+        overrides["auto_consolidation_dry_run"] = False
+    return replace(config, **overrides)
+
+
+def _specs_from_config(config: AgentConfig) -> dict[MemoryLayer, Any] | None:
+    layer_config = config.layer_config_path
     return load_layer_specs(layer_config) if layer_config else None
 
 
@@ -1147,23 +1156,23 @@ def _json_object_or_none(raw: str | None) -> dict[str, Any] | None:
     return {str(key): val for key, val in value.items()}
 
 
-def _run_eval_command(args: argparse.Namespace, *, backend: str, memory_dir: Path) -> None:
+def _run_eval_command(config: AgentConfig) -> None:
     script = Path(__file__).resolve().parents[2] / "scripts" / "run_golden_evals.py"
     command = [
         sys.executable,
         str(script),
         "--backend",
-        backend,
+        config.backend,
         "--memory-dir",
-        str(memory_dir),
+        str(config.memory_dir),
         "--provider",
-        args.provider,
+        config.provider,
         "--model",
-        args.model,
+        config.model,
         "--workspace",
-        str(args.workspace),
+        str(config.workspace),
     ]
-    completed = subprocess.run(command, check=False)
+    completed = subprocess.run(command, check=False)  # nosec B603
     raise SystemExit(completed.returncode)
 
 

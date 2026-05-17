@@ -117,12 +117,10 @@ def _failure(call: ToolCall, *, content: str, error: str) -> ToolExecution:
 
 
 def _cancel_tool(tool: AgentTool, call_id: str) -> None:
-    cancel = getattr(tool, "cancel", None)
-    if callable(cancel):
-        try:
-            cancel(call_id)
-        except Exception:
-            return
+    try:
+        tool.cancel(call_id)
+    except Exception:
+        return
 
 
 _ENABLEMENT_BY_TOOL = {

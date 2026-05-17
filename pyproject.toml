@@ -19,7 +19,7 @@ anthropic = ["anthropic>=0.39"]
 gemini = ["google-genai>=0.3"]
 server = ["fastapi>=0.110", "uvicorn>=0.29"]
 mcp = ["mcp>=1.0"]
-dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.10", "fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27"]
+dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.10", "bandit>=1.7", "fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27"]
 
 [project.scripts]
 nested-memvid = "nested_memvid_agent.cli:main"

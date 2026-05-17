@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,12 @@ from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.state_store import AgentStateStore
+
+
+def _clear_nest_agent_env(monkeypatch: MonkeyPatch) -> None:
+    for name in tuple(os.environ):
+        if name.startswith("NEST_AGENT_") or name.startswith("NESTED_MEMVID_"):
+            monkeypatch.delenv(name, raising=False)
 
 
 def test_memory_verify_subcommand_reports_layers(tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object) -> None:
@@ -288,6 +295,79 @@ def test_doctor_subcommand_reports_runtime_readiness(
     assert '"backend": "memory"' in output
     assert '"allow_shell": false' in output
     assert '"default_command": "pytest -q"' in output
+
+
+def test_doctor_subcommand_uses_env_config(tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object) -> None:
+    _clear_nest_agent_env(monkeypatch)
+    monkeypatch.setenv("NEST_AGENT_BACKEND", "memory")
+    monkeypatch.setenv("NEST_AGENT_MEMORY_DIR", str(tmp_path / "env-memory"))
+    monkeypatch.setenv("NEST_AGENT_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("NEST_AGENT_MODEL", "env-model")
+    monkeypatch.setenv("NEST_AGENT_BASE_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.setenv("NEST_AGENT_ALLOW_SHELL", "true")
+    monkeypatch.setenv("NEST_AGENT_CONTEXT_BUDGET_CHARS", "12345")
+    monkeypatch.setattr(sys, "argv", ["nest-agent", "doctor"])
+
+    main()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["memory"]["backend"] == "memory"
+    assert payload["memory"]["path"] == str(tmp_path / "env-memory")
+    assert payload["provider"]["provider"] == "openai-compatible"
+    assert payload["provider"]["model"] == "env-model"
+    assert payload["provider"]["base_url_configured"] is True
+    assert payload["tool_config"]["allow_shell"] is True
+    assert payload["tool_config"]["context_budget_chars"] == 12345
+
+
+def test_doctor_flags_override_env_config(tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object) -> None:
+    _clear_nest_agent_env(monkeypatch)
+    monkeypatch.setenv("NEST_AGENT_BACKEND", "memvid")
+    monkeypatch.setenv("NEST_AGENT_MEMORY_DIR", str(tmp_path / "env-memory"))
+    monkeypatch.setenv("NEST_AGENT_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("NEST_AGENT_MODEL", "env-model")
+    monkeypatch.setenv("NEST_AGENT_BASE_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.setenv("NEST_AGENT_ALLOW_SHELL", "true")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "nest-agent",
+            "doctor",
+            "--backend",
+            "memory",
+            "--memory-dir",
+            str(tmp_path / "flag-memory"),
+            "--provider",
+            "mock",
+            "--model",
+            "flag-model",
+        ],
+    )
+
+    main()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["memory"]["backend"] == "memory"
+    assert payload["memory"]["path"] == str(tmp_path / "flag-memory")
+    assert payload["provider"]["provider"] == "mock"
+    assert payload["provider"]["model"] == "flag-model"
+    assert payload["provider"]["base_url_configured"] is True
+    assert payload["tool_config"]["allow_shell"] is True
+
+
+def test_doctor_default_memory_dir_is_nest_memory(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object
+) -> None:
+    _clear_nest_agent_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["nest-agent", "doctor"])
+
+    main()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["memory"]["backend"] == "memory"
+    assert payload["memory"]["path"] == ".nest/memory"
 
 
 def test_run_subcommand_reports_structured_turn(tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object) -> None:

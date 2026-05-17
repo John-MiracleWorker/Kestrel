@@ -85,6 +85,20 @@ nest-agent chat --backend memory --provider mock --message "hello"
 
 The mock provider and in-memory backend are deterministic and are the default fast path for tests.
 
+## CLI Configuration
+
+`nest-agent` starts from `AgentConfig.from_env()`. Environment variables under `NEST_AGENT_*` provide the baseline config, and CLI flags are sparse overrides for a single command. With no env or flags, the default memory root is `.nest/memory`.
+
+```bash
+export NEST_AGENT_BACKEND=memory
+export NEST_AGENT_MEMORY_DIR=.nest/memory
+export NEST_AGENT_PROVIDER=mock
+export NEST_AGENT_MODEL=mock
+nest-agent doctor
+```
+
+The older `NESTED_MEMVID_*` names are not part of the agent runtime config; use the `NEST_AGENT_*` names shown in `.env.example`.
+
 ## CLI Chat
 
 One-shot chat:

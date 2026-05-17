@@ -210,3 +210,78 @@ def test_memvid_backend_normalizes_find_hits(tmp_path: Path, monkeypatch: pytest
     assert len(hits) == 1
     assert hits[0].record.kind == MemoryKind.FACT
     assert hits[0].record.title == "Hit fact"
+
+
+def test_memvid_backend_persists_exact_records_and_tombstones_across_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "semantic.mv2"
+
+    class FakeMem:
+        def put(self, *args: object, **kwargs: object) -> str:
+            del args, kwargs
+            return "sdk_record"
+
+        def find(self, *args: object, **kwargs: object) -> dict[str, object]:
+            del args, kwargs
+            return {
+                "hits": [
+                    {
+                        "id": "fact-1",
+                        "title": "Durable fact",
+                        "text": "Durable exact-record index survives process restart.",
+                        "score": 0.9,
+                        "metadata": {"id": "fact-1", "kind": MemoryKind.FACT.value},
+                    }
+                ]
+            }
+
+        def close(self) -> None:
+            return None
+
+    def fake_create(filename: str, **kwargs: object) -> FakeMem:
+        del kwargs
+        Path(filename).write_bytes(b"fake mv2")
+        return FakeMem()
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.backends.memvid_backend.import_module",
+        lambda name: SimpleNamespace(create=fake_create, use=lambda *args, **kwargs: FakeMem()),
+    )
+
+    first = MemvidBackend(path=path, layer=MemoryLayer.SEMANTIC)
+    first.open()
+    first.put(
+        MemoryRecord(
+            id="fact-1",
+            title="Durable fact",
+            content="Durable exact-record index survives process restart.",
+            layer=MemoryLayer.SEMANTIC,
+            kind=MemoryKind.FACT,
+            confidence=0.91,
+            metadata={"frame_id": "frame-fact-1", "validation_status": "validated"},
+        )
+    )
+    first.tombstone("fact-1", reason="superseded", superseded_by="fact-2")
+    first.close()
+
+    reopened = MemvidBackend(path=path, layer=MemoryLayer.SEMANTIC)
+    reopened.open()
+    try:
+        assert reopened.get_record("fact-1", include_inactive=False) is None
+        inactive = reopened.get_record("fact-1")
+        assert inactive is not None
+        assert inactive.metadata["active"] is False
+        assert inactive.metadata["superseded_by"] == "fact-2"
+        assert reopened.get_record("frame-fact-1") == inactive
+        assert [record.id for record in reopened.iter_records()] == ["tombstone_fact-1"]
+        assert {record.id for record in reopened.iter_records(include_inactive=True)} == {
+            "fact-1",
+            "tombstone_fact-1",
+        }
+        assert reopened.find("Durable fact", include_inactive=False) == []
+        inactive_hits = reopened.find("Durable fact", include_inactive=True)
+        assert inactive_hits
+        assert inactive_hits[0].record.metadata["tombstone_reason"] == "superseded"
+    finally:
+        reopened.close()

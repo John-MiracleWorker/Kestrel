@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import shutil
-import subprocess
+import subprocess  # nosec B404
 import tempfile
 from dataclasses import dataclass
 from importlib import import_module
@@ -739,7 +739,7 @@ def _looks_like_sha(value: str) -> bool:
 
 
 def _run_git(command: list[str]) -> str:
-    completed = subprocess.run(  # noqa: S603 - list argv only, no shell
+    completed = subprocess.run(  # noqa: S603 - list argv only, no shell  # nosec B603
         command,
         capture_output=True,
         text=True,

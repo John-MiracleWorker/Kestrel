@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import subprocess
+import subprocess  # nosec B404
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -338,7 +338,7 @@ def _run_skill_process(
     runtime_type: str,
     timeout_seconds: int,
 ) -> dict[str, Any]:
-    completed = subprocess.run(  # noqa: S603 - list argv, skill cwd, timeout, no shell
+    completed = subprocess.run(  # noqa: S603 - list argv, skill cwd, timeout, no shell  # nosec B603
         command,
         cwd=capsule.path,
         input=json.dumps(payload),

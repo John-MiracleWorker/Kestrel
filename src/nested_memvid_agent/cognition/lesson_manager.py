@@ -94,7 +94,7 @@ class LessonManager:
                 continue
             try:
                 lesson = LessonCard.from_memory_record(record)
-            except Exception:
+            except Exception:  # nosec B112
                 continue
             if lesson.failure_category != category:
                 continue

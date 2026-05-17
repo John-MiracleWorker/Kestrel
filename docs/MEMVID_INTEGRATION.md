@@ -1,6 +1,6 @@
 # Memvid Integration
 
-Last updated: 2026-05-16
+Last updated: 2026-05-17
 
 Kestrel uses Memvid v2 `.mv2` files as its durable retrieval-memory substrate. Do not build against deprecated QR/video-frame Memvid v1 behavior, and do not replace `.mv2` memory with SQLite, Postgres, Chroma, FAISS, or JSON logs.
 
@@ -21,6 +21,7 @@ Current behavior:
 - Normalizes SDK `find()` result shapes into `MemoryHit`.
 - Avoids scope assumptions that can trigger lexical-index errors in installed SDKs.
 - Supports context-frame round trips through `put_frame()` and `find_frames()`.
+- Maintains a companion exact-record index next to each `.mv2` file for `get_record()`, `iter_records()`, tombstones, corrections, exports, and conflict checks after process restart.
 - Exposes `seal()`, `verify()`, `doctor(dry_run=True)`, `stats()`, and `close()`.
 
 The adapter was hardened against `memvid_sdk 2.0.159`. Re-check SDK signatures before upgrading the dependency.
@@ -46,6 +47,14 @@ Run capsules live separately:
 
 `complete.mv2` is a run evidence bundle, not a permanent memory layer.
 
+Each `.mv2` file may have a companion exact-record sidecar:
+
+```text
+.nest/memory/semantic.mv2.records.json
+```
+
+The sidecar stores canonical `MemoryRecord` snapshots and inactive/tombstoned IDs. It exists so exact-record APIs can survive close/reopen boundaries; Memvid `.mv2` remains the retrieval substrate for search. Do not replace retrieval memory with the sidecar, and do not create QR/video-frame v1 storage.
+
 ## Data-Loss Rules
 
 - Never call `create(path)` when `path` already exists.
@@ -53,6 +62,7 @@ Run capsules live separately:
 - Copy `.mv2` files for backup or migration; do not recreate them in place.
 - Seal changed memories after writes.
 - Verify important memory directories after migration, restore, or SDK upgrade.
+- Keep `.mv2.records.json` files with their matching `.mv2` files during backup, restore, and migration when exact record enumeration, export, tombstones, corrections, or conflict metadata must be preserved.
 
 ## Metadata Contract
 
@@ -127,6 +137,7 @@ RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --p
 The integration suite covers:
 
 - write -> seal -> verify -> close -> reopen -> search
+- exact-record `get_record()`/`iter_records()` and tombstone state after close -> reopen
 - context-frame metadata round trip
 - run-capsule `complete.mv2` summary reads
 - isolated memory directories for golden eval cases to avoid `.mv2` lock contention

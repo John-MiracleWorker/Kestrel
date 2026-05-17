@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import subprocess
+import subprocess  # nosec B404
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -57,7 +57,7 @@ class CodexCLIProvider(LLMProvider):
             output_path = Path(tmpdir) / "last-message.txt"
             command = self._command(output_path)
             try:
-                completed = subprocess.run(  # noqa: S603 - fixed executable and argument vector
+                completed = subprocess.run(  # noqa: S603 - fixed executable and argument vector  # nosec B603
                     command,
                     cwd=self.workspace,
                     input=prompt,

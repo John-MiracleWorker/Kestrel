@@ -5,7 +5,11 @@ import hmac
 import json
 from pathlib import Path
 
+import pytest
+
 from nested_memvid_agent.channels import ChannelEndpointConfig, ChannelManager
+from nested_memvid_agent.channels.adapters import DiscordAdapter, GenericWebhookAdapter
+from nested_memvid_agent.channels.models import ChannelOutboundMessage
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.server import create_app
 
@@ -222,6 +226,65 @@ def test_unknown_explicit_channel_id_is_rejected(tmp_path: Path, monkeypatch: ob
     assert not (tmp_path / "memory" / "working.memory.json").exists()
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example.com/hook",
+        "https://localhost/hook",
+        "https://127.0.0.1/hook",
+        "https://10.0.0.5/hook",
+        "https://172.16.0.1/hook",
+        "https://192.168.1.10/hook",
+        "https://169.254.169.254/latest/meta-data",
+        "https://metadata.google.internal/computeMetadata/v1/",
+    ],
+)
+def test_generic_webhook_delivery_rejects_unsafe_urls(url: str) -> None:
+    delivery = GenericWebhookAdapter().build_delivery(
+        ChannelEndpointConfig(
+            id="webhook",
+            provider="webhook",
+            settings={"webhook_url": url},
+        ),
+        _outbound(),
+        dry_run=False,
+    )
+
+    assert delivery.error
+    assert "_request_url" not in delivery.request_json
+
+
+def test_generic_webhook_delivery_allows_public_https() -> None:
+    delivery = GenericWebhookAdapter().build_delivery(
+        ChannelEndpointConfig(
+            id="webhook",
+            provider="webhook",
+            settings={"webhook_url": "https://93.184.216.34/kestrel/hook"},
+        ),
+        _outbound(),
+        dry_run=False,
+    )
+
+    assert delivery.error is None
+    assert delivery.request_json["_request_url"] == "https://93.184.216.34/kestrel/hook"
+    assert delivery.endpoint == "https://93.184.216.34/kestrel/hook"
+
+
+def test_discord_webhook_delivery_rejects_unsafe_url() -> None:
+    delivery = DiscordAdapter().build_delivery(
+        ChannelEndpointConfig(
+            id="discord",
+            provider="discord",
+            settings={"webhook_url": "https://127.0.0.1/discord"},
+        ),
+        _outbound(),
+        dry_run=False,
+    )
+
+    assert delivery.error
+    assert "_request_url" not in delivery.request_json
+
+
 def test_server_exposes_channel_ingest_route(tmp_path: Path) -> None:
     from fastapi.testclient import TestClient
 
@@ -286,6 +349,15 @@ def _config(tmp_path: Path) -> AgentConfig:
         skills_dir=tmp_path / "skills",
         workspace=tmp_path,
         channel_config_path=tmp_path / "channels.json",
+    )
+
+
+def _outbound() -> ChannelOutboundMessage:
+    return ChannelOutboundMessage(
+        channel="webhook",
+        channel_id="webhook",
+        conversation_id="thread",
+        text="hello",
     )
 
 

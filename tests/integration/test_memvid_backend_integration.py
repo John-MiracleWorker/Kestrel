@@ -136,3 +136,50 @@ def test_memvid_backend_persists_cognition_failure_and_lesson_records(tmp_path: 
     finally:
         reopened_episodic.close()
         reopened_procedural.close()
+
+
+def test_memvid_backend_exact_record_index_survives_reopen_for_tombstones(tmp_path: Path) -> None:
+    path = tmp_path / "semantic.mv2"
+    backend = MemvidBackend(path=path, layer=MemoryLayer.SEMANTIC)
+    backend.open()
+    try:
+        backend.put(
+            MemoryRecord(
+                id="durable-fact",
+                layer=MemoryLayer.SEMANTIC,
+                kind=MemoryKind.FACT,
+                title="Durable exact fact",
+                content="Durable exact records survive Memvid backend reopen.",
+                confidence=0.92,
+                metadata={"frame_id": "durable-frame", "validation_status": "validated"},
+            )
+        )
+        backend.seal()
+    finally:
+        backend.close()
+
+    reopened = MemvidBackend(path=path, layer=MemoryLayer.SEMANTIC)
+    reopened.open()
+    try:
+        assert reopened.get_record("durable-fact") is not None
+        assert reopened.get_record("durable-frame") is not None
+        assert any(record.id == "durable-fact" for record in reopened.iter_records())
+        reopened.tombstone("durable-fact", reason="integration_superseded", superseded_by="durable-fact-2")
+        reopened.seal()
+    finally:
+        reopened.close()
+
+    final = MemvidBackend(path=path, layer=MemoryLayer.SEMANTIC)
+    final.open()
+    try:
+        assert final.get_record("durable-fact", include_inactive=False) is None
+        inactive = final.get_record("durable-fact")
+        assert inactive is not None
+        assert inactive.metadata["active"] is False
+        assert inactive.metadata["tombstone_reason"] == "integration_superseded"
+        assert {record.id for record in final.iter_records(include_inactive=True)} >= {
+            "durable-fact",
+            "tombstone_durable-fact",
+        }
+    finally:
+        final.close()

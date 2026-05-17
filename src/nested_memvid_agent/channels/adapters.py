@@ -7,6 +7,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from ..net_safety import public_url_allowed
 from .models import (
     ChannelDelivery,
     ChannelEndpointConfig,
@@ -187,6 +188,19 @@ class DiscordAdapter(ChannelAdapter):
                 blocked_reason=blocked_reason,
             )
         if not dry_run and webhook_url:
+            safe, reason = public_url_allowed(webhook_url, require_https=True)
+            if not safe:
+                return ChannelDelivery(
+                    channel=self.provider,
+                    channel_id=config.id,
+                    conversation_id=outbound.conversation_id,
+                    sent=False,
+                    dry_run=False,
+                    endpoint=_redacted_url(webhook_url),
+                    request_json=request_json,
+                    error=reason,
+                    blocked_reason=blocked_reason,
+                )
             request_json["_request_url"] = webhook_url
         return ChannelDelivery(
             channel=self.provider,
@@ -256,6 +270,19 @@ class GenericWebhookAdapter(ChannelAdapter):
                 blocked_reason=blocked_reason,
             )
         if not dry_run and webhook_url:
+            safe, reason = public_url_allowed(webhook_url, require_https=True)
+            if not safe:
+                return ChannelDelivery(
+                    channel=config.provider,
+                    channel_id=config.id,
+                    conversation_id=outbound.conversation_id,
+                    sent=False,
+                    dry_run=False,
+                    endpoint=_redacted_url(webhook_url),
+                    request_json=request_json,
+                    error=reason,
+                    blocked_reason=blocked_reason,
+                )
             request_json["_request_url"] = webhook_url
         return ChannelDelivery(
             channel=config.provider,
@@ -287,7 +314,7 @@ def _post_json(delivery: ChannelDelivery, *, timeout_seconds: int) -> ChannelDel
     data = json.dumps(payload).encode("utf-8")
     request = Request(request_url, data=data, headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:  # noqa: S310 - explicit opt-in via config gates
+        with urlopen(request, timeout=timeout_seconds) as response:  # nosec
             response_text = response.read().decode("utf-8", errors="replace")
             return _copy_delivery(
                 delivery,

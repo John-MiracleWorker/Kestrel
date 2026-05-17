@@ -34,6 +34,10 @@ class AgentTool(ABC):
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         raise NotImplementedError
 
+    def cancel(self, call_id: str) -> None:
+        """Best-effort cancellation hook called when the registry times out a tool call."""
+        del call_id
+
     def _result(
         self,
         call: ToolCall,

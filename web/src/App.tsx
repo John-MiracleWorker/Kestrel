@@ -30,8 +30,21 @@ import {
   X
 } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { deleteJson, getJson, postJson, putJson, queryString } from "./api";
+import { ApiAuthError, deleteJson, getJson, postJson, putJson, queryString, subscribeJsonEvents } from "./api";
+import { getApiToken, setApiToken } from "./auth";
 import { EmptyState, Field, InlineMeta, JsonBlock, Panel, StatusBadge } from "./components";
+import {
+  activityItemsForEvents,
+  assistantTextForRun,
+  deriveThreadTitle,
+  eventBelongsToRun,
+  eventKey,
+  eventTimestamp,
+  friendlyEventLabel,
+  riskLabel,
+  summarizeArguments,
+  type LiveActivityItem
+} from "./runActivity";
 import { TweaksPanel, TweakSection, TweakSlider, TweakToggle, TweakRadio, TweakColor } from "./tweaks-panel.jsx";
 import type {
   AgentLogEvent,
@@ -57,15 +70,6 @@ import type {
   TraceEvent
 } from "./types";
 
-type LiveActivityItem = {
-  id: string;
-  kind: "thinking" | "tool";
-  label: string;
-  detail: string;
-  meta: string;
-  status: "running" | "completed" | "failed" | "info";
-};
-
 const providerOptions = ["mock", "openai", "openai-compatible", "openrouter", "ollama", "anthropic", "gemini", "codex-cli"];
 const modelSuggestionsByProvider: Record<string, string[]> = {
   mock: ["mock"],
@@ -82,10 +86,36 @@ const autonomyOptions = [
   { value: "manual", label: "Manual" },
   { value: "autonomous", label: "Autopilot" }
 ];
+const runEventTypes = [
+  "run.started",
+  "run.completed",
+  "run.blocked",
+  "run.failed",
+  "run.cancelled",
+  "approval.requested",
+  "approval.approved",
+  "approval.denied",
+  "tool.started",
+  "tool.completed",
+  "tool.failed",
+  "assistant.token",
+  "assistant.tool_call",
+  "context.compile",
+  "memory.write",
+  "diagnosis.classified",
+  "scheduler.step",
+  "scheduler.run",
+  "task.approved",
+  "subagent.started",
+  "subagent.completed",
+  "subagent.failed"
+];
 
 export function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [authPromptOpen, setAuthPromptOpen] = useState(false);
+  const [apiTokenDraft, setApiTokenDraft] = useState(() => getApiToken());
   const [runtime, setRuntime] = useState<Record<string, unknown> | null>(null);
   const [selfState, setSelfState] = useState<SelfState | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
@@ -304,9 +334,7 @@ export function App() {
     if (!activeRun?.run_id) return;
     setEvents([]);
     refreshRunDetails(activeRun.run_id).catch(reportError);
-    const source = new EventSource(`/api/runs/${activeRun.run_id}/events`);
-    const appendEvent = (event: MessageEvent) => {
-      const parsed = JSON.parse(event.data) as TraceEvent;
+    const appendEvent = (parsed: TraceEvent) => {
       setEvents((rows) => [...rows.slice(-120), parsed]);
       if (parsed.type !== "assistant.token") {
         refreshSummary().catch(reportError);
@@ -314,32 +342,7 @@ export function App() {
         refreshThreadRuns(activeRun.session_id).catch(reportError);
       }
     };
-    source.onmessage = appendEvent;
-    [
-      "run.started",
-      "run.completed",
-      "run.blocked",
-      "run.failed",
-      "run.cancelled",
-      "approval.requested",
-      "approval.approved",
-      "approval.denied",
-      "tool.started",
-      "tool.completed",
-      "tool.failed",
-      "assistant.token",
-      "assistant.tool_call",
-      "context.compile",
-      "memory.write",
-      "diagnosis.classified",
-      "scheduler.step",
-      "scheduler.run",
-      "task.approved",
-      "subagent.started",
-      "subagent.completed",
-      "subagent.failed"
-    ].forEach((type) => source.addEventListener(type, appendEvent));
-    return () => source.close();
+    return subscribeJsonEvents<TraceEvent>(`/api/runs/${activeRun.run_id}/events`, runEventTypes, appendEvent, reportError);
   }, [activeRun?.run_id]);
 
   async function refreshSummary() {
@@ -438,7 +441,21 @@ export function App() {
   }
 
   function reportError(value: unknown) {
+    if (value instanceof ApiAuthError) {
+      setAuthPromptOpen(true);
+      setApiTokenDraft(getApiToken());
+      setError(null);
+      return;
+    }
     setError(value instanceof Error ? value.message : String(value));
+  }
+
+  async function saveToken(event: FormEvent) {
+    event.preventDefault();
+    setApiToken(apiTokenDraft);
+    setAuthPromptOpen(false);
+    setError(null);
+    await refreshAll().catch(reportError);
   }
 
   async function guarded(action: () => Promise<void>, success?: string) {
@@ -938,6 +955,28 @@ export function App() {
           </div>
         </div>
       </header>
+      {authPromptOpen ? (
+        <main className="conversation" id="workspace">
+          <section className="settings-grid" aria-label="API authentication">
+            <Panel title="Kestrel API token" icon={<KeyRound size={19} />}>
+              <form className="stacked-form" onSubmit={saveToken}>
+                <Field label="API token">
+                  <input
+                    type="password"
+                    value={apiTokenDraft}
+                    onChange={(event) => setApiTokenDraft(event.target.value)}
+                    autoComplete="off"
+                    autoFocus
+                  />
+                </Field>
+                <button type="submit">
+                  <ShieldCheck size={15} /> Save token
+                </button>
+              </form>
+            </Panel>
+          </section>
+        </main>
+      ) : (
       <div className={`chat-shell ${inspectorOpen ? "" : "no-inspector"}`} data-active-section={activeSection}>
       <a className="skip-link" href="#workspace">Skip to workspace</a>
       <aside className="rail" aria-label="Threads">
@@ -1833,6 +1872,7 @@ export function App() {
         )}
       </main>
     </div>
+      )}
     <TweaksPanel title="Design">
       <TweakSection label="Theme">
         <TweakColor label="Accent" value={primaryColor} options={['#a8442a', '#2A6FDB', '#1F8A5B', '#7A5AE0']} onChange={setPrimaryColor} />
@@ -2006,174 +2046,6 @@ function scoreLabel(value: unknown): string {
   return typeof value === "number" ? value.toFixed(2) : "";
 }
 
-function deriveThreadTitle(message: string): string {
-  const compact = message.replace(/\s+/g, " ").trim();
-  if (!compact) return "New chat";
-  return compact.length > 54 ? `${compact.slice(0, 51)}...` : compact;
-}
-
 function createThreadId(): string {
   return `thread_${crypto.randomUUID()}`;
 }
-
-function assistantTextForRun(run: Run, activeRunId: string | null | undefined, streamedAssistant: string): string {
-  if (run.run_id === activeRunId && !run.assistant_message && streamedAssistant) return streamedAssistant;
-  return run.assistant_message || friendlyRunStatus(run);
-}
-
-function friendlyRunStatus(run: Run): string {
-  if (run.status === "queued") return "Queued";
-  if (run.status === "running") return "Kestrel is working...";
-  if (run.status === "failed") return run.error || "Failed";
-  if (run.status === "cancelled") return "Cancelled";
-  return run.stop_reason || "Working...";
-}
-
-function friendlyEventLabel(type: string): string {
-  const labels: Record<string, string> = {
-    "run.queued": "Queued",
-    "run.started": "Started",
-    "context.compile": "Gathering context",
-
-    "memory.write": "Updating memory",
-    "tool.started": "Using tool",
-    "tool.completed": "Tool finished",
-    "tool.failed": "Tool failed",
-    "approval.requested": "Needs approval",
-    "run.completed": "Complete",
-    "run.failed": "Failed",
-    "run.cancelled": "Cancelled",
-    "scheduler.step": "Planning",
-    "scheduler.run": "Planning",
-    "subagent.started": "Delegating",
-    "subagent.completed": "Delegation complete",
-    "task.approved": "Task approved"
-  };
-  return labels[type] ?? type;
-}
-
-function activityItemsForEvents(events: TraceEvent[]): LiveActivityItem[] {
-  return events
-    .map(activityItemForEvent)
-    .filter((item): item is LiveActivityItem => Boolean(item))
-    .slice(-8);
-}
-
-function eventKey(event: TraceEvent): string {
-  return Number.isFinite(event.id) ? String(event.id) : `${event.type}-${eventTimestamp(event)}-${JSON.stringify(event.payload).slice(0, 80)}`;
-}
-
-function eventBelongsToRun(event: TraceEvent, runId: string | null | undefined): boolean {
-  if (!runId) return false;
-  return event.run_id === runId || event.payload.run_id === runId;
-}
-
-function eventTimestamp(event: TraceEvent): string {
-  return typeof event.created_at === "string" ? event.created_at : "";
-}
-
-function activityItemForEvent(event: TraceEvent): LiveActivityItem | null {
-  if (event.type === "assistant.token") return null;
-  if (!isVisibleActivityEvent(event.type)) return null;
-  const toolName = toolNameForEvent(event);
-  if (event.type === "tool.started") {
-    return {
-      id: String(event.id),
-      kind: "tool",
-      label: `Using ${toolName}`,
-      meta: argumentsSummaryForEvent(event),
-      detail: "",
-      status: "running"
-    };
-  }
-  if (event.type === "tool.completed") {
-    return {
-      id: String(event.id),
-      kind: "tool",
-      label: `Finished ${toolName}`,
-      meta: argumentsSummaryForEvent(event),
-      detail: compactActivityDetail(event.payload.content),
-      status: "completed"
-    };
-  }
-  if (event.type === "tool.failed") {
-    return {
-      id: String(event.id),
-      kind: "tool",
-      label: `Failed ${toolName}`,
-      meta: argumentsSummaryForEvent(event),
-      detail: compactActivityDetail(event.payload.content ?? event.payload.error),
-      status: "failed"
-    };
-  }
-  return {
-    id: String(event.id),
-    kind: "thinking",
-    label: friendlyEventLabel(event.type),
-    meta: thinkingMetaForEvent(event),
-    detail: thinkingDetailForEvent(event),
-    status: event.type === "run.completed" ? "completed" : event.type === "run.failed" ? "failed" : "info"
-  };
-}
-
-function isVisibleActivityEvent(type: string): boolean {
-  return [
-    "run.started",
-    "context.compile",
-    "memory.write",
-    "tool.started",
-    "tool.completed",
-    "tool.failed",
-    "approval.requested",
-    "run.completed",
-    "run.failed",
-    "run.cancelled",
-    "scheduler.step",
-    "scheduler.run",
-    "subagent.started",
-    "subagent.completed",
-    "subagent.failed",
-    "task.approved"
-  ].includes(type);
-}
-
-function toolNameForEvent(event: TraceEvent): string {
-  return String(event.payload.tool ?? event.payload.tool_name ?? "tool");
-}
-
-function argumentsSummaryForEvent(event: TraceEvent): string {
-  const args = event.payload.arguments;
-  return args && typeof args === "object" && !Array.isArray(args) ? summarizeArguments(args as Record<string, unknown>) : "";
-}
-
-function thinkingMetaForEvent(event: TraceEvent): string {
-  if (event.type === "context.compile" && typeof event.payload.context_chars === "number") return `${event.payload.context_chars} context chars`;
-  if (event.type === "memory.write" && event.payload.index && event.payload.total) return `${event.payload.index}/${event.payload.total}`;
-  if (event.type.startsWith("scheduler.") && event.payload.task_id) return String(event.payload.task_id);
-  return "";
-}
-
-function thinkingDetailForEvent(event: TraceEvent): string {
-  const value = event.payload.query ?? event.payload.record_id ?? event.payload.source ?? event.payload.error;
-  return compactActivityDetail(value);
-}
-
-function compactActivityDetail(value: unknown): string {
-  if (value === null || value === undefined) return "";
-  const text = String(value).replace(/\s+/g, " ").trim();
-  return text.length > 120 ? `${text.slice(0, 117)}...` : text;
-}
-
-function riskLabel(risk: string): string {
-  if (!risk) return "Unknown risk";
-  return `${risk.charAt(0).toUpperCase()}${risk.slice(1)} risk`;
-}
-
-function summarizeArguments(argumentsValue: Record<string, unknown>): string {
-  const command = argumentsValue.command;
-  if (Array.isArray(command)) return command.map((item) => String(item)).join(" ");
-  const path = argumentsValue.path ?? argumentsValue.file ?? argumentsValue.cwd;
-  if (path) return String(path);
-  return Object.keys(argumentsValue).slice(0, 3).join(", ") || "No arguments";
-}
-

@@ -110,3 +110,16 @@ Never call `create(path)` on an existing `.mv2` file. The backend must use exist
 ## Retention Notes
 
 Working memory can be compacted or promoted through the nested learning pipeline, but semantic/procedural/self/policy layers require structured validation evidence. Policy memory requires explicit configuration, repeated evidence, high validation, and explicit user instruction.
+
+## Safe Write Paths
+
+`memory.write` is a direct-write tool for volatile layers only: `working` and `episodic`.
+
+Stable layers must use paths that preserve validation, provenance, confidence, and approval metadata:
+
+- Use `memory.learn` for validated semantic/procedural promotion.
+- Use `self.remember` for validated Soul/self memory.
+- Use `memory.correct` to correct existing stable records without overwriting history.
+- Use approval-gated `memory.import` or an admin path for migrations and bulk restoration.
+
+Policy writes are stricter than other stable writes. They remain disabled unless `allow_policy_writes` is explicitly enabled, and even then direct `memory.write` does not write policy records; use the nested-learning or admin path so policy evidence, repeat count, explicit instruction, and approval gates stay intact.
