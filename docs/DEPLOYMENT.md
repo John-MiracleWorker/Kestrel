@@ -11,7 +11,7 @@ For a local Memvid-backed Kestrel install:
 curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | bash
 ```
 
-The installer clones or updates `https://github.com/John-MiracleWorker/Kestrel.git` into `${KESTREL_HOME:-$HOME/.kestrel-agent}`, detects Python 3.11 or newer, creates `.venv`, installs `.[memvid,openai,server,mcp,dev]`, runs `npm ci --prefix web`, builds the web workbench, initializes `.nest/memory` with Memvid `.mv2` layers, verifies memory, and runs doctor plus a deterministic `mock` chat smoke check. The smoke check proves the CLI path without requiring secrets; it is not the recommended provider for real use.
+The installer clones or updates `https://github.com/John-MiracleWorker/Kestrel.git` into `${KESTREL_HOME:-$HOME/.kestrel-agent}`, detects Python 3.11 or newer, creates `.venv`, installs `.[memvid,openai,server,mcp,dev]`, runs `npm ci --prefix web`, builds the web workbench, initializes `.nest/memory` with Memvid `.mv2` layers, verifies memory, runs doctor plus a deterministic `mock` chat smoke check, starts the localhost server in a detached `screen`/`tmux`/`nohup` session, waits for `/api/health`, and opens the web UI at `http://127.0.0.1:8765/`. The smoke check proves the CLI path without requiring secrets; it is not the recommended provider for real use.
 
 Useful options:
 
@@ -21,10 +21,19 @@ KESTREL_HOME="$HOME/dev/kestrel" bash install.sh
 KESTREL_REF=main bash install.sh
 KESTREL_SKIP_WEB=1 bash install.sh
 KESTREL_SKIP_SMOKE=1 bash install.sh
-KESTREL_START_SERVER=1 KESTREL_PORT=8765 bash install.sh
+KESTREL_START_SERVER=0 bash install.sh
+KESTREL_OPEN_BROWSER=0 KESTREL_PORT=8766 bash install.sh
+KESTREL_SERVER_SESSION=kestrel-agent-dev bash install.sh
 ```
 
 The installer refuses to overwrite a non-git nonempty target directory. It keeps the same safe runtime defaults as the rest of the repo: Memvid backend, localhost server commands, no provider secrets collected, and high-risk shell/file-write/policy/Codex/plugin/git remote mutation flags disabled.
+
+The default detached server writes logs to `${KESTREL_HOME:-$HOME/.kestrel-agent}/.nest/server.log`. Stop it with:
+
+```bash
+kill "$(cat "$HOME/.kestrel-agent/.nest/server.pid")"
+screen -S kestrel-agent -X quit 2>/dev/null || true
+```
 
 After install, run with the provider you actually want to use:
 
@@ -35,7 +44,7 @@ OPENAI_API_KEY=... .venv/bin/nest-agent chat --backend memvid --memory-dir .nest
 .venv/bin/nest-agent chat --backend memvid --memory-dir .nest/memory --provider openai-compatible --base-url http://127.0.0.1:1234/v1 --model local-model
 ```
 
-The local workbench can start with any configured provider. `mock` remains useful only as a smoke-test fallback:
+The one-shot installer starts the local workbench with `mock` by default. The workbench can also start manually with any configured provider; `mock` remains useful only as a smoke-test fallback:
 
 ```bash
 .venv/bin/nest-agent server --backend memvid --memory-dir .nest/memory --provider mock --model mock --host 127.0.0.1 --port 8765

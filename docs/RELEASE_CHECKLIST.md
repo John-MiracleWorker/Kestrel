@@ -32,6 +32,7 @@ nest-agent doctor --backend memory --provider mock
 nest-agent chat --backend memory --provider mock --message "packaging smoke"
 bash -n install.sh
 KESTREL_DRY_RUN=1 bash install.sh
+KESTREL_DRY_RUN=1 KESTREL_START_SERVER=0 bash install.sh
 docker build -t kestrel-agent:local .
 docker run --rm kestrel-agent:local nest-agent doctor --backend memory --memory-dir /tmp/kestrel-memory --provider mock
 ```

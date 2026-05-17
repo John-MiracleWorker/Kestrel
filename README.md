@@ -70,7 +70,7 @@ One-shot local install:
 curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | bash
 ```
 
-The installer clones or updates Kestrel in `${KESTREL_HOME:-$HOME/.kestrel-agent}`, finds Python 3.11 or newer without relying on bare `python`, installs the Memvid/OpenAI/server/MCP/dev extras, builds the web workbench, initializes `.nest/memory/*.mv2`, verifies memory, and runs a deterministic `mock` CLI smoke check. `mock` is a zero-secret health check, not the intended operating mode. The installer does not ask for secrets or enable high-risk tools.
+The installer clones or updates Kestrel in `${KESTREL_HOME:-$HOME/.kestrel-agent}`, finds Python 3.11 or newer without relying on bare `python`, installs the Memvid/OpenAI/server/MCP/dev extras, builds the web workbench, initializes `.nest/memory/*.mv2`, verifies memory, runs a deterministic `mock` CLI smoke check, starts the localhost server in a detached session, waits for `/api/health`, and opens the web UI at `http://127.0.0.1:8765/`. `mock` is a zero-secret health check, not the intended operating mode. The installer does not ask for secrets or enable high-risk tools.
 
 Useful installer options:
 
@@ -78,7 +78,15 @@ Useful installer options:
 KESTREL_HOME="$HOME/dev/kestrel" bash install.sh
 KESTREL_DRY_RUN=1 bash install.sh
 KESTREL_SKIP_WEB=1 bash install.sh
-KESTREL_START_SERVER=1 bash install.sh
+KESTREL_START_SERVER=0 bash install.sh
+KESTREL_OPEN_BROWSER=0 KESTREL_PORT=8766 bash install.sh
+```
+
+To stop the default detached server:
+
+```bash
+kill "$(cat "$HOME/.kestrel-agent/.nest/server.pid")"
+screen -S kestrel-agent -X quit 2>/dev/null || true
 ```
 
 After install, choose a real provider for normal use:
@@ -90,7 +98,7 @@ OPENAI_API_KEY=... .venv/bin/nest-agent chat --backend memvid --memory-dir .nest
 .venv/bin/nest-agent chat --backend memvid --memory-dir .nest/memory --provider openai-compatible --base-url http://127.0.0.1:1234/v1 --model local-model
 ```
 
-To start the workbench with the smoke-test provider while you configure a real provider:
+The one-shot path starts the workbench with the smoke-test provider while you configure a real provider. To start it manually:
 
 ```bash
 .venv/bin/nest-agent server --backend memvid --memory-dir .nest/memory --provider mock --model mock --host 127.0.0.1 --port 8765
