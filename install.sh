@@ -132,7 +132,7 @@ print_install_plan() {
   dry run: ${DRY_RUN_LABEL}
   init command: nest-agent init --backend memvid --memory-dir .nest/memory
   verify command: nest-agent memory verify --backend memvid --memory-dir .nest/memory
-  smoke command: nest-agent chat --backend memvid --memory-dir .nest/memory --provider mock --model mock --timeout-seconds 300 --message "hello from one-shot install"
+  smoke command: nest-agent chat --backend memory --memory-dir .nest/install-smoke-memory --provider mock --model mock --message "hello from one-shot install"
 EOF
 }
 
@@ -191,7 +191,7 @@ run_smoke_checks() {
     return 0
   fi
   run .venv/bin/nest-agent doctor --backend memvid --memory-dir .nest/memory --provider mock --model mock --timeout-seconds 300
-  run .venv/bin/nest-agent chat --backend memvid --memory-dir .nest/memory --provider mock --model mock --timeout-seconds 300 --message "hello from one-shot install"
+  run .venv/bin/nest-agent chat --backend memory --memory-dir .nest/install-smoke-memory --provider mock --model mock --message "hello from one-shot install"
 }
 
 print_next_steps() {

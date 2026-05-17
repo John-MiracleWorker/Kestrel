@@ -53,7 +53,7 @@ KESTREL_DRY_RUN=1 bash install.sh
 The local-clone installer smoke is optional because it installs dependencies into a temporary checkout and initializes real Memvid `.mv2` files:
 
 ```bash
-RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/test_install_script.py::test_install_from_local_repo_smoke_with_memvid
+RUN_MEMVID_INTEGRATION=1 RUN_INSTALLER_INTEGRATION=1 python -m pytest -q tests/test_install_script.py::test_install_from_local_repo_smoke_with_memvid
 ```
 
 ## Optional Memvid Integration

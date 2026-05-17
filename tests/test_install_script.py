@@ -112,7 +112,7 @@ def test_install_dry_run_uses_memvid_mock_defaults(tmp_path: Path) -> None:
     assert ".[memvid,openai,server,mcp,dev]" in result.stdout
     assert "nest-agent init --backend memvid --memory-dir .nest/memory" in result.stdout
     assert "nest-agent memory verify --backend memvid --memory-dir .nest/memory" in result.stdout
-    assert 'nest-agent chat --backend memvid --memory-dir .nest/memory --provider mock --model mock --timeout-seconds 300 --message "hello from one-shot install"' in result.stdout
+    assert 'nest-agent chat --backend memory --memory-dir .nest/install-smoke-memory --provider mock --model mock --message "hello from one-shot install"' in result.stdout
     assert "NEST_AGENT_ALLOW_SHELL=false" in result.stdout
     assert "NEST_AGENT_ALLOW_POLICY_WRITES=false" in result.stdout
     assert "NEST_AGENT_ALLOW_PLUGIN_INSTALL=false" in result.stdout
@@ -139,7 +139,10 @@ def test_install_script_detects_python_311_without_bare_python_default() -> None
     assert "python -m venv" not in text
 
 
-@pytest.mark.skipif(os.getenv("RUN_MEMVID_INTEGRATION") != "1", reason="requires RUN_MEMVID_INTEGRATION=1")
+@pytest.mark.skipif(
+    os.getenv("RUN_MEMVID_INTEGRATION") != "1" or os.getenv("RUN_INSTALLER_INTEGRATION") != "1",
+    reason="requires RUN_MEMVID_INTEGRATION=1 and RUN_INSTALLER_INTEGRATION=1",
+)
 def test_install_from_local_repo_smoke_with_memvid(tmp_path: Path) -> None:
     source_repo = _current_tree_git_repo(tmp_path)
     result = _run_install(
