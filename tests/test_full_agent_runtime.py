@@ -1796,6 +1796,41 @@ def test_run_manager_pauses_and_resumes_approved_tool(tmp_path: Path) -> None:
     assert final["tool_count"] >= 1
 
 
+def test_run_manager_executes_manual_terminal_run_approval_without_continuation(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.config = AgentConfig(
+        **{**manager.config.__dict__, "allow_file_write": True}
+    )
+    run = manager.state.create_run(
+        run_id="run_completed_manual_tool",
+        message="manual",
+        session_id="session",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+    manager.state.transition_run(run.run_id, "running")
+    manager.state.transition_run(run.run_id, "completed", assistant_message="done", stop_reason="complete")
+
+    execution = manager.invoke_tool(
+        tool_name="file.write",
+        arguments={"path": "approved.txt", "content": "approved\n"},
+        session_id="session",
+        run_id=run.run_id,
+    )
+    assert execution.error == "approval_pending"
+    approval = manager.state.list_approvals(status="pending")[0]
+
+    decided = manager.decide_approval(approval["approval_id"], approved=True, arguments=approval["arguments"])
+
+    assert decided["status"] == "approved"
+    assert decided["result"] is not None
+    assert decided["result"]["success"] is True
+    assert (tmp_path / "approved.txt").read_text(encoding="utf-8") == "approved\n"
+    final = manager.get_run(run.run_id)
+    assert final["status"] == "completed"
+    assert final["assistant_message"] == "done"
+
+
 def test_run_manager_marks_denied_approval_failed(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     manager.config = AgentConfig(

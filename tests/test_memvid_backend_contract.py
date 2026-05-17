@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Thread
+from time import sleep
 from types import SimpleNamespace
 from typing import Any
 
@@ -91,6 +93,89 @@ def test_memvid_backend_wraps_corrupt_existing_file_open(tmp_path: Path, monkeyp
 
     with pytest.raises(RuntimeError, match="Failed to open existing Memvid memory"):
         backend.open()
+
+
+def test_memvid_backend_verify_closes_live_handle_before_deep_verify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "semantic.mv2"
+    path.write_bytes(b"existing")
+    instances: list[FakeMemForVerify] = []
+
+    class FakeMemForVerify:
+        def __init__(self) -> None:
+            self.closed = False
+            instances.append(self)
+
+        def verify(self, path_arg: str, *, deep: bool) -> dict[str, object]:
+            assert path_arg == str(path)
+            assert deep is True
+            if not self.closed:
+                raise RuntimeError("exclusive access unavailable")
+            return {"overall_status": "passed"}
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.backends.memvid_backend.import_module",
+        lambda name: SimpleNamespace(
+            create=lambda *args, **kwargs: FakeMemForVerify(),
+            use=lambda *args, **kwargs: FakeMemForVerify(),
+        ),
+    )
+
+    backend = MemvidBackend(path=path, layer=MemoryLayer.SEMANTIC)
+    backend.open()
+
+    assert backend.verify() is True
+    assert len(instances) == 2
+    assert instances[0].closed is True
+    assert instances[1].closed is False
+
+    backend.close()
+
+
+def test_memvid_backend_serializes_same_path_open_in_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "semantic.mv2"
+    path.write_bytes(b"existing")
+    opened: list[FakeMemForLock] = []
+
+    class FakeMemForLock:
+        def close(self) -> None:
+            return None
+
+    def fake_use(*args: object, **kwargs: object) -> FakeMemForLock:
+        del args, kwargs
+        mem = FakeMemForLock()
+        opened.append(mem)
+        return mem
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.backends.memvid_backend.import_module",
+        lambda name: SimpleNamespace(create=lambda *args, **kwargs: FakeMemForLock(), use=fake_use),
+    )
+
+    first = MemvidBackend(path=path, layer=MemoryLayer.SEMANTIC)
+    second = MemvidBackend(path=path, layer=MemoryLayer.SEMANTIC)
+    first.open()
+
+    thread = Thread(target=second.open)
+    thread.start()
+    sleep(0.05)
+
+    assert thread.is_alive()
+    assert len(opened) == 1
+
+    first.close()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert len(opened) == 2
+
+    second.close()
 
 
 def test_memvid_backend_normalizes_find_hits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -4,11 +4,15 @@ import json
 import re
 from importlib import import_module
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from ..context_frames import MV2ContextFrame, default_frame_type_for_memory, to_memory_record
 from ..models import MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
 from .base import MemoryBackend
+
+_PATH_LOCKS: dict[Path, Lock] = {}
+_PATH_LOCKS_GUARD = Lock()
 
 
 class MemvidBackend(MemoryBackend):
@@ -32,8 +36,18 @@ class MemvidBackend(MemoryBackend):
         self.enable_lex = enable_lex
         self.read_only = read_only
         self.mem: Any | None = None
+        self._path_lock: Lock | None = None
+        self._lock_acquired = False
 
     def open(self) -> None:
+        self._acquire_path_lock()
+        try:
+            self._open_unlocked()
+        except Exception:
+            self._release_path_lock()
+            raise
+
+    def _open_unlocked(self) -> None:
         try:
             memvid_sdk = import_module("memvid_sdk")
         except ImportError as exc:
@@ -156,16 +170,22 @@ class MemvidBackend(MemoryBackend):
         mem = self._require_mem()
         verify = getattr(mem, "verify", None)
         if callable(verify):
-            result = verify(str(self.path), deep=True)
-            if isinstance(result, dict):
-                overall_status = result.get("overall_status")
-                if isinstance(overall_status, str):
-                    return overall_status == "passed"
-                checks = result.get("checks")
-                if isinstance(checks, list):
-                    return all(isinstance(item, dict) and item.get("status") == "passed" for item in checks)
-                return bool(result.get("ok", result.get("valid", True)))
-            return bool(result)
+            # The SDK verifier opens the .mv2 file internally. Close this live
+            # handle while keeping the in-process path lock so another local
+            # request cannot claim the same file before verification finishes.
+            close = getattr(mem, "close", None)
+            if callable(close):
+                close()
+            self.mem = None
+            try:
+                result = verify(str(self.path), deep=True)
+                return _verify_result_to_bool(result)
+            finally:
+                try:
+                    self._open_unlocked()
+                except Exception:
+                    self._release_path_lock()
+                    raise
         return self.path.exists()
 
     def stats(self) -> dict[str, Any]:
@@ -195,11 +215,46 @@ class MemvidBackend(MemoryBackend):
             if callable(close):
                 close()
         self.mem = None
+        self._release_path_lock()
 
     def _require_mem(self) -> Any:
         if self.mem is None:
             raise RuntimeError("MemvidBackend.open() must be called before use")
         return self.mem
+
+    def _acquire_path_lock(self) -> None:
+        if self._lock_acquired:
+            return
+        resolved = self.path.resolve()
+        with _PATH_LOCKS_GUARD:
+            lock = _PATH_LOCKS.setdefault(resolved, Lock())
+        lock.acquire()
+        self._path_lock = lock
+        self._lock_acquired = True
+
+    def _release_path_lock(self) -> None:
+        if not self._lock_acquired:
+            return
+        lock = self._path_lock
+        self._path_lock = None
+        self._lock_acquired = False
+        if lock is not None:
+            lock.release()
+
+
+def _verify_result_to_bool(result: Any) -> bool:
+    if isinstance(result, dict):
+        overall_status = result.get("overall_status")
+        if isinstance(overall_status, str):
+            return overall_status == "passed"
+        checks = result.get("checks")
+        if isinstance(checks, list):
+            return all(
+                isinstance(item, dict) and item.get("status") in {"passed", "skipped"}
+                for item in checks
+            )
+        return bool(result.get("ok", result.get("valid", True)))
+    return bool(result)
 
 
 def _record_from_hit(item: dict[str, Any], metadata: dict[str, Any], layer: MemoryLayer) -> MemoryRecord:

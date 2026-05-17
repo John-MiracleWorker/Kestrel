@@ -28,6 +28,9 @@ from .tracing import SpanRecorder
 from .worker_isolation import prepare_git_worktree
 
 
+_TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
+
+
 class RunManager:
     """Background run orchestration for the web UI and API."""
 
@@ -198,6 +201,7 @@ class RunManager:
         self.events.publish(updated["run_id"], f"approval.{status}", updated)
         if approved:
             self._resume_after_approval(updated, approved_arguments)
+            updated = self.state.get_approval(approval_id)
         else:
             self.state.transition_run(updated["run_id"], "failed", error="Approval denied", stop_reason="approval_denied")
             self.events.publish(updated["run_id"], "run.failed", {"error": "Approval denied"})
@@ -486,8 +490,40 @@ class RunManager:
             return
         run = self.state.get_run(run_id)
         config = replace(self.config, workspace=Path(run.workspace), provider=run.provider, model=run.model)
+        if run.status in _TERMINAL_RUN_STATUSES:
+            self._run_approved_tool_without_continuation(config, approval, arguments, run.session_id)
+            return
         self.state.transition_run(run_id, "running", stop_reason="resuming_after_approval")
         self._start_thread(run_id, self._run_approved_tool_then_continue, config, approval, arguments, run.session_id)
+
+    def _run_approved_tool_without_continuation(
+        self,
+        config: AgentConfig,
+        approval: dict[str, Any],
+        arguments: dict[str, Any],
+        session_id: str,
+    ) -> None:
+        run_id = str(approval["run_id"])
+        agent = self._build_agent(config)
+        try:
+            if self._is_cancelled(run_id):
+                return
+            self._execute_approved_tool(agent, approval, arguments, session_id)
+        except Exception as exc:  # noqa: BLE001
+            error_text = f"{type(exc).__name__}: {exc}"
+            payload = {
+                "tool": str(approval["tool_name"]),
+                "tool_call_id": str(approval["tool_call_id"]),
+                "arguments": arguments,
+                "success": False,
+                "content": error_text,
+                "data": {},
+                "error": "approved_tool_failed",
+            }
+            self.state.record_approval_result(str(approval["approval_id"]), payload)
+            self.events.publish(run_id, "tool.failed", payload)
+        finally:
+            agent.close()
 
     def _run_approved_tool_then_continue(
         self,
@@ -501,23 +537,7 @@ class RunManager:
         try:
             if self._is_cancelled(run_id):
                 return
-            call = ToolCall(name=str(approval["tool_name"]), arguments=arguments, id=str(approval["tool_call_id"]))
-            execution = agent.tools.execute(
-                call,
-                ToolContext(
-                    memory=agent.memory,
-                    config=agent.config,
-                    workspace=agent.config.workspace,
-                    event_log=agent.event_log,
-                    session_id=session_id,
-                    run_id=run_id,
-                    approved_tool_call_ids=frozenset({call.id}),
-                    approved_tool_call_arguments={call.id: arguments},
-                ),
-            )
-            self.state.record_approval_result(str(approval["approval_id"]), _execution_payload(execution))
-            self.events.publish(run_id, "tool.executed", _execution_payload(execution))
-            self.events.publish(run_id, "tool.completed" if execution.success else "tool.failed", _execution_payload(execution))
+            call, execution = self._execute_approved_tool(agent, approval, arguments, session_id)
             continuation = (
                 f"Continue the previous run after approved tool `{call.name}`.\n\n"
                 f"Tool success: {execution.success}\n"
@@ -541,6 +561,34 @@ class RunManager:
             self.events.publish(run_id, "run.failed", {"error": f"{type(exc).__name__}: {exc}"})
         finally:
             agent.close()
+
+    def _execute_approved_tool(
+        self,
+        agent: NestedMV2Agent,
+        approval: dict[str, Any],
+        arguments: dict[str, Any],
+        session_id: str,
+    ) -> tuple[ToolCall, ToolExecution]:
+        run_id = str(approval["run_id"])
+        call = ToolCall(name=str(approval["tool_name"]), arguments=arguments, id=str(approval["tool_call_id"]))
+        execution = agent.tools.execute(
+            call,
+            ToolContext(
+                memory=agent.memory,
+                config=agent.config,
+                workspace=agent.config.workspace,
+                event_log=agent.event_log,
+                session_id=session_id,
+                run_id=run_id,
+                approved_tool_call_ids=frozenset({call.id}),
+                approved_tool_call_arguments={call.id: arguments},
+            ),
+        )
+        payload = _execution_payload(execution)
+        self.state.record_approval_result(str(approval["approval_id"]), payload)
+        self.events.publish(run_id, "tool.executed", payload)
+        self.events.publish(run_id, "tool.completed" if execution.success else "tool.failed", payload)
+        return call, execution
 
     def _finish_agent_turn(
         self,
