@@ -60,6 +60,7 @@ let approvals: Approval[];
 let secrets: SecretRef[];
 let eventSources: MockEventSource[];
 let eventId: number;
+let traceTimelines: Record<string, TraceEvent[]>;
 
 describe("App", () => {
   beforeEach(() => {
@@ -94,6 +95,23 @@ describe("App", () => {
     secrets = [];
     eventSources = [];
     eventId = 1;
+    traceTimelines = {
+      run_1: [
+        {
+          id: 1,
+          run_id: "run_1",
+          type: "run.completed",
+          payload: {
+            proof_of_work: {
+              completed_steps: ["answered"],
+              validation_evidence: ["mock"],
+              remaining_risks: []
+            }
+          },
+          created_at: baseRun.updated_at
+        }
+      ]
+    };
     vi.stubGlobal("fetch", vi.fn(fetchMock));
     vi.stubGlobal("EventSource", MockEventSource);
   });
@@ -206,6 +224,70 @@ describe("App", () => {
       expect(transcript).toHaveTextContent("Streaming answer");
       expect(transcript).not.toHaveTextContent("Streaming answerStreaming answer");
     });
+  });
+
+  it("shows live thinking and tool use inside the active assistant turn", async () => {
+    sessionRuns.session_1 = [{ ...baseRun, status: "running", assistant_message: "", stop_reason: "" }];
+    runs = [sessionRuns.session_1[0], otherRun];
+    sessions = [
+      { ...sessions[1], latest_run_id: "run_1", latest_status: "running", latest_message: "Inspect the repo" },
+      sessions[0]
+    ];
+    approvals = [];
+    render(<App />);
+
+    await screen.findByText("Inspect the repo");
+    eventSources[0].emit("context.compile", { query: "repo", context_chars: 1200 });
+    eventSources[0].emit("tool.started", { tool: "shell.run", tool_call_id: "tool_1" });
+    eventSources[0].emit("tool.completed", {
+      tool: "shell.run",
+      tool_call_id: "tool_1",
+      arguments: { command: ["npm", "test"] },
+      content: "7 passed",
+      success: true
+    });
+
+    const activity = await screen.findByLabelText("Live run activity");
+    expect(within(activity).getByText("Thinking")).toBeInTheDocument();
+    expect(within(activity).getByText("Gathering context")).toBeInTheDocument();
+    expect(within(activity).getByText("Using shell.run")).toBeInTheDocument();
+    expect(within(activity).getByText("Finished shell.run")).toBeInTheDocument();
+    expect(within(activity).getByText("npm test")).toBeInTheDocument();
+    expect(within(activity).getByText("7 passed")).toBeInTheDocument();
+  });
+
+  it("hydrates thinking and tool use from the selected run trace", async () => {
+    sessionRuns.session_1 = [{ ...baseRun, status: "completed", assistant_message: "Done", stop_reason: "complete" }];
+    runs = [sessionRuns.session_1[0], otherRun];
+    sessions = [
+      { ...sessions[1], run_count: 1, latest_run_id: "run_1", latest_status: "completed", latest_message: "Inspect the repo" },
+      sessions[0]
+    ];
+    approvals = [];
+    traceTimelines.run_1 = [
+      {
+        id: 10,
+        run_id: "",
+        type: "context.compile",
+        payload: { context_chars: 1200 },
+        created_at: "2026-05-16T00:00:02Z"
+      },
+      {
+        id: 11,
+        run_id: "",
+        type: "tool.completed",
+        payload: { tool: "shell.run", arguments: { command: ["npm", "test"] }, content: "7 passed" },
+        created_at: "2026-05-16T00:00:03Z"
+      }
+    ];
+    render(<App />);
+
+    const activity = await screen.findByLabelText("Live run activity");
+    expect(within(activity).getByText("Thinking")).toBeInTheDocument();
+    expect(within(activity).getByText("Gathering context")).toBeInTheDocument();
+    expect(within(activity).getByText("Finished shell.run")).toBeInTheDocument();
+    expect(within(activity).getByText("npm test")).toBeInTheDocument();
+    expect(within(activity).getByText("7 passed")).toBeInTheDocument();
   });
 
   it("renders inline approvals for the active thread and preserves exact-call decision arguments", async () => {
@@ -403,31 +485,21 @@ function payloadFor(path: string): unknown {
   if (path.match(/^\/api\/runs\/run_[a-z0-9]+\/task-graph$/)) {
     return { tasks: [], ready_tasks: [], approval_blocked_tasks: [], subagents: [] };
   }
-  if (path.match(/^\/api\/runs\/run_[a-z0-9]+\/trace\?limit=700$/)) {
+  const traceMatch = path.match(/^\/api\/runs\/([^/]+)\/trace\?limit=700$/);
+  if (traceMatch) {
+    const runId = traceMatch[1];
+    const run = runs.find((item) => item.run_id === runId) ?? baseRun;
+    const timeline = traceTimelines[runId] ?? [];
     return {
-      run: runs.find((item) => path.includes(item.run_id)) ?? baseRun,
+      run,
       summary: {
-        event_count: 1,
+        event_count: timeline.length,
         span_count: 0,
-        first_event_at: baseRun.created_at,
-        last_event_at: baseRun.updated_at,
+        first_event_at: timeline[0]?.created_at ?? run.created_at,
+        last_event_at: timeline[timeline.length - 1]?.created_at ?? run.updated_at,
         trace_counts: { lifecycle: 1 }
       },
-      timeline: [
-        {
-          id: 1,
-          run_id: "run_1",
-          type: "run.completed",
-          payload: {
-            proof_of_work: {
-              completed_steps: ["answered"],
-              validation_evidence: ["mock"],
-              remaining_risks: []
-            }
-          },
-          created_at: baseRun.updated_at
-        }
-      ],
+      timeline,
       traces: { lifecycle: [] }
     };
   }

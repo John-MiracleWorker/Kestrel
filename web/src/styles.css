@@ -417,6 +417,82 @@ nav a:focus-visible {
   font-weight: 700;
 }
 
+.run-activity {
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+  display: grid;
+  gap: 9px;
+}
+
+.run-activity-heading {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #d9fff6;
+  font-size: 13px;
+}
+
+.activity-list {
+  display: grid;
+  gap: 7px;
+}
+
+.activity-row {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 8px;
+  padding: 8px 9px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.activity-row.tool {
+  border-color: rgba(124, 169, 223, 0.34);
+}
+
+.activity-row.completed {
+  border-color: rgba(79, 182, 163, 0.34);
+}
+
+.activity-row.failed {
+  border-color: rgba(225, 111, 102, 0.5);
+}
+
+.activity-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: rgba(79, 182, 163, 0.12);
+  color: #d9fff6;
+}
+
+.activity-row.tool .activity-icon {
+  background: rgba(124, 169, 223, 0.13);
+  color: #d8e9ff;
+}
+
+.activity-row.failed .activity-icon {
+  background: rgba(225, 111, 102, 0.13);
+  color: #ffe0dc;
+}
+
+.activity-row strong,
+.activity-row small {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.activity-row small {
+  margin-top: 2px;
+  color: var(--muted);
+}
+
 .inline-approval {
   display: grid;
   gap: 10px;

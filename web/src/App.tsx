@@ -56,6 +56,15 @@ import type {
   TraceEvent
 } from "./types";
 
+type LiveActivityItem = {
+  id: string;
+  kind: "thinking" | "tool";
+  label: string;
+  detail: string;
+  meta: string;
+  status: "running" | "completed" | "failed" | "info";
+};
+
 const providerOptions = ["mock", "openai", "openai-compatible", "openrouter", "ollama", "anthropic", "gemini", "codex-cli"];
 const modelSuggestionsByProvider: Record<string, string[]> = {
   mock: ["mock"],
@@ -220,6 +229,17 @@ export function App() {
     () => approvals.filter((approval) => activeRunIds.has(approval.run_id) || approval.run_id === activeRun?.run_id),
     [approvals, activeRunIds, activeRun?.run_id]
   );
+  const activeRunEvents = useMemo(() => {
+    const rows = new Map<string, TraceEvent>();
+    const traceEvents = runTrace && runTrace.run.run_id === activeRun?.run_id ? runTrace.timeline : [];
+    traceEvents
+      .filter((event) => event.type !== "assistant.token")
+      .forEach((event) => rows.set(eventKey(event), event));
+    events
+      .filter((event) => eventBelongsToRun(event, activeRun?.run_id) && event.type !== "assistant.token")
+      .forEach((event) => rows.set(eventKey(event), event));
+    return [...rows.values()].sort((left, right) => eventTimestamp(left).localeCompare(eventTimestamp(right)));
+  }, [events, activeRun?.run_id, runTrace]);
   const modelSuggestions = modelSuggestionsByProvider[provider] ?? [];
   const streamedAssistant = useMemo(
     () =>
@@ -980,21 +1000,10 @@ export function App() {
                     <article className="bubble assistant">
                       <strong>Kestrel</strong>
                       <p>{assistantTextForRun(run, activeRun?.run_id, streamedAssistant)}</p>
+                      {run.run_id === activeRun?.run_id && <LiveRunActivity events={activeRunEvents} />}
                     </article>
                   </div>
                 ))
-              )}
-              {events.some((event) => event.type !== "assistant.token") && (
-                <div className="progress-timeline" aria-label="Run progress">
-                  {events
-                    .filter((event) => event.type !== "assistant.token")
-                    .slice(-8)
-                    .map((event) => (
-                      <span className="progress-chip" key={event.id}>
-                        {friendlyEventLabel(event.type)}
-                      </span>
-                    ))}
-                </div>
               )}
               {activeApprovals.map((approval) => (
                 <ApprovalCardInline key={approval.approval_id} approval={approval} onApprove={decideApproval} />
@@ -1862,6 +1871,40 @@ function ApprovalCardInline({ approval, onApprove }: { approval: Approval; onApp
   );
 }
 
+function LiveRunActivity({ events }: { events: TraceEvent[] }) {
+  const items = activityItemsForEvents(events);
+  if (items.length === 0) return null;
+  return (
+    <div className="run-activity" aria-label="Live run activity" aria-live="polite">
+      <div className="run-activity-heading">
+        <Brain size={15} />
+        <strong>Thinking</strong>
+      </div>
+      <div className="activity-list">
+        {items.map((item) => (
+          <div className={`activity-row ${item.kind} ${item.status}`} key={item.id}>
+            <span className="activity-icon" aria-hidden="true">
+              {activityIcon(item)}
+            </span>
+            <span>
+              <strong>{item.label}</strong>
+              {item.meta && <small>{item.meta}</small>}
+              {item.detail && <small>{item.detail}</small>}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function activityIcon(item: LiveActivityItem) {
+  if (item.status === "completed") return <Check size={14} />;
+  if (item.status === "failed") return <X size={14} />;
+  if (item.kind === "tool") return <Wrench size={14} />;
+  return <Sparkles size={14} />;
+}
+
 function RecordList({ records }: { records: Array<Record<string, unknown>> }) {
   if (records.length === 0) return <EmptyState>No records found.</EmptyState>;
   return (
@@ -1958,6 +2001,7 @@ function friendlyEventLabel(type: string): string {
     "memory.write": "Updating memory",
     "tool.started": "Using tool",
     "tool.completed": "Tool finished",
+    "tool.failed": "Tool failed",
     "approval.requested": "Needs approval",
     "run.completed": "Complete",
     "run.failed": "Failed",
@@ -1969,6 +2013,118 @@ function friendlyEventLabel(type: string): string {
     "task.approved": "Task approved"
   };
   return labels[type] ?? type;
+}
+
+function activityItemsForEvents(events: TraceEvent[]): LiveActivityItem[] {
+  return events
+    .map(activityItemForEvent)
+    .filter((item): item is LiveActivityItem => Boolean(item))
+    .slice(-8);
+}
+
+function eventKey(event: TraceEvent): string {
+  return Number.isFinite(event.id) ? String(event.id) : `${event.type}-${eventTimestamp(event)}-${JSON.stringify(event.payload).slice(0, 80)}`;
+}
+
+function eventBelongsToRun(event: TraceEvent, runId: string | null | undefined): boolean {
+  if (!runId) return false;
+  return event.run_id === runId || event.payload.run_id === runId;
+}
+
+function eventTimestamp(event: TraceEvent): string {
+  return typeof event.created_at === "string" ? event.created_at : "";
+}
+
+function activityItemForEvent(event: TraceEvent): LiveActivityItem | null {
+  if (event.type === "assistant.token") return null;
+  if (!isVisibleActivityEvent(event.type)) return null;
+  const toolName = toolNameForEvent(event);
+  if (event.type === "tool.started") {
+    return {
+      id: String(event.id),
+      kind: "tool",
+      label: `Using ${toolName}`,
+      meta: argumentsSummaryForEvent(event),
+      detail: "",
+      status: "running"
+    };
+  }
+  if (event.type === "tool.completed") {
+    return {
+      id: String(event.id),
+      kind: "tool",
+      label: `Finished ${toolName}`,
+      meta: argumentsSummaryForEvent(event),
+      detail: compactActivityDetail(event.payload.content),
+      status: "completed"
+    };
+  }
+  if (event.type === "tool.failed") {
+    return {
+      id: String(event.id),
+      kind: "tool",
+      label: `Failed ${toolName}`,
+      meta: argumentsSummaryForEvent(event),
+      detail: compactActivityDetail(event.payload.content ?? event.payload.error),
+      status: "failed"
+    };
+  }
+  return {
+    id: String(event.id),
+    kind: "thinking",
+    label: friendlyEventLabel(event.type),
+    meta: thinkingMetaForEvent(event),
+    detail: thinkingDetailForEvent(event),
+    status: event.type === "run.completed" ? "completed" : event.type === "run.failed" ? "failed" : "info"
+  };
+}
+
+function isVisibleActivityEvent(type: string): boolean {
+  return [
+    "run.started",
+    "context.compile",
+    "memory.write",
+    "tool.started",
+    "tool.completed",
+    "tool.failed",
+    "approval.requested",
+    "run.completed",
+    "run.failed",
+    "run.cancelled",
+    "scheduler.step",
+    "scheduler.run",
+    "subagent.started",
+    "subagent.completed",
+    "subagent.failed",
+    "task.approved"
+  ].includes(type);
+}
+
+function toolNameForEvent(event: TraceEvent): string {
+  return String(event.payload.tool ?? event.payload.tool_name ?? "tool");
+}
+
+function argumentsSummaryForEvent(event: TraceEvent): string {
+  const args = event.payload.arguments;
+  return args && typeof args === "object" && !Array.isArray(args) ? summarizeArguments(args as Record<string, unknown>) : "";
+}
+
+function thinkingMetaForEvent(event: TraceEvent): string {
+  if (event.type === "context.compile" && typeof event.payload.context_chars === "number") return `${event.payload.context_chars} context chars`;
+  if (event.type === "memory.write" && event.payload.index && event.payload.total) return `${event.payload.index}/${event.payload.total}`;
+  if (event.type.startsWith("scheduler.") && event.payload.task_id) return String(event.payload.task_id);
+  return "";
+}
+
+function thinkingDetailForEvent(event: TraceEvent): string {
+  const value = event.payload.query ?? event.payload.record_id ?? event.payload.source ?? event.payload.error;
+  return compactActivityDetail(value);
+}
+
+function compactActivityDetail(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  const text = String(value).replace(/\s+/g, " ").trim();
+  return text.length > 120 ? `${text.slice(0, 117)}...` : text;
 }
 
 function riskLabel(risk: string): string {
