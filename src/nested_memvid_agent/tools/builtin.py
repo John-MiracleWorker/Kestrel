@@ -907,7 +907,8 @@ class MemoryCorrectTool(AgentTool):
             },
             "required": ["target_record_id", "correction_text"],
         },
-        risk="medium",
+        risk="high",
+        requires_approval=True,
     )
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:

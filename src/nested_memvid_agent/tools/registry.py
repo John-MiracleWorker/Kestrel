@@ -155,6 +155,7 @@ _ENABLEMENT_BY_TOOL = {
     "plugin.install": "allow_plugin_install",
     "git.commit": "allow_git_commit",
     "memory.import": "allow_memory_import",
+    "memory.correct": "allow_memory_import",
     "web.search": "allow_web",
     "web.fetch": "allow_web",
     "self.propose_change": "allow_self_modification",
