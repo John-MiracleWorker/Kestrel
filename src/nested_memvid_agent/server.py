@@ -79,13 +79,12 @@ def create_app(config: AgentConfig | None = None) -> Any:
             SkillInstallRequest,
             SubagentRequest,
             ToolInvokeRequest,
-            WebFetchRequest,
-            WebSearchRequest,
         )
         from .server_observability_routes import register_observability_routes
         from .server_runtime_routes import register_runtime_routes
         from .server_secret_routes import register_secret_routes
         from .server_tool_routes import register_tool_routes, tool_invoke_response
+        from .server_web_routes import register_web_routes
     except ImportError as exc:
         raise RuntimeError("Install server extras with `pip install -e '.[server]'`.") from exc
 
@@ -357,21 +356,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         )
         return _execution_response(execution)
 
-    @app.post("/api/web/search")  # type: ignore[untyped-decorator]
-    def search_web(request: WebSearchRequest) -> dict[str, object]:
-        arguments: dict[str, object] = {"query": request.query}
-        if request.max_results is not None:
-            arguments["max_results"] = request.max_results
-        execution = runs.invoke_tool(tool_name="web.search", arguments=arguments, session_id="api")
-        return _execution_response(execution)
-
-    @app.post("/api/web/fetch")  # type: ignore[untyped-decorator]
-    def fetch_web(request: WebFetchRequest) -> dict[str, object]:
-        arguments: dict[str, object] = {"url": request.url}
-        if request.max_bytes is not None:
-            arguments["max_bytes"] = request.max_bytes
-        execution = runs.invoke_tool(tool_name="web.fetch", arguments=arguments, session_id="api")
-        return _execution_response(execution)
+    register_web_routes(app, runs=runs)
 
     @app.get("/api/approvals")  # type: ignore[untyped-decorator]
     def list_approvals(status: str | None = None) -> list[dict[str, object]]:
