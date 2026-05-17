@@ -1,6 +1,6 @@
 # Testing Guide
 
-Last updated: 2026-05-16
+Last updated: 2026-05-17
 
 Kestrel's fast test path is deterministic: it uses `InMemoryBackend` plus the mock LLM provider. Memvid, MCP, provider, and platform integrations stay behind explicit environment flags.
 
@@ -39,6 +39,22 @@ npm run build --prefix web
 `npm run test --prefix web` currently runs the TypeScript build in no-pretty mode. `npm run build --prefix web` runs TypeScript plus the Vite production build.
 
 CI runs the web app in its own Node 22 job with `npm ci`, `npm test`, and `npm run build`, then runs a Docker build smoke job after Python and web checks pass.
+
+## Installer Validation
+
+Fast installer tests cover shell syntax, help text, dry-run defaults, Python 3.11+ detection, safe Memvid/mock commands, and refusal to overwrite non-git nonempty directories:
+
+```bash
+python -m pytest -q tests/test_install_script.py
+bash -n install.sh
+KESTREL_DRY_RUN=1 bash install.sh
+```
+
+The local-clone installer smoke is optional because it installs dependencies into a temporary checkout and initializes real Memvid `.mv2` files:
+
+```bash
+RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/test_install_script.py::test_install_from_local_repo_smoke_with_memvid
+```
 
 ## Optional Memvid Integration
 

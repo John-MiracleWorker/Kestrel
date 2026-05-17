@@ -7,6 +7,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 ## Working Now
 
 - CLI chat loop with in-memory and Memvid `.mv2` memory backends.
+- GitHub curl one-shot installer for a local Memvid-backed mock-provider agent, with dry-run, Python 3.11+ detection, web build, memory verify, and smoke checks.
 - Layered memory files for working, episodic, semantic, procedural, self, and policy layers.
 - Context compiler that retrieves nested memory and builds the model prompt.
 - MV2 context-frame model and token-aware pseudo-context packer that retrieves summaries first, deduplicates content, flags conflict metadata, and expands raw evidence on demand.
@@ -127,6 +128,8 @@ RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integ
 RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
 npm run test --prefix web
 npm run build --prefix web
+bash -n install.sh
+KESTREL_DRY_RUN=1 bash install.sh
 ```
 
 Use `python -m pytest` instead of a global `pytest` binary for optional integration tests so the fixture subprocesses inherit the same environment and installed extras (`mcp`, `memvid-sdk`).

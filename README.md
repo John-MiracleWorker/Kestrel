@@ -9,6 +9,7 @@ Kestrel is still an alpha runtime. It is useful for local development and harden
 ## What Works Now
 
 - CLI chat with in-memory or Memvid `.mv2` memory.
+- One-shot GitHub installer for a local Memvid-backed mock-provider agent.
 - Deterministic mock provider for tests and golden evals.
 - OpenAI Responses provider with streaming deltas when the SDK stream surface is available.
 - OpenAI-compatible chat completions provider for local/model-server endpoints.
@@ -63,7 +64,32 @@ Important storage rules:
 
 ## Quick Start
 
-Use Python 3.11 or newer.
+One-shot local install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | bash
+```
+
+The installer clones or updates Kestrel in `${KESTREL_HOME:-$HOME/.kestrel-agent}`, finds Python 3.11 or newer without relying on bare `python`, installs the Memvid/OpenAI/server/MCP/dev extras, builds the web workbench, initializes `.nest/memory/*.mv2`, verifies memory, and runs a mock-provider CLI chat smoke check. It does not ask for secrets or enable high-risk tools.
+
+Useful installer options:
+
+```bash
+KESTREL_HOME="$HOME/dev/kestrel" bash install.sh
+KESTREL_DRY_RUN=1 bash install.sh
+KESTREL_SKIP_WEB=1 bash install.sh
+KESTREL_START_SERVER=1 bash install.sh
+```
+
+After install:
+
+```bash
+cd "${KESTREL_HOME:-$HOME/.kestrel-agent}"
+.venv/bin/nest-agent chat --backend memvid --memory-dir .nest/memory --provider mock --model mock
+.venv/bin/nest-agent server --backend memvid --memory-dir .nest/memory --provider mock --model mock --host 127.0.0.1 --port 8765
+```
+
+Manual development install:
 
 ```bash
 python -m venv .venv

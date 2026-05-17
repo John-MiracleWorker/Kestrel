@@ -1,0 +1,155 @@
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+INSTALL = ROOT / "install.sh"
+
+
+def _run_install(*, env: dict[str, str] | None = None, args: list[str] | None = None) -> subprocess.CompletedProcess[str]:
+    install_env = os.environ.copy()
+    install_env.update(env or {})
+    return subprocess.run(
+        ["bash", str(INSTALL), *(args or [])],
+        cwd=ROOT,
+        env=install_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _current_tree_git_repo(tmp_path: Path) -> Path:
+    source = tmp_path / "source"
+    source.mkdir()
+    tracked = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "-z"],
+        text=False,
+        capture_output=True,
+        check=True,
+    ).stdout.split(b"\0")
+    extra_paths = [Path("install.sh"), Path("tests/test_install_script.py")]
+    for raw in [*tracked, *(str(path).encode() for path in extra_paths)]:
+        if not raw:
+            continue
+        relative = Path(raw.decode())
+        src = ROOT / relative
+        if not src.exists() or src.is_dir():
+            continue
+        dst = source / relative
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+    subprocess.run(["git", "init", "-q"], cwd=source, check=True)
+    subprocess.run(["git", "add", "."], cwd=source, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Kestrel Installer Test",
+            "-c",
+            "user.email=kestrel-installer@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "installer smoke source",
+        ],
+        cwd=source,
+        check=True,
+    )
+    return source
+
+
+def test_install_script_is_valid_bash() -> None:
+    assert INSTALL.exists()
+
+    result = subprocess.run(
+        ["bash", "-n", str(INSTALL)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_install_help_documents_github_curl_and_options() -> None:
+    result = _run_install(args=["--help"])
+
+    assert result.returncode == 0
+    assert "curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | bash" in result.stdout
+    for option in [
+        "KESTREL_HOME",
+        "KESTREL_REPO",
+        "KESTREL_REF",
+        "KESTREL_PYTHON",
+        "KESTREL_EXTRAS",
+        "KESTREL_SKIP_WEB",
+        "KESTREL_SKIP_SMOKE",
+        "KESTREL_START_SERVER",
+        "KESTREL_PORT",
+        "KESTREL_DRY_RUN",
+    ]:
+        assert option in result.stdout
+
+
+def test_install_dry_run_uses_memvid_mock_defaults(tmp_path: Path) -> None:
+    result = _run_install(
+        env={
+            "KESTREL_DRY_RUN": "1",
+            "KESTREL_HOME": str(tmp_path / "kestrel-home"),
+        }
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "DRY RUN" in result.stdout
+    assert "https://github.com/John-MiracleWorker/Kestrel.git" in result.stdout
+    assert ".[memvid,openai,server,mcp,dev]" in result.stdout
+    assert "nest-agent init --backend memvid --memory-dir .nest/memory" in result.stdout
+    assert "nest-agent memory verify --backend memvid --memory-dir .nest/memory" in result.stdout
+    assert 'nest-agent chat --backend memvid --memory-dir .nest/memory --provider mock --model mock --timeout-seconds 300 --message "hello from one-shot install"' in result.stdout
+    assert "NEST_AGENT_ALLOW_SHELL=false" in result.stdout
+    assert "NEST_AGENT_ALLOW_POLICY_WRITES=false" in result.stdout
+    assert "NEST_AGENT_ALLOW_PLUGIN_INSTALL=false" in result.stdout
+
+
+def test_install_refuses_non_git_nonempty_target_even_in_dry_run(tmp_path: Path) -> None:
+    target = tmp_path / "occupied"
+    target.mkdir()
+    (target / "keep.txt").write_text("do not overwrite\n", encoding="utf-8")
+
+    result = _run_install(env={"KESTREL_DRY_RUN": "1", "KESTREL_HOME": str(target)})
+
+    assert result.returncode != 0
+    assert "Refusing to install into non-git nonempty directory" in result.stderr
+
+
+def test_install_script_detects_python_311_without_bare_python_default() -> None:
+    text = INSTALL.read_text(encoding="utf-8")
+
+    assert "KESTREL_PYTHON" in text
+    for candidate in ["python3.13", "python3.12", "python3.11", "/opt/homebrew/bin/python3.11"]:
+        assert candidate in text
+    assert '"$PYTHON_BIN" -m venv .venv' in text
+    assert "python -m venv" not in text
+
+
+@pytest.mark.skipif(os.getenv("RUN_MEMVID_INTEGRATION") != "1", reason="requires RUN_MEMVID_INTEGRATION=1")
+def test_install_from_local_repo_smoke_with_memvid(tmp_path: Path) -> None:
+    source_repo = _current_tree_git_repo(tmp_path)
+    result = _run_install(
+        env={
+            "KESTREL_HOME": str(tmp_path / "installed"),
+            "KESTREL_REPO": str(source_repo),
+            "KESTREL_REF": "HEAD",
+            "KESTREL_SKIP_WEB": "1",
+        }
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Kestrel install complete" in result.stdout

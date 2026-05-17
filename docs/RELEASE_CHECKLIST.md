@@ -30,14 +30,23 @@ RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --p
 python -m pip install -e '.[memvid,openai,server,mcp,dev]'
 nest-agent doctor --backend memory --provider mock
 nest-agent chat --backend memory --provider mock --message "packaging smoke"
+bash -n install.sh
+KESTREL_DRY_RUN=1 bash install.sh
 docker build -t kestrel-agent:local .
 docker run --rm kestrel-agent:local nest-agent doctor --backend memory --memory-dir /tmp/kestrel-memory --provider mock
+```
+
+Optional one-shot installer smoke from a local repo clone:
+
+```bash
+RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/test_install_script.py::test_install_from_local_repo_smoke_with_memvid
 ```
 
 ## Documentation Checks
 
 - `.env.example` documents provider keys and safety flags.
-- `docs/DEPLOYMENT.md` covers local, Docker, Compose, provider, and local model setup.
+- `README.md` exposes the public GitHub curl installer.
+- `docs/DEPLOYMENT.md` covers one-shot, local, Docker, Compose, provider, and local model setup.
 - `docs/MEMORY_OPERATIONS.md` covers backup, restore, verification, and migration without recreating existing `.mv2` files.
 - `docs/SECURITY.md` keeps dangerous tool enablement explicit.
 

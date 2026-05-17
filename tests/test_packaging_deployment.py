@@ -74,6 +74,8 @@ def test_deployment_docs_cover_release_and_memory_operations() -> None:
     security = (ROOT / "docs" / "SECURITY.md").read_text(encoding="utf-8")
     checklist = (ROOT / "docs" / "RELEASE_CHECKLIST.md").read_text(encoding="utf-8")
 
+    assert "curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | bash" in deployment
+    assert "KESTREL_DRY_RUN=1 bash install.sh" in checklist
     assert "python -m pip install -e '.[memvid,openai,server,mcp,dev]'" in deployment
     assert "docker run --rm kestrel-agent:local" in deployment
     assert "OpenAI-compatible local servers" in deployment

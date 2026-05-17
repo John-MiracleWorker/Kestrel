@@ -293,10 +293,9 @@ def main() -> None:
 
     if args.cmd == "chat":
         manager = _build_run_manager(config)
-        agent = build_agent(config, tools=manager.build_registry(), state=manager.state)
         try:
             if args.message:
-                if _handle_slash_command(agent, args.message.strip(), args.session_id, manager=manager):
+                if _handle_slash_command_for_manager(manager, config, args.message.strip(), args.session_id):
                     return
                 _run_manager_chat_and_print(manager, args.message, session_id=args.session_id)
                 return
@@ -307,11 +306,10 @@ def main() -> None:
                     return
                 if not user_message:
                     continue
-                if _handle_slash_command(agent, user_message, args.session_id, manager=manager):
+                if _handle_slash_command_for_manager(manager, config, user_message, args.session_id):
                     continue
                 _run_manager_chat_and_print(manager, user_message, session_id=args.session_id, prefix="agent> ")
         finally:
-            agent.close()
             manager.mcp.shutdown()
         return
 
@@ -1214,11 +1212,14 @@ def _print_plugin(plugin: dict[str, Any], *, json_output: bool) -> None:
 def _wait_for_run(manager: RunManager, run_id: str) -> dict[str, Any]:
     deadline = monotonic() + max(manager.config.timeout_seconds + 15, 15)
     terminal = {"completed", "failed", "blocked", "cancelled"}
+    thread = manager._threads.get(run_id)  # CLI wait is in-process; yield to the worker before polling state.
     while monotonic() < deadline:
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.25)
         run = manager.get_run(run_id)
         if str(run["status"]) in terminal:
             return run
-        sleep(0.05)
+        sleep(0.25)
     raise SystemExit(f"Run {run_id} did not finish within the CLI wait timeout.")
 
 
@@ -1279,6 +1280,21 @@ def _chat_and_print(agent: NestedMV2Agent, user_message: str, *, session_id: str
         print(result.assistant_message)
         return
     print(f"{prefix}{result.assistant_message}" if prefix else result.assistant_message)
+
+
+def _handle_slash_command_for_manager(
+    manager: RunManager,
+    config: AgentConfig,
+    command: str,
+    session_id: str,
+) -> bool:
+    if not command.startswith("/"):
+        return False
+    agent = build_agent(config, tools=manager.build_registry(), state=manager.state)
+    try:
+        return _handle_slash_command(agent, command, session_id, manager=manager)
+    finally:
+        agent.close()
 
 
 def _handle_slash_command(
