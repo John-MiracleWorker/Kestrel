@@ -32,6 +32,7 @@ import {
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { deleteJson, getJson, postJson, putJson, queryString } from "./api";
 import { EmptyState, Field, InlineMeta, JsonBlock, Panel, StatusBadge } from "./components";
+import { TweaksPanel, TweakSection, TweakSlider, TweakToggle, TweakRadio, TweakColor } from "./tweaks-panel.jsx";
 import type {
   AgentLogEvent,
   ApiResult,
@@ -113,6 +114,10 @@ export function App() {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [activeSection, setActiveSection] = useState<"chat" | "advanced" | "settings">("chat");
+  const [primaryColor, setPrimaryColor] = useState("#a8442a");
+  const [fontSize, setFontSize] = useState(15);
+  const [density, setDensity] = useState("regular");
+  const [darkMode, setDarkMode] = useState(false);
 
   const [message, setMessage] = useState("");
   const [sessionId, setSessionId] = useState("");
@@ -1828,6 +1833,16 @@ export function App() {
         )}
       </main>
     </div>
+    <TweaksPanel title="Design">
+      <TweakSection label="Theme">
+        <TweakColor label="Accent" value={primaryColor} options={['#a8442a', '#2A6FDB', '#1F8A5B', '#7A5AE0']} onChange={setPrimaryColor} />
+        <TweakToggle label="Dark mode" value={darkMode} onChange={setDarkMode} />
+      </TweakSection>
+      <TweakSection label="Typography">
+        <TweakSlider label="Font size" value={fontSize} min={10} max={24} unit="px" onChange={setFontSize} />
+        <TweakRadio label="Density" value={density} options={['compact', 'regular', 'comfy']} onChange={setDensity} />
+      </TweakSection>
+    </TweaksPanel>
   </>
   );
 }
