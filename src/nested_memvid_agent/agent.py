@@ -16,7 +16,7 @@ from .event_log import AgentEvent, JsonlEventLog
 from .layers import LayeredMemorySystem
 from .llm.base import LLMProvider, ProviderError
 from .llm.parser import ControlMessageError, validate_llm_response
-from .models import MemoryKind, MemoryLayer
+from .models import MemoryKind, MemoryLayer, RetrievalQuery
 from .runtime_models import (
     AgentTurnResult,
     ChatMessage,
@@ -28,6 +28,7 @@ from .runtime_models import (
     ToolSpec,
     TurnSource,
 )
+from .self_profile import SELF_PROFILE_QUERY, soul_profile_context_from_hits
 from .summarization import HeuristicSummarizer, LLMSummarizer, TurnSummarizer
 from .tools.base import ApprovalHandler, ToolContext
 from .tools.registry import ToolRegistry
@@ -143,6 +144,7 @@ class NestedMV2Agent:
             lesson_manager.preflight(objective=user_message) if lesson_manager is not None else []
         )
         context_prompt = _context_with_preflight_lessons(compiled.prompt, preflight_lessons)
+        context_prompt = _context_with_soul_profile(context_prompt, self._soul_profile_context())
         if proof is not None:
             proof.lessons_applied.extend(preflight_lessons)
         self._event(
@@ -585,6 +587,15 @@ class NestedMV2Agent:
     def close(self) -> None:
         self.memory.close_all()
 
+    def _soul_profile_context(self) -> str:
+        try:
+            hits = self.memory.retrieve(
+                RetrievalQuery(query=SELF_PROFILE_QUERY, layers=(MemoryLayer.SELF,), k_per_layer=8)
+            )
+        except Exception:
+            return ""
+        return soul_profile_context_from_hits(hits)
+
     def _write_frame(
         self,
         *,
@@ -692,6 +703,12 @@ def _context_with_preflight_lessons(context_prompt: str, lessons: list[dict[str,
         layer = str(lesson.get("layer", "memory"))
         lines.append(f"- [{layer}] {title}: {snippet[:500]}")
     return f"{context_prompt}\n\n" + "\n".join(lines)
+
+
+def _context_with_soul_profile(context_prompt: str, soul_profile_context: str) -> str:
+    if not soul_profile_context:
+        return context_prompt
+    return f"{context_prompt}\n\n## Active Soul/User Profile\n{soul_profile_context}"
 
 
 def _tool_failure_text(execution: ToolExecution) -> str:

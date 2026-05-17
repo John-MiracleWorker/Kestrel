@@ -1505,6 +1505,8 @@ def build_default_tools() -> ToolRegistry:
 _SELF_SCHEMAS = {
     "identity_summary",
     "capability_snapshot",
+    "user_profile",
+    "agent_persona",
     "user_workflow_preference",
     "self_change_request",
     "validation_metadata",

@@ -6,6 +6,7 @@ import {
   Check,
   ClipboardCheck,
   Database,
+  Feather,
   FileText,
   GitBranch,
   Home,
@@ -45,7 +46,6 @@ import {
   summarizeArguments,
   type LiveActivityItem
 } from "./runActivity";
-import { TweaksPanel, TweakSection, TweakSlider, TweakToggle, TweakRadio, TweakColor } from "./tweaks-panel.jsx";
 import type {
   AgentLogEvent,
   ApiResult,
@@ -55,11 +55,15 @@ import type {
   McpServer,
   MemoryHit,
   MemoryLayerStatus,
+  OnboardingProfile,
+  PersonaPreset,
   Plugin,
   Run,
   RunTrace,
   RuntimeConfig,
   SelfState,
+  SelfOnboardingSaveResult,
+  SelfOnboardingState,
   Session,
   SecretRef,
   Skill,
@@ -86,6 +90,7 @@ const autonomyOptions = [
   { value: "manual", label: "Manual" },
   { value: "autonomous", label: "Autopilot" }
 ];
+const HASH_ROUTING_ENABLED = typeof navigator === "undefined" || !navigator.userAgent.toLowerCase().includes("jsdom");
 const runEventTypes = [
   "run.started",
   "run.completed",
@@ -110,6 +115,57 @@ const runEventTypes = [
   "subagent.completed",
   "subagent.failed"
 ];
+const SETUP_DISMISSED_KEY = "kestrel.setup.dismissed";
+const defaultPersonaPresets: PersonaPreset[] = [
+  {
+    id: "steady",
+    name: "Steady Companion",
+    summary: "Warm, grounded, concise, and quietly capable.",
+    guidance: "Be warm and direct. Keep momentum, explain tradeoffs clearly, and avoid performative enthusiasm."
+  },
+  {
+    id: "mentor",
+    name: "Patient Mentor",
+    summary: "Explains reasoning, teaches patterns, and checks understanding without dragging.",
+    guidance: "Be patient and instructional. Explain the why behind decisions while keeping the next action clear."
+  },
+  {
+    id: "spark",
+    name: "Creative Spark",
+    summary: "More playful, imaginative, and idea-forward while staying useful.",
+    guidance: "Bring more creative options and a livelier voice, but keep answers practical and grounded in evidence."
+  },
+  {
+    id: "operator",
+    name: "Calm Operator",
+    summary: "Precise, terse, and technical for focused execution.",
+    guidance: "Be crisp and operational. Lead with facts, actions, blockers, and verification evidence."
+  }
+];
+
+type SetupDraft = {
+  agent_name: string;
+  user_name: string;
+  preferred_name: string;
+  persona: string;
+  working_style: string;
+  goals_text: string;
+  interests_text: string;
+  communication_notes: string;
+  continuous_learning: boolean;
+};
+
+const emptySetupDraft: SetupDraft = {
+  agent_name: "Kestrel",
+  user_name: "",
+  preferred_name: "",
+  persona: "steady",
+  working_style: "",
+  goals_text: "",
+  interests_text: "",
+  communication_notes: "",
+  continuous_learning: true
+};
 
 export function App() {
   const [error, setError] = useState<string | null>(null);
@@ -117,7 +173,12 @@ export function App() {
   const [authPromptOpen, setAuthPromptOpen] = useState(false);
   const [apiTokenDraft, setApiTokenDraft] = useState(() => getApiToken());
   const [runtime, setRuntime] = useState<Record<string, unknown> | null>(null);
+  const [runtimeSettingsResult, setRuntimeSettingsResult] = useState<Record<string, unknown> | null>(null);
   const [selfState, setSelfState] = useState<SelfState | null>(null);
+  const [onboardingState, setOnboardingState] = useState<SelfOnboardingState | null>(null);
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [setupDismissed, setSetupDismissed] = useState(() => localStorage.getItem(SETUP_DISMISSED_KEY) === "1");
+  const [setupDraft, setSetupDraft] = useState<SetupDraft>(emptySetupDraft);
   const [runs, setRuns] = useState<Run[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [tools, setTools] = useState<Tool[]>([]);
@@ -141,13 +202,11 @@ export function App() {
   const [localThreads, setLocalThreads] = useState<ThreadSummary[]>([]);
   const activeRunIdRef = useRef<string | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
+  const memoryBackendHydratedRef = useRef(false);
+  const setupDraftHydratedRef = useRef(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [activeSection, setActiveSection] = useState<"chat" | "advanced" | "settings">("chat");
-  const [primaryColor, setPrimaryColor] = useState("#a8442a");
-  const [fontSize, setFontSize] = useState(15);
-  const [density, setDensity] = useState("regular");
-  const [darkMode, setDarkMode] = useState(false);
 
   const [message, setMessage] = useState("");
   const [sessionId, setSessionId] = useState("");
@@ -155,6 +214,9 @@ export function App() {
   const [provider, setProvider] = useState("mock");
   const [model, setModel] = useState("mock");
   const [autonomyMode, setAutonomyMode] = useState("background");
+  const [streamResponses, setStreamResponses] = useState(false);
+  const [memoryBackendDraft, setMemoryBackendDraft] = useState<"In-memory" | "Memvid">("In-memory");
+  const [apiAuthRequired, setApiAuthRequired] = useState(false);
 
   const [subagentProfile, setSubagentProfile] = useState("worker");
   const [subagentGoal, setSubagentGoal] = useState("");
@@ -297,6 +359,26 @@ export function App() {
       ),
     [mcpServers]
   );
+  const activeThread = useMemo(
+    () => threadSummaries.find((thread) => thread.session_id === activeSessionId) ?? null,
+    [threadSummaries, activeSessionId]
+  );
+
+  function routeToSection(section: "chat" | "advanced" | "settings") {
+    setActiveSection(section);
+    if (!HASH_ROUTING_ENABLED) return;
+    const hash = `#${section}`;
+    if (window.location.hash !== hash) {
+      window.history.replaceState(null, "", hash);
+    }
+  }
+
+  function jumpToAdvanced(anchor: string) {
+    routeToSection("advanced");
+    window.setTimeout(() => {
+      document.getElementById(anchor)?.scrollIntoView({ block: "start", behavior: "smooth" });
+    }, 0);
+  }
 
   function selectSessionId(sessionId: string | null) {
     activeSessionIdRef.current = sessionId;
@@ -317,9 +399,31 @@ export function App() {
   }, [activeRunId]);
 
   useEffect(() => {
+    if (!onboardingState) return;
+    if (onboardingState.profile && !setupDraftHydratedRef.current) {
+      setSetupDraft(setupDraftFromProfile(onboardingState.profile));
+      setupDraftHydratedRef.current = true;
+    }
+    if (!onboardingState.completed && !setupDismissed) {
+      setSetupOpen(true);
+    }
+  }, [onboardingState, setupDismissed]);
+
+  useEffect(() => {
     refreshAll().catch(reportError);
     const timer = window.setInterval(() => refreshSummary().catch(reportError), 3500);
     return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!HASH_ROUTING_ENABLED) return;
+    const syncRoute = () => {
+      const next = sectionFromHash(window.location.hash);
+      if (next) setActiveSection(next);
+    };
+    syncRoute();
+    window.addEventListener("hashchange", syncRoute);
+    return () => window.removeEventListener("hashchange", syncRoute);
   }, []);
 
   useEffect(() => {
@@ -371,6 +475,10 @@ export function App() {
     setChannels(channelList);
     setSecrets(secretList);
     setMemoryLayers(layerList);
+    if (!memoryBackendHydratedRef.current) {
+      setMemoryBackendDraft(layerList.some((layer) => layer.backend.toLowerCase().includes("memvid")) ? "Memvid" : "In-memory");
+      memoryBackendHydratedRef.current = true;
+    }
     const selectedSessionId = activeSessionIdRef.current;
     const selectedRunId = activeRunIdRef.current;
     if (!selectedSessionId && sessionList.length > 0) {
@@ -389,17 +497,25 @@ export function App() {
 
   async function refreshAll() {
     await refreshSummary();
-    const [runtimeConfig, selfSnapshot, logList, lessonList, failureList] = await Promise.all([
+    const [runtimeConfig, selfSnapshot, onboardingSnapshot, logList, lessonList, failureList] = await Promise.all([
       getJson<RuntimeConfig>("/api/runtime/config"),
       getJson<SelfState>("/api/self"),
+      getJson<SelfOnboardingState>("/api/self/onboarding"),
       getJson<AgentLogEvent[]>("/api/logs?limit=120"),
       getJson<{ items: Array<Record<string, unknown>> }>("/api/cognition/lessons?k=20"),
       getJson<{ items: Array<Record<string, unknown>> }>("/api/cognition/failures?k=20")
     ]);
     setRuntime(runtimeConfig);
     setSelfState(selfSnapshot);
-    setProvider(String(runtimeConfig.provider?.name ?? "mock"));
-    setModel(String(runtimeConfig.provider?.model ?? "mock"));
+    setOnboardingState(onboardingSnapshot);
+    const savedSettings = runtimeSettingsFrom(runtimeConfig);
+    setProvider(String(savedSettings.provider ?? runtimeConfig.provider?.name ?? "mock"));
+    setModel(String(savedSettings.model ?? runtimeConfig.provider?.model ?? "mock"));
+    setWorkspace(String(savedSettings.workspace ?? runtimeConfig.paths?.workspace ?? ""));
+    setAutonomyMode(validAutonomyMode(savedSettings.autonomy_mode, "background"));
+    setMemoryBackendDraft(String(savedSettings.backend ?? "").toLowerCase() === "memvid" ? "Memvid" : "In-memory");
+    setStreamResponses(Boolean(savedSettings.stream ?? runtimeConfig.provider?.stream));
+    setApiAuthRequired(Boolean(savedSettings.require_api_auth ?? runtimeConfig.feature_flags?.require_api_auth));
     setLogs(logList);
     setLessons(lessonList.items);
     setFailures(failureList.items);
@@ -456,6 +572,25 @@ export function App() {
     setAuthPromptOpen(false);
     setError(null);
     await refreshAll().catch(reportError);
+  }
+
+  async function saveRuntimeSettings() {
+    const currentRuntime = runtime as RuntimeConfig | null;
+    const savedSettings = runtimeSettingsFrom(currentRuntime);
+    await guarded(async () => {
+      const result = await putJson<Record<string, unknown>>("/api/runtime/settings", {
+        provider,
+        model: model.trim() || "mock",
+        backend: memoryBackendDraft === "Memvid" ? "memvid" : "memory",
+        memory_dir: String(savedSettings.memory_dir ?? currentRuntime?.paths?.memory_dir ?? ".nest/memory"),
+        workspace: workspace.trim() || String(currentRuntime?.paths?.workspace ?? "."),
+        stream: streamResponses,
+        require_api_auth: apiAuthRequired,
+        autonomy_mode: autonomyMode
+      });
+      setRuntimeSettingsResult(result);
+      await refreshAll();
+    }, "Settings saved and applied to new runs.");
   }
 
   async function guarded(action: () => Promise<void>, success?: string) {
@@ -921,6 +1056,43 @@ export function App() {
     }, "Soul memory reviewed.");
   }
 
+  async function saveSetup(event: FormEvent) {
+    event.preventDefault();
+    await guarded(async () => {
+      const result = await postJson<SelfOnboardingSaveResult>("/api/self/onboarding", {
+        agent_name: setupDraft.agent_name,
+        user_name: setupDraft.user_name,
+        preferred_name: setupDraft.preferred_name,
+        persona: setupDraft.persona,
+        working_style: setupDraft.working_style,
+        goals: splitSetupList(setupDraft.goals_text),
+        interests: splitSetupList(setupDraft.interests_text),
+        communication_notes: setupDraft.communication_notes,
+        continuous_learning: setupDraft.continuous_learning
+      });
+      if (!result.success) {
+        throw new Error(String(result.memory?.error ?? "Setup could not be saved to Soul memory."));
+      }
+      setOnboardingState({
+        completed: result.success,
+        profile: result.profile,
+        personas: result.personas
+      });
+      setSelfRememberResult(result.memory);
+      localStorage.setItem(SETUP_DISMISSED_KEY, "1");
+      setSetupDismissed(true);
+      setSetupOpen(false);
+      setupDraftHydratedRef.current = true;
+      await refreshAll();
+    }, "Setup saved to Soul memory.");
+  }
+
+  function dismissSetup() {
+    localStorage.setItem(SETUP_DISMISSED_KEY, "1");
+    setSetupDismissed(true);
+    setSetupOpen(false);
+  }
+
   async function searchWeb(event: FormEvent) {
     event.preventDefault();
     await guarded(async () => {
@@ -932,33 +1104,49 @@ export function App() {
     });
   }
 
+  const runtimeConfig = runtime as RuntimeConfig | null;
+  const runtimeProvider = runtimeConfig?.provider ?? {};
+  const runtimeLimits = runtimeConfig?.limits ?? {};
+  const runtimePaths = runtimeConfig?.paths ?? {};
+  const featureFlags = runtimeConfig?.feature_flags ?? {};
+  const providerConfigured = Boolean(runtimeProvider.api_key_configured);
+  const memoryBackend = memoryLayers.some((layer) => layer.backend.toLowerCase().includes("memvid")) ? "Memvid" : "In-memory";
+  const statusSummary = `${memoryBackend.toLowerCase()} · ${provider} · ${autonomyLabel(autonomyMode)}`;
+  const onboardingProfile = onboardingState?.profile ?? null;
+  const personaPresets = onboardingState?.personas?.length ? onboardingState.personas : defaultPersonaPresets;
+  const agentDisplayName = String(onboardingProfile?.agent_name || selfState?.identity?.name || "Kestrel");
+  const userDisplayName = String(onboardingProfile?.preferred_name || onboardingProfile?.user_name || "");
+
   return (
     <>
       <header className="topbar">
         <div className="topbar-inner">
           <a className="brand" href="#workspace">
             <span className="brand-mark" aria-hidden="true">
-              <MessageCircle size={24} />
+              <Feather size={22} />
             </span>
             <span>
-              <span className="brand-name">Kestrel</span>
-              <span className="brand-tag">Local-first agent</span>
+              <span className="brand-name">{agentDisplayName}</span>
+              <span className="brand-tag">{onboardingProfile?.persona_name ?? "Local-first agent"}</span>
             </span>
           </a>
           <nav className="primary-nav" aria-label="Primary">
-            <button type="button" className={activeSection === "chat" ? "active" : ""} onClick={() => setActiveSection("chat")}>Chat</button>
-            <button type="button" className={activeSection === "advanced" ? "active" : ""} onClick={() => setActiveSection("advanced")}>Advanced</button>
-            <button type="button" className={activeSection === "settings" ? "active" : ""} onClick={() => setActiveSection("settings")}>Settings</button>
+            <button type="button" className={activeSection === "chat" ? "active" : ""} onClick={() => routeToSection("chat")}>Chat</button>
+            <button type="button" className={activeSection === "settings" ? "active" : ""} onClick={() => routeToSection("settings")}>Settings</button>
+            <button type="button" className={activeSection === "advanced" ? "active" : ""} onClick={() => routeToSection("advanced")}>Advanced</button>
           </nav>
           <div className="topbar-meta">
-            <span className="status-pill"><span className="status-dot"></span>Runtime ready</span>
+            <button type="button" className="setup-button" onClick={() => setSetupOpen(true)}>
+              <Sparkles size={14} /> Setup
+            </button>
+            <span className="status-pill"><span className="status-dot"></span>{statusSummary}</span>
           </div>
         </div>
       </header>
       {authPromptOpen ? (
         <main className="conversation" id="workspace">
           <section className="settings-grid" aria-label="API authentication">
-            <Panel title="Kestrel API token" icon={<KeyRound size={19} />}>
+            <Panel title={`${agentDisplayName} API token`} icon={<KeyRound size={19} />}>
               <form className="stacked-form" onSubmit={saveToken}>
                 <Field label="API token">
                   <input
@@ -1012,10 +1200,20 @@ export function App() {
       <main className="conversation" id="workspace">
         {activeSection === "chat" && (
           <>
-        <header className="topbar" data-section="chat">
+        <header className="conv-head" data-section="chat">
           <div>
-            <p className="page-eyebrow">Local-first agent</p>
-            <h1>Ask Kestrel</h1>
+            <h1>Ask {agentDisplayName} <em>{activeRun?.status ? `· ${activeRun.status}` : ""}</em></h1>
+            <div className="conv-meta">
+              <span>{activeThread ? `Thread: ${activeThread.title}` : "New thread"}</span>
+              <span className="sep">·</span>
+              <span className="mono">{activeThread?.session_id ?? "draft"}</span>
+              <span className="sep">·</span>
+              <span>{activeThread ? `${activeThread.run_count} runs` : "ready"}</span>
+              <span className="sep">·</span>
+              <span>{provider} · {model}</span>
+              <span className="sep">·</span>
+              <span className="tag ghost">Mode: {autonomyLabel(autonomyMode)}</span>
+            </div>
           </div>
           <div className="conv-tools">
             <StatusBadge value={activeRun?.status ?? "ready"} />
@@ -1047,8 +1245,8 @@ export function App() {
               {sortedThreadRuns.length === 0 ? (
                 <div className="empty-state">
                   <MessageCircle size={28} />
-                  <h2>Tell Kestrel what to do.</h2>
-                  <p>Start with a build, fix, research, inspection, or continuation request. Kestrel will keep the work in this thread.</p>
+                  <h2>Tell {agentDisplayName} what to do.</h2>
+                  <p>Start with a build, fix, research, inspection, or continuation request. {agentDisplayName} will keep the work in this thread.</p>
                 </div>
               ) : (
                 sortedThreadRuns.map((run) => (
@@ -1072,11 +1270,11 @@ export function App() {
             </div>
             <form className="composer" onSubmit={submitRun}>
               <label className="composer-field">
-                <span>Ask Kestrel</span>
+                <span>Ask {agentDisplayName}</span>
                 <textarea
                   value={message}
                   onChange={(event) => setMessage(event.target.value)}
-                  placeholder="Ask Kestrel to build, fix, research, inspect, or continue something..."
+                  placeholder={`Ask ${agentDisplayName} to build, fix, research, inspect, or continue something...`}
                   rows={3}
                 />
               </label>
@@ -1100,70 +1298,50 @@ export function App() {
             </form>
           </div>
 
-          {inspectorOpen && (
-            <aside className="inspector" aria-label="Inspector">
-              <div className="inspector-head">
-                <h2>Inspector</h2>
-                <button type="button" aria-label="Close panel" onClick={() => setInspectorOpen(false)}>
-                  <X size={15} />
-                </button>
-              </div>
-              {activeRun ? (
-                <>
-                  <section>
-                    <h3>Current run</h3>
-                    <StatusBadge value={activeRun.status} />
-                    <InlineMeta items={[activeRun.run_id, activeRun.session_id, activeRun.model]} />
-                    {activeRun.error && <p className="danger-text">{activeRun.error}</p>}
-                  </section>
-                  <section>
-                    <h3>Plan</h3>
-                    <TaskList title="Needs You" tasks={taskGraph?.approval_blocked_tasks ?? []} onApprove={approveTask} />
-                    <TaskList title="Ready" tasks={taskGraph?.ready_tasks ?? []} onApprove={approveTask} />
-                  </section>
-                  {proofOfWork && (
-                    <section>
-                      <h3>Validation</h3>
-                      <SummaryList title="Completed" values={asStringArray(proofOfWork.completed_steps)} />
-                      <SummaryList title="Evidence" values={asStringArray(proofOfWork.validation_evidence)} />
-                      <SummaryList title="Risks" values={asStringArray(proofOfWork.remaining_risks)} />
-                    </section>
-                  )}
-                  <section>
-                    <h3>Activity</h3>
-                    <div className="trace-list compact-trace">
-                      {(runTrace?.timeline ?? events).slice(-12).map((event) => (
-                        <div className="trace-row" key={`${event.id}-${event.type}`}>
-                          <strong>{friendlyEventLabel(event.type)}</strong>
-                          <small>{event.created_at}</small>
-                          <code>{JSON.stringify(event.payload).slice(0, 220)}</code>
-                        </div>
-                      ))}
-                    </div>
-                  </section>
-                </>
-              ) : (
-                <EmptyState>No run selected.</EmptyState>
-              )}
-            </aside>
-          )}
         </section>
 
           </>
         )}
         {activeSection === "advanced" && (
-          <section id="advanced" className="shell" data-section="advanced" aria-label="Advanced Operator Console">
-            <div className="page-head">
+          <section id="advanced" className="shell page-shell advanced-page" data-section="advanced" aria-label="Advanced Operator Console">
+            <header className="page-head">
               <div>
-                <p className="page-eyebrow">Advanced / Debug</p>
-                <h2>Advanced Operator Console</h2>
+                <p className="page-eyebrow">Operator Console</p>
+                <h1 className="page-title">Advanced<em>.</em></h1>
+                <p className="page-subtitle">
+                  Tuning surfaces for the runtime that powers Kestrel: runs, approvals, memory,
+                  tools, MCP, plugins, channels, traces, and gated capabilities. Defaults stay conservative.
+                </p>
               </div>
-              <button type="button" onClick={() => setActiveSection("chat")}>
-                <X size={15} /> Close Advanced
-              </button>
-            </div>
+              <div className="page-actions">
+                <button className="btn subtle" type="button" onClick={() => refreshAll().catch(reportError)}>
+                  <RefreshCw size={15} /> Refresh
+                </button>
+                <button className="btn primary" type="button" onClick={() => routeToSection("chat")}>
+                  <X size={15} /> Close
+                </button>
+              </div>
+            </header>
+            <nav className="section-index" aria-label="Advanced section index">
+              {[
+                ["runtime", "Run agent"],
+                ["runs", "Runs"],
+                ["approvals", "Approvals"],
+                ["soul", "Soul"],
+                ["memory", "Memory"],
+                ["tools", "Tools"],
+                ["mcp", "MCP"],
+                ["skills", "Skills"],
+                ["channels", "Channels"],
+                ["observability", "Observability"]
+              ].map(([id, label]) => (
+                <button className="tag ghost" type="button" key={id} onClick={() => document.getElementById(id)?.scrollIntoView({ block: "start", behavior: "smooth" })}>
+                  {label}
+                </button>
+              ))}
+            </nav>
 
-        <section className="section">
+        <section id="runtime" className="section">
           <Panel
             title="Run Agent"
             icon={<TerminalSquare size={19} />}
@@ -1375,6 +1553,16 @@ export function App() {
                   <Metric label="Skills" value={selfState.skills?.length ?? skills.length} />
                   <Metric label="Plugins" value={selfState.plugins?.length ?? plugins.length} />
                 </div>
+                {onboardingProfile && (
+                  <>
+                    <h3>Active Profile</h3>
+                    <div className="data-row">
+                      <strong>{onboardingProfile.agent_name}</strong>
+                      <InlineMeta items={[onboardingProfile.persona_name, onboardingProfile.preferred_name || onboardingProfile.user_name]} />
+                      <p>{onboardingProfile.working_style || onboardingProfile.communication_notes}</p>
+                    </div>
+                  </>
+                )}
                 <h3>Soul Memory Layers</h3>
                 <div className="layer-grid">
                   {selfState.memory_layers.map((layer) => (
@@ -1422,6 +1610,8 @@ export function App() {
                 <select value={selfSchema} onChange={(event) => setSelfSchema(event.target.value)}>
                   <option value="identity_summary">identity_summary</option>
                   <option value="capability_snapshot">capability_snapshot</option>
+                  <option value="user_profile">user_profile</option>
+                  <option value="agent_persona">agent_persona</option>
                   <option value="user_workflow_preference">user_workflow_preference</option>
                   <option value="self_change_request">self_change_request</option>
                   <option value="validation_metadata">validation_metadata</option>
@@ -1842,48 +2032,549 @@ export function App() {
       </section>
       )}
         {activeSection === "settings" && (
-          <>
-        <section id="settings" className="section" data-section="settings">
-          <Panel title="Settings & Health" icon={<Settings size={19} />}>
-            {runtime ? (
-              <>
-                <div className="metric-grid">
+          <section id="settings" className="shell page-shell settings-page" data-section="settings" aria-label="Settings">
+            <header className="page-head">
+              <div>
+                <p className="page-eyebrow">Configuration</p>
+                <h1 className="page-title">Settings<em>.</em></h1>
+                <p className="page-subtitle">
+                  The everyday surface for Kestrel: identity, provider, memory, channels,
+                  secrets, and permissions. Deep runtime controls stay one click away in Advanced.
+                </p>
+              </div>
+              <div className="page-actions">
+                <button className="btn subtle" type="button" onClick={() => refreshAll().catch(reportError)}>
+                  <RefreshCw size={15} /> Refresh
+                </button>
+                <button className="btn primary" type="button" onClick={() => saveRuntimeSettings().catch(reportError)}>
+                  <Check size={15} /> Save Settings
+                </button>
+                <button className="btn subtle" type="button" onClick={() => jumpToAdvanced("runtime")}>
+                  Open Advanced
+                </button>
+              </div>
+            </header>
+            {notice && (
+              <div className="announcer page-notice" aria-live="polite">
+                {notice}
+              </div>
+            )}
+
+            <section className="section" id="identity">
+              <div className="section-head">
+                <h2>Identity</h2>
+                <p>How this Kestrel instance presents itself across chat, channels, and logs.</p>
+                <span className="anchor">/api/runtime/config · name</span>
+              </div>
+              <div className="section-body">
+                <div className="row">
+                  <div className="row-label">
+                    <strong>Agent name</strong>
+                    <p>Shown on the chat surface and used in run metadata.</p>
+                  </div>
+                  <div className="row-control">
+                    <input className="input short" type="text" value={runtimeConfig?.name ?? "Kestrel"} readOnly />
+                  </div>
+                </div>
+                <div className="row">
+                  <div className="row-label">
+                    <strong>Default autonomy</strong>
+                    <p>The level Kestrel starts with for new conversation runs from this browser.</p>
+                  </div>
+                  <div className="row-control">
+                    <div className="segmented" role="tablist" aria-label="Autonomy mode">
+                      {autonomyOptions.map((option) => (
+                        <button
+                          type="button"
+                          key={option.value}
+                          className={autonomyMode === option.value ? "active" : ""}
+                          aria-pressed={autonomyMode === option.value}
+                          onClick={() => {
+                            setAutonomyMode(option.value);
+                            setNotice(`Autonomy set to ${option.label}.`);
+                          }}
+                        >
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+                <div className="row">
+                  <div className="row-label">
+                    <strong>Workspace</strong>
+                    <p>The project root Kestrel operates from. Blank uses the configured workspace.</p>
+                  </div>
+                  <div className="row-control">
+                    <input
+                      className="input mono short"
+                      type="text"
+                      value={workspace}
+                      placeholder={String(runtimePaths.workspace ?? ".")}
+                      onChange={(event) => setWorkspace(event.target.value)}
+                    />
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section className="section" id="provider">
+              <div className="section-head">
+                <h2>Provider</h2>
+                <p>Which model powers the response loop. The controls here feed new runs immediately.</p>
+                <span className="anchor">provider · model · fallback_provider</span>
+              </div>
+              <div className="section-body">
+                <div className="section-row-group">
+                  <label>
+                    Provider
+                    <select className="select" value={provider} onChange={(event) => setProvider(event.target.value)}>
+                      {providerOptions.map((item) => <option key={item} value={item}>{item}</option>)}
+                    </select>
+                  </label>
+                  <label>
+                    Model
+                    <input className="input" type="text" value={model} list="settings-models" onChange={(event) => setModel(event.target.value)} />
+                    <datalist id="settings-models">
+                      {modelSuggestions.map((item) => <option key={`settings-${provider}-${item}`} value={item} />)}
+                    </datalist>
+                  </label>
+                  <label>
+                    API key env
+                    <input className="input mono" type="text" value={String(runtimeProvider.api_key_env ?? "")} placeholder="not required" readOnly />
+                  </label>
+                  <label>
+                    Configured
+                    <span className="settings-status"><StatusBadge value={providerConfigured ? "configured" : "missing"} /></span>
+                  </label>
+                </div>
+                <div className="row">
+                  <div className="row-label">
+                    <strong>Stream responses</strong>
+                    <p>Provider-reported streaming support for this runtime config.</p>
+                  </div>
+                  <div className="row-control">
+                    <label className="toggle">
+                      <input
+                        type="checkbox"
+                        aria-label="Stream responses"
+                        checked={streamResponses}
+                        onChange={(event) => {
+                          setStreamResponses(event.target.checked);
+                          setNotice(`Response streaming ${event.target.checked ? "enabled" : "disabled"} for new runs.`);
+                        }}
+                      />
+                      <span className="track"><span className="thumb"></span></span>
+                    </label>
+                  </div>
+                </div>
+                <div className="row">
+                  <div className="row-label">
+                    <strong>Provider timeout</strong>
+                    <p>Per-request timeout before the provider path fails.</p>
+                  </div>
+                  <div className="row-control">
+                    <input className="input num" type="number" value={Number(runtimeProvider.timeout_seconds ?? 60)} readOnly />
+                    <span className="muted">s</span>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section className="section" id="memory-settings">
+              <div className="section-head">
+                <h2>Memory</h2>
+                <p>Kestrel keeps six nested memory layers with conservative promotion gates.</p>
+                <span className="anchor">/api/memory/layers · memory_dir</span>
+              </div>
+              <div className="section-body">
+                <div className="row">
+                  <div className="row-label">
+                    <strong>Backend</strong>
+                    <p>In-memory keeps local tests deterministic; Memvid persists in durable <code className="mono">.mv2</code> files.</p>
+                  </div>
+                  <div className="row-control">
+                    <div className="segmented" aria-label="Memory backend">
+                      {(["In-memory", "Memvid"] as const).map((backend) => (
+                        <button
+                          type="button"
+                          key={backend}
+                          className={memoryBackendDraft === backend ? "active" : ""}
+                          aria-pressed={memoryBackendDraft === backend}
+                          onClick={() => {
+                            setMemoryBackendDraft(backend);
+                            setNotice(`Memory backend preference set to ${backend}.`);
+                          }}
+                        >
+                          {backend}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+                <div className="row">
+                  <div className="row-label">
+                    <strong>Memory directory</strong>
+                    <p>Where the six layer files live when using the Memvid backend.</p>
+                  </div>
+                  <div className="row-control">
+                    <input className="input mono short" type="text" value={String(runtimePaths.memory_dir ?? ".nest/memory")} readOnly />
+                  </div>
+                </div>
+                <div className="layer-grid settings-layer-grid">
+                  {memoryLayers.map((layer) => (
+                    <article className="layer-card" key={layer.layer}>
+                      <h3>{layer.layer}<span className="file">{layer.path}</span></h3>
+                      <p className="desc">{layer.backend}</p>
+                      <div className="row-meta">
+                        <StatusBadge value={layer.ok ? "ok" : "failed"} />
+                        <StatusBadge value={layer.exists ? "file present" : "virtual"} />
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              </div>
+            </section>
+
+            <section className="section" id="permissions">
+              <div className="section-head">
+                <h2>Permissions</h2>
+                <p>Safe defaults for the local runtime. High-risk work still requires approval.</p>
+                <span className="anchor">feature_flags</span>
+              </div>
+              <div className="section-body">
+                <div className="metric-grid settings-metrics">
                   <Metric label="Runs" value={runs.length} />
-                  <Metric label="Approvals" value={approvals.length} />
-                  <Metric label="MCP Servers" value={mcpServers.length} />
+                  <Metric label="Pending approvals" value={approvals.length} />
+                  <Metric label="MCP servers" value={mcpServers.length} />
                   <Metric label="Skills" value={skills.length} />
                 </div>
-                <h3>Feature Flags</h3>
-                <div className="flag-grid">
-                  {Object.entries((runtime as RuntimeConfig).feature_flags ?? {}).map(([key, value]) => (
+                <div className="flag-grid settings-flags">
+                  {Object.entries(featureFlags).map(([key, value]) => (
                     <span key={key} className="flag"><StatusBadge value={value} /> {key}</span>
                   ))}
                 </div>
-              </>
-            ) : (
-              <EmptyState>Runtime config is loading.</EmptyState>
-            )}
-          </Panel>
-          <Panel title="Runtime Config" icon={<FileText size={19} />}>
-            {runtime && <JsonBlock value={runtime} maxHeight="680px" />}
-          </Panel>
-        </section>
-          </>
+              </div>
+            </section>
+
+            <section className="section" id="channels-settings">
+              <div className="section-head">
+                <h2>Channels</h2>
+                <p>Inbound and outbound channel adapters. Editing routes to the advanced channel console.</p>
+                <span className="anchor">/api/channels</span>
+              </div>
+              <div className="section-body">
+                {channels.length === 0 && <EmptyState>No channels configured.</EmptyState>}
+                {channels.map((channel) => (
+                  <article className="channel-card" key={channel.id}>
+                    <span className="channel-icon"><Bell size={16} /></span>
+                    <div className="channel-meta">
+                      <strong>{channel.id}</strong>
+                      <span className="env">{channel.provider} · {channel.token_env || channel.webhook_url_env || "no env binding"}</span>
+                    </div>
+                    <div className="channel-toggles">
+                      <span className="mini"><label>enabled</label><StatusBadge value={channel.enabled} /></span>
+                      <span className="mini"><label>send</label><StatusBadge value={channel.send_enabled} /></span>
+                      <button className="btn" type="button" onClick={() => { loadChannel(channel); jumpToAdvanced("channels"); }}>Edit</button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </section>
+
+            <section className="section" id="secrets-settings">
+              <div className="section-head">
+                <h2>Secrets</h2>
+                <p>Stored locally by the secret broker. API routes return status and handles, not raw values.</p>
+                <span className="anchor">/api/secrets</span>
+              </div>
+              <div className="section-body">
+                <form className="section-row-group" onSubmit={saveSecret}>
+                  <label>
+                    Secret name
+                    <input className="input mono" value={secretName} onChange={(event) => setSecretName(event.target.value)} autoComplete="off" />
+                  </label>
+                  <label>
+                    Purpose
+                    <input className="input" value={secretPurpose} onChange={(event) => setSecretPurpose(event.target.value)} />
+                  </label>
+                  <label>
+                    Secret value
+                    <input className="input" type="password" value={secretValue} onChange={(event) => setSecretValue(event.target.value)} autoComplete="new-password" />
+                  </label>
+                  <label className="settings-inline-action">
+                    <span>Broker action</span>
+                    <button className="btn primary" type="submit" disabled={!secretName.trim() || !secretValue.trim()}>Store secret</button>
+                  </label>
+                </form>
+                {secrets.length === 0 ? (
+                  <div className="row"><div className="row-label"><strong>No brokered secrets configured.</strong><p>Values saved here are stored by the backend and never echoed back.</p></div></div>
+                ) : (
+                  secrets.map((secret) => (
+                    <div className="env-row" key={secret.id}>
+                      <div>
+                        <span className="key">{secret.name}</span>
+                        <span className="desc">{secret.purpose || secret.secret_ref}</span>
+                      </div>
+                      <div className="row-control">
+                        <StatusBadge value={secret.validated ? "validated" : secret.configured ? "stored" : "missing"} />
+                        <button className="btn" type="button" onClick={() => validateSecret(secret)}>Validate</button>
+                      </div>
+                    </div>
+                  ))
+                )}
+                {secretResult && <JsonBlock value={secretResult} maxHeight="180px" />}
+              </div>
+            </section>
+
+            <section className="section" id="api-access">
+              <div className="section-head">
+                <h2>API access</h2>
+                <p>The local FastAPI workbench can stay open or be gated by a bearer token.</p>
+                <span className="anchor">require_api_auth · NEST_AGENT_API_TOKEN</span>
+              </div>
+              <div className="section-body">
+                <div className="row">
+                  <div className="row-label">
+                    <strong>Require API authentication</strong>
+                    <p>When on, requests need <code className="mono">Authorization: Bearer</code> or <code className="mono">X-Kestrel-API-Key</code>.</p>
+                  </div>
+                  <div className="row-control">
+                    <label className="toggle">
+                      <input
+                        type="checkbox"
+                        aria-label="Require API authentication"
+                        checked={apiAuthRequired}
+                        onChange={(event) => {
+                          setApiAuthRequired(event.target.checked);
+                          setNotice(`API authentication ${event.target.checked ? "enabled" : "disabled"} in the settings draft.`);
+                        }}
+                      />
+                      <span className="track"><span className="thumb"></span></span>
+                    </label>
+                  </div>
+                </div>
+                <form className="row" onSubmit={saveToken}>
+                  <div className="row-label">
+                    <strong>Browser API token</strong>
+                    <p>Stored only in this browser client and used for authenticated routes.</p>
+                  </div>
+                  <div className="row-control">
+                    <input className="input mono short" type="password" value={apiTokenDraft} onChange={(event) => setApiTokenDraft(event.target.value)} autoComplete="off" />
+                    <button className="btn" type="submit">Save</button>
+                  </div>
+                </form>
+              </div>
+            </section>
+
+            <section className="section" id="runtime-json">
+              <div className="section-head">
+                <h2>Runtime JSON</h2>
+                <p>Raw live configuration returned by the server, for auditing and support.</p>
+                <span className="anchor">/api/runtime/config</span>
+              </div>
+              <div className="section-body json-section">
+                {runtimeSettingsResult && <JsonBlock value={runtimeSettingsResult} maxHeight="240px" />}
+                {runtime ? <JsonBlock value={runtime} maxHeight="680px" /> : <EmptyState>Runtime config is loading.</EmptyState>}
+              </div>
+            </section>
+          </section>
         )}
       </main>
+      {activeSection === "chat" && inspectorOpen && (
+        <aside className="inspector" aria-label="Inspector">
+          <div className="inspector-head">
+            <h2>Inspector</h2>
+            <button type="button" aria-label="Close panel" onClick={() => setInspectorOpen(false)}>
+              <X size={15} />
+            </button>
+          </div>
+          {activeRun ? (
+            <>
+              <section>
+                <h3>Current run</h3>
+                <StatusBadge value={activeRun.status} />
+                <InlineMeta items={[activeRun.run_id, activeRun.session_id, activeRun.model]} />
+                {activeRun.error && <p className="danger-text">{activeRun.error}</p>}
+              </section>
+              <section>
+                <h3>Plan</h3>
+                <TaskList title="Needs You" tasks={taskGraph?.approval_blocked_tasks ?? []} onApprove={approveTask} />
+                <TaskList title="Ready" tasks={taskGraph?.ready_tasks ?? []} onApprove={approveTask} />
+              </section>
+              {proofOfWork && (
+                <section>
+                  <h3>Validation</h3>
+                  <SummaryList title="Completed" values={asStringArray(proofOfWork.completed_steps)} />
+                  <SummaryList title="Evidence" values={asStringArray(proofOfWork.validation_evidence)} />
+                  <SummaryList title="Risks" values={asStringArray(proofOfWork.remaining_risks)} />
+                </section>
+              )}
+              <section>
+                <h3>Activity</h3>
+                <div className="trace-list compact-trace">
+                  {(runTrace?.timeline ?? events).slice(-12).map((event) => (
+                    <div className="trace-row" key={`${event.id}-${event.type}`}>
+                      <strong>{friendlyEventLabel(event.type)}</strong>
+                      <small>{event.created_at}</small>
+                      <code>{JSON.stringify(event.payload).slice(0, 220)}</code>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            </>
+          ) : (
+            <EmptyState>No run selected.</EmptyState>
+          )}
+        </aside>
+      )}
     </div>
       )}
-    <TweaksPanel title="Design">
-      <TweakSection label="Theme">
-        <TweakColor label="Accent" value={primaryColor} options={['#a8442a', '#2A6FDB', '#1F8A5B', '#7A5AE0']} onChange={setPrimaryColor} />
-        <TweakToggle label="Dark mode" value={darkMode} onChange={setDarkMode} />
-      </TweakSection>
-      <TweakSection label="Typography">
-        <TweakSlider label="Font size" value={fontSize} min={10} max={24} unit="px" onChange={setFontSize} />
-        <TweakRadio label="Density" value={density} options={['compact', 'regular', 'comfy']} onChange={setDensity} />
-      </TweakSection>
-    </TweaksPanel>
+      {setupOpen && (
+        <SetupWizard
+          draft={setupDraft}
+          personas={personaPresets}
+          existingProfile={onboardingProfile}
+          userDisplayName={userDisplayName}
+          onChange={setSetupDraft}
+          onSubmit={saveSetup}
+          onClose={dismissSetup}
+        />
+      )}
   </>
+  );
+}
+
+function SetupWizard({
+  draft,
+  personas,
+  existingProfile,
+  userDisplayName,
+  onChange,
+  onSubmit,
+  onClose
+}: {
+  draft: SetupDraft;
+  personas: PersonaPreset[];
+  existingProfile: OnboardingProfile | null;
+  userDisplayName: string;
+  onChange: (draft: SetupDraft) => void;
+  onSubmit: (event: FormEvent) => void;
+  onClose: () => void;
+}) {
+  const selectedPersona = personas.find((persona) => persona.id === draft.persona) ?? personas[0] ?? defaultPersonaPresets[0];
+  const update = (patch: Partial<SetupDraft>) => onChange({ ...draft, ...patch });
+  return (
+    <div className="setup-backdrop" role="presentation">
+      <section className="setup-dialog" role="dialog" aria-modal="true" aria-labelledby="setup-title">
+        <header className="setup-head">
+          <div>
+            <p className="page-eyebrow">{existingProfile ? "Soul Setup" : "Welcome"}</p>
+            <h1 id="setup-title">{existingProfile ? "Tune your Kestrel" : "Meet your Kestrel"}</h1>
+            <p>
+              {userDisplayName
+                ? `${userDisplayName}, this profile lives in the Soul layer so your agent can keep the relationship coherent.`
+                : "Name the agent, choose its voice, and give it a first sketch of how you like to work."}
+            </p>
+          </div>
+          <button type="button" aria-label="Close setup" onClick={onClose}>
+            <X size={16} />
+          </button>
+        </header>
+
+        <form className="setup-grid" onSubmit={onSubmit}>
+          <div className="setup-section">
+            <h2>Names</h2>
+            <div className="field-row">
+              <Field label="Agent name">
+                <input value={draft.agent_name} onChange={(event) => update({ agent_name: event.target.value })} />
+              </Field>
+              <Field label="Your name">
+                <input value={draft.user_name} onChange={(event) => update({ user_name: event.target.value })} />
+              </Field>
+              <Field label="What should it call you?">
+                <input value={draft.preferred_name} onChange={(event) => update({ preferred_name: event.target.value })} />
+              </Field>
+            </div>
+          </div>
+
+          <div className="setup-section">
+            <h2>Persona</h2>
+            <div className="persona-grid" role="radiogroup" aria-label="Kestrel persona">
+              {personas.map((persona) => (
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={draft.persona === persona.id}
+                  className={`persona-card ${draft.persona === persona.id ? "active" : ""}`}
+                  key={persona.id}
+                  onClick={() => update({ persona: persona.id })}
+                >
+                  <strong>{persona.name}</strong>
+                  <span>{persona.summary}</span>
+                </button>
+              ))}
+            </div>
+            <p className="setup-hint">{selectedPersona.guidance}</p>
+          </div>
+
+          <div className="setup-section">
+            <h2>Working Together</h2>
+            <Field label="What are you usually trying to get done?">
+              <textarea
+                value={draft.goals_text}
+                onChange={(event) => update({ goals_text: event.target.value })}
+                rows={3}
+                placeholder="Ship Kestrel, build local tools, research product ideas..."
+              />
+            </Field>
+            <Field label="How do you like collaboration to feel?">
+              <textarea
+                value={draft.working_style}
+                onChange={(event) => update({ working_style: event.target.value })}
+                rows={3}
+                placeholder="Short plans, direct tradeoffs, live verification, no fluff..."
+              />
+            </Field>
+          </div>
+
+          <div className="setup-section">
+            <h2>Fun Details</h2>
+            <Field label="Interests or recurring themes">
+              <textarea
+                value={draft.interests_text}
+                onChange={(event) => update({ interests_text: event.target.value })}
+                rows={3}
+                placeholder="Local-first software, thoughtful UI, creative automation..."
+              />
+            </Field>
+            <Field label="Anything else it should remember?">
+              <textarea
+                value={draft.communication_notes}
+                onChange={(event) => update({ communication_notes: event.target.value })}
+                rows={3}
+                placeholder="Tone preferences, pet peeves, project rituals, decision style..."
+              />
+            </Field>
+            <label className="check-row">
+              <input
+                type="checkbox"
+                checked={draft.continuous_learning}
+                onChange={(event) => update({ continuous_learning: event.target.checked })}
+              />
+              <span>Keep adapting from explicit remember requests and confirmed corrections.</span>
+            </label>
+          </div>
+
+          <footer className="setup-actions">
+            <button type="button" className="btn subtle" onClick={onClose}>Later</button>
+            <button type="submit" className="btn primary" disabled={!draft.agent_name.trim()}>
+              <Sparkles size={15} /> Save to Soul
+            </button>
+          </footer>
+        </form>
+      </section>
+    </div>
   );
 }
 
@@ -2048,4 +2739,50 @@ function scoreLabel(value: unknown): string {
 
 function createThreadId(): string {
   return `thread_${crypto.randomUUID()}`;
+}
+
+function sectionFromHash(hash: string): "chat" | "advanced" | "settings" | null {
+  const normalized = hash.replace(/^#/, "").toLowerCase();
+  return normalized === "chat" || normalized === "advanced" || normalized === "settings" ? normalized : null;
+}
+
+function runtimeSettingsFrom(config: RuntimeConfig | null): Record<string, unknown> {
+  const runtimeSettings = config?.settings?.runtime;
+  return runtimeSettings && typeof runtimeSettings === "object" && !Array.isArray(runtimeSettings)
+    ? runtimeSettings as Record<string, unknown>
+    : {};
+}
+
+function setupDraftFromProfile(profile: OnboardingProfile): SetupDraft {
+  return {
+    agent_name: profile.agent_name || "Kestrel",
+    user_name: profile.user_name || "",
+    preferred_name: profile.preferred_name || "",
+    persona: profile.persona || "steady",
+    working_style: profile.working_style || "",
+    goals_text: (profile.goals ?? []).join("\n"),
+    interests_text: (profile.interests ?? []).join("\n"),
+    communication_notes: profile.communication_notes || "",
+    continuous_learning: profile.continuous_learning !== false
+  };
+}
+
+function splitSetupList(value: string): string[] {
+  return value
+    .split(/[\n,]/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .slice(0, 6);
+}
+
+function validAutonomyMode(value: unknown, fallback: string): string {
+  const mode = String(value ?? "");
+  return mode === "background" || mode === "manual" || mode === "autonomous" ? mode : fallback;
+}
+
+function autonomyLabel(value: string): string {
+  if (value === "background") return "Safe Auto";
+  if (value === "manual") return "Manual";
+  if (value === "autonomous") return "Autopilot";
+  return value;
 }

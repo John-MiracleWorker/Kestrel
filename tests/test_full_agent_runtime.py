@@ -895,6 +895,35 @@ def test_server_exposes_self_and_web_routes(tmp_path: Path) -> None:
     assert remembered.status_code == 200
     assert remembered.json()["success"] is True
 
+    onboarding_before = client.get("/api/self/onboarding")
+    assert onboarding_before.status_code == 200
+    assert onboarding_before.json()["completed"] is False
+    assert {persona["id"] for persona in onboarding_before.json()["personas"]} >= {"steady", "mentor", "spark", "operator"}
+
+    onboarded = client.post(
+        "/api/self/onboarding",
+        json={
+            "agent_name": "Northstar",
+            "user_name": "Taylor",
+            "preferred_name": "Tay",
+            "persona": "spark",
+            "working_style": "Prefer short plans before edits.",
+            "goals": ["build a local-first agent"],
+            "interests": ["interface craft"],
+            "communication_notes": "Keep it warm but concrete.",
+        },
+    )
+    assert onboarded.status_code == 200
+    assert onboarded.json()["success"] is True
+    assert onboarded.json()["profile"]["agent_name"] == "Northstar"
+    assert onboarded.json()["profile"]["preferred_name"] == "Tay"
+    assert onboarded.json()["memory"]["success"] is True
+
+    onboarding_after = client.get("/api/self/onboarding")
+    assert onboarding_after.status_code == 200
+    assert onboarding_after.json()["completed"] is True
+    assert onboarding_after.json()["profile"]["persona"] == "spark"
+
     proposed = client.post("/api/self/propose-change", json={"request": "Rewrite Kestrel without approval."})
     assert proposed.status_code == 200
     assert proposed.json()["success"] is False

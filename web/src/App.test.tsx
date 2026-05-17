@@ -58,6 +58,7 @@ let sessions: Session[];
 let sessionRuns: Record<string, Run[]>;
 let approvals: Approval[];
 let secrets: SecretRef[];
+let onboardingProfile: Record<string, unknown> | null;
 let eventSources: MockEventSource[];
 let eventId: number;
 let traceTimelines: Record<string, TraceEvent[]>;
@@ -93,6 +94,23 @@ describe("App", () => {
     };
     approvals = [pendingApproval];
     secrets = [];
+    onboardingProfile = {
+      schema_version: "kestrel_onboarding_profile.v1",
+      setup_complete: true,
+      agent_name: "Kestrel",
+      user_name: "Tiuni",
+      preferred_name: "Tiuni",
+      persona: "steady",
+      persona_name: "Steady Companion",
+      persona_summary: "Warm, grounded, concise, and quietly capable.",
+      persona_guidance: "Be warm and direct.",
+      working_style: "Keep it practical.",
+      goals: ["ship local-first tools"],
+      interests: ["agent workbenches"],
+      communication_notes: "",
+      continuous_learning: true,
+      updated_at: "2026-05-16T00:00:00Z"
+    };
     eventSources = [];
     eventId = 1;
     traceTimelines = {
@@ -342,6 +360,82 @@ describe("App", () => {
     });
   });
 
+  it("saves runtime settings through the persisted settings route", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    await screen.findByRole("heading", { name: /settings/i });
+    fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "codex-cli" } });
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-5.4" } });
+    fireEvent.click(screen.getByRole("button", { name: "Manual" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Stream responses" }));
+    fireEvent.click(screen.getByRole("button", { name: "Memvid" }));
+    fireEvent.click(screen.getByRole("button", { name: /save settings/i }));
+
+    await waitFor(() => {
+      const saveCall = fetchSpy.mock.calls.find(([path, init]) => path === "/api/runtime/settings" && init?.method === "PUT");
+      expect(saveCall).toBeDefined();
+      const body = JSON.parse(String(saveCall?.[1]?.body ?? "{}"));
+      expect(body).toMatchObject({
+        provider: "codex-cli",
+        model: "gpt-5.4",
+        backend: "memvid",
+        memory_dir: "/tmp/memory",
+        workspace: "/tmp/kestrel",
+        stream: true,
+        require_api_auth: false,
+        autonomy_mode: "manual"
+      });
+    });
+    expect(await screen.findByText("Settings saved and applied to new runs.")).toBeInTheDocument();
+  });
+
+  it("runs the setup wizard and saves onboarding to Soul memory", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    onboardingProfile = null;
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Meet your Kestrel" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Agent name"), { target: { value: "Northstar" } });
+    fireEvent.change(screen.getByLabelText("Your name"), { target: { value: "Taylor" } });
+    fireEvent.change(screen.getByLabelText("What should it call you?"), { target: { value: "Tay" } });
+    fireEvent.click(screen.getByRole("radio", { name: /creative spark/i }));
+    fireEvent.change(screen.getByLabelText("What are you usually trying to get done?"), {
+      target: { value: "Build Kestrel\nDesign local tools" }
+    });
+    fireEvent.change(screen.getByLabelText("How do you like collaboration to feel?"), {
+      target: { value: "Short plans, direct tradeoffs, live verification." }
+    });
+    fireEvent.change(screen.getByLabelText("Interests or recurring themes"), {
+      target: { value: "Local-first software, thoughtful UI" }
+    });
+    fireEvent.change(screen.getByLabelText("Anything else it should remember?"), {
+      target: { value: "Warm but concrete." }
+    });
+    fireEvent.click(screen.getByRole("button", { name: /save to soul/i }));
+
+    await waitFor(() => {
+      const setupCall = fetchSpy.mock.calls.find(([path, init]) => path === "/api/self/onboarding" && init?.method === "POST");
+      expect(setupCall).toBeDefined();
+      const body = JSON.parse(String(setupCall?.[1]?.body ?? "{}"));
+      expect(body).toMatchObject({
+        agent_name: "Northstar",
+        user_name: "Taylor",
+        preferred_name: "Tay",
+        persona: "spark",
+        working_style: "Short plans, direct tradeoffs, live verification.",
+        communication_notes: "Warm but concrete.",
+        continuous_learning: true
+      });
+      expect(body.goals).toEqual(["Build Kestrel", "Design local tools"]);
+      expect(body.interests).toEqual(["Local-first software", "thoughtful UI"]);
+    });
+    expect(await screen.findByText("Setup saved to Soul memory.")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Meet your Kestrel" })).not.toBeInTheDocument();
+  });
+
   it("prompts for an API token after a 401 and sends it on later API calls", async () => {
     const fetchSpy = vi.mocked(fetch);
     fetchSpy.mockImplementationOnce(async () => jsonResponse({ detail: "Invalid or missing Kestrel API token." }, 401));
@@ -456,6 +550,44 @@ async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<
     secrets = [secret];
     return jsonResponse(secret);
   }
+  if (path === "/api/runtime/settings" && init?.method === "PUT") {
+    const body = JSON.parse(String(init.body ?? "{}"));
+    return jsonResponse({
+      settings: {
+        ...body,
+        updated_at: "2026-05-16T00:10:00Z",
+        path: ".nest/config/runtime_settings.json",
+        persisted: true
+      },
+      runtime: body
+    });
+  }
+  if (path === "/api/self/onboarding" && init?.method === "POST") {
+    const body = JSON.parse(String(init.body ?? "{}"));
+    onboardingProfile = {
+      schema_version: "kestrel_onboarding_profile.v1",
+      setup_complete: true,
+      agent_name: body.agent_name,
+      user_name: body.user_name,
+      preferred_name: body.preferred_name,
+      persona: body.persona,
+      persona_name: body.persona === "spark" ? "Creative Spark" : "Steady Companion",
+      persona_summary: "Saved persona",
+      persona_guidance: "Saved guidance",
+      working_style: body.working_style,
+      goals: body.goals,
+      interests: body.interests,
+      communication_notes: body.communication_notes,
+      continuous_learning: body.continuous_learning,
+      updated_at: "2026-05-16T00:10:00Z"
+    };
+    return jsonResponse({
+      success: true,
+      profile: onboardingProfile,
+      personas: personaPayload(),
+      memory: { success: true, data: { record_id: "self_profile_1" } }
+    });
+  }
   return jsonResponse(payloadFor(path));
 }
 
@@ -492,6 +624,14 @@ function payloadFor(path: string): unknown {
       mcp_servers: []
     };
   }
+  if (path === "/api/self/onboarding") {
+    return {
+      completed: Boolean(onboardingProfile),
+      profile: onboardingProfile,
+      personas: personaPayload(),
+      reflection: onboardingProfile ? "Relevant Soul/self memory: Kestrel onboarding profile" : "No validated Soul/self memory matched the query yet."
+    };
+  }
   if (path === "/api/runtime/config") {
     return {
       name: "Nested MV2 Agent",
@@ -507,6 +647,19 @@ function payloadFor(path: string): unknown {
       },
       limits: { max_tool_rounds: 6 },
       paths: { workspace: "/tmp/kestrel", memory_dir: "/tmp/memory" },
+      settings: {
+        runtime: {
+          provider: "mock",
+          model: "mock",
+          backend: "memory",
+          memory_dir: "/tmp/memory",
+          workspace: "/tmp/kestrel",
+          stream: false,
+          require_api_auth: false,
+          autonomy_mode: "background",
+          persisted: false
+        }
+      },
       validation_commands: ["python -m pytest -q"]
     };
   }
@@ -535,6 +688,35 @@ function payloadFor(path: string): unknown {
     };
   }
   return {};
+}
+
+function personaPayload() {
+  return [
+    {
+      id: "steady",
+      name: "Steady Companion",
+      summary: "Warm, grounded, concise, and quietly capable.",
+      guidance: "Be warm and direct."
+    },
+    {
+      id: "mentor",
+      name: "Patient Mentor",
+      summary: "Explains reasoning, teaches patterns, and checks understanding without dragging.",
+      guidance: "Be patient and instructional."
+    },
+    {
+      id: "spark",
+      name: "Creative Spark",
+      summary: "More playful, imaginative, and idea-forward while staying useful.",
+      guidance: "Bring more creative options."
+    },
+    {
+      id: "operator",
+      name: "Calm Operator",
+      summary: "Precise, terse, and technical for focused execution.",
+      guidance: "Be crisp and operational."
+    }
+  ];
 }
 
 function jsonResponse(payload: unknown, status = 200): Response {

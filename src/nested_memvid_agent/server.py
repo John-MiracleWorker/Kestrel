@@ -14,7 +14,21 @@ from .models import MemoryLayer, RetrievalQuery
 from .orchestrator import build_memory_system
 from .plugin_manager import PluginError, PluginManager
 from .run_manager import RunManager
+from .runtime_settings import (
+    RuntimeSettingsStore,
+    apply_runtime_settings,
+    default_runtime_settings_path,
+)
 from .secret_broker import build_secret_broker
+from .self_profile import (
+    SELF_PROFILE_QUERY,
+    SELF_PROFILE_SCHEMA,
+    build_onboarding_profile,
+    onboarding_record_content,
+    onboarding_record_title,
+    onboarding_state_from_reflection,
+    persona_presets_public,
+)
 from .server_support import (
     api_auth_error as _api_auth_error,
 )
@@ -75,6 +89,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
             SchedulerRunRequest,
             SchedulerStepRequest,
             SelfChangeRequest,
+            SelfOnboardingRequest,
             SelfRememberRequest,
             SkillInstallRequest,
             SubagentRequest,
@@ -97,7 +112,9 @@ def create_app(config: AgentConfig | None = None) -> Any:
     StaticFiles = staticfiles_module.StaticFiles
     CORSMiddleware = cors_module.CORSMiddleware
 
-    active_config = config or AgentConfig.from_env()
+    base_config = config or AgentConfig.from_env()
+    runtime_settings_store = RuntimeSettingsStore(default_runtime_settings_path(base_config))
+    active_config = apply_runtime_settings(base_config, runtime_settings_store.load(base_config))
     secret_broker = build_secret_broker(
         active_config.secret_store_path, backend=active_config.secret_backend
     )
@@ -117,6 +134,12 @@ def create_app(config: AgentConfig | None = None) -> Any:
     secret_broker.register_allowed_env_names(
         _known_secret_env_names(channels.list_channels(), mcp.list_servers())
     )
+
+    def update_active_config(next_config: AgentConfig) -> None:
+        nonlocal active_config
+        active_config = next_config
+        runs.config = next_config
+        channels.config = next_config
 
     def require_api_auth(
         authorization: str | None = Header(default=None),
@@ -229,8 +252,11 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
     register_runtime_routes(
         app,
-        active_config=active_config,
+        active_config=lambda: active_config,
         state=state,
+        settings_store=runtime_settings_store,
+        on_config_update=update_active_config,
+        http_exception=HTTPException,
     )
 
     register_secret_routes(
@@ -337,6 +363,45 @@ def create_app(config: AgentConfig | None = None) -> Any:
         if execution.success:
             return execution.data
         return _execution_response(execution)
+
+    @app.get("/api/self/onboarding")  # type: ignore[untyped-decorator]
+    def inspect_self_onboarding() -> dict[str, object]:
+        execution = runs.invoke_tool(
+            tool_name="self.reflect",
+            arguments={"query": SELF_PROFILE_QUERY, "k": 8},
+            session_id="api",
+        )
+        rows = []
+        if execution.success and isinstance(execution.data, dict):
+            raw_rows = execution.data.get("self_memory_hits")
+            rows = raw_rows if isinstance(raw_rows, list) else []
+        state_payload = onboarding_state_from_reflection(rows)
+        state_payload["reflection"] = execution.data.get("reflection") if isinstance(execution.data, dict) else None
+        return state_payload
+
+    @app.post("/api/self/onboarding")  # type: ignore[untyped-decorator]
+    def save_self_onboarding(request: SelfOnboardingRequest) -> dict[str, object]:
+        profile = build_onboarding_profile(request.model_dump())
+        execution = runs.invoke_tool(
+            tool_name="self.remember",
+            arguments={
+                "title": onboarding_record_title(profile),
+                "content": onboarding_record_content(profile),
+                "schema": SELF_PROFILE_SCHEMA,
+                "validation_status": "user_confirmed",
+                "confidence": 0.92,
+                "importance": 0.84,
+                "source": "web.onboarding_wizard",
+                "locator": "api://self/onboarding",
+            },
+            session_id="api",
+        )
+        return {
+            "success": execution.success,
+            "profile": profile,
+            "personas": persona_presets_public(),
+            "memory": _execution_response(execution),
+        }
 
     @app.post("/api/self/remember")  # type: ignore[untyped-decorator]
     def remember_self(request: SelfRememberRequest) -> dict[str, object]:

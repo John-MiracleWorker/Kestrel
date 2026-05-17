@@ -19,6 +19,7 @@ from nested_memvid_agent.runtime_models import (
     ToolExecution,
     ToolSpec,
 )
+from nested_memvid_agent.self_profile import build_onboarding_profile, onboarding_record_content
 from nested_memvid_agent.tools.base import AgentTool, ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
 from nested_memvid_agent.tools.registry import ToolRegistry
@@ -319,6 +320,53 @@ def test_agent_injects_preflight_lessons_into_context(tmp_path: Path) -> None:
     assert result.proof_of_work is not None
     assert result.proof_of_work["lessons_applied"]
     assert any("Prior Failure Lessons" in message.content for message in provider.messages if message.role == "system")
+
+
+def test_agent_injects_onboarding_profile_from_soul_memory(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    profile = build_onboarding_profile(
+        {
+            "agent_name": "Northstar",
+            "user_name": "Taylor",
+            "preferred_name": "Tay",
+            "persona": "mentor",
+            "working_style": "Show the reasoning before code changes.",
+            "goals": ["ship local-first agent workflows"],
+        }
+    )
+    memory.put(
+        MemoryRecord(
+            layer=MemoryLayer.SELF,
+            kind=MemoryKind.FACT,
+            title="Kestrel onboarding profile",
+            content=onboarding_record_content(profile),
+            confidence=0.92,
+            importance=0.84,
+            metadata={"self_schema": "user_profile", "frame_type": "self_model"},
+        )
+    )
+    provider = CapturingProvider()
+    agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=memory,
+            llm=provider,
+            tools=build_default_tools(),
+            config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
+        )
+    )
+
+    result = agent.chat("help me refactor this", session_id="test")
+
+    assert result.assistant_message == "ok"
+    profile_messages = [
+        message.content
+        for message in provider.messages
+        if message.role == "system" and "Active Soul/User Profile" in message.content
+    ]
+    assert profile_messages
+    assert "Northstar" in profile_messages[0]
+    assert "Tay" in profile_messages[0]
+    assert "Patient Mentor" in profile_messages[0]
 
 
 def test_agent_records_failure_episode_and_blocks_unchanged_retry(tmp_path: Path) -> None:

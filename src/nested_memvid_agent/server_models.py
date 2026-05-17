@@ -141,6 +141,18 @@ class SelfRememberRequest(BaseModel):
     importance: float = 0.72
 
 
+class SelfOnboardingRequest(BaseModel):
+    agent_name: str = "Kestrel"
+    user_name: str = ""
+    preferred_name: str = ""
+    persona: str = "steady"
+    working_style: str = ""
+    goals: list[str] = Field(default_factory=list)
+    interests: list[str] = Field(default_factory=list)
+    communication_notes: str = ""
+    continuous_learning: bool = True
+
+
 class SelfChangeRequest(BaseModel):
     request: str
     rationale: str = ""

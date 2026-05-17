@@ -299,6 +299,7 @@ export type RuntimeConfig = {
   feature_flags: Record<string, boolean>;
   limits: Record<string, number>;
   paths: Record<string, string>;
+  settings?: Record<string, unknown>;
   validation_commands: string[];
 };
 
@@ -312,6 +313,45 @@ export type SelfState = {
   skills?: Skill[];
   plugins?: Plugin[];
   mcp_servers?: McpServer[];
+};
+
+export type PersonaPreset = {
+  id: string;
+  name: string;
+  summary: string;
+  guidance: string;
+};
+
+export type OnboardingProfile = {
+  schema_version: string;
+  setup_complete: boolean;
+  agent_name: string;
+  user_name: string;
+  preferred_name: string;
+  persona: string;
+  persona_name: string;
+  persona_summary: string;
+  persona_guidance: string;
+  working_style: string;
+  goals: string[];
+  interests: string[];
+  communication_notes: string;
+  continuous_learning: boolean;
+  updated_at: string;
+};
+
+export type SelfOnboardingState = {
+  completed: boolean;
+  profile: OnboardingProfile | null;
+  personas: PersonaPreset[];
+  reflection?: string | null;
+};
+
+export type SelfOnboardingSaveResult = {
+  success: boolean;
+  profile: OnboardingProfile;
+  personas: PersonaPreset[];
+  memory: Record<string, unknown>;
 };
 
 export type ApiResult = Record<string, unknown>;
