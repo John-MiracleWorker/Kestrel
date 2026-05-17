@@ -73,6 +73,22 @@ def _capability_enabled(tool: AgentTool, context: ToolContext) -> tuple[bool, st
     return False, f"Tool {tool.spec.name} is disabled. Enable {enablement_attr} before requesting approval."
 
 
+def tool_enablement_status(spec: ToolSpec, config: Any | None) -> dict[str, Any]:
+    enablement_attr = _enablement_attr_for_spec(spec)
+    if enablement_attr is None:
+        return {"enabled": True, "enablement_flag": None}
+    return {
+        "enabled": bool(config is not None and getattr(config, enablement_attr, False)),
+        "enablement_flag": enablement_attr,
+    }
+
+
+def _enablement_attr_for_spec(spec: ToolSpec) -> str | None:
+    if spec.source == "skill" and "executable-skill" in spec.capabilities:
+        return "allow_executable_skills"
+    return _ENABLEMENT_BY_TOOL.get(spec.name)
+
+
 def _is_exact_call_approved(call: ToolCall, arguments: dict[str, Any], context: ToolContext) -> bool:
     if call.id not in context.approved_tool_call_ids:
         return False

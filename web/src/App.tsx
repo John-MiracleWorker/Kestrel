@@ -90,6 +90,67 @@ const autonomyOptions = [
   { value: "manual", label: "Manual" },
   { value: "autonomous", label: "Autopilot" }
 ];
+const toolPermissionDefinitions = [
+  {
+    key: "allow_shell",
+    label: "Command tools",
+    description: "shell.run, test.run, lint.run, and shell-backed validation.",
+    risk: "high risk"
+  },
+  {
+    key: "allow_file_write",
+    label: "File-write tools",
+    description: "file.write, patch.apply, repairs, and skill materialization.",
+    risk: "high risk"
+  },
+  {
+    key: "allow_codex_cli",
+    label: "Codex CLI",
+    description: "codex.exec delegation through the local Codex CLI.",
+    risk: "high risk"
+  },
+  {
+    key: "allow_web",
+    label: "Web context",
+    description: "web.search and web.fetch read-only outside context.",
+    risk: "medium risk"
+  },
+  {
+    key: "allow_plugin_install",
+    label: "Plugin install",
+    description: "plugin.install from approved Kestrel manifests.",
+    risk: "high risk"
+  },
+  {
+    key: "allow_memory_import",
+    label: "Memory import",
+    description: "memory.import with provenance and validation metadata.",
+    risk: "high risk"
+  },
+  {
+    key: "allow_executable_skills",
+    label: "Executable skills",
+    description: "Skill-provided executable tool adapters.",
+    risk: "high risk"
+  },
+  {
+    key: "allow_git_commit",
+    label: "Git commit",
+    description: "git.commit under exact-call approval.",
+    risk: "high risk"
+  },
+  {
+    key: "allow_self_modification",
+    label: "Self proposals",
+    description: "self.propose_change through the repair gate.",
+    risk: "critical risk"
+  }
+] as const;
+type ToolPermissionKey = (typeof toolPermissionDefinitions)[number]["key"];
+type ToolPermissionDraft = Record<ToolPermissionKey, boolean>;
+const defaultToolPermissions = Object.fromEntries(
+  toolPermissionDefinitions.map((permission) => [permission.key, false])
+) as ToolPermissionDraft;
 const HASH_ROUTING_ENABLED = typeof navigator === "undefined" || !navigator.userAgent.toLowerCase().includes("jsdom");
 const runEventTypes = [
   "run.started",
@@ -217,6 +278,7 @@ export function App() {
   const [streamResponses, setStreamResponses] = useState(false);
   const [memoryBackendDraft, setMemoryBackendDraft] = useState<"In-memory" | "Memvid">("In-memory");
   const [apiAuthRequired, setApiAuthRequired] = useState(false);
+  const [toolPermissions, setToolPermissions] = useState<ToolPermissionDraft>(defaultToolPermissions);
 
   const [subagentProfile, setSubagentProfile] = useState("worker");
   const [subagentGoal, setSubagentGoal] = useState("");
@@ -362,6 +424,10 @@ export function App() {
   const activeThread = useMemo(
     () => threadSummaries.find((thread) => thread.session_id === activeSessionId) ?? null,
     [threadSummaries, activeSessionId]
+  );
+  const enabledToolCount = useMemo(
+    () => tools.filter((tool) => isToolEnabled(tool, toolPermissions)).length,
+    [tools, toolPermissions]
   );
 
   function routeToSection(section: "chat" | "advanced" | "settings") {
@@ -516,6 +582,7 @@ export function App() {
     setMemoryBackendDraft(String(savedSettings.backend ?? "").toLowerCase() === "memvid" ? "Memvid" : "In-memory");
     setStreamResponses(Boolean(savedSettings.stream ?? runtimeConfig.provider?.stream));
     setApiAuthRequired(Boolean(savedSettings.require_api_auth ?? runtimeConfig.feature_flags?.require_api_auth));
+    setToolPermissions(toolPermissionsFromRuntime(runtimeConfig));
     setLogs(logList);
     setLessons(lessonList.items);
     setFailures(failureList.items);
@@ -586,7 +653,8 @@ export function App() {
         workspace: workspace.trim() || String(currentRuntime?.paths?.workspace ?? "."),
         stream: streamResponses,
         require_api_auth: apiAuthRequired,
-        autonomy_mode: autonomyMode
+        autonomy_mode: autonomyMode,
+        ...toolPermissions
       });
       setRuntimeSettingsResult(result);
       await refreshAll();
@@ -1757,21 +1825,31 @@ export function App() {
               <button type="submit" disabled={!toolName}>Invoke Tool</button>
             </form>
             <div className="tool-grid">
-              {tools.map((tool) => (
-                <button
-                  type="button"
-                  className="tool-card"
-                  key={tool.name}
-                  onClick={() => {
-                    setToolName(tool.name);
-                    setToolArgs(JSON.stringify(schemaDefault(tool.parameters), null, 2));
-                  }}
-                >
-                  <strong>{tool.name}</strong>
-                  <InlineMeta items={[tool.source, tool.risk, tool.requires_approval ? "approval" : "direct"]} />
-                  <span>{tool.description}</span>
-                </button>
-              ))}
+              {tools.map((tool) => {
+                const enabled = isToolEnabled(tool, toolPermissions);
+                return (
+                  <button
+                    type="button"
+                    className={`tool-card ${enabled ? "" : "disabled"}`}
+                    key={tool.name}
+                    onClick={() => {
+                      setToolName(tool.name);
+                      setToolArgs(JSON.stringify(schemaDefault(tool.parameters), null, 2));
+                    }}
+                  >
+                    <strong>{tool.name}</strong>
+                    <InlineMeta
+                      items={[
+                        tool.source,
+                        tool.risk,
+                        enabled ? "enabled" : `disabled: ${tool.enablement_flag ?? "config"}`,
+                        tool.requires_approval ? "approval" : "direct"
+                      ]}
+                    />
+                    <span>{tool.description}</span>
+                  </button>
+                );
+              })}
             </div>
           </Panel>
           <Panel title="Tool Result" icon={<Activity size={19} />}>
@@ -2246,8 +2324,36 @@ export function App() {
                 <div className="metric-grid settings-metrics">
                   <Metric label="Runs" value={runs.length} />
                   <Metric label="Pending approvals" value={approvals.length} />
+                  <Metric label="Tools enabled" value={`${enabledToolCount}/${tools.length}`} />
                   <Metric label="MCP servers" value={mcpServers.length} />
-                  <Metric label="Skills" value={skills.length} />
+                </div>
+                <div className="permission-grid">
+                  {toolPermissionDefinitions.map((permission) => {
+                    const affectedTools = tools.filter((tool) => tool.enablement_flag === permission.key);
+                    const isEnabled = toolPermissions[permission.key];
+                    return (
+                      <article className="permission-card" key={permission.key}>
+                        <div>
+                          <strong>{permission.label}</strong>
+                          <p>{permission.description}</p>
+                          <InlineMeta items={[permission.key, `${affectedTools.length} tools`, permission.risk]} />
+                        </div>
+                        <label className={`toggle ${permission.risk.includes("critical") ? "danger" : permission.risk.includes("high") ? "warn" : ""}`}>
+                          <input
+                            type="checkbox"
+                            aria-label={permission.label}
+                            checked={isEnabled}
+                            onChange={(event) => {
+                              const checked = event.target.checked;
+                              setToolPermissions((draft) => ({ ...draft, [permission.key]: checked }));
+                              setNotice(`${permission.label} ${checked ? "enabled" : "disabled"} in the settings draft.`);
+                            }}
+                          />
+                          <span className="track"><span className="thumb"></span></span>
+                        </label>
+                      </article>
+                    );
+                  })}
                 </div>
                 <div className="flag-grid settings-flags">
                   {Object.entries(featureFlags).map(([key, value]) => (
@@ -2751,6 +2857,25 @@ function runtimeSettingsFrom(config: RuntimeConfig | null): Record<string, unkno
   return runtimeSettings && typeof runtimeSettings === "object" && !Array.isArray(runtimeSettings)
     ? runtimeSettings as Record<string, unknown>
     : {};
+}
+
+function toolPermissionsFromRuntime(config: RuntimeConfig): ToolPermissionDraft {
+  const savedSettings = runtimeSettingsFrom(config);
+  const featureFlags = config.feature_flags ?? {};
+  return Object.fromEntries(
+    toolPermissionDefinitions.map((permission) => [
+      permission.key,
+      Boolean(savedSettings[permission.key] ?? featureFlags[permission.key])
+    ])
+  ) as ToolPermissionDraft;
+}
+
+function isToolEnabled(tool: Tool, permissions: ToolPermissionDraft): boolean {
+  const flag = tool.enablement_flag;
+  if (!flag) return typeof tool.enabled === "boolean" ? tool.enabled : true;
+  if (flag in permissions) return permissions[flag as ToolPermissionKey];
+  if (typeof tool.enabled === "boolean") return tool.enabled;
+  return false;
 }
 
 function setupDraftFromProfile(profile: OnboardingProfile): SetupDraft {

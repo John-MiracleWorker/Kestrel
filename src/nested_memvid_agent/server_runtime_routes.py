@@ -151,6 +151,15 @@ def register_runtime_routes(
                 "workspace": str(next_config.workspace),
                 "stream": next_config.stream,
                 "require_api_auth": next_config.require_api_auth,
+                "allow_shell": next_config.allow_shell,
+                "allow_file_write": next_config.allow_file_write,
+                "allow_codex_cli": next_config.allow_codex_cli,
+                "allow_plugin_install": next_config.allow_plugin_install,
+                "allow_git_commit": next_config.allow_git_commit,
+                "allow_memory_import": next_config.allow_memory_import,
+                "allow_executable_skills": next_config.allow_executable_skills,
+                "allow_web": next_config.allow_web,
+                "allow_self_modification": next_config.allow_self_modification,
             },
         }
 

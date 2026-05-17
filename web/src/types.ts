@@ -106,6 +106,8 @@ export type Tool = {
   server_id?: string | null;
   skill_id?: string | null;
   capabilities?: string[];
+  enabled?: boolean;
+  enablement_flag?: string | null;
 };
 
 export type McpTool = Tool & {

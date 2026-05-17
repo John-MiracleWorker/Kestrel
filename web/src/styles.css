@@ -1727,6 +1727,11 @@ textarea.input {
   background: var(--bg);
 }
 
+.tool-card.disabled {
+  background: #f8f6ef;
+  color: var(--muted);
+}
+
 .tool-card strong,
 .tool-card span {
   display: block;
@@ -1848,6 +1853,40 @@ textarea.input {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 10px;
+}
+
+.permission-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+  padding: 18px 22px;
+  border-top: 1px solid var(--rule);
+}
+
+.permission-card {
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--paper);
+  padding: 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  min-height: 106px;
+}
+
+.permission-card strong {
+  display: block;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.permission-card p {
+  margin: 5px 0 8px;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.45;
 }
 
 .flag {

@@ -372,6 +372,8 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Manual" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Stream responses" }));
     fireEvent.click(screen.getByRole("button", { name: "Memvid" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Command tools" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Web context" }));
     fireEvent.click(screen.getByRole("button", { name: /save settings/i }));
 
     await waitFor(() => {
@@ -386,8 +388,12 @@ describe("App", () => {
         workspace: "/tmp/kestrel",
         stream: true,
         require_api_auth: false,
-        autonomy_mode: "manual"
+        autonomy_mode: "manual",
+        allow_shell: true,
+        allow_web: true
       });
+      expect(body.allow_file_write).toBe(false);
+      expect(body.allow_codex_cli).toBe(false);
     });
     expect(await screen.findByText("Settings saved and applied to new runs.")).toBeInTheDocument();
   });

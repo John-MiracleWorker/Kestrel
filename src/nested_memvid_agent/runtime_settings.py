@@ -20,6 +20,17 @@ PROVIDER_CHOICES = {
 }
 BACKEND_CHOICES = {"memory", "memvid"}
 AUTONOMY_CHOICES = {"background", "manual", "autonomous"}
+TOOL_PERMISSION_FIELDS = {
+    "allow_shell",
+    "allow_file_write",
+    "allow_codex_cli",
+    "allow_plugin_install",
+    "allow_git_commit",
+    "allow_memory_import",
+    "allow_executable_skills",
+    "allow_web",
+    "allow_self_modification",
+}
 
 
 @dataclass(frozen=True)
@@ -32,6 +43,15 @@ class RuntimeSettings:
     stream: bool
     require_api_auth: bool
     autonomy_mode: str = "background"
+    allow_shell: bool = False
+    allow_file_write: bool = False
+    allow_codex_cli: bool = False
+    allow_plugin_install: bool = False
+    allow_git_commit: bool = False
+    allow_memory_import: bool = False
+    allow_executable_skills: bool = False
+    allow_web: bool = False
+    allow_self_modification: bool = False
     updated_at: str | None = None
 
     @classmethod
@@ -45,6 +65,15 @@ class RuntimeSettings:
             stream=config.stream,
             require_api_auth=config.require_api_auth,
             autonomy_mode=autonomy_mode,
+            allow_shell=config.allow_shell,
+            allow_file_write=config.allow_file_write,
+            allow_codex_cli=config.allow_codex_cli,
+            allow_plugin_install=config.allow_plugin_install,
+            allow_git_commit=config.allow_git_commit,
+            allow_memory_import=config.allow_memory_import,
+            allow_executable_skills=config.allow_executable_skills,
+            allow_web=config.allow_web,
+            allow_self_modification=config.allow_self_modification,
         )
 
     @classmethod
@@ -104,6 +133,15 @@ def apply_runtime_settings(config: AgentConfig, settings: RuntimeSettings) -> Ag
         workspace=Path(settings.workspace),
         stream=settings.stream,
         require_api_auth=settings.require_api_auth,
+        allow_shell=settings.allow_shell,
+        allow_file_write=settings.allow_file_write,
+        allow_codex_cli=settings.allow_codex_cli,
+        allow_plugin_install=settings.allow_plugin_install,
+        allow_git_commit=settings.allow_git_commit,
+        allow_memory_import=settings.allow_memory_import,
+        allow_executable_skills=settings.allow_executable_skills,
+        allow_web=settings.allow_web,
+        allow_self_modification=settings.allow_self_modification,
     )
 
 
@@ -118,6 +156,7 @@ def merge_runtime_settings(config: AgentConfig, current: RuntimeSettings, raw: d
         "stream",
         "require_api_auth",
         "autonomy_mode",
+        *TOOL_PERMISSION_FIELDS,
     }:
         if key in raw:
             values[key] = raw[key]
@@ -147,6 +186,15 @@ def _normalize_settings(settings: RuntimeSettings) -> RuntimeSettings:
         stream=_clean_bool(settings.stream),
         require_api_auth=_clean_bool(settings.require_api_auth),
         autonomy_mode=autonomy_mode,
+        allow_shell=_clean_bool(settings.allow_shell),
+        allow_file_write=_clean_bool(settings.allow_file_write),
+        allow_codex_cli=_clean_bool(settings.allow_codex_cli),
+        allow_plugin_install=_clean_bool(settings.allow_plugin_install),
+        allow_git_commit=_clean_bool(settings.allow_git_commit),
+        allow_memory_import=_clean_bool(settings.allow_memory_import),
+        allow_executable_skills=_clean_bool(settings.allow_executable_skills),
+        allow_web=_clean_bool(settings.allow_web),
+        allow_self_modification=_clean_bool(settings.allow_self_modification),
         updated_at=str(settings.updated_at) if settings.updated_at else None,
     )
 

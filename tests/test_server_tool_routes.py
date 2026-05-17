@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.runtime_models import ToolCall, ToolExecution, ToolSpec
 from nested_memvid_agent.server_models import ToolInvokeRequest
 from nested_memvid_agent.server_tool_routes import register_tool_routes, tool_invoke_response
@@ -9,6 +10,7 @@ from nested_memvid_agent.server_tool_routes import register_tool_routes, tool_in
 class _FakeRuns:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
+        self.config = AgentConfig()
 
     def build_registry(self) -> object:
         class _Registry:
@@ -62,6 +64,8 @@ def test_tool_routes_list_specs_and_invoke_tools() -> None:
             "skill_id": None,
             "capabilities": [],
             "produces_validation": False,
+            "enabled": True,
+            "enablement_flag": None,
         }
     ]
     assert invoked.status_code == 200
@@ -81,6 +85,40 @@ def test_tool_routes_list_specs_and_invoke_tools() -> None:
             "run_id": "run_1",
         }
     ]
+
+
+def test_tool_routes_report_config_enablement_status() -> None:
+    class _ShellRuns(_FakeRuns):
+        def build_registry(self) -> object:
+            class _Registry:
+                def specs(self) -> list[ToolSpec]:
+                    return [
+                        ToolSpec(
+                            name="shell.run",
+                            description="Run a command",
+                            parameters={"type": "object"},
+                            risk="high",
+                            requires_approval=True,
+                        )
+                    ]
+
+            return _Registry()
+
+    app = FastAPI()
+    runs = _ShellRuns()
+    register_tool_routes(app, runs=runs)
+    client = TestClient(app)
+
+    disabled = client.get("/api/tools")
+    runs.config = AgentConfig(allow_shell=True)
+    enabled = client.get("/api/tools")
+
+    assert disabled.status_code == 200
+    assert disabled.json()[0]["enablement_flag"] == "allow_shell"
+    assert disabled.json()[0]["enabled"] is False
+    assert enabled.status_code == 200
+    assert enabled.json()[0]["enablement_flag"] == "allow_shell"
+    assert enabled.json()[0]["enabled"] is True
 
 
 def test_tool_invoke_response_matches_route_payload_for_skill_reuse() -> None:

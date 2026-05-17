@@ -80,6 +80,15 @@ def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> 
             "stream": True,
             "require_api_auth": False,
             "autonomy_mode": "manual",
+            "allow_shell": True,
+            "allow_file_write": True,
+            "allow_codex_cli": True,
+            "allow_plugin_install": True,
+            "allow_git_commit": True,
+            "allow_memory_import": True,
+            "allow_executable_skills": True,
+            "allow_web": True,
+            "allow_self_modification": True,
         },
     )
 
@@ -93,6 +102,15 @@ def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> 
     assert active_config.model == "gpt-5.4"
     assert active_config.backend == "memvid"
     assert active_config.stream is True
+    assert active_config.allow_shell is True
+    assert active_config.allow_file_write is True
+    assert active_config.allow_codex_cli is True
+    assert active_config.allow_plugin_install is True
+    assert active_config.allow_git_commit is True
+    assert active_config.allow_memory_import is True
+    assert active_config.allow_executable_skills is True
+    assert active_config.allow_web is True
+    assert active_config.allow_self_modification is True
 
     runtime = client.get("/api/runtime/config")
     assert runtime.status_code == 200
@@ -102,6 +120,8 @@ def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> 
     assert runtime_payload["provider"]["stream"] is True
     assert runtime_payload["paths"]["workspace"] == str(tmp_path / "workspace")
     assert runtime_payload["settings"]["runtime"]["persisted"] is True
+    assert runtime_payload["settings"]["runtime"]["allow_shell"] is True
+    assert runtime_payload["feature_flags"]["allow_shell"] is True
 
 
 def test_runtime_settings_rejects_api_auth_without_configured_token(tmp_path) -> None:
@@ -137,6 +157,8 @@ def test_runtime_settings_store_loads_saved_config_on_restart(tmp_path) -> None:
             stream=True,
             require_api_auth=False,
             autonomy_mode="manual",
+            allow_shell=True,
+            allow_web=True,
         )
     )
 
@@ -149,3 +171,5 @@ def test_runtime_settings_store_loads_saved_config_on_restart(tmp_path) -> None:
     assert restarted_config.backend == "memvid"
     assert restarted_config.memory_dir == tmp_path / "mv2"
     assert restarted_config.stream is True
+    assert restarted_config.allow_shell is True
+    assert restarted_config.allow_web is True
