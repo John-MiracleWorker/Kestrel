@@ -5,6 +5,7 @@ import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from hashlib import sha256
 from pathlib import Path
@@ -12,6 +13,7 @@ from pathlib import Path
 from .backends.base import MemoryBackend
 from .context_frames import MV2ContextFrame, make_conflict_set_frame, to_memory_record
 from .models import MemoryHit, MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
+from .promotion_ledger import PromotionEntry, PromotionLedger, make_outcome
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,7 @@ class LayerSpec:
     promotion_threshold: float
     min_repeat_count_for_promotion: int
     retention_days: int
+    provisional_threshold: float | None = None
     search_mode: str = "auto"
     vector_search_enabled: bool = False
     vector_embedding_provider: str | None = None
@@ -43,6 +46,7 @@ DEFAULT_LAYER_SPECS: dict[MemoryLayer, LayerSpec] = {
         context_budget_chars=3500,
         min_write_confidence=0.2,
         promotion_threshold=0.65,
+        provisional_threshold=None,
         min_repeat_count_for_promotion=1,
         retention_days=2,
         search_mode="lex",
@@ -56,6 +60,7 @@ DEFAULT_LAYER_SPECS: dict[MemoryLayer, LayerSpec] = {
         context_budget_chars=4500,
         min_write_confidence=0.5,
         promotion_threshold=0.65,
+        provisional_threshold=None,
         min_repeat_count_for_promotion=1,
         retention_days=90,
         search_mode="auto",
@@ -69,6 +74,7 @@ DEFAULT_LAYER_SPECS: dict[MemoryLayer, LayerSpec] = {
         context_budget_chars=4500,
         min_write_confidence=0.75,
         promotion_threshold=0.78,
+        provisional_threshold=None,
         min_repeat_count_for_promotion=1,
         retention_days=365,
         search_mode="auto",
@@ -82,6 +88,7 @@ DEFAULT_LAYER_SPECS: dict[MemoryLayer, LayerSpec] = {
         context_budget_chars=4000,
         min_write_confidence=0.82,
         promotion_threshold=0.78,
+        provisional_threshold=None,
         min_repeat_count_for_promotion=2,
         retention_days=365,
         search_mode="auto",
@@ -95,6 +102,7 @@ DEFAULT_LAYER_SPECS: dict[MemoryLayer, LayerSpec] = {
         context_budget_chars=3500,
         min_write_confidence=0.78,
         promotion_threshold=0.78,
+        provisional_threshold=None,
         min_repeat_count_for_promotion=1,
         retention_days=365,
         search_mode="auto",
@@ -108,6 +116,7 @@ DEFAULT_LAYER_SPECS: dict[MemoryLayer, LayerSpec] = {
         context_budget_chars=3000,
         min_write_confidence=0.95,
         promotion_threshold=0.97,
+        provisional_threshold=None,
         min_repeat_count_for_promotion=5,
         retention_days=730,
         search_mode="lex",
@@ -122,6 +131,7 @@ class LayeredMemorySystem:
         self,
         backends: dict[MemoryLayer, MemoryBackend],
         specs: dict[MemoryLayer, LayerSpec] | None = None,
+        ledger: PromotionLedger | None = None,
     ) -> None:
         self.specs = specs or DEFAULT_LAYER_SPECS
         missing = set(self.specs) - set(backends)
@@ -129,6 +139,7 @@ class LayeredMemorySystem:
             missing_names = ", ".join(layer.value for layer in sorted(missing, key=str))
             raise ValueError(f"Missing backends for layers: {missing_names}")
         self.backends = backends
+        self.ledger = ledger
         self._writes_since_seal = 0
         self._dirty_layers: set[MemoryLayer] = set()
         self._last_seal_monotonic = time.monotonic()
@@ -139,6 +150,7 @@ class LayeredMemorySystem:
         memory_dir: Path,
         backend_factory: type[MemoryBackend],
         specs: dict[MemoryLayer, LayerSpec] | None = None,
+        ledger: PromotionLedger | None = None,
         **backend_kwargs: object,
     ) -> LayeredMemorySystem:
         layer_specs = specs or DEFAULT_LAYER_SPECS
@@ -152,18 +164,27 @@ class LayeredMemorySystem:
             backend = backend_factory(path=path, layer=layer, **layer_backend_kwargs)
             backend.open()
             backends[layer] = backend
-        return cls(backends=backends, specs=layer_specs)
+        return cls(backends=backends, specs=layer_specs, ledger=ledger)
 
     def put(self, record: MemoryRecord) -> str:
-        record, conflict_frame = self._with_conflict_metadata(record)
+        record, conflict_frame, conflicts = self._with_conflict_metadata(record)
         spec = self.specs[record.layer]
         if record.confidence < spec.min_write_confidence:
             raise ValueError(
                 f"Record confidence {record.confidence:.2f} is below {record.layer} write threshold "
                 f"{spec.min_write_confidence:.2f}"
             )
+        confirmed_twin = self._confirmed_record_matches_provisional(record)
+        if confirmed_twin is not None:
+            self._record_promotion(record, record_id=confirmed_twin.id)
+            entry = _promotion_entry_from_record(record, record_id=confirmed_twin.id)
+            if entry is not None:
+                self.confirm_provisional(confirmed_twin.id, entry)
+            return confirmed_twin.id
         record_id = self.backends[record.layer].put(record)
         self._note_write(record.layer)
+        self._record_promotion(record, record_id=record_id)
+        self._record_conflict_outcomes(record, conflicts)
         if conflict_frame is not None:
             conflict_frame.confidence = max(conflict_frame.confidence, spec.min_write_confidence)
             self.backends[conflict_frame.layer].put(to_memory_record(conflict_frame))
@@ -171,15 +192,24 @@ class LayeredMemorySystem:
         return record_id
 
     def upsert(self, record: MemoryRecord) -> str:
-        record, conflict_frame = self._with_conflict_metadata(record)
+        record, conflict_frame, conflicts = self._with_conflict_metadata(record)
         spec = self.specs[record.layer]
         if record.confidence < spec.min_write_confidence:
             raise ValueError(
                 f"Record confidence {record.confidence:.2f} is below {record.layer} write threshold "
                 f"{spec.min_write_confidence:.2f}"
             )
+        confirmed_twin = self._confirmed_record_matches_provisional(record)
+        if confirmed_twin is not None and confirmed_twin.id != record.id:
+            self._record_promotion(record, record_id=confirmed_twin.id)
+            entry = _promotion_entry_from_record(record, record_id=confirmed_twin.id)
+            if entry is not None:
+                self.confirm_provisional(confirmed_twin.id, entry)
+            return confirmed_twin.id
         record_id = self.backends[record.layer].upsert(record)
         self._note_write(record.layer)
+        self._record_promotion(record, record_id=record_id)
+        self._record_conflict_outcomes(record, conflicts)
         if conflict_frame is not None:
             conflict_frame.confidence = max(conflict_frame.confidence, spec.min_write_confidence)
             self.backends[conflict_frame.layer].upsert(to_memory_record(conflict_frame))
@@ -194,9 +224,32 @@ class LayeredMemorySystem:
         reason: str,
         superseded_by: str | None = None,
     ) -> bool:
+        record = self.backends[layer].get_record(record_id, include_inactive=True)
         changed = self.backends[layer].tombstone(record_id, reason=reason, superseded_by=superseded_by)
         if changed:
             self._note_write(layer)
+            promotion_id = None if record is None else _promotion_id(record)
+            if promotion_id:
+                if reason == "corrected":
+                    self.record_promotion_outcome(
+                        promotion_id,
+                        "corrected",
+                        evidence_record_id=superseded_by,
+                        notes="correction frame superseded this promoted record",
+                    )
+                elif superseded_by:
+                    self.record_promotion_outcome(
+                        promotion_id,
+                        "superseded",
+                        evidence_record_id=superseded_by,
+                        notes=f"record superseded during tombstone: {reason}",
+                    )
+                self.record_promotion_outcome(
+                    promotion_id,
+                    "tombstoned",
+                    evidence_record_id=superseded_by,
+                    notes=reason,
+                )
         return changed
 
     def iter_records(self, layer: MemoryLayer | None = None, *, include_inactive: bool = False) -> Iterable[MemoryRecord]:
@@ -235,7 +288,50 @@ class LayeredMemorySystem:
                     include_inactive=query.include_inactive,
                 )
             )
-        return sorted(hits, key=lambda hit: (hit.score, hit.record.importance), reverse=True)
+        ordered = sorted(hits, key=lambda hit: (hit.score, hit.record.importance), reverse=True)
+        self._write_back_retrieval_hits(ordered)
+        return ordered
+
+    def record_promotion_outcome(
+        self,
+        promotion_id: str,
+        outcome: str,
+        *,
+        evidence_record_id: str | None = None,
+        notes: str = "",
+    ) -> None:
+        if self.ledger is None:
+            return
+        self.ledger.record_outcome(
+            make_outcome(
+                promotion_id,
+                outcome,  # type: ignore[arg-type]
+                evidence_record_id=evidence_record_id,
+                notes=notes,
+            )
+        )
+
+    def confirm_provisional(self, record_id: str, evidence: PromotionEntry) -> bool:
+        record = self.get_record(None, record_id, include_inactive=True)
+        if record is None or record.metadata.get("promotion_status") != "provisional":
+            return False
+        record.metadata["promotion_status"] = "confirmed"
+        record.metadata["confirmed_at"] = datetime.now(UTC).isoformat()
+        record.metadata["confirmation_promotion_id"] = evidence.promotion_id
+        record.metadata["confirmation_evidence_record_id"] = evidence.record_id
+        record.expires_at = None
+        record.updated_at = datetime.now(UTC)
+        self.backends[record.layer].upsert(record)
+        self._note_write(record.layer)
+        old_promotion_id = _promotion_id(record)
+        if old_promotion_id:
+            self.record_promotion_outcome(
+                old_promotion_id,
+                "useful",
+                evidence_record_id=evidence.record_id,
+                notes="provisional record confirmed by later full-threshold evidence",
+            )
+        return True
 
     def seal_all(self) -> None:
         for backend in self.backends.values():
@@ -277,16 +373,16 @@ class LayeredMemorySystem:
     def iter_layers(self) -> Iterable[tuple[MemoryLayer, LayerSpec]]:
         return self.specs.items()
 
-    def _with_conflict_metadata(self, record: MemoryRecord) -> tuple[MemoryRecord, MV2ContextFrame | None]:
+    def _with_conflict_metadata(self, record: MemoryRecord) -> tuple[MemoryRecord, MV2ContextFrame | None, list[MemoryRecord]]:
         if not _eligible_for_conflict_detection(record):
-            return record, None
+            return record, None, []
         conflicts = [
             existing
             for existing in self.iter_records(record.layer)
             if existing.id != record.id and _records_conflict(existing, record)
         ]
         if not conflicts:
-            return record, None
+            return record, None, []
         group_id = _conflict_group_id(record, conflicts)
         record.metadata["conflict_group_id"] = group_id
         member_ids = tuple(existing.id for existing in conflicts) + (record.id,)
@@ -301,7 +397,7 @@ class LayeredMemorySystem:
             member_ids=member_ids,
             reason="deterministic conflict detection after memory write",
         )
-        return record, conflict_frame
+        return record, conflict_frame, conflicts
 
     def _note_write(self, layer: MemoryLayer) -> None:
         self._writes_since_seal += 1
@@ -309,6 +405,53 @@ class LayeredMemorySystem:
 
     def _requires_eager_seal(self) -> bool:
         return any(backend.__class__.__name__ == "InMemoryBackend" for backend in self.backends.values())
+
+    def _record_promotion(self, record: MemoryRecord, *, record_id: str) -> None:
+        if self.ledger is None:
+            return
+        entry = _promotion_entry_from_record(record, record_id=record_id)
+        if entry is not None:
+            self.ledger.record_promotion(entry)
+
+    def _record_conflict_outcomes(self, record: MemoryRecord, conflicts: list[MemoryRecord]) -> None:
+        if not conflicts:
+            return
+        for existing in conflicts:
+            promotion_id = _promotion_id(existing)
+            if not promotion_id:
+                continue
+            self.record_promotion_outcome(
+                promotion_id,
+                "contradicted",
+                evidence_record_id=record.id,
+                notes="deterministic conflict detection after memory write",
+            )
+
+    def _write_back_retrieval_hits(self, hits: list[MemoryHit]) -> None:
+        now = datetime.now(UTC)
+        for hit in hits:
+            record = hit.record
+            previous = _metadata_datetime(record.metadata.get("last_retrieved_at"))
+            if previous is not None and (now - previous).total_seconds() < 3600:
+                continue
+            record.metadata["last_retrieved_at"] = now.isoformat()
+            record.updated_at = now
+            self.backends[record.layer].upsert(record)
+            self._note_write(record.layer)
+
+    def _confirmed_record_matches_provisional(self, record: MemoryRecord) -> MemoryRecord | None:
+        if record.metadata.get("promotion_status", "confirmed") != "confirmed":
+            return None
+        if record.metadata.get("active", True) is False:
+            return None
+        for existing in self.iter_records(record.layer):
+            if existing.id == record.id:
+                continue
+            if existing.metadata.get("promotion_status") != "provisional":
+                continue
+            if _conceptually_same_record(existing, record):
+                return existing
+        return None
 
 
 def load_layer_specs(path: Path) -> dict[MemoryLayer, LayerSpec]:
@@ -328,9 +471,12 @@ def load_layer_specs(path: Path) -> dict[MemoryLayer, LayerSpec]:
         index_path = _optional_str(vector.get("index_path", payload.get("vector_index_path")))
         local_vector_enabled = bool(vector_enabled and provider == "local" and index_path)
         search_mode = str(payload.get("search_mode", base.search_mode))
+        if layer == MemoryLayer.PROCEDURAL and local_vector_enabled and "search_mode" not in payload:
+            search_mode = "hybrid"
         if layer == MemoryLayer.POLICY or not local_vector_enabled:
             search_mode = "lex" if layer == MemoryLayer.POLICY else ("lex" if search_mode in {"vec", "vector", "hybrid"} else search_mode)
             local_vector_enabled = False
+        provisional_threshold_raw = payload.get("provisional_threshold", base.provisional_threshold)
         specs[layer] = LayerSpec(
             layer=layer,
             description=str(payload.get("description", base.description)),
@@ -344,6 +490,7 @@ def load_layer_specs(path: Path) -> dict[MemoryLayer, LayerSpec]:
                 payload.get("min_repeat_count_for_promotion", base.min_repeat_count_for_promotion)
             ),
             retention_days=int(payload.get("retention_days", base.retention_days)),
+            provisional_threshold=None if provisional_threshold_raw is None else float(provisional_threshold_raw),
             search_mode=search_mode,
             vector_search_enabled=local_vector_enabled,
             vector_embedding_provider=provider if local_vector_enabled else None,
@@ -407,3 +554,72 @@ def _optional_str(value: object) -> str | None:
         return None
     stripped = str(value).strip()
     return stripped or None
+
+
+def _promotion_id(record: MemoryRecord) -> str | None:
+    value = record.metadata.get("promotion_id")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _promotion_entry_from_record(record: MemoryRecord, *, record_id: str) -> PromotionEntry | None:
+    promotion_id = _promotion_id(record)
+    nested = record.metadata.get("nested_learning")
+    if not promotion_id or not isinstance(nested, dict):
+        return None
+    decision = nested.get("decision")
+    flow = nested.get("context_flow")
+    optimizer_trace = nested.get("optimizer_trace")
+    if not isinstance(decision, dict) or not isinstance(flow, dict):
+        return None
+    source_layer_value = record.metadata.get("source_layer")
+    if not source_layer_value:
+        source_layers = flow.get("source_layers")
+        if isinstance(source_layers, list) and source_layers:
+            source_layer_value = source_layers[0]
+    try:
+        source_layer = MemoryLayer(str(source_layer_value or record.layer.value))
+    except ValueError:
+        source_layer = record.layer
+    return PromotionEntry(
+        promotion_id=promotion_id,
+        record_id=record_id,
+        source_layer=source_layer,
+        target_layer=record.layer,
+        decision_reason=str(decision.get("reason") or ""),
+        validation_score=float(record.metadata.get("validation_score", 0.0)),
+        repeat_count=int(record.metadata.get("repeat_count", 1)),
+        explicit_instruction=bool(record.metadata.get("explicit_instruction", False)),
+        optimizer_trace=dict(optimizer_trace) if isinstance(optimizer_trace, dict) else {},
+        promoted_at=record.created_at.isoformat(),
+    )
+
+
+def _metadata_datetime(value: object) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _conceptually_same_record(left: MemoryRecord, right: MemoryRecord) -> bool:
+    left_category = str(left.metadata.get("failure_category") or left.tags.get("failure_category") or "")
+    right_category = str(right.metadata.get("failure_category") or right.tags.get("failure_category") or "")
+    if left_category or right_category:
+        if left_category != right_category:
+            return False
+        return SequenceMatcher(None, _normalize_content(left.content), _normalize_content(right.content)).ratio() >= 0.60
+    if _normalize_claim_key(left.title) != _normalize_claim_key(right.title):
+        return False
+    return SequenceMatcher(None, _normalize_content(left.content), _normalize_content(right.content)).ratio() >= 0.65
+
+
+def _normalize_content(text: str) -> str:
+    return " ".join(re.findall(r"[a-zA-Z0-9_]+", text.lower()))

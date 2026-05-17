@@ -12,6 +12,7 @@ from nested_memvid_agent.cli import _validate_server_bind, main
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.orchestrator import build_memory_system
+from nested_memvid_agent.promotion_ledger import PromotionEntry, PromotionLedger
 from nested_memvid_agent.state_store import AgentStateStore
 
 
@@ -123,6 +124,47 @@ def test_memory_compact_subcommand_is_dry_run_by_default(
     output = capsys.readouterr().out
     assert '"dry_run": true' in output
     assert '"layer": "working"' in output
+
+
+def test_memory_ledger_subcommand_reports_promotions(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object
+) -> None:
+    state_path = tmp_path / "state.db"
+    ledger = PromotionLedger(AgentStateStore(state_path))
+    ledger.record_promotion(
+        PromotionEntry(
+            promotion_id="promotion-cli",
+            record_id="record-cli",
+            source_layer=MemoryLayer.EPISODIC,
+            target_layer=MemoryLayer.PROCEDURAL,
+            decision_reason="test",
+            validation_score=0.9,
+            repeat_count=2,
+            explicit_instruction=False,
+            optimizer_trace={"validation_score": 0.9},
+            promoted_at="2026-05-17T00:00:00+00:00",
+        )
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "nest-agent",
+            "memory",
+            "ledger",
+            "--state-path",
+            str(state_path),
+            "--since",
+            "all",
+        ],
+    )
+
+    main()
+
+    output = capsys.readouterr().out
+    assert "Promotion ledger" in output
+    assert "episodic->procedural" in output
+    assert "False-positive rate" in output
 
 
 def test_tools_subcommand_lists_risk_levels(monkeypatch: MonkeyPatch, capsys: object) -> None:

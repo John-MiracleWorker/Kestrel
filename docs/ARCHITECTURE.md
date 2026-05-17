@@ -104,8 +104,9 @@ The SQLite state store tracks operational state:
 - plugins and plugin enablement metadata
 - task nodes
 - subagent runs
+- promotion ledger and outcome rows
 
-Terminal run statuses and approval decisions are replay-safe. State migrations currently initialize schema version 9.
+Terminal run statuses and approval decisions are replay-safe. State migrations currently initialize schema version 10.
 
 ## Tooling Boundary
 

@@ -63,7 +63,7 @@ This is not a claim that the repo implements HOPE or neural self-modifying weigh
 - Storage: `procedural.mv2`.
 - Update cadence: repeated validated success.
 - Purpose: recipes, checklists, debugging playbooks, tool-use skills.
-- Retrieval mode: lexical/auto by default; hybrid/vector search only when layer config explicitly enables local vector settings.
+- Retrieval mode: lexical/auto by default; hybrid recall is preferred when the procedural layer config explicitly enables local vector settings.
 - Promotion: to policy only after repeated high-confidence validation.
 
 ### L5: Self/Soul memory
@@ -82,6 +82,16 @@ This is not a claim that the repo implements HOPE or neural self-modifying weigh
 - Retrieval mode: lexical exactness preferred.
 - Promotion: manual review or strong automated gate.
 
+## Closed-loop instrumentation
+
+Promotions now carry `promotion_id` and `promotion_status` metadata. `promotion_status` is `confirmed` when the full gate cleared and `provisional` when the signal only cleared the graded near-miss tier.
+
+The promotion ledger records the source layer, target layer, validation score, repeat count, explicit-instruction flag, optimizer trace, and decision reason for every promoted record. Later state changes append outcomes such as `useful`, `corrected`, `contradicted`, `tombstoned`, `superseded`, or `never_retrieved`.
+
+`LayeredMemorySystem.retrieve()` writes back `last_retrieved_at` at most once per hour for returned hits. Retention compaction uses that field to distinguish unused promoted records from records that were actually recalled.
+
+See `docs/LEARNING_LOOP.md` for the operator playbook and tuning rules. The ledger is feedback instrumentation, not threshold auto-tuning and not a learned scoring function.
+
 ## Promotion thresholds
 
 Thresholds come from the active `LayerSpec` objects. The defaults are:
@@ -95,6 +105,8 @@ Thresholds come from the active `LayerSpec` objects. The defaults are:
 | Procedural | Policy | validation_score >= 0.97 and repeat_count >= 5 |
 
 The implementation adds one more policy constraint: policy promotion must be based on an explicit instruction or reviewed rule. A repeated ordinary event can become semantic/procedural memory, but it must not become policy by accident.
+
+Each gate also has a `provisional_threshold`, defaulting to `promotion_threshold - 0.13`. Signals that clear the provisional threshold but miss the full threshold are admitted with `promotion_status: provisional`, degraded confidence, half retention, and no downstream promotion privileges until later full-threshold evidence confirms them.
 
 ## Confidence model
 

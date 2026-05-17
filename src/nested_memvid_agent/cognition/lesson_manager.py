@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
+from hashlib import sha256
 from typing import Any
 
 from ..diagnosis import FailureClassification
@@ -26,7 +27,7 @@ class LessonManager:
         query = " ".join(["lesson failure", objective, *expected_tools]).strip()
         if not query:
             return []
-        return self._retrieve_lessons(query=query, k=k)
+        return self._retrieve_lessons_semantic(query=query, k=k, include_episodic=True)
 
     def recall_failure(
         self,
@@ -35,7 +36,7 @@ class LessonManager:
         failure_text: str,
         k: int = 5,
     ) -> list[dict[str, Any]]:
-        return self._retrieve_lessons(query=f"{classification.category} {failure_text}", k=k)
+        return self._retrieve_lessons_semantic(query=f"{classification.category} {failure_text}", k=k, include_episodic=True)
 
     def record_failure(
         self,
@@ -67,6 +68,7 @@ class LessonManager:
         existing = self.find_existing_lesson(
             category=lesson.failure_category,
             corrected_strategy=lesson.corrected_strategy,
+            failure_signature=lesson.failure_signature,
         )
         if existing is not None:
             evidence_refs = tuple(dict.fromkeys((*existing.evidence_refs, *lesson.evidence_refs)))
@@ -87,9 +89,26 @@ class LessonManager:
             return lesson, self.memory.upsert(lesson.to_memory_record())
         return lesson, self.memory.upsert(lesson.to_memory_record())
 
-    def find_existing_lesson(self, *, category: str, corrected_strategy: str) -> LessonCard | None:
+    def find_existing_lesson(
+        self,
+        *,
+        category: str,
+        corrected_strategy: str,
+        failure_signature: str = "",
+    ) -> LessonCard | None:
         best: tuple[float, LessonCard] | None = None
-        for record in self.memory.iter_records(MemoryLayer.PROCEDURAL):
+        candidates = self._retrieve_lessons_semantic(
+            query=_lesson_query(category=category, corrected_strategy=corrected_strategy, failure_signature=failure_signature),
+            k=10,
+            include_episodic=False,
+        )
+        candidate_ids = {str(item.get("id", "")) for item in candidates if item.get("id")}
+        records = [
+            record
+            for record in self.memory.iter_records(MemoryLayer.PROCEDURAL)
+            if not candidate_ids or record.id in candidate_ids
+        ]
+        for record in records:
             if str(record.metadata.get("cognition_schema", "")) != "lesson_card.v1":
                 continue
             try:
@@ -103,9 +122,60 @@ class LessonManager:
                 _normalize_strategy(lesson.corrected_strategy),
                 _normalize_strategy(corrected_strategy),
             ).ratio()
-            if similarity >= 0.85 and (best is None or similarity > best[0]):
-                best = (similarity, lesson)
+            signature_similarity = SequenceMatcher(
+                None,
+                _normalize_signature(lesson.failure_signature),
+                _normalize_signature(failure_signature),
+            ).ratio()
+            matches = similarity >= 0.85 or (signature_similarity >= 0.75 and similarity >= 0.60)
+            score = max(similarity, (signature_similarity + similarity) / 2)
+            if matches and (best is None or score > best[0]):
+                best = (score, lesson)
         return None if best is None else best[1]
+
+    def _retrieve_lessons_semantic(
+        self,
+        *,
+        query: str,
+        k: int,
+        include_episodic: bool = False,
+    ) -> list[dict[str, Any]]:
+        layers = (MemoryLayer.PROCEDURAL, MemoryLayer.EPISODIC) if include_episodic else (MemoryLayer.PROCEDURAL,)
+        hits = self.memory.retrieve(
+            RetrievalQuery(
+                query=query,
+                layers=layers,
+                k_per_layer=max(1, min(k, 10)),
+                mode="hybrid",
+            )
+        )
+        rows = self._lesson_rows_from_hits(hits, k=k)
+        if len(rows) >= k:
+            return rows[:k]
+
+        seen = {str(row.get("id")) for row in rows}
+        for layer in layers:
+            for record in self.memory.iter_records(layer):
+                if record.id in seen:
+                    continue
+                schema = str(record.metadata.get("cognition_schema", ""))
+                if schema not in {"lesson_card.v1", "failure_episode.v1"}:
+                    continue
+                rows.append(
+                    {
+                        "id": record.id,
+                        "layer": record.layer.value,
+                        "kind": record.kind.value,
+                        "title": record.title,
+                        "score": 0.0,
+                        "schema": schema,
+                        "snippet": record.content[:500],
+                    }
+                )
+                seen.add(record.id)
+                if len(rows) >= k:
+                    return rows
+        return rows[:k]
 
     def _retrieve_lessons(self, *, query: str, k: int) -> list[dict[str, Any]]:
         hits = self.memory.retrieve(
@@ -115,6 +185,9 @@ class LessonManager:
                 k_per_layer=max(1, min(k, 10)),
             )
         )
+        return self._lesson_rows_from_hits(hits, k=k)
+
+    def _lesson_rows_from_hits(self, hits: list[Any], *, k: int) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for hit in hits[:k]:
             schema = str(hit.record.metadata.get("cognition_schema", ""))
@@ -137,6 +210,14 @@ class LessonManager:
 
 
 def _normalize_strategy(text: str) -> str:
+    replacements = {
+        "credential": "auth",
+        "credentials": "auth",
+        "token": "auth",
+        "renew": "refresh",
+        "rerun": "retry",
+        "again": "retry",
+    }
     tokens = []
     for raw in text.lower().replace(".", " ").split():
         token = raw.strip()
@@ -146,5 +227,38 @@ def _normalize_strategy(text: str) -> str:
                 token = token[:-1]
         elif token.endswith("s") and len(token) > 4:
             token = token[:-1]
-        tokens.append(token)
+        tokens.append(replacements.get(token, token))
     return " ".join(sorted(tokens))
+
+
+def _normalize_signature(text: str) -> str:
+    replacements = {
+        "401": "auth",
+        "403": "auth",
+        "credential": "auth",
+        "credentials": "auth",
+        "token": "auth",
+        "expired": "stale",
+        "rejected": "denied",
+        "unauthorized": "auth",
+    }
+    tokens = []
+    for raw in text.lower().replace(".", " ").replace(":", " ").split():
+        token = raw.strip()
+        tokens.append(replacements.get(token, token))
+    return " ".join(sorted(tokens))
+
+
+def _lesson_query(*, category: str, corrected_strategy: str, failure_signature: str) -> str:
+    category_hash = sha256(category.encode("utf-8")).hexdigest()[:12]
+    return " ".join(
+        part
+        for part in (
+            "lesson failure",
+            category,
+            corrected_strategy,
+            failure_signature,
+            category_hash,
+        )
+        if part
+    )

@@ -40,7 +40,12 @@ class EvidenceRef:
 
 @dataclass
 class MemoryRecord:
-    """Canonical unit that can be stored in Memvid or a test backend."""
+    """Canonical unit that can be stored in Memvid or a test backend.
+
+    Promotion metadata keys used by the learning loop include
+    `promotion_id`, `promotion_status`, `provisional_admitted_at`, and
+    `last_retrieved_at`.
+    """
 
     content: str
     layer: MemoryLayer

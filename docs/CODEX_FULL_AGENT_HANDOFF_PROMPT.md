@@ -120,7 +120,7 @@ Treat these as implemented unless current verification proves otherwise:
 - `memory.learn`, `memory.consolidate`, and promotion gate metadata.
 - `web.search` and `web.fetch` behind `NEST_AGENT_ALLOW_WEB`, with deterministic mock backend support and public-network fetch checks.
 - Exact-call approval gates for high-risk tools.
-- SQLite state schema version 9, including durable trace spans and persisted run provider.
+- SQLite state schema version 10, including durable trace spans, persisted run provider, and promotion outcome ledger tables.
 - Replay-safe terminal run and approval decisions.
 - Managed stdio MCP sessions.
 - Skills with manifest validation, provenance hashes, and local runtimes.

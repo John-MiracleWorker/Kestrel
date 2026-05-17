@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS, LayerSpec
+from nested_memvid_agent.backends.in_memory import InMemoryBackend
+from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS, LayeredMemorySystem, LayerSpec
 from nested_memvid_agent.models import EvidenceRef, MemoryKind, MemoryLayer
 from nested_memvid_agent.nested_learning import (
     LearningSignal,
@@ -166,3 +167,110 @@ def test_optimizer_trace_uses_source_evidence_chars_for_compression_ratio() -> N
 
     assert trace["compression_ratio"] == round(len(signal.content) / 120, 4)
     assert trace["confidence_delta_kind"] == "expected"
+
+
+def test_semantic_near_miss_is_admitted_as_provisional() -> None:
+    signal = LearningSignal(
+        title="Near miss fact",
+        content="The local workbench defaults to mock provider.",
+        kind=MemoryKind.FACT,
+        source_layer=MemoryLayer.EPISODIC,
+        validation_score=0.66,
+        repeat_count=1,
+    )
+
+    kernel = NestedLearningKernel()
+    decision = kernel.decide(signal)
+    record = kernel.to_memory_record(signal, decision)
+
+    assert decision.accepted
+    assert decision.action == "promote_provisional"
+    assert decision.target_layer == MemoryLayer.SEMANTIC
+    assert record.metadata["promotion_status"] == "provisional"
+    assert record.confidence == DEFAULT_LAYER_SPECS[MemoryLayer.SEMANTIC].min_write_confidence
+    assert record.expires_at is not None
+
+
+def test_confirmed_followup_confirms_matching_provisional_without_duplicate(tmp_path) -> None:
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path / "memory",
+        InMemoryBackend,
+    )
+    kernel = NestedLearningKernel(memory=memory)
+    first = LearningSignal(
+        title="Provider fact",
+        content="The workbench provider selector defaults to mock.",
+        kind=MemoryKind.FACT,
+        source_layer=MemoryLayer.EPISODIC,
+        validation_score=0.66,
+        repeat_count=1,
+    )
+    first_record = kernel.to_memory_record(first, kernel.decide(first))
+    first_id = memory.put(first_record)
+    followup = LearningSignal(
+        title="Provider fact",
+        content="The workbench provider selector defaults to mock.",
+        kind=MemoryKind.FACT,
+        source_layer=MemoryLayer.EPISODIC,
+        validation_score=0.80,
+        repeat_count=1,
+    )
+    followup_record = kernel.to_memory_record(followup, kernel.decide(followup))
+
+    followup_id = memory.put(followup_record)
+    records = list(memory.iter_records(MemoryLayer.SEMANTIC))
+
+    assert followup_id == first_id
+    assert len(records) == 1
+    assert records[0].metadata["promotion_status"] == "confirmed"
+    assert records[0].expires_at is None
+
+
+def test_provisional_record_cannot_source_promote_further() -> None:
+    signal = LearningSignal(
+        title="Provisional source",
+        content="A provisional fact should not become a procedure.",
+        kind=MemoryKind.PROCEDURE,
+        source_layer=MemoryLayer.SEMANTIC,
+        validation_score=0.9,
+        repeat_count=3,
+        metadata={"promotion_status": "provisional"},
+    )
+
+    decision = NestedLearningKernel().decide(signal)
+
+    assert not decision.accepted
+    assert decision.reason == "Cannot promote from provisional record; await confirmation evidence."
+
+
+def test_signal_below_provisional_gate_is_rejected() -> None:
+    signal = LearningSignal(
+        title="Weak fact",
+        content="A weak signal should not enter semantic memory.",
+        kind=MemoryKind.FACT,
+        source_layer=MemoryLayer.EPISODIC,
+        validation_score=0.50,
+        repeat_count=1,
+    )
+
+    decision = NestedLearningKernel().decide(signal)
+
+    assert not decision.accepted
+    assert decision.action == "reject"
+
+
+def test_repeat_count_blocks_provisional_procedural_admission() -> None:
+    signal = LearningSignal(
+        title="One-off near recipe",
+        content="Restart the local server after a transient failure.",
+        kind=MemoryKind.PROCEDURE,
+        source_layer=MemoryLayer.EPISODIC,
+        requested_target_layer=MemoryLayer.PROCEDURAL,
+        validation_score=0.70,
+        repeat_count=1,
+    )
+
+    decision = NestedLearningKernel().decide(signal)
+
+    assert not decision.accepted
+    assert decision.to_payload()["promotion_requirements"]["min_repeat_count"] == 2
