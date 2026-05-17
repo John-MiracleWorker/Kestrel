@@ -5,8 +5,8 @@ DEFAULT_REPO="https://github.com/John-MiracleWorker/Kestrel.git"
 DEFAULT_HOME="${HOME}/.kestrel-agent"
 DEFAULT_EXTRAS="memvid,openai,server,mcp,dev"
 DEFAULT_PORT="8765"
-DEFAULT_START_SERVER="1"
-DEFAULT_OPEN_BROWSER="1"
+DEFAULT_START_SERVER="0"
+DEFAULT_OPEN_BROWSER="0"
 DEFAULT_SERVER_SESSION="kestrel-agent"
 
 usage() {
@@ -24,8 +24,8 @@ Environment options:
   KESTREL_EXTRAS        Python extras to install. Defaults to memvid,openai,server,mcp,dev.
   KESTREL_SKIP_WEB      Set to 1/true to skip npm ci and web build.
   KESTREL_SKIP_SMOKE    Set to 1/true to skip doctor/chat smoke checks.
-  KESTREL_START_SERVER  Set to 0/false to skip launching the local server and web UI. Defaults to 1.
-  KESTREL_OPEN_BROWSER  Set to 0/false to skip opening the web UI in your browser. Defaults to 1.
+  KESTREL_START_SERVER  Set to 1/true to launch the local server and web UI. Defaults to 0.
+  KESTREL_OPEN_BROWSER  Set to 1/true to open the web UI in your browser (when server launch is enabled). Defaults to 0.
   KESTREL_SERVER_SESSION Detached screen/tmux session name. Defaults to kestrel-agent.
   KESTREL_SERVER_LOG    Server log path. Defaults to $KESTREL_HOME/.nest/server.log.
   KESTREL_SERVER_PID    Server PID file path. Defaults to $KESTREL_HOME/.nest/server.pid.
