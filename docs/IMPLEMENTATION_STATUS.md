@@ -7,7 +7,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 ## Working Now
 
 - CLI chat loop with in-memory and Memvid `.mv2` memory backends.
-- GitHub curl one-shot installer for a local Memvid-backed mock-provider agent, with dry-run, Python 3.11+ detection, web build, memory verify, and smoke checks.
+- GitHub curl one-shot installer for the local Memvid-backed agent runtime, with dry-run, Python 3.11+ detection, web build, memory verify, and deterministic `mock` smoke checks.
 - Layered memory files for working, episodic, semantic, procedural, self, and policy layers.
 - Context compiler that retrieves nested memory and builds the model prompt.
 - MV2 context-frame model and token-aware pseudo-context packer that retrieves summaries first, deduplicates content, flags conflict metadata, and expands raw evidence on demand.

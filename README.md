@@ -9,7 +9,7 @@ Kestrel is still an alpha runtime. It is useful for local development and harden
 ## What Works Now
 
 - CLI chat with in-memory or Memvid `.mv2` memory.
-- One-shot GitHub installer for a local Memvid-backed mock-provider agent.
+- One-shot GitHub installer for the local Memvid-backed agent runtime; the installer uses `mock` only for deterministic smoke checks.
 - Deterministic mock provider for tests and golden evals.
 - OpenAI Responses provider with streaming deltas when the SDK stream surface is available.
 - OpenAI-compatible chat completions provider for local/model-server endpoints.
@@ -70,7 +70,7 @@ One-shot local install:
 curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | bash
 ```
 
-The installer clones or updates Kestrel in `${KESTREL_HOME:-$HOME/.kestrel-agent}`, finds Python 3.11 or newer without relying on bare `python`, installs the Memvid/OpenAI/server/MCP/dev extras, builds the web workbench, initializes `.nest/memory/*.mv2`, verifies memory, and runs a deterministic mock-provider CLI chat smoke check. It does not ask for secrets or enable high-risk tools.
+The installer clones or updates Kestrel in `${KESTREL_HOME:-$HOME/.kestrel-agent}`, finds Python 3.11 or newer without relying on bare `python`, installs the Memvid/OpenAI/server/MCP/dev extras, builds the web workbench, initializes `.nest/memory/*.mv2`, verifies memory, and runs a deterministic `mock` CLI smoke check. `mock` is a zero-secret health check, not the intended operating mode. The installer does not ask for secrets or enable high-risk tools.
 
 Useful installer options:
 
@@ -81,11 +81,18 @@ KESTREL_SKIP_WEB=1 bash install.sh
 KESTREL_START_SERVER=1 bash install.sh
 ```
 
-After install:
+After install, choose a real provider for normal use:
 
 ```bash
 cd "${KESTREL_HOME:-$HOME/.kestrel-agent}"
-.venv/bin/nest-agent chat --backend memvid --memory-dir .nest/memory --provider mock --model mock
+.venv/bin/nest-agent chat --backend memvid --memory-dir .nest/memory --provider codex-cli --model gpt-5.5
+OPENAI_API_KEY=... .venv/bin/nest-agent chat --backend memvid --memory-dir .nest/memory --provider openai --model gpt-5.5
+.venv/bin/nest-agent chat --backend memvid --memory-dir .nest/memory --provider openai-compatible --base-url http://127.0.0.1:1234/v1 --model local-model
+```
+
+To start the workbench with the smoke-test provider while you configure a real provider:
+
+```bash
 .venv/bin/nest-agent server --backend memvid --memory-dir .nest/memory --provider mock --model mock --host 127.0.0.1 --port 8765
 ```
 

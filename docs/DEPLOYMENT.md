@@ -1,17 +1,17 @@
 # Deployment Guide
 
 Kestrel is a local-first agent runtime. The deployment default is intentionally conservative:
-Memvid `.mv2` memory, mock provider, localhost binding, no shell/file-write/policy/Codex high-risk tools enabled, and no automatic consolidation writes.
+Memvid `.mv2` memory, localhost binding, no shell/file-write/policy/Codex high-risk tools enabled, and no automatic consolidation writes. The `mock` provider appears in smoke checks because it needs no secrets and is deterministic; configure a real provider for normal operation.
 
 ## One-Shot GitHub Install
 
-For a local Memvid-backed mock-provider install:
+For a local Memvid-backed Kestrel install:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | bash
 ```
 
-The installer clones or updates `https://github.com/John-MiracleWorker/Kestrel.git` into `${KESTREL_HOME:-$HOME/.kestrel-agent}`, detects Python 3.11 or newer, creates `.venv`, installs `.[memvid,openai,server,mcp,dev]`, runs `npm ci --prefix web`, builds the web workbench, initializes `.nest/memory` with Memvid `.mv2` layers, verifies memory, and runs doctor plus a deterministic mock chat smoke check.
+The installer clones or updates `https://github.com/John-MiracleWorker/Kestrel.git` into `${KESTREL_HOME:-$HOME/.kestrel-agent}`, detects Python 3.11 or newer, creates `.venv`, installs `.[memvid,openai,server,mcp,dev]`, runs `npm ci --prefix web`, builds the web workbench, initializes `.nest/memory` with Memvid `.mv2` layers, verifies memory, and runs doctor plus a deterministic `mock` chat smoke check. The smoke check proves the CLI path without requiring secrets; it is not the recommended provider for real use.
 
 Useful options:
 
@@ -24,13 +24,20 @@ KESTREL_SKIP_SMOKE=1 bash install.sh
 KESTREL_START_SERVER=1 KESTREL_PORT=8765 bash install.sh
 ```
 
-The installer refuses to overwrite a non-git nonempty target directory. It keeps the same safe runtime defaults as the rest of the repo: Memvid backend, mock provider/model, localhost server commands, no provider secrets collected, and high-risk shell/file-write/policy/Codex/plugin/git remote mutation flags disabled.
+The installer refuses to overwrite a non-git nonempty target directory. It keeps the same safe runtime defaults as the rest of the repo: Memvid backend, localhost server commands, no provider secrets collected, and high-risk shell/file-write/policy/Codex/plugin/git remote mutation flags disabled.
 
-After install:
+After install, run with the provider you actually want to use:
 
 ```bash
 cd "${KESTREL_HOME:-$HOME/.kestrel-agent}"
-.venv/bin/nest-agent chat --backend memvid --memory-dir .nest/memory --provider mock --model mock
+.venv/bin/nest-agent chat --backend memvid --memory-dir .nest/memory --provider codex-cli --model gpt-5.5
+OPENAI_API_KEY=... .venv/bin/nest-agent chat --backend memvid --memory-dir .nest/memory --provider openai --model gpt-5.5
+.venv/bin/nest-agent chat --backend memvid --memory-dir .nest/memory --provider openai-compatible --base-url http://127.0.0.1:1234/v1 --model local-model
+```
+
+The local workbench can start with any configured provider. `mock` remains useful only as a smoke-test fallback:
+
+```bash
 .venv/bin/nest-agent server --backend memvid --memory-dir .nest/memory --provider mock --model mock --host 127.0.0.1 --port 8765
 ```
 
