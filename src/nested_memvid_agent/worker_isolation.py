@@ -47,7 +47,7 @@ def prepare_git_worktree(
 
 def _git_output(cwd: Path, *args: str) -> str:
     completed = subprocess.run(  # noqa: S603 - fixed executable with argument vector  # nosec
-        ["git", *args],
+        ["git", "-c", "core.hooksPath=/dev/null", *args],
         cwd=cwd,
         capture_output=True,
         text=True,
