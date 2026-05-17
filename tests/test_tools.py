@@ -1425,16 +1425,15 @@ def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_
     assert validation.data["next_action"] == "create_repair_review_before_commit"
     assert validation.data["commit_allowed"] is False
 
-    review = registry.execute(
-        ToolCall(
-            name="repair.review",
-            arguments={
-                "validation": validation.data["validation"],
-                "summary": "Calculator repair validated by targeted pytest.",
-            },
-        ),
-        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    review_call = ToolCall(
+        name="repair.review",
+        arguments={
+            "validation": validation.data["validation"],
+            "summary": "Calculator repair validated by targeted pytest.",
+        },
+        id="review_e2e",
     )
+    review = registry.execute(review_call, _approved_context(memory, tmp_path, review_call))
     assert review.success
     assert review.data["commit_gate"]["commit_allowed"] is True
     assert review.data["commit_gate"]["approval_required_before_commit"] is True
@@ -1533,13 +1532,12 @@ def test_stale_repair_review_blocks_commit_and_rollback_preserves_artifact(tmp_p
         "command": ["pytest", "-q"],
         "content": "passed",
     }
-    review = registry.execute(
-        ToolCall(
-            name="repair.review",
-            arguments={"validation": validation, "summary": "Calculator fix reviewed."},
-        ),
-        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    review_call = ToolCall(
+        name="repair.review",
+        arguments={"validation": validation, "summary": "Calculator fix reviewed."},
+        id="review_stale",
     )
+    review = registry.execute(review_call, _approved_context(memory, tmp_path, review_call))
     assert review.success
 
     (tmp_path / "calculator.py").write_text("def add(a, b):\n    return a + b + 1\n")
@@ -1598,11 +1596,10 @@ def test_repair_review_creates_commit_gate_after_successful_validation(tmp_path:
             "validation": {"success": True, "command": ["pytest", "-q"], "content": "passed"},
             "summary": "README patch validated with tests.",
         },
+        id="review_gate",
     )
 
-    result = registry.execute(
-        call, ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path)
-    )
+    result = registry.execute(call, _approved_context(memory, tmp_path, call))
 
     assert result.success
     assert result.data["commit_gate"]["commit_allowed"] is True
@@ -1673,16 +1670,15 @@ def test_git_commit_allows_repair_branch_with_current_reviewer_gate(tmp_path: Pa
     )
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
-    review = registry.execute(
-        ToolCall(
-            name="repair.review",
-            arguments={
-                "validation": {"success": True, "command": ["pytest", "-q"]},
-                "summary": "validated",
-            },
-        ),
-        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    review_call = ToolCall(
+        name="repair.review",
+        arguments={
+            "validation": {"success": True, "command": ["pytest", "-q"]},
+            "summary": "validated",
+        },
+        id="review_for_commit",
     )
+    review = registry.execute(review_call, _approved_context(memory, tmp_path, review_call))
     call = ToolCall(
         name="git.commit",
         arguments={"message": "repair commit", "repair_review_id": review.data["review_id"]},
