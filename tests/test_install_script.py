@@ -117,13 +117,13 @@ def test_install_dry_run_uses_memvid_mock_defaults(tmp_path: Path) -> None:
     assert "nest-agent init --backend memvid --memory-dir .nest/memory" in result.stdout
     assert "nest-agent memory verify --backend memvid --memory-dir .nest/memory" in result.stdout
     assert 'nest-agent chat --backend memory --memory-dir .nest/install-smoke-memory --provider mock --model mock --message "hello from one-shot install"' in result.stdout
-    assert "server auto-start: enabled" in result.stdout
-    assert "browser open: enabled" in result.stdout
+    assert "server auto-start: disabled" in result.stdout
+    assert "browser open: disabled" in result.stdout
     assert "server pid:" in result.stdout
     assert ".nest/server.pid" in result.stdout
-    assert "health check: http://127.0.0.1:8765/api/health" in result.stdout
-    assert "web UI: http://127.0.0.1:8765/" in result.stdout
-    assert "nest-agent server --backend memvid --memory-dir .nest/memory --provider mock --model mock --host 127.0.0.1 --port 8765" in result.stdout
+    assert "health check: skipped" in result.stdout
+    assert "web UI: skipped" in result.stdout
+    assert "launch command: skipped" in result.stdout
     assert "NEST_AGENT_ALLOW_SHELL=false" in result.stdout
     assert "NEST_AGENT_ALLOW_POLICY_WRITES=false" in result.stdout
     assert "NEST_AGENT_ALLOW_PLUGIN_INSTALL=false" in result.stdout
