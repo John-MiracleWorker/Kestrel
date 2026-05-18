@@ -235,6 +235,21 @@ def test_file_read_rejects_path_escape(tmp_path: Path) -> None:
     assert result.error == "file_read_failed"
 
 
+def test_file_read_rejects_secret_store_path(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    secrets_dir = tmp_path / ".nest" / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    (secrets_dir / "local_vault.json").write_text('{"secrets": {"token": {"value": "raw"}}}')
+    result = registry.execute(
+        ToolCall(name="file.read", arguments={"path": ".nest/secrets/local_vault.json"}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+    assert not result.success
+    assert result.error == "file_read_failed"
+    assert "not allowed" in result.content.lower()
+
+
 def test_high_risk_tool_requires_enablement(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
