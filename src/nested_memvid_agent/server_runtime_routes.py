@@ -5,6 +5,7 @@ from importlib import metadata as importlib_metadata
 from typing import Any, NoReturn, cast
 
 from .config import AgentConfig
+from .llm.model_catalog import all_model_catalogs, default_api_key_env, model_catalog_for_provider
 from .runtime_settings import RuntimeSettingsStore, apply_runtime_settings, merge_runtime_settings
 
 
@@ -29,8 +30,8 @@ def register_runtime_routes(
             package_version = importlib_metadata.version("nested-memvid-agent")
         except importlib_metadata.PackageNotFoundError:
             package_version = None
-        provider_env = config.api_key_env
-        fallback_env = config.fallback_api_key_env
+        provider_env = default_api_key_env(config.provider, config.api_key_env)
+        fallback_env = default_api_key_env(config.fallback_provider or "", config.fallback_api_key_env)
         saved_settings = settings_store.load(config) if settings_store is not None else None
         return {
             "name": config.name,
@@ -48,6 +49,7 @@ def register_runtime_routes(
                 "fallback_api_key_env": fallback_env,
                 "fallback_api_key_configured": bool(fallback_env and os.getenv(fallback_env)),
                 "stream": config.stream,
+                "temperature": config.temperature,
                 "timeout_seconds": config.timeout_seconds,
                 "max_retries": config.max_retries,
             },
@@ -119,6 +121,14 @@ def register_runtime_routes(
             ],
         }
 
+    @app.get("/api/runtime/models")  # type: ignore[untyped-decorator]
+    def runtime_models(provider: str | None = None) -> dict[str, object]:
+        config = _active_config(active_config)
+        if provider:
+            catalog = model_catalog_for_provider(config, provider)
+            return catalog.to_public_dict()
+        return {"providers": [catalog.to_public_dict() for catalog in all_model_catalogs(config)]}
+
     @app.get("/api/runtime/settings")  # type: ignore[untyped-decorator]
     def get_runtime_settings() -> dict[str, object]:
         store = _require_settings_store(settings_store, http_exception)
@@ -132,11 +142,11 @@ def register_runtime_routes(
         config = _active_config(active_config)
         try:
             current = store.load(config)
+            if "require_api_auth" in request and _request_bool(request["require_api_auth"]) != config.require_api_auth:
+                _raise(http_exception, 400, "require_api_auth_is_launch_controlled")
             settings = merge_runtime_settings(config, current, request)
         except ValueError as exc:
             _raise(http_exception, 400, str(exc))
-        if not config.require_api_auth and settings.require_api_auth:
-            _raise(http_exception, 400, "require_api_auth_is_launch_controlled")
         saved = store.save(settings)
         next_config = apply_runtime_settings(config, saved)
         if on_config_update is not None:
@@ -151,6 +161,15 @@ def register_runtime_routes(
                 "workspace": str(next_config.workspace),
                 "stream": next_config.stream,
                 "require_api_auth": next_config.require_api_auth,
+                "allow_shell": next_config.allow_shell,
+                "allow_file_write": next_config.allow_file_write,
+                "allow_codex_cli": next_config.allow_codex_cli,
+                "allow_plugin_install": next_config.allow_plugin_install,
+                "allow_git_commit": next_config.allow_git_commit,
+                "allow_memory_import": next_config.allow_memory_import,
+                "allow_executable_skills": next_config.allow_executable_skills,
+                "allow_web": next_config.allow_web,
+                "allow_self_modification": next_config.allow_self_modification,
             },
         }
 
@@ -170,3 +189,11 @@ def _raise(http_exception: Any | None, status_code: int, detail: str) -> NoRetur
     if http_exception is not None:
         raise http_exception(status_code=status_code, detail=detail)
     raise RuntimeError(detail)
+
+
+def _request_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)

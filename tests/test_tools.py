@@ -235,6 +235,21 @@ def test_file_read_rejects_path_escape(tmp_path: Path) -> None:
     assert result.error == "file_read_failed"
 
 
+def test_file_read_rejects_secret_store_path(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    secrets_dir = tmp_path / ".nest" / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    (secrets_dir / "local_vault.json").write_text('{"secrets": {"token": {"value": "raw"}}}')
+    result = registry.execute(
+        ToolCall(name="file.read", arguments={"path": ".nest/secrets/local_vault.json"}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+    assert not result.success
+    assert result.error == "file_read_failed"
+    assert "not allowed" in result.content.lower()
+
+
 def test_high_risk_tool_requires_enablement(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
@@ -987,6 +1002,59 @@ def test_repair_prepare_refuses_dirty_repo_by_default(tmp_path: Path) -> None:
     assert result.error == "dirty_worktree"
 
 
+def test_repair_prepare_disables_git_checkout_hooks(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    hooks_dir = tmp_path / ".githooks"
+    hooks_dir.mkdir()
+    hook = hooks_dir / "post-checkout"
+    marker = tmp_path / "hook-ran.txt"
+    hook.write_text(f"#!/usr/bin/env sh\necho hook-ran > {marker}\n")
+    hook.chmod(0o755)
+    subprocess.run(
+        ["git", "add", ".githooks/post-checkout"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "add checkout hook",
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "core.hooksPath", ".githooks"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(
+        name="repair.prepare", arguments={"branch": "codex/no-hooks"}, id="repair_no_hooks"
+    )
+
+    result = registry.execute(
+        call,
+        _approved_context(memory, tmp_path, call),
+    )
+
+    assert result.success
+    assert not marker.exists()
+
+
 def test_repair_status_reports_active_repair_branch_and_changed_files(tmp_path: Path) -> None:
     base = _init_git_repo(tmp_path)
     subprocess.run(
@@ -1425,16 +1493,15 @@ def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_
     assert validation.data["next_action"] == "create_repair_review_before_commit"
     assert validation.data["commit_allowed"] is False
 
-    review = registry.execute(
-        ToolCall(
-            name="repair.review",
-            arguments={
-                "validation": validation.data["validation"],
-                "summary": "Calculator repair validated by targeted pytest.",
-            },
-        ),
-        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    review_call = ToolCall(
+        name="repair.review",
+        arguments={
+            "validation": validation.data["validation"],
+            "summary": "Calculator repair validated by targeted pytest.",
+        },
+        id="review_e2e",
     )
+    review = registry.execute(review_call, _approved_context(memory, tmp_path, review_call))
     assert review.success
     assert review.data["commit_gate"]["commit_allowed"] is True
     assert review.data["commit_gate"]["approval_required_before_commit"] is True
@@ -1533,13 +1600,12 @@ def test_stale_repair_review_blocks_commit_and_rollback_preserves_artifact(tmp_p
         "command": ["pytest", "-q"],
         "content": "passed",
     }
-    review = registry.execute(
-        ToolCall(
-            name="repair.review",
-            arguments={"validation": validation, "summary": "Calculator fix reviewed."},
-        ),
-        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    review_call = ToolCall(
+        name="repair.review",
+        arguments={"validation": validation, "summary": "Calculator fix reviewed."},
+        id="review_stale",
     )
+    review = registry.execute(review_call, _approved_context(memory, tmp_path, review_call))
     assert review.success
 
     (tmp_path / "calculator.py").write_text("def add(a, b):\n    return a + b + 1\n")
@@ -1598,11 +1664,10 @@ def test_repair_review_creates_commit_gate_after_successful_validation(tmp_path:
             "validation": {"success": True, "command": ["pytest", "-q"], "content": "passed"},
             "summary": "README patch validated with tests.",
         },
+        id="review_gate",
     )
 
-    result = registry.execute(
-        call, ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path)
-    )
+    result = registry.execute(call, _approved_context(memory, tmp_path, call))
 
     assert result.success
     assert result.data["commit_gate"]["commit_allowed"] is True
@@ -1673,16 +1738,15 @@ def test_git_commit_allows_repair_branch_with_current_reviewer_gate(tmp_path: Pa
     )
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
-    review = registry.execute(
-        ToolCall(
-            name="repair.review",
-            arguments={
-                "validation": {"success": True, "command": ["pytest", "-q"]},
-                "summary": "validated",
-            },
-        ),
-        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    review_call = ToolCall(
+        name="repair.review",
+        arguments={
+            "validation": {"success": True, "command": ["pytest", "-q"]},
+            "summary": "validated",
+        },
+        id="review_for_commit",
     )
+    review = registry.execute(review_call, _approved_context(memory, tmp_path, review_call))
     call = ToolCall(
         name="git.commit",
         arguments={"message": "repair commit", "repair_review_id": review.data["review_id"]},
@@ -2093,18 +2157,45 @@ def test_memory_correct_writes_correction_and_hides_superseded_target(tmp_path: 
         )
     )
 
-    result = build_default_tools().execute(
-        ToolCall(
-            name="memory.correct",
-            arguments={
-                "target_record_id": target_id,
-                "correction_text": "Feature alpha is not enabled.",
-                "evidence": [
-                    {"source": "user", "locator": "turn-1", "quote": "actually, alpha is off"}
-                ],
-            },
-        ),
+    call = ToolCall(
+        name="memory.correct",
+        id="correct_alpha",
+        arguments={
+            "target_record_id": target_id,
+            "correction_text": "Feature alpha is not enabled.",
+            "evidence": [
+                {"source": "user", "locator": "turn-1", "quote": "actually, alpha is off"}
+            ],
+        },
+    )
+    registry = build_default_tools()
+    disabled = registry.execute(
+        call,
         ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+    assert not disabled.success
+    assert disabled.error == "tool_disabled"
+
+    blocked = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_memory_import=True),
+            workspace=tmp_path,
+        ),
+    )
+    assert not blocked.success
+    assert blocked.error == "approval_required"
+
+    result = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_memory_import=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"correct_alpha"}),
+            approved_tool_call_arguments={"correct_alpha": call.arguments},
+        ),
     )
 
     assert result.success

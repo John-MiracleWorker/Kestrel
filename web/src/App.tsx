@@ -58,6 +58,7 @@ import type {
   OnboardingProfile,
   PersonaPreset,
   Plugin,
+  ProviderModelCatalog,
   Run,
   RunTrace,
   RuntimeConfig,
@@ -74,13 +75,28 @@ import type {
   TraceEvent
 } from "./types";
 
-const providerOptions = ["mock", "openai", "openai-compatible", "openrouter", "ollama", "anthropic", "gemini", "codex-cli"];
+const providerOptions = [
+  "mock",
+  "openai",
+  "openai-compatible",
+  "openrouter",
+  "deepseek",
+  "kimi",
+  "ollama",
+  "ollama-cloud",
+  "anthropic",
+  "gemini",
+  "codex-cli"
+];
 const modelSuggestionsByProvider: Record<string, string[]> = {
   mock: ["mock"],
   openai: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
   "openai-compatible": ["local-model"],
   openrouter: ["openai/gpt-5.5", "anthropic/claude-sonnet-4.5"],
+  deepseek: ["deepseek-v4-pro", "deepseek-v4-flash"],
+  kimi: ["kimi-k2.6", "kimi-k2.5"],
   ollama: ["llama3.1", "qwen2.5-coder", "mistral"],
+  "ollama-cloud": ["gpt-oss:120b", "gpt-oss:20b"],
   anthropic: ["claude-sonnet-4.5", "claude-opus-4.1"],
   gemini: ["gemini-2.5-pro", "gemini-2.5-flash"],
   "codex-cli": ["gpt-5.5", "gpt-5.4"]
@@ -90,6 +106,67 @@ const autonomyOptions = [
   { value: "manual", label: "Manual" },
   { value: "autonomous", label: "Autopilot" }
 ];
+const toolPermissionDefinitions = [
+  {
+    key: "allow_shell",
+    label: "Command tools",
+    description: "shell.run, test.run, lint.run, and shell-backed validation.",
+    risk: "high risk"
+  },
+  {
+    key: "allow_file_write",
+    label: "File-write tools",
+    description: "file.write, patch.apply, repairs, and skill materialization.",
+    risk: "high risk"
+  },
+  {
+    key: "allow_codex_cli",
+    label: "Codex CLI",
+    description: "codex.exec delegation through the local Codex CLI.",
+    risk: "high risk"
+  },
+  {
+    key: "allow_web",
+    label: "Web context",
+    description: "web.search and web.fetch read-only outside context.",
+    risk: "medium risk"
+  },
+  {
+    key: "allow_plugin_install",
+    label: "Plugin install",
+    description: "plugin.install from approved Kestrel manifests.",
+    risk: "high risk"
+  },
+  {
+    key: "allow_memory_import",
+    label: "Memory import",
+    description: "memory.import with provenance and validation metadata.",
+    risk: "high risk"
+  },
+  {
+    key: "allow_executable_skills",
+    label: "Executable skills",
+    description: "Skill-provided executable tool adapters.",
+    risk: "high risk"
+  },
+  {
+    key: "allow_git_commit",
+    label: "Git commit",
+    description: "git.commit under exact-call approval.",
+    risk: "high risk"
+  },
+  {
+    key: "allow_self_modification",
+    label: "Self proposals",
+    description: "self.propose_change through the repair gate.",
+    risk: "critical risk"
+  }
+] as const;
+type ToolPermissionKey = (typeof toolPermissionDefinitions)[number]["key"];
+type ToolPermissionDraft = Record<ToolPermissionKey, boolean>;
+const defaultToolPermissions = Object.fromEntries(
+  toolPermissionDefinitions.map((permission) => [permission.key, false])
+) as ToolPermissionDraft;
 const HASH_ROUTING_ENABLED = typeof navigator === "undefined" || !navigator.userAgent.toLowerCase().includes("jsdom");
 const runEventTypes = [
   "run.started",
@@ -213,10 +290,14 @@ export function App() {
   const [workspace, setWorkspace] = useState("");
   const [provider, setProvider] = useState("mock");
   const [model, setModel] = useState("mock");
+  const [temperature, setTemperature] = useState("0.2");
+  const [modelCatalogs, setModelCatalogs] = useState<Record<string, ProviderModelCatalog>>({});
+  const [modelCatalogLoading, setModelCatalogLoading] = useState(false);
   const [autonomyMode, setAutonomyMode] = useState("background");
   const [streamResponses, setStreamResponses] = useState(false);
   const [memoryBackendDraft, setMemoryBackendDraft] = useState<"In-memory" | "Memvid">("In-memory");
   const [apiAuthRequired, setApiAuthRequired] = useState(false);
+  const [toolPermissions, setToolPermissions] = useState<ToolPermissionDraft>(defaultToolPermissions);
 
   const [subagentProfile, setSubagentProfile] = useState("worker");
   const [subagentGoal, setSubagentGoal] = useState("");
@@ -338,7 +419,17 @@ export function App() {
       .forEach((event) => rows.set(eventKey(event), event));
     return [...rows.values()].sort((left, right) => eventTimestamp(left).localeCompare(eventTimestamp(right)));
   }, [events, activeRun?.run_id, runTrace]);
-  const modelSuggestions = modelSuggestionsByProvider[provider] ?? [];
+  const providerCatalog = modelCatalogs[provider] ?? null;
+  const modelSuggestions = providerCatalog?.models?.length ? providerCatalog.models : (modelSuggestionsByProvider[provider] ?? []);
+  const modelCatalogLabel = modelCatalogLoading
+    ? "loading"
+    : providerCatalog?.ok
+      ? providerCatalog.source === "provider"
+        ? `${providerCatalog.models.length} provider models`
+        : "static models"
+      : providerCatalog?.error
+        ? "fallback models"
+        : "static models";
   const streamedAssistant = useMemo(
     () =>
       events
@@ -362,6 +453,10 @@ export function App() {
   const activeThread = useMemo(
     () => threadSummaries.find((thread) => thread.session_id === activeSessionId) ?? null,
     [threadSummaries, activeSessionId]
+  );
+  const enabledToolCount = useMemo(
+    () => tools.filter((tool) => isToolEnabled(tool, toolPermissions)).length,
+    [tools, toolPermissions]
   );
 
   function routeToSection(section: "chat" | "advanced" | "settings") {
@@ -390,6 +485,52 @@ export function App() {
     setActiveRunId(runId);
   }
 
+  function chooseProvider(nextProvider: string) {
+    const previousProvider = provider;
+    setProvider(nextProvider);
+    const suggestions = modelsForProvider(nextProvider, modelCatalogs);
+    setModel((current) => {
+      if (!current.trim() || isKnownProviderModel(previousProvider, current, modelCatalogs)) {
+        return suggestions[0] ?? current;
+      }
+      return current;
+    });
+  }
+
+  async function refreshProviderModels(nextProvider = provider) {
+    setModelCatalogLoading(true);
+    try {
+      const catalog = await getJson<ProviderModelCatalog>(`/api/runtime/models${queryString({ provider: nextProvider })}`);
+      setModelCatalogs((catalogs) => ({ ...catalogs, [catalog.provider]: catalog }));
+      setModel((current) => {
+        if (!catalog.models.length || !catalog.ok) return current;
+        const staticModels = modelSuggestionsByProvider[catalog.provider] ?? [];
+        if (!current.trim() || staticModels.includes(current)) {
+          return catalog.models[0] ?? current;
+        }
+        return current;
+      });
+    } catch {
+      const fallback = modelSuggestionsByProvider[nextProvider] ?? [];
+      setModelCatalogs((catalogs) => ({
+        ...catalogs,
+        [nextProvider]: {
+          provider: nextProvider,
+          models: fallback,
+          fallback_models: fallback,
+          source: "fallback",
+          ok: false,
+          fetchable: true,
+          error: "model catalog unavailable",
+          base_url_configured: false,
+          api_key_configured: false
+        }
+      }));
+    } finally {
+      setModelCatalogLoading(false);
+    }
+  }
+
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
@@ -414,6 +555,10 @@ export function App() {
     const timer = window.setInterval(() => refreshSummary().catch(reportError), 3500);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    void refreshProviderModels(provider);
+  }, [provider]);
 
   useEffect(() => {
     if (!HASH_ROUTING_ENABLED) return;
@@ -511,11 +656,13 @@ export function App() {
     const savedSettings = runtimeSettingsFrom(runtimeConfig);
     setProvider(String(savedSettings.provider ?? runtimeConfig.provider?.name ?? "mock"));
     setModel(String(savedSettings.model ?? runtimeConfig.provider?.model ?? "mock"));
+    setTemperature(formatTemperature(savedSettings.temperature ?? runtimeConfig.provider?.temperature ?? 0.2));
     setWorkspace(String(savedSettings.workspace ?? runtimeConfig.paths?.workspace ?? ""));
     setAutonomyMode(validAutonomyMode(savedSettings.autonomy_mode, "background"));
     setMemoryBackendDraft(String(savedSettings.backend ?? "").toLowerCase() === "memvid" ? "Memvid" : "In-memory");
     setStreamResponses(Boolean(savedSettings.stream ?? runtimeConfig.provider?.stream));
     setApiAuthRequired(Boolean(savedSettings.require_api_auth ?? runtimeConfig.feature_flags?.require_api_auth));
+    setToolPermissions(toolPermissionsFromRuntime(runtimeConfig));
     setLogs(logList);
     setLessons(lessonList.items);
     setFailures(failureList.items);
@@ -581,12 +728,14 @@ export function App() {
       const result = await putJson<Record<string, unknown>>("/api/runtime/settings", {
         provider,
         model: model.trim() || "mock",
+        temperature: coerceTemperature(temperature),
         backend: memoryBackendDraft === "Memvid" ? "memvid" : "memory",
         memory_dir: String(savedSettings.memory_dir ?? currentRuntime?.paths?.memory_dir ?? ".nest/memory"),
         workspace: workspace.trim() || String(currentRuntime?.paths?.workspace ?? "."),
         stream: streamResponses,
         require_api_auth: apiAuthRequired,
-        autonomy_mode: autonomyMode
+        autonomy_mode: autonomyMode,
+        ...toolPermissions
       });
       setRuntimeSettingsResult(result);
       await refreshAll();
@@ -1359,7 +1508,7 @@ export function App() {
                   <input value={workspace} onChange={(event) => setWorkspace(event.target.value)} />
                 </Field>
                 <Field label="Provider">
-                  <select value={provider} onChange={(event) => setProvider(event.target.value)}>
+                  <select value={provider} onChange={(event) => chooseProvider(event.target.value)}>
                     {providerOptions.map((item) => (
                       <option key={item} value={item}>
                         {item}
@@ -1367,8 +1516,19 @@ export function App() {
                     ))}
                   </select>
                 </Field>
-                <Field label="Model">
-                  <input list="models" value={model} onChange={(event) => setModel(event.target.value)} />
+                <Field label="Model" hint={providerCatalog?.error ?? modelCatalogLabel}>
+                  <div className="model-picker">
+                    <input aria-label="Model" list="models" value={model} onChange={(event) => setModel(event.target.value)} />
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      title="Refresh model list"
+                      aria-label="Refresh model list"
+                      onClick={() => refreshProviderModels(provider).catch(reportError)}
+                    >
+                      <RefreshCw size={15} />
+                    </button>
+                  </div>
                 </Field>
                 <Field label="Autonomy">
                   <select value={autonomyMode} onChange={(event) => setAutonomyMode(event.target.value)}>
@@ -1757,21 +1917,31 @@ export function App() {
               <button type="submit" disabled={!toolName}>Invoke Tool</button>
             </form>
             <div className="tool-grid">
-              {tools.map((tool) => (
-                <button
-                  type="button"
-                  className="tool-card"
-                  key={tool.name}
-                  onClick={() => {
-                    setToolName(tool.name);
-                    setToolArgs(JSON.stringify(schemaDefault(tool.parameters), null, 2));
-                  }}
-                >
-                  <strong>{tool.name}</strong>
-                  <InlineMeta items={[tool.source, tool.risk, tool.requires_approval ? "approval" : "direct"]} />
-                  <span>{tool.description}</span>
-                </button>
-              ))}
+              {tools.map((tool) => {
+                const enabled = isToolEnabled(tool, toolPermissions);
+                return (
+                  <button
+                    type="button"
+                    className={`tool-card ${enabled ? "" : "disabled"}`}
+                    key={tool.name}
+                    onClick={() => {
+                      setToolName(tool.name);
+                      setToolArgs(JSON.stringify(schemaDefault(tool.parameters), null, 2));
+                    }}
+                  >
+                    <strong>{tool.name}</strong>
+                    <InlineMeta
+                      items={[
+                        tool.source,
+                        tool.risk,
+                        enabled ? "enabled" : `disabled: ${tool.enablement_flag ?? "config"}`,
+                        tool.requires_approval ? "approval" : "direct"
+                      ]}
+                    />
+                    <span>{tool.description}</span>
+                  </button>
+                );
+              })}
             </div>
           </Panel>
           <Panel title="Tool Result" icon={<Activity size={19} />}>
@@ -2128,16 +2298,41 @@ export function App() {
                 <div className="section-row-group">
                   <label>
                     Provider
-                    <select className="select" value={provider} onChange={(event) => setProvider(event.target.value)}>
+                    <select className="select" value={provider} onChange={(event) => chooseProvider(event.target.value)}>
                       {providerOptions.map((item) => <option key={item} value={item}>{item}</option>)}
                     </select>
                   </label>
                   <label>
                     Model
-                    <input className="input" type="text" value={model} list="settings-models" onChange={(event) => setModel(event.target.value)} />
+                    <div className="model-picker">
+                      <input className="input" type="text" aria-label="Model" value={model} list="settings-models" onChange={(event) => setModel(event.target.value)} />
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        title="Refresh model list"
+                        aria-label="Refresh model list"
+                        onClick={() => refreshProviderModels(provider).catch(reportError)}
+                      >
+                        <RefreshCw size={15} />
+                      </button>
+                      <span className="model-picker-meta">{providerCatalog?.error ?? modelCatalogLabel}</span>
+                    </div>
                     <datalist id="settings-models">
                       {modelSuggestions.map((item) => <option key={`settings-${provider}-${item}`} value={item} />)}
                     </datalist>
+                  </label>
+                  <label>
+                    Temperature
+                    <input
+                      className="input num"
+                      type="number"
+                      aria-label="Temperature"
+                      min="0"
+                      max="2"
+                      step="0.1"
+                      value={temperature}
+                      onChange={(event) => setTemperature(event.target.value)}
+                    />
                   </label>
                   <label>
                     API key env
@@ -2246,8 +2441,36 @@ export function App() {
                 <div className="metric-grid settings-metrics">
                   <Metric label="Runs" value={runs.length} />
                   <Metric label="Pending approvals" value={approvals.length} />
+                  <Metric label="Tools enabled" value={`${enabledToolCount}/${tools.length}`} />
                   <Metric label="MCP servers" value={mcpServers.length} />
-                  <Metric label="Skills" value={skills.length} />
+                </div>
+                <div className="permission-grid">
+                  {toolPermissionDefinitions.map((permission) => {
+                    const affectedTools = tools.filter((tool) => tool.enablement_flag === permission.key);
+                    const isEnabled = toolPermissions[permission.key];
+                    return (
+                      <article className="permission-card" key={permission.key}>
+                        <div>
+                          <strong>{permission.label}</strong>
+                          <p>{permission.description}</p>
+                          <InlineMeta items={[permission.key, `${affectedTools.length} tools`, permission.risk]} />
+                        </div>
+                        <label className={`toggle ${permission.risk.includes("critical") ? "danger" : permission.risk.includes("high") ? "warn" : ""}`}>
+                          <input
+                            type="checkbox"
+                            aria-label={permission.label}
+                            checked={isEnabled}
+                            onChange={(event) => {
+                              const checked = event.target.checked;
+                              setToolPermissions((draft) => ({ ...draft, [permission.key]: checked }));
+                              setNotice(`${permission.label} ${checked ? "enabled" : "disabled"} in the settings draft.`);
+                            }}
+                          />
+                          <span className="track"><span className="thumb"></span></span>
+                        </label>
+                      </article>
+                    );
+                  })}
                 </div>
                 <div className="flag-grid settings-flags">
                   {Object.entries(featureFlags).map(([key, value]) => (
@@ -2751,6 +2974,44 @@ function runtimeSettingsFrom(config: RuntimeConfig | null): Record<string, unkno
   return runtimeSettings && typeof runtimeSettings === "object" && !Array.isArray(runtimeSettings)
     ? runtimeSettings as Record<string, unknown>
     : {};
+}
+
+function coerceTemperature(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0.2;
+  return Math.min(2, Math.max(0, parsed));
+}
+
+function formatTemperature(value: unknown): string {
+  return String(coerceTemperature(value));
+}
+
+function modelsForProvider(provider: string, catalogs: Record<string, ProviderModelCatalog>): string[] {
+  const catalogModels = catalogs[provider]?.models ?? [];
+  return catalogModels.length ? catalogModels : (modelSuggestionsByProvider[provider] ?? []);
+}
+
+function isKnownProviderModel(provider: string, model: string, catalogs: Record<string, ProviderModelCatalog>): boolean {
+  return [...modelsForProvider(provider, catalogs), ...(modelSuggestionsByProvider[provider] ?? [])].includes(model);
+}
+
+function toolPermissionsFromRuntime(config: RuntimeConfig): ToolPermissionDraft {
+  const savedSettings = runtimeSettingsFrom(config);
+  const featureFlags = config.feature_flags ?? {};
+  return Object.fromEntries(
+    toolPermissionDefinitions.map((permission) => [
+      permission.key,
+      Boolean(savedSettings[permission.key] ?? featureFlags[permission.key])
+    ])
+  ) as ToolPermissionDraft;
+}
+
+function isToolEnabled(tool: Tool, permissions: ToolPermissionDraft): boolean {
+  const flag = tool.enablement_flag;
+  if (!flag) return typeof tool.enabled === "boolean" ? tool.enabled : true;
+  if (flag in permissions) return permissions[flag as ToolPermissionKey];
+  if (typeof tool.enabled === "boolean") return tool.enabled;
+  return false;
 }
 
 function setupDraftFromProfile(profile: OnboardingProfile): SetupDraft {

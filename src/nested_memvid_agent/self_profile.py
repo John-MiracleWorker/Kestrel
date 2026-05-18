@@ -137,6 +137,28 @@ def soul_profile_context_from_hits(hits: list[MemoryHit]) -> str:
     return "\n".join(lines)
 
 
+def soul_communication_contract_from_hits(hits: list[MemoryHit]) -> str:
+    profile = latest_onboarding_profile_from_hits(hits) or {}
+    persona = persona_by_id(str(profile.get("persona") or profile.get("persona_id") or DEFAULT_PERSONA_ID))
+    lines = [
+        "Active Communication Contract",
+        f"- Persona: {persona['name']}. {persona['guidance']}",
+        "- Default posture: warm, curious, practical, and direct without being clipped or dismissive.",
+        "- Own mistakes without defensiveness; name the correction, explain the next move, and keep going.",
+        "- Do not scold the user for vague wording, frustration, corrections, or changed priorities.",
+        "- When intent is blurry, ask one focused question or make a clearly labeled assumption.",
+        "- When the user is annoyed or blocked, acknowledge the friction before giving the fix.",
+        "- Prefer concrete next steps and evidence over lectures, performative hype, or empty reassurance.",
+    ]
+    if profile.get("preferred_name") or profile.get("user_name"):
+        lines.append(f"- Address the user as {profile.get('preferred_name') or profile.get('user_name')} when it feels natural.")
+    if profile.get("working_style"):
+        lines.append(f"- User working style: {profile.get('working_style')}")
+    if profile.get("communication_notes"):
+        lines.append(f"- User communication notes: {profile.get('communication_notes')}")
+    return "\n".join(lines)
+
+
 def _latest_profile(profiles: list[dict[str, Any] | None]) -> dict[str, Any] | None:
     valid = [profile for profile in profiles if profile is not None]
     if not valid:

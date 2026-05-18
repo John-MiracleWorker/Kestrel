@@ -92,6 +92,10 @@ def test_install_help_documents_github_curl_and_options() -> None:
         "KESTREL_SKIP_WEB",
         "KESTREL_SKIP_SMOKE",
         "KESTREL_START_SERVER",
+        "KESTREL_OPEN_BROWSER",
+        "KESTREL_SERVER_SESSION",
+        "KESTREL_SERVER_LOG",
+        "KESTREL_SERVER_PID",
         "KESTREL_PORT",
         "KESTREL_DRY_RUN",
     ]:
@@ -113,9 +117,31 @@ def test_install_dry_run_uses_memvid_mock_defaults(tmp_path: Path) -> None:
     assert "nest-agent init --backend memvid --memory-dir .nest/memory" in result.stdout
     assert "nest-agent memory verify --backend memvid --memory-dir .nest/memory" in result.stdout
     assert 'nest-agent chat --backend memory --memory-dir .nest/install-smoke-memory --provider mock --model mock --message "hello from one-shot install"' in result.stdout
+    assert "server auto-start: disabled" in result.stdout
+    assert "browser open: disabled" in result.stdout
+    assert "server pid:" in result.stdout
+    assert ".nest/server.pid" in result.stdout
+    assert "health check: skipped" in result.stdout
+    assert "web UI: skipped" in result.stdout
+    assert "launch command: skipped" in result.stdout
     assert "NEST_AGENT_ALLOW_SHELL=false" in result.stdout
     assert "NEST_AGENT_ALLOW_POLICY_WRITES=false" in result.stdout
     assert "NEST_AGENT_ALLOW_PLUGIN_INSTALL=false" in result.stdout
+
+
+def test_install_dry_run_can_disable_server_autostart(tmp_path: Path) -> None:
+    result = _run_install(
+        env={
+            "KESTREL_DRY_RUN": "1",
+            "KESTREL_START_SERVER": "0",
+            "KESTREL_HOME": str(tmp_path / "kestrel-home"),
+        }
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "server auto-start: disabled" in result.stdout
+    assert "browser open: disabled" in result.stdout
+    assert "health check: skipped" in result.stdout
 
 
 def test_install_refuses_non_git_nonempty_target_even_in_dry_run(tmp_path: Path) -> None:
@@ -139,6 +165,19 @@ def test_install_script_detects_python_311_without_bare_python_default() -> None
     assert "python -m venv" not in text
 
 
+def test_install_script_launches_server_detached_and_checks_health() -> None:
+    text = INSTALL.read_text(encoding="utf-8")
+
+    assert "start_server_detached" in text
+    assert "wait_for_server" in text
+    assert "/api/health" in text
+    assert "KESTREL_SERVER_PID" in text
+    assert "child=$!" in text
+    assert "screen -dmS" in text
+    assert "nohup" in text
+    assert "run .venv/bin/nest-agent server --backend memvid" not in text
+
+
 @pytest.mark.skipif(
     os.getenv("RUN_MEMVID_INTEGRATION") != "1" or os.getenv("RUN_INSTALLER_INTEGRATION") != "1",
     reason="requires RUN_MEMVID_INTEGRATION=1 and RUN_INSTALLER_INTEGRATION=1",
@@ -151,6 +190,7 @@ def test_install_from_local_repo_smoke_with_memvid(tmp_path: Path) -> None:
             "KESTREL_REPO": str(source_repo),
             "KESTREL_REF": "HEAD",
             "KESTREL_SKIP_WEB": "1",
+            "KESTREL_START_SERVER": "0",
         }
     )
 

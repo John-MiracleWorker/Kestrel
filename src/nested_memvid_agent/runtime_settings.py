@@ -1,25 +1,29 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .config import AgentConfig
+from .llm.model_catalog import PROVIDER_OPTIONS
 
-PROVIDER_CHOICES = {
-    "mock",
-    "openai",
-    "openai-compatible",
-    "openrouter",
-    "ollama",
-    "anthropic",
-    "gemini",
-    "codex-cli",
-}
+PROVIDER_CHOICES = set(PROVIDER_OPTIONS)
 BACKEND_CHOICES = {"memory", "memvid"}
 AUTONOMY_CHOICES = {"background", "manual", "autonomous"}
+TOOL_PERMISSION_FIELDS = {
+    "allow_shell",
+    "allow_file_write",
+    "allow_codex_cli",
+    "allow_plugin_install",
+    "allow_git_commit",
+    "allow_memory_import",
+    "allow_executable_skills",
+    "allow_web",
+    "allow_self_modification",
+}
 
 
 @dataclass(frozen=True)
@@ -29,9 +33,19 @@ class RuntimeSettings:
     backend: str
     memory_dir: str
     workspace: str
+    temperature: float
     stream: bool
     require_api_auth: bool
     autonomy_mode: str = "background"
+    allow_shell: bool = False
+    allow_file_write: bool = False
+    allow_codex_cli: bool = False
+    allow_plugin_install: bool = False
+    allow_git_commit: bool = False
+    allow_memory_import: bool = False
+    allow_executable_skills: bool = False
+    allow_web: bool = False
+    allow_self_modification: bool = False
     updated_at: str | None = None
 
     @classmethod
@@ -42,9 +56,19 @@ class RuntimeSettings:
             backend=config.backend,
             memory_dir=str(config.memory_dir),
             workspace=str(config.workspace),
+            temperature=config.temperature,
             stream=config.stream,
             require_api_auth=config.require_api_auth,
             autonomy_mode=autonomy_mode,
+            allow_shell=config.allow_shell,
+            allow_file_write=config.allow_file_write,
+            allow_codex_cli=config.allow_codex_cli,
+            allow_plugin_install=config.allow_plugin_install,
+            allow_git_commit=config.allow_git_commit,
+            allow_memory_import=config.allow_memory_import,
+            allow_executable_skills=config.allow_executable_skills,
+            allow_web=config.allow_web,
+            allow_self_modification=config.allow_self_modification,
         )
 
     @classmethod
@@ -99,10 +123,20 @@ def apply_runtime_settings(config: AgentConfig, settings: RuntimeSettings) -> Ag
         config,
         provider=settings.provider,
         model=settings.model,
+        temperature=settings.temperature,
         backend=settings.backend,
         memory_dir=Path(settings.memory_dir),
         workspace=Path(settings.workspace),
         stream=settings.stream,
+        allow_shell=settings.allow_shell,
+        allow_file_write=settings.allow_file_write,
+        allow_codex_cli=settings.allow_codex_cli,
+        allow_plugin_install=settings.allow_plugin_install,
+        allow_git_commit=settings.allow_git_commit,
+        allow_memory_import=settings.allow_memory_import,
+        allow_executable_skills=settings.allow_executable_skills,
+        allow_web=settings.allow_web,
+        allow_self_modification=settings.allow_self_modification,
         # `require_api_auth` is launch-time security policy and must not be
         # overridden by persisted runtime settings.
     )
@@ -116,8 +150,10 @@ def merge_runtime_settings(config: AgentConfig, current: RuntimeSettings, raw: d
         "backend",
         "memory_dir",
         "workspace",
+        "temperature",
         "stream",
         "autonomy_mode",
+        *TOOL_PERMISSION_FIELDS,
     }:
         if key in raw:
             values[key] = raw[key]
@@ -144,9 +180,19 @@ def _normalize_settings(settings: RuntimeSettings) -> RuntimeSettings:
         backend=backend,
         memory_dir=memory_dir,
         workspace=workspace,
+        temperature=_clean_temperature(settings.temperature),
         stream=_clean_bool(settings.stream),
         require_api_auth=_clean_bool(settings.require_api_auth),
         autonomy_mode=autonomy_mode,
+        allow_shell=_clean_bool(settings.allow_shell),
+        allow_file_write=_clean_bool(settings.allow_file_write),
+        allow_codex_cli=_clean_bool(settings.allow_codex_cli),
+        allow_plugin_install=_clean_bool(settings.allow_plugin_install),
+        allow_git_commit=_clean_bool(settings.allow_git_commit),
+        allow_memory_import=_clean_bool(settings.allow_memory_import),
+        allow_executable_skills=_clean_bool(settings.allow_executable_skills),
+        allow_web=_clean_bool(settings.allow_web),
+        allow_self_modification=_clean_bool(settings.allow_self_modification),
         updated_at=str(settings.updated_at) if settings.updated_at else None,
     )
 
@@ -164,3 +210,17 @@ def _clean_bool(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _clean_temperature(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise ValueError("temperature must be a number")
+    try:
+        temperature = float(value)
+    except ValueError as exc:
+        raise ValueError("temperature must be a number") from exc
+    if not math.isfinite(temperature):
+        raise ValueError("temperature must be finite")
+    if temperature < 0 or temperature > 2:
+        raise ValueError("temperature must be between 0 and 2")
+    return temperature

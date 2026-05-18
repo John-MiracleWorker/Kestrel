@@ -367,6 +367,15 @@ def test_agent_injects_onboarding_profile_from_soul_memory(tmp_path: Path) -> No
     assert "Northstar" in profile_messages[0]
     assert "Tay" in profile_messages[0]
     assert "Patient Mentor" in profile_messages[0]
+    contract_messages = [
+        message.content
+        for message in provider.messages
+        if message.role == "system" and "Active Communication Contract" in message.content
+    ]
+    assert contract_messages
+    assert "Patient Mentor" in contract_messages[0]
+    assert "Own mistakes without defensiveness" in contract_messages[0]
+    assert "Do not scold the user" in contract_messages[0]
 
 
 def test_agent_records_failure_episode_and_blocks_unchanged_retry(tmp_path: Path) -> None:

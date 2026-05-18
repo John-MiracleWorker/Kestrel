@@ -106,6 +106,8 @@ export type Tool = {
   server_id?: string | null;
   skill_id?: string | null;
   capabilities?: string[];
+  enabled?: boolean;
+  enablement_flag?: string | null;
 };
 
 export type McpTool = Tool & {
@@ -301,6 +303,20 @@ export type RuntimeConfig = {
   paths: Record<string, string>;
   settings?: Record<string, unknown>;
   validation_commands: string[];
+};
+
+export type ProviderModelCatalog = {
+  provider: string;
+  models: string[];
+  fallback_models: string[];
+  source: string;
+  ok: boolean;
+  fetchable: boolean;
+  error?: string | null;
+  base_url_configured: boolean;
+  api_key_env?: string | null;
+  api_key_configured: boolean;
+  fetched_at?: string | null;
 };
 
 export type SelfState = {

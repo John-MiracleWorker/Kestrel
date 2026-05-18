@@ -28,7 +28,11 @@ from .runtime_models import (
     ToolSpec,
     TurnSource,
 )
-from .self_profile import SELF_PROFILE_QUERY, soul_profile_context_from_hits
+from .self_profile import (
+    SELF_PROFILE_QUERY,
+    soul_communication_contract_from_hits,
+    soul_profile_context_from_hits,
+)
 from .summarization import HeuristicSummarizer, LLMSummarizer, TurnSummarizer
 from .tools.base import ApprovalHandler, ToolContext
 from .tools.registry import ToolRegistry
@@ -144,7 +148,8 @@ class NestedMV2Agent:
             lesson_manager.preflight(objective=user_message) if lesson_manager is not None else []
         )
         context_prompt = _context_with_preflight_lessons(compiled.prompt, preflight_lessons)
-        context_prompt = _context_with_soul_profile(context_prompt, self._soul_profile_context())
+        soul_profile_context, communication_contract = self._soul_profile_contexts()
+        context_prompt = _context_with_soul_profile(context_prompt, soul_profile_context)
         if proof is not None:
             proof.lessons_applied.extend(preflight_lessons)
         self._event(
@@ -170,6 +175,7 @@ class NestedMV2Agent:
         tool_block = "\n\n".join(spec.to_prompt_block() for spec in self.tools.specs())
         messages = [
             ChatMessage(role="system", content=self.system_prompt),
+            ChatMessage(role="system", content=communication_contract),
             ChatMessage(role="system", content=f"Compiled nested memory context:\n{context_prompt}"),
             ChatMessage(role="system", content=f"Available tools:\n{tool_block}"),
             ChatMessage(role="user", content=user_message),
@@ -587,14 +593,14 @@ class NestedMV2Agent:
     def close(self) -> None:
         self.memory.close_all()
 
-    def _soul_profile_context(self) -> str:
+    def _soul_profile_contexts(self) -> tuple[str, str]:
         try:
             hits = self.memory.retrieve(
                 RetrievalQuery(query=SELF_PROFILE_QUERY, layers=(MemoryLayer.SELF,), k_per_layer=8)
             )
         except Exception:
-            return ""
-        return soul_profile_context_from_hits(hits)
+            hits = []
+        return soul_profile_context_from_hits(hits), soul_communication_contract_from_hits(hits)
 
     def _write_frame(
         self,

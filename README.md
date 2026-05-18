@@ -70,7 +70,7 @@ One-shot local install:
 curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | bash
 ```
 
-The installer clones or updates Kestrel in `${KESTREL_HOME:-$HOME/.kestrel-agent}`, finds Python 3.11 or newer without relying on bare `python`, installs the Memvid/OpenAI/server/MCP/dev extras, builds the web workbench, initializes `.nest/memory/*.mv2`, verifies memory, and runs a deterministic `mock` CLI smoke check. `mock` is a zero-secret health check, not the intended operating mode. The installer does not ask for secrets or enable high-risk tools.
+The installer clones or updates Kestrel in `${KESTREL_HOME:-$HOME/.kestrel-agent}`, finds Python 3.11 or newer without relying on bare `python`, installs the Memvid/OpenAI/server/MCP/dev extras, builds the web workbench, initializes `.nest/memory/*.mv2`, verifies memory, runs a deterministic `mock` CLI smoke check, starts the localhost server in a detached session, waits for `/api/health`, and opens the web UI at `http://127.0.0.1:8765/`. `mock` is a zero-secret health check, not the intended operating mode. The installer does not ask for secrets or enable high-risk tools.
 
 Useful installer options:
 
@@ -78,7 +78,15 @@ Useful installer options:
 KESTREL_HOME="$HOME/dev/kestrel" bash install.sh
 KESTREL_DRY_RUN=1 bash install.sh
 KESTREL_SKIP_WEB=1 bash install.sh
-KESTREL_START_SERVER=1 bash install.sh
+KESTREL_START_SERVER=0 bash install.sh
+KESTREL_OPEN_BROWSER=0 KESTREL_PORT=8766 bash install.sh
+```
+
+To stop the default detached server:
+
+```bash
+kill "$(cat "$HOME/.kestrel-agent/.nest/server.pid")"
+screen -S kestrel-agent -X quit 2>/dev/null || true
 ```
 
 After install, choose a real provider for normal use:
@@ -90,7 +98,7 @@ OPENAI_API_KEY=... .venv/bin/nest-agent chat --backend memvid --memory-dir .nest
 .venv/bin/nest-agent chat --backend memvid --memory-dir .nest/memory --provider openai-compatible --base-url http://127.0.0.1:1234/v1 --model local-model
 ```
 
-To start the workbench with the smoke-test provider while you configure a real provider:
+The one-shot path starts the workbench with the smoke-test provider while you configure a real provider. To start it manually:
 
 ```bash
 .venv/bin/nest-agent server --backend memvid --memory-dir .nest/memory --provider mock --model mock --host 127.0.0.1 --port 8765
@@ -223,7 +231,42 @@ nest-agent chat \
 ```
 
 Use `--api-key-env NAME` when the endpoint needs a non-default API key environment variable.
-Provider aliases are also available for `openrouter`, `ollama`, `anthropic`, and `gemini`. OpenRouter and Ollama use the OpenAI-compatible contract; Anthropic and Gemini use their native SDK surface when installed with the matching optional extras.
+Provider aliases are also available for `openrouter`, `deepseek`, `kimi`, `ollama`, `ollama-cloud`, `anthropic`, and `gemini`. OpenRouter, DeepSeek, Kimi, and local Ollama use the OpenAI-compatible contract; Ollama Cloud uses Ollama's native cloud API; Anthropic and Gemini use their native surfaces.
+
+DeepSeek:
+
+```bash
+export DEEPSEEK_API_KEY=...
+nest-agent chat \
+  --backend memory \
+  --provider deepseek \
+  --model deepseek-v4-pro \
+  --message "hello"
+```
+
+Kimi:
+
+```bash
+export MOONSHOT_API_KEY=...
+nest-agent chat \
+  --backend memory \
+  --provider kimi \
+  --model kimi-k2.6 \
+  --message "hello"
+```
+
+Ollama Cloud direct API:
+
+```bash
+export OLLAMA_API_KEY=...
+nest-agent chat \
+  --backend memory \
+  --provider ollama-cloud \
+  --model gpt-oss:120b \
+  --message "hello"
+```
+
+The workbench model picker fetches provider model catalogs from `/api/runtime/models?provider=<name>` when a provider is selected. If credentials or a local model server are unavailable, it keeps deterministic fallback suggestions instead of blocking the run form.
 
 Codex CLI as the response provider:
 

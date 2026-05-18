@@ -73,6 +73,22 @@ def _capability_enabled(tool: AgentTool, context: ToolContext) -> tuple[bool, st
     return False, f"Tool {tool.spec.name} is disabled. Enable {enablement_attr} before requesting approval."
 
 
+def tool_enablement_status(spec: ToolSpec, config: Any | None) -> dict[str, Any]:
+    enablement_attr = _enablement_attr_for_spec(spec)
+    if enablement_attr is None:
+        return {"enabled": True, "enablement_flag": None}
+    return {
+        "enabled": bool(config is not None and getattr(config, enablement_attr, False)),
+        "enablement_flag": enablement_attr,
+    }
+
+
+def _enablement_attr_for_spec(spec: ToolSpec) -> str | None:
+    if spec.source == "skill" and "executable-skill" in spec.capabilities:
+        return "allow_executable_skills"
+    return _ENABLEMENT_BY_TOOL.get(spec.name)
+
+
 def _is_exact_call_approved(call: ToolCall, arguments: dict[str, Any], context: ToolContext) -> bool:
     if call.id not in context.approved_tool_call_ids:
         return False
@@ -133,12 +149,14 @@ _ENABLEMENT_BY_TOOL = {
     "repair.apply_patch": "allow_file_write",
     "repair.validate": "allow_shell",
     "repair.orchestrate_validate": "allow_shell",
+    "repair.review": "allow_file_write",
     "repair.rollback": "allow_file_write",
     "codex.exec": "allow_codex_cli",
     "skill.install": "allow_file_write",
     "plugin.install": "allow_plugin_install",
     "git.commit": "allow_git_commit",
     "memory.import": "allow_memory_import",
+    "memory.correct": "allow_memory_import",
     "web.search": "allow_web",
     "web.fetch": "allow_web",
     "self.propose_change": "allow_self_modification",
