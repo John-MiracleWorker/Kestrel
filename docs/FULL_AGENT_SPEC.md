@@ -184,7 +184,7 @@ The FastAPI control plane and React/Vite workbench expose:
 
 API auth can be enabled through `NEST_AGENT_REQUIRE_API_AUTH=1` plus a token environment variable.
 
-Plugin installation is an alpha/high-risk surface. The registry and CLI exist, but install-path allow-flag enforcement, review UX, dependency isolation, and shared-runtime security review remain hardening work.
+Plugin installation is an alpha/high-risk surface. The registry, CLI/API review flow, review-first web UX, allow-flag enforcement, exact-call approval, and enable blockers for unmanaged dependencies or required unavailable isolation exist. Managed dependency installation, real container isolation, executable Hermes compatibility, and shared-runtime security review remain hardening work.
 
 ### Channels
 

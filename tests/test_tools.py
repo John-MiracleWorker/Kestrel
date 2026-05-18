@@ -8,12 +8,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import sleep
 
+import pytest
 from pytest import MonkeyPatch
 
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.runtime_models import ToolCall, ToolExecution, ToolSpec
+from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.tools.base import AgentTool, ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
 from nested_memvid_agent.tools.registry import ToolRegistry
@@ -119,6 +121,194 @@ def test_memory_search_invalid_layer_returns_structured_failure(tmp_path: Path) 
     assert not result.success
     assert result.error == "invalid_tool_arguments"
     assert "Unknown memory layer" in result.content
+
+
+def test_tool_registry_tool_filters_active_specs_and_reports_enablement(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    specs = registry.specs()
+
+    result = registry.execute(
+        ToolCall(
+            name="tool.registry",
+            arguments={"query": "shell.run", "enabled": False, "include_parameters": False},
+        ),
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(),
+            workspace=tmp_path,
+            tool_specs=tuple(specs),
+        ),
+    )
+
+    assert result.success is True
+    assert result.data["count"] == 1
+    assert result.data["tools"][0]["name"] == "shell.run"
+    assert result.data["tools"][0]["enabled"] is False
+    assert result.data["tools"][0]["enablement_flag"] == "allow_shell"
+    assert "parameters" not in result.data["tools"][0]
+
+
+def test_skill_discover_tool_reports_empty_directory_and_validation_errors(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    skills_dir = tmp_path / "skills"
+    state_path = tmp_path / "state.db"
+    config = AgentConfig(skills_dir=skills_dir, state_path=state_path)
+
+    empty = registry.execute(
+        ToolCall(name="skill.discover", arguments={}),
+        ToolContext(memory=memory, config=config, workspace=tmp_path),
+    )
+
+    assert empty.success is True
+    assert empty.data["discovered_count"] == 0
+    assert empty.data["skills_dir"] == str(skills_dir)
+    assert "No skill capsules" in empty.data["message"]
+
+    invalid_dir = skills_dir / "invalid"
+    invalid_dir.mkdir(parents=True)
+    (invalid_dir / "skill.json").write_text(
+        json.dumps({"id": "invalid", "risk": "spicy"}),
+        encoding="utf-8",
+    )
+    (invalid_dir / "SKILL.md").write_text("No description.", encoding="utf-8")
+
+    invalid = registry.execute(
+        ToolCall(name="skill.discover", arguments={}),
+        ToolContext(memory=memory, config=config, workspace=tmp_path),
+    )
+
+    assert invalid.success is True
+    assert invalid.data["discovered_count"] == 0
+    assert invalid.data["validation_errors"][0]["errors"] == ["missing_description", "invalid_risk"]
+    assert "Validation rejected" in invalid.data["message"]
+
+
+def test_skill_inspect_tool_returns_persisted_validation_and_provenance(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    config = AgentConfig(skills_dir=tmp_path / "skills", state_path=tmp_path / "state.db")
+    skill_dir = config.skills_dir / "review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "skill.json").write_text(
+        json.dumps(
+            {
+                "id": "review",
+                "name": "Review",
+                "description": "Review code with memory.",
+                "risk": "low",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (skill_dir / "SKILL.md").write_text("Review with Kestrel memory.", encoding="utf-8")
+    registry.execute(
+        ToolCall(name="skill.discover", arguments={}),
+        ToolContext(memory=memory, config=config, workspace=tmp_path),
+    )
+
+    result = registry.execute(
+        ToolCall(name="skill.inspect", arguments={"skill_id": "review"}),
+        ToolContext(memory=memory, config=config, workspace=tmp_path),
+    )
+
+    assert result.success is True
+    assert result.data["skill"]["id"] == "review"
+    assert result.data["skill"]["manifest"]["validation"]["ok"] is True
+    assert len(result.data["skill"]["manifest"]["provenance"]["manifest_sha256"]) == 64
+
+
+def test_plugin_and_mcp_registry_tools_redact_and_count_materialized_state(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    state = AgentStateStore(tmp_path / "state.db")
+    state.upsert_plugin(
+        {
+            "id": "demo",
+            "name": "Demo Plugin",
+            "description": "Demo plugin.",
+            "source_url": "https://github.com/acme/demo",
+            "commit_sha": "a" * 40,
+            "install_path": str(tmp_path / "plugins" / "demo"),
+            "manifest": {"id": "demo"},
+            "capabilities": ["skill", "mcp"],
+            "enabled": True,
+            "risk_report": {"risk": "medium"},
+            "install_status": "installed",
+            "format": "kestrel",
+        }
+    )
+    state.upsert_skill(
+        {
+            "id": "plugin.demo.review",
+            "name": "Plugin Review",
+            "description": "Plugin skill.",
+            "path": str(tmp_path / "plugins" / "demo" / "skills" / "review"),
+            "manifest": {"id": "plugin.demo.review"},
+            "enabled": True,
+        }
+    )
+    state.upsert_mcp_server(
+        {
+            "id": "plugin.demo.static",
+            "name": "Plugin Static",
+            "transport": "stdio",
+            "tools": [{"name": "echo", "description": "Echo"}],
+            "enabled": True,
+            "secret_env": {"API_TOKEN": "secret://missing"},
+            "session_state": "disconnected",
+        }
+    )
+    context = ToolContext(
+        memory=memory,
+        config=AgentConfig(state_path=tmp_path / "state.db", secret_store_path=tmp_path / "secrets.json"),
+        workspace=tmp_path,
+    )
+
+    plugins = registry.execute(ToolCall(name="plugin.registry", arguments={}), context)
+    mcp = registry.execute(ToolCall(name="mcp.registry", arguments={}), context)
+
+    assert plugins.success is True
+    assert plugins.data["plugins"][0]["materialized_skill_count"] == 1
+    assert plugins.data["plugins"][0]["materialized_mcp_count"] == 1
+    assert mcp.success is True
+    assert "secret_env" not in mcp.data["servers"][0]
+    assert mcp.data["servers"][0]["secret_env_status"]["API_TOKEN"]["configured"] is False
+
+
+def test_file_find_stat_git_log_show_and_project_scripts_are_bounded(tmp_path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "kestrel@example.test"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Kestrel Test"], cwd=tmp_path, check=True)
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname = \"demo\"\n[tool.pytest.ini_options]\naddopts = \"-q\"\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "agent.py").write_text("print('kestrel')\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    context = ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path)
+
+    found = registry.execute(ToolCall(name="file.find", arguments={"pattern": "*.py"}), context)
+    stat = registry.execute(ToolCall(name="file.stat", arguments={"path": "src/agent.py"}), context)
+    log = registry.execute(ToolCall(name="git.log", arguments={"max_count": 1}), context)
+    shown = registry.execute(ToolCall(name="git.show", arguments={"rev": "HEAD", "max_chars": 2000}), context)
+    scripts = registry.execute(ToolCall(name="project.scripts", arguments={}), context)
+
+    assert found.success is True
+    assert found.data["matches"] == [{"path": "src/agent.py", "type": "file"}]
+    assert stat.success is True
+    assert stat.data["path"] == "src/agent.py"
+    assert log.success is True
+    assert log.data["commits"][0]["subject"] == "initial"
+    assert shown.success is True
+    assert "initial" in shown.content
+    assert scripts.success is True
+    assert "pytest -q" in scripts.data["suggested_commands"]
 
 
 def test_memory_write_accepts_only_working_and_episodic_direct_writes(tmp_path: Path) -> None:
@@ -776,6 +966,82 @@ def test_plugin_install_requires_enablement_and_exact_approval(
     assert approved.success is True
     assert approved.data["id"] == "toolplug"
     assert approved.data["enabled"] is True
+
+
+def test_plugin_review_requires_enablement_and_exact_approval(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    plugin_repo = tmp_path / "plugin-repo"
+    plugin_repo.mkdir()
+    (plugin_repo / "kestrel.plugin.json").write_text(
+        json.dumps(
+            {
+                "id": "reviewplug",
+                "name": "Review Plugin",
+                "description": "Reviewed through the high-risk plugin tool.",
+                "dependencies": {"python": ["requests>=2"]},
+                "skills": [{"id": "hello", "description": "Say hello.", "instructions": "Return hello."}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_fetch(self: object, source: object, destination: Path, ref: str | None = None) -> str:
+        del self, source, ref
+        shutil.copytree(plugin_repo, destination)
+        return "b" * 40
+
+    monkeypatch.setattr("nested_memvid_agent.plugin_manager.GitPluginFetcher.fetch", fake_fetch)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    arguments = {"source": "owner/repo", "ref": "main"}
+    call = ToolCall(name="plugin.review", arguments=arguments, id="plugin_review_exact")
+
+    disabled = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(state_path=tmp_path / "state.db", plugins_dir=tmp_path / "plugins"),
+            workspace=tmp_path,
+        ),
+    )
+    assert disabled.error == "tool_disabled"
+
+    pending = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(
+                allow_plugin_install=True,
+                state_path=tmp_path / "state.db",
+                plugins_dir=tmp_path / "plugins",
+            ),
+            workspace=tmp_path,
+        ),
+    )
+    assert pending.error == "approval_required"
+
+    approved = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(
+                allow_plugin_install=True,
+                state_path=tmp_path / "state.db",
+                plugins_dir=tmp_path / "plugins",
+            ),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"plugin_review_exact"}),
+            approved_tool_call_arguments={"plugin_review_exact": arguments},
+        ),
+    )
+
+    assert approved.success is True
+    assert approved.data["manifest"]["id"] == "reviewplug"
+    assert approved.data["dependency_review"]["declared"]["python"] == ["requests>=2"]
+    with pytest.raises(KeyError):
+        AgentStateStore(tmp_path / "state.db").get_plugin("reviewplug")
 
 
 def test_approved_exact_tool_call_runs_once_and_changed_args_do_not_run(tmp_path: Path) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -56,6 +57,91 @@ class ReadFileTool(AgentTool):
             return self._result(call, success=True, content=text, data={"path": str(path), "chars": len(text)})
         except Exception as exc:  # noqa: BLE001
             return self._result(call, success=False, content=str(exc), error="file_read_failed")
+
+
+class FindFilesTool(AgentTool):
+    spec = ToolSpec(
+        name="file.find",
+        description="Find files or directories under the workspace using a bounded glob pattern.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "path": {"type": "string"},
+                "type": {"type": "string", "enum": ["any", "file", "dir"]},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 500},
+            },
+            "required": ["pattern"],
+        },
+        aliases=("find",),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        pattern = str(arguments.get("pattern", "")).strip()
+        if not pattern:
+            return self._result(call, success=False, content="Missing pattern", error="missing_pattern")
+        try:
+            root = _safe_path(context.workspace, str(arguments.get("path", ".")))
+            workspace = context.workspace.resolve()
+            max_results = max(1, min(int(arguments.get("max_results", 100)), 500))
+            kind = str(arguments.get("type", "file"))
+            if kind not in {"any", "file", "dir"}:
+                return self._result(call, success=False, content=f"Unknown type: {kind}", error="bad_type")
+            rows: list[dict[str, str]] = []
+            for path in sorted(root.rglob(pattern), key=lambda item: item.as_posix()):
+                if len(rows) >= max_results:
+                    break
+                if any(_skip_repo_name(part) for part in path.relative_to(workspace).parts):
+                    continue
+                if kind == "file" and not path.is_file():
+                    continue
+                if kind == "dir" and not path.is_dir():
+                    continue
+                rows.append({"path": str(path.relative_to(workspace)), "type": "dir" if path.is_dir() else "file"})
+            return self._result(call, success=True, content=json.dumps(rows, indent=2), data={"matches": rows})
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="file_find_failed")
+
+
+class FileStatTool(AgentTool):
+    spec = ToolSpec(
+        name="file.stat",
+        description="Return bounded metadata for a workspace file or directory without reading full content.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "hash": {"type": "boolean"},
+                "max_hash_bytes": {"type": "integer", "minimum": 1, "maximum": 10000000},
+            },
+            "required": ["path"],
+        },
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        try:
+            path = _safe_path(context.workspace, str(arguments.get("path", "")))
+            _assert_not_secret_store_path(context.workspace, path)
+            if not path.exists():
+                return self._result(call, success=False, content=f"Path not found: {arguments.get('path', '')}", error="not_found")
+            stat = path.stat()
+            rel = str(path.relative_to(context.workspace.resolve()))
+            payload: dict[str, Any] = {
+                "path": rel,
+                "type": "dir" if path.is_dir() else "file",
+                "bytes": stat.st_size,
+                "modified_at": stat.st_mtime,
+            }
+            if path.is_file() and bool(arguments.get("hash", False)):
+                max_hash_bytes = max(1, min(int(arguments.get("max_hash_bytes", 1_000_000)), 10_000_000))
+                raw = path.read_bytes()[:max_hash_bytes]
+                payload["sha256"] = hashlib.sha256(raw).hexdigest()
+                payload["hash_truncated"] = stat.st_size > max_hash_bytes
+            return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="file_stat_failed")
 
 
 class WriteFileTool(AgentTool):

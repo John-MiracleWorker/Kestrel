@@ -21,6 +21,7 @@ PLUGIN_SOURCE_DIR = "source"
 PLUGIN_GENERATED_DIR = "generated"
 DEFAULT_PLUGIN_RISK = "medium"
 GIT_TIMEOUT_SECONDS = 60
+PLUGIN_DEPENDENCY_KINDS = ("python", "node", "system")
 
 _GITHUB_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
 _PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -58,6 +59,8 @@ class PluginManifest:
     risk: str
     permissions: tuple[str, ...]
     requires_env: tuple[str, ...]
+    dependencies: dict[str, list[str]]
+    isolation: dict[str, Any]
     skills: tuple[dict[str, Any], ...]
     mcp_servers: tuple[dict[str, Any], ...]
     warnings: tuple[str, ...]
@@ -74,6 +77,8 @@ class PluginManifest:
             "risk": self.risk,
             "permissions": list(self.permissions),
             "requires_env": list(self.requires_env),
+            "dependencies": self.dependencies,
+            "isolation": self.isolation,
             "skills": list(self.skills),
             "mcp_servers": list(self.mcp_servers),
             "warnings": list(self.warnings),
@@ -113,6 +118,29 @@ class PluginManager:
         self.fetcher = fetcher or GitPluginFetcher()
         self.root.mkdir(parents=True, exist_ok=True)
 
+    def review(self, source: str, *, ref: str | None = None) -> dict[str, Any]:
+        parsed_source = parse_github_plugin_source(source)
+        normalized_ref = _normalize_ref(ref)
+        tmp_parent = self.root / ".tmp"
+        tmp_parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="plugin-review-", dir=tmp_parent) as tmp_name:
+            repo_path = Path(tmp_name) / "repo"
+            commit_sha = self.fetcher.fetch(parsed_source, repo_path, normalized_ref)
+            manifest = load_plugin_manifest(repo_path)
+            risk_report = _risk_report(
+                manifest,
+                source=parsed_source.display_url,
+                commit_sha=commit_sha,
+                source_dir=repo_path,
+            )
+            return _review_payload(
+                manifest,
+                source=parsed_source.display_url,
+                ref=normalized_ref,
+                commit_sha=commit_sha,
+                risk_report=risk_report,
+            )
+
     def install(
         self,
         source: str,
@@ -132,6 +160,13 @@ class PluginManager:
             initial_manifest = load_plugin_manifest(repo_path)
             if expected_plugin_id is not None and initial_manifest.id != expected_plugin_id:
                 raise PluginError(f"Plugin manifest id changed during update: expected {expected_plugin_id}, got {initial_manifest.id}")
+            risk_report = _risk_report(
+                initial_manifest,
+                source=parsed_source.display_url,
+                commit_sha=commit_sha,
+                source_dir=repo_path,
+            )
+            _ensure_plugin_enable_allowed(initial_manifest, risk_report, enable=enable)
             plugin_dir = _safe_plugin_dir(self.root, initial_manifest.id)
             if plugin_dir.exists() and not overwrite:
                 raise FileExistsError(f"Plugin already installed: {initial_manifest.id}")
@@ -142,12 +177,7 @@ class PluginManager:
             shutil.move(str(repo_path), str(source_dir))
 
         manifest = load_plugin_manifest(source_dir)
-        risk_report = _risk_report(
-            manifest,
-            source=parsed_source.display_url,
-            commit_sha=commit_sha,
-            source_dir=source_dir,
-        )
+        risk_report = _risk_report(manifest, source=parsed_source.display_url, commit_sha=commit_sha, source_dir=source_dir)
         row = self.state.upsert_plugin(
             {
                 "id": manifest.id,
@@ -185,6 +215,9 @@ class PluginManager:
         return self.state.get_plugin(plugin_id)
 
     def set_enabled(self, plugin_id: str, enabled: bool) -> dict[str, Any]:
+        row = self.state.get_plugin(plugin_id)
+        if enabled:
+            _ensure_plugin_enable_allowed_from_row(row)
         self.state.set_plugin_enabled(plugin_id, enabled)
         self.sync_plugin(plugin_id)
         return self.state.get_plugin(plugin_id)
@@ -361,6 +394,8 @@ def _normalize_kestrel_manifest(raw: dict[str, Any], repo_root: Path) -> PluginM
     risk = _risk(str(raw.get("risk", DEFAULT_PLUGIN_RISK)))
     permissions = _string_tuple(raw.get("permissions", []), "permissions")
     requires_env = _env_tuple(raw.get("requires_env", []))
+    dependencies = _dependency_map(raw.get("dependencies", {}))
+    isolation = _isolation(raw.get("isolation", {}))
     warnings: list[str] = []
     skills = tuple(_normalize_skill(plugin_id, item, repo_root, risk) for item in _dict_list(raw.get("skills", []), "skills"))
     mcp_servers = tuple(_normalize_mcp_server(plugin_id, item) for item in _dict_list(raw.get("mcp_servers", []), "mcp_servers"))
@@ -375,6 +410,8 @@ def _normalize_kestrel_manifest(raw: dict[str, Any], repo_root: Path) -> PluginM
         risk=risk,
         permissions=permissions,
         requires_env=requires_env,
+        dependencies=dependencies,
+        isolation=isolation,
         skills=skills,
         mcp_servers=mcp_servers,
         warnings=tuple(warnings),
@@ -411,6 +448,8 @@ def _normalize_hermes_manifest(raw: dict[str, Any], repo_root: Path) -> PluginMa
         risk=risk,
         permissions=_string_tuple(raw.get("permissions", []), "permissions"),
         requires_env=_env_tuple(raw.get("requires_env", [])),
+        dependencies=_dependency_map(raw.get("dependencies", {})),
+        isolation=_isolation(raw.get("isolation", {})),
         skills=skills,
         mcp_servers=mcp_servers,
         warnings=tuple(warnings),
@@ -625,10 +664,16 @@ def _risk_report(
     commit_sha: str,
     source_dir: Path,
 ) -> dict[str, Any]:
+    dependency_review = _dependency_review(manifest.dependencies)
+    isolation_review = _isolation_review(manifest.isolation)
+    enable_blockers = _enable_blockers(dependency_review, isolation_review)
     return {
         "risk": manifest.risk,
         "permissions": list(manifest.permissions),
         "requires_env": list(manifest.requires_env),
+        "dependency_review": dependency_review,
+        "isolation_review": isolation_review,
+        "enable_blockers": enable_blockers,
         "warnings": list(manifest.warnings),
         "unsupported_features": list(manifest.unsupported_features),
         "source_url": source,
@@ -636,6 +681,68 @@ def _risk_report(
         "approval_policy": "approval_by_default",
         "tree_sha256": _tree_sha256(source_dir),
     }
+
+
+def _review_payload(
+    manifest: PluginManifest,
+    *,
+    source: str,
+    ref: str | None,
+    commit_sha: str,
+    risk_report: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "source_url": source,
+        "source_ref": ref,
+        "commit_sha": commit_sha,
+        "manifest": manifest.to_state_payload(),
+        "capabilities": _capabilities(manifest),
+        "risk_report": risk_report,
+        "dependency_review": risk_report["dependency_review"],
+        "isolation_review": risk_report["isolation_review"],
+        "enable_blockers": risk_report["enable_blockers"],
+        "warnings": list(manifest.warnings),
+        "unsupported_features": list(manifest.unsupported_features),
+    }
+
+
+def _ensure_plugin_enable_allowed(manifest: PluginManifest, risk_report: dict[str, Any], *, enable: bool) -> None:
+    if enable and risk_report.get("enable_blockers"):
+        blockers = ", ".join(str(item) for item in risk_report["enable_blockers"])
+        raise PluginError(f"Plugin enable blocked: {manifest.id}: {blockers}")
+
+
+def _ensure_plugin_enable_allowed_from_row(row: dict[str, Any]) -> None:
+    risk_report = dict(row.get("risk_report", {}) or {})
+    blockers = [str(item) for item in risk_report.get("enable_blockers", [])]
+    if blockers:
+        raise PluginError(f"Plugin enable blocked: {row['id']}: {', '.join(blockers)}")
+
+
+def _dependency_review(dependencies: dict[str, list[str]]) -> dict[str, Any]:
+    declared = {kind: list(dependencies.get(kind, [])) for kind in PLUGIN_DEPENDENCY_KINDS}
+    requires_install = any(declared[kind] for kind in PLUGIN_DEPENDENCY_KINDS)
+    return {
+        "declared": declared,
+        "requires_install": requires_install,
+        "managed": False,
+        "status": "unmanaged" if requires_install else "none",
+    }
+
+
+def _isolation_review(isolation: dict[str, Any]) -> dict[str, Any]:
+    mode = str(isolation.get("mode", "shared"))
+    required = bool(isolation.get("required", False))
+    return {"mode": mode, "required": required, "available": mode == "shared" or not required}
+
+
+def _enable_blockers(dependency_review: dict[str, Any], isolation_review: dict[str, Any]) -> list[str]:
+    blockers: list[str] = []
+    if dependency_review["requires_install"] and not dependency_review["managed"]:
+        blockers.append("plugin_dependencies_unmanaged")
+    if isolation_review["required"] and not isolation_review["available"]:
+        blockers.append("plugin_isolation_unavailable")
+    return blockers
 
 
 def _capabilities(manifest: PluginManifest) -> list[str]:
@@ -719,6 +826,39 @@ def _env_tuple(value: object) -> tuple[str, ...]:
     if bad:
         raise PluginError(f"Invalid environment variable names: {', '.join(bad)}")
     return env
+
+
+def _dependency_map(value: object) -> dict[str, list[str]]:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise PluginError("Plugin dependencies must be an object.")
+    unknown = sorted(str(key) for key in value if str(key) not in PLUGIN_DEPENDENCY_KINDS)
+    if unknown:
+        raise PluginError(f"Unsupported plugin dependency kinds: {', '.join(unknown)}")
+    dependencies: dict[str, list[str]] = {kind: [] for kind in PLUGIN_DEPENDENCY_KINDS}
+    for kind in PLUGIN_DEPENDENCY_KINDS:
+        raw_items = value.get(kind, [])
+        if raw_items is None:
+            raw_items = []
+        if not isinstance(raw_items, list) or not all(isinstance(item, str) for item in raw_items):
+            raise PluginError(f"Plugin dependencies.{kind} must be a list of strings.")
+        dependencies[kind] = [item.strip() for item in raw_items if item.strip()]
+    return dependencies
+
+
+def _isolation(value: object) -> dict[str, Any]:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise PluginError("Plugin isolation must be an object.")
+    mode = str(value.get("mode", "shared")).strip().lower() or "shared"
+    if mode not in {"shared", "process", "container"}:
+        raise PluginError("Plugin isolation.mode must be shared, process, or container.")
+    required = value.get("required", False)
+    if not isinstance(required, bool):
+        raise PluginError("Plugin isolation.required must be a boolean.")
+    return {"mode": mode, "required": required}
 
 
 def _dict_list(value: object, field: str) -> list[dict[str, Any]]:

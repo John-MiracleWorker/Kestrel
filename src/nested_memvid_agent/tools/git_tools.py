@@ -367,6 +367,123 @@ class GitCreateLocalBranchTool(AgentTool):
             )
 
 
+class GitLogTool(AgentTool):
+    spec = ToolSpec(
+        name="git.log",
+        description="Return recent git commits for the workspace. Read-only.",
+        parameters={
+            "type": "object",
+            "properties": {"max_count": {"type": "integer", "minimum": 1, "maximum": 50}},
+        },
+        aliases=("log",),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        max_count = max(1, min(int(arguments.get("max_count", 10)), 50))
+        try:
+            completed = subprocess.run(  # noqa: S603 - fixed read-only git command  # nosec
+                [
+                    "git",
+                    "log",
+                    f"--max-count={max_count}",
+                    "--pretty=format:%H%x1f%h%x1f%ct%x1f%an%x1f%s",
+                ],
+                cwd=context.workspace,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if completed.returncode != 0:
+                return self._result(
+                    call,
+                    success=False,
+                    content=completed.stderr,
+                    data={"returncode": completed.returncode},
+                    error="git_log_failed",
+                )
+            commits = []
+            for line in completed.stdout.splitlines():
+                full, short, timestamp, author, subject = (
+                    line.split("\x1f", maxsplit=4) + ["", "", "", "", ""]
+                )[:5]
+                commits.append(
+                    {
+                        "commit": full,
+                        "short": short,
+                        "timestamp": int(timestamp) if timestamp.isdigit() else None,
+                        "author": author,
+                        "subject": subject,
+                    }
+                )
+            return self._result(
+                call,
+                success=True,
+                content=json.dumps({"commits": commits}, indent=2),
+                data={"commits": commits, "returncode": completed.returncode},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="git_log_failed")
+
+
+class GitShowTool(AgentTool):
+    spec = ToolSpec(
+        name="git.show",
+        description="Show a bounded read-only git object, commit, or path diff from the workspace.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "rev": {"type": "string"},
+                "path": {"type": "string"},
+                "max_chars": {"type": "integer", "minimum": 1000, "maximum": 200000},
+            },
+        },
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        rev = str(arguments.get("rev", "HEAD")).strip() or "HEAD"
+        if rev.startswith("-") or "\x00" in rev:
+            return self._result(call, success=False, content="Invalid revision.", error="invalid_revision")
+        max_chars = max(1000, min(int(arguments.get("max_chars", 40_000)), 200_000))
+        command = ["git", "show", "--stat", "--patch", "--format=fuller", rev]
+        path_arg = str(arguments.get("path", "")).strip()
+        if path_arg:
+            try:
+                path = _safe_path(context.workspace, path_arg)
+                command.extend(["--", str(path.relative_to(context.workspace.resolve()))])
+            except Exception as exc:  # noqa: BLE001
+                return self._result(call, success=False, content=str(exc), error="invalid_path")
+        try:
+            completed = subprocess.run(  # noqa: S603 - fixed read-only git command  # nosec
+                command,
+                cwd=context.workspace,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if completed.returncode != 0:
+                return self._result(
+                    call,
+                    success=False,
+                    content=completed.stderr,
+                    data={"returncode": completed.returncode},
+                    error="git_show_failed",
+                )
+            truncated = len(completed.stdout) > max_chars
+            content = completed.stdout[:max_chars] + ("\n... truncated ..." if truncated else "")
+            return self._result(
+                call,
+                success=True,
+                content=content,
+                data={"returncode": completed.returncode, "truncated": truncated},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._result(call, success=False, content=str(exc), error="git_show_failed")
+
+
 class GitCommitTool(AgentTool):
     spec = ToolSpec(
         name="git.commit",

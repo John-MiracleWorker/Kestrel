@@ -196,6 +196,11 @@ def main() -> None:
     plugins_list = plugins_sub.add_parser("list")
     _add_agent_args(plugins_list)
     plugins_list.add_argument("--json", action="store_true")
+    plugins_review = plugins_sub.add_parser("review")
+    _add_agent_args(plugins_review)
+    plugins_review.add_argument("source")
+    plugins_review.add_argument("--ref")
+    plugins_review.add_argument("--json", action="store_true")
     plugins_install = plugins_sub.add_parser("install")
     _add_agent_args(plugins_install)
     plugins_install.add_argument("source")
@@ -1118,6 +1123,11 @@ def _handle_plugins_command(
         if args.plugins_cmd == "list":
             _print_plugins(manager.plugins.list_plugins(), json_output=args.json)
             return
+        if args.plugins_cmd == "review":
+            _require_plugin_install_enabled(manager.config)
+            review = manager.plugins.review(args.source, ref=args.ref)
+            _print_plugin_review(review, json_output=args.json)
+            return
         if args.plugins_cmd == "install":
             _require_plugin_install_enabled(manager.config)
             plugin = manager.plugins.install(
@@ -1210,6 +1220,19 @@ def _print_plugin(plugin: dict[str, Any], *, json_output: bool) -> None:
         print(f"warnings: {', '.join(str(item) for item in warnings)}")
     if unsupported:
         print(f"unsupported: {', '.join(str(item) for item in unsupported)}")
+
+
+def _print_plugin_review(review: dict[str, Any], *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(review, indent=2))
+        return
+    manifest = review.get("manifest", {})
+    plugin_id = manifest.get("id", "unknown") if isinstance(manifest, dict) else "unknown"
+    print(f"{plugin_id} [review]")
+    print(f"source: {review['source_url']}")
+    print(f"commit: {review['commit_sha']}")
+    blockers = [str(item) for item in review.get("enable_blockers", [])]
+    print(f"enable blockers: {', '.join(blockers) if blockers else 'none'}")
 
 
 def _wait_for_run(manager: RunManager, run_id: str) -> dict[str, Any]:

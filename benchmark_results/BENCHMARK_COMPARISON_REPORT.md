@@ -11,6 +11,7 @@
 |--------|--------|-------|-------------|
 | **Kestrel (mock)** | Memory + Agent Tasks + Error Recovery + Learning | **100% tasks, +68.5% precision, 3× faster** | All systems functional; learning mechanism validated |
 | **Kestrel (kimi-k2.6 real)** | Agent Tasks + Error Recovery + Memory | **4/4 tasks, 4/6 error recovery** | Real LLM confirms agent tasks work; error recovery drops without retry layer tuning |
+| **Kestrel + DeepSeek v4 Pro** | Coding (JS/Python) | **4/5 (80%)** | Beats Dominion by +2 tasks; only miss was provider timeout on expert Python task |
 | **OpenClaw Dominion** | Coding (JS/Python) | **2/5 (40%)** | Moderate coding ability, unreliable on complex tasks |
 | **GPT 5.5 (via OpenClaw)** | Coding (JS/Python) | **5/5 (100%)** | Strongest coding model tested |
 | **Opus / kimi-code** | Coding (JS/Python) | **4/5 (80%)** | Good but occasional bugs on expert tasks |
@@ -111,6 +112,28 @@ This benchmark tests whether Kestrel's memory enables learning across sessions.
 
 ---
 
+### 1.6 Coding Benchmark — DeepSeek v4 Pro via Ollama Cloud
+
+**Files:**
+- `benchmarks/coding_benchmark.py`
+- `benchmark_results/coding_deepseek_v4pro_aggregate.json`
+- `benchmark_results/CODING_DEEPSEEK_V4PRO_REPORT.md`
+
+| Task | Difficulty | Language | Status | Tool Rounds | Elapsed |
+|------|------------|----------|--------|-------------|---------|
+| easy-js-duration | 1 | JavaScript | ✅ PASS | 7 | 171.9s |
+| medium-js-lru | 2 | JavaScript | ✅ PASS | 8 | 142.6s |
+| hard-js-async-pool | 3 | JavaScript | ✅ PASS | 11 | 257.4s |
+| expert-js-json-patch | 4 | JavaScript | ✅ PASS | 9 | 454.9s |
+| expert-py-template-engine | 5 | Python | ❌ FAIL | 2 | 308.4s |
+| **Total** | | | **4/5 (80%)** | **37 total** | **1335.1s** |
+
+**Failure note:** `expert-py-template-engine` failed with `Provider error (TimeoutError): The read operation timed out` after `file.list` and `file.read`; no failing implementation was produced. This is a provider/model timeout, not a failed test assertion.
+
+**Comparison:** Kestrel + DeepSeek v4 Pro scored **4/5 (80%)**, beating the OpenClaw Dominion reference score of **2/5 (40%)** by **+2 tasks / +40 percentage points**.
+
+---
+
 ## 2. External Benchmarks
 
 ### 2.1 OpenClaw / Dominion — Coding Benchmark
@@ -163,12 +186,12 @@ This benchmark tests whether Kestrel's memory enables learning across sessions.
 
 1. **Real LLM error recovery** drops to 67% without retry layer tuning — kimi-k2.6 is overly cautious
 2. **Tool count sensitivity** — models vary wildly in their ability to handle 20+ tools (kimi-k2.6: excellent; gemma3: refuses)
-3. **No coding benchmark yet** — Kestrel has not been tested on hidden-test coding tasks like Dominion's
+3. **Coding benchmark provider sensitivity** — Kestrel reached 4/5 with DeepSeek v4 Pro, but kimi-k2.6 timed out on sustained coding generation
 
 ### ❌ Not Proven / Not Tested
 
 1. **Large-scale memory** — Tests used 55 docs. Behavior at 10K+ docs unknown.
-2. **Coding tasks** — No JS/Python coding benchmark for Kestrel yet
+2. **GPT 5.5-class coding model** — Kestrel has not yet been tested with the model family that scored 5/5 in the OpenClaw comparison
 3. **Multi-agent orchestration** — Kestrel is single-agent; no delegation benchmark
 4. **Comparison to Zep, Letta, Mem0** — Memory systems not tested head-to-head
 5. **Long-term learning** — Benchmarks simulate 2 sessions; behavior over 100+ sessions unknown
@@ -178,7 +201,7 @@ This benchmark tests whether Kestrel's memory enables learning across sessions.
 ## 5. Recommendations
 
 ### To make Kestrel more competitive on coding
-→ Build a hidden-test coding benchmark (JS/Python) and test Kestrel's tool-based coding ability against Dominion's results. Kestrel has `file.write`, `shell.exec`, and `test.run` tools — it may be capable of 4/5 or 5/5 with the right model.
+→ Investigate provider timeouts on long Python generation tasks and test with additional fast coding-oriented models. Kestrel already scored 4/5 with DeepSeek v4 Pro, matching Opus/kimi-code and beating Dominion's 2/5 reference.
 
 ### To improve real LLM error recovery
 → The programmatic retry layer (`RetryingRegistry`) is critical. Without it, kimi-k2.6 drops from 100% to 67% on error recovery because it refuses to retry transient failures. Ensure this layer is always active in production.

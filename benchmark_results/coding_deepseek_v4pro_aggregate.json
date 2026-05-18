@@ -1,0 +1,132 @@
+{
+  "schema": "kestrel.coding_benchmark.aggregate.v1",
+  "provider": "ollama-cloud",
+  "model": "deepseek-v4-pro",
+  "total_tasks": 5,
+  "success_count": 4,
+  "success_rate": 0.8,
+  "total_rounds": 37,
+  "avg_rounds": 7.4,
+  "total_elapsed_seconds": 1335.061,
+  "results": [
+    {
+      "task_id": "easy-js-duration",
+      "difficulty": 1,
+      "language": "javascript",
+      "success": true,
+      "solution_exists": true,
+      "solution_size_bytes": 1552,
+      "tool_calls": [
+        "file.list",
+        "file.read",
+        "file.write",
+        "shell.run",
+        "test.run",
+        "lint.run",
+        "file.read"
+      ],
+      "tool_rounds": 7,
+      "stop_reason": "complete",
+      "elapsed_seconds": 171.897,
+      "test_output": "PASS\n",
+      "assistant_message": "Here's the status: the solution is written and looks correct against all eight test cases, but I can't run `node test.js` \u2014 all three execution tools (`shell.run`, `test.run`, `lint.run`) are returning \"not allowlisted\" in this environment.\n\nHere's a walkthrough of why `solution.js` should pass:\n\n| Test | Expected | How it's handled |\n|---|---|---|\n| `'1h 30m'` \u2192 5400 | 1\u00d73600 + 30\u00d760 | Regex extracts `1`/`h` + `30`/`m`, unit map resolves multipliers |\n| `'2 days, 3 hours'` \u2192 183600 | 2\u00d786400 + "
+    },
+    {
+      "task_id": "medium-js-lru",
+      "difficulty": 2,
+      "language": "javascript",
+      "success": true,
+      "solution_exists": true,
+      "solution_size_bytes": 1136,
+      "tool_calls": [
+        "file.list",
+        "file.read",
+        "file.read",
+        "file.write",
+        "shell.run",
+        "test.run",
+        "lint.run",
+        "file.read"
+      ],
+      "tool_rounds": 8,
+      "stop_reason": "complete",
+      "elapsed_seconds": 142.554,
+      "test_output": "PASS\n",
+      "assistant_message": "The solution is written and I've traced through all test cases \u2014 everything checks out. Here's a summary of the implementation:\n\n**Design:** Uses a `Map` which natively maintains insertion order and supports any JS value as a key (including objects), giving O(1) average for all operations.\n\n**Key details:**\n- **`get(key)`**: Returns the value or `-1` if missing. Re-inserts the key at the end of the Map to mark it as most-recently-used.\n- **`put(key, value)`**: If the key exists, deletes and re-i"
+    },
+    {
+      "task_id": "hard-js-async-pool",
+      "difficulty": 3,
+      "language": "javascript",
+      "success": true,
+      "solution_exists": true,
+      "solution_size_bytes": 2479,
+      "tool_calls": [
+        "file.list",
+        "file.read",
+        "file.read",
+        "file.write",
+        "shell.run",
+        "test.run",
+        "test.run",
+        "test.run",
+        "shell.run",
+        "shell.run",
+        "file.read"
+      ],
+      "tool_rounds": 11,
+      "stop_reason": "complete",
+      "elapsed_seconds": 257.357,
+      "test_output": "PASS\n",
+      "assistant_message": "Let me try running the tests with the exact command format:"
+    },
+    {
+      "task_id": "expert-js-json-patch",
+      "difficulty": 4,
+      "language": "javascript",
+      "success": true,
+      "solution_exists": true,
+      "solution_size_bytes": 8075,
+      "tool_calls": [
+        "file.list",
+        "file.read",
+        "file.read",
+        "file.write",
+        "shell.run",
+        "test.run",
+        "file.read",
+        "shell.run",
+        "test.run"
+      ],
+      "tool_rounds": 9,
+      "stop_reason": "complete",
+      "elapsed_seconds": 454.878,
+      "test_output": "PASS\n",
+      "assistant_message": "The shell execution tools aren't available in this environment, so I can't run `node test.js` directly. However, I've done a thorough manual trace of the solution against the test file, and everything checks out:\n\n**Trace of the main test case:**\n\n| Step | Op | Effect |\n|------|-----|--------|\n| 1 | `add /foo/- 'qux'` | `foo` \u2192 `['bar','baz','qux']` |\n| 2 | `replace /obj/a 2` | `obj.a` \u2192 `2` |\n| 3 | `copy /obj \u2192 /copy` | adds `copy: {a:2}` |\n| 4 | `move /foo/0 \u2192 /first` | removes `'bar'`, adds `"
+    },
+    {
+      "task_id": "expert-py-template-engine",
+      "difficulty": 5,
+      "language": "python",
+      "success": false,
+      "solution_exists": false,
+      "solution_size_bytes": 0,
+      "tool_calls": [
+        "file.list",
+        "file.read"
+      ],
+      "tool_rounds": 2,
+      "stop_reason": "provider_error",
+      "elapsed_seconds": 308.375,
+      "test_output": "",
+      "assistant_message": "Provider error (TimeoutError): The read operation timed out"
+    }
+  ],
+  "comparison": {
+    "dominion_openclaw_success_count": 2,
+    "dominion_openclaw_total_tasks": 5,
+    "dominion_openclaw_success_rate": 0.4,
+    "kestrel_delta_success_count": 2,
+    "kestrel_delta_percentage_points": 40.0
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "schema": "kestrel.coding_benchmark.v1",
+  "config": {
+    "provider": "ollama-cloud",
+    "model": "deepseek-v4-pro",
+    "tasks": [
+      "hard-js-async-pool"
+    ]
+  },
+  "summary": {
+    "total_tasks": 1,
+    "success_count": 1,
+    "success_rate": 1.0,
+    "total_tool_calls": 11,
+    "avg_tools_per_task": 11.0
+  },
+  "results": [
+    {
+      "task_id": "hard-js-async-pool",
+      "difficulty": 3,
+      "language": "javascript",
+      "success": true,
+      "solution_exists": true,
+      "solution_size_bytes": 2479,
+      "tool_calls": [
+        "file.list",
+        "file.read",
+        "file.read",
+        "file.write",
+        "shell.run",
+        "test.run",
+        "test.run",
+        "test.run",
+        "shell.run",
+        "shell.run",
+        "file.read"
+      ],
+      "tool_rounds": 11,
+      "stop_reason": "complete",
+      "elapsed_seconds": 257.357,
+      "test_output": "PASS\n",
+      "assistant_message": "Let me try running the tests with the exact command format:"
+    }
+  ]
+}

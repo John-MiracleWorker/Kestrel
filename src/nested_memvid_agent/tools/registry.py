@@ -48,6 +48,9 @@ class ToolRegistry:
         if tool is None:
             return _failure(call, content=f"Unknown tool: {call.name}", error="unknown_tool")
 
+        if not context.tool_specs:
+            context.tool_specs = tuple(self.specs())
+
         arguments = dict(call.arguments)
         if getattr(tool, "needs_call_id", False):
             arguments.setdefault("_tool_call_id", call.id)
@@ -166,6 +169,7 @@ _ENABLEMENT_BY_TOOL = {
     "repair.rollback": "allow_file_write",
     "codex.exec": "allow_codex_cli",
     "skill.install": "allow_file_write",
+    "plugin.review": "allow_plugin_install",
     "plugin.install": "allow_plugin_install",
     "git.commit": "allow_git_commit",
     "memory.import": "allow_memory_import",

@@ -58,6 +58,7 @@ import type {
   OnboardingProfile,
   PersonaPreset,
   Plugin,
+  PluginReviewReport,
   ProviderModelCatalog,
   Run,
   RunTrace,
@@ -68,6 +69,7 @@ import type {
   Session,
   SecretRef,
   Skill,
+  SkillDiscoveryReport,
   TaskGraph,
   TaskNode,
   ThreadSummary,
@@ -326,6 +328,10 @@ export function App() {
   const [toolName, setToolName] = useState("");
   const [toolArgs, setToolArgs] = useState("{}");
   const [toolResult, setToolResult] = useState<Record<string, unknown> | null>(null);
+  const [toolFilter, setToolFilter] = useState("");
+  const [toolSourceFilter, setToolSourceFilter] = useState("all");
+  const [toolRiskFilter, setToolRiskFilter] = useState("all");
+  const [toolEnabledFilter, setToolEnabledFilter] = useState("all");
 
   const [mcpId, setMcpId] = useState("");
   const [mcpName, setMcpName] = useState("");
@@ -345,10 +351,15 @@ export function App() {
   const [skillManifest, setSkillManifest] = useState('{\n  "id": "local-skill",\n  "name": "Local Skill",\n  "description": "Describe what this skill does.",\n  "risk": "medium"\n}');
   const [skillInstructions, setSkillInstructions] = useState("");
   const [skillResult, setSkillResult] = useState<Record<string, unknown> | null>(null);
+  const [skillDiscovery, setSkillDiscovery] = useState<SkillDiscoveryReport | null>(null);
+  const [skillDiscovering, setSkillDiscovering] = useState(false);
   const [pluginSource, setPluginSource] = useState("");
   const [pluginRef, setPluginRef] = useState("");
   const [pluginEnable, setPluginEnable] = useState(false);
   const [pluginResult, setPluginResult] = useState<Record<string, unknown> | null>(null);
+  const [pluginReview, setPluginReview] = useState<PluginReviewReport | null>(null);
+  const [pluginReviewSource, setPluginReviewSource] = useState("");
+  const [pluginReviewRef, setPluginReviewRef] = useState<string | null>(null);
 
   const [channelId, setChannelId] = useState("webhook");
   const [channelProvider, setChannelProvider] = useState("webhook");
@@ -458,6 +469,34 @@ export function App() {
     () => tools.filter((tool) => isToolEnabled(tool, toolPermissions)).length,
     [tools, toolPermissions]
   );
+  const filteredTools = useMemo(
+    () =>
+      tools.filter((tool) => {
+        const enabled = isToolEnabled(tool, toolPermissions);
+        const query = toolFilter.trim().toLowerCase();
+        const haystack = [
+          tool.name,
+          tool.description,
+          tool.source,
+          tool.risk,
+          ...(tool.capabilities ?? [])
+        ].join(" ").toLowerCase();
+        if (query && !haystack.includes(query)) return false;
+        if (toolSourceFilter !== "all" && tool.source !== toolSourceFilter) return false;
+        if (toolRiskFilter !== "all" && tool.risk !== toolRiskFilter) return false;
+        if (toolEnabledFilter === "enabled" && !enabled) return false;
+        if (toolEnabledFilter === "disabled" && enabled) return false;
+        return true;
+      }),
+    [tools, toolPermissions, toolFilter, toolSourceFilter, toolRiskFilter, toolEnabledFilter]
+  );
+  const toolSources = useMemo(() => uniqueStrings(tools.map((tool) => tool.source)), [tools]);
+  const toolRisks = useMemo(() => uniqueStrings(tools.map((tool) => tool.risk)), [tools]);
+  const pluginSourceValue = pluginSource.trim();
+  const pluginRefValue = pluginRef.trim() || null;
+  const reviewedCurrentPlugin =
+    Boolean(pluginReview) && pluginReviewSource === pluginSourceValue && pluginReviewRef === pluginRefValue;
+  const pluginEnableBlockers = reviewedCurrentPlugin ? pluginReview?.enable_blockers ?? [] : [];
 
   function routeToSection(section: "chat" | "advanced" | "settings") {
     setActiveSection(section);
@@ -471,7 +510,7 @@ export function App() {
   function jumpToAdvanced(anchor: string) {
     routeToSection("advanced");
     window.setTimeout(() => {
-      document.getElementById(anchor)?.scrollIntoView({ block: "start", behavior: "smooth" });
+      scrollToElement(anchor);
     }, 0);
   }
 
@@ -1037,9 +1076,18 @@ export function App() {
 
   async function discoverSkills() {
     await guarded(async () => {
-      await postJson("/api/skills/discover");
-      await refreshSummary();
-    }, "Skills discovered.");
+      setSkillDiscovering(true);
+      try {
+        const result = await postJson<SkillDiscoveryReport>("/api/skills/discover");
+        setSkillDiscovery(result);
+        setSkillResult(result as unknown as Record<string, unknown>);
+        setSkills(result.skills);
+        await refreshSummary();
+        setNotice(result.message);
+      } finally {
+        setSkillDiscovering(false);
+      }
+    });
   }
 
   async function installSkill(event: FormEvent) {
@@ -1069,8 +1117,27 @@ export function App() {
     });
   }
 
-  async function installPlugin(event: FormEvent) {
+  async function reviewPlugin(event: FormEvent) {
     event.preventDefault();
+    await guarded(async () => {
+      const source = pluginSource.trim();
+      const ref = pluginRef.trim() || null;
+      const result = await postJson<PluginReviewReport>("/api/plugins/review", {
+        source,
+        ref
+      });
+      setPluginReview(result);
+      setPluginReviewSource(source);
+      setPluginReviewRef(ref);
+      setPluginResult(result as unknown as Record<string, unknown>);
+      if (result.enable_blockers.length > 0) {
+        setPluginEnable(false);
+      }
+      setNotice(result.enable_blockers.length ? "Plugin review found enable blockers." : "Plugin review complete.");
+    });
+  }
+
+  async function installPlugin() {
     await guarded(async () => {
       const result = await postJson<Record<string, unknown>>("/api/plugins/install", {
         source: pluginSource,
@@ -1484,7 +1551,7 @@ export function App() {
                 ["channels", "Channels"],
                 ["observability", "Observability"]
               ].map(([id, label]) => (
-                <button className="tag ghost" type="button" key={id} onClick={() => document.getElementById(id)?.scrollIntoView({ block: "start", behavior: "smooth" })}>
+                <button className="tag ghost" type="button" key={id} onClick={() => scrollToElement(id)}>
                   {label}
                 </button>
               ))}
@@ -1916,8 +1983,33 @@ export function App() {
               </Field>
               <button type="submit" disabled={!toolName}>Invoke Tool</button>
             </form>
-            <div className="tool-grid">
-              {tools.map((tool) => {
+            <div className="field-row compact">
+              <Field label="Filter tools">
+                <input value={toolFilter} onChange={(event) => setToolFilter(event.target.value)} />
+              </Field>
+              <Field label="Tool source">
+                <select value={toolSourceFilter} onChange={(event) => setToolSourceFilter(event.target.value)}>
+                  <option value="all">All sources</option>
+                  {toolSources.map((source) => <option key={source} value={source}>{source}</option>)}
+                </select>
+              </Field>
+              <Field label="Tool risk">
+                <select value={toolRiskFilter} onChange={(event) => setToolRiskFilter(event.target.value)}>
+                  <option value="all">All risks</option>
+                  {toolRisks.map((risk) => <option key={risk} value={risk}>{risk}</option>)}
+                </select>
+              </Field>
+              <Field label="Tool enabled state">
+                <select value={toolEnabledFilter} onChange={(event) => setToolEnabledFilter(event.target.value)}>
+                  <option value="all">All states</option>
+                  <option value="enabled">Enabled</option>
+                  <option value="disabled">Disabled</option>
+                </select>
+              </Field>
+            </div>
+            <InlineMeta items={[`${filteredTools.length}/${tools.length} tools shown`]} />
+            <div className="tool-grid" aria-label="Tool cards">
+              {filteredTools.length === 0 ? <EmptyState>No tools match the current filters.</EmptyState> : filteredTools.map((tool) => {
                 const enabled = isToolEnabled(tool, toolPermissions);
                 return (
                   <button
@@ -2066,9 +2158,28 @@ export function App() {
         </section>
 
         <section id="skills" className="section">
-          <Panel title="Skills" icon={<Sparkles size={19} />} actions={<button type="button" onClick={discoverSkills}>Discover</button>}>
+          <Panel
+            title="Skills"
+            icon={<Sparkles size={19} />}
+            actions={<button type="button" onClick={discoverSkills} disabled={skillDiscovering}>{skillDiscovering ? "Discovering" : "Discover"}</button>}
+          >
+            {skillDiscovery ? (
+              <div className="data-row compact">
+                <strong>{skillDiscovery.message}</strong>
+                <InlineMeta
+                  items={[
+                    skillDiscovery.skills_dir,
+                    `${skillDiscovery.discovered_count} discovered`,
+                    `${skillDiscovery.enabled_count} enabled`,
+                    `${skillDiscovery.validation_errors.length} rejected`
+                  ]}
+                />
+              </div>
+            ) : null}
             <div className="list">
-              {skills.map((skill) => (
+              {skills.length === 0 ? (
+                <EmptyState>No discovered skills in the registry.</EmptyState>
+              ) : skills.map((skill) => (
                 <div className="data-row" key={skill.id}>
                   <button type="button" className="link-button" onClick={() => setSkillSelection(skill.id)}>{skill.name}</button>
                   <InlineMeta items={[skill.id, skill.enabled ? "enabled" : "disabled"]} />
@@ -2077,6 +2188,7 @@ export function App() {
                 </div>
               ))}
             </div>
+            {skillDiscovery?.validation_errors.length ? <JsonBlock value={skillDiscovery.validation_errors} maxHeight="180px" /> : null}
           </Panel>
           <Panel title="Run or Install Skill" icon={<Bot size={19} />}>
             <form onSubmit={runSkill} className="stack-form">
@@ -2097,22 +2209,50 @@ export function App() {
             {skillResult && <JsonBlock value={skillResult} maxHeight="360px" />}
           </Panel>
           <Panel title="Plugins" icon={<GitBranch size={19} />}>
-            <form onSubmit={installPlugin} className="inline-form">
+            <form onSubmit={reviewPlugin} className="inline-form">
               <Field label="GitHub source"><input value={pluginSource} onChange={(event) => setPluginSource(event.target.value)} /></Field>
               <Field label="Ref"><input value={pluginRef} onChange={(event) => setPluginRef(event.target.value)} /></Field>
               <label className="check-row">
-                <input type="checkbox" checked={pluginEnable} onChange={(event) => setPluginEnable(event.target.checked)} />
+                <input
+                  type="checkbox"
+                  checked={pluginEnable}
+                  disabled={!reviewedCurrentPlugin || pluginEnableBlockers.length > 0}
+                  onChange={(event) => setPluginEnable(event.target.checked)}
+                />
                 <span>Enable after install</span>
               </label>
-              <button type="submit" disabled={!pluginSource.trim()}>Install</button>
+              <button type="submit" disabled={!pluginSource.trim()}>Review</button>
+              <button
+                type="button"
+                disabled={!pluginSource.trim() || !reviewedCurrentPlugin || (pluginEnable && pluginEnableBlockers.length > 0)}
+                onClick={() => installPlugin().catch(reportError)}
+              >
+                Install
+              </button>
             </form>
+            {reviewedCurrentPlugin && pluginReview && (
+              <div className="data-row">
+                <strong>Review: {pluginReviewName(pluginReview)}</strong>
+                <InlineMeta items={[String(pluginReview.risk_report.risk ?? "medium"), pluginReview.commit_sha.slice(0, 12)]} />
+                <p>Dependencies: {pluginDependencySummary(pluginReview)}</p>
+                <p>Isolation: {pluginIsolationSummary(pluginReview)}</p>
+                {pluginEnableBlockers.length > 0 && <InlineMeta items={pluginEnableBlockers} />}
+              </div>
+            )}
             {plugins.map((plugin) => (
               <div className="data-row" key={plugin.id}>
                 <strong>{plugin.name}</strong>
                 <InlineMeta items={[plugin.id, plugin.format, plugin.install_status, plugin.enabled ? "enabled" : "disabled"]} />
                 <p>{plugin.description}</p>
+                {pluginBlockers(plugin).length > 0 && <InlineMeta items={pluginBlockers(plugin)} />}
                 <div className="page-actions">
-                  <button type="button" onClick={() => pluginAction(plugin, plugin.enabled ? "disable" : "enable")}>{plugin.enabled ? "Disable" : "Enable"}</button>
+                  <button
+                    type="button"
+                    disabled={!plugin.enabled && pluginBlockers(plugin).length > 0}
+                    onClick={() => pluginAction(plugin, plugin.enabled ? "disable" : "enable")}
+                  >
+                    {plugin.enabled ? "Disable" : "Enable"}
+                  </button>
                   <button type="button" onClick={() => pluginAction(plugin, "update")}>Update</button>
                   <button type="button" className="btn danger" onClick={() => pluginAction(plugin, "remove")}>Remove</button>
                 </div>
@@ -2960,6 +3100,38 @@ function scoreLabel(value: unknown): string {
   return typeof value === "number" ? value.toFixed(2) : "";
 }
 
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values.filter((value) => value.trim()).sort()));
+}
+
+function pluginReviewName(review: PluginReviewReport): string {
+  return String(review.manifest.id ?? review.source_url);
+}
+
+function pluginDependencySummary(review: PluginReviewReport): string {
+  const declared = review.dependency_review.declared;
+  if (!declared || typeof declared !== "object" || Array.isArray(declared)) return "none";
+  const parts = Object.entries(declared).flatMap(([kind, value]) =>
+    stringArray(value).map((item) => `${kind}:${item}`)
+  );
+  return parts.length ? parts.join(", ") : "none";
+}
+
+function pluginIsolationSummary(review: PluginReviewReport): string {
+  const mode = String(review.isolation_review.mode ?? "shared");
+  const required = Boolean(review.isolation_review.required);
+  const available = Boolean(review.isolation_review.available);
+  return `${mode}${required ? " required" : ""}${available ? "" : " unavailable"}`;
+}
+
+function pluginBlockers(plugin: Plugin): string[] {
+  return stringArray(plugin.risk_report.enable_blockers);
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.map((item) => String(item)).filter(Boolean) : [];
+}
+
 function createThreadId(): string {
   return `thread_${crypto.randomUUID()}`;
 }
@@ -2967,6 +3139,13 @@ function createThreadId(): string {
 function sectionFromHash(hash: string): "chat" | "advanced" | "settings" | null {
   const normalized = hash.replace(/^#/, "").toLowerCase();
   return normalized === "chat" || normalized === "advanced" || normalized === "settings" ? normalized : null;
+}
+
+function scrollToElement(id: string) {
+  const target = document.getElementById(id);
+  if (typeof target?.scrollIntoView === "function") {
+    target.scrollIntoView({ block: "start", behavior: "smooth" });
+  }
 }
 
 function runtimeSettingsFrom(config: RuntimeConfig | null): Record<string, unknown> {

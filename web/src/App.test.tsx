@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import axe from "axe-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import type { Approval, Run, SecretRef, Session, TraceEvent } from "./types";
+import type { Approval, Run, SecretRef, Session, Skill, Tool, TraceEvent } from "./types";
 
 const baseRun: Run = {
   run_id: "run_1",
@@ -58,6 +58,8 @@ let sessions: Session[];
 let sessionRuns: Record<string, Run[]>;
 let approvals: Approval[];
 let secrets: SecretRef[];
+let toolsPayload: Tool[];
+let skillsPayload: Skill[];
 let onboardingProfile: Record<string, unknown> | null;
 let eventSources: MockEventSource[];
 let eventId: number;
@@ -94,6 +96,39 @@ describe("App", () => {
     };
     approvals = [pendingApproval];
     secrets = [];
+    toolsPayload = [
+      {
+        name: "memory.search",
+        description: "Search nested memory.",
+        risk: "low",
+        requires_approval: false,
+        source: "builtin",
+        capabilities: ["memory"],
+        enabled: true,
+        enablement_flag: null
+      },
+      {
+        name: "shell.run",
+        description: "Run an allowlisted shell command.",
+        risk: "high",
+        requires_approval: true,
+        source: "builtin",
+        capabilities: [],
+        enabled: false,
+        enablement_flag: "allow_shell"
+      },
+      {
+        name: "web.search",
+        description: "Search outside context.",
+        risk: "medium",
+        requires_approval: false,
+        source: "builtin",
+        capabilities: ["web"],
+        enabled: false,
+        enablement_flag: "allow_web"
+      }
+    ];
+    skillsPayload = [];
     onboardingProfile = {
       schema_version: "kestrel_onboarding_profile.v1",
       setup_complete: true,
@@ -400,6 +435,66 @@ describe("App", () => {
     expect(await screen.findByText("Settings saved and applied to new runs.")).toBeInTheDocument();
   });
 
+  it("reports skills discovery results instead of making discover look idle", async () => {
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Discover" }));
+
+    expect(await screen.findByText("No skill capsules found in .nest/skills.")).toBeInTheDocument();
+    expect(screen.getByText(/"discovered_count": 0/)).toBeInTheDocument();
+  });
+
+  it("reviews plugins before install and surfaces enable blockers", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+
+    fireEvent.change(screen.getByLabelText("GitHub source"), { target: { value: "owner/repo" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+
+    expect(await screen.findByText("Review: reviewed")).toBeInTheDocument();
+    expect(screen.getByText(/python:requests>=2/)).toBeInTheDocument();
+    expect(screen.getByText(/container required unavailable/)).toBeInTheDocument();
+    expect(screen.getByText("plugin_dependencies_unmanaged")).toBeInTheDocument();
+    expect(screen.getByText("plugin_isolation_unavailable")).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /enable after install/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Install" })).toBeEnabled();
+
+    await waitFor(() => {
+      const reviewCall = fetchSpy.mock.calls.find(([path, init]) => path === "/api/plugins/review" && init?.method === "POST");
+      expect(reviewCall).toBeDefined();
+      expect(JSON.parse(String(reviewCall?.[1]?.body ?? "{}"))).toEqual({
+        source: "owner/repo",
+        ref: null
+      });
+    });
+  });
+
+  it("filters tool cards by name and enabled state", async () => {
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+
+    const grid = await screen.findByLabelText("Tool cards");
+    expect(within(grid).getByText("memory.search")).toBeInTheDocument();
+    expect(within(grid).getByText("shell.run")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Filter tools"), { target: { value: "memory" } });
+    expect(within(grid).getByText("memory.search")).toBeInTheDocument();
+    expect(within(grid).queryByText("shell.run")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Filter tools"), { target: { value: "" } });
+    fireEvent.change(screen.getByLabelText("Tool enabled state"), { target: { value: "disabled" } });
+    expect(within(grid).getByText("shell.run")).toBeInTheDocument();
+    expect(within(grid).getByText("web.search")).toBeInTheDocument();
+    expect(within(grid).queryByText("memory.search")).not.toBeInTheDocument();
+  });
+
   it("fetches provider model names when the provider changes", async () => {
     const fetchSpy = vi.mocked(fetch);
     render(<App />);
@@ -612,6 +707,38 @@ async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<
       memory: { success: true, data: { record_id: "self_profile_1" } }
     });
   }
+  if (path === "/api/skills/discover" && init?.method === "POST") {
+    return jsonResponse({
+      skills: skillsPayload,
+      discovered_count: 0,
+      enabled_count: 0,
+      skills_dir: ".nest/skills",
+      validation_errors: [],
+      message: "No skill capsules found in .nest/skills."
+    });
+  }
+  if (path === "/api/plugins/review" && init?.method === "POST") {
+    return jsonResponse({
+      source_url: "https://github.com/owner/repo",
+      source_ref: null,
+      commit_sha: "a".repeat(40),
+      manifest: { id: "reviewed", name: "Reviewed Plugin" },
+      capabilities: ["plugin", "skill"],
+      risk_report: {
+        enable_blockers: ["plugin_dependencies_unmanaged", "plugin_isolation_unavailable"]
+      },
+      dependency_review: {
+        declared: { python: ["requests>=2"], node: [], system: [] },
+        requires_install: true,
+        managed: false,
+        status: "unmanaged"
+      },
+      isolation_review: { mode: "container", required: true, available: false },
+      enable_blockers: ["plugin_dependencies_unmanaged", "plugin_isolation_unavailable"],
+      warnings: [],
+      unsupported_features: []
+    });
+  }
   return jsonResponse(payloadFor(path));
 }
 
@@ -622,9 +749,9 @@ function payloadFor(path: string): unknown {
   if (sessionMatch) return sessionRuns[decodeURIComponent(sessionMatch[1])] ?? [];
   if (path === "/api/approvals?status=pending") return approvals;
   if (path === "/api/approvals") return approvals;
-  if (path === "/api/tools") return [];
+  if (path === "/api/tools") return toolsPayload;
   if (path === "/api/mcp/servers") return [];
-  if (path === "/api/skills") return [];
+  if (path === "/api/skills") return skillsPayload;
   if (path === "/api/plugins") return [];
   if (path === "/api/channels") return [];
   if (path === "/api/secrets") return secrets;

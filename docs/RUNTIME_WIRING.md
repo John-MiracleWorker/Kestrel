@@ -155,7 +155,7 @@ The local-only git lane includes `git.create_local_branch` for approval-gated br
 
 `web.search` and `web.fetch` are disabled unless `allow_web` is enabled. They are read-only context tools; `web.fetch` rejects private, local, link-local, multicast, reserved, and unspecified addresses and applies timeout/byte limits.
 
-The plugin registry can fetch public GitHub repositories and materialize plugin-declared skills/MCP servers. CLI/API plugin install, update, enable, and sync/materialization routes require `NEST_AGENT_ALLOW_PLUGIN_INSTALL=true` or `--allow-plugin-install`. Agent-initiated `plugin.install` uses the same enablement gate plus exact-call approval, and installed plugins remain disabled unless explicitly enabled.
+The plugin registry can fetch public GitHub repositories and materialize plugin-declared skills/MCP servers. CLI/API plugin review, install, update, enable, and sync/materialization routes require `NEST_AGENT_ALLOW_PLUGIN_INSTALL=true` or `--allow-plugin-install`. Review returns provenance, dependency, isolation, warning, unsupported-feature, and enable-blocker metadata without installing or executing plugin code. Agent-initiated `plugin.review` and `plugin.install` use the same enablement gate plus exact-call approval, and installed plugins remain disabled unless explicitly enabled. Plugins with unmanaged declared dependencies or required unavailable isolation can be installed disabled but cannot be enabled.
 
 ## Memory Wiring
 

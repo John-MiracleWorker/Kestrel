@@ -25,6 +25,7 @@ class ToolContext:
     approval_handler: ApprovalHandler | None = None
     approved_tool_call_ids: frozenset[str] = frozenset()
     approved_tool_call_arguments: Mapping[str, dict[str, Any]] | None = None
+    tool_specs: tuple[ToolSpec, ...] = ()
 
 
 class AgentTool(ABC):

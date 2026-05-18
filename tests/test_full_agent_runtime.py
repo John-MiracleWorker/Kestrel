@@ -1077,7 +1077,12 @@ def test_server_exposes_local_operator_api_parity(tmp_path: Path, monkeypatch: A
     assert mcp_updated.status_code == 200
     assert mcp_updated.json()["name"] == "Operator Static"
 
-    assert client.post("/api/skills/discover").status_code == 200
+    discovered = client.post("/api/skills/discover")
+    assert discovered.status_code == 200
+    assert discovered.json()["discovered_count"] == 1
+    assert discovered.json()["enabled_count"] == 1
+    assert discovered.json()["skills_dir"] == str(config.skills_dir)
+    assert discovered.json()["validation_errors"] == []
     skill = client.get("/api/skills/review")
     assert skill.status_code == 200
     assert skill.json()["manifest"]["validation"]["ok"] is True
@@ -1232,6 +1237,66 @@ def test_api_plugin_install_enable_update_require_plugin_install_flag(tmp_path: 
     assert update.status_code == 403
     assert not (tmp_path / "plugins" / "api-blocked").exists()
     assert state.get_plugin("existing")["enabled"] is False
+
+
+def test_api_plugin_review_and_enable_blockers(tmp_path: Path, monkeypatch: Any) -> None:
+    from fastapi.testclient import TestClient
+
+    plugin_repo = tmp_path / "plugin-repo"
+    plugin_repo.mkdir()
+    (plugin_repo / "kestrel.plugin.json").write_text(
+        json.dumps(
+            {
+                "id": "reviewed",
+                "name": "Reviewed Plugin",
+                "description": "Review before install.",
+                "dependencies": {"python": ["requests>=2"]},
+                "isolation": {"mode": "container", "required": True},
+                "skills": [{"id": "hello", "description": "Hello.", "instructions": "Hello."}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_fetch(self: object, source: object, destination: Path, ref: str | None = None) -> str:
+        del self, source, ref
+        shutil.copytree(plugin_repo, destination)
+        return "e" * 40
+
+    monkeypatch.setattr("nested_memvid_agent.plugin_manager.GitPluginFetcher.fetch", fake_fetch)
+    config = AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        state_path=tmp_path / "state.db",
+        skills_dir=tmp_path / "skills",
+        plugins_dir=tmp_path / "plugins",
+        workspace=tmp_path,
+        allow_plugin_install=True,
+    )
+    client = TestClient(create_app(config))
+
+    review = client.post("/api/plugins/review", json={"source": "owner/repo", "ref": "main"})
+
+    assert review.status_code == 200
+    assert review.json()["source_ref"] == "main"
+    assert review.json()["dependency_review"]["declared"]["python"] == ["requests>=2"]
+    assert review.json()["enable_blockers"] == [
+        "plugin_dependencies_unmanaged",
+        "plugin_isolation_unavailable",
+    ]
+    with pytest.raises(KeyError):
+        AgentStateStore(config.state_path).get_plugin("reviewed")
+
+    installed = client.post("/api/plugins/install", json={"source": "owner/repo"})
+    assert installed.status_code == 200
+    assert installed.json()["enabled"] is False
+
+    enabled = client.post("/api/plugins/reviewed/enable")
+    assert enabled.status_code == 400
+    assert "enable blocked" in enabled.json()["detail"]
 
 
 def test_api_mcp_invoke_uses_unified_approval_gate(tmp_path: Path) -> None:

@@ -40,6 +40,22 @@ def _remote_mutation_violation(command: list[str]) -> str | None:
     return None
 
 
+def _is_python_executable_name(name: str) -> bool:
+    if name in {"python", "python3"}:
+        return True
+    suffix = name.removeprefix("python")
+    return bool(suffix) and suffix[0].isdigit() and all(part.isdigit() for part in suffix.split("."))
+
+
+def _is_allowlisted_command(command: list[str], allowed_first_tokens: set[str]) -> bool:
+    if not command:
+        return False
+    executable = Path(command[0]).name.lower()
+    if executable in allowed_first_tokens:
+        return True
+    return "python" in allowed_first_tokens and _is_python_executable_name(executable)
+
+
 class ShellRunTool(AgentTool):
     spec = ToolSpec(
         name="shell.run",
@@ -89,7 +105,7 @@ class ShellRunTool(AgentTool):
                     "allow_remote_mutation": context.config.allow_remote_mutation,
                 },
             )
-        if not command or Path(command[0]).name not in self.allowed_first_tokens:
+        if not _is_allowlisted_command(command, self.allowed_first_tokens):
             return self._result(
                 call,
                 success=False,
@@ -302,7 +318,7 @@ class TestRunTool(AgentTool):
                 call, success=False, content="command must be list[str]", error="bad_command"
             )
         command = list(command_raw)
-        if not command or Path(command[0]).name not in self.allowed_first_tokens:
+        if not _is_allowlisted_command(command, self.allowed_first_tokens):
             return self._result(
                 call,
                 success=False,
@@ -364,7 +380,7 @@ class LintRunTool(AgentTool):
                 call, success=False, content="command must be list[str]", error="bad_command"
             )
         command = list(command_raw)
-        if not command or Path(command[0]).name not in self.allowed_first_tokens:
+        if not _is_allowlisted_command(command, self.allowed_first_tokens):
             return self._result(
                 call,
                 success=False,

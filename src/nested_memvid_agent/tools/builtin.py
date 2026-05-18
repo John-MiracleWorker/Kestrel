@@ -37,12 +37,22 @@ from .command_tools import (
     TestRunTool,
 )
 from .diagnosis_tools import DiagnosisClassifyTool, DiagnosisRecallTool
+from .discovery_tools import (
+    McpRegistryTool,
+    PluginRegistryTool,
+    ProjectScriptsTool,
+    SkillDiscoverTool,
+    SkillInspectTool,
+    ToolRegistryTool,
+)
 from .git_tools import (
     GitBranchTool,
     GitCommitTool,
     GitCreateLocalBranchTool,
     GitDiffTool,
     GitExportPatchTool,
+    GitLogTool,
+    GitShowTool,
     GitStatusTool,
 )
 from .registry import ToolRegistry
@@ -62,6 +72,8 @@ from .validation_helpers import (
 )
 from .web_tools import WebFetchTool, WebSearchTool
 from .workspace_tools import (
+    FileStatTool,
+    FindFilesTool,
     ListFilesTool,
     ReadFileTool,
     RepoMapTool,
@@ -1247,6 +1259,46 @@ class PluginInstallTool(AgentTool):
             )
 
 
+class PluginReviewTool(AgentTool):
+    spec = ToolSpec(
+        name="plugin.review",
+        description="Review a public GitHub plugin repo without installing it. Requires plugin-install enablement and exact approval.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "source": {"type": "string"},
+                "ref": {"type": "string"},
+            },
+            "required": ["source"],
+        },
+        risk="high",
+        requires_approval=True,
+        capabilities=("plugin-review", "github", "provenance", "read-only"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        source = str(arguments.get("source", "")).strip()
+        if not source:
+            return self._result(
+                call, success=False, content="source is required", error="missing_source"
+            )
+        state = AgentStateStore(context.config.state_path)
+        manager = PluginManager(context.config.plugins_dir, state)
+        try:
+            review = manager.review(
+                source,
+                ref=str(arguments["ref"]).strip() if arguments.get("ref") else None,
+            )
+            return self._result(
+                call, success=True, content=json.dumps(review, indent=2), data=review
+            )
+        except Exception as exc:  # noqa: BLE001 - plugin review boundary reports structured failure
+            return self._result(
+                call, success=False, content=str(exc), error="plugin_review_failed"
+            )
+
+
 class SelfInspectTool(AgentTool):
     spec = ToolSpec(
         name="self.inspect",
@@ -1480,6 +1532,12 @@ class SelfProposeChangeTool(AgentTool):
 
 def build_default_tools() -> ToolRegistry:
     registry = ToolRegistry()
+    registry.register(ToolRegistryTool())
+    registry.register(SkillDiscoverTool())
+    registry.register(SkillInspectTool())
+    registry.register(PluginRegistryTool())
+    registry.register(McpRegistryTool())
+    registry.register(ProjectScriptsTool())
     registry.register(DiagnosisClassifyTool())
     registry.register(DiagnosisRecallTool())
     registry.register(RepairPrepareTool())
@@ -1504,6 +1562,8 @@ def build_default_tools() -> ToolRegistry:
     registry.register(MemoryConflictsTool())
     registry.register(ListFilesTool())
     registry.register(ReadFileTool())
+    registry.register(FindFilesTool())
+    registry.register(FileStatTool())
     registry.register(WriteFileTool())
     registry.register(ShellRunTool())
     registry.register(CodexExecTool())
@@ -1517,6 +1577,8 @@ def build_default_tools() -> ToolRegistry:
     registry.register(GitExportPatchTool())
     registry.register(GitBranchTool())
     registry.register(GitCreateLocalBranchTool())
+    registry.register(GitLogTool())
+    registry.register(GitShowTool())
     registry.register(GitCommitTool())
     registry.register(MemvidVerifyTool())
     registry.register(MemvidDoctorTool())
@@ -1530,6 +1592,7 @@ def build_default_tools() -> ToolRegistry:
     registry.register(MemoryExportTool())
     registry.register(MemoryImportTool())
     registry.register(SkillInstallTool())
+    registry.register(PluginReviewTool())
     registry.register(PluginInstallTool())
     return registry
 

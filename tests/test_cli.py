@@ -256,6 +256,12 @@ def test_plugins_subcommands_install_list_and_toggle(
         str(tmp_path / "memory"),
         "--allow-plugin-install",
     ]
+    monkeypatch.setattr(sys, "argv", ["nest-agent", "plugins", "review", "owner/repo", *common_args, "--json"])
+    main()
+    review = json.loads(capsys.readouterr().out)
+    assert review["manifest"]["id"] == "clip"
+    assert review["enable_blockers"] == []
+
     monkeypatch.setattr(sys, "argv", ["nest-agent", "plugins", "install", "owner/repo", *common_args])
     main()
     assert "clip [not enabled]" in capsys.readouterr().out

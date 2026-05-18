@@ -151,6 +151,15 @@ export type Skill = {
   updated_at?: string;
 };
 
+export type SkillDiscoveryReport = {
+  skills: Skill[];
+  discovered_count: number;
+  enabled_count: number;
+  skills_dir: string;
+  validation_errors: Array<Record<string, unknown>>;
+  message: string;
+};
+
 export type Plugin = {
   id: string;
   name: string;
@@ -167,6 +176,20 @@ export type Plugin = {
   format: string;
   created_at: string;
   updated_at: string;
+};
+
+export type PluginReviewReport = {
+  source_url: string;
+  source_ref?: string | null;
+  commit_sha: string;
+  manifest: Record<string, unknown>;
+  capabilities: string[];
+  risk_report: Record<string, unknown>;
+  dependency_review: Record<string, unknown>;
+  isolation_review: Record<string, unknown>;
+  enable_blockers: string[];
+  warnings: string[];
+  unsupported_features: string[];
 };
 
 export type Channel = {

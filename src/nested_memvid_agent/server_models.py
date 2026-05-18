@@ -207,6 +207,11 @@ class PluginInstallRequest(BaseModel):
     overwrite: bool = False
 
 
+class PluginReviewRequest(BaseModel):
+    source: str
+    ref: str | None = None
+
+
 class PluginUpdateRequest(BaseModel):
     ref: str | None = None
 

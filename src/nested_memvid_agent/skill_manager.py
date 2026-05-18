@@ -78,6 +78,32 @@ class SkillManager:
             found.append(self.state.upsert_skill(_capsule_to_state(capsule)))
         return found
 
+    def discover_report(self) -> dict[str, Any]:
+        skills = self.discover()
+        errors = list(self.validation_errors)
+        discovered_count = len(skills)
+        enabled_count = sum(1 for skill in skills if bool(skill.get("enabled", False)))
+        rejected_count = len(errors)
+        if discovered_count and rejected_count:
+            message = (
+                f"Discovered {discovered_count} skill capsule(s); "
+                f"validation rejected {rejected_count} skill capsule(s)."
+            )
+        elif discovered_count:
+            message = f"Discovered {discovered_count} skill capsule(s)."
+        elif rejected_count:
+            message = f"Validation rejected {rejected_count} skill capsule(s); no valid skills discovered."
+        else:
+            message = f"No skill capsules found in {self.root}."
+        return {
+            "skills": skills,
+            "discovered_count": discovered_count,
+            "enabled_count": enabled_count,
+            "skills_dir": str(self.root),
+            "validation_errors": errors,
+            "message": message,
+        }
+
     def list_skills(self) -> list[dict[str, Any]]:
         return self.state.list_skills()
 

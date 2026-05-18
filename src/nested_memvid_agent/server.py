@@ -85,6 +85,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
             MemoryLearnRequest,
             MemorySearchRequest,
             PluginInstallRequest,
+            PluginReviewRequest,
             PluginUpdateRequest,
             SchedulerRunRequest,
             SchedulerStepRequest,
@@ -453,6 +454,14 @@ def create_app(config: AgentConfig | None = None) -> Any:
     def list_plugins() -> list[dict[str, object]]:
         return plugins.list_plugins()
 
+    @app.post("/api/plugins/review")  # type: ignore[untyped-decorator]
+    def review_plugin(request: PluginReviewRequest) -> dict[str, object]:
+        require_plugin_install_enabled()
+        try:
+            return plugins.review(request.source, ref=request.ref)
+        except PluginError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.get("/api/plugins/{plugin_id}")  # type: ignore[untyped-decorator]
     def get_plugin(plugin_id: str) -> dict[str, object]:
         try:
@@ -499,6 +508,8 @@ def create_app(config: AgentConfig | None = None) -> Any:
             return plugin
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PluginError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/plugins/{plugin_id}/disable")  # type: ignore[untyped-decorator]
     def disable_plugin(plugin_id: str) -> dict[str, object]:
@@ -554,8 +565,8 @@ def create_app(config: AgentConfig | None = None) -> Any:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/skills/discover")  # type: ignore[untyped-decorator]
-    def discover_skills() -> list[dict[str, object]]:
-        return skills.discover()
+    def discover_skills() -> dict[str, object]:
+        return skills.discover_report()
 
     @app.post("/api/skills/install")  # type: ignore[untyped-decorator]
     def install_skill(request: SkillInstallRequest) -> dict[str, object]:

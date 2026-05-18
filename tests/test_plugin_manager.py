@@ -76,6 +76,80 @@ def test_plugin_manager_installs_disabled_and_enable_materializes_extensions(tmp
         state.get_skill("plugin.demo.hello")
 
 
+def test_plugin_review_reports_dependency_and_isolation_blockers(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_manifest(
+        repo,
+        {
+            "id": "blocked",
+            "name": "Blocked Plugin",
+            "description": "Declares dependencies and required isolation.",
+            "dependencies": {
+                "python": ["requests>=2"],
+                "node": ["left-pad"],
+                "system": ["git"],
+            },
+            "isolation": {"mode": "container", "required": True},
+            "skills": [{"id": "hello", "description": "Hello.", "instructions": "Hello."}],
+        },
+    )
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = PluginManager(tmp_path / "plugins", state, fetcher=FakeFetcher(repo))
+
+    review = manager.review("owner/repo")
+
+    assert review["source_url"] == "https://github.com/owner/repo"
+    assert review["commit_sha"] == "a" * 40
+    assert review["dependency_review"]["requires_install"] is True
+    assert review["dependency_review"]["declared"]["python"] == ["requests>=2"]
+    assert review["isolation_review"] == {"mode": "container", "required": True, "available": False}
+    assert review["enable_blockers"] == [
+        "plugin_dependencies_unmanaged",
+        "plugin_isolation_unavailable",
+    ]
+    with pytest.raises(KeyError):
+        state.get_plugin("blocked")
+
+    installed = manager.install("owner/repo")
+    assert installed["enabled"] is False
+    assert installed["risk_report"]["enable_blockers"] == review["enable_blockers"]
+
+    with pytest.raises(PluginError, match="enable blocked"):
+        manager.install("owner/repo", overwrite=True, enable=True)
+    with pytest.raises(PluginError, match="enable blocked"):
+        manager.set_enabled("blocked", True)
+
+
+def test_plugin_manifest_rejects_malformed_dependency_and_isolation_metadata(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    _write_manifest(
+        repo,
+        {
+            "id": "baddeps",
+            "name": "Bad Dependencies",
+            "description": "Bad dependency metadata.",
+            "dependencies": {"python": "requests"},
+        },
+    )
+    with pytest.raises(PluginError, match="dependencies.python"):
+        load_plugin_manifest(repo)
+
+    _write_manifest(
+        repo,
+        {
+            "id": "badisolation",
+            "name": "Bad Isolation",
+            "description": "Bad isolation metadata.",
+            "isolation": {"mode": "spaceship"},
+        },
+    )
+    with pytest.raises(PluginError, match="isolation.mode"):
+        load_plugin_manifest(repo)
+
+
 def test_enabled_plugins_appear_in_runtime_registry_and_disabled_plugins_do_not(tmp_path: Path) -> None:
     repo = _kestrel_plugin_repo(tmp_path / "repo")
     config = AgentConfig(

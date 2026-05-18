@@ -19,12 +19,12 @@ Kestrel is still an alpha runtime. It is useful for local development and harden
 - MV2 context frames plus a token-aware pseudo-context packer with evidence pointers, conflict warnings, and on-demand raw expansion.
 - Run-scoped `complete.mv2` task capsules for reviewable learning signals.
 - Nested Learning kernel with context-flow metadata, optimizer traces, promotion gates, and explicit policy-write constraints.
-- Built-in tools for memory, context, repo search, patching, tests, linting, git status/diff/commit, Memvid verify/doctor/stats, diagnosis, repair, Soul/self inspection, gated web context, skills, and Codex CLI delegation.
-- Exact-call approval gates for high-risk tools, including shell, file writes, patching, tests/lint, repair mutations, commits, skill installs, imports, and Codex CLI delegation.
+- Built-in tools for memory, context, repo search and file metadata, patching, tests, linting, git status/diff/log/show/commit, Memvid verify/doctor/stats, diagnosis, repair, Soul/self inspection, gated web context, skills, plugins, MCP registry inspection, project scripts, and Codex CLI delegation.
+- Exact-call approval gates for high-risk tools, including shell, file writes, patching, tests/lint, repair mutations, commits, skill installs, plugin review/install, imports, and Codex CLI delegation.
 - SQLite control-plane state for runs, approvals, MCP servers, skills, plugins, task nodes, subagents, and replay-safe terminal transitions. SQLite is not the retrieval memory store.
 - Local FastAPI/web workbench with background runs, SSE timeline events, approvals, Soul/self views, gated web search, memory/context tools, MCP controls, skills, subagents, and scheduler actions.
 - Managed stdio MCP sessions with lazy connect/disconnect/restart/health, tool discovery, vetting metadata, and approval-by-default risk normalization.
-- Experimental plugin registry/CLI that can materialize plugin-provided skills and MCP server entries from GitHub plugin manifests.
+- Experimental plugin registry/CLI/API/web review flow that can inspect GitHub plugin manifests, report dependency/isolation blockers, and materialize plugin-provided skills and MCP server entries.
 - Multi-channel ingress for Telegram-shaped, Discord-shaped, webhook, and custom payloads, with outbound delivery disabled by default.
 - Optional autonomous scheduler that drains approved ready tasks within bounded task/cycle limits.
 - Safe repair primitives with branch isolation, diagnosis-gated validation, reviewer artifacts, and commit gates for repair branches.
@@ -183,13 +183,14 @@ Plugin registry commands:
 
 ```bash
 nest-agent plugins list --backend memory
+nest-agent plugins review owner/repo --backend memory
 nest-agent plugins install owner/repo --backend memory
 nest-agent plugins inspect <plugin_id> --backend memory
 nest-agent plugins enable <plugin_id> --backend memory
 nest-agent plugins disable <plugin_id> --backend memory
 ```
 
-Plugin installation and updates fetch public GitHub plugin sources, accept `kestrel.plugin.json` plus limited Hermes-style `plugin.yaml`, and materialize plugin-declared skills/MCP servers disabled by default. Agent-initiated `plugin.install` is high risk: it requires `--allow-plugin-install` / `NEST_AGENT_ALLOW_PLUGIN_INSTALL` plus exact-call approval before execution.
+Plugin review, installation, and updates fetch public GitHub plugin sources, accept `kestrel.plugin.json` plus limited Hermes-style `plugin.yaml`, and materialize plugin-declared skills/MCP servers disabled by default. Review returns provenance, risk, declared dependency, isolation, warning, unsupported-feature, and enable-blocker metadata without installing or executing plugin code. Agent-initiated `plugin.review` and `plugin.install` are high risk: they require `--allow-plugin-install` / `NEST_AGENT_ALLOW_PLUGIN_INSTALL` plus exact-call approval before execution.
 
 ## Memvid Backend
 
@@ -293,7 +294,7 @@ nest-agent server --backend memory --provider mock --host 127.0.0.1 --port 8765
 
 Open `http://127.0.0.1:8765/`.
 
-The workbench exposes runs, live event streams, approvals, MCP server health/sync/connect/disconnect/restart, manual MCP invocation, memory/context utilities, skills, subagent/task graph views, and scheduler controls.
+The workbench exposes runs, live event streams, approvals, tool filters, MCP server health/sync/connect/disconnect/restart, manual MCP invocation, memory/context utilities, skills discovery feedback, subagent/task graph views, and scheduler controls.
 
 The Soul tab surfaces Kestrel's non-secret self model: identity, memory layers, available tools, skills, plugins, MCP state, validated self-memory capture, and gated web search.
 
@@ -410,7 +411,7 @@ Kestrel is not yet production-complete. The main remaining hardening areas are:
 - Production-grade auth, user/session isolation, and deployment boundaries.
 - Real MCP SSE/streamable HTTP fixtures and soak testing.
 - Container-grade skill isolation and package dependency management.
-- Plugin install gate enforcement, approval UX, dependency isolation, and security review.
+- Managed plugin dependency installation and container-grade isolation beyond the current review metadata and enable blockers.
 - More capable planner/executor/reviewer loops with isolated worker branches or worktrees.
 - Production bot identity verification and platform-specific rate-limit handling.
 - Fully autonomous self-improvement with diff review, test gates, rollback, and explicit human approval.

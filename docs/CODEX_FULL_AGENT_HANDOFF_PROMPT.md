@@ -138,7 +138,7 @@ The next useful hardening work should usually target one of these:
 - Production-grade auth, user/session isolation, and deployment boundaries.
 - MCP SSE/streamable HTTP fixtures and failure-recovery soak tests.
 - Container-grade skill isolation and package dependency management.
-- Plugin install allow-flag enforcement, approval UX, dependency isolation, and security review.
+- Managed plugin dependency installation, real container isolation, executable Hermes compatibility, and broader security review beyond the current review metadata and enable blockers.
 - Stronger consolidation validation loops and review UI.
 - Richer self-change execution UX beyond approval-gated proposal capture and the existing repair gates.
 - Fully dynamic planner/executor/reviewer plan rewriting across worker branches.

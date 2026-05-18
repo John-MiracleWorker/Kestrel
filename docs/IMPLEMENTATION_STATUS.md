@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-05-17
+Last updated: 2026-05-18
 
 This repository is a working local agent scaffold, not a finished Hermes/OpenClaw agent. The status below is intentionally literal so future Codex passes can harden the right layers without treating roadmap items as done.
 
@@ -20,16 +20,16 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Anthropic Messages and Gemini provider adapters now implement the same strict Kestrel response contract with native tool-use/function-call normalization and SDK-stream surface support.
 - Codex CLI provider that can use local `codex exec` as the normal response engine.
 - Provider capability metadata is exposed on built-in providers, and a retryable-error fallback wrapper can route from a primary provider to a configured secondary provider.
-- Built-in tool registry with structured exception boundaries, timeout enforcement, and exact-call approval gates for shell, file writes, patch application, tests, and Codex CLI delegation.
+- Built-in tool registry with structured exception boundaries, timeout enforcement, tool/source/risk introspection, and exact-call approval gates for shell, file writes, patch application, tests, and Codex CLI delegation.
 - Self-diagnosis primitives can classify common provider/tool/test/import/permission/MCP/sandbox failures and recall similar procedural/episodic failure lessons before retry.
 - The default-on agentic failure cycle retrieves prior failure lessons before tool planning, records failed tool attempts as episodic `FailureEpisode` records, blocks unchanged same-action retries until a meaningful changed strategy is supplied, and returns a structured proof-of-work summary on agent turns. It can be disabled with `NEST_AGENT_DISABLE_AGENTIC_CYCLE=1`.
 - Safe self-repair now has branch-isolated repair primitives: `repair.prepare`, `repair.status`, `repair.apply_patch`, `repair.validate`, `repair.orchestrate_validate`, and `repair.rollback`.
 - Self-awareness tools now expose non-secret identity, runtime config, provider capability, memory layer, tool, skill, plugin, MCP, and state snapshots through `self.inspect`, `self.reflect`, `self.remember`, and approval-gated `self.propose_change`.
 - Gated web context tools now provide read-only `web.search` and `web.fetch`, disabled by default behind `NEST_AGENT_ALLOW_WEB`, with deterministic mock backend support, citations, byte/time/result limits, redaction boundaries, and private/local network URL rejection.
 - The first diagnosis-gated repair orchestration slice can run validation on an active repair branch, classify failures, recall prior lessons, and block repeated validation retries until the strategy changes.
-- Skills now have a first manifest validation gate plus persisted validation/provenance metadata for discovered instruction capsules.
-- Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry, Secret Broker metadata routes, memory search, Soul/self routes, gated web routes, non-secret runtime config, channel CRUD, plugin/skill detail, memory inspect, cognition lesson/failure lists, and diagnosis classify/recall routes.
-- Local operator web UI now exposes the implemented Kestrel runtime surfaces: provider/model/workspace run controls, real task graph and scheduler controls, approvals/history, Soul/self inspection and memory capture, gated web search, memory/context/lesson/failure views, tool invocation, Secret Broker setup, MCP create/edit/lifecycle/manual invoke, skills/plugins, channels, observability, and non-secret runtime settings.
+- Skills now have a first manifest validation gate plus persisted validation/provenance metadata for discovered instruction capsules, and discovery returns structured counts, empty-directory messages, and validation errors.
+- Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry/discovery reports, Secret Broker metadata routes, memory search, Soul/self routes, gated web routes, non-secret runtime config, channel CRUD, plugin/skill detail, memory inspect, cognition lesson/failure lists, and diagnosis classify/recall routes.
+- Local operator web UI now exposes the implemented Kestrel runtime surfaces: provider/model/workspace run controls, real task graph and scheduler controls, approvals/history, Soul/self inspection and memory capture, gated web search, memory/context/lesson/failure views, filterable tool inventory, tool invocation, Secret Broker setup, MCP create/edit/lifecycle/manual invoke, skills discovery status, plugins, channels, observability, and non-secret runtime settings.
 - Multi-channel ingress for Telegram Bot API updates, Discord message/interaction-shaped payloads, and generic/custom webhooks, with CLI and API routes.
 - SQLite state store for runs, run steps, approvals, MCP servers, skills, plugins, task nodes, subagent runs, trace spans, and promotion ledger outcomes, now initialized through schema version `10`.
 - Paper-guided nested learning kernel with context-flow metadata, optimizer traces, conservative continuum-memory routing, and a `memory.learn` tool/API path.
@@ -61,9 +61,9 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Stale repair reviews now have a rollback proof: if a reviewed diff changes before commit, `git.commit` blocks with `repair_review_stale`, and approval-gated `repair.rollback` restores the repair branch while writing a durable rollback artifact under `.nest/repair_rollbacks/`.
 - Terminal run records and approval decisions are replay-safe: late duplicate terminal transitions cannot overwrite original run results, and already-decided approval records cannot be flipped by replayed decisions.
 - Approval resume flow now records the executed tool result back onto the already-approved approval record without reopening or flipping the decision, and a full-flow smoke test covers run creation, approval blocking, exact-call approval, resume, tool result persistence, traces, task graph, and capsule creation together.
-- Skills can now run instruction, Python, and shell-list runtimes from their skill directory with path checks, JSON stdin, timeout bounds, and provenance-backed episodic records; container runtime remains intentionally unavailable.
+- Skills can now run instruction, Python, and shell-list runtimes from their skill directory with path checks, JSON stdin, timeout bounds, discoverable validation errors, and provenance-backed episodic records; container runtime remains intentionally unavailable.
 - `skill.install` provides an approval-gated local upload/install path for new skill capsules under the configured skills directory, with manifest validation and content hashes.
-- A first plugin registry slice exists with public GitHub source parsing/fetching, Kestrel and limited Hermes manifest loading, plugin state records, CLI/API list/install/inspect/enable/disable/update/remove commands, approval-gated `plugin.install`, and materialization of plugin-declared skills/MCP server entries.
+- A first plugin registry slice exists with public GitHub source parsing/fetching, Kestrel and limited Hermes manifest loading, plugin state records, CLI/API review/install/inspect/enable/disable/update/remove commands, approval-gated `plugin.review` and `plugin.install`, review-first web UX, enable blockers for unmanaged dependencies or required unavailable isolation, and materialization of plugin-declared skills/MCP server entries.
 - The FastAPI control plane can require bearer/API-key auth via `NEST_AGENT_REQUIRE_API_AUTH=1` and a token environment variable.
 - Generic/custom channel endpoints can require HMAC-SHA256 webhook signatures using a per-channel secret environment variable.
 - Shell/test/repair validation commands normalize `python`/`python3` to the active interpreter so autonomous validation is stable across local environments.
@@ -72,8 +72,8 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 
 - Streaming/provider parity: OpenAI Responses, OpenAI-compatible, Anthropic, and Gemini streaming surfaces are implemented where the SDK exposes them. OpenRouter/Ollama aliases and Anthropic/Gemini adapters have mocked contract tests, and a flag-gated live provider integration harness exists. Credentialed CI/live runs across all providers and richer per-provider context/JSON-mode details still need hardening.
 - MCP: stdio live sessions are hardened and covered by a flag-gated integration test. SSE and streamable HTTP use the same manager path but still need real transport fixtures and production soak testing.
-- Skills: filesystem discovery, manifest validation, provenance metadata, upload/install, and instruction/Python/shell-list runtimes exist. Container-grade isolation and package dependency management remain incomplete.
-- Plugins: registry, public GitHub fetch, manifest parsing, CLI/API commands, exact-call approval for agent-initiated installs, and skill/MCP materialization exist. Dependency isolation, richer compatibility with executable Hermes hooks, and broader network/security review still need hardening before shared use.
+- Skills: filesystem discovery, manifest validation, provenance metadata, upload/install, and instruction/Python/shell-list runtimes exist. Review metadata can expose declared plugin dependencies and isolation requirements, but container-grade isolation and package dependency management remain incomplete.
+- Plugins: registry, public GitHub fetch, manifest parsing, CLI/API review/install/update/enable commands, exact-call approval for agent-initiated review/install, review-first web UX, enable blockers for unmanaged dependencies or required unavailable isolation, and skill/MCP materialization exist. Managed dependency installation, real container isolation, richer compatibility with executable Hermes hooks, and broader network/security review still need hardening before shared use.
 - Codex CLI: `codex-cli` can drive responses and `codex.exec` is available as a high-risk approval-gated tool. It is not yet a branch-isolated autonomous repair loop.
 - Consolidation: capsule extraction and Nested Learning decisions exist, but auto-consolidation remains disabled by default and validation loops are still basic.
 - Self-diagnosis: first-pass classification, memory recall tools, and the default chat-loop retry gate exist. Hybrid LLM diagnosis, reviewer-confirmed diagnosis, and cross-run retry-state matching are still next steps.
@@ -115,6 +115,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - MCP tools remain approval-by-default unless a server is explicitly configured to trust its manifest; dangerous tool names/descriptions such as file writes, deletes, shell execution, patching, committing, or secrets are promoted to high risk during vetting.
 - Invalid skill manifests are rejected during discovery; accepted skill manifests record validation status plus manifest/SKILL.md content hashes for provenance.
 - Memory promotion decisions must carry auditable gate metadata, validation evidence refs, provenance, confidence, and validation status; one-off procedural successes and ordinary events can explain why they were not promoted into procedural/policy memory.
+- Plugin review metadata can block enablement; it is not a package installer or container runtime.
 
 ## Validation Commands
 
