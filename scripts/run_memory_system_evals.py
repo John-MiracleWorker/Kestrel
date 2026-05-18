@@ -194,12 +194,20 @@ def _case_correction_tombstone(root: Path) -> dict[str, Any]:
     ledger = PromotionLedger(AgentStateStore(state_path))
     memory = _memory(root, ledger=ledger)
     target_id = memory.put(_promoted_record("eval-correction-promotion", "Eval correction fact", "eval_correction_33 old value."))
+    arguments = {
+        "target_record_id": target_id,
+        "correction_text": "eval_correction_33 corrected value.",
+    }
+    call = ToolCall(name="memory.correct", id="eval-memory-correct", arguments=arguments)
     result = build_default_tools().execute(
-        ToolCall(
-            name="memory.correct",
-            arguments={"target_record_id": target_id, "correction_text": "eval_correction_33 corrected value."},
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(state_path=state_path, allow_memory_import=True),
+            workspace=root,
+            approved_tool_call_ids=frozenset({call.id}),
+            approved_tool_call_arguments={call.id: arguments},
         ),
-        ToolContext(memory=memory, config=AgentConfig(state_path=state_path), workspace=root),
     )
     target = memory.get_record(MemoryLayer.SEMANTIC, target_id, include_inactive=True)
     row = ledger.summarize().rows[0]

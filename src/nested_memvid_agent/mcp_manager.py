@@ -93,6 +93,7 @@ class MCPManager:
         server = _server_from_state(row)
         started = time.monotonic()
         try:
+            _validate_server_endpoint(server, allow_network_endpoints=self.allow_network_endpoints)
             if not _has_live_endpoint(server):
                 if server.tools:
                     row["status"] = "online"
@@ -159,6 +160,7 @@ class MCPManager:
         server = _server_from_state(row)
         started = time.monotonic()
         try:
+            _validate_server_endpoint(server, allow_network_endpoints=self.allow_network_endpoints)
             if not _has_live_endpoint(server):
                 if server.tools:
                     row["status"] = "online"
@@ -194,6 +196,7 @@ class MCPManager:
         server = self.state.get_mcp_server(server_id)
         started = time.monotonic()
         try:
+            _validate_server_endpoint(_server_from_state(server), allow_network_endpoints=self.allow_network_endpoints)
             prefer_static = _prefer_static_manifest(server)
             _validate_stdio_command_hash(server)
             approval_result = self._connect_approval_result(server, latency_ms=_elapsed_ms(started))
@@ -233,6 +236,7 @@ class MCPManager:
         call = ToolCall(name=f"mcp.{server.id}.{tool_name}", arguments=arguments)
         started = time.monotonic()
         try:
+            _validate_server_endpoint(server, allow_network_endpoints=self.allow_network_endpoints)
             if not _has_live_endpoint(server):
                 raise ValueError("MCP server has static tool metadata but no command or URL to invoke.")
             result = self._call_live_tool(server, tool_name, arguments)
@@ -258,6 +262,7 @@ class MCPManager:
         server = _server_from_state(row)
         remote_name = _remote_name_for(row, tool_name)
         try:
+            _validate_server_endpoint(server, allow_network_endpoints=self.allow_network_endpoints)
             _validate_stdio_command_hash(row)
             approval_result = self._connect_approval_result(row, latency_ms=0)
             if approval_result is not None:

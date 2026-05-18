@@ -142,11 +142,11 @@ def register_runtime_routes(
         config = _active_config(active_config)
         try:
             current = store.load(config)
+            if "require_api_auth" in request and _request_bool(request["require_api_auth"]) != config.require_api_auth:
+                _raise(http_exception, 400, "require_api_auth_is_launch_controlled")
             settings = merge_runtime_settings(config, current, request)
         except ValueError as exc:
             _raise(http_exception, 400, str(exc))
-        if settings.require_api_auth and not os.getenv(config.api_auth_token_env):
-            _raise(http_exception, 400, f"api_auth_token_unconfigured:{config.api_auth_token_env}")
         saved = store.save(settings)
         next_config = apply_runtime_settings(config, saved)
         if on_config_update is not None:
@@ -189,3 +189,11 @@ def _raise(http_exception: Any | None, status_code: int, detail: str) -> NoRetur
     if http_exception is not None:
         raise http_exception(status_code=status_code, detail=detail)
     raise RuntimeError(detail)
+
+
+def _request_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)

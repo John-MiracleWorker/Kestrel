@@ -25,23 +25,32 @@ def test_memory_correct_tombstones_target_and_records_ledger_outcomes(tmp_path: 
     ledger = PromotionLedger(state)
     memory = LayeredMemorySystem.from_backend_factory(tmp_path / "memory", InMemoryBackend, ledger=ledger)
     target_id = memory.put(
-            _promoted_record(
-                promotion_id="promotion-corrected",
-                title="Correctable fact",
-                content="sentinel_old_correction_tombstone_19b says the old value is true.",
-            )
+        _promoted_record(
+            promotion_id="promotion-corrected",
+            title="Correctable fact",
+            content="sentinel_old_correction_tombstone_19b says the old value is true.",
         )
+    )
+    arguments = {
+        "target_record_id": target_id,
+        "correction_text": "sentinel_new_correction_tombstone_19b says the corrected value is true.",
+        "evidence": [{"source": "test", "locator": "memory-layer-interaction"}],
+    }
+    call = ToolCall(
+        name="memory.correct",
+        id="memory-correct-test",
+        arguments=arguments,
+    )
 
     result = build_default_tools().execute(
-        ToolCall(
-            name="memory.correct",
-            arguments={
-                "target_record_id": target_id,
-                "correction_text": "sentinel_new_correction_tombstone_19b says the corrected value is true.",
-                "evidence": [{"source": "test", "locator": "memory-layer-interaction"}],
-            },
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(state_path=tmp_path / "state.db", allow_memory_import=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({call.id}),
+            approved_tool_call_arguments={call.id: arguments},
         ),
-        ToolContext(memory=memory, config=AgentConfig(state_path=tmp_path / "state.db"), workspace=tmp_path),
     )
 
     assert result.success

@@ -103,7 +103,7 @@ class RepairPrepareTool(AgentTool):
                     data={"dirty_status": status.stdout},
                 )
             created = subprocess.run(  # nosec
-                ["git", "switch", "-c", branch],
+                ["git", "-c", "core.hooksPath=/dev/null", "switch", "-c", branch],
                 cwd=context.workspace,
                 capture_output=True,
                 text=True,
@@ -495,6 +495,7 @@ class RepairReviewTool(AgentTool):
             "required": ["validation"],
         },
         risk="medium",
+        requires_approval=True,
         capabilities=("safe-repair", "review-gate"),
     )
 

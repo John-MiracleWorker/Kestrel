@@ -1153,12 +1153,14 @@ def test_server_api_auth_requires_configured_token(tmp_path: Path, monkeypatch: 
     )
     client = TestClient(create_app(config))
 
-    index = client.get("/")
-    assert index.status_code == 200
-    assert "text/html" in index.headers["content-type"]
-    asset = next((Path(__file__).resolve().parents[1] / "web" / "dist" / "assets").iterdir(), None)
-    if asset is not None:
-        assert client.get(f"/assets/{asset.name}").status_code == 200
+    web_dist = Path(__file__).resolve().parents[1] / "web" / "dist"
+    if web_dist.exists():
+        index = client.get("/")
+        assert index.status_code == 200
+        assert "text/html" in index.headers["content-type"]
+        asset = next((web_dist / "assets").iterdir(), None)
+        if asset is not None:
+            assert client.get(f"/assets/{asset.name}").status_code == 200
     assert client.get("/api/health").status_code == 401
     authorized = client.get("/api/health", headers={"Authorization": "Bearer secret-token"})
     assert authorized.status_code == 200
