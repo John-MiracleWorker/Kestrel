@@ -53,6 +53,7 @@ def test_fetch_pins_dns_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(web_tools, "build_opener", lambda *_: _FakeOpener(_FakeResponse(b"ok", "https://example.com")))
 
     calls: list[str] = []
+
     def tracking_getaddrinfo(host: str, port: object, *args: object, **kwargs: object):
         del args, kwargs
         calls.append(host)
