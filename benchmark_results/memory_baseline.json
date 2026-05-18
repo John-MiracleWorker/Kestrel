@@ -1,0 +1,953 @@
+{
+  "schema": "kestrel.memory_benchmark.v1",
+  "config": {
+    "k": 5,
+    "seed": 42,
+    "total_queries": 30,
+    "total_docs": 55
+  },
+  "overall": {
+    "kestrel": {
+      "recall_at_k": 0.967,
+      "precision_at_k": 0.331,
+      "mrr": 0.858,
+      "avg_latency_ms": 0.073,
+      "p99_latency_ms": 0.108
+    },
+    "baseline": {
+      "recall_at_k": 1.0,
+      "precision_at_k": 0.2,
+      "mrr": 0.878,
+      "avg_latency_ms": 0.125,
+      "p99_latency_ms": 0.149
+    }
+  },
+  "deltas": {
+    "recall_at_k": -0.033,
+    "precision_at_k": 0.131,
+    "mrr": -0.02
+  },
+  "per_layer": {
+    "semantic": {
+      "kestrel": {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.42,
+        "mrr": 0.95,
+        "avg_latency_ms": 0.083
+      },
+      "baseline": {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 0.95,
+        "avg_latency_ms": 0.123
+      }
+    },
+    "episodic": {
+      "kestrel": {
+        "recall_at_k": 0.9,
+        "precision_at_k": 0.26,
+        "mrr": 0.8,
+        "avg_latency_ms": 0.073
+      },
+      "baseline": {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 0.883,
+        "avg_latency_ms": 0.128
+      }
+    },
+    "procedural": {
+      "kestrel": {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.312,
+        "mrr": 0.825,
+        "avg_latency_ms": 0.062
+      },
+      "baseline": {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 0.8,
+        "avg_latency_ms": 0.123
+      }
+    }
+  },
+  "query_details": {
+    "kestrel": [
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What did I say about the health endpoint?",
+        "layer": "episodic",
+        "latency_ms": 0.106,
+        "retrieved_ids": [
+          "epi_012",
+          "epi_004",
+          "epi_d3",
+          "epi_005",
+          "epi_d1"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What security advice did I give about webhooks?",
+        "layer": "episodic",
+        "latency_ms": 0.078,
+        "retrieved_ids": [
+          "epi_005",
+          "epi_d3",
+          "epi_d1",
+          "epi_d5",
+          "epi_007"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What did the user ask about on Monday?",
+        "layer": "episodic",
+        "latency_ms": 0.082,
+        "retrieved_ids": [
+          "epi_001",
+          "epi_012",
+          "epi_d3",
+          "epi_005",
+          "epi_d1"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 1.0,
+        "mrr": 1.0,
+        "query": "How do I iterate through paginated results?",
+        "layer": "procedural",
+        "latency_ms": 0.058,
+        "retrieved_ids": [
+          "proc_007"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 0.25,
+        "query": "How do I upload a 50MB file?",
+        "layer": "procedural",
+        "latency_ms": 0.065,
+        "retrieved_ids": [
+          "proc_002",
+          "proc_006",
+          "proc_010",
+          "proc_003",
+          "proc_009"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.5,
+        "mrr": 1.0,
+        "query": "How do I run database migrations?",
+        "layer": "semantic",
+        "latency_ms": 0.076,
+        "retrieved_ids": [
+          "sem_013",
+          "sem_020"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "When is the GraphQL gateway being removed?",
+        "layer": "semantic",
+        "latency_ms": 0.096,
+        "retrieved_ids": [
+          "sem_012",
+          "sem_006",
+          "sem_008",
+          "sem_018",
+          "sem_001"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What did I tell the user about the base URL?",
+        "layer": "episodic",
+        "latency_ms": 0.081,
+        "retrieved_ids": [
+          "epi_003",
+          "epi_012",
+          "epi_d3",
+          "epi_005",
+          "epi_d1"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "When did the user report 429 errors?",
+        "layer": "episodic",
+        "latency_ms": 0.072,
+        "retrieved_ids": [
+          "epi_002",
+          "epi_012",
+          "epi_008",
+          "epi_004",
+          "epi_003"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 0.5,
+        "query": "What migration issue did the user have?",
+        "layer": "episodic",
+        "latency_ms": 0.071,
+        "retrieved_ids": [
+          "epi_012",
+          "epi_006",
+          "epi_008",
+          "epi_004",
+          "epi_003"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 1.0,
+        "mrr": 1.0,
+        "query": "How long do integration tests take?",
+        "layer": "semantic",
+        "latency_ms": 0.067,
+        "retrieved_ids": [
+          "sem_017"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.3333333333333333,
+        "mrr": 1.0,
+        "query": "How do I safely run database migrations?",
+        "layer": "procedural",
+        "latency_ms": 0.062,
+        "retrieved_ids": [
+          "proc_006",
+          "proc_d1",
+          "proc_009"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "How do I investigate a memory leak?",
+        "layer": "procedural",
+        "latency_ms": 0.06,
+        "retrieved_ids": [
+          "proc_010",
+          "proc_002",
+          "proc_006",
+          "proc_009",
+          "proc_008"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What is the token refresh procedure?",
+        "layer": "procedural",
+        "latency_ms": 0.063,
+        "retrieved_ids": [
+          "proc_002",
+          "proc_007",
+          "proc_005",
+          "proc_003",
+          "proc_004"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What did I explain about pagination?",
+        "layer": "episodic",
+        "latency_ms": 0.059,
+        "retrieved_ids": [
+          "epi_007",
+          "epi_d3",
+          "epi_005",
+          "epi_d1",
+          "epi_d5"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What are the deployment steps for a new version?",
+        "layer": "procedural",
+        "latency_ms": 0.077,
+        "retrieved_ids": [
+          "proc_008",
+          "proc_002",
+          "proc_009",
+          "proc_005",
+          "proc_010"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.5,
+        "mrr": 0.5,
+        "query": "How do I refresh an expired token?",
+        "layer": "semantic",
+        "latency_ms": 0.073,
+        "retrieved_ids": [
+          "sem_001",
+          "sem_002"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 0.5,
+        "query": "How did I help with CSV uploads?",
+        "layer": "episodic",
+        "latency_ms": 0.064,
+        "retrieved_ids": [
+          "epi_d2",
+          "epi_004",
+          "epi_005",
+          "epi_002",
+          "epi_012"
+        ]
+      },
+      {
+        "recall_at_k": 0.0,
+        "precision_at_k": 0.0,
+        "mrr": 0.0,
+        "query": "What did the user ask about Redis?",
+        "layer": "episodic",
+        "latency_ms": 0.072,
+        "retrieved_ids": [
+          "epi_012",
+          "epi_d3",
+          "epi_005",
+          "epi_d1",
+          "epi_d5"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What are the rate limits for enterprise keys?",
+        "layer": "semantic",
+        "latency_ms": 0.108,
+        "retrieved_ids": [
+          "sem_004",
+          "sem_015",
+          "sem_012",
+          "sem_014",
+          "sem_011"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 1.0,
+        "mrr": 1.0,
+        "query": "What Docker information did I share?",
+        "layer": "episodic",
+        "latency_ms": 0.048,
+        "retrieved_ids": [
+          "epi_008"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 0.5,
+        "query": "What is the feature development workflow?",
+        "layer": "procedural",
+        "latency_ms": 0.06,
+        "retrieved_ids": [
+          "proc_007",
+          "proc_009",
+          "proc_002",
+          "proc_005",
+          "proc_003"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What endpoint do I use for file uploads?",
+        "layer": "semantic",
+        "latency_ms": 0.094,
+        "retrieved_ids": [
+          "sem_010",
+          "sem_014",
+          "sem_d3",
+          "sem_004",
+          "sem_005"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What is the debugging procedure for 500 errors?",
+        "layer": "procedural",
+        "latency_ms": 0.066,
+        "retrieved_ids": [
+          "proc_005",
+          "proc_007",
+          "proc_002",
+          "proc_d1",
+          "proc_010"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What environment variables are needed for production?",
+        "layer": "semantic",
+        "latency_ms": 0.081,
+        "retrieved_ids": [
+          "sem_014",
+          "sem_004",
+          "sem_013",
+          "sem_d3",
+          "sem_d2"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "Where are Docker images published?",
+        "layer": "semantic",
+        "latency_ms": 0.071,
+        "retrieved_ids": [
+          "sem_016",
+          "sem_013",
+          "sem_004",
+          "sem_017",
+          "sem_015"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.3333333333333333,
+        "mrr": 0.5,
+        "query": "How do I verify webhook authenticity?",
+        "layer": "procedural",
+        "latency_ms": 0.052,
+        "retrieved_ids": [
+          "proc_006",
+          "proc_004",
+          "proc_008"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What is the Kestrel API base URL?",
+        "layer": "semantic",
+        "latency_ms": 0.097,
+        "retrieved_ids": [
+          "sem_001",
+          "sem_011",
+          "sem_006",
+          "sem_008",
+          "sem_018"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 1.0,
+        "mrr": 1.0,
+        "query": "How does pagination work?",
+        "layer": "semantic",
+        "latency_ms": 0.065,
+        "retrieved_ids": [
+          "sem_008"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.25,
+        "mrr": 1.0,
+        "query": "How do I handle rate limits in Kestrel?",
+        "layer": "procedural",
+        "latency_ms": 0.057,
+        "retrieved_ids": [
+          "proc_001",
+          "proc_002",
+          "proc_006",
+          "proc_004"
+        ]
+      }
+    ],
+    "baseline": [
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What did I say about the health endpoint?",
+        "layer": "episodic",
+        "latency_ms": 0.145,
+        "retrieved_ids": [
+          "epi_012",
+          "sem_020",
+          "sem_002",
+          "sem_009",
+          "proc_008"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What security advice did I give about webhooks?",
+        "layer": "episodic",
+        "latency_ms": 0.149,
+        "retrieved_ids": [
+          "epi_005",
+          "proc_004",
+          "epi_001",
+          "epi_d1",
+          "epi_012"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What did the user ask about on Monday?",
+        "layer": "episodic",
+        "latency_ms": 0.139,
+        "retrieved_ids": [
+          "epi_001",
+          "sem_d4",
+          "sem_020",
+          "epi_005",
+          "epi_012"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "How do I iterate through paginated results?",
+        "layer": "procedural",
+        "latency_ms": 0.127,
+        "retrieved_ids": [
+          "proc_007",
+          "sem_008",
+          "sem_001",
+          "sem_002",
+          "sem_003"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "How do I upload a 50MB file?",
+        "layer": "procedural",
+        "latency_ms": 0.127,
+        "retrieved_ids": [
+          "proc_003",
+          "sem_010",
+          "epi_004",
+          "sem_003",
+          "sem_001"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "How do I run database migrations?",
+        "layer": "semantic",
+        "latency_ms": 0.12,
+        "retrieved_ids": [
+          "sem_013",
+          "proc_006",
+          "epi_006",
+          "sem_014",
+          "proc_d1"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "When is the GraphQL gateway being removed?",
+        "layer": "semantic",
+        "latency_ms": 0.129,
+        "retrieved_ids": [
+          "sem_012",
+          "sem_006",
+          "sem_008",
+          "proc_007",
+          "sem_018"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What did I tell the user about the base URL?",
+        "layer": "episodic",
+        "latency_ms": 0.129,
+        "retrieved_ids": [
+          "epi_003",
+          "sem_001",
+          "sem_014",
+          "epi_012",
+          "epi_011"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "When did the user report 429 errors?",
+        "layer": "episodic",
+        "latency_ms": 0.119,
+        "retrieved_ids": [
+          "epi_002",
+          "sem_006",
+          "sem_008",
+          "proc_005",
+          "proc_007"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What migration issue did the user have?",
+        "layer": "episodic",
+        "latency_ms": 0.123,
+        "retrieved_ids": [
+          "epi_006",
+          "sem_005",
+          "epi_004",
+          "epi_003",
+          "epi_012"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "How long do integration tests take?",
+        "layer": "semantic",
+        "latency_ms": 0.125,
+        "retrieved_ids": [
+          "sem_017",
+          "epi_009",
+          "proc_006",
+          "proc_009",
+          "sem_001"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "How do I safely run database migrations?",
+        "layer": "procedural",
+        "latency_ms": 0.117,
+        "retrieved_ids": [
+          "proc_006",
+          "sem_013",
+          "epi_006",
+          "sem_014",
+          "proc_d1"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 0.5,
+        "query": "How do I investigate a memory leak?",
+        "layer": "procedural",
+        "latency_ms": 0.118,
+        "retrieved_ids": [
+          "epi_d4",
+          "proc_010",
+          "sem_d2",
+          "sem_001",
+          "sem_002"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What is the token refresh procedure?",
+        "layer": "procedural",
+        "latency_ms": 0.122,
+        "retrieved_ids": [
+          "proc_002",
+          "sem_002",
+          "sem_012",
+          "sem_006",
+          "sem_018"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 0.5,
+        "query": "What did I explain about pagination?",
+        "layer": "episodic",
+        "latency_ms": 0.121,
+        "retrieved_ids": [
+          "proc_d1",
+          "epi_007",
+          "sem_008",
+          "epi_005",
+          "epi_001"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What are the deployment steps for a new version?",
+        "layer": "procedural",
+        "latency_ms": 0.128,
+        "retrieved_ids": [
+          "proc_008",
+          "sem_012",
+          "sem_011",
+          "sem_004",
+          "proc_d2"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 0.5,
+        "query": "How do I refresh an expired token?",
+        "layer": "semantic",
+        "latency_ms": 0.121,
+        "retrieved_ids": [
+          "proc_002",
+          "sem_002",
+          "sem_001",
+          "sem_003",
+          "sem_004"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "How did I help with CSV uploads?",
+        "layer": "episodic",
+        "latency_ms": 0.119,
+        "retrieved_ids": [
+          "epi_004",
+          "epi_d2",
+          "sem_010",
+          "sem_006",
+          "sem_005"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What did the user ask about Redis?",
+        "layer": "episodic",
+        "latency_ms": 0.12,
+        "retrieved_ids": [
+          "epi_011",
+          "sem_015",
+          "sem_014",
+          "epi_005",
+          "epi_012"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What are the rate limits for enterprise keys?",
+        "layer": "semantic",
+        "latency_ms": 0.132,
+        "retrieved_ids": [
+          "sem_004",
+          "epi_001",
+          "proc_001",
+          "epi_d5",
+          "sem_012"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 0.3333333333333333,
+        "query": "What Docker information did I share?",
+        "layer": "episodic",
+        "latency_ms": 0.118,
+        "retrieved_ids": [
+          "sem_016",
+          "sem_017",
+          "epi_008",
+          "proc_008",
+          "sem_001"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What is the feature development workflow?",
+        "layer": "procedural",
+        "latency_ms": 0.121,
+        "retrieved_ids": [
+          "proc_009",
+          "sem_012",
+          "sem_006",
+          "sem_018",
+          "sem_001"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What endpoint do I use for file uploads?",
+        "layer": "semantic",
+        "latency_ms": 0.126,
+        "retrieved_ids": [
+          "sem_010",
+          "proc_003",
+          "sem_004",
+          "sem_002",
+          "sem_009"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 0.25,
+        "query": "What is the debugging procedure for 500 errors?",
+        "layer": "procedural",
+        "latency_ms": 0.124,
+        "retrieved_ids": [
+          "epi_002",
+          "epi_d4",
+          "sem_012",
+          "proc_005",
+          "sem_004"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What environment variables are needed for production?",
+        "layer": "semantic",
+        "latency_ms": 0.127,
+        "retrieved_ids": [
+          "sem_014",
+          "sem_004",
+          "proc_006",
+          "sem_012",
+          "proc_010"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "Where are Docker images published?",
+        "layer": "semantic",
+        "latency_ms": 0.117,
+        "retrieved_ids": [
+          "sem_016",
+          "sem_017",
+          "epi_008",
+          "proc_008",
+          "sem_015"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 0.25,
+        "query": "How do I verify webhook authenticity?",
+        "layer": "procedural",
+        "latency_ms": 0.123,
+        "retrieved_ids": [
+          "sem_005",
+          "epi_005",
+          "proc_006",
+          "proc_004",
+          "proc_008"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "What is the Kestrel API base URL?",
+        "layer": "semantic",
+        "latency_ms": 0.12,
+        "retrieved_ids": [
+          "sem_001",
+          "epi_003",
+          "sem_014",
+          "epi_008",
+          "sem_016"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "How does pagination work?",
+        "layer": "semantic",
+        "latency_ms": 0.11,
+        "retrieved_ids": [
+          "sem_008",
+          "epi_007",
+          "sem_001",
+          "sem_002",
+          "sem_003"
+        ]
+      },
+      {
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.2,
+        "mrr": 1.0,
+        "query": "How do I handle rate limits in Kestrel?",
+        "layer": "procedural",
+        "latency_ms": 0.127,
+        "retrieved_ids": [
+          "proc_001",
+          "sem_004",
+          "epi_001",
+          "sem_001",
+          "sem_016"
+        ]
+      }
+    ]
+  }
+}

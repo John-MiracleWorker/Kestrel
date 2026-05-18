@@ -1,0 +1,101 @@
+{
+  "schema": "kestrel.error_recovery_benchmark.v1",
+  "config": {
+    "provider": "openai-compatible",
+    "model": "kimi-k2.6",
+    "backend": "memory",
+    "tasks": [
+      "transient_file_read",
+      "file_not_found",
+      "empty_search_results",
+      "malformed_tool_name",
+      "strategy_retry",
+      "max_retries_exceeded"
+    ]
+  },
+  "summary": {
+    "total_tasks": 6,
+    "success_count": 6,
+    "success_rate": 1.0,
+    "total_errors_injected": 3,
+    "total_tool_attempts": 6,
+    "avg_tools_per_task": 1.0,
+    "total_elapsed_ms": 150148.0
+  },
+  "results": [
+    {
+      "task": "transient_file_read",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read"
+      ],
+      "errors_seen": [],
+      "final_answer": "The secret code is **42**.",
+      "elapsed_ms": 31213.62
+    },
+    {
+      "task": "file_not_found",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read"
+      ],
+      "errors_seen": [
+        "not_found"
+      ],
+      "final_answer": "The file doesn't exist at that path. The workspace reports:\n\n**File not found:** `/var/folders/wg/mqfrcdmd0tvdk86lh4b3mshh0000gn/T/kestrel-error-bench-file_not_found-42d4abkn/workspace/missing.txt`\n\nI",
+      "elapsed_ms": 20878.35
+    },
+    {
+      "task": "empty_search_results",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "repo.search"
+      ],
+      "errors_seen": [
+        "empty_results"
+      ],
+      "final_answer": "No matches found for **\"zebra\"** in the workspace.",
+      "elapsed_ms": 37286.2
+    },
+    {
+      "task": "malformed_tool_name",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read"
+      ],
+      "errors_seen": [],
+      "final_answer": "The secret code is **42**.",
+      "elapsed_ms": 9537.67
+    },
+    {
+      "task": "strategy_retry",
+      "success": true,
+      "retry_allowed": false,
+      "turns": 1,
+      "tool_calls": [
+        "file.read"
+      ],
+      "errors_seen": [],
+      "final_answer": "The secret code is **42**.",
+      "elapsed_ms": 12872.19
+    },
+    {
+      "task": "max_retries_exceeded",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read"
+      ],
+      "errors_seen": [
+        "transient_error"
+      ],
+      "file_read_attempts": 1,
+      "final_answer": "I tried to read the file, but the read operation failed with a persistent error, so I can't retrieve the secret code from that path.\n\nIf the file is inside the configured workspace, you can point me t",
+      "elapsed_ms": 38359.98
+    }
+  ]
+}

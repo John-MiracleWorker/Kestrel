@@ -1,0 +1,93 @@
+{
+  "schema": "kestrel.coding_benchmark.v1",
+  "config": {
+    "provider": "mock",
+    "model": "mock",
+    "tasks": [
+      "easy-js-duration",
+      "medium-js-lru",
+      "hard-js-async-pool",
+      "expert-js-json-patch",
+      "expert-py-template-engine"
+    ]
+  },
+  "summary": {
+    "total_tasks": 5,
+    "success_count": 0,
+    "success_rate": 0.0,
+    "total_tool_calls": 0,
+    "avg_tools_per_task": 0.0
+  },
+  "results": [
+    {
+      "task_id": "easy-js-duration",
+      "difficulty": 1,
+      "language": "javascript",
+      "success": false,
+      "solution_exists": false,
+      "solution_size_bytes": 0,
+      "tool_calls": [],
+      "tool_rounds": 0,
+      "stop_reason": "complete",
+      "elapsed_seconds": 0.002,
+      "test_output": "",
+      "assistant_message": "Mock response: Coding task: easy-js-duration\n\nWrite the solution to the following problem in the file `solution.js` in the workspace /var/folders/wg/mqfrcdmd0tvdk86lh4b3mshh0000gn/T/kestrel_coding_ner_ywa0/easy-js-duration.\n\nCreate a CommonJS module exporting function parseDuration(input). It receives a human duration string and returns total seconds as an integer. Support units: weeks/w, days/d, hours/hr/h, minutes/min/m, seconds/sec/s. Examples: '1h 30m' => 5400, '2 days, 3 hours' => 183600, '"
+    },
+    {
+      "task_id": "medium-js-lru",
+      "difficulty": 2,
+      "language": "javascript",
+      "success": false,
+      "solution_exists": false,
+      "solution_size_bytes": 0,
+      "tool_calls": [],
+      "tool_rounds": 0,
+      "stop_reason": "complete",
+      "elapsed_seconds": 0.002,
+      "test_output": "",
+      "assistant_message": "Mock response: Coding task: medium-js-lru\n\nWrite the solution to the following problem in the file `solution.js` in the workspace /var/folders/wg/mqfrcdmd0tvdk86lh4b3mshh0000gn/T/kestrel_coding_ner_ywa0/medium-js-lru.\n\nCreate a CommonJS module exporting class LRUCache. Constructor takes positive integer capacity. Methods: get(key) returns value or -1 and marks key recently used; put(key,value) inserts/updates and evicts least recently used when over capacity; delete(key) removes and returns true"
+    },
+    {
+      "task_id": "hard-js-async-pool",
+      "difficulty": 3,
+      "language": "javascript",
+      "success": false,
+      "solution_exists": false,
+      "solution_size_bytes": 0,
+      "tool_calls": [],
+      "tool_rounds": 0,
+      "stop_reason": "complete",
+      "elapsed_seconds": 0.001,
+      "test_output": "",
+      "assistant_message": "Mock response: Coding task: hard-js-async-pool\n\nWrite the solution to the following problem in the file `solution.js` in the workspace /var/folders/wg/mqfrcdmd0tvdk86lh4b3mshh0000gn/T/kestrel_coding_ner_ywa0/hard-js-async-pool.\n\nCreate a CommonJS module exporting async function runPool(tasks, limit, options). tasks is an array of functions returning values/promises. limit is max concurrency. options optional: { stopOnError=false, signal }. Return a promise resolving to an array of results in ori"
+    },
+    {
+      "task_id": "expert-js-json-patch",
+      "difficulty": 4,
+      "language": "javascript",
+      "success": false,
+      "solution_exists": false,
+      "solution_size_bytes": 0,
+      "tool_calls": [],
+      "tool_rounds": 0,
+      "stop_reason": "complete",
+      "elapsed_seconds": 0.001,
+      "test_output": "",
+      "assistant_message": "Mock response: Coding task: expert-js-json-patch\n\nWrite the solution to the following problem in the file `solution.js` in the workspace /var/folders/wg/mqfrcdmd0tvdk86lh4b3mshh0000gn/T/kestrel_coding_ner_ywa0/expert-js-json-patch.\n\nCreate a CommonJS module exporting function applyJsonPatch(document, patch). Implement RFC6902 operations add, remove, replace, move, copy, test for JSON-compatible data. Do not mutate the input document. Support JSON Pointer escaping ~0 and ~1. Array add supports '-"
+    },
+    {
+      "task_id": "expert-py-template-engine",
+      "difficulty": 5,
+      "language": "python",
+      "success": false,
+      "solution_exists": false,
+      "solution_size_bytes": 0,
+      "tool_calls": [],
+      "tool_rounds": 0,
+      "stop_reason": "complete",
+      "elapsed_seconds": 0.001,
+      "test_output": "",
+      "assistant_message": "Mock response: Coding task: expert-py-template-engine\n\nWrite the solution to the following problem in the file `solution.py` in the workspace /var/folders/wg/mqfrcdmd0tvdk86lh4b3mshh0000gn/T/kestrel_coding_ner_ywa0/expert-py-template-engine.\n\nWrite a Python 3 module solution.py implementing render(template: str, context: dict) -> str. Mini template language: variables {{ user.name }} with dotted lookup through dicts/objects; HTML escape variables by default; triple braces {{{ raw }}} are unescap"
+    }
+  ]
+}

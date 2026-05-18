@@ -1,0 +1,149 @@
+{
+  "schema": "kestrel.learning_benchmark.v1",
+  "config": {
+    "seed": 42
+  },
+  "dimensions": [
+    {
+      "name": "few_shot_tool_selection",
+      "description": "Does episodic/procedural memory improve tool selection over sessions?",
+      "sessions": 5,
+      "session_results": [
+        {
+          "session": 1,
+          "correct": 3,
+          "total": 8,
+          "accuracy": 0.375
+        },
+        {
+          "session": 2,
+          "correct": 8,
+          "total": 8,
+          "accuracy": 1.0
+        },
+        {
+          "session": 3,
+          "correct": 8,
+          "total": 8,
+          "accuracy": 1.0
+        },
+        {
+          "session": 4,
+          "correct": 7,
+          "total": 8,
+          "accuracy": 0.875
+        },
+        {
+          "session": 5,
+          "correct": 8,
+          "total": 8,
+          "accuracy": 1.0
+        }
+      ],
+      "first_session_accuracy": 0.375,
+      "last_session_accuracy": 1.0,
+      "accuracy_delta": 0.625,
+      "improved": true,
+      "avg_accuracy": 0.85
+    },
+    {
+      "name": "mistake_avoidance",
+      "description": "Does the agent avoid previously-recorded mistakes over rounds?",
+      "rounds": 4,
+      "round_results": [
+        {
+          "round": 1,
+          "avoided": 0,
+          "total": 5,
+          "avoidance_rate": 0.0
+        },
+        {
+          "round": 2,
+          "avoided": 5,
+          "total": 5,
+          "avoidance_rate": 1.0
+        },
+        {
+          "round": 3,
+          "avoided": 4,
+          "total": 5,
+          "avoidance_rate": 0.8
+        },
+        {
+          "round": 4,
+          "avoided": 5,
+          "total": 5,
+          "avoidance_rate": 1.0
+        }
+      ],
+      "first_round_avoidance": 0.0,
+      "last_round_avoidance": 1.0,
+      "avoidance_delta": 1.0,
+      "improved": true
+    },
+    {
+      "name": "promotion_accuracy",
+      "description": "Does the kernel correctly admit high-quality signals and reject low-quality ones?",
+      "n_signals": 100,
+      "accepted": 27,
+      "rejected": 73,
+      "true_positive": 27,
+      "false_positive": 0,
+      "true_negative": 73,
+      "false_negative": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1_score": 1.0,
+      "accuracy": 1.0
+    },
+    {
+      "name": "router_calibration",
+      "description": "Does learned routing improve expected utility over rule-based baseline?",
+      "training_examples": 10,
+      "oracle_gate_violations": 0,
+      "oracle_abstention_rate": 0.0,
+      "expected_utility_delta": 9.1305,
+      "improvement_passes": true,
+      "per_target_stats": {}
+    },
+    {
+      "name": "procedural_consolidation",
+      "description": "Do repeated successes become reusable procedures in procedural memory?",
+      "repetitions_available": 5,
+      "tasks": [
+        {
+          "task_id": "p1",
+          "problem": "Fix failing auth tests",
+          "procedure_formed": true,
+          "procedure_form_round": 2,
+          "retrieved_after_formation": true
+        },
+        {
+          "task_id": "p2",
+          "problem": "Add a new API endpoint",
+          "procedure_formed": true,
+          "procedure_form_round": 2,
+          "retrieved_after_formation": true
+        },
+        {
+          "task_id": "p3",
+          "problem": "Refactor duplicate code",
+          "procedure_formed": true,
+          "procedure_form_round": 2,
+          "retrieved_after_formation": true
+        }
+      ],
+      "procedures_formed": 3,
+      "procedures_retrievable": 3,
+      "formation_rate": 1.0,
+      "retrieval_rate": 1.0
+    }
+  ],
+  "summary": {
+    "few_shot_improved": true,
+    "mistake_avoidance_improved": true,
+    "promotion_f1": 1.0,
+    "router_utility_lift": 9.1305,
+    "procedural_formation_rate": 1.0
+  }
+}

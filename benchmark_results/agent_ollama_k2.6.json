@@ -1,0 +1,67 @@
+{
+  "schema": "kestrel.agent_benchmark.v1",
+  "config": {
+    "provider": "openai-compatible",
+    "model": "kimi-k2.6",
+    "backend": "memory",
+    "tasks": [
+      "memory_persistence",
+      "file_read_qa",
+      "repo_search",
+      "git_status"
+    ]
+  },
+  "summary": {
+    "total_tasks": 4,
+    "success_count": 4,
+    "success_rate": 1.0,
+    "total_tool_calls": 5,
+    "avg_tools_per_task": 1.25,
+    "total_elapsed_ms": 108337.24
+  },
+  "results": [
+    {
+      "task": "memory_persistence",
+      "success": true,
+      "turns": 2,
+      "tool_calls": [
+        "memory.search",
+        "self.reflect"
+      ],
+      "direct_found": true,
+      "llm_recall": true,
+      "final_answer": "I can see from my working memory that you previously mentioned **teal** as your favorite color. However, I don't have it stored as a validated, durable preference in my Soul/self memory layer \u2014 the ea",
+      "elapsed_ms": 61060.03
+    },
+    {
+      "task": "file_read_qa",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read"
+      ],
+      "final_answer": "The secret code is **42**.",
+      "elapsed_ms": 5818.64
+    },
+    {
+      "task": "repo_search",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "repo.search"
+      ],
+      "final_answer": "The word **banana** appears in:\n\n**`fruits.txt`** (line 2)",
+      "elapsed_ms": 30713.15
+    },
+    {
+      "task": "git_status",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "git.status"
+      ],
+      "final_answer": "The workspace is on the `main` branch with **no commits yet**.\n\nYes, there is an **untracked file**:\n\n- `new_feature.py`\n\nThat\u2019s the only item in the working tree right now.",
+      "elapsed_ms": 10745.41
+    }
+  ]
+}

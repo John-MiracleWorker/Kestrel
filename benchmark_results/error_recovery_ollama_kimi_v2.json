@@ -1,0 +1,77 @@
+{
+  "schema": "kestrel.error_recovery_benchmark.v1",
+  "config": {
+    "provider": "openai-compatible",
+    "model": "kimi-k2.5",
+    "backend": "memory",
+    "tasks": [
+      "transient_file_read",
+      "file_not_found",
+      "empty_search_results",
+      "malformed_tool_name"
+    ]
+  },
+  "summary": {
+    "total_tasks": 4,
+    "success_count": 4,
+    "success_rate": 1.0,
+    "total_errors_injected": 3,
+    "total_tool_attempts": 6,
+    "avg_tools_per_task": 1.5,
+    "total_elapsed_ms": 25926.53
+  },
+  "results": [
+    {
+      "task": "transient_file_read",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read",
+        "file.read"
+      ],
+      "errors_seen": [
+        "transient_error"
+      ],
+      "final_answer": "The secret code is **42**.",
+      "elapsed_ms": 8287.24
+    },
+    {
+      "task": "file_not_found",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read"
+      ],
+      "errors_seen": [
+        "not_found"
+      ],
+      "final_answer": "The file `/var/folders/wg/mqfrcdmd0tvdk86lh4b3mshh0000gn/T/kestrel-error-bench-file_not_found-y8w5lbbd/workspace/missing.txt` **does not exist**.\n\nThe path suggests this may be a benchmark or test cas",
+      "elapsed_ms": 6175.25
+    },
+    {
+      "task": "empty_search_results",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "repo.search"
+      ],
+      "errors_seen": [
+        "empty_results"
+      ],
+      "final_answer": "No matches found for \"zebra\" in the workspace.\n\nThe repository search completed successfully, but there are no files containing that term in `/var/folders/wg/mqfrcdmd0tvdk86lh4b3mshh0000gn/T/kestrel-e",
+      "elapsed_ms": 3692.48
+    },
+    {
+      "task": "malformed_tool_name",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read",
+        "file.read"
+      ],
+      "errors_seen": [],
+      "final_answer": "The secret code is **42**.",
+      "elapsed_ms": 7771.56
+    }
+  ]
+}

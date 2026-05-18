@@ -1,0 +1,62 @@
+{
+  "schema": "kestrel.agent_benchmark.v1",
+  "config": {
+    "provider": "ollama-cloud",
+    "model": "kimi-k2.6",
+    "backend": "memory",
+    "tasks": [
+      "memory_persistence",
+      "file_read_qa",
+      "repo_search",
+      "git_status"
+    ]
+  },
+  "summary": {
+    "total_tasks": 4,
+    "success_count": 3,
+    "success_rate": 0.75,
+    "total_tool_calls": 3,
+    "avg_tools_per_task": 0.75,
+    "total_elapsed_ms": 34521.1
+  },
+  "results": [
+    {
+      "task": "memory_persistence",
+      "success": true,
+      "turns": 2,
+      "tool_calls": [
+        "memory.search"
+      ],
+      "final_answer": "I found it in my memory: you told me your favorite color is **teal**.\n\nHowever, I should be transparent \u2014 when you asked me to remember it before, my attempt to save it to my durable Soul layer failed",
+      "elapsed_ms": 18640.99
+    },
+    {
+      "task": "file_read_qa",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read"
+      ],
+      "final_answer": "The secret code is **42**.",
+      "elapsed_ms": 6505.41
+    },
+    {
+      "task": "repo_search",
+      "success": false,
+      "turns": 1,
+      "tool_calls": [],
+      "final_answer": "Provider error (invalid_control_message): unknown tool call: search",
+      "elapsed_ms": 3072.42
+    },
+    {
+      "task": "git_status",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "git.status"
+      ],
+      "final_answer": "The workspace is on a fresh `main` branch with **no commits yet**.\n\nYes, there is **one untracked file**:\n\n- `new_feature.py`\n\nThat\u2019s the only item in the working tree right now. Nothing is staged or ",
+      "elapsed_ms": 6302.28
+    }
+  ]
+}

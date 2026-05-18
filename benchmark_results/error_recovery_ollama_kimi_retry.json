@@ -1,0 +1,52 @@
+{
+  "schema": "kestrel.error_recovery_benchmark.v1",
+  "config": {
+    "provider": "openai-compatible",
+    "model": "kimi-k2.5",
+    "backend": "memory",
+    "tasks": [
+      "strategy_retry",
+      "max_retries_exceeded"
+    ]
+  },
+  "summary": {
+    "total_tasks": 2,
+    "success_count": 2,
+    "success_rate": 1.0,
+    "total_errors_injected": 2,
+    "total_tool_attempts": 3,
+    "avg_tools_per_task": 1.5,
+    "total_elapsed_ms": 24278.58
+  },
+  "results": [
+    {
+      "task": "strategy_retry",
+      "success": true,
+      "retry_allowed": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read",
+        "file.read"
+      ],
+      "errors_seen": [
+        "transient_error"
+      ],
+      "final_answer": "The secret code is **42**.",
+      "elapsed_ms": 10655.27
+    },
+    {
+      "task": "max_retries_exceeded",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "read"
+      ],
+      "errors_seen": [
+        "transient_error"
+      ],
+      "file_read_attempts": 0,
+      "final_answer": "I attempted to read the file, but the read failed. The path you provided (`/var/folders/wg/mqfrcdmd0tvdk86lh4b3mshh0000gn/T/kestrel-error-bench-max_retries_exceeded-pu2ynkpe/workspace/answer.txt`) app",
+      "elapsed_ms": 13623.31
+    }
+  ]
+}

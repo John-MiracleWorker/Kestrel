@@ -1,0 +1,85 @@
+{
+  "schema": "kestrel.error_recovery_benchmark.v1",
+  "config": {
+    "provider": "ollama-cloud",
+    "model": "gemma3:27b",
+    "backend": "memory",
+    "tasks": [
+      "transient_file_read",
+      "file_not_found",
+      "empty_search_results",
+      "malformed_tool_name",
+      "strategy_retry",
+      "max_retries_exceeded"
+    ]
+  },
+  "summary": {
+    "total_tasks": 6,
+    "success_count": 3,
+    "success_rate": 0.5,
+    "total_errors_injected": 0,
+    "total_tool_attempts": 1,
+    "avg_tools_per_task": 0.17,
+    "total_elapsed_ms": 26423.92
+  },
+  "results": [
+    {
+      "task": "transient_file_read",
+      "success": false,
+      "turns": 1,
+      "tool_calls": [],
+      "errors_seen": [],
+      "final_answer": "Okay, I will read the file and tell you the secret code.\n\n```tool_code\n{\n  \"message\": \"Reading the file to find the secret code.\",\n  \"tool_calls\": [\n    {\"name\": \"file_read\", \"arguments\": {\"file_path\"",
+      "elapsed_ms": 5148.79
+    },
+    {
+      "task": "file_not_found",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [],
+      "errors_seen": [],
+      "final_answer": "I am unable to access the file at that path. It appears to be a temporary file that does not exist or is not accessible to me.\n\nIs there another file I can read, or perhaps you would like me to perfor",
+      "elapsed_ms": 2286.75
+    },
+    {
+      "task": "empty_search_results",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "memory.search"
+      ],
+      "errors_seen": [],
+      "final_answer": "Okay, I see you asked me to search for \"zebra\" in a specific workspace directory. That directory appears to be a temporary location used for testing, and based on the name (\"empty_search_results\"), it",
+      "elapsed_ms": 6121.99
+    },
+    {
+      "task": "malformed_tool_name",
+      "success": false,
+      "turns": 1,
+      "tool_calls": [],
+      "errors_seen": [],
+      "final_answer": "Provider error (invalid_control_message): unknown tool call: file_reader",
+      "elapsed_ms": 3840.09
+    },
+    {
+      "task": "strategy_retry",
+      "success": false,
+      "retry_allowed": false,
+      "turns": 1,
+      "tool_calls": [],
+      "errors_seen": [],
+      "final_answer": "Provider error (invalid_control_message): unknown tool call: files.read",
+      "elapsed_ms": 5171.58
+    },
+    {
+      "task": "max_retries_exceeded",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [],
+      "errors_seen": [],
+      "file_read_attempts": 0,
+      "final_answer": "Okay, I will read the file and tell you the secret code.\n\n```tool_code\n{\n  \"message\": \"Reading the file to find the secret code.\",\n  \"tool_calls\": [\n    {\"name\": \"files.read\", \"arguments\": {\"file_path",
+      "elapsed_ms": 3854.72
+    }
+  ]
+}

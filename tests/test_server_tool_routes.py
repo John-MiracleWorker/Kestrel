@@ -64,6 +64,7 @@ def test_tool_routes_list_specs_and_invoke_tools() -> None:
             "skill_id": None,
             "capabilities": [],
             "produces_validation": False,
+            "aliases": [],
             "enabled": True,
             "enablement_flag": None,
         }

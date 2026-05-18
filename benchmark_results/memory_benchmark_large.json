@@ -1,0 +1,83 @@
+{
+  "schema": "kestrel.memory_benchmark_large.v1",
+  "config": {
+    "k": 5,
+    "seed": 42,
+    "total_queries": 136,
+    "total_docs": 665
+  },
+  "overall": {
+    "kestrel": {
+      "recall_at_k": 0.456,
+      "precision_at_k": 0.092,
+      "mrr": 0.237,
+      "avg_latency_ms": 0.836,
+      "p99_latency_ms": 1.354,
+      "ingest_time_s": 0.031
+    },
+    "baseline": {
+      "recall_at_k": 0.279,
+      "precision_at_k": 0.056,
+      "mrr": 0.159,
+      "avg_latency_ms": 1.358,
+      "p99_latency_ms": 1.5,
+      "ingest_time_s": 4.523
+    }
+  },
+  "deltas": {
+    "recall_at_k": 0.177,
+    "precision_at_k": 0.036,
+    "mrr": 0.078
+  },
+  "speedup": 1.62,
+  "per_layer": {
+    "semantic": {
+      "kestrel": {
+        "recall_at_k": 0.367,
+        "precision_at_k": 0.073,
+        "mrr": 0.212,
+        "avg_latency_ms": 0.773,
+        "p99_latency_ms": 0.968
+      },
+      "baseline": {
+        "recall_at_k": 0.183,
+        "precision_at_k": 0.037,
+        "mrr": 0.137,
+        "avg_latency_ms": 1.328,
+        "p99_latency_ms": 1.386
+      }
+    },
+    "episodic": {
+      "kestrel": {
+        "recall_at_k": 0.36,
+        "precision_at_k": 0.072,
+        "mrr": 0.168,
+        "avg_latency_ms": 1.128,
+        "p99_latency_ms": 1.446
+      },
+      "baseline": {
+        "recall_at_k": 0.28,
+        "precision_at_k": 0.056,
+        "mrr": 0.124,
+        "avg_latency_ms": 1.398,
+        "p99_latency_ms": 1.5
+      }
+    },
+    "procedural": {
+      "kestrel": {
+        "recall_at_k": 0.846,
+        "precision_at_k": 0.171,
+        "mrr": 0.428,
+        "avg_latency_ms": 0.421,
+        "p99_latency_ms": 0.526
+      },
+      "baseline": {
+        "recall_at_k": 0.5,
+        "precision_at_k": 0.1,
+        "mrr": 0.276,
+        "avg_latency_ms": 1.349,
+        "p99_latency_ms": 1.389
+      }
+    }
+  }
+}

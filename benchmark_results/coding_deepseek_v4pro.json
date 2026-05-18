@@ -1,0 +1,33 @@
+{
+  "schema": "kestrel.coding_benchmark.v1",
+  "config": {
+    "provider": "ollama-cloud",
+    "model": "deepseek-v4-pro",
+    "tasks": [
+      "easy-js-duration"
+    ]
+  },
+  "summary": {
+    "total_tasks": 1,
+    "success_count": 0,
+    "success_rate": 0.0,
+    "total_tool_calls": 0,
+    "avg_tools_per_task": 0.0
+  },
+  "results": [
+    {
+      "task_id": "easy-js-duration",
+      "difficulty": 1,
+      "language": "javascript",
+      "success": false,
+      "solution_exists": false,
+      "solution_size_bytes": 0,
+      "tool_calls": [],
+      "tool_rounds": 0,
+      "stop_reason": "provider_error",
+      "elapsed_seconds": 0.214,
+      "test_output": "",
+      "assistant_message": "Provider error (RuntimeError): Ollama request failed with HTTP 401: unauthorized\n"
+    }
+  ]
+}

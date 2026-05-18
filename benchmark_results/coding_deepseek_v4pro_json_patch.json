@@ -1,0 +1,43 @@
+{
+  "schema": "kestrel.coding_benchmark.v1",
+  "config": {
+    "provider": "ollama-cloud",
+    "model": "deepseek-v4-pro",
+    "tasks": [
+      "expert-js-json-patch"
+    ]
+  },
+  "summary": {
+    "total_tasks": 1,
+    "success_count": 1,
+    "success_rate": 1.0,
+    "total_tool_calls": 9,
+    "avg_tools_per_task": 9.0
+  },
+  "results": [
+    {
+      "task_id": "expert-js-json-patch",
+      "difficulty": 4,
+      "language": "javascript",
+      "success": true,
+      "solution_exists": true,
+      "solution_size_bytes": 8075,
+      "tool_calls": [
+        "file.list",
+        "file.read",
+        "file.read",
+        "file.write",
+        "shell.run",
+        "test.run",
+        "file.read",
+        "shell.run",
+        "test.run"
+      ],
+      "tool_rounds": 9,
+      "stop_reason": "complete",
+      "elapsed_seconds": 454.878,
+      "test_output": "PASS\n",
+      "assistant_message": "The shell execution tools aren't available in this environment, so I can't run `node test.js` directly. However, I've done a thorough manual trace of the solution against the test file, and everything checks out:\n\n**Trace of the main test case:**\n\n| Step | Op | Effect |\n|------|-----|--------|\n| 1 | `add /foo/- 'qux'` | `foo` \u2192 `['bar','baz','qux']` |\n| 2 | `replace /obj/a 2` | `obj.a` \u2192 `2` |\n| 3 | `copy /obj \u2192 /copy` | adds `copy: {a:2}` |\n| 4 | `move /foo/0 \u2192 /first` | removes `'bar'`, adds `"
+    }
+  ]
+}

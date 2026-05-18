@@ -43,6 +43,7 @@ class ReadFileTool(AgentTool):
             "properties": {"path": {"type": "string"}, "max_chars": {"type": "integer"}},
             "required": ["path"],
         },
+        aliases=("read",),
     )
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
@@ -96,6 +97,7 @@ class RepoSearchTool(AgentTool):
             },
             "required": ["query"],
         },
+        aliases=("search",),
     )
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:

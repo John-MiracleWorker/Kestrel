@@ -1,0 +1,101 @@
+{
+  "schema": "kestrel.error_recovery_benchmark.v1",
+  "config": {
+    "provider": "openai-compatible",
+    "model": "kimi-k2.6",
+    "backend": "memory",
+    "tasks": [
+      "transient_file_read",
+      "file_not_found",
+      "empty_search_results",
+      "malformed_tool_name",
+      "strategy_retry",
+      "max_retries_exceeded"
+    ]
+  },
+  "summary": {
+    "total_tasks": 6,
+    "success_count": 4,
+    "success_rate": 0.67,
+    "total_errors_injected": 4,
+    "total_tool_attempts": 5,
+    "avg_tools_per_task": 0.83,
+    "total_elapsed_ms": 170588.41
+  },
+  "results": [
+    {
+      "task": "transient_file_read",
+      "success": false,
+      "turns": 1,
+      "tool_calls": [
+        "read"
+      ],
+      "errors_seen": [
+        "transient_error"
+      ],
+      "final_answer": "I can only read files that live inside the configured workspace root. The path you gave me (`/var/folders/wg/...`) is outside that boundary, which is why the read failed.\n\nIf you want me to read `answ",
+      "elapsed_ms": 21765.86
+    },
+    {
+      "task": "file_not_found",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read"
+      ],
+      "errors_seen": [
+        "not_found"
+      ],
+      "final_answer": "The file doesn't exist at that path:\n\n`/var/folders/wg/mqfrcdmd0tvdk86lh4b3mshh0000gn/T/kestrel-error-bench-file_not_found-o4h8hv8a/workspace/missing.txt`\n\nIf you meant a different file or need help l",
+      "elapsed_ms": 28847.48
+    },
+    {
+      "task": "empty_search_results",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "repo.search"
+      ],
+      "errors_seen": [
+        "empty_results"
+      ],
+      "final_answer": "No matches found for **\"zebra\"** in the workspace. The search completed across the workspace files and returned zero results.",
+      "elapsed_ms": 45375.58
+    },
+    {
+      "task": "malformed_tool_name",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read"
+      ],
+      "errors_seen": [],
+      "final_answer": "The secret code is **42**.",
+      "elapsed_ms": 15228.34
+    },
+    {
+      "task": "strategy_retry",
+      "success": false,
+      "retry_allowed": false,
+      "turns": 1,
+      "tool_calls": [
+        "file.read"
+      ],
+      "errors_seen": [
+        "transient_error"
+      ],
+      "final_answer": "I can\u2019t read that file. The path you gave (`/var/folders/...`) is outside my configured workspace root, and the `file.read` tool is restricted to files within the workspace. The attempt returned a con",
+      "elapsed_ms": 33464.12
+    },
+    {
+      "task": "max_retries_exceeded",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [],
+      "errors_seen": [],
+      "file_read_attempts": 0,
+      "final_answer": "I can only read files that are inside the configured workspace root. The path you provided (`/var/folders/wg/.../answer.txt`) appears to be outside that workspace, so I can't access it directly.\n\nIf y",
+      "elapsed_ms": 25907.03
+    }
+  ]
+}

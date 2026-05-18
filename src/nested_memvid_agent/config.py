@@ -79,6 +79,8 @@ class AgentConfig:
     require_api_auth: bool = False
     api_auth_token_env: str = "NEST_AGENT_API_TOKEN"
     tool_timeout_seconds: float = 30.0
+    tool_retry_max_attempts: int = 3
+    tool_retry_backoff_base_seconds: float = 1.0
     trusted_hosts: tuple[str, ...] = ("127.0.0.1", "localhost", "::1", "[::1]", "testserver")
     cors_origins: tuple[str, ...] = ()
     llm_turn_summaries: bool = False
@@ -120,6 +122,8 @@ class AgentConfig:
             enable_channel_delivery=_env_bool("NEST_AGENT_ENABLE_CHANNEL_DELIVERY"),
             channel_send_timeout_seconds=_env_int("NEST_AGENT_CHANNEL_SEND_TIMEOUT_SECONDS", 10),
             tool_timeout_seconds=_env_float("NEST_AGENT_TOOL_TIMEOUT_SECONDS", 30.0),
+            tool_retry_max_attempts=_env_int("NEST_AGENT_TOOL_RETRY_MAX_ATTEMPTS", 3),
+            tool_retry_backoff_base_seconds=_env_float("NEST_AGENT_TOOL_RETRY_BACKOFF_BASE_SECONDS", 1.0),
             allow_shell=_env_bool("NEST_AGENT_ALLOW_SHELL"),
             allow_file_write=_env_bool("NEST_AGENT_ALLOW_FILE_WRITE"),
             allow_policy_writes=_env_bool("NEST_AGENT_ALLOW_POLICY_WRITES"),

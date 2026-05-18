@@ -179,6 +179,8 @@ def _tool_spec(name: str, tools: list[ToolSpec] | tuple[ToolSpec, ...]) -> ToolS
     for spec in tools:
         if spec.name == name:
             return spec
+        if name in spec.aliases:
+            return spec
     return None
 
 

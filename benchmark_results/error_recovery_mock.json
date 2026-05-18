@@ -1,0 +1,116 @@
+{
+  "schema": "kestrel.error_recovery_benchmark.v1",
+  "config": {
+    "provider": "mock",
+    "model": "mock",
+    "backend": "memory",
+    "tasks": [
+      "transient_file_read",
+      "file_not_found",
+      "empty_search_results",
+      "malformed_tool_name",
+      "strategy_retry",
+      "max_retries_exceeded"
+    ]
+  },
+  "summary": {
+    "total_tasks": 6,
+    "success_count": 6,
+    "success_rate": 1.0,
+    "total_errors_injected": 10,
+    "total_tool_attempts": 12,
+    "avg_tools_per_task": 2.0,
+    "total_elapsed_ms": 16.57
+  },
+  "results": [
+    {
+      "task": "transient_file_read",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read",
+        "file.read"
+      ],
+      "errors_seen": [
+        "transient_error",
+        "retry_blocked"
+      ],
+      "final_answer": "The secret code is 42.",
+      "elapsed_ms": 2.93
+    },
+    {
+      "task": "file_not_found",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read"
+      ],
+      "errors_seen": [
+        "not_found"
+      ],
+      "final_answer": "The file missing.txt does not exist.",
+      "elapsed_ms": 1.71
+    },
+    {
+      "task": "empty_search_results",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "repo.search"
+      ],
+      "errors_seen": [
+        "empty_results"
+      ],
+      "final_answer": "No matches were found for 'zebra'.",
+      "elapsed_ms": 1.77
+    },
+    {
+      "task": "malformed_tool_name",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read"
+      ],
+      "errors_seen": [],
+      "final_answer": "The secret code is 42.",
+      "elapsed_ms": 2.21
+    },
+    {
+      "task": "strategy_retry",
+      "success": true,
+      "retry_allowed": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read",
+        "file.read"
+      ],
+      "errors_seen": [
+        "transient_error"
+      ],
+      "final_answer": "The secret code is 42.",
+      "elapsed_ms": 2.47
+    },
+    {
+      "task": "max_retries_exceeded",
+      "success": true,
+      "turns": 1,
+      "tool_calls": [
+        "file.read",
+        "file.read",
+        "file.read",
+        "file.read",
+        "file.read"
+      ],
+      "errors_seen": [
+        "transient_error",
+        "retry_blocked",
+        "retry_blocked",
+        "retry_blocked",
+        "retry_blocked"
+      ],
+      "file_read_attempts": 5,
+      "final_answer": "I was unable to read the file after multiple attempts.",
+      "elapsed_ms": 5.47
+    }
+  ]
+}

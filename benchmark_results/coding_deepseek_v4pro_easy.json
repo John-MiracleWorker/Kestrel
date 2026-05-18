@@ -1,0 +1,41 @@
+{
+  "schema": "kestrel.coding_benchmark.v1",
+  "config": {
+    "provider": "ollama-cloud",
+    "model": "deepseek-v4-pro",
+    "tasks": [
+      "easy-js-duration"
+    ]
+  },
+  "summary": {
+    "total_tasks": 1,
+    "success_count": 1,
+    "success_rate": 1.0,
+    "total_tool_calls": 7,
+    "avg_tools_per_task": 7.0
+  },
+  "results": [
+    {
+      "task_id": "easy-js-duration",
+      "difficulty": 1,
+      "language": "javascript",
+      "success": true,
+      "solution_exists": true,
+      "solution_size_bytes": 1552,
+      "tool_calls": [
+        "file.list",
+        "file.read",
+        "file.write",
+        "shell.run",
+        "test.run",
+        "lint.run",
+        "file.read"
+      ],
+      "tool_rounds": 7,
+      "stop_reason": "complete",
+      "elapsed_seconds": 171.897,
+      "test_output": "PASS\n",
+      "assistant_message": "Here's the status: the solution is written and looks correct against all eight test cases, but I can't run `node test.js` \u2014 all three execution tools (`shell.run`, `test.run`, `lint.run`) are returning \"not allowlisted\" in this environment.\n\nHere's a walkthrough of why `solution.js` should pass:\n\n| Test | Expected | How it's handled |\n|---|---|---|\n| `'1h 30m'` \u2192 5400 | 1\u00d73600 + 30\u00d760 | Regex extracts `1`/`h` + `30`/`m`, unit map resolves multipliers |\n| `'2 days, 3 hours'` \u2192 183600 | 2\u00d786400 + "
+    }
+  ]
+}

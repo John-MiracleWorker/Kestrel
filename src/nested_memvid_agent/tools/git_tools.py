@@ -159,6 +159,7 @@ class GitStatusTool(AgentTool):
         name="git.status",
         description="Return read-only git status for the workspace.",
         parameters={"type": "object", "properties": {}},
+        aliases=("status",),
     )
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:

@@ -1,0 +1,236 @@
+{
+  "meta": {
+    "provider": "mock",
+    "model": "mock",
+    "workspace": "/var/folders/wg/mqfrcdmd0tvdk86lh4b3mshh0000gn/T/kestrel_real_learning_6442p76t/workspace",
+    "scenario_count": 6
+  },
+  "control_results": [
+    {
+      "scenario_id": "lint_workflow_1",
+      "scenario_name": "Fix lint issue (create lesson)",
+      "category": "lint_workflow",
+      "success": false,
+      "tool_calls": [
+        "file.read",
+        "file.write"
+      ],
+      "tool_rounds": 2,
+      "stop_reason": "complete",
+      "elapsed_seconds": 0.003,
+      "assistant_message": "Task complete.",
+      "condition": "control"
+    },
+    {
+      "scenario_id": "lint_workflow_2",
+      "scenario_name": "Fix lint issue again (test learning)",
+      "category": "lint_workflow",
+      "success": false,
+      "tool_calls": [
+        "file.read",
+        "file.write"
+      ],
+      "tool_rounds": 2,
+      "stop_reason": "complete",
+      "elapsed_seconds": 0.004,
+      "assistant_message": "Task complete.",
+      "condition": "control"
+    },
+    {
+      "scenario_id": "test_workflow_1",
+      "scenario_name": "Fix calculator bug (create lesson)",
+      "category": "test_workflow",
+      "success": false,
+      "tool_calls": [
+        "file.read",
+        "file.write"
+      ],
+      "tool_rounds": 2,
+      "stop_reason": "complete",
+      "elapsed_seconds": 0.004,
+      "assistant_message": "Task complete.",
+      "condition": "control"
+    },
+    {
+      "scenario_id": "test_workflow_2",
+      "scenario_name": "Fix calculator bug again (test learning)",
+      "category": "test_workflow",
+      "success": false,
+      "tool_calls": [
+        "file.read",
+        "file.write"
+      ],
+      "tool_rounds": 2,
+      "stop_reason": "complete",
+      "elapsed_seconds": 0.003,
+      "assistant_message": "Task complete.",
+      "condition": "control"
+    },
+    {
+      "scenario_id": "debug_workflow_1",
+      "scenario_name": "Fix KeyError bug (create lesson)",
+      "category": "debug_workflow",
+      "success": false,
+      "tool_calls": [
+        "file.read",
+        "file.write"
+      ],
+      "tool_rounds": 2,
+      "stop_reason": "complete",
+      "elapsed_seconds": 0.002,
+      "assistant_message": "Task complete.",
+      "condition": "control"
+    },
+    {
+      "scenario_id": "debug_workflow_2",
+      "scenario_name": "Fix KeyError bug again (test learning)",
+      "category": "debug_workflow",
+      "success": false,
+      "tool_calls": [
+        "file.read",
+        "file.write"
+      ],
+      "tool_rounds": 2,
+      "stop_reason": "complete",
+      "elapsed_seconds": 0.002,
+      "assistant_message": "Task complete.",
+      "condition": "control"
+    }
+  ],
+  "treatment_results": [
+    {
+      "scenario_id": "lint_workflow_1",
+      "scenario_name": "Fix lint issue (create lesson)",
+      "category": "lint_workflow",
+      "success": false,
+      "tool_calls": [
+        "file.read",
+        "file.write"
+      ],
+      "tool_rounds": 2,
+      "stop_reason": "complete",
+      "elapsed_seconds": 0.002,
+      "assistant_message": "Task complete.",
+      "condition": "treatment"
+    },
+    {
+      "scenario_id": "lint_workflow_2",
+      "scenario_name": "Fix lint issue again (test learning)",
+      "category": "lint_workflow",
+      "success": true,
+      "tool_calls": [
+        "file.read",
+        "file.write",
+        "lint.run"
+      ],
+      "tool_rounds": 3,
+      "stop_reason": "complete",
+      "elapsed_seconds": 0.037,
+      "assistant_message": "Task complete.",
+      "condition": "treatment"
+    },
+    {
+      "scenario_id": "test_workflow_1",
+      "scenario_name": "Fix calculator bug (create lesson)",
+      "category": "test_workflow",
+      "success": false,
+      "tool_calls": [
+        "file.read",
+        "file.write"
+      ],
+      "tool_rounds": 2,
+      "stop_reason": "complete",
+      "elapsed_seconds": 0.003,
+      "assistant_message": "Task complete.",
+      "condition": "treatment"
+    },
+    {
+      "scenario_id": "test_workflow_2",
+      "scenario_name": "Fix calculator bug again (test learning)",
+      "category": "test_workflow",
+      "success": true,
+      "tool_calls": [
+        "file.read",
+        "test.run",
+        "file.write",
+        "test.run"
+      ],
+      "tool_rounds": 4,
+      "stop_reason": "complete",
+      "elapsed_seconds": 4.09,
+      "assistant_message": "Task complete.",
+      "condition": "treatment"
+    },
+    {
+      "scenario_id": "debug_workflow_1",
+      "scenario_name": "Fix KeyError bug (create lesson)",
+      "category": "debug_workflow",
+      "success": false,
+      "tool_calls": [
+        "file.read",
+        "file.write"
+      ],
+      "tool_rounds": 2,
+      "stop_reason": "complete",
+      "elapsed_seconds": 0.002,
+      "assistant_message": "Task complete.",
+      "condition": "treatment"
+    },
+    {
+      "scenario_id": "debug_workflow_2",
+      "scenario_name": "Fix KeyError bug again (test learning)",
+      "category": "debug_workflow",
+      "success": true,
+      "tool_calls": [
+        "file.read",
+        "file.read",
+        "file.write"
+      ],
+      "tool_rounds": 3,
+      "stop_reason": "complete",
+      "elapsed_seconds": 0.003,
+      "assistant_message": "Task complete.",
+      "condition": "treatment"
+    }
+  ],
+  "analysis": {
+    "task1_baseline": {
+      "control_success_rate": 0.0,
+      "control_avg_rounds": 2.0,
+      "treatment_success_rate": 0.0,
+      "treatment_avg_rounds": 2.0
+    },
+    "task2_learning": {
+      "control_success_rate": 0.0,
+      "control_avg_rounds": 2.0,
+      "treatment_success_rate": 1.0,
+      "treatment_avg_rounds": 3.33,
+      "efficiency_gains": {
+        "lint_workflow": {
+          "control_rounds": 2,
+          "treatment_rounds": 3,
+          "delta": -1,
+          "pct_fewer": -50.0
+        },
+        "debug_workflow": {
+          "control_rounds": 2,
+          "treatment_rounds": 3,
+          "delta": -1,
+          "pct_fewer": -50.0
+        },
+        "test_workflow": {
+          "control_rounds": 2,
+          "treatment_rounds": 4,
+          "delta": -2,
+          "pct_fewer": -100.0
+        }
+      }
+    },
+    "overall": {
+      "control_success_rate": 0.0,
+      "treatment_success_rate": 0.5,
+      "control_avg_rounds": 2.0,
+      "treatment_avg_rounds": 2.67
+    }
+  }
+}
