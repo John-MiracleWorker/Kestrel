@@ -6,6 +6,7 @@ from .base import FallbackLLMProvider, LLMProvider
 from .codex_cli_provider import CodexCLIProvider
 from .gemini_provider import GeminiProvider
 from .mock import MockLLMProvider
+from .ollama_provider import OllamaNativeProvider
 from .openai_compatible_provider import OpenAICompatibleProvider
 from .openai_provider import OpenAIResponsesProvider
 
@@ -63,6 +64,26 @@ def _build_single_provider(
             temperature=config.temperature,
             provider_name="openrouter",
         )
+    if provider == "deepseek":
+        return OpenAICompatibleProvider(
+            model=model,
+            base_url=base_url or "https://api.deepseek.com",
+            api_key_env=api_key_env or "DEEPSEEK_API_KEY",
+            timeout_seconds=config.timeout_seconds,
+            max_retries=config.max_retries,
+            temperature=config.temperature,
+            provider_name="deepseek",
+        )
+    if provider == "kimi":
+        return OpenAICompatibleProvider(
+            model=model,
+            base_url=base_url or "https://api.moonshot.ai/v1",
+            api_key_env=api_key_env or "MOONSHOT_API_KEY",
+            timeout_seconds=config.timeout_seconds,
+            max_retries=config.max_retries,
+            temperature=config.temperature,
+            provider_name="kimi",
+        )
     if provider == "ollama":
         return OpenAICompatibleProvider(
             model=model,
@@ -72,6 +93,15 @@ def _build_single_provider(
             max_retries=config.max_retries,
             temperature=config.temperature,
             provider_name="ollama",
+        )
+    if provider == "ollama-cloud":
+        return OllamaNativeProvider(
+            model=model,
+            base_url=base_url or "https://ollama.com/api",
+            api_key_env=api_key_env or "OLLAMA_API_KEY",
+            timeout_seconds=config.timeout_seconds,
+            max_retries=config.max_retries,
+            temperature=config.temperature,
         )
     if provider == "anthropic":
         return AnthropicMessagesProvider(

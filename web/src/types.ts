@@ -305,6 +305,20 @@ export type RuntimeConfig = {
   validation_commands: string[];
 };
 
+export type ProviderModelCatalog = {
+  provider: string;
+  models: string[];
+  fallback_models: string[];
+  source: string;
+  ok: boolean;
+  fetchable: boolean;
+  error?: string | null;
+  base_url_configured: boolean;
+  api_key_env?: string | null;
+  api_key_configured: boolean;
+  fetched_at?: string | null;
+};
+
 export type SelfState = {
   identity: Record<string, unknown>;
   provider: Record<string, unknown>;

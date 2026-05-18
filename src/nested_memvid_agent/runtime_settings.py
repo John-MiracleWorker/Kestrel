@@ -1,23 +1,16 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .config import AgentConfig
+from .llm.model_catalog import PROVIDER_OPTIONS
 
-PROVIDER_CHOICES = {
-    "mock",
-    "openai",
-    "openai-compatible",
-    "openrouter",
-    "ollama",
-    "anthropic",
-    "gemini",
-    "codex-cli",
-}
+PROVIDER_CHOICES = set(PROVIDER_OPTIONS)
 BACKEND_CHOICES = {"memory", "memvid"}
 AUTONOMY_CHOICES = {"background", "manual", "autonomous"}
 TOOL_PERMISSION_FIELDS = {
@@ -40,6 +33,7 @@ class RuntimeSettings:
     backend: str
     memory_dir: str
     workspace: str
+    temperature: float
     stream: bool
     require_api_auth: bool
     autonomy_mode: str = "background"
@@ -62,6 +56,7 @@ class RuntimeSettings:
             backend=config.backend,
             memory_dir=str(config.memory_dir),
             workspace=str(config.workspace),
+            temperature=config.temperature,
             stream=config.stream,
             require_api_auth=config.require_api_auth,
             autonomy_mode=autonomy_mode,
@@ -128,6 +123,7 @@ def apply_runtime_settings(config: AgentConfig, settings: RuntimeSettings) -> Ag
         config,
         provider=settings.provider,
         model=settings.model,
+        temperature=settings.temperature,
         backend=settings.backend,
         memory_dir=Path(settings.memory_dir),
         workspace=Path(settings.workspace),
@@ -153,6 +149,7 @@ def merge_runtime_settings(config: AgentConfig, current: RuntimeSettings, raw: d
         "backend",
         "memory_dir",
         "workspace",
+        "temperature",
         "stream",
         "require_api_auth",
         "autonomy_mode",
@@ -183,6 +180,7 @@ def _normalize_settings(settings: RuntimeSettings) -> RuntimeSettings:
         backend=backend,
         memory_dir=memory_dir,
         workspace=workspace,
+        temperature=_clean_temperature(settings.temperature),
         stream=_clean_bool(settings.stream),
         require_api_auth=_clean_bool(settings.require_api_auth),
         autonomy_mode=autonomy_mode,
@@ -212,3 +210,17 @@ def _clean_bool(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _clean_temperature(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise ValueError("temperature must be a number")
+    try:
+        temperature = float(value)
+    except ValueError as exc:
+        raise ValueError("temperature must be a number") from exc
+    if not math.isfinite(temperature):
+        raise ValueError("temperature must be finite")
+    if temperature < 0 or temperature > 2:
+        raise ValueError("temperature must be between 0 and 2")
+    return temperature

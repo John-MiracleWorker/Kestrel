@@ -369,6 +369,7 @@ describe("App", () => {
     await screen.findByRole("heading", { name: /settings/i });
     fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "codex-cli" } });
     fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-5.4" } });
+    fireEvent.change(screen.getByLabelText("Temperature"), { target: { value: "0.7" } });
     fireEvent.click(screen.getByRole("button", { name: "Manual" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Stream responses" }));
     fireEvent.click(screen.getByRole("button", { name: "Memvid" }));
@@ -383,6 +384,7 @@ describe("App", () => {
       expect(body).toMatchObject({
         provider: "codex-cli",
         model: "gpt-5.4",
+        temperature: 0.7,
         backend: "memvid",
         memory_dir: "/tmp/memory",
         workspace: "/tmp/kestrel",
@@ -396,6 +398,22 @@ describe("App", () => {
       expect(body.allow_codex_cli).toBe(false);
     });
     expect(await screen.findByText("Settings saved and applied to new runs.")).toBeInTheDocument();
+  });
+
+  it("fetches provider model names when the provider changes", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    await screen.findByRole("heading", { name: /settings/i });
+    fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "ollama-cloud" } });
+
+    await waitFor(() => {
+      expect(fetchSpy.mock.calls.some(([path]) => path === "/api/runtime/models?provider=ollama-cloud")).toBe(true);
+    });
+    expect(screen.getByDisplayValue("gpt-oss:120b")).toBeInTheDocument();
+    expect(screen.getByText("2 provider models")).toBeInTheDocument();
   });
 
   it("runs the setup wizard and saves onboarding to Soul memory", async () => {
@@ -669,6 +687,37 @@ function payloadFor(path: string): unknown {
       validation_commands: ["python -m pytest -q"]
     };
   }
+  const modelCatalogMatch = path.match(/^\/api\/runtime\/models\?provider=([^&]+)$/);
+  if (modelCatalogMatch) {
+    const provider = decodeURIComponent(modelCatalogMatch[1]);
+    const modelsByProvider: Record<string, string[]> = {
+      mock: ["mock"],
+      openai: ["gpt-5.5", "gpt-5.4"],
+      "openai-compatible": ["local-model"],
+      openrouter: ["openai/gpt-5.5", "anthropic/claude-sonnet-4.5"],
+      deepseek: ["deepseek-v4-pro", "deepseek-v4-flash"],
+      kimi: ["kimi-k2.6", "kimi-k2.5"],
+      ollama: ["llama3.1", "qwen2.5-coder"],
+      "ollama-cloud": ["gpt-oss:120b", "gpt-oss:20b"],
+      anthropic: ["claude-sonnet-4.5"],
+      gemini: ["gemini-2.5-pro"],
+      "codex-cli": ["gpt-5.5", "gpt-5.4"]
+    };
+    return {
+      provider,
+      models: modelsByProvider[provider] ?? [],
+      fallback_models: modelsByProvider[provider] ?? [],
+      source: provider === "mock" || provider === "codex-cli" ? "static" : "provider",
+      ok: true,
+      fetchable: provider !== "mock" && provider !== "codex-cli",
+      error: null,
+      base_url_configured: false,
+      api_key_env: apiKeyEnvForProvider(provider),
+      api_key_configured: !["ollama-cloud", "deepseek", "kimi"].includes(provider),
+      fetched_at: "2026-05-17T00:00:00Z"
+    };
+  }
+  if (path === "/api/runtime/models") return { providers: [] };
   if (path === "/api/logs?limit=120") return [];
   if (path === "/api/cognition/lessons?k=20") return { items: [] };
   if (path === "/api/cognition/failures?k=20") return { items: [] };
@@ -694,6 +743,15 @@ function payloadFor(path: string): unknown {
     };
   }
   return {};
+}
+
+function apiKeyEnvForProvider(provider: string): string | null {
+  const apiKeyEnvs: Record<string, string> = {
+    "ollama-cloud": "OLLAMA_API_KEY",
+    deepseek: "DEEPSEEK_API_KEY",
+    kimi: "MOONSHOT_API_KEY"
+  };
+  return apiKeyEnvs[provider] ?? null;
 }
 
 function personaPayload() {

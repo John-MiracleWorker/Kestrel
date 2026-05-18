@@ -15,6 +15,8 @@ from nested_memvid_agent.llm.base import (
 )
 from nested_memvid_agent.llm.factory import build_llm_provider
 from nested_memvid_agent.llm.gemini_provider import GeminiProvider
+from nested_memvid_agent.llm.model_catalog import model_catalog_for_provider
+from nested_memvid_agent.llm.ollama_provider import OllamaNativeProvider
 from nested_memvid_agent.llm.openai_compatible_provider import OpenAICompatibleProvider
 from nested_memvid_agent.llm.openai_provider import OpenAIResponsesProvider
 from nested_memvid_agent.llm.parser import ControlMessageError, parse_agent_response
@@ -108,14 +110,100 @@ def test_factory_builds_openai_compatible_provider() -> None:
 
 def test_factory_builds_provider_parity_aliases() -> None:
     openrouter = build_llm_provider(AgentConfig(provider="openrouter", model="openai/gpt-test"))
+    deepseek = build_llm_provider(AgentConfig(provider="deepseek", model="deepseek-v4-pro"))
+    kimi = build_llm_provider(AgentConfig(provider="kimi", model="kimi-k2.6"))
     ollama = build_llm_provider(AgentConfig(provider="ollama", model="llama3.1"))
+    ollama_cloud = build_llm_provider(AgentConfig(provider="ollama-cloud", model="gpt-oss:120b"))
     anthropic = build_llm_provider(AgentConfig(provider="anthropic", model="claude-test"))
     gemini = build_llm_provider(AgentConfig(provider="gemini", model="gemini-test"))
 
     assert openrouter.capabilities.name == "openrouter"
+    assert deepseek.capabilities.name == "deepseek"
+    assert kimi.capabilities.name == "kimi"
     assert ollama.capabilities.name == "ollama"
+    assert isinstance(ollama_cloud, OllamaNativeProvider)
+    assert ollama_cloud.capabilities.name == "ollama-cloud"
     assert isinstance(anthropic, AnthropicMessagesProvider)
     assert isinstance(gemini, GeminiProvider)
+
+
+def test_model_catalog_returns_static_models_for_mock() -> None:
+    catalog = model_catalog_for_provider(AgentConfig(), "mock")
+
+    assert catalog.ok is True
+    assert catalog.fetchable is False
+    assert catalog.models == ("mock",)
+
+
+def test_model_catalog_fetches_openai_compatible_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, Any] = {}
+
+    def fake_fetch_json(url: str, **kwargs: Any) -> Any:
+        calls["url"] = url
+        calls["kwargs"] = kwargs
+        return {"data": [{"id": "local-a"}, {"id": "local-b"}]}
+
+    monkeypatch.setattr("nested_memvid_agent.llm.model_catalog._fetch_json", fake_fetch_json)
+    catalog = model_catalog_for_provider(
+        AgentConfig(
+            provider="openai-compatible",
+            model="local-a",
+            base_url="http://127.0.0.1:1234/v1",
+        ),
+        "openai-compatible",
+    )
+
+    assert catalog.ok is True
+    assert catalog.models == ("local-a", "local-b")
+    assert calls["url"] == "http://127.0.0.1:1234/v1/models"
+
+
+def test_model_catalog_fetches_deepseek_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, Any] = {}
+
+    def fake_fetch_json(url: str, **kwargs: Any) -> Any:
+        calls["url"] = url
+        calls["kwargs"] = kwargs
+        return {"data": [{"id": "deepseek-v4-pro"}, {"id": "deepseek-v4-flash"}]}
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr("nested_memvid_agent.llm.model_catalog._fetch_json", fake_fetch_json)
+    catalog = model_catalog_for_provider(AgentConfig(), "deepseek")
+
+    assert catalog.ok is True
+    assert catalog.models == ("deepseek-v4-pro", "deepseek-v4-flash")
+    assert catalog.api_key_env == "DEEPSEEK_API_KEY"
+    assert calls["url"] == "https://api.deepseek.com/models"
+    assert calls["kwargs"]["api_key"] == "test-key"
+
+
+def test_model_catalog_fetches_kimi_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, Any] = {}
+
+    def fake_fetch_json(url: str, **kwargs: Any) -> Any:
+        calls["url"] = url
+        calls["kwargs"] = kwargs
+        return {"data": [{"id": "kimi-k2.6"}, {"id": "kimi-k2.5"}]}
+
+    monkeypatch.setenv("MOONSHOT_API_KEY", "test-key")
+    monkeypatch.setattr("nested_memvid_agent.llm.model_catalog._fetch_json", fake_fetch_json)
+    catalog = model_catalog_for_provider(AgentConfig(), "kimi")
+
+    assert catalog.ok is True
+    assert catalog.models == ("kimi-k2.6", "kimi-k2.5")
+    assert catalog.api_key_env == "MOONSHOT_API_KEY"
+    assert calls["url"] == "https://api.moonshot.ai/v1/models"
+    assert calls["kwargs"]["api_key"] == "test-key"
+
+
+def test_model_catalog_falls_back_when_provider_is_unconfigured() -> None:
+    catalog = model_catalog_for_provider(AgentConfig(), "ollama-cloud")
+
+    assert catalog.ok is False
+    assert catalog.fetchable is True
+    assert catalog.models == ("gpt-oss:120b", "gpt-oss:20b")
+    assert catalog.api_key_env == "OLLAMA_API_KEY"
+    assert "OLLAMA_API_KEY" in str(catalog.error)
 
 
 def test_strict_control_message_rejects_unknown_tool() -> None:
@@ -288,6 +376,56 @@ def test_openai_compatible_provider_normalizes_native_tool_calls(monkeypatch: py
     assert response.tool_calls[0].id == "call_local"
     assert response.tool_calls[0].arguments == {"query": "local", "k": 1}
     assert response.usage == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+
+
+def test_ollama_native_provider_uses_chat_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, Any] = {}
+
+    def fake_post_json(url: str, payload: dict[str, Any], **kwargs: Any) -> Any:
+        calls["url"] = url
+        calls["payload"] = payload
+        calls["kwargs"] = kwargs
+        return {
+            "message": {
+                "role": "assistant",
+                "content": '{"message":"cloud ok"}',
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "memory.search",
+                            "arguments": {"query": "cloud"},
+                        }
+                    }
+                ],
+            },
+            "prompt_eval_count": 5,
+            "eval_count": 7,
+            "done_reason": "stop",
+        }
+
+    monkeypatch.setattr("nested_memvid_agent.llm.ollama_provider._post_json", fake_post_json)
+    provider = OllamaNativeProvider(model="gpt-oss:120b", api_key="test-key")
+    response = provider.generate(
+        [ChatMessage(role="user", content="hello")],
+        tools=[
+            ToolSpec(
+                name="memory.search",
+                description="Search",
+                parameters={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+            )
+        ],
+        options=LLMOptions(timeout_seconds=11, temperature=0.4),
+    )
+
+    assert calls["url"] == "https://ollama.com/api/chat"
+    assert calls["kwargs"]["api_key"] == "test-key"
+    assert calls["payload"]["model"] == "gpt-oss:120b"
+    assert calls["payload"]["stream"] is False
+    assert calls["payload"]["options"] == {"temperature": 0.4}
+    assert calls["payload"]["tools"][0]["function"]["name"] == "memory.search"
+    assert response.content == "cloud ok"
+    assert response.tool_calls[0].arguments == {"query": "cloud"}
+    assert response.usage == {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}
 
 
 def test_anthropic_provider_normalizes_tool_use(monkeypatch: pytest.MonkeyPatch) -> None:

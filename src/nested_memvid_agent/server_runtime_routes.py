@@ -5,6 +5,7 @@ from importlib import metadata as importlib_metadata
 from typing import Any, NoReturn, cast
 
 from .config import AgentConfig
+from .llm.model_catalog import all_model_catalogs, default_api_key_env, model_catalog_for_provider
 from .runtime_settings import RuntimeSettingsStore, apply_runtime_settings, merge_runtime_settings
 
 
@@ -29,8 +30,8 @@ def register_runtime_routes(
             package_version = importlib_metadata.version("nested-memvid-agent")
         except importlib_metadata.PackageNotFoundError:
             package_version = None
-        provider_env = config.api_key_env
-        fallback_env = config.fallback_api_key_env
+        provider_env = default_api_key_env(config.provider, config.api_key_env)
+        fallback_env = default_api_key_env(config.fallback_provider or "", config.fallback_api_key_env)
         saved_settings = settings_store.load(config) if settings_store is not None else None
         return {
             "name": config.name,
@@ -48,6 +49,7 @@ def register_runtime_routes(
                 "fallback_api_key_env": fallback_env,
                 "fallback_api_key_configured": bool(fallback_env and os.getenv(fallback_env)),
                 "stream": config.stream,
+                "temperature": config.temperature,
                 "timeout_seconds": config.timeout_seconds,
                 "max_retries": config.max_retries,
             },
@@ -118,6 +120,14 @@ def register_runtime_routes(
                 "npm run build --prefix web",
             ],
         }
+
+    @app.get("/api/runtime/models")  # type: ignore[untyped-decorator]
+    def runtime_models(provider: str | None = None) -> dict[str, object]:
+        config = _active_config(active_config)
+        if provider:
+            catalog = model_catalog_for_provider(config, provider)
+            return catalog.to_public_dict()
+        return {"providers": [catalog.to_public_dict() for catalog in all_model_catalogs(config)]}
 
     @app.get("/api/runtime/settings")  # type: ignore[untyped-decorator]
     def get_runtime_settings() -> dict[str, object]:

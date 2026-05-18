@@ -1597,6 +1597,31 @@ textarea.input {
   gap: 10px;
 }
 
+.model-picker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.model-picker .icon-btn {
+  width: 38px;
+  height: 38px;
+  border-color: var(--rule);
+  background: var(--paper);
+}
+
+.model-picker input {
+  width: 100%;
+}
+
+.model-picker-meta {
+  grid-column: 1 / -1;
+  color: var(--faint);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
 .check-row {
   display: inline-flex;
   align-items: center;

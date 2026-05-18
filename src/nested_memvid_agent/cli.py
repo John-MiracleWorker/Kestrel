@@ -22,6 +22,7 @@ from .context_compiler import ContextCompiler
 from .context_packer import ContextPacker, ContextPackRequest
 from .event_bus import RunEventBus
 from .layers import load_layer_specs
+from .llm.model_catalog import PROVIDER_OPTIONS
 from .mcp_manager import MCPManager
 from .models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from .orchestrator import build_memory_system
@@ -46,7 +47,7 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     _add_common_args(parser)
     parser.add_argument(
         "--provider",
-        choices=["mock", "openai", "openai-compatible", "openrouter", "ollama", "anthropic", "gemini", "codex-cli"],
+        choices=list(PROVIDER_OPTIONS),
         default=argparse.SUPPRESS,
     )
     parser.add_argument("--model", default=argparse.SUPPRESS)
@@ -263,7 +264,7 @@ def main() -> None:
     _add_common_args(eval_cmd)
     eval_cmd.add_argument(
         "--provider",
-        choices=["mock", "openai", "openai-compatible", "openrouter", "ollama", "anthropic", "gemini", "codex-cli"],
+        choices=list(PROVIDER_OPTIONS),
         default=argparse.SUPPRESS,
     )
     eval_cmd.add_argument("--model", default=argparse.SUPPRESS)

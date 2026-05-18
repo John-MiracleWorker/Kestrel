@@ -120,6 +120,40 @@ def _provider_cases() -> list[ProviderCase]:
             reason="set KESTREL_IT_OLLAMA_MODEL and optionally KESTREL_IT_OLLAMA_BASE_URL",
         ),
         ProviderCase(
+            name="ollama-cloud",
+            config=AgentConfig(
+                provider="ollama-cloud",
+                model=os.getenv("KESTREL_IT_OLLAMA_CLOUD_MODEL", ""),
+                base_url=os.getenv("KESTREL_IT_OLLAMA_CLOUD_BASE_URL"),
+                api_key_env="OLLAMA_API_KEY",
+                timeout_seconds=_timeout(),
+            ),
+            available=bool(os.getenv("OLLAMA_API_KEY") and os.getenv("KESTREL_IT_OLLAMA_CLOUD_MODEL")),
+            reason="set OLLAMA_API_KEY and KESTREL_IT_OLLAMA_CLOUD_MODEL",
+        ),
+        ProviderCase(
+            name="deepseek",
+            config=AgentConfig(
+                provider="deepseek",
+                model=os.getenv("KESTREL_IT_DEEPSEEK_MODEL", ""),
+                api_key_env="DEEPSEEK_API_KEY",
+                timeout_seconds=_timeout(),
+            ),
+            available=bool(os.getenv("DEEPSEEK_API_KEY") and os.getenv("KESTREL_IT_DEEPSEEK_MODEL")),
+            reason="set DEEPSEEK_API_KEY and KESTREL_IT_DEEPSEEK_MODEL",
+        ),
+        ProviderCase(
+            name="kimi",
+            config=AgentConfig(
+                provider="kimi",
+                model=os.getenv("KESTREL_IT_KIMI_MODEL", ""),
+                api_key_env="MOONSHOT_API_KEY",
+                timeout_seconds=_timeout(),
+            ),
+            available=bool(os.getenv("MOONSHOT_API_KEY") and os.getenv("KESTREL_IT_KIMI_MODEL")),
+            reason="set MOONSHOT_API_KEY and KESTREL_IT_KIMI_MODEL",
+        ),
+        ProviderCase(
             name="openrouter",
             config=AgentConfig(
                 provider="openrouter",

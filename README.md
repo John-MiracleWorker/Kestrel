@@ -231,7 +231,42 @@ nest-agent chat \
 ```
 
 Use `--api-key-env NAME` when the endpoint needs a non-default API key environment variable.
-Provider aliases are also available for `openrouter`, `ollama`, `anthropic`, and `gemini`. OpenRouter and Ollama use the OpenAI-compatible contract; Anthropic and Gemini use their native SDK surface when installed with the matching optional extras.
+Provider aliases are also available for `openrouter`, `deepseek`, `kimi`, `ollama`, `ollama-cloud`, `anthropic`, and `gemini`. OpenRouter, DeepSeek, Kimi, and local Ollama use the OpenAI-compatible contract; Ollama Cloud uses Ollama's native cloud API; Anthropic and Gemini use their native surfaces.
+
+DeepSeek:
+
+```bash
+export DEEPSEEK_API_KEY=...
+nest-agent chat \
+  --backend memory \
+  --provider deepseek \
+  --model deepseek-v4-pro \
+  --message "hello"
+```
+
+Kimi:
+
+```bash
+export MOONSHOT_API_KEY=...
+nest-agent chat \
+  --backend memory \
+  --provider kimi \
+  --model kimi-k2.6 \
+  --message "hello"
+```
+
+Ollama Cloud direct API:
+
+```bash
+export OLLAMA_API_KEY=...
+nest-agent chat \
+  --backend memory \
+  --provider ollama-cloud \
+  --model gpt-oss:120b \
+  --message "hello"
+```
+
+The workbench model picker fetches provider model catalogs from `/api/runtime/models?provider=<name>` when a provider is selected. If credentials or a local model server are unavailable, it keeps deterministic fallback suggestions instead of blocking the run form.
 
 Codex CLI as the response provider:
 

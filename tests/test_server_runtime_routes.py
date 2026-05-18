@@ -41,6 +41,36 @@ def test_runtime_routes_report_health_and_redacted_config(tmp_path, monkeypatch)
     assert "raw-secret-value" not in runtime.text
 
 
+def test_runtime_models_route_returns_static_and_dynamic_catalogs(tmp_path) -> None:
+    config = AgentConfig(memory_dir=tmp_path / "memory", state_path=tmp_path / "state.db")
+    app = FastAPI()
+    register_runtime_routes(app, active_config=config, state=_FakeState())
+    client = TestClient(app)
+
+    mock_catalog = client.get("/api/runtime/models?provider=mock")
+    cloud_catalog = client.get("/api/runtime/models?provider=ollama-cloud")
+    deepseek_catalog = client.get("/api/runtime/models?provider=deepseek")
+    kimi_catalog = client.get("/api/runtime/models?provider=kimi")
+    all_catalogs = client.get("/api/runtime/models")
+
+    assert mock_catalog.status_code == 200
+    assert mock_catalog.json()["models"] == ["mock"]
+    assert cloud_catalog.status_code == 200
+    assert cloud_catalog.json()["api_key_env"] == "OLLAMA_API_KEY"
+    assert cloud_catalog.json()["models"] == ["gpt-oss:120b", "gpt-oss:20b"]
+    assert deepseek_catalog.status_code == 200
+    assert deepseek_catalog.json()["api_key_env"] == "DEEPSEEK_API_KEY"
+    assert deepseek_catalog.json()["models"] == ["deepseek-v4-pro", "deepseek-v4-flash"]
+    assert kimi_catalog.status_code == 200
+    assert kimi_catalog.json()["api_key_env"] == "MOONSHOT_API_KEY"
+    assert kimi_catalog.json()["models"] == ["kimi-k2.6", "kimi-k2.5"]
+    assert all_catalogs.status_code == 200
+    providers = {item["provider"] for item in all_catalogs.json()["providers"]}
+    assert "ollama-cloud" in providers
+    assert "deepseek" in providers
+    assert "kimi" in providers
+
+
 def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> None:
     config = AgentConfig(
         memory_dir=tmp_path / "memory",
@@ -74,6 +104,7 @@ def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> 
         json={
             "provider": "codex-cli",
             "model": "gpt-5.4",
+            "temperature": 0.7,
             "backend": "memvid",
             "memory_dir": str(tmp_path / "mv2"),
             "workspace": str(tmp_path / "workspace"),
@@ -100,6 +131,7 @@ def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> 
     assert payload["settings"]["autonomy_mode"] == "manual"
     assert active_config.provider == "codex-cli"
     assert active_config.model == "gpt-5.4"
+    assert active_config.temperature == 0.7
     assert active_config.backend == "memvid"
     assert active_config.stream is True
     assert active_config.allow_shell is True
@@ -117,9 +149,11 @@ def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> 
     runtime_payload = runtime.json()
     assert runtime_payload["provider"]["name"] == "codex-cli"
     assert runtime_payload["provider"]["model"] == "gpt-5.4"
+    assert runtime_payload["provider"]["temperature"] == 0.7
     assert runtime_payload["provider"]["stream"] is True
     assert runtime_payload["paths"]["workspace"] == str(tmp_path / "workspace")
     assert runtime_payload["settings"]["runtime"]["persisted"] is True
+    assert runtime_payload["settings"]["runtime"]["temperature"] == 0.7
     assert runtime_payload["settings"]["runtime"]["allow_shell"] is True
     assert runtime_payload["feature_flags"]["allow_shell"] is True
 
@@ -154,6 +188,7 @@ def test_runtime_settings_store_loads_saved_config_on_restart(tmp_path) -> None:
             backend="memvid",
             memory_dir=str(tmp_path / "mv2"),
             workspace=str(tmp_path),
+            temperature=0.7,
             stream=True,
             require_api_auth=False,
             autonomy_mode="manual",
@@ -168,6 +203,7 @@ def test_runtime_settings_store_loads_saved_config_on_restart(tmp_path) -> None:
     assert loaded == saved
     assert restarted_config.provider == "codex-cli"
     assert restarted_config.model == "gpt-5.4"
+    assert restarted_config.temperature == 0.7
     assert restarted_config.backend == "memvid"
     assert restarted_config.memory_dir == tmp_path / "mv2"
     assert restarted_config.stream is True
