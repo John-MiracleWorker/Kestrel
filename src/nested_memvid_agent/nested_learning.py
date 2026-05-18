@@ -491,6 +491,11 @@ class NestedLearningKernel:
                 "Rejected: procedural writes require "
                 f"validation >= {spec.promotion_threshold:.2f} and repeat_count >= {spec.min_repeat_count_for_promotion}.",
             )
+        if target == MemoryLayer.SELF and not _self_appropriate(signal):
+            return (
+                False,
+                "Rejected: self writes require an explicit self schema or explicit operator/user instruction.",
+            )
         if target in {MemoryLayer.SELF, MemoryLayer.SEMANTIC, MemoryLayer.EPISODIC}:
             ok = score >= spec.promotion_threshold and repeat_ok
             if ok:
@@ -650,3 +655,12 @@ def _layer_level(layer: MemoryLayer) -> int:
         MemoryLayer.SELF: 4,
         MemoryLayer.POLICY: 5,
     }[layer]
+
+
+def _self_appropriate(signal: LearningSignal) -> bool:
+    metadata = signal.metadata or {}
+    tags = signal.tags or {}
+    return bool(
+        str(metadata.get("self_schema") or tags.get("self_schema") or "").strip()
+        or signal.explicit_instruction
+    )

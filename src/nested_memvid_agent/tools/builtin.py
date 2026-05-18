@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from datetime import UTC, datetime
 from typing import Any
 
 from ..consolidation import Consolidator
@@ -20,6 +21,7 @@ from ..nested_learning import (
     compute_validation_score,
 )
 from ..plugin_manager import PluginManager
+from ..promotion_ledger import OUTCOME_KINDS, PromotionLedger
 from ..retention import RetentionCompactor
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
 from ..secret_broker import SecretBroker, build_secret_broker, is_secret_ref
@@ -654,6 +656,34 @@ class MemvidStatsTool(AgentTool):
             content=json.dumps(rows, indent=2, default=str),
             data={"layers": rows},
         )
+
+
+class MemoryLedgerTool(AgentTool):
+    spec = ToolSpec(
+        name="memory.ledger",
+        description="Summarize promotion ledger outcomes without changing memory gates.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "since": {"type": "string"},
+                "target_layer": {"type": "string"},
+                "outcome": {"type": "string"},
+            },
+        },
+        capabilities=("nested-learning", "memory-diagnostics"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        try:
+            since = _datetime_arg(arguments.get("since"))
+            target_layer = _layer_arg(arguments.get("target_layer"))
+            outcome = _outcome_arg(arguments.get("outcome"))
+            ledger = context.memory.ledger or PromotionLedger(AgentStateStore(context.config.state_path))
+            payload = ledger.summarize(since=since, target_layer=target_layer, outcome=outcome).to_payload()
+            return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+        except Exception as exc:  # noqa: BLE001 - tool boundary returns structured diagnostics
+            return self._result(call, success=False, content=str(exc), error="memory_ledger_failed")
 
 
 class MemoryConsolidateTool(AgentTool):
@@ -1490,6 +1520,7 @@ def build_default_tools() -> ToolRegistry:
     registry.register(MemvidVerifyTool())
     registry.register(MemvidDoctorTool())
     registry.register(MemvidStatsTool())
+    registry.register(MemoryLedgerTool())
     registry.register(MemoryLearnTool())
     registry.register(MemoryConsolidateTool())
     registry.register(MemoryCorrectTool())
@@ -1682,6 +1713,29 @@ def _layer_arg(value: object) -> MemoryLayer | None:
     if not text:
         return None
     return MemoryLayer(text)
+
+
+def _datetime_arg(value: object) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _outcome_arg(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text not in OUTCOME_KINDS:
+        raise ValueError(f"Unknown promotion outcome: {text}")
+    return text
 
 
 def _layers_arg(value: object) -> tuple[MemoryLayer, ...] | None:
