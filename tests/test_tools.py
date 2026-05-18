@@ -987,6 +987,59 @@ def test_repair_prepare_refuses_dirty_repo_by_default(tmp_path: Path) -> None:
     assert result.error == "dirty_worktree"
 
 
+def test_repair_prepare_disables_git_checkout_hooks(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    hooks_dir = tmp_path / ".githooks"
+    hooks_dir.mkdir()
+    hook = hooks_dir / "post-checkout"
+    marker = tmp_path / "hook-ran.txt"
+    hook.write_text(f"#!/usr/bin/env sh\necho hook-ran > {marker}\n")
+    hook.chmod(0o755)
+    subprocess.run(
+        ["git", "add", ".githooks/post-checkout"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "add checkout hook",
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "core.hooksPath", ".githooks"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(
+        name="repair.prepare", arguments={"branch": "codex/no-hooks"}, id="repair_no_hooks"
+    )
+
+    result = registry.execute(
+        call,
+        _approved_context(memory, tmp_path, call),
+    )
+
+    assert result.success
+    assert not marker.exists()
+
+
 def test_repair_status_reports_active_repair_branch_and_changed_files(tmp_path: Path) -> None:
     base = _init_git_repo(tmp_path)
     subprocess.run(
