@@ -2157,18 +2157,45 @@ def test_memory_correct_writes_correction_and_hides_superseded_target(tmp_path: 
         )
     )
 
-    result = build_default_tools().execute(
-        ToolCall(
-            name="memory.correct",
-            arguments={
-                "target_record_id": target_id,
-                "correction_text": "Feature alpha is not enabled.",
-                "evidence": [
-                    {"source": "user", "locator": "turn-1", "quote": "actually, alpha is off"}
-                ],
-            },
-        ),
+    call = ToolCall(
+        name="memory.correct",
+        id="correct_alpha",
+        arguments={
+            "target_record_id": target_id,
+            "correction_text": "Feature alpha is not enabled.",
+            "evidence": [
+                {"source": "user", "locator": "turn-1", "quote": "actually, alpha is off"}
+            ],
+        },
+    )
+    registry = build_default_tools()
+    disabled = registry.execute(
+        call,
         ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+    assert not disabled.success
+    assert disabled.error == "tool_disabled"
+
+    blocked = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_memory_import=True),
+            workspace=tmp_path,
+        ),
+    )
+    assert not blocked.success
+    assert blocked.error == "approval_required"
+
+    result = registry.execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_memory_import=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({"correct_alpha"}),
+            approved_tool_call_arguments={"correct_alpha": call.arguments},
+        ),
     )
 
     assert result.success
