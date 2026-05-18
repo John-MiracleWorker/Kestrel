@@ -167,6 +167,7 @@ def main() -> None:
     memory_correct.add_argument("--evidence-source", default="cli")
     memory_correct.add_argument("--evidence-locator", default="memory.correct")
     memory_correct.add_argument("--dry-run", action="store_true")
+    memory_correct.add_argument("--allow-memory-import", action="store_true", default=argparse.SUPPRESS)
     memory_compact = memory_sub.add_parser("compact")
     _add_common_args(memory_compact)
     memory_compact.add_argument("--layer", choices=[layer.value for layer in MemoryLayer], default=MemoryLayer.WORKING.value)
@@ -477,26 +478,27 @@ def main() -> None:
                     raise SystemExit(1)
                 return
             if args.memory_cmd == "correct":
+                arguments = {
+                    "target_record_id": args.target_record_id,
+                    "correction_text": args.correction_text,
+                    "evidence": [
+                        {
+                            "source": args.evidence_source,
+                            "locator": args.evidence_locator,
+                        }
+                    ],
+                    "dry_run": args.dry_run,
+                }
+                call = ToolCall(name="memory.correct", id="cli_memory_correct", arguments=arguments)
                 execution = build_default_tools().execute(
-                    ToolCall(
-                        name="memory.correct",
-                        arguments={
-                            "target_record_id": args.target_record_id,
-                            "correction_text": args.correction_text,
-                            "evidence": [
-                                {
-                                    "source": args.evidence_source,
-                                    "locator": args.evidence_locator,
-                                }
-                            ],
-                            "dry_run": args.dry_run,
-                        },
-                    ),
+                    call,
                     ToolContext(
                         memory=memory,
                         config=config,
                         workspace=config.workspace,
                         session_id="cli",
+                        approved_tool_call_ids=frozenset({call.id}),
+                        approved_tool_call_arguments={call.id: arguments},
                     ),
                 )
                 print(execution.content)

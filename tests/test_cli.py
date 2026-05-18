@@ -97,6 +97,7 @@ def test_memory_correct_subcommand_supersedes_target(
             "memory",
             "--memory-dir",
             str(memory_dir),
+            "--allow-memory-import",
         ],
     )
 

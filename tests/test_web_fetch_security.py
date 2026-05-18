@@ -16,7 +16,7 @@ class _FakeResponse:
         self._final_url = final_url
         self.headers = _FakeHeaders()
 
-    def __enter__(self) -> "_FakeResponse":
+    def __enter__(self) -> _FakeResponse:
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
@@ -35,10 +35,12 @@ class _FakeOpener:
 
     def open(self, _request: object, timeout: int) -> _FakeResponse:
         del timeout
+        web_tools.socket.getaddrinfo("example.com", 443)
         return self._response
 
 
 def test_fetch_rejects_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(web_tools, "_resolve_public_addresses", lambda _url: {"93.184.216.34"})
     monkeypatch.setattr(web_tools, "build_opener", lambda *_: (_ for _ in ()).throw(ValueError("Redirects are not allowed for web.fetch.")))
 
     with pytest.raises(ValueError, match="Redirects are not allowed"):
@@ -47,14 +49,22 @@ def test_fetch_rejects_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_fetch_pins_dns_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(web_tools, "_resolve_public_addresses", lambda _url: {"93.184.216.34"})
+    monkeypatch.setattr(web_tools, "_public_web_url_allowed", lambda _url: (True, ""))
     monkeypatch.setattr(web_tools, "build_opener", lambda *_: _FakeOpener(_FakeResponse(b"ok", "https://example.com")))
 
     calls: list[str] = []
-    original = web_tools.socket.getaddrinfo
-
     def tracking_getaddrinfo(host: str, port: object, *args: object, **kwargs: object):
+        del args, kwargs
         calls.append(host)
-        return original(host, port, *args, **kwargs)
+        return [
+            (
+                web_tools.socket.AF_INET,
+                web_tools.socket.SOCK_STREAM,
+                web_tools.socket.IPPROTO_TCP,
+                "",
+                ("93.184.216.34", int(port or 443)),
+            )
+        ]
 
     monkeypatch.setattr(web_tools.socket, "getaddrinfo", tracking_getaddrinfo)
 

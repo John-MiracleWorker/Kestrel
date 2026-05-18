@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import re
 import socket
+from collections.abc import Iterator
 from contextlib import contextmanager
 from html import unescape
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -161,7 +162,7 @@ def _resolve_public_addresses(url: str) -> set[str]:
 
 
 @contextmanager
-def _pin_host_resolution(host: str, vetted_addresses: set[str]):
+def _pin_host_resolution(host: str, vetted_addresses: set[str]) -> Iterator[None]:
     if not vetted_addresses:
         yield
         return
@@ -178,7 +179,7 @@ def _pin_host_resolution(host: str, vetted_addresses: set[str]):
             raise OSError(f"Host resolution changed for {target_host}.")
         return filtered
 
-    socket.getaddrinfo = _pinned_getaddrinfo
+    socket.getaddrinfo = cast(Any, _pinned_getaddrinfo)
     try:
         yield
     finally:
