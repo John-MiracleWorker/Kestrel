@@ -495,6 +495,7 @@ class RepairReviewTool(AgentTool):
             "required": ["validation"],
         },
         risk="medium",
+        requires_approval=True,
         capabilities=("safe-repair", "review-gate"),
     )
 
