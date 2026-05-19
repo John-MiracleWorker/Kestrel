@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
-from threading import RLock
+from threading import RLock, Thread
 from typing import Any
 
 from ..agent import NestedMV2Agent
@@ -175,19 +175,7 @@ class ChannelManager:
         run_id = str(getattr(run, "run_id", "") or "")
         run_payload = self._wait_for_run_payload(run_id)
         status = str(run_payload.get("status") or "")
-        stop_reason = str(run_payload.get("stop_reason") or status or "unknown")
-        assistant = str(run_payload.get("assistant_message") or "")
-        metadata: dict[str, Any] = {"run_id": run_id, "stop_reason": stop_reason}
-        if status == "blocked":
-            pending = _pending_approvals(run_payload)
-            assistant = _approval_prompt_text(pending)
-            reply_markup = _approval_reply_markup(pending)
-            if reply_markup:
-                metadata["reply_markup"] = reply_markup
-        elif status == "failed" and not assistant:
-            assistant = f"Kestrel run failed: {run_payload.get('error') or stop_reason}"
-        elif not assistant:
-            assistant = "Kestrel accepted the request and is still working."
+        assistant, metadata = self._run_reply(run_id, run_payload, fallback_to_working=True)
         outbound = ChannelOutboundMessage(
             channel=inbound.channel,
             channel_id=inbound.channel_id,
@@ -210,7 +198,7 @@ class ChannelManager:
             tool_executions=(),
             context_chars=0,
             memory_writes=(),
-            stop_reason=stop_reason,
+            stop_reason=str(metadata.get("stop_reason") or status or "unknown"),
             run_id=run_id,
             source=inbound.to_turn_source(),
         )
@@ -227,17 +215,123 @@ class ChannelManager:
                 "blocked_reason": delivery.blocked_reason,
             },
         )
+        if status in {"queued", "running"}:
+            self._start_run_followup(
+                channel,
+                adapter,
+                inbound,
+                run_id,
+                dry_run=dry_run,
+                blocked_reason=blocked_reason,
+            )
         return result
 
-    def _wait_for_run_payload(self, run_id: str) -> dict[str, Any]:
+    def _wait_for_run_payload(self, run_id: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
         if self.run_manager is None:
             raise ChannelPayloadError("Run manager is required for channel approval prompts.")
-        deadline = time.monotonic() + max(float(self.config.channel_send_timeout_seconds), 0.1)
+        timeout = self.config.channel_send_timeout_seconds if timeout_seconds is None else timeout_seconds
+        deadline = time.monotonic() + max(float(timeout), 0.1)
         last = self.run_manager.get_run(run_id)
         while str(last.get("status") or "") in {"queued", "running"} and time.monotonic() < deadline:
             time.sleep(0.05)
             last = self.run_manager.get_run(run_id)
         return dict(last)
+
+    def _run_reply(
+        self,
+        run_id: str,
+        run_payload: Mapping[str, Any],
+        *,
+        fallback_to_working: bool,
+    ) -> tuple[str, dict[str, Any]]:
+        status = str(run_payload.get("status") or "")
+        stop_reason = str(run_payload.get("stop_reason") or status or "unknown")
+        assistant = str(run_payload.get("assistant_message") or "")
+        metadata: dict[str, Any] = {"run_id": run_id, "stop_reason": stop_reason}
+        if status == "blocked":
+            pending = _pending_approvals(run_payload)
+            assistant = _approval_prompt_text(pending)
+            reply_markup = _approval_reply_markup(pending)
+            if reply_markup:
+                metadata["reply_markup"] = reply_markup
+        elif status == "failed" and not assistant:
+            assistant = f"Kestrel run failed: {run_payload.get('error') or stop_reason}"
+        elif not assistant and fallback_to_working:
+            assistant = "Kestrel accepted the request and is still working."
+        return assistant, metadata
+
+    def _start_run_followup(
+        self,
+        channel: ChannelEndpointConfig,
+        adapter: ChannelAdapter,
+        inbound: ChannelInboundMessage,
+        run_id: str,
+        *,
+        dry_run: bool,
+        blocked_reason: str | None,
+    ) -> None:
+        thread = Thread(
+            target=self._deliver_run_followup,
+            args=(channel, adapter, inbound, run_id),
+            kwargs={"dry_run": dry_run, "blocked_reason": blocked_reason},
+            name=f"channel-followup-{run_id}",
+            daemon=True,
+        )
+        thread.start()
+
+    def _deliver_run_followup(
+        self,
+        channel: ChannelEndpointConfig,
+        adapter: ChannelAdapter,
+        inbound: ChannelInboundMessage,
+        run_id: str,
+        *,
+        dry_run: bool,
+        blocked_reason: str | None,
+    ) -> None:
+        try:
+            timeout = max(float(self.config.timeout_seconds), float(self.config.channel_send_timeout_seconds))
+            run_payload = self._wait_for_run_payload(run_id, timeout_seconds=timeout)
+            if str(run_payload.get("status") or "") in {"queued", "running"}:
+                self._event("channel.followup.timeout", {"channel": inbound.channel, "conversation_id": inbound.conversation_id, "run_id": run_id})
+                return
+            assistant, metadata = self._run_reply(run_id, run_payload, fallback_to_working=False)
+            if not assistant:
+                return
+            outbound = ChannelOutboundMessage(
+                channel=inbound.channel,
+                channel_id=inbound.channel_id,
+                conversation_id=inbound.conversation_id,
+                reply_to_message_id=inbound.message_id,
+                text=assistant,
+                metadata={**metadata, "followup": True},
+            )
+            delivery = adapter.deliver(
+                channel,
+                outbound,
+                dry_run=dry_run,
+                timeout_seconds=self.config.channel_send_timeout_seconds,
+                blocked_reason=blocked_reason,
+            )
+            self._event(
+                "channel.deliver",
+                {
+                    "channel": inbound.channel,
+                    "channel_id": inbound.channel_id,
+                    "conversation_id": inbound.conversation_id,
+                    "sent": delivery.sent,
+                    "dry_run": delivery.dry_run,
+                    "error": delivery.error,
+                    "blocked_reason": delivery.blocked_reason,
+                    "followup": True,
+                    "run_id": run_id,
+                },
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging for daemon thread
+            self._event(
+                "channel.followup.error",
+                {"channel": inbound.channel, "conversation_id": inbound.conversation_id, "run_id": run_id, "error": str(exc)},
+            )
 
     def _handle_telegram_approval_callback(
         self,

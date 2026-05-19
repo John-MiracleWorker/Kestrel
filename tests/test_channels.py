@@ -11,8 +11,8 @@ import pytest
 
 from nested_memvid_agent.agent import NestedMV2Agent
 from nested_memvid_agent.channels import ChannelEndpointConfig, ChannelManager
-from nested_memvid_agent.channels.adapters import DiscordAdapter, GenericWebhookAdapter
-from nested_memvid_agent.channels.models import ChannelOutboundMessage
+from nested_memvid_agent.channels.adapters import ChannelAdapter, DiscordAdapter, GenericWebhookAdapter
+from nested_memvid_agent.channels.models import ChannelDelivery, ChannelInboundMessage, ChannelOutboundMessage
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.runtime_models import AgentTurnResult, ToolCall, ToolExecution
 from nested_memvid_agent.server import create_app
@@ -626,6 +626,96 @@ def test_telegram_approval_callback_decides_pending_approval(tmp_path: Path) -> 
 
     assert fake_runs.decisions == [("approval_123", True)]
     assert result.outbound.text == "Approved approval_123. Continuing…"
+
+
+def test_telegram_run_manager_sends_followup_when_run_finishes_after_initial_timeout(tmp_path: Path) -> None:
+    class FakeRun:
+        run_id = "run_slow"
+        session_id = "channel:telegram:12345"
+
+    class FakeRunManager:
+        def create_run(self, **kwargs: Any) -> FakeRun:
+            return FakeRun()
+
+        def get_run(self, run_id: str) -> dict[str, Any]:
+            assert run_id == "run_slow"
+            return {"run_id": run_id, "status": "running", "assistant_message": ""}
+
+    class CaptureTelegramAdapter(ChannelAdapter):
+        provider = "telegram"
+
+        def __init__(self) -> None:
+            self.outbounds: list[ChannelOutboundMessage] = []
+
+        def parse_inbound(self, config: ChannelEndpointConfig, payload: dict[str, Any]) -> ChannelInboundMessage:
+            return ChannelInboundMessage(
+                channel="telegram",
+                channel_id=config.id,
+                conversation_id="12345",
+                user_id="777",
+                message_id="55",
+                text="slow request",
+            )
+
+        def build_delivery(
+            self,
+            config: ChannelEndpointConfig,
+            outbound: ChannelOutboundMessage,
+            *,
+            dry_run: bool,
+            blocked_reason: str | None = None,
+        ) -> ChannelDelivery:
+            self.outbounds.append(outbound)
+            return ChannelDelivery(
+                channel="telegram",
+                channel_id=config.id,
+                conversation_id=outbound.conversation_id,
+                sent=True,
+                dry_run=dry_run,
+                endpoint="capture://telegram",
+                request_json={"text": outbound.text, **outbound.metadata},
+                blocked_reason=blocked_reason,
+            )
+
+    adapter = CaptureTelegramAdapter()
+    cfg = replace(_config(tmp_path), channel_send_timeout_seconds=0, timeout_seconds=1)
+    manager = ChannelManager(
+        cfg,
+        adapters={"telegram": adapter},
+        run_manager=FakeRunManager(),
+        channel_configs=[ChannelEndpointConfig(id="telegram", provider="telegram", send_enabled=True, auto_reply=True)],
+    )
+    wait_calls = 0
+
+    def fake_wait_for_run_payload(run_id: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        nonlocal wait_calls
+        assert run_id == "run_slow"
+        wait_calls += 1
+        if wait_calls == 1:
+            return {"run_id": run_id, "status": "running", "assistant_message": ""}
+        return {
+            "run_id": run_id,
+            "status": "completed",
+            "stop_reason": "complete",
+            "assistant_message": "Which folder should I use under /Users/tiuni?",
+        }
+
+    manager._wait_for_run_payload = fake_wait_for_run_payload  # type: ignore[method-assign]
+
+    result = manager.handle_payload(provider="telegram", payload={"message": {"text": "slow request"}}, send=True)
+
+    import time
+
+    deadline = time.monotonic() + 1
+    while len(adapter.outbounds) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert result.outbound.text == "Kestrel accepted the request and is still working."
+    assert [outbound.text for outbound in adapter.outbounds] == [
+        "Kestrel accepted the request and is still working.",
+        "Which folder should I use under /Users/tiuni?",
+    ]
+    assert adapter.outbounds[1].metadata["followup"] is True
 
 
 def test_channel_manager_reuses_agent_for_hot_path(tmp_path: Path) -> None:
