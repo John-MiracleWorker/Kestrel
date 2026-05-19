@@ -45,6 +45,9 @@ from .server_support import (
     hostname_from_header as _hostname_from_header,
 )
 from .server_support import (
+    host_is_trusted as _host_is_trusted,
+)
+from .server_support import (
     hostname_from_url as _hostname_from_url,
 )
 from .server_support import (
@@ -131,7 +134,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
     runs = RunManager(
         config=active_config, state=state, events=events, mcp=mcp, skills=skills, plugins=plugins
     )
-    channels = ChannelManager(active_config, secret_resolver=secret_broker.resolve)
+    channels = ChannelManager(active_config, secret_resolver=secret_broker.resolve, run_manager=runs)
     secret_broker.register_allowed_env_names(
         _known_secret_env_names(channels.list_channels(), mcp.list_servers())
     )
@@ -225,21 +228,12 @@ def create_app(config: AgentConfig | None = None) -> Any:
         headers = request_headers(request)
         host = _hostname_from_header(str(headers.get("host", "")))
         trusted_hosts = set(active_config.trusted_hosts)
-        if (
-            "0.0.0.0" not in trusted_hosts
-            and "*" not in trusted_hosts
-            and host not in trusted_hosts
-        ):  # nosec
+        if not _host_is_trusted(host, trusted_hosts):  # nosec
             return responses_module.JSONResponse({"detail": "untrusted_host"}, status_code=400)
         origin = str(headers.get("origin", "")).strip()
         if origin:
             origin_host = _hostname_from_url(origin)
-            if (
-                origin_host
-                and "0.0.0.0" not in trusted_hosts
-                and "*" not in trusted_hosts
-                and origin_host not in trusted_hosts
-            ):  # nosec
+            if origin_host and not _host_is_trusted(origin_host, trusted_hosts):  # nosec
                 return responses_module.JSONResponse(
                     {"detail": "untrusted_origin"}, status_code=403
                 )

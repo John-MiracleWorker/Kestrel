@@ -212,6 +212,49 @@ def test_memvid_backend_normalizes_find_hits(tmp_path: Path, monkeypatch: pytest
     assert hits[0].record.title == "Hit fact"
 
 
+def test_memvid_backend_falls_back_to_exact_index_when_lex_index_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class LexIndexDisabledError(Exception):
+        pass
+
+    class FakeMem:
+        def put(self, *args: object, **kwargs: object) -> str:
+            del args, kwargs
+            return "record_1"
+
+        def find(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise LexIndexDisabledError("MV004: Lexical index is not enabled")
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.backends.memvid_backend.import_module",
+        lambda name: SimpleNamespace(
+            LexIndexDisabledError=LexIndexDisabledError,
+            create=lambda *args, **kwargs: FakeMem(),
+            use=lambda *args, **kwargs: FakeMem(),
+        ),
+    )
+    backend = MemvidBackend(path=tmp_path / "semantic.mv2", layer=MemoryLayer.SEMANTIC)
+    backend.open()
+    backend.put(
+        MemoryRecord(
+            id="fact-1",
+            title="Durable fact",
+            content="Telegram turns should survive missing lexical index by reading exact records.",
+            layer=MemoryLayer.SEMANTIC,
+            kind=MemoryKind.FACT,
+            confidence=0.91,
+        )
+    )
+
+    hits = backend.find("Telegram lexical index", k=3)
+
+    assert hits
+    assert hits[0].record.id == "fact-1"
+    assert hits[0].source_backend == "memvid_exact_fallback"
+
+
 def test_memvid_backend_persists_exact_records_and_tombstones_across_reopen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

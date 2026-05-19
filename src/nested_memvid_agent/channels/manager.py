@@ -15,9 +15,11 @@ from ..agent import NestedMV2Agent
 from ..app_factory import build_agent
 from ..config import AgentConfig
 from ..event_log import AgentEvent, JsonlEventLog
+from ..runtime_models import AgentTurnResult
 from .adapters import ChannelAdapter, ChannelPayloadError, GenericWebhookAdapter, default_adapters
 from .models import (
     ChannelEndpointConfig,
+    ChannelInboundMessage,
     ChannelOutboundMessage,
     ChannelProcessResult,
 )
@@ -37,6 +39,7 @@ class ChannelManager:
         adapters: Mapping[str, ChannelAdapter] | None = None,
         channel_configs: list[ChannelEndpointConfig] | None = None,
         secret_resolver: SecretResolver | None = None,
+        run_manager: Any | None = None,
     ) -> None:
         self.config = config
         self.agent_factory = agent_factory
@@ -47,6 +50,7 @@ class ChannelManager:
             for channel in (channel_configs if channel_configs is not None else load_channel_configs(config.channel_config_path))
         }
         self.event_log = JsonlEventLog(config.log_dir / "events.jsonl")
+        self.run_manager = run_manager
         self._agent: NestedMV2Agent | None = None
         self._agent_lock = RLock()
 
@@ -88,11 +92,43 @@ class ChannelManager:
         channel = self._with_resolved_secrets(channel)
         _verify_channel_signature(channel, raw_body or b"", headers or {}, require_signature=require_signature)
         adapter = self._adapter_for(channel.provider)
+        if channel.provider == "telegram" and "callback_query" in payload and self.run_manager is not None:
+            return self._handle_telegram_approval_callback(channel, adapter, payload, send=send)
         inbound = adapter.parse_inbound(channel, payload)
         self._event("channel.receive", inbound.to_public_dict())
+        requested_send = channel.auto_reply if send is None else send
+        dry_run, blocked_reason = self._delivery_gate(channel, requested=requested_send)
+        adapter.notify_processing_started(
+            channel,
+            inbound,
+            dry_run=dry_run,
+            timeout_seconds=self.config.channel_send_timeout_seconds,
+            blocked_reason=blocked_reason,
+        )
+        if self.run_manager is not None:
+            return self._handle_payload_with_run_manager(
+                channel,
+                adapter,
+                inbound,
+                dry_run=dry_run,
+                blocked_reason=blocked_reason,
+            )
         with self._agent_lock:
             agent = self._agent_for_hot_path()
-            turn = agent.chat(inbound.text, session_id=inbound.session_id, source=inbound.to_turn_source())
+            turn = agent.chat(
+                inbound.text,
+                session_id=inbound.session_id,
+                source=inbound.to_turn_source(),
+                progress_handler=lambda event_type, payload: self._notify_progress(
+                    adapter,
+                    channel,
+                    inbound,
+                    event_type,
+                    payload,
+                    dry_run=dry_run,
+                    blocked_reason=blocked_reason,
+                ),
+            )
 
         outbound = ChannelOutboundMessage(
             channel=inbound.channel,
@@ -102,8 +138,6 @@ class ChannelManager:
             text=turn.assistant_message,
             metadata={"stop_reason": turn.stop_reason},
         )
-        requested_send = channel.auto_reply if send is None else send
-        dry_run, blocked_reason = self._delivery_gate(channel, requested=requested_send)
         delivery = adapter.deliver(
             channel,
             outbound,
@@ -125,6 +159,157 @@ class ChannelManager:
             },
         )
         return result
+
+    def _handle_payload_with_run_manager(
+        self,
+        channel: ChannelEndpointConfig,
+        adapter: ChannelAdapter,
+        inbound: ChannelInboundMessage,
+        *,
+        dry_run: bool,
+        blocked_reason: str | None,
+    ) -> ChannelProcessResult:
+        if self.run_manager is None:
+            raise ChannelPayloadError("Run manager is required for channel approval prompts.")
+        run = self.run_manager.create_run(message=inbound.text, session_id=inbound.session_id)
+        run_id = str(getattr(run, "run_id", "") or "")
+        run_payload = self._wait_for_run_payload(run_id)
+        status = str(run_payload.get("status") or "")
+        stop_reason = str(run_payload.get("stop_reason") or status or "unknown")
+        assistant = str(run_payload.get("assistant_message") or "")
+        metadata: dict[str, Any] = {"run_id": run_id, "stop_reason": stop_reason}
+        if status == "blocked":
+            pending = _pending_approvals(run_payload)
+            assistant = _approval_prompt_text(pending)
+            reply_markup = _approval_reply_markup(pending)
+            if reply_markup:
+                metadata["reply_markup"] = reply_markup
+        elif status == "failed" and not assistant:
+            assistant = f"Kestrel run failed: {run_payload.get('error') or stop_reason}"
+        elif not assistant:
+            assistant = "Kestrel accepted the request and is still working."
+        outbound = ChannelOutboundMessage(
+            channel=inbound.channel,
+            channel_id=inbound.channel_id,
+            conversation_id=inbound.conversation_id,
+            reply_to_message_id=inbound.message_id,
+            text=assistant,
+            metadata=metadata,
+        )
+        delivery = adapter.deliver(
+            channel,
+            outbound,
+            dry_run=dry_run,
+            timeout_seconds=self.config.channel_send_timeout_seconds,
+            blocked_reason=blocked_reason,
+        )
+        turn = AgentTurnResult(
+            session_id=inbound.session_id,
+            user_message=inbound.text,
+            assistant_message=assistant,
+            tool_executions=(),
+            context_chars=0,
+            memory_writes=(),
+            stop_reason=stop_reason,
+            run_id=run_id,
+            source=inbound.to_turn_source(),
+        )
+        result = ChannelProcessResult(inbound=inbound, outbound=outbound, delivery=delivery, turn=turn)
+        self._event(
+            "channel.deliver",
+            {
+                "channel": inbound.channel,
+                "channel_id": inbound.channel_id,
+                "conversation_id": inbound.conversation_id,
+                "sent": delivery.sent,
+                "dry_run": delivery.dry_run,
+                "error": delivery.error,
+                "blocked_reason": delivery.blocked_reason,
+            },
+        )
+        return result
+
+    def _wait_for_run_payload(self, run_id: str) -> dict[str, Any]:
+        if self.run_manager is None:
+            raise ChannelPayloadError("Run manager is required for channel approval prompts.")
+        deadline = time.monotonic() + max(float(self.config.channel_send_timeout_seconds), 0.1)
+        last = self.run_manager.get_run(run_id)
+        while str(last.get("status") or "") in {"queued", "running"} and time.monotonic() < deadline:
+            time.sleep(0.05)
+            last = self.run_manager.get_run(run_id)
+        return dict(last)
+
+    def _handle_telegram_approval_callback(
+        self,
+        channel: ChannelEndpointConfig,
+        adapter: ChannelAdapter,
+        payload: dict[str, Any],
+        *,
+        send: bool | None,
+    ) -> ChannelProcessResult:
+        if self.run_manager is None:
+            raise ChannelPayloadError("Run manager is required for channel approval prompts.")
+        callback = _dict_or_empty(payload.get("callback_query"))
+        data = str(callback.get("data") or "")
+        if data.startswith("kestrel_approve:"):
+            approval_id = data.removeprefix("kestrel_approve:")
+            approved = True
+        elif data.startswith("kestrel_deny:"):
+            approval_id = data.removeprefix("kestrel_deny:")
+            approved = False
+        else:
+            raise ChannelPayloadError("Unsupported Telegram callback data.")
+        message = _dict_or_empty(callback.get("message"))
+        chat = _dict_or_empty(message.get("chat"))
+        conversation_id = str(chat.get("id") or "")
+        if not conversation_id:
+            raise ChannelPayloadError("Telegram callback did not include a chat id.")
+        decision = self.run_manager.decide_approval(approval_id, approved=approved, arguments=None)
+        text = f"{'Approved' if approved else 'Denied'} {approval_id}." + (" Continuing…" if approved else "")
+        if approved:
+            run_id = str(decision.get("run_id") or "")
+            if run_id:
+                run_payload = self._wait_for_run_payload(run_id)
+                assistant = str(run_payload.get("assistant_message") or "").strip()
+                if str(run_payload.get("status") or "") == "completed" and assistant:
+                    text = assistant
+        inbound = ChannelInboundMessage(
+            channel="telegram",
+            channel_id=channel.id,
+            conversation_id=conversation_id,
+            user_id=_optional_str(_dict_or_empty(callback.get("from")).get("id")),
+            message_id=_optional_str(message.get("message_id")),
+            text=data,
+            metadata={"callback_query_id": _optional_str(callback.get("id")), "approval_id": approval_id},
+        )
+        requested_send = channel.auto_reply if send is None else send
+        dry_run, blocked_reason = self._delivery_gate(channel, requested=requested_send)
+        outbound = ChannelOutboundMessage(
+            channel="telegram",
+            channel_id=channel.id,
+            conversation_id=conversation_id,
+            text=text,
+            metadata={"approval_decision": decision},
+        )
+        delivery = adapter.deliver(
+            channel,
+            outbound,
+            dry_run=dry_run,
+            timeout_seconds=self.config.channel_send_timeout_seconds,
+            blocked_reason=blocked_reason,
+        )
+        turn = AgentTurnResult(
+            session_id=inbound.session_id,
+            user_message=data,
+            assistant_message=text,
+            tool_executions=(),
+            context_chars=0,
+            memory_writes=(),
+            stop_reason="approval_decided",
+            run_id=str(decision.get("run_id") or ""),
+            source=inbound.to_turn_source(),
+        )
+        return ChannelProcessResult(inbound=inbound, outbound=outbound, delivery=delivery, turn=turn)
 
     def close(self) -> None:
         with self._agent_lock:
@@ -164,6 +349,43 @@ class ChannelManager:
             return True, "channel_send_disabled"
         return False, None
 
+    def _notify_progress(
+        self,
+        adapter: ChannelAdapter,
+        channel: ChannelEndpointConfig,
+        inbound: ChannelInboundMessage,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        dry_run: bool,
+        blocked_reason: str | None,
+    ) -> None:
+        text = _progress_text(event_type, payload)
+        if not text:
+            return
+        delivery = adapter.notify_progress(
+            channel,
+            inbound,
+            text,
+            dry_run=dry_run,
+            timeout_seconds=self.config.channel_send_timeout_seconds,
+            blocked_reason=blocked_reason,
+        )
+        self._event(
+            "channel.progress",
+            {
+                "channel": inbound.channel,
+                "channel_id": inbound.channel_id,
+                "conversation_id": inbound.conversation_id,
+                "event_type": event_type,
+                "text": text,
+                "sent": delivery.sent if delivery is not None else False,
+                "dry_run": delivery.dry_run if delivery is not None else dry_run,
+                "error": delivery.error if delivery is not None else None,
+                "blocked_reason": delivery.blocked_reason if delivery is not None else blocked_reason,
+            },
+        )
+
     def _event(self, event_type: str, payload: dict[str, Any]) -> None:
         self.event_log.append(AgentEvent(type=event_type, payload=payload))
 
@@ -180,6 +402,67 @@ class ChannelManager:
         settings = dict(channel.settings)
         settings["_resolved_secrets"] = resolved
         return replace(channel, settings=settings)
+
+
+def _pending_approvals(run_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    approvals = run_payload.get("approvals")
+    if not isinstance(approvals, list):
+        return []
+    return [dict(item) for item in approvals if isinstance(item, dict) and item.get("status") == "pending"]
+
+
+def _approval_prompt_text(approvals: list[dict[str, Any]]) -> str:
+    if not approvals:
+        return "Approval required, but no pending approval record was found."
+    lines = ["Approval required before Kestrel can continue:"]
+    for approval in approvals:
+        tool = str(approval.get("tool_name") or "tool")
+        risk = str(approval.get("risk") or "unknown")
+        approval_id = str(approval.get("approval_id") or "")
+        lines.append(f"- {tool} ({risk}) — {approval_id}")
+    return "\n".join(lines)
+
+
+def _approval_reply_markup(approvals: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not approvals:
+        return None
+    buttons = []
+    for approval in approvals[:1]:
+        approval_id = str(approval.get("approval_id") or "").strip()
+        if not approval_id:
+            continue
+        buttons.append(
+            [
+                {"text": "Approve", "callback_data": f"kestrel_approve:{approval_id}"},
+                {"text": "Deny", "callback_data": f"kestrel_deny:{approval_id}"},
+            ]
+        )
+    return {"inline_keyboard": buttons} if buttons else None
+
+
+def _dict_or_empty(value: object) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _progress_text(event_type: str, payload: dict[str, Any]) -> str | None:
+    tool = str(payload.get("tool") or "").strip()
+    if not tool:
+        return None
+    if event_type == "tool.request":
+        return f"🔧 Using tool: {tool}"
+    if event_type == "tool.result":
+        return f"✅ Tool finished: {tool}"
+    if event_type == "tool.error":
+        error = str(payload.get("error") or "failed").strip()
+        return f"⚠️ Tool failed: {tool} ({error})"
+    return None
 
 
 def load_channel_configs(path: Path) -> list[ChannelEndpointConfig]:
@@ -258,6 +541,9 @@ def _verify_channel_signature(
     if provider == "stripe":
         _verify_stripe_signature(secret, raw_body, headers, channel)
         return
+    if provider == "telegram":
+        _verify_telegram_secret_token(secret, headers)
+        return
     header_name = _signature_header_name(channel, provider)
     supplied = _header(headers, header_name)
     if not supplied:
@@ -300,6 +586,14 @@ def _verify_stripe_signature(secret: str, raw_body: bytes, headers: Mapping[str,
     expected = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
     if not any(hmac.compare_digest(signature, expected) for signature in signatures):
         raise ChannelPayloadError("Invalid webhook signature.")
+
+
+def _verify_telegram_secret_token(secret: str, headers: Mapping[str, str]) -> None:
+    supplied = _header(headers, "x-telegram-bot-api-secret-token")
+    if not supplied:
+        raise ChannelPayloadError("Missing Telegram webhook secret token header: x-telegram-bot-api-secret-token")
+    if not hmac.compare_digest(supplied, secret):
+        raise ChannelPayloadError("Invalid Telegram webhook secret token.")
 
 
 def _verify_discord_signature(channel: ChannelEndpointConfig, raw_body: bytes, headers: Mapping[str, str]) -> None:

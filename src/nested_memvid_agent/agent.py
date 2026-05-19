@@ -38,6 +38,7 @@ from .tools.base import ApprovalHandler, ToolContext
 from .tools.registry import ToolRegistry
 
 StreamHandler = Callable[[LLMStreamEvent], None]
+ProgressHandler = Callable[[str, dict[str, Any]], None]
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,7 @@ class NestedMV2Agent:
         approved_tool_call_ids: frozenset[str] = frozenset(),
         approved_tool_call_arguments: dict[str, dict[str, Any]] | None = None,
         stream_handler: StreamHandler | None = None,
+        progress_handler: ProgressHandler | None = None,
         source: TurnSource | None = None,
     ) -> AgentTurnResult:
         session = session_id or f"session_{uuid4().hex}"
@@ -276,6 +278,16 @@ class NestedMV2Agent:
                         "tool_call_id": call.id,
                     },
                 )
+                if progress_handler is not None:
+                    progress_handler(
+                        "tool.request",
+                        {
+                            "session_id": session,
+                            "run_id": active_run_id,
+                            "tool": call.name,
+                            "tool_call_id": call.id,
+                        },
+                    )
                 if call.id in approved_tool_call_ids:
                     self._event(
                         "approval.resolved",
@@ -353,6 +365,19 @@ class NestedMV2Agent:
                         "content_chars": len(execution.content),
                     },
                 )
+                if progress_handler is not None:
+                    progress_handler(
+                        "tool.result" if execution.success else "tool.error",
+                        {
+                            "session_id": session,
+                            "run_id": active_run_id,
+                            "tool": call.name,
+                            "tool_call_id": call.id,
+                            "success": execution.success,
+                            "error": execution.error,
+                            "content_chars": len(execution.content),
+                        },
+                    )
                 messages.append(
                     ChatMessage(
                         role="tool",

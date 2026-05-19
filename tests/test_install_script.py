@@ -9,6 +9,22 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALL = ROOT / "install.sh"
+START_TELEGRAM = ROOT / "scripts" / "start-telegram-agent.sh"
+
+
+def _clean_kestrel_env() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("NEST_AGENT_")
+        and key
+        not in {
+            "KESTREL_TELEGRAM_RUNTIME",
+            "KESTREL_PRINT_ENV",
+            "KESTREL_TELEGRAM_ENV",
+            "KESTREL_PORT",
+        }
+    }
 
 
 def _run_install(*, env: dict[str, str] | None = None, args: list[str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -76,6 +92,59 @@ def test_install_script_is_valid_bash() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_start_telegram_agent_defaults_to_shared_memvid_runtime(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env.telegram"
+    env_file.write_text("# test env intentionally has no runtime overrides\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["bash", str(START_TELEGRAM)],
+        cwd=ROOT,
+        env={
+            **_clean_kestrel_env(),
+            "KESTREL_TELEGRAM_ENV": str(env_file),
+            "KESTREL_PRINT_ENV": "1",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "KESTREL_TELEGRAM_RUNTIME=shared" in result.stdout
+    assert "NEST_AGENT_BACKEND=memvid" in result.stdout
+    assert "NEST_AGENT_MEMORY_DIR=.nest/memory" in result.stdout
+    assert "NEST_AGENT_LOG_DIR=.nest/logs" in result.stdout
+    assert "NEST_AGENT_STATE_PATH=.nest/state/agent.db" in result.stdout
+    assert "NEST_AGENT_SECRET_STORE_PATH=.nest/secrets/local_vault.json" in result.stdout
+    assert "NEST_AGENT_TRUSTED_HOSTS=127.0.0.1,localhost,::1,[::1],testserver,*.trycloudflare.com" in result.stdout
+
+
+def test_start_telegram_agent_can_use_isolated_memvid_runtime(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env.telegram"
+    env_file.write_text("KESTREL_TELEGRAM_RUNTIME=isolated\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["bash", str(START_TELEGRAM)],
+        cwd=ROOT,
+        env={
+            **_clean_kestrel_env(),
+            "KESTREL_TELEGRAM_ENV": str(env_file),
+            "KESTREL_PRINT_ENV": "1",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "KESTREL_TELEGRAM_RUNTIME=isolated" in result.stdout
+    assert "NEST_AGENT_BACKEND=memvid" in result.stdout
+    assert "NEST_AGENT_MEMORY_DIR=.nest/telegram/memory" in result.stdout
+    assert "NEST_AGENT_LOG_DIR=.nest/telegram/logs" in result.stdout
+    assert "NEST_AGENT_STATE_PATH=.nest/telegram/state/agent.db" in result.stdout
+    assert "NEST_AGENT_SECRET_STORE_PATH=.nest/telegram/secrets/local_vault.json" in result.stdout
 
 
 def test_install_help_documents_github_curl_and_options() -> None:

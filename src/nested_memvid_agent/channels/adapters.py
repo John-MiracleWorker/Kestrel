@@ -52,6 +52,43 @@ class ChannelAdapter(ABC):
             return delivery
         return _post_json(delivery, timeout_seconds=timeout_seconds)
 
+    def notify_processing_started(
+        self,
+        config: ChannelEndpointConfig,
+        inbound: ChannelInboundMessage,
+        *,
+        dry_run: bool,
+        timeout_seconds: int,
+        blocked_reason: str | None = None,
+    ) -> ChannelDelivery | None:
+        return None
+
+    def notify_progress(
+        self,
+        config: ChannelEndpointConfig,
+        inbound: ChannelInboundMessage,
+        text: str,
+        *,
+        dry_run: bool,
+        timeout_seconds: int,
+        blocked_reason: str | None = None,
+    ) -> ChannelDelivery | None:
+        outbound = ChannelOutboundMessage(
+            channel=inbound.channel,
+            channel_id=inbound.channel_id,
+            conversation_id=inbound.conversation_id,
+            reply_to_message_id=inbound.message_id,
+            text=text,
+            metadata={"kind": "progress"},
+        )
+        return self.deliver(
+            config,
+            outbound,
+            dry_run=dry_run,
+            timeout_seconds=timeout_seconds,
+            blocked_reason=blocked_reason,
+        )
+
 
 class TelegramAdapter(ChannelAdapter):
     provider = "telegram"
@@ -104,6 +141,9 @@ class TelegramAdapter(ChannelAdapter):
         }
         if outbound.reply_to_message_id:
             request_json["reply_parameters"] = {"message_id": _message_id_value(outbound.reply_to_message_id)}
+        reply_markup = outbound.metadata.get("reply_markup")
+        if isinstance(reply_markup, dict):
+            request_json["reply_markup"] = reply_markup
         if not dry_run and not token:
             return ChannelDelivery(
                 channel=self.provider,
@@ -129,6 +169,52 @@ class TelegramAdapter(ChannelAdapter):
             request_json=request_json,
             blocked_reason=blocked_reason,
         )
+
+    def notify_processing_started(
+        self,
+        config: ChannelEndpointConfig,
+        inbound: ChannelInboundMessage,
+        *,
+        dry_run: bool,
+        timeout_seconds: int,
+        blocked_reason: str | None = None,
+    ) -> ChannelDelivery | None:
+        token_env = config.token_env or "TELEGRAM_BOT_TOKEN"
+        token = _configured_secret(config, token_env)
+        request_json: dict[str, Any] = {
+            "chat_id": inbound.conversation_id,
+            "action": "typing",
+        }
+        if inbound.metadata.get("message_thread_id"):
+            request_json["message_thread_id"] = _message_id_value(str(inbound.metadata["message_thread_id"]))
+        if not dry_run and not token:
+            return ChannelDelivery(
+                channel=self.provider,
+                channel_id=config.id,
+                conversation_id=inbound.conversation_id,
+                sent=False,
+                dry_run=False,
+                endpoint="https://api.telegram.org/bot<token>/sendChatAction",
+                request_json=request_json,
+                error=f"Missing Telegram bot token environment variable: {token_env}",
+                blocked_reason=blocked_reason,
+            )
+        endpoint = "https://api.telegram.org/bot<token>/sendChatAction"
+        if not dry_run and token:
+            request_json["_request_url"] = f"https://api.telegram.org/bot{token}/sendChatAction"
+        delivery = ChannelDelivery(
+            channel=self.provider,
+            channel_id=config.id,
+            conversation_id=inbound.conversation_id,
+            sent=False,
+            dry_run=dry_run,
+            endpoint=endpoint,
+            request_json=request_json,
+            blocked_reason=blocked_reason,
+        )
+        if dry_run or delivery.error is not None:
+            return delivery
+        return _post_json(delivery, timeout_seconds=timeout_seconds)
 
 
 class DiscordAdapter(ChannelAdapter):

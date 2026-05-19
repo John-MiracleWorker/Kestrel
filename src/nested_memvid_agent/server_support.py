@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 from urllib.parse import urlparse
 
@@ -62,6 +62,27 @@ def hostname_from_url(value: str) -> str:
     if parsed.hostname == "::1":
         return "::1"
     return host
+
+
+def host_is_trusted(host: str, trusted_hosts: Iterable[str]) -> bool:
+    """Return whether an HTTP Host/Origin hostname is allowed.
+
+    Exact hostnames remain the default. Wildcard entries are intentionally
+    limited to a leading ``*.`` suffix match so temporary tunnel hosts such as
+    ``*.trycloudflare.com`` can be trusted without allowing arbitrary domains.
+    """
+
+    normalized = host.strip().lower().rstrip(".")
+    trusted = {item.strip().lower().rstrip(".") for item in trusted_hosts if item.strip()}
+    if "*" in trusted or "0.0.0.0" in trusted or normalized in trusted:
+        return True
+    for item in trusted:
+        if not item.startswith("*."):
+            continue
+        suffix = item[1:]
+        if normalized.endswith(suffix) and normalized != suffix.lstrip("."):
+            return True
+    return False
 
 
 def known_secret_env_names(channels: list[dict[str, Any]], servers: list[dict[str, Any]]) -> set[str]:

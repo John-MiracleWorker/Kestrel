@@ -3,14 +3,18 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from dataclasses import replace
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
+from nested_memvid_agent.agent import NestedMV2Agent
 from nested_memvid_agent.channels import ChannelEndpointConfig, ChannelManager
 from nested_memvid_agent.channels.adapters import DiscordAdapter, GenericWebhookAdapter
 from nested_memvid_agent.channels.models import ChannelOutboundMessage
 from nested_memvid_agent.config import AgentConfig
+from nested_memvid_agent.runtime_models import AgentTurnResult, ToolCall, ToolExecution
 from nested_memvid_agent.server import create_app
 
 
@@ -41,6 +45,147 @@ def test_telegram_channel_payload_runs_agent_and_records_provenance(tmp_path: Pa
     assert user_record["metadata"]["channel_user_id"] == "777"
     assert user_record["metadata"]["channel_message_id"] == "55"
     assert user_record["evidence"][0]["source"] == "channel:telegram"
+
+
+def test_telegram_channel_sends_typing_action_before_agent_reply(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:test-token")
+    calls: list[dict[str, Any]] = []
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"ok":true}'
+
+    def fake_urlopen(request: object, timeout: int) -> FakeResponse:
+        calls.append(
+            {
+                "url": getattr(request, "full_url"),
+                "payload": json.loads(getattr(request, "data").decode("utf-8")),
+                "timeout": timeout,
+            }
+        )
+        return FakeResponse()
+
+    monkeypatch.setattr("nested_memvid_agent.channels.adapters.urlopen", fake_urlopen)
+    cfg = replace(_config(tmp_path), enable_channel_delivery=True)
+    manager = ChannelManager(
+        cfg,
+        channel_configs=[ChannelEndpointConfig(id="telegram", provider="telegram", send_enabled=True, auto_reply=True)],
+    )
+
+    result = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "update_id": 101,
+            "message": {
+                "message_id": 55,
+                "text": "hello telegram",
+                "chat": {"id": 12345, "type": "private"},
+                "from": {"id": 777},
+            },
+        },
+        send=True,
+    )
+
+    assert result.delivery.sent is True
+    assert [call["url"] for call in calls] == [
+        "https://api.telegram.org/bot123:test-token/sendChatAction",
+        "https://api.telegram.org/bot123:test-token/sendMessage",
+    ]
+    assert calls[0]["payload"] == {"chat_id": "12345", "action": "typing"}
+    assert calls[1]["payload"]["text"] == "Mock response: hello telegram"
+
+
+def test_telegram_channel_reports_tool_progress_before_agent_reply(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:test-token")
+    calls: list[dict[str, Any]] = []
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"ok":true}'
+
+    def fake_urlopen(request: object, timeout: int) -> FakeResponse:
+        calls.append(
+            {
+                "url": getattr(request, "full_url"),
+                "payload": json.loads(getattr(request, "data").decode("utf-8")),
+                "timeout": timeout,
+            }
+        )
+        return FakeResponse()
+
+    class ProgressAgent:
+        def chat(self, user_message: str, session_id: str | None = None, **kwargs: Any) -> AgentTurnResult:
+            progress_handler = kwargs.get("progress_handler")
+            call = ToolCall(name="file.read", arguments={"path": "README.md"}, id="tool_readme")
+            execution = ToolExecution(call=call, success=True, content="README contents")
+            assert progress_handler is not None
+            progress_handler("tool.request", {"tool": call.name, "tool_call_id": call.id})
+            progress_handler(
+                "tool.result",
+                {"tool": call.name, "tool_call_id": call.id, "success": True, "error": None, "content_chars": 15},
+            )
+            return AgentTurnResult(
+                session_id=session_id or "session",
+                user_message=user_message,
+                assistant_message="Done after using a tool.",
+                tool_executions=(execution,),
+                context_chars=0,
+                memory_writes=(),
+                stop_reason="complete",
+                run_id="run_progress",
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("nested_memvid_agent.channels.adapters.urlopen", fake_urlopen)
+    cfg = replace(_config(tmp_path), enable_channel_delivery=True)
+    manager = ChannelManager(
+        cfg,
+        agent_factory=lambda config: cast(NestedMV2Agent, ProgressAgent()),
+        channel_configs=[ChannelEndpointConfig(id="telegram", provider="telegram", send_enabled=True, auto_reply=True)],
+    )
+
+    result = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "update_id": 101,
+            "message": {
+                "message_id": 55,
+                "text": "please inspect",
+                "chat": {"id": 12345, "type": "private"},
+                "from": {"id": 777},
+            },
+        },
+        send=True,
+    )
+
+    assert result.delivery.sent is True
+    assert [call["url"] for call in calls] == [
+        "https://api.telegram.org/bot123:test-token/sendChatAction",
+        "https://api.telegram.org/bot123:test-token/sendMessage",
+        "https://api.telegram.org/bot123:test-token/sendMessage",
+        "https://api.telegram.org/bot123:test-token/sendMessage",
+    ]
+    assert calls[1]["payload"]["text"] == "🔧 Using tool: file.read"
+    assert calls[2]["payload"]["text"] == "✅ Tool finished: file.read"
+    assert calls[3]["payload"]["text"] == "Done after using a tool."
 
 
 def test_discord_interaction_payload_is_normalized_and_dry_run_delivered(tmp_path: Path) -> None:
@@ -118,6 +263,52 @@ def test_channel_webhook_signature_gate_rejects_bad_signatures(tmp_path: Path, m
         assert "Invalid webhook signature" in str(exc)
     else:
         raise AssertionError("Expected invalid signature to be rejected")
+
+
+def test_telegram_webhook_secret_token_header_is_verified(tmp_path: Path, monkeypatch: object) -> None:
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "telegram-secret")  # type: ignore[attr-defined]
+    channel = ChannelEndpointConfig(
+        id="telegram",
+        provider="telegram",
+        settings={
+            "signature_provider": "telegram",
+            "signature_secret_env": "TELEGRAM_WEBHOOK_SECRET",
+        },
+    )
+    manager = ChannelManager(_config(tmp_path), channel_configs=[channel])
+    payload = {
+        "update_id": 101,
+        "message": {
+            "message_id": 55,
+            "text": "hello telegram",
+            "chat": {"id": 12345, "type": "private"},
+            "from": {"id": 777},
+        },
+    }
+    raw_body = json.dumps(payload).encode("utf-8")
+
+    result = manager.handle_payload(
+        provider="telegram",
+        payload=payload,
+        raw_body=raw_body,
+        headers={"x-telegram-bot-api-secret-token": "telegram-secret"},
+        require_signature=True,
+    )
+
+    assert result.turn.assistant_message == "Mock response: hello telegram"
+
+    try:
+        manager.handle_payload(
+            provider="telegram",
+            payload=payload,
+            raw_body=raw_body,
+            headers={"x-telegram-bot-api-secret-token": "wrong"},
+            require_signature=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - assert channel boundary error without importing pytest
+        assert "Invalid Telegram webhook secret token" in str(exc)
+    else:
+        raise AssertionError("Expected invalid Telegram secret token to be rejected")
 
 
 def test_signed_webhook_uses_raw_body_not_canonical_json(tmp_path: Path, monkeypatch: object) -> None:
@@ -317,6 +508,124 @@ def test_server_rejects_untrusted_host_and_origin(tmp_path: Path) -> None:
 
     assert host_response.status_code == 400
     assert origin_response.status_code == 403
+
+
+def test_server_accepts_trusted_wildcard_tunnel_host(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    config = replace(
+        _config(tmp_path),
+        trusted_hosts=("127.0.0.1", "localhost", "*.trycloudflare.com"),
+    )
+    client = TestClient(create_app(config))
+
+    response = client.get(
+        "/api/health",
+        headers={"host": "coming-emacs-experienced-dome.trycloudflare.com"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_telegram_run_manager_blocked_run_sends_inline_approval_prompt(tmp_path: Path) -> None:
+    class FakeRun:
+        run_id = "run_approval"
+        session_id = "channel:telegram:12345"
+
+    class FakeRunManager:
+        def __init__(self) -> None:
+            self.created: dict[str, Any] | None = None
+
+        def create_run(self, **kwargs: Any) -> FakeRun:
+            self.created = kwargs
+            return FakeRun()
+
+        def get_run(self, run_id: str) -> dict[str, Any]:
+            assert run_id == "run_approval"
+            return {
+                "run_id": run_id,
+                "status": "blocked",
+                "assistant_message": "",
+                "stop_reason": "approval_required",
+                "approvals": [
+                    {
+                        "approval_id": "approval_123",
+                        "status": "pending",
+                        "tool_name": "file.write",
+                        "risk": "high",
+                        "arguments": {"path": "demo.txt", "content": "hi"},
+                    }
+                ],
+            }
+
+    manager = ChannelManager(
+        _config(tmp_path),
+        run_manager=FakeRunManager(),
+        channel_configs=[ChannelEndpointConfig(id="telegram", provider="telegram", send_enabled=True, auto_reply=True)],
+    )
+
+    result = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "update_id": 101,
+            "message": {
+                "message_id": 55,
+                "text": "write a file",
+                "chat": {"id": 12345, "type": "private"},
+                "from": {"id": 777},
+            },
+        },
+        send=True,
+    )
+
+    assert result.turn.run_id == "run_approval"
+    assert "Approval required" in result.outbound.text
+    assert result.delivery.request_json["reply_markup"] == {
+        "inline_keyboard": [
+            [
+                {"text": "Approve", "callback_data": "kestrel_approve:approval_123"},
+                {"text": "Deny", "callback_data": "kestrel_deny:approval_123"},
+            ]
+        ]
+    }
+
+
+def test_telegram_approval_callback_decides_pending_approval(tmp_path: Path) -> None:
+    class FakeRunManager:
+        def __init__(self) -> None:
+            self.decisions: list[tuple[str, bool]] = []
+
+        def decide_approval(self, approval_id: str, *, approved: bool, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+            assert arguments is None
+            self.decisions.append((approval_id, approved))
+            return {"approval_id": approval_id, "run_id": "run_approval", "status": "approved" if approved else "denied"}
+
+        def get_run(self, run_id: str) -> dict[str, Any]:
+            return {"run_id": run_id, "status": "running", "assistant_message": ""}
+
+    fake_runs = FakeRunManager()
+    manager = ChannelManager(
+        _config(tmp_path),
+        run_manager=fake_runs,
+        channel_configs=[ChannelEndpointConfig(id="telegram", provider="telegram", send_enabled=True, auto_reply=True)],
+    )
+
+    result = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "update_id": 102,
+            "callback_query": {
+                "id": "callback_1",
+                "data": "kestrel_approve:approval_123",
+                "from": {"id": 777},
+                "message": {"message_id": 56, "chat": {"id": 12345, "type": "private"}},
+            },
+        },
+        send=True,
+    )
+
+    assert fake_runs.decisions == [("approval_123", True)]
+    assert result.outbound.text == "Approved approval_123. Continuing…"
 
 
 def test_channel_manager_reuses_agent_for_hot_path(tmp_path: Path) -> None:

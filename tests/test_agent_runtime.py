@@ -19,10 +19,23 @@ from nested_memvid_agent.runtime_models import (
     ToolExecution,
     ToolSpec,
 )
-from nested_memvid_agent.self_profile import build_onboarding_profile, onboarding_record_content
+from nested_memvid_agent.self_profile import (
+    build_onboarding_profile,
+    onboarding_record_content,
+    soul_communication_contract_from_hits,
+)
 from nested_memvid_agent.tools.base import AgentTool, ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
 from nested_memvid_agent.tools.registry import ToolRegistry
+
+
+def test_default_communication_contract_rejects_flat_greeting_posture() -> None:
+    contract = soul_communication_contract_from_hits([])
+
+    assert "Avoid flat acknowledgments like" in contract
+    assert "I'm here. What do you want to work on first?" in contract
+    assert "mirror the user's casual energy" in contract
+    assert "not a ticket intake form" in contract
 
 
 def test_agent_chat_writes_working_and_episodic_memory(tmp_path: Path) -> None:

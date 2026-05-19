@@ -21,3 +21,5 @@ web/dist/
 web/.vite/
 *.tsbuildinfo
 runs/
+
+.env.telegram

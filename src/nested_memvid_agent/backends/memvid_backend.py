@@ -15,6 +15,7 @@ from .base import MemoryBackend
 
 _PATH_LOCKS: dict[Path, Lock] = {}
 _PATH_LOCKS_GUARD = Lock()
+_TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+")
 
 
 class MemvidBackend(MemoryBackend):
@@ -190,16 +191,26 @@ class MemvidBackend(MemoryBackend):
         include_inactive: bool = False,
     ) -> list[MemoryHit]:
         mem = self._require_mem()
-        raw = mem.find(
-            query,
-            mode=mode,
-            k=k,
-            snippet_chars=700,
-            adaptive=True,
-            min_relevancy=min_relevancy,
-            max_k=max(k, 8),
-            adaptive_strategy="combined",
-        )
+        try:
+            raw = mem.find(
+                query,
+                mode=mode,
+                k=k,
+                snippet_chars=700,
+                adaptive=True,
+                min_relevancy=min_relevancy,
+                max_k=max(k, 8),
+                adaptive_strategy="combined",
+            )
+        except Exception as exc:
+            if _is_index_disabled_error(exc):
+                return self._find_exact_index_fallback(
+                    query=query,
+                    k=k,
+                    min_relevancy=min_relevancy,
+                    include_inactive=include_inactive,
+                )
+            raise
         hits = raw.get("hits", raw) if isinstance(raw, dict) else raw
         converted: list[MemoryHit] = []
         for item in hits:
@@ -224,6 +235,42 @@ class MemvidBackend(MemoryBackend):
                 )
             )
         return converted
+
+    def _find_exact_index_fallback(
+        self,
+        *,
+        query: str,
+        k: int,
+        min_relevancy: float,
+        include_inactive: bool,
+    ) -> list[MemoryHit]:
+        query_tokens = set(_tokens(query))
+        if not query_tokens:
+            return []
+        scored: list[MemoryHit] = []
+        for record in self._records.values():
+            if not include_inactive and not _record_active(record, inactive_ids=self._inactive_ids):
+                continue
+            haystack = f"{record.title} {record.content} {' '.join(record.tags.values())}"
+            record_tokens = set(_tokens(haystack))
+            if not record_tokens:
+                continue
+            overlap = query_tokens & record_tokens
+            if not overlap:
+                continue
+            score = len(overlap) / max(len(query_tokens), 1)
+            if score < min_relevancy:
+                continue
+            scored.append(
+                MemoryHit(
+                    record=record,
+                    score=score,
+                    source_backend="memvid_exact_fallback",
+                    frame_id=str(record.metadata.get("frame_id") or record.id),
+                    snippet=_snippet(record.content, overlap),
+                )
+            )
+        return sorted(scored, key=lambda hit: hit.score, reverse=True)[:k]
 
     def find_frames(
         self,
@@ -395,6 +442,23 @@ def _verify_result_to_bool(result: Any) -> bool:
             )
         return bool(result.get("ok", result.get("valid", True)))
     return bool(result)
+
+
+def _tokens(text: str) -> list[str]:
+    return [match.group(0).lower() for match in _TOKEN_RE.finditer(text)]
+
+
+def _snippet(text: str, query_tokens: set[str], window: int = 220) -> str:
+    lower = text.lower()
+    first_idx = min((lower.find(token) for token in query_tokens if token in lower), default=0)
+    start = max(first_idx - 60, 0)
+    return text[start : start + window].strip()
+
+
+def _is_index_disabled_error(exc: Exception) -> bool:
+    exc_name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    return "indexdisabled" in exc_name or "index is not enabled" in message or "index disabled" in message
 
 
 def _record_from_hit(item: dict[str, Any], metadata: dict[str, Any], layer: MemoryLayer) -> MemoryRecord:

@@ -5,6 +5,7 @@ from nested_memvid_agent.server_support import (
     bounded_limit,
     csv_layers,
     execution_response,
+    host_is_trusted,
     hostname_from_header,
     hostname_from_url,
     known_secret_env_names,
@@ -35,6 +36,9 @@ def test_server_support_normalizes_request_helpers() -> None:
     assert bounded_limit(200, default=20, maximum=100) == 100
     assert hostname_from_header("127.0.0.1:8765") == "127.0.0.1"
     assert hostname_from_url("http://localhost:8765/path") == "localhost"
+    assert host_is_trusted("coming-emacs-experienced-dome.trycloudflare.com", ["*.trycloudflare.com"])
+    assert not host_is_trusted("trycloudflare.com", ["*.trycloudflare.com"])
+    assert not host_is_trusted("evil.example", ["*.trycloudflare.com"])
 
 
 def test_server_support_collects_allowed_secret_env_names() -> None:
