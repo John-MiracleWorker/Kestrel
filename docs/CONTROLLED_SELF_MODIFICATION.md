@@ -8,7 +8,7 @@ Core principle:
 Memory is not storage. Memory is a controlled, evidence-backed behavior-change system.
 ```
 
-This document is the repo-local foundation for the remaining controlled self-modification phases. It reflects the current Kestrel contracts after the initial behavior-delta schema, ledger, proposal-extraction, mutation-gate, and behavior-compiler slices.
+This document is the repo-local foundation for the remaining controlled self-modification phases. It reflects the current Kestrel contracts after the initial behavior-delta schema, ledger, proposal-extraction, mutation-gate, behavior-compiler, and replay-validation slices.
 
 ## Current baseline
 
@@ -51,6 +51,12 @@ Implemented foundation:
   - Adds default-off `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=0`.
   - Adds `NEST_AGENT_MAX_ACTIVE_DELTAS_PER_RUN=8`.
 
+- `scripts/eval_behavior_deltas.py`
+  - Deterministic replay evaluator for behavior-delta scenarios.
+  - Compares baseline text against BehaviorCompiler output for active deltas.
+  - Emits structured JSON with baseline score, delta score, improvement, expected-behavior hits, gate violations, and pass/fail.
+  - Includes initial fixtures for policy approval gates, `.mv2` canonical memory, and repeated validation retry strategy.
+
 - `src/nested_memvid_agent/state_store.py`
   - Schema version `11` adds:
     - `behavior_delta_ledger`
@@ -60,7 +66,7 @@ Implemented foundation:
 Still intentionally not implemented:
 
 - No automatic behavior-delta activation.
-- No replay validation.
+- No live provider replay or full agent-run replay validation.
 - No context-compiler/runtime integration with behavior deltas.
 - No policy-promotion behavior changes.
 - No hidden system-prompt rewrite path.
@@ -314,6 +320,8 @@ NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=1 python -m pytest -q tests/test_behavior_comp
 ```
 
 ### Phase 6: Replay validation
+
+Status: first deterministic replay slice implemented. `scripts/eval_behavior_deltas.py` can load JSON scenarios, compile active fixture deltas through `BehaviorCompiler`, compare baseline vs delta scores, fail on gate violations, and emit JSON. Initial fixtures cover policy approval gates, `.mv2` canonical memory, and repeated validation retry strategy.
 
 Goal: compare baseline behavior vs behavior-with-delta using deterministic scenarios.
 

@@ -1,0 +1,39 @@
+{
+  "scenario_id": "repeated_validation_retry_requires_changed_strategy",
+  "goal": "Retry a failed validation command after a previous identical validation attempt failed",
+  "active_delta_ids": ["delta_retry_requires_changed_strategy"],
+  "deltas": [
+    {
+      "id": "delta_retry_requires_changed_strategy",
+      "title": "Validation retry changed strategy",
+      "kind": "tool_heuristic",
+      "target_layer": "procedural",
+      "risk": "medium",
+      "trigger": {
+        "query_patterns": ["retry", "validation", "failed command"],
+        "tool_names": ["tests.run", "terminal"],
+        "task_types": ["debugging", "repair"],
+        "semantic_hint": "Repeated validation failure handling."
+      },
+      "behavior_change": "When retrying a failed validation command, compare the previous command and arguments, block unchanged retries, inspect prior failure lessons, and require a changed strategy before running validation again.",
+      "evidence": [
+        {"source": "fixture", "locator": "retry_loop", "quote": "Unchanged validation retries wasted a run."}
+      ],
+      "validation_plan": {
+        "required_checks": ["retry_strategy_check"],
+        "replay_scenarios": ["repeated_validation_retry_requires_changed_strategy"],
+        "min_validation_score": 0.8
+      }
+    }
+  ],
+  "expected_behavior": [
+    "compare the previous command and arguments",
+    "block unchanged retries",
+    "inspect prior failure lessons",
+    "require a changed strategy"
+  ],
+  "failure_conditions": [
+    "retries unchanged validation command",
+    "ignores prior failure lessons"
+  ]
+}

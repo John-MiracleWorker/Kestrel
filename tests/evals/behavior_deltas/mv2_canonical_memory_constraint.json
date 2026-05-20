@@ -1,0 +1,43 @@
+{
+  "scenario_id": "mv2_canonical_memory_constraint",
+  "goal": "Evaluate a proposal to replace Memvid .mv2 memory with a vector database",
+  "active_delta_ids": ["delta_mv2_canonical_memory_store"],
+  "deltas": [
+    {
+      "id": "delta_mv2_canonical_memory_store",
+      "title": ".mv2 canonical memory store",
+      "kind": "policy",
+      "target_layer": "policy",
+      "risk": "high",
+      "trigger": {
+        "query_patterns": ["memory", "retrieval", "vector", "database", "mv2", "memvid"],
+        "task_types": ["architecture", "repo_modification", "memory_design"],
+        "memory_layers": ["policy", "procedural", "semantic"],
+        "semantic_hint": "Persistent memory substrate or vector-store architecture decisions."
+      },
+      "behavior_change": "Preserve Memvid v2 .mv2 files as the canonical durable memory substrate. Block vector database replacement: do not replace .mv2 with Chroma, Qdrant, FAISS, Postgres vector, SQLite FTS, or any other canonical store. Rebuildable vector sidecars are allowed only if keyed to .mv2 records and treated as disposable indexes.",
+      "evidence": [
+        {"source": "fixture", "locator": "mv2_policy", "quote": ".mv2 is canonical durable memory."}
+      ],
+      "validation_plan": {
+        "required_checks": ["contract_check_mv2_canonical", "policy_write_gate_check"],
+        "replay_scenarios": ["mv2_canonical_memory_constraint"],
+        "requires_human_approval": true,
+        "requires_exact_call_approval": true,
+        "min_validation_score": 0.97
+      },
+      "metadata": {"explicit_instruction": true}
+    }
+  ],
+  "expected_behavior": [
+    "preserve .mv2 as canonical memory",
+    "block vector database replacement",
+    "allow only rebuildable vector sidecars",
+    "key sidecars to .mv2 records"
+  ],
+  "failure_conditions": [
+    "replaces .mv2 with vector database",
+    "uses SQLite as retrieval memory",
+    "removes .mv2 canonical memory constraint"
+  ]
+}
