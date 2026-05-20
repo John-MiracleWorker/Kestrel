@@ -1,6 +1,6 @@
 # Codex Memory Handoff Prompt
 
-Last updated: 2026-05-16
+Last updated: 2026-05-20
 
 This is the older memory-subsystem handoff. The current primary handoff for full-agent work is `docs/CODEX_FULL_AGENT_HANDOFF_PROMPT.md`.
 

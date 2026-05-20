@@ -1,12 +1,12 @@
 # Project Manifest - Kestrel
 
-Last updated: 2026-05-16
+Last updated: 2026-05-20
 
 ## Purpose
 
 Kestrel is a concrete local-first agent runtime built around Nested Learning-inspired memory layers and Memvid v2 `.mv2` storage.
 
-The repo now goes beyond the original scaffold: it includes a conversational CLI, provider adapters, deterministic mock mode, a tool/approval system, Soul/self memory, gated web context, a FastAPI and web workbench, managed MCP stdio sessions, skill capsules, task graphs, repair gates, task capsules, golden evals, packaging, and deployment docs.
+The repo now goes beyond the original scaffold: it includes a conversational CLI, provider adapters, deterministic mock mode, a tool/approval system, Soul/self memory, gated web context, a FastAPI and web workbench, managed MCP stdio sessions, skill capsules, task graphs, repair gates, task capsules, controlled behavior deltas, live-learning evals, golden evals, packaging, and deployment docs.
 
 ## Important Files
 
@@ -18,7 +18,7 @@ The repo now goes beyond the original scaffold: it includes a conversational CLI
 - `docs/FULL_AGENT_SPEC.md` - product/system specification.
 - `docs/RUNTIME_WIRING.md` - current run, approval, scheduler, and memory wiring.
 - `docs/IMPLEMENTATION_PIPELINE.md` - implemented phases and remaining hardening sequence.
-- `docs/TEST_MATRIX.md` - unit, runtime, integration, and golden validation matrix.
+- `docs/TEST_MATRIX.md` - unit, runtime, integration, live-learning, and golden validation matrix.
 - `docs/MEMVID_INTEGRATION.md` - current Memvid v2 adapter contract.
 - `docs/MV2_CONTEXT_PACKING.md` - pseudo-context frame and packer contract.
 - `docs/TASK_CAPSULES.md` - run-scoped `complete.mv2` lifecycle.
@@ -32,8 +32,10 @@ The repo now goes beyond the original scaffold: it includes a conversational CLI
 - `src/nested_memvid_agent/mcp_manager.py` - managed MCP server sessions and tool adapters.
 - `src/nested_memvid_agent/plugin_manager.py` - alpha GitHub plugin registry and skill/MCP materialization.
 - `src/nested_memvid_agent/tools/builtin.py` - built-in tools and high-risk gates.
-- `src/nested_memvid_agent/state_store.py` - SQLite control-plane state, currently schema version 9.
-- `scripts/run_golden_evals.py` - deterministic golden eval harness.
+- `src/nested_memvid_agent/state_store.py` - SQLite control-plane state, currently schema version 11.
+- `scripts/run_golden_evals.py` - deterministic and live-provider golden eval harness.
+- `scripts/run_live_learning_eval.py` - isolated live-provider learning/safety E2E harness.
+- `scripts/eval_behavior_deltas.py` - deterministic behavior-delta replay harness.
 - `tests/integration/test_memvid_backend_integration.py` - gated Memvid backend integration.
 - `tests/integration/test_memvid_context_frames.py` - gated Memvid context/capsule integration.
 - `tests/integration/test_mcp_stdio_integration.py` - gated live stdio MCP integration.
@@ -59,7 +61,7 @@ nest-agent memory verify --backend memvid --memory-dir .nest/memory
 nest-agent chat --backend memvid --memory-dir .nest/memory --provider openai --model <available-model>
 ```
 
-The mock backend and mock LLM are deterministic. Memvid and MCP live tests are opt-in behind environment variables.
+The mock backend and mock LLM are deterministic. Memvid, MCP, provider, and live-learning tests are opt-in behind environment variables and isolated paths.
 
 Permanent memory now includes `.nest/memory/self.mv2` for the user-facing Soul layer. It stores identity, capability snapshots, user/workflow preferences, self-change requests, and validation metadata with evidence/provenance requirements.
 
@@ -89,6 +91,9 @@ Optional integration validation:
 RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integration.py
 RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
 RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
+RUN_PROVIDER_INTEGRATION=1 python -m pytest -q tests/integration/test_provider_live_integration.py
+python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memory --output-root /tmp/kestrel-live-learning-memory
+python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memvid --output-root /tmp/kestrel-live-learning-memvid
 ```
 
 ## Non-Negotiables

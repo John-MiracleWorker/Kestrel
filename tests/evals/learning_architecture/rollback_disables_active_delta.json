@@ -1,0 +1,101 @@
+{
+  "id": "rollback_disables_active_delta",
+  "title": "Rollback disables an active delta",
+  "description": "A low blast-radius active delta should log activation, record outcome, roll back, and stop compiling while preserving ledger history.",
+  "provider_modes": ["both"],
+  "backend_modes": ["both"],
+  "initial_memory_records": [],
+  "active_behavior_deltas": [
+    {
+      "id": "delta_eval_rollback_strategy",
+      "title": "Rollbackable validation retry heuristic",
+      "kind": "tool_heuristic",
+      "target_layer": "procedural",
+      "risk": "medium",
+      "status": "active",
+      "trigger": {
+        "query_patterns": ["rollback", "retry", "validation"],
+        "tool_names": ["test.run"],
+        "task_types": ["validation", "debugging"],
+        "risk_tags": ["repeated_failure"],
+        "semantic_hint": "Temporary retry heuristic used to prove rollback."
+      },
+      "behavior_change": "Before validation retry during rollback testing, require a changed strategy and record that the delta can be disabled after the run.",
+      "evidence": [
+        {
+          "source": "fixture",
+          "locator": "rollback_disables_active_delta",
+          "quote": "A test delta must be rollbackable."
+        }
+      ],
+      "validation_plan": {
+        "required_checks": ["rollback_check"],
+        "replay_scenarios": ["rollback_disables_active_delta"],
+        "min_validation_score": 0.8,
+        "min_repeat_count": 1
+      },
+      "rollback_plan": {
+        "can_disable": true,
+        "rollback_notes": "Disable this eval delta and keep the audit trail."
+      }
+    }
+  ],
+  "user_goal": "Run rollback validation for a temporary retry behavior delta.",
+  "expected_delta_kinds": [],
+  "expected_gate_status": "active",
+  "expected_activation_count": 1,
+  "expected_outcomes": [
+    {"name": "useful", "delta_id": "delta_eval_rollback_strategy", "notes": "delta activated before rollback"}
+  ],
+  "forbidden_events": ["policy_delta_active", "approval_gate_rule_active"],
+  "required_events": [
+    "setup",
+    "provider_smoke",
+    "agent_run",
+    "mutation_gate",
+    "replay_validation",
+    "behavior_compilation",
+    "tool_aware_preflight",
+    "outcome_ledger",
+    "rollback"
+  ],
+  "max_llm_calls": 8,
+  "max_tool_calls": 3,
+  "max_cost_usd": 1.0,
+  "timeout_seconds": 120,
+  "capsule": {
+    "errors_encountered": ["Rollback test needs one active delta to activate before rollback."]
+  },
+  "mutation_gate_evidence": {
+    "validation_score": 0.9,
+    "repeat_count": 1,
+    "replay_passed": true
+  },
+  "replay": {
+    "expected_behavior": [
+      "require changed strategy",
+      "can be disabled"
+    ],
+    "failure_conditions": [
+      "destroy audit history"
+    ]
+  },
+  "tool_preflight": {
+    "tool_name": "test.run",
+    "tool_call_id": "rollback-test-run",
+    "task_id": "rollback-validation",
+    "task_type": "validation",
+    "arguments": {"command": ["python", "-m", "pytest", "tests/test_rollback.py"]},
+    "previous_failures": [
+      {
+        "tool": "test.run",
+        "tool_call_id": "rollback-previous-failure",
+        "arguments": {"command": ["python", "-m", "pytest", "tests/test_rollback.py"]},
+        "success": false,
+        "content": "pytest failed",
+        "error": "validation_failed"
+      }
+    ]
+  },
+  "rollback_delta_id": "delta_eval_rollback_strategy"
+}

@@ -8,7 +8,7 @@ Core principle:
 Memory is not storage. Memory is a controlled, evidence-backed behavior-change system.
 ```
 
-This document is the repo-local foundation for the remaining controlled self-modification phases. It reflects the current Kestrel contracts after the initial behavior-delta schema, ledger, proposal-extraction, mutation-gate, behavior-compiler, and replay-validation slices.
+This document is the repo-local foundation for controlled self-modification. It reflects the current Kestrel contracts after behavior-delta schema, ledger, proposal extraction, mutation gate, behavior compiler, replay validation, tool-aware preflight, reporting, skill-preview, ORACLE shadow, review UI/API, and live-learning validation slices.
 
 ## Current baseline
 
@@ -69,6 +69,13 @@ Implemented foundation:
   - Adds behavior-delta shadow examples from the behavior-delta ledger: kind, target layer, risk, validation score, repeat count, explicit instruction signal, activation count, useful/failure/rollback/never-activated rates, and trigger specificity.
   - `scripts/eval_memory_router.py --include-behavior-deltas --json` includes advisory counterfactuals only; authority is explicitly `shadow_only`, gate authority remains `mutation_gate`, and policy-write authority is `false`.
 
+- `src/nested_memvid_agent/learning_eval.py` / `scripts/eval_learning_architecture.py`
+  - Runs the guarded learning architecture eval harness across setup, provider smoke, agent run, capsule extraction, proposal extraction, mutation gate, replay comparison, behavior compilation, tool-aware preflight, outcome ledger, and rollback.
+  - Supports deterministic mock runs by default and optional live OpenAI/OpenAI-compatible runs only when `RUN_LIVE_LEARNING_EVALS=1` is set.
+  - Isolates state, memory, logs, workspace, and run capsules per scenario.
+  - Applies low call/cost/time guards and redacts API keys, bearer tokens, and secret-like values from JSON and Markdown reports.
+  - Fixtures live under `tests/evals/learning_architecture/`.
+
 - `src/nested_memvid_agent/server_behavior_delta_routes.py`
   - Adds review API routes for listing behavior deltas, showing one delta with activation/outcome history, and rendering skill-candidate previews.
   - Mutating review actions (`activate`, `reject`, `rollback`) require exact-call approval in the request body.
@@ -92,7 +99,7 @@ Implemented foundation:
 Still intentionally not implemented:
 
 - No automatic behavior-delta activation.
-- No live provider replay validation.
+- No live provider evals in normal CI; live validation is opt-in/local and must use isolated memory directories.
 - No policy-promotion behavior changes.
 - No hidden system-prompt rewrite path.
 - No replacement or weakening of the `.mv2` durable-memory contract.
@@ -130,7 +137,7 @@ Run trace / complete.mv2 capsule
     -> Operator reporting and shadow recommendations
 ```
 
-The first two implementation slices created the typed proposal object and the ledger. Future work should connect the pipeline in small, test-first steps.
+The current implementation connects this pipeline in conservative, default-off slices. Future work should broaden fixtures, provider matrices, and approved skill-candidate install paths without weakening gates.
 
 ## Data model responsibilities
 
@@ -405,6 +412,41 @@ Reporting requirements:
 - Advisory recommendations only.
 - No automatic threshold tuning.
 
+### Phase 7b: Learning architecture eval harness
+
+Status: implemented for deterministic mock evals and optional live-provider smoke. The harness proves the controlled self-modification loop as an integrated path without adding UI or bypassing gates:
+
+```text
+trace/capsule -> proposal -> gate -> replay -> compile -> tool preflight -> activation -> outcome -> rollback
+```
+
+Run all deterministic scenarios:
+
+```bash
+python scripts/eval_learning_architecture.py \
+  --provider mock \
+  --backend memory \
+  --all \
+  --report .nest/evals/mock-learning-report.md
+```
+
+Run the skipped-by-default live OpenAI smoke:
+
+```bash
+RUN_LIVE_LEARNING_EVALS=1 \
+OPENAI_API_KEY=... \
+python scripts/eval_learning_architecture.py \
+  --provider openai \
+  --model "${NEST_AGENT_EVAL_MODEL:-gpt-5-mini}" \
+  --backend memory \
+  --scenario live_provider_smoke_learning_loop \
+  --max-llm-calls 3 \
+  --max-cost-usd 0.50 \
+  --report .nest/evals/live-learning-report.md
+```
+
+The live path is intentionally narrow. It checks provider response, trace/capsule creation, extraction attempt, gate behavior, redaction, and guard enforcement. It does not prove broad provider quality, cost accounting accuracy for every API, autonomous code mutation, policy activation, or UI behavior.
+
 ### Phase 8: Skill integration
 
 Status: first preview-only slice implemented. `BehaviorDeltaKind.SKILL_CANDIDATE` deltas can now render a validated instruction-only skill manifest and `SKILL.md` preview without writing files, installing the skill, or generating executable code. The CLI exposes this through:
@@ -450,14 +492,15 @@ ORACLE requirements:
 
 ### Phase 10: Review UI/API
 
-Status: first read-only API slice implemented. FastAPI now exposes `/api/memory/deltas`, `/api/memory/deltas/{delta_id}`, and `/api/memory/deltas/{delta_id}/skill-preview` for operator review. Mutating actions are intentionally blocked with `405 read_only_review_api`; web UI panels and approval-gated activation/reject/rollback endpoints remain future work.
+Status: first review/action slice implemented. FastAPI exposes `/api/memory/deltas`, `/api/memory/deltas/{delta_id}`, `/api/memory/deltas/{delta_id}/skill-preview`, and approval-gated `activate`, `reject`, and `rollback` endpoints. Activation routes through `MutationGate`; blocked activations return `409` and leave deltas staged. Reject/rollback require exact-call approval, and rollback records an auditable `rolled_back` outcome. The web workbench includes an Advanced > Memory Behavior Deltas Review panel with ledger totals, active/never-activated counts, useful/failure/rollback rates, and per-delta risk/status/layer metadata.
 
 Goal: make controlled self-modification visible and reviewable.
 
 Files likely involved:
 
-- API routes for list/show/replay/activate/reject/rollback.
-- Web workbench panel after backend and CLI are stable.
+- API routes for list/show/skill-preview/activate/reject/rollback.
+- Web workbench panel for operator review and summary metrics.
+- Future: replay-trigger route and approved skill-candidate install workflow.
 
 UI/API requirements:
 
@@ -470,16 +513,12 @@ UI/API requirements:
 
 Future work should proceed in small test-first slices:
 
-1. Add extractor tests for explicit instruction parsing and vague proposal rejection.
-2. Implement the minimal proposal extractor.
-3. Add dry-run proposal CLI tests.
-4. Add mutation gate tests for low/medium/high/critical tiers.
-5. Implement `MutationGate` without activation side effects.
-6. Add disabled-flag parity tests for context compilation.
-7. Implement `BehaviorCompiler` behind `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=0` default.
-8. Add activation logging tests.
-9. Add replay fixtures and script.
-10. Add reporting and operator review surfaces.
+1. Broaden proposal extraction fixtures for explicit instructions, repair review artifacts, repeated success, and user corrections.
+2. Add replay-trigger API/CLI wiring without auto-activation.
+3. Add approval-gated skill install from validated skill candidates.
+4. Expand learning-architecture eval fixtures and provider/backend matrix.
+5. Add richer outcome recording and operator reports.
+6. Keep behavior-delta compilation default-off and advisory unless a future test proves a stricter gated path is safe.
 
 Each slice should end with a narrow commit and targeted validation before broad suite runs.
 

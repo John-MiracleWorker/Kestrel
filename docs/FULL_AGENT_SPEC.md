@@ -1,6 +1,6 @@
 # Full Agent Specification
 
-Last updated: 2026-05-16
+Last updated: 2026-05-20
 
 ## Product Goal
 
@@ -17,8 +17,8 @@ LLM provider
 + inspectable Soul/self model
 + context compiler and pseudo-context packer
 + event and state logs
-+ consolidation and task capsules
-+ eval harness
++ consolidation, task capsules, and behavior-delta ledgers
++ deterministic, live-provider, and learning-architecture eval harnesses
 + CLI/API/web control surfaces
 ```
 
@@ -45,9 +45,9 @@ Class: `NestedMV2Agent`.
 
 Responsibilities:
 
-- receive user input from CLI/API/channel surfaces
+- receive user input from CLI/API/channel surfaces, including deterministic `/search` and `/memory search` direct commands
 - write current turn observations into working memory
-- compile relevant nested memory context
+- compile relevant nested memory context and optional active behavior-delta instructions
 - call an LLM provider
 - parse final answers or portable JSON tool envelopes
 - execute tools through `ToolRegistry`
@@ -79,7 +79,7 @@ Current providers:
 - deterministic mock provider
 - OpenAI Responses provider
 - OpenAI-compatible chat completions provider
-- OpenRouter and Ollama aliases through the OpenAI-compatible provider contract
+- OpenRouter and local Ollama aliases through the OpenAI-compatible provider contract; Ollama Cloud through the native Ollama cloud API
 - Anthropic Messages provider
 - Gemini provider
 - local Codex CLI provider
@@ -91,12 +91,12 @@ Current provider support:
 - portable JSON tool envelope
 - strict control-message and native-tool-call validation against the active `ToolSpec` registry
 - OpenAI Responses, OpenAI-compatible, Anthropic, and Gemini streaming deltas when available
-- flag-gated live provider integration harness
+- flag-gated live provider integration harness plus live learning E2E and live golden-eval validation paths
 
 Remaining provider hardening:
 
-- credentialed live integration runs for all non-mock providers
-- richer provider-specific context and JSON-mode handling
+- credentialed CI/release matrix across all non-mock providers; Ollama Cloud + `gpt-oss:120b` has passed local live learning and golden-eval validation
+- richer provider-specific context and JSON-mode handling where native APIs differ
 
 ### Tool System
 
@@ -180,7 +180,7 @@ The FastAPI control plane and React/Vite workbench expose:
 - skill registry and install flow
 - task graph, subagent, and scheduler surfaces
 - channel ingress
-- plugin registry state where wired
+- plugin registry and behavior-delta review state where wired
 
 API auth can be enabled through `NEST_AGENT_REQUIRE_API_AUTH=1` plus a token environment variable.
 
@@ -212,4 +212,4 @@ RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integ
 RUN_PROVIDER_INTEGRATION=1 python -m pytest -q tests/integration/test_provider_live_integration.py
 ```
 
-The runtime is production-ready only when the remaining gaps in `docs/IMPLEMENTATION_STATUS.md` are closed, especially credentialed provider validation, production auth/isolation, MCP non-stdio transport fixtures, container-grade skill isolation, and Codex-backed isolated worker orchestration.
+The runtime is production-ready only when the remaining gaps in `docs/IMPLEMENTATION_STATUS.md` are closed, especially broad credentialed provider CI beyond the locally validated Ollama Cloud path, production auth/isolation, MCP non-stdio transport fixtures, container-grade skill isolation, and Codex-backed isolated worker orchestration.

@@ -1,6 +1,6 @@
 # Implementation Pipeline
 
-Last updated: 2026-05-16
+Last updated: 2026-05-20
 
 This file records what has landed and what should be hardened next. `docs/IMPLEMENTATION_STATUS.md` is the authoritative current truth table.
 
@@ -45,7 +45,7 @@ Landed:
 
 - `nest-agent chat` one-shot and interactive modes.
 - `--session-id`.
-- Slash commands: `/exit`, `/tools`, `/context`, `/memory`, `/doctor`, `/session`.
+- Slash commands: `/exit`, `/tools`, `/context`, `/memory`, `/doctor`, `/session`, plus deterministic `/search` and `/memory search` tool routing.
 - Background run/status/approval CLI surfaces.
 - Deterministic mock provider path.
 
@@ -63,17 +63,17 @@ Landed:
 - Mock provider.
 - OpenAI Responses provider.
 - OpenAI-compatible chat completions provider.
-- Codex CLI provider.
+- Anthropic Messages, Gemini, OpenRouter/Ollama aliases, native Ollama Cloud provider, and Codex CLI provider.
 - Provider capability metadata.
 - Retryable provider fallback wrapper.
-- OpenAI Responses streaming deltas when the SDK stream surface is available.
+- OpenAI Responses/OpenAI-compatible/Anthropic/Gemini streaming deltas when the SDK/API stream surface is available.
 - Portable JSON tool envelope.
 
 Remaining:
 
-- Native tool-calling parity across providers.
-- Streaming parity for OpenAI-compatible/local providers.
-- Broader live integration tests for real provider variants.
+- Broader native tool-calling parity across every provider.
+- Richer provider-specific streaming/context/JSON-mode handling.
+- Broader live integration tests for real provider variants; Ollama Cloud + `gpt-oss:120b` has passed local live golden and live-learning E2E validation.
 - Richer context/JSON-mode handling per provider.
 
 ## Phase 4 - Tool Expansion and Safety
@@ -153,18 +153,21 @@ Remaining:
 
 ## Phase 6 - Evaluation Harness
 
-Status: implemented for mock and optional Memvid paths.
+Status: implemented for mock, optional Memvid, behavior-delta replay, and opt-in live-provider learning paths.
 
 Current commands:
 
 ```bash
 python scripts/run_golden_evals.py --backend memory --provider mock
 RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
+python scripts/eval_behavior_deltas.py --scenario tests/evals/behavior_deltas/policy_write_requires_approval.json
+python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memory --output-root /tmp/kestrel-live-learning-memory
+python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memvid --output-root /tmp/kestrel-live-learning-memvid
 ```
 
 Remaining:
 
-- Add provider-specific golden suites once live provider tests are stable.
+- Add provider-specific golden suites for the full matrix; the Ollama Cloud path is stable locally.
 - Add long-running regression fixtures for scheduler/repair flows.
 
 ## Phase 7 - API, Web, Channels, MCP, Skills
@@ -178,6 +181,7 @@ Landed:
 - Approval routes.
 - Memory/context routes.
 - Skills registry and upload/install path.
+- Behavior-delta review API, approval-gated actions, and web review panel.
 - Managed stdio MCP sessions and gated integration fixture.
 - Multi-channel ingress and generic HMAC webhook verification.
 - Local bearer/API-key auth option.

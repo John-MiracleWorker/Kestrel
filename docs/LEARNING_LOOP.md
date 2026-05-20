@@ -92,6 +92,47 @@ python scripts/eval_memory_router.py \
 
 Activation beyond shadow mode should remain narrow and reversible. Low-risk gates such as working-to-episodic or episodic-to-semantic can be evaluated first; policy routing remains recommendation-only unless a future explicit enablement gate is added.
 
+## Learning Architecture Eval Harness
+
+`scripts/eval_learning_architecture.py` is the integrated eval for the behavior-learning loop. It is separate from the promotion-ledger replay harness: instead of only asking whether a memory signal should be admitted, it asks whether a whole controlled learning cycle stays safe and auditable.
+
+Stages:
+
+1. setup: isolated workspace, `.nest/memory`, SQLite control-plane state, seeded memory, and seeded active behavior deltas.
+2. provider smoke: deterministic mock response or one guarded live provider call.
+3. agent run: a normal Kestrel runtime turn with shell/web/dangerous tools disabled.
+4. capsule/trace extraction: run-scoped `complete.mv2` capsule plus behavior-delta proposal extraction.
+5. mutation gate: rule-based staged/rejected/active decision under supplied evidence.
+6. replay validation: baseline score, delta score, and improvement without activating proposed deltas.
+7. behavior compilation: active relevant deltas compile into bounded future context.
+8. tool-aware preflight: active relevant deltas compile before a matching tool call and log one tool activation.
+9. outcome ledger: useful/ignored/failure/rollback outcomes are appended and summarized.
+10. rollback: configured active test deltas become `rolled_back`, stop compiling, and keep audit history.
+
+Mock evals are the normal path:
+
+```bash
+python scripts/eval_learning_architecture.py --provider mock --backend memory --all --json
+```
+
+Live provider evals are skipped unless explicitly enabled:
+
+```bash
+RUN_LIVE_LEARNING_EVALS=1 \
+OPENAI_API_KEY=... \
+python scripts/eval_learning_architecture.py \
+  --provider openai \
+  --model "${NEST_AGENT_EVAL_MODEL:-gpt-5-mini}" \
+  --backend memory \
+  --scenario live_provider_smoke_learning_loop \
+  --max-llm-calls 3 \
+  --max-cost-usd 0.50
+```
+
+Interpret failures by stage. A provider-smoke failure means provider setup or credentials are wrong. A capsule/proposal failure means the trace did not contain specific enough evidence. A mutation-gate failure means the expected gate status did not match the supplied evidence. A replay failure means the proposed behavior does not improve the deterministic expectation or trips a forbidden behavior. A preflight failure means the active delta did not match the tool context or activation dedupe broke. A rollback failure means audit history or future compilation semantics regressed.
+
+The harness does not auto-tune thresholds, does not auto-activate proposed or staged deltas, does not rewrite hidden system prompts, does not grant policy-write authority, and does not replace `.mv2` as canonical memory.
+
 ## Tuning Playbook
 
 Every quarter:

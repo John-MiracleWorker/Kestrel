@@ -1,6 +1,6 @@
 # Kestrel Production-Ready Agent Build Prompt for Codex
 
-Generated: 2026-05-16  
+Last updated: 2026-05-20
 Repository: `John-MiracleWorker/Kestrel`  
 Target file location: `docs/CODEX_PRODUCTION_READY_AGENT_PROMPT.md`
 
@@ -40,7 +40,8 @@ LLM provider
 + context compiler
 + event log
 + consolidation pipeline
-+ eval harness
++ controlled behavior-delta ledger/compiler/review
++ deterministic, live-provider, and live-learning eval harnesses
 + CLI/API/web control surface
 + packaging/deployment system
 ```
@@ -54,6 +55,7 @@ evidence-backed learning
 procedure formation from repeated success
 honest failure tracking
 safe local codebase maintenance
+controlled self-modification with evidence, review, rollback, and audit history
 ```
 
 ---
@@ -107,8 +109,9 @@ tests/
 Then run the baseline:
 
 ```bash
-python -m compileall -q src tests
-pytest -q
+python -m compileall -q src tests scripts
+python -m pytest -q
+python scripts/run_golden_evals.py --backend memory --provider mock
 nest-agent chat --backend memory --provider mock --message "hello"
 ```
 
@@ -146,6 +149,7 @@ Use one `.mv2` file per memory layer:
 .nest/memory/episodic.mv2
 .nest/memory/semantic.mv2
 .nest/memory/procedural.mv2
+.nest/memory/self.mv2
 .nest/memory/policy.mv2
 ```
 
@@ -175,6 +179,11 @@ Procedural
 - repair recipes
 - coding/debugging procedures
 - formed only after repeated verified success
+
+Self
+- identity/capability snapshots
+- user/workflow preferences
+- self-change requests and validation metadata
 
 Policy
 - slow-changing safety rules

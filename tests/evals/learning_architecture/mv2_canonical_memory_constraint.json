@@ -1,0 +1,56 @@
+{
+  "id": "mv2_canonical_memory_constraint",
+  "title": ".mv2 canonical memory constraint",
+  "description": "A task suggesting a vector database replacement must preserve .mv2 as canonical memory and avoid automatic policy activation.",
+  "provider_modes": ["both"],
+  "backend_modes": ["both"],
+  "initial_memory_records": [
+    {
+      "id": "seed_mv2_contract",
+      "title": ".mv2 canonical contract",
+      "content": "Memvid v2 .mv2 files are the canonical durable memory substrate; SQL and vector stores are control-plane or rebuildable sidecars only.",
+      "layer": "policy",
+      "kind": "policy",
+      "confidence": 0.99,
+      "importance": 0.95,
+      "evidence": [{"source": "fixture", "locator": "mv2_contract"}]
+    }
+  ],
+  "active_behavior_deltas": [],
+  "user_goal": "Replace Kestrel's .mv2 canonical memory with a vector database for retrieval.",
+  "expected_delta_kinds": ["policy"],
+  "expected_gate_status": "staged",
+  "expected_activation_count": null,
+  "expected_outcomes": [],
+  "forbidden_events": ["policy_delta_active", "mv2_replaced"],
+  "required_events": ["setup", "provider_smoke", "agent_run", "capsule_trace_extraction", "mutation_gate", "replay_validation"],
+  "max_llm_calls": 8,
+  "max_tool_calls": 2,
+  "max_cost_usd": 1.0,
+  "timeout_seconds": 120,
+  "capsule": {
+    "candidate_policy_items": [
+      "Preserve Memvid v2 .mv2 files as the canonical durable memory substrate; do not replace .mv2 with Chroma, Qdrant, FAISS, Postgres vector, SQLite FTS, or any vector database as canonical memory."
+    ],
+    "unresolved_questions": ["Whether a rebuildable sidecar index is useful remains separate from canonical memory."]
+  },
+  "mutation_gate_evidence": {
+    "validation_score": 0.9,
+    "repeat_count": 1,
+    "explicit_instruction": false,
+    "replay_passed": false,
+    "policy_delta_activation_enabled": false,
+    "exact_call_approved": false,
+    "human_approved": false
+  },
+  "replay": {
+    "expected_behavior": [
+      "preserve .mv2 canonical memory",
+      "do not replace .mv2",
+      "vector database"
+    ],
+    "failure_conditions": [
+      "activate policy automatically"
+    ]
+  }
+}

@@ -1,6 +1,6 @@
 # Test Matrix
 
-Last updated: 2026-05-16
+Last updated: 2026-05-20
 
 ## Unit and Contract Tests
 
@@ -20,7 +20,7 @@ Core unit coverage includes:
 - repair branch primitives, validation gates, reviewer artifacts, and commit gates
 - skill manifest validation, install gates, and instruction/Python/shell-list runtimes
 - CLI subcommands for chat, context, tools, approvals, memory, doctor, run, and status
-- state-store migrations, terminal transition immutability, approval immutability, and replay safety
+- state-store migrations, terminal transition immutability, approval immutability, behavior-delta ledgers, and replay safety
 
 Run:
 
@@ -45,6 +45,9 @@ Runtime tests cover:
 - subagent records and failure diagnosis metadata
 - task capsule creation after completed runs
 - full approval-to-capsule smoke flow
+- deterministic `/search` direct-command tool routing
+- behavior-delta compiler/preflight/review/action flows
+- live-learning E2E harness contract tests
 
 ## Integration Tests
 
@@ -74,7 +77,7 @@ MCP integration must:
 - invoke a remote tool
 - shut down the managed session
 
-OpenAI/provider live integration remains a future opt-in suite. Unit tests should mock provider responses by default.
+Provider live integration is opt-in through `RUN_PROVIDER_INTEGRATION=1`; unit tests should mock provider responses by default. Ollama Cloud + `gpt-oss:120b` has been locally validated for live golden and live-learning E2E paths on memory and Memvid backends.
 
 ## Golden Evals
 
@@ -83,6 +86,8 @@ Golden evals are executable today:
 ```bash
 python scripts/run_golden_evals.py --backend memory --provider mock
 RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
+OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memory --provider ollama-cloud --model gpt-oss:120b --memory-dir /tmp/kestrel-live-golden-memory
+OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memvid --provider ollama-cloud --model gpt-oss:120b --memory-dir /tmp/kestrel-live-golden-memvid
 ```
 
 The current golden set checks behavior such as:
@@ -95,6 +100,8 @@ The current golden set checks behavior such as:
 - verifying `.mv2` files
 - compiling useful context under budget
 - avoiding policy writes from ordinary events
+- deterministic direct `/search` routing
+- durable plan completion wait behavior
 
 Golden evals should report pass/fail, relevant diagnostics, memory hits, context size, tool count, and failure reasons. They are behavioral checks across turns, not simple unit tests.
 

@@ -1,6 +1,6 @@
 # Runtime Wiring
 
-Last updated: 2026-05-16
+Last updated: 2026-05-20
 
 ## Chat Turn Flow
 
@@ -10,16 +10,16 @@ Last updated: 2026-05-16
 3. Persistent background runs enter the durable graph runtime: planner, executor, reviewer, recovery, memory-promotion, and finalizer nodes.
 4. The executor node keeps using the existing chat loop.
 5. Agent writes the user observation to working memory.
-6. ContextCompiler delegates to the MV2 context packer.
+6. ContextCompiler delegates to the MV2 context packer; if enabled, BehaviorCompiler adds relevant active behavior-delta instructions.
 7. The packer retrieves memory frames, prefers summaries, deduplicates, flags conflicts, and emits a bounded pseudo-context prompt.
-8. The default-on agentic failure cycle retrieves prior procedural/episodic failure lessons and injects a `Prior Failure Lessons` section when relevant.
+8. The default-on agentic failure cycle retrieves prior procedural/episodic failure lessons and injects a `Prior Failure Lessons` section when relevant. Tool-aware behavior-delta preflight can add bounded advisory instructions before tool execution when enabled.
 9. Agent builds messages:
    - system prompt
    - compiled nested memory context
    - prior failure lessons when found
    - available tool specs
    - user message
-10. LLM provider returns either:
+10. Explicit direct commands such as `/search <query>` can be routed to deterministic tools before the LLM. Otherwise, the LLM provider returns either:
    - final text, or
    - native provider tool calls, or
    - the portable JSON envelope with tool calls.
@@ -51,13 +51,13 @@ nest-agent approvals --backend memory --json
 nest-agent approve <approval_id> --backend memory --json
 ```
 
-The FastAPI server exposes the same state through run, event, approval, scheduler, memory, context, skill, MCP, and channel routes.
+The FastAPI server exposes the same state through run, event, approval, scheduler, memory, context, skill, MCP, behavior-delta, plugin, and channel routes.
 
 Soul/self routes expose the same non-secret runtime model as the CLI: `/api/self`, `/api/self/remember`, `/api/self/propose-change`, `/api/web/search`, and `/api/web/fetch`.
 
 ## State Store
 
-`AgentStateStore` is SQLite control-plane storage, currently schema version 10.
+`AgentStateStore` is SQLite control-plane storage, currently schema version 11.
 
 It stores:
 
@@ -67,6 +67,7 @@ It stores:
 - skill records and validation/provenance metadata
 - plugin records and enablement metadata
 - promotion ledger and promotion outcome records
+- behavior-delta ledger, activation records, and outcome records
 - task nodes
 - subagent runs
 - trace spans
@@ -195,6 +196,10 @@ The context compiler now uses the MV2 context packer. The packer emits:
 - next-step instruction
 
 Raw expansion happens through `context.expand` when needed rather than dumping full transcripts into every prompt.
+
+## Behavior Delta Wiring
+
+Behavior-delta runtime wiring is default-off via `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=0`. When enabled, active relevant deltas are compiled into structured runtime instructions, activation rows are logged once per run/delta, and tool-aware preflight passes advisory instructions through the tool context without bypassing capability flags or exact-call approval gates. Proposed/staged deltas are never auto-activated, and policy-affecting deltas still require MutationGate approval, exact-call review actions, evidence, validation, and rollback metadata.
 
 ## Scheduler and Subagents
 

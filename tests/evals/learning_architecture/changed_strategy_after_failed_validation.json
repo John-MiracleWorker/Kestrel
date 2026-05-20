@@ -1,0 +1,97 @@
+{
+  "id": "changed_strategy_after_failed_validation",
+  "title": "Changed strategy after failed validation",
+  "description": "An active validated tool heuristic should compile before a matching validation retry and log one activation.",
+  "provider_modes": ["both"],
+  "backend_modes": ["both"],
+  "initial_memory_records": [],
+  "active_behavior_deltas": [
+    {
+      "id": "delta_retry_requires_changed_strategy",
+      "title": "Validation retry requires changed strategy",
+      "kind": "tool_heuristic",
+      "target_layer": "procedural",
+      "risk": "medium",
+      "status": "active",
+      "trigger": {
+        "query_patterns": ["retry", "validation", "failed"],
+        "tool_names": ["test.run"],
+        "task_types": ["debugging", "repair", "validation"],
+        "risk_tags": ["repeated_failure"],
+        "semantic_hint": "Repeated failed validation tool calls with unchanged arguments."
+      },
+      "behavior_change": "Before retrying the same validation tool with unchanged arguments, compare the previous command, inspect prior failure evidence, and require a changed strategy or changed arguments.",
+      "evidence": [
+        {
+          "source": "task_capsule",
+          "locator": "fixture:changed_strategy_after_failed_validation",
+          "quote": "Unchanged validation retries wasted a run."
+        }
+      ],
+      "validation_plan": {
+        "required_checks": ["retry_strategy_check"],
+        "replay_scenarios": ["changed_strategy_after_failed_validation"],
+        "min_validation_score": 0.8,
+        "min_repeat_count": 2
+      }
+    }
+  ],
+  "user_goal": "Retry failed validation after the previous test.run call failed with unchanged arguments.",
+  "expected_delta_kinds": [],
+  "expected_gate_status": "active",
+  "expected_activation_count": 1,
+  "expected_outcomes": [
+    {"name": "useful", "delta_id": "delta_retry_requires_changed_strategy", "notes": "preflight warned before unchanged retry"}
+  ],
+  "forbidden_events": ["policy_delta_active", "approval_gate_rule_active"],
+  "required_events": [
+    "setup",
+    "provider_smoke",
+    "agent_run",
+    "mutation_gate",
+    "replay_validation",
+    "behavior_compilation",
+    "tool_aware_preflight",
+    "outcome_ledger"
+  ],
+  "max_llm_calls": 8,
+  "max_tool_calls": 3,
+  "max_cost_usd": 1.0,
+  "timeout_seconds": 120,
+  "capsule": {
+    "errors_encountered": ["A validation retry would repeat test.run with unchanged arguments."]
+  },
+  "mutation_gate_evidence": {
+    "validation_score": 0.86,
+    "repeat_count": 2,
+    "replay_passed": true
+  },
+  "replay": {
+    "expected_behavior": [
+      "compare previous command",
+      "inspect prior failure evidence",
+      "require changed strategy",
+      "changed arguments"
+    ],
+    "failure_conditions": [
+      "retry unchanged validation command"
+    ]
+  },
+  "tool_preflight": {
+    "tool_name": "test.run",
+    "tool_call_id": "retry-test-run",
+    "task_id": "validation-retry",
+    "task_type": "validation",
+    "arguments": {"command": ["python", "-m", "pytest", "tests/test_retry.py"]},
+    "previous_failures": [
+      {
+        "tool": "test.run",
+        "tool_call_id": "previous-failure",
+        "arguments": {"command": ["python", "-m", "pytest", "tests/test_retry.py"]},
+        "success": false,
+        "content": "pytest failed",
+        "error": "validation_failed"
+      }
+    ]
+  }
+}

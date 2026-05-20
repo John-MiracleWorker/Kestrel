@@ -1,6 +1,6 @@
 # Validation Plan
 
-Last updated: 2026-05-16
+Last updated: 2026-05-20
 
 ## Test Pyramid
 
@@ -22,7 +22,7 @@ Coverage goals:
 - tool schemas, timeouts, enablement, and approvals
 - state-store lifecycle and migration behavior
 - CLI and run-manager smoke paths
-- scheduler, subagent, skill, repair, and task-capsule slices
+- scheduler, subagent, skill, repair, task-capsule, behavior-delta, and live-learning slices
 
 ### Compile, Lint, and Types
 
@@ -59,6 +59,16 @@ RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integ
 
 This validates managed stdio server connection, discovery, invocation, and shutdown.
 
+### Behavior Delta and Live Learning Evals
+
+```bash
+python scripts/eval_behavior_deltas.py --scenario tests/evals/behavior_deltas/policy_write_requires_approval.json
+python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memory --output-root /tmp/kestrel-live-learning-memory
+python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memvid --output-root /tmp/kestrel-live-learning-memvid
+```
+
+Live commands require provider credentials in environment variables and must use isolated memory directories. The committed mock path remains the default release gate; the Ollama Cloud + `gpt-oss:120b` path has been validated locally for memory and Memvid backends.
+
 ### Golden Evals
 
 Fast path:
@@ -67,7 +77,7 @@ Fast path:
 python scripts/run_golden_evals.py --backend memory --provider mock
 ```
 
-Golden evals should stay deterministic under the mock provider. They should prove behavior across turns, including recall, prior-failure use, procedural promotion gates, workspace safety, shell blocking, `.mv2` verification, context packing, and policy-write refusal.
+Golden evals should stay deterministic under the mock provider and can also be run against live providers. They prove behavior across turns, including recall, prior-failure use, procedural promotion gates, workspace safety, shell blocking, `.mv2` verification, context packing, direct `/search` tool routing, durable plan completion, and policy-write refusal.
 
 ## Promotion Validation
 

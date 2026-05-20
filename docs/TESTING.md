@@ -1,6 +1,6 @@
 # Testing Guide
 
-Last updated: 2026-05-17
+Last updated: 2026-05-20
 
 Kestrel's fast test path is deterministic: it uses `InMemoryBackend` plus the mock LLM provider. Memvid, MCP, provider, and platform integrations stay behind explicit environment flags.
 
@@ -86,7 +86,7 @@ Live provider coverage is gated by `RUN_PROVIDER_INTEGRATION=1`:
 RUN_PROVIDER_INTEGRATION=1 python -m pytest -q tests/integration/test_provider_live_integration.py
 ```
 
-Each provider case also requires its own credentials or endpoint variables. The harness covers OpenAI, Anthropic, Gemini, OpenAI-compatible endpoints, Ollama, OpenRouter, and Codex CLI, and skips cases whose required environment is missing.
+Each provider case also requires its own credentials or endpoint variables. The harness covers OpenAI, Anthropic, Gemini, OpenAI-compatible endpoints, Ollama, Ollama Cloud, OpenRouter, and Codex CLI, and skips cases whose required environment is missing. Ollama Cloud + `gpt-oss:120b` has been locally validated against both memory and Memvid live learning/golden eval paths.
 
 ## Live Learning E2E Eval
 
@@ -99,6 +99,7 @@ export OLLAMA_API_KEY=...  # do not commit or paste this into logs
 export KESTREL_IT_OLLAMA_CLOUD_MODEL="gpt-oss:120b"
 python scripts/run_live_learning_eval.py \
   --provider ollama-cloud \
+  --model "$KESTREL_IT_OLLAMA_CLOUD_MODEL" \
   --backend memory \
   --output-root ./tmp-live-kestrel/memory-live \
   --timeout-seconds 180
@@ -115,7 +116,62 @@ python scripts/run_live_learning_eval.py \
   --timeout-seconds 180
 ```
 
-The live E2E cases cover provider handshake, durable memory retrieval after reopen, correction-frame capture, nested-learning promotion gates, task-capsule learning-signal extraction, unapproved high-risk tool blocking, and behavior-delta activation logging. Missing credentials/model configuration are reported by env-var name only; secret values are not printed.
+The live E2E cases cover provider handshake, durable memory retrieval after reopen, correction-frame capture, nested-learning promotion gates, task-capsule learning-signal extraction, unapproved high-risk tool blocking, and behavior-delta activation logging. Missing credentials/model configuration are reported by env-var name only; secret values are not printed. Use isolated output roots; never point this harness at an operator's real `.nest` memory.
+
+## Learning Architecture Eval Harness
+
+Use `scripts/eval_learning_architecture.py` when you need the full controlled self-modification loop in one report:
+
+```text
+trace/capsule -> proposal -> gate -> replay -> compile -> tool preflight -> activation -> outcome -> rollback
+```
+
+Fast deterministic path:
+
+```bash
+python scripts/eval_learning_architecture.py \
+  --provider mock \
+  --backend memory \
+  --all \
+  --report .nest/evals/mock-learning-report.md
+```
+
+JSON path for automation:
+
+```bash
+python scripts/eval_learning_architecture.py --provider mock --backend memory --all --json
+```
+
+Live OpenAI smoke path:
+
+```bash
+RUN_LIVE_LEARNING_EVALS=1 \
+OPENAI_API_KEY=... \
+python scripts/eval_learning_architecture.py \
+  --provider openai \
+  --model "${NEST_AGENT_EVAL_MODEL:-gpt-5-mini}" \
+  --backend memory \
+  --scenario live_provider_smoke_learning_loop \
+  --max-llm-calls 3 \
+  --max-cost-usd 0.50 \
+  --report .nest/evals/live-learning-report.md
+```
+
+Rules:
+
+- Live providers are skipped unless `RUN_LIVE_LEARNING_EVALS=1`.
+- `provider=openai` also requires `OPENAI_API_KEY`.
+- `provider=openai-compatible` requires `--base-url`, `NEST_AGENT_BASE_URL`, or `OPENAI_COMPATIBLE_BASE_URL`.
+- `--model` overrides `NEST_AGENT_EVAL_MODEL`; mock defaults to `mock`.
+- Call, tool, cost, and timeout guards fail before the next guarded action would exceed the configured limit.
+- Reports redact API-key-like strings, bearer tokens, auth headers, and secret/token fields.
+- Normal CI should run only mock evals. The live integration test is skipped unless both `RUN_LIVE_LEARNING_EVALS=1` and `OPENAI_API_KEY` are present:
+
+```bash
+RUN_LIVE_LEARNING_EVALS=1 OPENAI_API_KEY=... python -m pytest -q tests/integration/test_live_learning_architecture_eval.py
+```
+
+The harness proves integration of existing gates and ledgers. It does not prove broad live-model quality, exact natural-language output, all provider pricing, UI behavior, automatic policy activation, or autonomous code mutation.
 
 ## Golden Evals
 
@@ -133,7 +189,7 @@ Memvid path:
 RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
 ```
 
-Each Memvid golden case should use its own memory/log directory to avoid `.mv2` lock contention.
+Each Memvid golden case should use its own memory/log directory to avoid `.mv2` lock contention. Live golden evals also support provider/model args; the Ollama Cloud `gpt-oss:120b` memory and Memvid paths have passed locally after deterministic `/search` routing and the durable plan wait-window hardening.
 
 ## Release Validation
 

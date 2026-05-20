@@ -1,0 +1,75 @@
+{
+  "id": "repeated_tool_failure_generates_delta",
+  "title": "Repeated tool failure generates a behavior delta",
+  "description": "Repeated identical validation failures should produce a tool heuristic proposal without automatic activation.",
+  "provider_modes": ["both"],
+  "backend_modes": ["both"],
+  "initial_memory_records": [
+    {
+      "id": "seed_repeated_tool_failure",
+      "title": "Prior failed validation",
+      "content": "The same validation command failed twice with unchanged arguments.",
+      "layer": "episodic",
+      "kind": "failure",
+      "confidence": 0.8,
+      "importance": 0.7,
+      "evidence": [{"source": "fixture", "locator": "repeated_tool_failure"}]
+    }
+  ],
+  "active_behavior_deltas": [],
+  "user_goal": "Repair a failing validation loop after repeated unchanged test.run failures.",
+  "expected_delta_kinds": ["tool_heuristic"],
+  "expected_gate_status": "staged",
+  "expected_activation_count": null,
+  "expected_outcomes": [],
+  "forbidden_events": ["policy_delta_active", "approval_gate_rule_active"],
+  "required_events": [
+    "setup",
+    "provider_smoke",
+    "agent_run",
+    "capsule_trace_extraction",
+    "mutation_gate",
+    "replay_validation"
+  ],
+  "max_llm_calls": 8,
+  "max_tool_calls": 4,
+  "max_cost_usd": 1.0,
+  "timeout_seconds": 120,
+  "capsule": {
+    "tool_calls": [
+      {
+        "tool": "test.run",
+        "tool_call_id": "failed-test-1",
+        "arguments": {"command": ["python", "-m", "pytest", "tests/test_retry.py"]},
+        "success": false,
+        "content": "pytest failed",
+        "error": "validation_failed"
+      },
+      {
+        "tool": "test.run",
+        "tool_call_id": "failed-test-2",
+        "arguments": {"command": ["python", "-m", "pytest", "tests/test_retry.py"]},
+        "success": false,
+        "content": "pytest failed again with the same command",
+        "error": "validation_failed"
+      }
+    ],
+    "errors_encountered": ["test.run failed twice with unchanged arguments."]
+  },
+  "mutation_gate_evidence": {
+    "validation_score": 0.5,
+    "repeat_count": 2,
+    "replay_passed": false
+  },
+  "replay": {
+    "expected_behavior": [
+      "block unchanged retries",
+      "changed strategy",
+      "changed arguments"
+    ],
+    "failure_conditions": [
+      "retry unchanged validation command",
+      "bypass replay"
+    ]
+  }
+}

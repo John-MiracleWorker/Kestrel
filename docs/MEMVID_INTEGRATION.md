@@ -1,10 +1,10 @@
 # Memvid Integration
 
-Last updated: 2026-05-17
+Last updated: 2026-05-20
 
 Kestrel uses Memvid v2 `.mv2` files as its durable retrieval-memory substrate. Do not build against deprecated QR/video-frame Memvid v1 behavior, and do not replace `.mv2` memory with SQLite, Postgres, Chroma, FAISS, or JSON logs.
 
-SQLite is used only for control-plane state such as runs, approvals, MCP servers, skills, task nodes, and subagent records.
+SQLite is used only for control-plane state such as runs, approvals, MCP servers, skills, task nodes, subagent records, promotion ledgers, and behavior-delta ledgers.
 
 ## Current Adapter
 
@@ -132,6 +132,8 @@ Memvid tests are opt-in:
 ```bash
 RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
 RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
+OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memvid --provider ollama-cloud --model gpt-oss:120b --memory-dir /tmp/kestrel-live-golden-memvid
+python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memvid --output-root /tmp/kestrel-live-learning-memvid
 ```
 
 The integration suite covers:
@@ -139,7 +141,7 @@ The integration suite covers:
 - write -> seal -> verify -> close -> reopen -> search
 - exact-record `get_record()`/`iter_records()` and tombstone state after close -> reopen
 - context-frame metadata round trip
-- run-capsule `complete.mv2` summary reads
+- run-capsule `complete.mv2` summary reads, preferring exact indexed records before search snippets
 - isolated memory directories for golden eval cases to avoid `.mv2` lock contention
 
 Use `python -m pytest` so fixture subprocesses inherit the same interpreter and installed extras.
@@ -153,4 +155,4 @@ Before changing the Memvid SDK version:
 3. Confirm lexical-first writes do not require an embedding API key.
 4. Confirm `find()` result metadata is still normalized into `MemoryHit`.
 5. Run the gated Memvid integration tests.
-6. Run golden evals with both memory and Memvid backends when possible.
+6. Run golden evals with both memory and Memvid backends when possible, plus the live-learning Memvid harness for release-provider validation.

@@ -1,10 +1,10 @@
 # Codex Full Agent Handoff Prompt
 
-Last updated: 2026-05-16
+Last updated: 2026-05-20
 
 You are working inside the Kestrel repository. Kestrel is a local-first, memory-native agent runtime built around Nested Learning-inspired memory layers and Memvid v2 `.mv2` files.
 
-This is not just a RAG layer. The runtime already includes CLI chat, provider adapters, deterministic mock mode, tools, approvals, state, task capsules, a FastAPI/web control plane, managed MCP stdio sessions, skills, scheduler slices, and safe repair gates. Your job is to harden the next slice without regressing the current contract.
+This is not just a RAG layer. The runtime already includes CLI chat, provider adapters, deterministic mock mode, tools, approvals, state, task capsules, controlled behavior deltas, live-learning evals, a FastAPI/web control plane, managed MCP stdio sessions, skills, scheduler slices, and safe repair gates. Your job is to harden the next slice without regressing the current contract.
 
 ## Read First
 
@@ -43,8 +43,8 @@ LLM provider
 + Soul/self runtime model
 + context compiler and pseudo-context packer
 + event/state logs
-+ task capsules
-+ consolidation/eval harness
++ task capsules and behavior-delta ledgers
++ consolidation/eval/live-learning harnesses
 + CLI/API/web control surface
 ```
 
@@ -98,6 +98,8 @@ If the phase touches live provider wiring, run the gated provider harness with t
 
 ```bash
 RUN_PROVIDER_INTEGRATION=1 python -m pytest -q tests/integration/test_provider_live_integration.py
+python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memory --output-root /tmp/kestrel-live-learning-memory
+python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memvid --output-root /tmp/kestrel-live-learning-memvid
 ```
 
 Use `python -m pytest` so subprocess fixtures inherit the active interpreter and installed extras.
@@ -109,7 +111,7 @@ Treat these as implemented unless current verification proves otherwise:
 - CLI chat with in-memory and Memvid backends.
 - Deterministic mock provider.
 - OpenAI Responses provider.
-- OpenAI-compatible local provider, plus OpenRouter/Ollama aliases through the same contract.
+- OpenAI-compatible local provider, OpenRouter/local Ollama aliases, and native Ollama Cloud support.
 - Anthropic Messages and Gemini provider adapters with strict tool-use/function-call normalization and stream support.
 - Codex CLI response provider.
 - Provider fallback on retryable failures.
@@ -120,7 +122,7 @@ Treat these as implemented unless current verification proves otherwise:
 - `memory.learn`, `memory.consolidate`, and promotion gate metadata.
 - `web.search` and `web.fetch` behind `NEST_AGENT_ALLOW_WEB`, with deterministic mock backend support and public-network fetch checks.
 - Exact-call approval gates for high-risk tools.
-- SQLite state schema version 10, including durable trace spans, persisted run provider, and promotion outcome ledger tables.
+- SQLite state schema version 11, including durable trace spans, persisted run provider, promotion outcome ledger tables, and behavior-delta ledger/activation/outcome tables.
 - Replay-safe terminal run and approval decisions.
 - Managed stdio MCP sessions.
 - Skills with manifest validation, provenance hashes, and local runtimes.
@@ -134,12 +136,12 @@ Treat these as implemented unless current verification proves otherwise:
 
 The next useful hardening work should usually target one of these:
 
-- Credentialed live provider integration runs in CI/local release validation.
+- Credentialed CI/release validation across the full provider matrix; Ollama Cloud + `gpt-oss:120b` has passed local live golden and live-learning E2E validation.
 - Production-grade auth, user/session isolation, and deployment boundaries.
 - MCP SSE/streamable HTTP fixtures and failure-recovery soak tests.
 - Container-grade skill isolation and package dependency management.
 - Managed plugin dependency installation, real container isolation, executable Hermes compatibility, and broader security review beyond the current review metadata and enable blockers.
-- Stronger consolidation validation loops and review UI.
+- Stronger consolidation validation loops and broader behavior-delta/operator review UX.
 - Richer self-change execution UX beyond approval-gated proposal capture and the existing repair gates.
 - Fully dynamic planner/executor/reviewer plan rewriting across worker branches.
 - Codex-backed worker fan-out with merge/review handling for isolated worker branches.

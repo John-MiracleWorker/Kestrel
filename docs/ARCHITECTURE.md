@@ -1,6 +1,6 @@
 # Architecture
 
-Last updated: 2026-05-16
+Last updated: 2026-05-20
 
 ## Goal
 
@@ -17,7 +17,7 @@ RunManager / EventBus / StateStore
         ↓
 NestedMV2Agent
         ↓
-ContextCompiler + MV2 ContextPacker ← layered .mv2 retrieval
+ContextCompiler + MV2 ContextPacker + BehaviorCompiler ← layered .mv2 retrieval
         ↓
 LLM Provider
         ↓
@@ -27,7 +27,7 @@ Tool results, approvals, diagnosis, repair gates
         ↓
 Working memory + run events + task capsule
         ↓
-NestedLearningKernel / Consolidator
+NestedLearningKernel / Consolidator / MutationGate
         ↓
 Episodic → Semantic/Procedural/Self → Policy .mv2 layers
 ```
@@ -105,8 +105,9 @@ The SQLite state store tracks operational state:
 - task nodes
 - subagent runs
 - promotion ledger and outcome rows
+- behavior-delta ledger, activation rows, and outcome rows
 
-Terminal run statuses and approval decisions are replay-safe. State migrations currently initialize schema version 10.
+Terminal run statuses and approval decisions are replay-safe. State migrations currently initialize schema version 11.
 
 ## Tooling Boundary
 
@@ -121,6 +122,12 @@ Tool execution goes through `ToolRegistry`:
 - failure diagnosis where applicable
 
 MCP tools are adapted into the same registry surface and default to approval-by-default unless explicitly trusted.
+
+## Controlled Self-Modification
+
+Behavior deltas are the current runtime-level self-modification primitive. They are typed, evidence-backed proposals stored in the SQLite control plane, not hidden prompt rewrites. `MutationGate` decides whether a delta can be staged/activated, `BehaviorCompiler` compiles only active relevant deltas, and tool-aware preflight can inject bounded advisory instructions when `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=1`. Proposed/staged deltas do not run automatically, policy deltas remain approval-gated, and rollback/outcome rows preserve audit history.
+
+Explicit direct commands such as `/search <query>` and `/memory search <query>` route deterministically to `memory.search` so operator/eval tool selection does not depend on model guesswork.
 
 ## Anti-Patterns
 

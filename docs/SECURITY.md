@@ -27,6 +27,8 @@ NEST_AGENT_MAX_SCHEDULER_CYCLES=5
 NEST_AGENT_ENABLE_CHANNEL_DELIVERY=false
 NEST_AGENT_ENABLE_AUTO_CONSOLIDATION=false
 NEST_AGENT_AUTO_CONSOLIDATION_DRY_RUN=true
+NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=false
+NEST_AGENT_MAX_ACTIVE_DELTAS_PER_RUN=8
 NEST_AGENT_REQUIRE_API_AUTH=false
 NEST_AGENT_TRUSTED_HOSTS=127.0.0.1,localhost,::1,[::1]
 NEST_AGENT_CORS_ORIGINS=
@@ -70,7 +72,7 @@ Logs and run events redact common API key, bearer token, password, authorization
 
 ## Tool Risk
 
-High-risk tools require explicit config enablement where applicable and exact-call approval. Approval is tied to the requested tool-call ID and arguments; changed arguments require a new approval. Shell execution, file writes, patching, repair mutations, git commits, Codex CLI execution, channel delivery, executable skills, memory imports, plugin review/install/update/enable, and policy memory writes are not production-safe defaults.
+High-risk tools require explicit config enablement where applicable and exact-call approval. Approval is tied to the requested tool-call ID and arguments; changed arguments require a new approval. Shell execution, file writes, patching, repair mutations, git commits, Codex CLI execution, channel delivery, executable skills, memory imports, plugin review/install/update/enable, behavior-delta activate/reject/rollback actions, and policy memory writes are not production-safe defaults.
 
 Self-improvement is local-first. Kestrel may write validated lessons to local `.mv2` memory, prepare local branches/worktrees, create patches, and run validation. `git.create_local_branch` and `git.export_patch` are approval-gated local-only primitives. Remote publishing is a separate lane: direct commits to protected branches, direct pushes to upstream `main`, force pushes, tag pushes, remote rewrites, repo setting edits, GitHub secrets, and workflow enablement are disabled by default. The default tool registry does not include `git.push`; `shell.run` is limited to minimal introspection commands and structurally blocks remote-publishing argv shapes such as `git push`, `git tag`, `git remote set-url`, `gh repo edit`, `gh secret set`, and `gh workflow enable`.
 
@@ -90,9 +92,9 @@ Generic/custom channel endpoints can require HMAC-SHA256 signatures by setting c
 
 An explicit unknown `channel_id` is rejected instead of being treated as an ephemeral local channel. This keeps signed webhook configuration from being bypassed by choosing a new ID.
 
-## Memory Safety
+## Memory and Behavior-Delta Safety
 
-Memory promotion must carry evidence, provenance, confidence, and validation status. A single ordinary event must not become policy, procedural, or semantic memory.
+Memory promotion must carry evidence, provenance, confidence, and validation status. A single ordinary event must not become policy, procedural, or semantic memory. Behavior deltas are default-off runtime instructions: proposed/staged deltas do not run, active deltas require evidence and rollback metadata, MutationGate adjudicates activation, exact-call approval protects review actions, and tool-aware preflight must not bypass capability flags or exact-call approval gates.
 
 ## Incident Response
 

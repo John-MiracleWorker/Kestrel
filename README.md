@@ -17,17 +17,18 @@ Kestrel is still an alpha runtime. It is useful for local development and harden
 - Retryable provider fallback wrapper and provider capability metadata.
 - One permanent `.mv2` file per memory layer: working, episodic, semantic, procedural, self, and policy.
 - MV2 context frames plus a token-aware pseudo-context packer with evidence pointers, conflict warnings, and on-demand raw expansion.
-- Run-scoped `complete.mv2` task capsules for reviewable learning signals.
+- Run-scoped `complete.mv2` task capsules for reviewable learning signals, plus behavior-delta proposal/replay/ledger/review flows for controlled self-modification.
 - Nested Learning kernel with context-flow metadata, optimizer traces, promotion gates, and explicit policy-write constraints.
 - Built-in tools for memory, context, repo search and file metadata, patching, tests, linting, git status/diff/log/show/commit, Memvid verify/doctor/stats, diagnosis, repair, Soul/self inspection, gated web context, skills, plugins, MCP registry inspection, project scripts, and Codex CLI delegation.
-- Exact-call approval gates for high-risk tools, including shell, file writes, patching, tests/lint, repair mutations, commits, skill installs, plugin review/install, imports, and Codex CLI delegation.
+- Exact-call approval gates for high-risk tools, including shell, file writes, patching, tests/lint, repair mutations, commits, skill installs, plugin review/install, behavior-delta review actions, imports, and Codex CLI delegation.
 - SQLite control-plane state for runs, approvals, MCP servers, skills, plugins, task nodes, subagents, and replay-safe terminal transitions. SQLite is not the retrieval memory store.
-- Local FastAPI/web workbench with background runs, SSE timeline events, approvals, Soul/self views, gated web search, memory/context tools, MCP controls, skills, subagents, and scheduler actions.
+- Local FastAPI/web workbench with background runs, SSE timeline events, approvals, Soul/self views, gated web search, memory/context tools, behavior-delta review, MCP controls, skills, plugins, subagents, and scheduler actions.
 - Managed stdio MCP sessions with lazy connect/disconnect/restart/health, tool discovery, vetting metadata, and approval-by-default risk normalization.
 - Experimental plugin registry/CLI/API/web review flow that can inspect GitHub plugin manifests, report dependency/isolation blockers, and materialize plugin-provided skills and MCP server entries.
 - Multi-channel ingress for Telegram-shaped, Discord-shaped, webhook, and custom payloads, with outbound delivery disabled by default.
 - Optional autonomous scheduler that drains approved ready tasks within bounded task/cycle limits.
 - Safe repair primitives with branch isolation, diagnosis-gated validation, reviewer artifacts, and commit gates for repair branches.
+- Live-provider validation harnesses: provider integration tests, full golden evals, and isolated live-learning E2E checks validated locally with Ollama Cloud + `gpt-oss:120b` on memory and Memvid backends.
 
 See `docs/IMPLEMENTATION_STATUS.md` for the detailed truth table.
 
@@ -349,6 +350,8 @@ NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER=false
 NEST_AGENT_ENABLE_CHANNEL_DELIVERY=false
 NEST_AGENT_ENABLE_AUTO_CONSOLIDATION=false
 NEST_AGENT_AUTO_CONSOLIDATION_DRY_RUN=true
+NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=false
+NEST_AGENT_MAX_ACTIVE_DELTAS_PER_RUN=8
 NEST_AGENT_REQUIRE_API_AUTH=false
 ```
 
@@ -370,6 +373,7 @@ python -m ruff check scripts src tests
 python -m mypy src
 python -m pytest -q
 python scripts/run_golden_evals.py --backend memory --provider mock
+python scripts/eval_behavior_deltas.py --scenario tests/evals/behavior_deltas/policy_write_requires_approval.json
 npm run test --prefix web
 npm run build --prefix web
 ```
@@ -380,6 +384,11 @@ Optional integration checks:
 RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integration.py
 RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
 RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
+RUN_PROVIDER_INTEGRATION=1 python -m pytest -q tests/integration/test_provider_live_integration.py
+OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memory --provider ollama-cloud --model gpt-oss:120b --memory-dir /tmp/kestrel-live-golden-memory
+OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memvid --provider ollama-cloud --model gpt-oss:120b --memory-dir /tmp/kestrel-live-golden-memvid
+python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memory --output-root /tmp/kestrel-live-learning-memory
+python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memvid --output-root /tmp/kestrel-live-learning-memvid
 ```
 
 Use `python -m pytest` for optional integration tests so fixture subprocesses inherit the same interpreter, environment, and installed extras.
@@ -406,13 +415,13 @@ Operational docs:
 
 Kestrel is not yet production-complete. The main remaining hardening areas are:
 
-- Native tool-calling parity across providers beyond the portable JSON envelope.
-- Streaming parity for OpenAI-compatible/local providers.
+- Broader live-provider CI/release coverage beyond the locally validated Ollama Cloud path.
+- Richer provider-specific JSON/context/streaming hardening for every native provider surface.
 - Production-grade auth, user/session isolation, and deployment boundaries.
 - Real MCP SSE/streamable HTTP fixtures and soak testing.
 - Container-grade skill isolation and package dependency management.
 - Managed plugin dependency installation and container-grade isolation beyond the current review metadata and enable blockers.
-- More capable planner/executor/reviewer loops with isolated worker branches or worktrees.
+- More capable planner/executor/reviewer loops with Codex-backed isolated worker branches or worktrees.
 - Production bot identity verification and platform-specific rate-limit handling.
 - Fully autonomous self-improvement with diff review, test gates, rollback, and explicit human approval.
 
