@@ -11,6 +11,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from nested_memvid_agent.app_factory import build_agent  # noqa: E402
 from nested_memvid_agent.behavior_compiler import (  # noqa: E402
     BehaviorCompileRequest,
     BehaviorCompiler,
@@ -22,6 +23,7 @@ from nested_memvid_agent.behavior_delta import (  # noqa: E402
     behavior_delta_from_metadata,
 )
 from nested_memvid_agent.behavior_delta_ledger import BehaviorDeltaLedger  # noqa: E402
+from nested_memvid_agent.config import AgentConfig  # noqa: E402
 from nested_memvid_agent.models import MemoryLayer  # noqa: E402
 from nested_memvid_agent.state_store import AgentStateStore  # noqa: E402
 
@@ -51,6 +53,10 @@ class BehaviorDeltaReplayResult:
     gate_violations: tuple[str, ...]
     passed: bool
     compiled_text: str
+    agent_context_prompt: str = ""
+    agent_stop_reason: str | None = None
+    activation_count: int = 0
+    context_compile_events: int = 0
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -64,6 +70,10 @@ class BehaviorDeltaReplayResult:
             "gate_violations": list(self.gate_violations),
             "passed": self.passed,
             "compiled_text": self.compiled_text,
+            "agent_context_prompt": self.agent_context_prompt,
+            "agent_stop_reason": self.agent_stop_reason,
+            "activation_count": self.activation_count,
+            "context_compile_events": self.context_compile_events,
         }
 
 
@@ -120,15 +130,82 @@ def evaluate_behavior_delta_scenario(scenario: BehaviorDeltaScenario) -> Behavio
     )
 
 
+def evaluate_behavior_delta_agent_scenario(scenario: BehaviorDeltaScenario) -> BehaviorDeltaReplayResult:
+    """Replay a scenario through a real NestedMV2Agent turn with mock provider.
+
+    This is deeper than fixture-only compiler replay: it persists active deltas in
+    the SQLite control plane, lets the agent compile context through its normal
+    chat path, and verifies activation logging/events from the runtime boundary.
+    """
+    with tempfile.TemporaryDirectory(prefix="kestrel_behavior_delta_agent_replay_") as tmp:
+        root = Path(tmp)
+        state = AgentStateStore(root / "state.db")
+        ledger = BehaviorDeltaLedger(state)
+        active_ids = set(scenario.active_delta_ids)
+        for delta in scenario.deltas:
+            status = BehaviorDeltaStatus.ACTIVE if delta.id in active_ids else delta.status
+            ledger.record_delta(_with_status(delta, status))
+
+        config = AgentConfig(
+            provider="mock",
+            model="mock",
+            backend="memory",
+            memory_dir=root / "memory",
+            log_dir=root / "logs",
+            state_path=root / "state.db",
+            enable_behavior_deltas=True,
+            max_tool_rounds=0,
+        )
+        agent = build_agent(config, state=state)
+        try:
+            turn = agent.chat(scenario.goal, session_id="behavior_delta_replay", run_id=f"replay_{scenario.scenario_id}")
+        finally:
+            agent.close()
+
+        text = turn.context_prompt
+        baseline_text = _baseline_behavior_text(scenario)
+        baseline_score = _score_text(baseline_text, scenario.expected_behavior)
+        delta_score = _score_text(text, scenario.expected_behavior)
+        gate_violations = _gate_violations(text, scenario.failure_conditions)
+        improvement = round(delta_score - baseline_score, 4)
+        expected_hits = _hit_count(text, scenario.expected_behavior)
+        active_delta_id = next(iter(scenario.active_delta_ids), None)
+        activations = ledger.list_activations(active_delta_id) if active_delta_id else ()
+        context_events = [event for event in agent.event_log.tail(limit=50) if event.type == "context.compile"] if agent.event_log else []
+        passed = delta_score > baseline_score and not gate_violations and expected_hits == len(scenario.expected_behavior)
+        return BehaviorDeltaReplayResult(
+            scenario_id=scenario.scenario_id,
+            delta_id=active_delta_id,
+            baseline_score=baseline_score,
+            delta_score=delta_score,
+            improvement=improvement,
+            expected_behavior_hits=expected_hits,
+            expected_behavior_total=len(scenario.expected_behavior),
+            gate_violations=gate_violations,
+            passed=passed,
+            compiled_text=text,
+            agent_context_prompt=text,
+            agent_stop_reason=turn.stop_reason,
+            activation_count=len(activations),
+            context_compile_events=len(context_events),
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Replay-evaluate Kestrel behavior-delta scenarios.")
     parser.add_argument("--scenario", type=Path, required=True)
     parser.add_argument("--provider", choices=["mock"], default="mock")
+    parser.add_argument("--mode", choices=["compiler", "agent"], default="compiler")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--fail-on-regression", action="store_true")
     args = parser.parse_args()
 
-    result = evaluate_behavior_delta_scenario(load_scenario(args.scenario))
+    scenario = load_scenario(args.scenario)
+    result = (
+        evaluate_behavior_delta_agent_scenario(scenario)
+        if args.mode == "agent"
+        else evaluate_behavior_delta_scenario(scenario)
+    )
     payload = result.to_payload()
     if args.json:
         print(json.dumps(payload, indent=2))

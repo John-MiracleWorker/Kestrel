@@ -54,6 +54,7 @@ Implemented foundation:
 - `scripts/eval_behavior_deltas.py`
   - Deterministic replay evaluator for behavior-delta scenarios.
   - Compares baseline text against BehaviorCompiler output for active deltas.
+  - Supports `--mode agent` to run a full mock-provider `NestedMV2Agent` turn through the normal runtime context path and verify activation logging.
   - Emits structured JSON with baseline score, delta score, improvement, expected-behavior hits, gate violations, and pass/fail.
   - Includes initial fixtures for policy approval gates, `.mv2` canonical memory, and repeated validation retry strategy.
 
@@ -66,8 +67,7 @@ Implemented foundation:
 Still intentionally not implemented:
 
 - No automatic behavior-delta activation.
-- No live provider replay or full agent-run replay validation.
-- No context-compiler/runtime integration with behavior deltas.
+- No live provider replay validation.
 - No policy-promotion behavior changes.
 - No hidden system-prompt rewrite path.
 - No replacement or weakening of the `.mv2` durable-memory contract.
@@ -153,7 +153,7 @@ Can this behavior delta become active runtime behavior?
 
 ### `BehaviorCompiler`
 
-The behavior compiler transforms selected active deltas into structured runtime instructions. It remains separate from `ContextPacker` and is not yet wired into the runtime context path.
+The behavior compiler transforms selected active deltas into structured runtime instructions. It remains separate from `ContextPacker` and is wired into the chat runtime only behind the default-off `enable_behavior_deltas` flag.
 
 `ContextPacker` retrieves and packs memory context.
 
@@ -291,7 +291,7 @@ python -m pytest -q tests/test_behavior_delta.py tests/test_behavior_delta_ledge
 
 ### Phase 5: Behavior compiler
 
-Status: first backend slice implemented. `BehaviorCompiler` can compile active, relevant, evidence-backed deltas from the ledger into structured sections behind a default-off config flag. It can log activations once per run/delta. It is not yet integrated into `ContextCompiler` or the live runtime prompt path.
+Status: first runtime slice implemented. `BehaviorCompiler` can compile active, relevant, evidence-backed deltas from the ledger into structured sections behind a default-off config flag. It can log activations once per run/delta, and `NestedMV2Agent.chat` appends those sections to the compiled memory context only when behavior deltas are explicitly enabled.
 
 Goal: compile relevant active deltas into bounded runtime instructions behind a default-off flag.
 
@@ -321,7 +321,7 @@ NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=1 python -m pytest -q tests/test_behavior_comp
 
 ### Phase 6: Replay validation
 
-Status: first deterministic replay slice implemented. `scripts/eval_behavior_deltas.py` can load JSON scenarios, compile active fixture deltas through `BehaviorCompiler`, compare baseline vs delta scores, fail on gate violations, and emit JSON. Initial fixtures cover policy approval gates, `.mv2` canonical memory, and repeated validation retry strategy.
+Status: deterministic replay plus first full-agent replay slice implemented. `scripts/eval_behavior_deltas.py` can load JSON scenarios, compile active fixture deltas through `BehaviorCompiler`, compare baseline vs delta scores, fail on gate violations, and emit JSON. With `--mode agent`, it persists active deltas in the SQLite control plane, runs a mock-provider `NestedMV2Agent` turn through the normal chat/context path, and verifies activation logging. Initial fixtures cover policy approval gates, `.mv2` canonical memory, and repeated validation retry strategy.
 
 Goal: compare baseline behavior vs behavior-with-delta using deterministic scenarios.
 
@@ -345,6 +345,7 @@ Validation target:
 
 ```bash
 python scripts/eval_behavior_deltas.py --scenario tests/evals/behavior_deltas/policy_write_requires_approval.json --provider mock
+python scripts/eval_behavior_deltas.py --scenario tests/evals/behavior_deltas/policy_write_requires_approval.json --provider mock --mode agent --fail-on-regression
 python -m pytest -q tests/test_behavior_delta_replay.py
 ```
 

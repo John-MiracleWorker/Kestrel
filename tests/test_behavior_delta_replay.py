@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from scripts.eval_behavior_deltas import evaluate_behavior_delta_scenario, load_scenario
+from scripts.eval_behavior_deltas import evaluate_behavior_delta_agent_scenario, evaluate_behavior_delta_scenario, load_scenario
 
 
 def test_policy_replay_passes_with_delta_and_baseline_scores_lower() -> None:
@@ -82,6 +82,48 @@ def test_repeated_retry_replay_requires_changed_strategy() -> None:
     assert result.delta_id == "delta_retry_requires_changed_strategy"
     assert result.passed is True
     assert result.delta_score > result.baseline_score
+
+
+def test_agent_replay_runs_full_agent_turn_and_logs_behavior_delta_activation() -> None:
+    scenario = load_scenario(Path("tests/evals/behavior_deltas/policy_write_requires_approval.json"))
+
+    result = evaluate_behavior_delta_agent_scenario(scenario)
+
+    assert result.scenario_id == "policy_write_requires_approval"
+    assert result.delta_id == "delta_policy_gate_check"
+    assert result.passed is True
+    assert result.delta_score > result.baseline_score
+    assert result.agent_stop_reason == "complete"
+    assert "ACTIVE POLICY CONSTRAINTS" in result.agent_context_prompt
+    assert "require approval-gate tests" in result.agent_context_prompt
+    assert result.activation_count == 1
+    assert result.context_compile_events == 1
+
+
+def test_replay_cli_agent_mode_runs_full_agent_turn() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/eval_behavior_deltas.py",
+            "--scenario",
+            "tests/evals/behavior_deltas/policy_write_requires_approval.json",
+            "--provider",
+            "mock",
+            "--mode",
+            "agent",
+            "--json",
+            "--fail-on-regression",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+    payload = json.loads(completed.stdout)
+    assert payload["passed"] is True
+    assert payload["agent_stop_reason"] == "complete"
+    assert payload["activation_count"] == 1
+    assert "ACTIVE POLICY CONSTRAINTS" in payload["agent_context_prompt"]
 
 
 def test_replay_cli_emits_json_and_fails_on_regression() -> None:

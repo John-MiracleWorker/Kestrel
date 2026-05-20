@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .behavior_compiler import BehaviorCompileRequest, BehaviorCompiler, BehaviorCompilerConfig
+from .behavior_delta_ledger import BehaviorDeltaLedger
 from .cognition import FailureEpisode, LessonManager, ProofOfWorkSummary, RetryPolicy
 from .config import AgentConfig
 from .context_compiler import ContextCompiler, ContextCompilerConfig
@@ -33,6 +35,7 @@ from .self_profile import (
     soul_communication_contract_from_hits,
     soul_profile_context_from_hits,
 )
+from .state_store import AgentStateStore
 from .summarization import HeuristicSummarizer, LLMSummarizer, TurnSummarizer
 from .tools.base import ApprovalHandler, ToolContext
 from .tools.registry import ToolRegistry
@@ -66,6 +69,17 @@ class NestedMV2Agent:
                 context_pack_token_budget=deps.config.context_pack_token_budget,
                 expand_raw=deps.config.context_pack_expand_raw,
             ),
+        )
+        self.behavior_compiler = (
+            BehaviorCompiler(
+                ledger=BehaviorDeltaLedger(AgentStateStore(deps.config.state_path)),
+                config=BehaviorCompilerConfig(
+                    enabled=True,
+                    max_active_deltas_per_run=deps.config.max_active_deltas_per_run,
+                ),
+            )
+            if deps.config.enable_behavior_deltas
+            else None
         )
         self.system_prompt = _load_system_prompt()
         self.turn_summarizer: TurnSummarizer = LLMSummarizer(self.llm) if self.config.llm_turn_summaries else HeuristicSummarizer()
@@ -146,10 +160,24 @@ class NestedMV2Agent:
             )
 
         compiled = self.compiler.compile(objective=user_message, query=user_message)
+        if self.behavior_compiler is not None:
+            behavior_deltas = self.behavior_compiler.compile(
+                BehaviorCompileRequest(
+                    objective=user_message,
+                    query=user_message,
+                    run_id=active_run_id,
+                )
+            )
+            behavior_delta_text = behavior_deltas.text
+            behavior_delta_ids = [delta.id for delta in behavior_deltas.deltas]
+        else:
+            behavior_delta_text = ""
+            behavior_delta_ids = []
+        context_prompt = _context_with_behavior_deltas(compiled.prompt, behavior_delta_text)
         preflight_lessons = (
             lesson_manager.preflight(objective=user_message) if lesson_manager is not None else []
         )
-        context_prompt = _context_with_preflight_lessons(compiled.prompt, preflight_lessons)
+        context_prompt = _context_with_preflight_lessons(context_prompt, preflight_lessons)
         soul_profile_context, communication_contract = self._soul_profile_contexts()
         context_prompt = _context_with_soul_profile(context_prompt, soul_profile_context)
         if proof is not None:
@@ -162,6 +190,7 @@ class NestedMV2Agent:
                 "context_chars": len(context_prompt),
                 "hits": len(compiled.hits),
                 "warnings": compiled.warnings,
+                "active_behavior_deltas": behavior_delta_ids,
                 "preflight_lessons": len(preflight_lessons),
             },
         )
@@ -722,6 +751,12 @@ def _looks_like_correction(text: str) -> bool:
         "remember:",
     )
     return any(marker in lowered for marker in markers)
+
+
+def _context_with_behavior_deltas(context_prompt: str, behavior_delta_text: str) -> str:
+    if not behavior_delta_text:
+        return context_prompt
+    return f"{context_prompt}\n\n## Active Behavior Deltas\n{behavior_delta_text}"
 
 
 def _context_with_preflight_lessons(context_prompt: str, lessons: list[dict[str, Any]]) -> str:
