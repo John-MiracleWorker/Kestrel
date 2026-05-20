@@ -54,7 +54,7 @@ def render_skill_candidate_preview(delta: BehaviorDelta, *, skill_id: str | None
         },
     }
     instructions = _render_skill_md(delta, manifest)
-    from .skill_manager import validate_skill_manifest
+    from .skill_validation import validate_skill_manifest
 
     return SkillCandidatePreview(
         delta_id=delta.id,

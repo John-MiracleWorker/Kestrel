@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord
-from .skill_manager import validate_skill_manifest
+from .skill_validation import validate_skill_manifest
 from .state_store import AgentStateStore
 
 PLUGIN_NAMESPACE = "plugin"

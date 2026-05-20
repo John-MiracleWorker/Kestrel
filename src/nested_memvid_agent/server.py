@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .app_factory import build_agent
+from .behavior_delta_ledger import BehaviorDeltaLedger
 from .channels import ChannelManager
 from .config import AgentConfig
 from .event_bus import RunEventBus
@@ -72,6 +73,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         staticfiles_module = import_module("starlette.staticfiles")
         cors_module = import_module("starlette.middleware.cors")
         from .server_channel_routes import register_channel_routes
+        from .server_behavior_delta_routes import register_behavior_delta_routes
         from .server_diagnosis_routes import register_diagnosis_routes
         from .server_mcp_routes import register_mcp_routes
         from .server_models import (
@@ -345,6 +347,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         events=events,
         runs=runs,
     )
+    register_behavior_delta_routes(app, http_exception=HTTPException, ledger=BehaviorDeltaLedger(state))
 
     register_tool_routes(app, runs=runs)
 

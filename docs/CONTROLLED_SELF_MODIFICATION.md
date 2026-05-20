@@ -69,6 +69,14 @@ Implemented foundation:
   - Adds behavior-delta shadow examples from the behavior-delta ledger: kind, target layer, risk, validation score, repeat count, explicit instruction signal, activation count, useful/failure/rollback/never-activated rates, and trigger specificity.
   - `scripts/eval_memory_router.py --include-behavior-deltas --json` includes advisory counterfactuals only; authority is explicitly `shadow_only`, gate authority remains `mutation_gate`, and policy-write authority is `false`.
 
+- `src/nested_memvid_agent/server_behavior_delta_routes.py`
+  - Adds read-only review API routes for listing behavior deltas, showing one delta with activation/outcome history, and rendering skill-candidate previews.
+  - Mutating review actions (`activate`, `reject`, `rollback`) deliberately return `405 read_only_review_api` in this first UI/API slice.
+  - Integrated into the FastAPI server under `/api/memory/deltas*` without adding activation, rollback, or skill-install side effects.
+
+- `src/nested_memvid_agent/skill_validation.py`
+  - Holds shared skill-manifest validation so behavior-delta skill previews can validate manifests without importing the full skill/tool/plugin runtime graph.
+
 - `src/nested_memvid_agent/state_store.py`
   - Schema version `11` adds:
     - `behavior_delta_ledger`
@@ -429,6 +437,8 @@ ORACLE requirements:
 - Must not bypass `MutationGate`.
 
 ### Phase 10: Review UI/API
+
+Status: first read-only API slice implemented. FastAPI now exposes `/api/memory/deltas`, `/api/memory/deltas/{delta_id}`, and `/api/memory/deltas/{delta_id}/skill-preview` for operator review. Mutating actions are intentionally blocked with `405 read_only_review_api`; web UI panels and approval-gated activation/reject/rollback endpoints remain future work.
 
 Goal: make controlled self-modification visible and reviewable.
 

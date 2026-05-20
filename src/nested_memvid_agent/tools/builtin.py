@@ -25,7 +25,7 @@ from ..promotion_ledger import OUTCOME_KINDS, PromotionLedger
 from ..retention import RetentionCompactor
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
 from ..secret_broker import SecretBroker, build_secret_broker, is_secret_ref
-from ..skill_manager import validate_skill_manifest
+from ..skill_validation import validate_skill_manifest
 from ..state_store import AgentStateStore
 from ..task_capsule import summarize_run_capsule
 from .base import AgentTool, ToolContext
