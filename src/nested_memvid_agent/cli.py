@@ -16,6 +16,8 @@ from typing import Any
 
 from .agent import NestedMV2Agent
 from .app_factory import build_agent
+from .behavior_delta_extractor import BehaviorDeltaExtractor
+from .behavior_delta_ledger import BehaviorDeltaLedger
 from .channels import ChannelManager, ChannelPayloadError
 from .config import AgentConfig
 from .context_compiler import ContextCompiler
@@ -178,6 +180,15 @@ def main() -> None:
     memory_ledger.add_argument("--layer", choices=[layer.value for layer in MemoryLayer])
     memory_ledger.add_argument("--outcome", choices=list(OUTCOME_KINDS))
     memory_ledger.add_argument("--json", action="store_true")
+    memory_deltas = memory_sub.add_parser("deltas")
+    deltas_sub = memory_deltas.add_subparsers(dest="deltas_cmd", required=True)
+    deltas_propose = deltas_sub.add_parser("propose")
+    deltas_propose.add_argument("--run-id", required=True)
+    deltas_propose.add_argument("--runs-dir", type=Path, default=Path(".nest/runs"))
+    deltas_propose.add_argument("--state-path", type=Path, default=Path(".nest/state/agent.db"))
+    deltas_propose.add_argument("--backend", choices=["memory", "memvid"], default="memory")
+    deltas_propose.add_argument("--dry-run", action="store_true")
+    deltas_propose.add_argument("--json", action="store_true")
 
     compile_cmd = sub.add_parser("compile-context")
     _add_common_args(compile_cmd)
@@ -419,6 +430,10 @@ def main() -> None:
 
     if args.cmd == "memory" and args.memory_cmd == "ledger":
         _print_promotion_ledger(args)
+        return
+
+    if args.cmd == "memory" and args.memory_cmd == "deltas":
+        _handle_behavior_deltas_command(args)
         return
 
     ledger = _ledger_for_memory_command(args)
@@ -665,6 +680,32 @@ def _ledger_for_memory_command(args: argparse.Namespace) -> PromotionLedger | No
         return None
     state_path = Path(getattr(args, "state_path", Path(".nest/state/agent.db")))
     return PromotionLedger(AgentStateStore(state_path))
+
+
+def _handle_behavior_deltas_command(args: argparse.Namespace) -> None:
+    if args.deltas_cmd != "propose":
+        raise SystemExit(f"Unknown behavior-delta command: {args.deltas_cmd}")
+    summary = summarize_run_capsule(runs_dir=args.runs_dir, run_id=args.run_id, backend=args.backend)
+    ledger = BehaviorDeltaLedger(AgentStateStore(args.state_path))
+    extractor = BehaviorDeltaExtractor(ledger=ledger)
+    proposals = extractor.propose_from_signals(
+        summary.learning_signals,
+        run_id=args.run_id,
+        dry_run=bool(args.dry_run),
+    )
+    payload = {
+        "run_id": args.run_id,
+        "dry_run": bool(args.dry_run),
+        "proposal_count": len(proposals),
+        "proposals": [delta.to_metadata() for delta in proposals],
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return
+    action = "Would record" if args.dry_run else "Recorded"
+    print(f"{action} {len(proposals)} behavior delta proposal(s) for run {args.run_id}.")
+    for delta in proposals:
+        print(f"- {delta.id} [{delta.kind.value}/{delta.risk.value}] {delta.title}")
 
 
 def _print_promotion_ledger(args: argparse.Namespace) -> None:

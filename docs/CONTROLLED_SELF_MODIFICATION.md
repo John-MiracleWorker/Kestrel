@@ -27,6 +27,12 @@ Implemented foundation:
   - Summary rates for useful/failure/rollback/never-activated outcomes.
   - Guard against activating terminal deltas without a future explicit override path.
 
+- `src/nested_memvid_agent/behavior_delta_extractor.py`
+  - Proposal-only extraction from task capsule payloads and learning signals.
+  - Initial support for policy candidates, procedural candidates, correction rules, reusable lessons, and repeated failed tool-call heuristics.
+  - Vague candidates are rejected before they become `BehaviorDelta` objects.
+  - Optional ledger recording is explicit; dry-run remains the CLI default for safe review.
+
 - `src/nested_memvid_agent/state_store.py`
   - Schema version `11` adds:
     - `behavior_delta_ledger`
@@ -37,6 +43,8 @@ Still intentionally not implemented:
 
 - No runtime behavior compilation.
 - No automatic behavior-delta activation.
+- No mutation-gate activation decisions.
+- No replay validation.
 - No policy-promotion behavior changes.
 - No hidden system-prompt rewrite path.
 - No replacement or weakening of the `.mv2` durable-memory contract.
@@ -178,6 +186,14 @@ Rules:
 ## Phase roadmap
 
 ### Phase 3: Proposal extraction
+
+Status: first backend slice implemented. Kestrel can now produce proposal-only deltas from task capsule payloads, summarized capsule learning signals, and repeated failed tool attempts. CLI dry-run review is available through:
+
+```bash
+nest-agent memory deltas propose --run-id <run_id> --dry-run
+```
+
+Remaining Phase 3 hardening: richer extraction sources, additional deterministic capsule fixtures, and broader CLI/API review paths.
 
 Goal: produce `BehaviorDelta(PROPOSED)` records from evidence without activation.
 
