@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from re import sub
 
@@ -34,9 +37,30 @@ class BehaviorCompileRequest:
 
 
 @dataclass(frozen=True)
-class CompiledBehaviorDeltas:
+class ToolPreflightContext:
+    run_id: str | None
+    task_id: str | None
+    objective: str
+    tool_name: str
+    tool_arguments: dict[str, object]
+    prior_failure_signature: str | None = None
+    prior_failed_tool_name: str | None = None
+    prior_failed_arguments_hash: str | None = None
+    touched_paths: tuple[str, ...] = ()
+    memory_layers: tuple[MemoryLayer, ...] = ()
+    risk_tags: tuple[str, ...] = ()
+    task_type: str | None = None
+    tool_call_id: str | None = None
+
+
+@dataclass(frozen=True)
+class CompiledBehavior:
     text: str
     deltas: tuple[BehaviorDelta, ...]
+    activation_reasons: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
+
+CompiledBehaviorDeltas = CompiledBehavior
 
 
 class BehaviorCompiler:
@@ -51,21 +75,55 @@ class BehaviorCompiler:
         self.ledger = ledger
         self.config = config or BehaviorCompilerConfig()
 
-    def compile(self, request: BehaviorCompileRequest) -> CompiledBehaviorDeltas:
+    def compile(self, request: BehaviorCompileRequest) -> CompiledBehavior:
         if not self.config.enabled:
-            return CompiledBehaviorDeltas(text="", deltas=())
+            return CompiledBehavior(text="", deltas=())
 
         candidates = self.ledger.list_deltas(status=BehaviorDeltaStatus.ACTIVE)
         relevant = [delta for delta in candidates if delta.evidence_refs and _matches(delta, request)]
         selected = self._select(relevant)
         if not selected:
-            return CompiledBehaviorDeltas(text="", deltas=())
+            return CompiledBehavior(text="", deltas=())
 
         sections = _render_sections(selected)
         text = "\n".join(sections).strip()
         if self.config.log_activations:
             self._record_activations(selected, request)
-        return CompiledBehaviorDeltas(text=text, deltas=tuple(selected))
+        return CompiledBehavior(text=text, deltas=tuple(selected))
+
+    def compile_for_tool_call(
+        self,
+        context: ToolPreflightContext,
+        active_deltas: Sequence[BehaviorDelta],
+        *,
+        max_deltas: int = 5,
+    ) -> CompiledBehavior:
+        if not self.config.enabled:
+            return CompiledBehavior(text="", deltas=())
+        if max_deltas < 1:
+            raise ValueError("max_deltas must be >= 1")
+
+        matches: list[tuple[BehaviorDelta, tuple[str, ...]]] = []
+        for delta in active_deltas:
+            if delta.status != BehaviorDeltaStatus.ACTIVE or not delta.evidence_refs:
+                continue
+            reasons = _tool_call_match_reasons(delta, context)
+            if reasons:
+                matches.append((delta, reasons))
+        selected = _select_tool_matches(matches, max_deltas=max_deltas)
+        if not selected:
+            return CompiledBehavior(text="", deltas=())
+
+        selected_deltas = [delta for delta, _ in selected]
+        reasons_by_delta = {delta.id: reasons for delta, reasons in selected}
+        text = _render_tool_preflight_sections(selected_deltas)
+        if self.config.log_activations:
+            self._record_tool_activations(selected, context)
+        return CompiledBehavior(
+            text=text,
+            deltas=tuple(selected_deltas),
+            activation_reasons=reasons_by_delta,
+        )
 
     def _select(self, deltas: list[BehaviorDelta]) -> list[BehaviorDelta]:
         deduped: list[BehaviorDelta] = []
@@ -95,6 +153,29 @@ class BehaviorCompiler:
                     objective=request.objective,
                     activated_at=utc_now(),
                     activation_reason=_activation_reason(delta, request),
+                    compiled_section=section,
+                )
+            )
+
+    def _record_tool_activations(
+        self,
+        matches: list[tuple[BehaviorDelta, tuple[str, ...]]],
+        context: ToolPreflightContext,
+    ) -> None:
+        for delta, reasons in matches:
+            section = f"TOOL BEHAVIOR-DELTA PREFLIGHT: {_section_for(delta)}"
+            activation_id = _tool_activation_id(delta.id, context, section)
+            if any(item.id == activation_id for item in self.ledger.list_activations(delta.id)):
+                continue
+            self.ledger.record_activation(
+                BehaviorDeltaActivation(
+                    id=activation_id,
+                    delta_id=delta.id,
+                    run_id=context.run_id,
+                    task_id=context.task_id,
+                    objective=context.objective,
+                    activated_at=utc_now(),
+                    activation_reason=",".join(reasons),
                     compiled_section=section,
                 )
             )
@@ -131,6 +212,17 @@ def _render_sections(deltas: list[BehaviorDelta]) -> list[str]:
     return lines
 
 
+def _render_tool_preflight_sections(deltas: list[BehaviorDelta]) -> str:
+    lines = [
+        "TOOL BEHAVIOR-DELTA PREFLIGHT:",
+        "- Advisory checklist for this tool call only.",
+        "- Existing capability and approval gates remain authoritative.",
+        "",
+    ]
+    lines.extend(_render_sections(deltas))
+    return "\n".join(lines).strip()
+
+
 def _matches(delta: BehaviorDelta, request: BehaviorCompileRequest) -> bool:
     trigger = delta.trigger
     haystack = " ".join(part for part in (request.objective, request.query or "") if part).lower()
@@ -147,6 +239,50 @@ def _matches(delta: BehaviorDelta, request: BehaviorCompileRequest) -> bool:
     if trigger.risk_tags and any(tag.lower() in haystack for tag in trigger.risk_tags):
         return True
     return False
+
+
+def _tool_call_match_reasons(delta: BehaviorDelta, context: ToolPreflightContext) -> tuple[str, ...]:
+    trigger = delta.trigger
+    matched: list[str] = []
+    if trigger.tool_names and context.tool_name in trigger.tool_names:
+        matched.append(f"matched_tool_name:{context.tool_name}")
+    if trigger.path_globs:
+        for path in context.touched_paths:
+            if any(fnmatch(path, glob) for glob in trigger.path_globs):
+                matched.append("matched_path_glob")
+                break
+    if trigger.memory_layers and set(context.memory_layers).intersection(trigger.memory_layers):
+        matched.append("matched_memory_layer")
+    if trigger.risk_tags and _normalized_intersection(context.risk_tags, trigger.risk_tags):
+        matched.append("matched_risk_tag")
+    if context.task_type and context.task_type in trigger.task_types:
+        matched.append("matched_task_type")
+    haystack = context.objective.lower()
+    if trigger.query_patterns and any(pattern.lower() in haystack for pattern in trigger.query_patterns):
+        matched.append("matched_query_pattern")
+    return tuple(matched)
+
+
+def _normalized_intersection(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
+    return bool({item.lower() for item in left}.intersection(item.lower() for item in right))
+
+
+def _select_tool_matches(
+    matches: list[tuple[BehaviorDelta, tuple[str, ...]]],
+    *,
+    max_deltas: int,
+) -> list[tuple[BehaviorDelta, tuple[str, ...]]]:
+    selected: list[tuple[BehaviorDelta, tuple[str, ...]]] = []
+    seen_changes: set[str] = set()
+    for delta, reasons in sorted(matches, key=lambda item: _priority_key(item[0])):
+        normalized = " ".join(delta.behavior_change.split()).lower()
+        if normalized in seen_changes:
+            continue
+        seen_changes.add(normalized)
+        selected.append((delta, reasons))
+        if len(selected) >= max_deltas:
+            break
+    return selected
 
 
 def _priority_key(delta: BehaviorDelta) -> tuple[int, float, float, str]:
@@ -186,16 +322,30 @@ def _section_for(delta: BehaviorDelta) -> str:
 def _activation_reason(delta: BehaviorDelta, request: BehaviorCompileRequest) -> str:
     matched = []
     if delta.trigger.query_patterns:
-        matched.append("query_patterns")
+        matched.append("matched_query_pattern")
     if request.task_type and request.task_type in delta.trigger.task_types:
-        matched.append("task_type")
+        matched.append("matched_task_type")
     if request.tool_names and set(request.tool_names).intersection(delta.trigger.tool_names):
-        matched.append("tool_names")
+        matched.append("matched_tool_name")
     if request.memory_layers and set(request.memory_layers).intersection(delta.trigger.memory_layers):
-        matched.append("memory_layers")
-    return "matched " + ",".join(matched or ["semantic_context"])
+        matched.append("matched_memory_layer")
+    return ",".join(matched or ["matched_semantic_context"])
 
 
 def _activation_id(delta_id: str, run_id: str | None, task_id: str | None, section: str) -> str:
     raw = f"act_{delta_id}_{run_id or 'no_run'}_{task_id or 'no_task'}_{section.lower()}"
     return sub(r"[^a-zA-Z0-9_]+", "_", raw)[:240]
+
+
+def _tool_activation_id(delta_id: str, context: ToolPreflightContext, section: str) -> str:
+    tool_call_key = context.tool_call_id or f"{context.tool_name}_{_arguments_hash(context.tool_arguments)}"
+    raw = (
+        f"act_{delta_id}_{context.run_id or 'no_run'}_{context.task_id or 'no_task'}_"
+        f"{tool_call_key}_{section.lower()}"
+    )
+    return sub(r"[^a-zA-Z0-9_]+", "_", raw)[:240]
+
+
+def _arguments_hash(arguments: dict[str, object]) -> str:
+    payload = json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]

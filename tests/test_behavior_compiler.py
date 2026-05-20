@@ -11,7 +11,12 @@ from nested_memvid_agent.behavior_delta import (
     ValidationPlan,
 )
 from nested_memvid_agent.behavior_delta_ledger import BehaviorDeltaLedger
-from nested_memvid_agent.behavior_compiler import BehaviorCompiler, BehaviorCompilerConfig, BehaviorCompileRequest
+from nested_memvid_agent.behavior_compiler import (
+    BehaviorCompiler,
+    BehaviorCompilerConfig,
+    BehaviorCompileRequest,
+    ToolPreflightContext,
+)
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.models import EvidenceRef, MemoryLayer
 from nested_memvid_agent.state_store import AgentStateStore
@@ -199,3 +204,209 @@ def test_compiler_records_one_activation_per_run_per_delta(tmp_path: Path) -> No
     assert activations[0].run_id == "run-1"
     assert activations[0].task_id == "task-1"
     assert activations[0].compiled_section == "ACTIVE POLICY CONSTRAINTS"
+
+
+def test_compile_for_tool_call_returns_empty_when_no_active_delta_matches(tmp_path: Path) -> None:
+    ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "state.db"))
+    delta = _delta(
+        "delta_unrelated_tool",
+        kind=BehaviorDeltaKind.TOOL_HEURISTIC,
+        layer=MemoryLayer.PROCEDURAL,
+        trigger=TriggerSpec(tool_names=("repair.validate",)),
+    )
+    ledger.record_delta(delta)
+    compiler = BehaviorCompiler(ledger=ledger, config=BehaviorCompilerConfig(enabled=True))
+
+    compiled = compiler.compile_for_tool_call(
+        ToolPreflightContext(
+            run_id="run-tool",
+            task_id="task-tool",
+            objective="Run tests",
+            tool_name="test.run",
+            tool_arguments={"command": ["pytest"]},
+        ),
+        ledger.list_deltas(),
+    )
+
+    assert compiled.text == ""
+    assert compiled.deltas == ()
+    assert ledger.list_activations(delta.id) == []
+
+
+def test_compile_for_tool_call_ignores_non_active_deltas(tmp_path: Path) -> None:
+    ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "state.db"))
+    for status in (
+        BehaviorDeltaStatus.PROPOSED,
+        BehaviorDeltaStatus.STAGED,
+        BehaviorDeltaStatus.REJECTED,
+    ):
+        ledger.record_delta(
+            _delta(
+                f"delta_{status.value}",
+                kind=BehaviorDeltaKind.TOOL_HEURISTIC,
+                layer=MemoryLayer.PROCEDURAL,
+                status=status,
+                trigger=TriggerSpec(tool_names=("test.run",)),
+            )
+        )
+    compiler = BehaviorCompiler(ledger=ledger, config=BehaviorCompilerConfig(enabled=True))
+
+    compiled = compiler.compile_for_tool_call(
+        ToolPreflightContext(
+            run_id="run-tool",
+            task_id=None,
+            objective="Run tests",
+            tool_name="test.run",
+            tool_arguments={"command": ["pytest"]},
+        ),
+        ledger.list_deltas(),
+    )
+
+    assert compiled.text == ""
+    assert compiled.deltas == ()
+
+
+def test_compile_for_tool_call_matches_active_tool_heuristic_by_tool_name(tmp_path: Path) -> None:
+    ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "state.db"))
+    delta = _delta(
+        "delta_retry_strategy",
+        kind=BehaviorDeltaKind.TOOL_HEURISTIC,
+        layer=MemoryLayer.PROCEDURAL,
+        behavior_change=(
+            "Before retrying the same validation tool with unchanged arguments, "
+            "require a changed strategy or changed arguments."
+        ),
+        trigger=TriggerSpec(tool_names=("test.run", "repair.validate"), risk_tags=("repeated_failure",)),
+    )
+    ledger.record_delta(delta)
+    compiler = BehaviorCompiler(ledger=ledger, config=BehaviorCompilerConfig(enabled=True))
+
+    compiled = compiler.compile_for_tool_call(
+        ToolPreflightContext(
+            run_id="run-tool",
+            task_id="task-tool",
+            objective="Fix the failing tests",
+            tool_name="test.run",
+            tool_arguments={"command": ["pytest", "-q"]},
+            risk_tags=("repeated_failure",),
+            tool_call_id="call-1",
+        ),
+        ledger.list_deltas(),
+    )
+
+    assert "TOOL BEHAVIOR-DELTA PREFLIGHT" in compiled.text
+    assert "changed strategy or changed arguments" in compiled.text
+    assert "delta_retry_strategy" in compiled.text
+    assert compiled.deltas == (delta,)
+    activations = ledger.list_activations(delta.id)
+    assert len(activations) == 1
+    assert "matched_tool_name" in activations[0].activation_reason
+
+
+def test_compile_for_tool_call_matches_active_procedure_by_path_glob(tmp_path: Path) -> None:
+    ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "state.db"))
+    delta = _delta(
+        "delta_docs_procedure",
+        kind=BehaviorDeltaKind.PROCEDURE,
+        layer=MemoryLayer.PROCEDURAL,
+        behavior_change="Before editing controlled self-modification docs, keep default-off behavior explicit.",
+        trigger=TriggerSpec(path_globs=("docs/*.md",)),
+    )
+    ledger.record_delta(delta)
+    compiler = BehaviorCompiler(ledger=ledger, config=BehaviorCompilerConfig(enabled=True))
+
+    compiled = compiler.compile_for_tool_call(
+        ToolPreflightContext(
+            run_id="run-docs",
+            task_id="task-docs",
+            objective="Update controlled self-modification docs",
+            tool_name="file.write",
+            tool_arguments={"path": "docs/CONTROLLED_SELF_MODIFICATION.md"},
+            touched_paths=("docs/CONTROLLED_SELF_MODIFICATION.md",),
+            tool_call_id="call-docs",
+        ),
+        ledger.list_deltas(),
+    )
+
+    assert compiled.deltas == (delta,)
+    assert "ACTIVE PROCEDURES" in compiled.text
+    assert "default-off behavior" in compiled.text
+    assert "matched_path_glob" in ledger.list_activations(delta.id)[0].activation_reason
+
+
+def test_compile_for_tool_call_policy_gate_requires_active_relevant_match(tmp_path: Path) -> None:
+    ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "state.db"))
+    staged_policy = _delta(
+        "delta_staged_policy_gate",
+        kind=BehaviorDeltaKind.APPROVAL_GATE_RULE,
+        layer=MemoryLayer.POLICY,
+        risk=BehaviorDeltaRisk.HIGH,
+        status=BehaviorDeltaStatus.STAGED,
+        behavior_change="Before modifying memory or policy, verify approval gates.",
+        trigger=TriggerSpec(tool_names=("memory.correct",), memory_layers=(MemoryLayer.POLICY,)),
+    )
+    active_irrelevant = _delta(
+        "delta_irrelevant_policy_gate",
+        kind=BehaviorDeltaKind.APPROVAL_GATE_RULE,
+        layer=MemoryLayer.POLICY,
+        risk=BehaviorDeltaRisk.HIGH,
+        behavior_change="Before modifying memory or policy, verify approval gates.",
+        trigger=TriggerSpec(tool_names=("git.commit",), memory_layers=(MemoryLayer.POLICY,)),
+    )
+    active_relevant = _delta(
+        "delta_active_policy_gate",
+        kind=BehaviorDeltaKind.APPROVAL_GATE_RULE,
+        layer=MemoryLayer.POLICY,
+        risk=BehaviorDeltaRisk.HIGH,
+        behavior_change="Before modifying memory or policy, verify approval gates.",
+        trigger=TriggerSpec(tool_names=("memory.correct",), memory_layers=(MemoryLayer.POLICY,)),
+    )
+    for delta in (staged_policy, active_irrelevant, active_relevant):
+        ledger.record_delta(delta)
+    compiler = BehaviorCompiler(ledger=ledger, config=BehaviorCompilerConfig(enabled=True))
+
+    compiled = compiler.compile_for_tool_call(
+        ToolPreflightContext(
+            run_id="run-policy",
+            task_id="task-policy",
+            objective="Correct policy memory",
+            tool_name="memory.correct",
+            tool_arguments={"layer": "policy"},
+            memory_layers=(MemoryLayer.POLICY,),
+            risk_tags=("approval_required",),
+            tool_call_id="call-policy",
+        ),
+        ledger.list_deltas(),
+    )
+
+    assert compiled.deltas == (active_relevant,)
+    assert "ACTIVE POLICY CONSTRAINTS" in compiled.text
+    assert "verify approval gates" in compiled.text
+    assert ledger.list_activations(staged_policy.id) == []
+    assert ledger.list_activations(active_irrelevant.id) == []
+
+
+def test_compile_for_tool_call_deduplicates_activation_per_run_tool_call_delta(tmp_path: Path) -> None:
+    ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "state.db"))
+    delta = _delta(
+        "delta_tool_dedupe",
+        kind=BehaviorDeltaKind.TOOL_HEURISTIC,
+        layer=MemoryLayer.PROCEDURAL,
+        trigger=TriggerSpec(tool_names=("test.run",)),
+    )
+    ledger.record_delta(delta)
+    compiler = BehaviorCompiler(ledger=ledger, config=BehaviorCompilerConfig(enabled=True))
+    context = ToolPreflightContext(
+        run_id="run-tool",
+        task_id="task-tool",
+        objective="Run tests",
+        tool_name="test.run",
+        tool_arguments={"command": ["pytest"]},
+        tool_call_id="call-dedupe",
+    )
+
+    first = compiler.compile_for_tool_call(context, ledger.list_deltas())
+    second = compiler.compile_for_tool_call(context, ledger.list_deltas())
+
+    assert first.deltas == second.deltas == (delta,)
+    assert len(ledger.list_activations(delta.id)) == 1

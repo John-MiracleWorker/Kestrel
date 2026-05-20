@@ -316,7 +316,7 @@ python -m pytest -q tests/test_behavior_delta.py tests/test_behavior_delta_ledge
 
 ### Phase 5: Behavior compiler
 
-Status: first runtime slice implemented. `BehaviorCompiler` can compile active, relevant, evidence-backed deltas from the ledger into structured sections behind a default-off config flag. It can log activations once per run/delta, and `NestedMV2Agent.chat` appends those sections to the compiled memory context only when behavior deltas are explicitly enabled.
+Status: first runtime slices implemented. `BehaviorCompiler` can compile active, relevant, evidence-backed deltas from the ledger into structured sections behind a default-off config flag. It can log activations once per run/delta, and `NestedMV2Agent.chat` appends those sections to the compiled memory context only when behavior deltas are explicitly enabled. The tool-aware preflight slice also compiles relevant active deltas immediately before a tool call and passes a bounded advisory checklist through the tool loop.
 
 Goal: compile relevant active deltas into bounded runtime instructions behind a default-off flag.
 
@@ -336,12 +336,18 @@ Compiler requirements:
 - Log one activation per run per delta.
 - Refuse silent policy activation without evidence.
 - Disabled flag must preserve byte-for-byte or semantically equivalent current behavior.
+- Tool-call preflight must remain gated by `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS`.
+- Tool-call preflight must match deterministic triggers only: tool names, path globs, memory layers, risk tags, task types, and objective/query patterns.
+- Tool-call preflight logs one activation per run/tool-call/delta combination with matched trigger reasons such as `matched_tool_name`, `matched_path_glob`, `matched_memory_layer`, `matched_risk_tag`, and `matched_query_pattern`.
+- Tool-call preflight is advisory. It does not auto-activate proposed or staged deltas, does not rewrite the system prompt, does not write policy memory, and does not bypass capability or exact-call approval gates.
+- Broad automatic blocking is still out of scope; only the existing deterministic unchanged-retry gate may block repeated same-action retries.
 
 Validation target:
 
 ```bash
 NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=0 python -m pytest -q tests/test_context_compiler.py tests/test_behavior_compiler.py
 NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=1 python -m pytest -q tests/test_behavior_compiler.py
+NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=1 python -m pytest -q tests/test_agent_runtime.py
 ```
 
 ### Phase 6: Replay validation

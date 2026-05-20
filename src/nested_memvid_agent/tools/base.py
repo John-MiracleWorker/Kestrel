@@ -26,6 +26,8 @@ class ToolContext:
     approved_tool_call_ids: frozenset[str] = frozenset()
     approved_tool_call_arguments: Mapping[str, dict[str, Any]] | None = None
     tool_specs: tuple[ToolSpec, ...] = ()
+    behavior_preflight: str = ""
+    behavior_preflight_delta_ids: tuple[str, ...] = ()
 
 
 class AgentTool(ABC):

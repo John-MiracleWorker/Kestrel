@@ -3,11 +3,19 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .behavior_compiler import BehaviorCompileRequest, BehaviorCompiler, BehaviorCompilerConfig
+from .behavior_compiler import (
+    BehaviorCompileRequest,
+    BehaviorCompiler,
+    BehaviorCompilerConfig,
+    CompiledBehavior,
+    ToolPreflightContext,
+)
+from .behavior_delta import BehaviorDeltaStatus
 from .behavior_delta_ledger import BehaviorDeltaLedger
 from .cognition import FailureEpisode, LessonManager, ProofOfWorkSummary, RetryPolicy
 from .config import AgentConfig
@@ -346,6 +354,28 @@ class NestedMV2Agent:
                             "decision": "approved",
                         },
                     )
+                tool_preflight = self.tool_preflight_for_call(
+                    objective=user_message,
+                    call=call,
+                    run_id=active_run_id,
+                    task_id=None,
+                    previous_executions=tuple(executions),
+                )
+                if tool_preflight.text:
+                    self._event(
+                        "behavior_delta.preflight",
+                        {
+                            "session_id": session,
+                            "run_id": active_run_id,
+                            "tool": call.name,
+                            "tool_call_id": call.id,
+                            "delta_ids": [delta.id for delta in tool_preflight.deltas],
+                            "activation_reasons": {
+                                key: list(value) for key, value in tool_preflight.activation_reasons.items()
+                            },
+                            "preflight_chars": len(tool_preflight.text),
+                        },
+                    )
                 retry_decision = None
                 if retry_policy is not None:
                     retry_decision = retry_policy.assess_call(
@@ -373,7 +403,10 @@ class NestedMV2Agent:
                         },
                     )
                 else:
-                    execution = self.tools.execute(call, tool_context)
+                    execution = self.tools.execute(
+                        call,
+                        _tool_context_with_preflight(tool_context, tool_preflight),
+                    )
                 executions.append(execution)
                 tool_frame_index += 1
                 tool_frame_id = f"{turn_frame_id}_tool_{tool_frame_index}"
@@ -430,7 +463,7 @@ class NestedMV2Agent:
                         role="tool",
                         name=call.name,
                         tool_call_id=call.id,
-                        content=execution.content,
+                        content=_tool_loop_content(execution.content, tool_preflight.text),
                     )
                 )
                 memory_writes.append(
@@ -666,6 +699,38 @@ class NestedMV2Agent:
         except ControlMessageError as exc:
             raise ProviderError(str(exc), code="invalid_control_message", retryable=False) from exc
 
+    def tool_preflight_for_call(
+        self,
+        *,
+        objective: str,
+        call: ToolCall,
+        run_id: str | None,
+        task_id: str | None,
+        previous_executions: tuple[ToolExecution, ...],
+    ) -> CompiledBehavior:
+        if self.behavior_compiler is None:
+            return CompiledBehavior(text="", deltas=())
+        spec = self.tools.spec_for(call.name)
+        prior_failure = _prior_failed_execution(call, previous_executions)
+        context = ToolPreflightContext(
+            run_id=run_id,
+            task_id=task_id,
+            objective=objective,
+            tool_name=call.name,
+            tool_arguments=dict(call.arguments),
+            prior_failure_signature=_tool_failure_text(prior_failure) if prior_failure is not None else None,
+            prior_failed_tool_name=prior_failure.call.name if prior_failure is not None else None,
+            prior_failed_arguments_hash=_arguments_hash(prior_failure.call.arguments) if prior_failure is not None else None,
+            touched_paths=_tool_touched_paths(call.arguments),
+            memory_layers=_tool_memory_layers(call.name, call.arguments),
+            risk_tags=_tool_risk_tags(call, spec, prior_failure),
+            tool_call_id=call.id,
+        )
+        return self.behavior_compiler.compile_for_tool_call(
+            context,
+            self.behavior_compiler.ledger.list_deltas(status=BehaviorDeltaStatus.ACTIVE),
+        )
+
     def close(self) -> None:
         self.memory.close_all()
 
@@ -811,6 +876,113 @@ def _context_with_soul_profile(context_prompt: str, soul_profile_context: str) -
     if not soul_profile_context:
         return context_prompt
     return f"{context_prompt}\n\n## Active Soul/User Profile\n{soul_profile_context}"
+
+
+def _tool_context_with_preflight(tool_context: ToolContext, preflight: CompiledBehavior) -> ToolContext:
+    return ToolContext(
+        memory=tool_context.memory,
+        config=tool_context.config,
+        workspace=tool_context.workspace,
+        event_log=tool_context.event_log,
+        session_id=tool_context.session_id,
+        run_id=tool_context.run_id,
+        approval_handler=tool_context.approval_handler,
+        approved_tool_call_ids=tool_context.approved_tool_call_ids,
+        approved_tool_call_arguments=tool_context.approved_tool_call_arguments,
+        tool_specs=tool_context.tool_specs,
+        behavior_preflight=preflight.text,
+        behavior_preflight_delta_ids=tuple(delta.id for delta in preflight.deltas),
+    )
+
+
+def _prior_failed_execution(call: ToolCall, previous_executions: tuple[ToolExecution, ...]) -> ToolExecution | None:
+    for execution in reversed(previous_executions):
+        if execution.call.name == call.name and not execution.success:
+            return execution
+    return None
+
+
+def _tool_touched_paths(arguments: dict[str, Any]) -> tuple[str, ...]:
+    paths: list[str] = []
+    for key in ("path", "paths", "file", "files", "target", "targets"):
+        value = arguments.get(key)
+        if isinstance(value, str):
+            paths.append(value)
+        elif isinstance(value, list | tuple):
+            paths.extend(str(item) for item in value if isinstance(item, str))
+    command = arguments.get("command")
+    if isinstance(command, list):
+        paths.extend(_command_path_candidates(command))
+    elif isinstance(command, str):
+        paths.extend(_command_path_candidates(command.split()))
+    return tuple(dict.fromkeys(path for path in paths if path))
+
+
+def _command_path_candidates(command: list[object]) -> list[str]:
+    candidates: list[str] = []
+    for item in command:
+        text = str(item)
+        if "/" in text or text.endswith((".py", ".md", ".json", ".toml", ".yaml", ".yml", ".txt")):
+            candidates.append(text)
+    return candidates
+
+
+def _tool_memory_layers(tool_name: str, arguments: dict[str, Any]) -> tuple[MemoryLayer, ...]:
+    layers: list[MemoryLayer] = []
+    for key in ("layer", "target_layer"):
+        layer = _memory_layer_from_value(arguments.get(key))
+        if layer is not None:
+            layers.append(layer)
+    raw_layers = arguments.get("layers") or arguments.get("memory_layers")
+    if isinstance(raw_layers, list | tuple):
+        for item in raw_layers:
+            layer = _memory_layer_from_value(item)
+            if layer is not None:
+                layers.append(layer)
+    if tool_name.startswith("memory.") and not layers:
+        layers.extend((MemoryLayer.WORKING, MemoryLayer.EPISODIC, MemoryLayer.SEMANTIC, MemoryLayer.PROCEDURAL))
+    return tuple(dict.fromkeys(layers))
+
+
+def _memory_layer_from_value(value: object) -> MemoryLayer | None:
+    if value is None:
+        return None
+    try:
+        return MemoryLayer(str(value))
+    except ValueError:
+        return None
+
+
+def _tool_risk_tags(call: ToolCall, spec: ToolSpec | None, prior_failure: ToolExecution | None) -> tuple[str, ...]:
+    tags: list[str] = []
+    if spec is not None:
+        tags.append(f"{spec.risk}_risk")
+        if spec.requires_approval:
+            tags.append("approval_required")
+        tags.extend(spec.capabilities)
+    if call.name.startswith("memory."):
+        tags.append("memory_tool")
+    if call.name in {"memory.import", "memory.correct"}:
+        tags.append("memory_mutation")
+    if prior_failure is not None:
+        tags.append("repeated_failure")
+        if _arguments_hash(prior_failure.call.arguments) == _arguments_hash(call.arguments):
+            tags.append("unchanged_retry")
+    return tuple(dict.fromkeys(tags))
+
+
+def _arguments_hash(arguments: dict[str, Any]) -> str:
+    payload = json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str)
+    return sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _tool_loop_content(content: str, preflight_text: str) -> str:
+    if not preflight_text:
+        return content
+    bounded = preflight_text[:4000]
+    if len(preflight_text) > len(bounded):
+        bounded += f"\n[TRUNCATED_PREFLIGHT total_chars={len(preflight_text)}]"
+    return f"{bounded}\n\nTOOL RESULT:\n{content}"
 
 
 def _tool_failure_text(execution: ToolExecution) -> str:

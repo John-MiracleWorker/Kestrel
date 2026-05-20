@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 from nested_memvid_agent.agent import AgentDependencies, NestedMV2Agent
+from nested_memvid_agent.behavior_delta import (
+    BehaviorDelta,
+    BehaviorDeltaKind,
+    BehaviorDeltaRisk,
+    BehaviorDeltaStatus,
+    TriggerSpec,
+    ValidationPlan,
+)
+from nested_memvid_agent.behavior_delta_ledger import BehaviorDeltaLedger
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.event_log import JsonlEventLog
 from nested_memvid_agent.llm.base import LLMProvider, ProviderError
 from nested_memvid_agent.llm.mock import MockLLMProvider
-from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
+from nested_memvid_agent.models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord
 from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.runtime_models import (
     ChatMessage,
@@ -27,6 +37,7 @@ from nested_memvid_agent.self_profile import (
 from nested_memvid_agent.tools.base import AgentTool, ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
 from nested_memvid_agent.tools.registry import ToolRegistry
+from nested_memvid_agent.state_store import AgentStateStore
 
 
 def test_default_communication_contract_rejects_flat_greeting_posture() -> None:
@@ -552,6 +563,149 @@ def test_agent_validation_success_uses_tool_spec_contract_not_name_substring(tmp
     assert result.proof_of_work["lessons_created"]
 
 
+def test_agent_behavior_delta_preflight_disabled_preserves_tool_behavior(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.db"
+    ledger = BehaviorDeltaLedger(AgentStateStore(state_path))
+    ledger.record_delta(_active_tool_delta("delta_disabled_preflight", tool_names=("preflight.inspect",)))
+    memory = build_memory_system("memory", tmp_path / "memory")
+    event_log = JsonlEventLog(tmp_path / "logs" / "events.jsonl")
+    registry = ToolRegistry()
+    registry.register(PreflightInspectTool())
+    llm = MockLLMProvider(
+        [
+            LLMResponse(
+                content="Inspect preflight.",
+                tool_calls=(ToolCall(name="preflight.inspect", arguments={"path": "src/example.py"}),),
+            ),
+            LLMResponse(content="Tool completed."),
+        ]
+    )
+    agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=memory,
+            llm=llm,
+            tools=registry,
+            config=AgentConfig(
+                memory_dir=tmp_path / "memory",
+                log_dir=tmp_path / "logs",
+                state_path=state_path,
+                enable_behavior_deltas=False,
+            ),
+            event_log=event_log,
+        )
+    )
+
+    result = agent.chat("run the inspector", session_id="test", run_id="run_disabled")
+    payload = json.loads(result.tool_executions[0].content)
+
+    assert result.stop_reason == "complete"
+    assert payload["preflight"] == ""
+    assert payload["delta_ids"] == []
+    assert ledger.list_activations("delta_disabled_preflight") == []
+    assert "behavior_delta.preflight" not in [event.type for event in event_log.tail(limit=50)]
+
+
+def test_agent_behavior_delta_preflight_enabled_reaches_tool_context_and_loop(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.db"
+    ledger = BehaviorDeltaLedger(AgentStateStore(state_path))
+    ledger.record_delta(
+        _active_tool_delta(
+            "delta_retry_preflight",
+            tool_names=("preflight.inspect",),
+            behavior_change=(
+                "Before retrying the same validation tool with unchanged arguments, "
+                "require a changed strategy or changed arguments."
+            ),
+        )
+    )
+    memory = build_memory_system("memory", tmp_path / "memory")
+    event_log = JsonlEventLog(tmp_path / "logs" / "events.jsonl")
+    registry = ToolRegistry()
+    registry.register(PreflightInspectTool())
+    provider = CapturingSequenceProvider(
+        [
+            LLMResponse(
+                content="Inspect preflight.",
+                tool_calls=(ToolCall(name="preflight.inspect", arguments={"path": "src/example.py"}, id="inspect-1"),),
+            ),
+            LLMResponse(content="Preflight observed."),
+        ]
+    )
+    agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=memory,
+            llm=provider,
+            tools=registry,
+            config=AgentConfig(
+                memory_dir=tmp_path / "memory",
+                log_dir=tmp_path / "logs",
+                state_path=state_path,
+                enable_behavior_deltas=True,
+            ),
+            event_log=event_log,
+        )
+    )
+
+    result = agent.chat("run the inspector", session_id="test", run_id="run_enabled")
+    payload = json.loads(result.tool_executions[0].content)
+
+    assert "TOOL BEHAVIOR-DELTA PREFLIGHT" in payload["preflight"]
+    assert "changed strategy or changed arguments" in payload["preflight"]
+    assert payload["delta_ids"] == ["delta_retry_preflight"]
+    assert len(ledger.list_activations("delta_retry_preflight")) == 1
+    assert any(event.type == "behavior_delta.preflight" for event in event_log.tail(limit=50))
+    assert any(
+        "TOOL BEHAVIOR-DELTA PREFLIGHT" in message.content
+        for message in provider.requests[1]
+        if message.role == "tool"
+    )
+
+
+def test_agent_behavior_delta_policy_preflight_does_not_bypass_approval_gate(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.db"
+    ledger = BehaviorDeltaLedger(AgentStateStore(state_path))
+    ledger.record_delta(
+        _active_tool_delta(
+            "delta_shell_approval_preflight",
+            kind=BehaviorDeltaKind.APPROVAL_GATE_RULE,
+            target_layer=MemoryLayer.POLICY,
+            risk=BehaviorDeltaRisk.HIGH,
+            tool_names=("shell.run",),
+            behavior_change="Before running approval-gated tools, verify exact-call approval gates remain active.",
+        )
+    )
+    memory = build_memory_system("memory", tmp_path / "memory")
+    llm = MockLLMProvider(
+        [
+            LLMResponse(
+                content="I need shell access.",
+                tool_calls=(ToolCall(name="shell.run", arguments={"command": ["echo", "blocked"]}, id="shell-1"),),
+            ),
+            LLMResponse(content="This should not run."),
+        ]
+    )
+    agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=memory,
+            llm=llm,
+            tools=build_default_tools(),
+            config=AgentConfig(
+                memory_dir=tmp_path / "memory",
+                log_dir=tmp_path / "logs",
+                state_path=state_path,
+                enable_behavior_deltas=True,
+                allow_shell=True,
+            ),
+        )
+    )
+
+    result = agent.chat("run echo", session_id="test", run_id="run_approval")
+
+    assert result.stop_reason == "approval_required"
+    assert result.tool_executions[0].error == "approval_required"
+    assert len(ledger.list_activations("delta_shell_approval_preflight")) == 1
+
+
 class FailingProvider(LLMProvider):
     def generate(
         self,
@@ -576,6 +730,24 @@ class CapturingProvider(LLMProvider):
         del tools, options
         self.messages = list(messages)
         return LLMResponse(content="ok")
+
+
+class CapturingSequenceProvider(LLMProvider):
+    def __init__(self, responses: list[LLMResponse]) -> None:
+        self.responses = list(responses)
+        self.requests: list[list[ChatMessage]] = []
+
+    def generate(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec],
+        options: LLMOptions | None = None,
+    ) -> LLMResponse:
+        del tools, options
+        self.requests.append(list(messages))
+        if not self.responses:
+            return LLMResponse(content="ok")
+        return self.responses.pop(0)
 
 
 class FailingTool(AgentTool):
@@ -641,3 +813,47 @@ class LongOutputTool(AgentTool):
         del context
         content = "A" * 12_000 + "TAIL_SENTINEL"
         return ToolExecution(call=ToolCall(name=self.spec.name, arguments=dict(arguments)), success=True, content=content)
+
+
+class PreflightInspectTool(AgentTool):
+    spec = ToolSpec(
+        name="preflight.inspect",
+        description="Returns the behavior-delta preflight supplied to the tool context.",
+        parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+    )
+
+    def run(self, arguments: dict[str, object], context: ToolContext) -> ToolExecution:
+        payload = {
+            "arguments": dict(arguments),
+            "preflight": context.behavior_preflight,
+            "delta_ids": list(context.behavior_preflight_delta_ids),
+        }
+        return ToolExecution(
+            call=ToolCall(name=self.spec.name, arguments=dict(arguments)),
+            success=True,
+            content=json.dumps(payload, sort_keys=True),
+            data=payload,
+        )
+
+
+def _active_tool_delta(
+    delta_id: str,
+    *,
+    tool_names: tuple[str, ...],
+    behavior_change: str = "Before running this tool, check the relevant behavior-delta preflight.",
+    kind: BehaviorDeltaKind = BehaviorDeltaKind.TOOL_HEURISTIC,
+    target_layer: MemoryLayer = MemoryLayer.PROCEDURAL,
+    risk: BehaviorDeltaRisk = BehaviorDeltaRisk.MEDIUM,
+) -> BehaviorDelta:
+    return BehaviorDelta(
+        id=delta_id,
+        title=delta_id.replace("_", " "),
+        kind=kind,
+        target_layer=target_layer,
+        risk=risk,
+        status=BehaviorDeltaStatus.ACTIVE,
+        trigger=TriggerSpec(tool_names=tool_names, risk_tags=("approval_required",)),
+        behavior_change=behavior_change,
+        evidence_refs=(EvidenceRef(source="fixture", locator=delta_id, quote="validated"),),
+        validation_plan=ValidationPlan(replay_scenarios=("tool_preflight",), min_validation_score=0.8),
+    )

@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-05-18
+Last updated: 2026-05-20
 
 This repository is a working local agent scaffold, not a finished Hermes/OpenClaw agent. The status below is intentionally literal so future Codex passes can harden the right layers without treating roadmap items as done.
 
@@ -67,6 +67,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - The FastAPI control plane can require bearer/API-key auth via `NEST_AGENT_REQUIRE_API_AUTH=1` and a token environment variable.
 - Generic/custom channel endpoints can require HMAC-SHA256 webhook signatures using a per-channel secret environment variable.
 - Shell/test/repair validation commands normalize `python`/`python3` to the active interpreter so autonomous validation is stable across local environments.
+- Tool-aware behavior-delta preflight now runs immediately before agent-loop tool execution when `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=1`. It compiles bounded advisory instructions from relevant active deltas, passes them through the tool context/tool-loop message, and logs activations without changing capability or exact-call approval gates.
 
 ## Partially Implemented
 
@@ -76,7 +77,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Plugins: registry, public GitHub fetch, manifest parsing, CLI/API review/install/update/enable commands, exact-call approval for agent-initiated review/install, review-first web UX, enable blockers for unmanaged dependencies or required unavailable isolation, and skill/MCP materialization exist. Managed dependency installation, real container isolation, richer compatibility with executable Hermes hooks, and broader network/security review still need hardening before shared use.
 - Codex CLI: `codex-cli` can drive responses and `codex.exec` is available as a high-risk approval-gated tool. It is not yet a branch-isolated autonomous repair loop.
 - Consolidation: capsule extraction and Nested Learning decisions exist, but auto-consolidation remains disabled by default and validation loops are still basic.
-- Controlled self-modification: behavior-delta schema, SQLite ledger persistence, proposal-only task capsule extraction, repeated failed tool-call heuristic extraction, `nest-agent memory deltas propose --dry-run`, rule-based mutation-gate decisions, a default-off behavior compiler, runtime context integration behind `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS`, deterministic compiler replay, full mock-agent replay, `nest-agent memory deltas ledger` JSON reporting with advisory recommendations, preview-only skill-candidate rendering, ORACLE shadow-only behavior-delta counterfactual reporting, FastAPI behavior-delta review routes, approval-gated activate/reject/rollback review endpoints, a deterministic review/action E2E test, and an Advanced web Behavior Deltas Review panel exist for visible operator review. Live provider replay and approval-gated skill install from candidates remain future phases.
+- Controlled self-modification: behavior-delta schema, SQLite ledger persistence, proposal-only task capsule extraction, repeated failed tool-call heuristic extraction, `nest-agent memory deltas propose --dry-run`, rule-based mutation-gate decisions, a default-off behavior compiler, runtime context integration behind `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS`, tool-aware preflight for active relevant deltas before tool execution, deterministic compiler replay, full mock-agent replay, `nest-agent memory deltas ledger` JSON reporting with advisory recommendations, preview-only skill-candidate rendering, ORACLE shadow-only behavior-delta counterfactual reporting, FastAPI behavior-delta review routes, approval-gated activate/reject/rollback review endpoints, a deterministic review/action E2E test, and an Advanced web Behavior Deltas Review panel exist for visible operator review. Live provider replay and approval-gated skill install from candidates remain future phases.
 - Self-diagnosis: first-pass classification, memory recall tools, and the default chat-loop retry gate exist. Hybrid LLM diagnosis, reviewer-confirmed diagnosis, and cross-run retry-state matching are still next steps.
 - Self-modification: the runtime can inspect itself, record validated Soul/self memories, and capture approval-gated self-change requests. Actual code changes still have to flow through existing repair and commit gates; policy writes still require explicit policy gates.
 - Safe repair: branch preparation, patch application, targeted validation, diagnosis-gated retry assessment, status reporting, and rollback primitives exist. Full autonomous patch proposal, reviewer gating, and approval-before-commit orchestration are still incomplete.
@@ -106,6 +107,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Cancelled runs must not transition to completed, blocked, or failed after cancellation; lifecycle updates should use the guarded state transition helper.
 - Completed, failed, and cancelled runs are immutable even for repeated same-status transition attempts; approval requests are immutable after leaving `pending`.
 - Tool execution is bounded by `tool_timeout_seconds` / `NEST_AGENT_TOOL_TIMEOUT_SECONDS` and timeout failures are returned as structured tool errors.
+- Behavior-delta runtime/preflight compilation is default-off through `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=0`. When enabled, it only compiles active relevant deltas, logs activations, and remains advisory; proposed/staged deltas are not auto-activated, policy-write gates are unchanged, and broad automatic blocking is not performed beyond existing deterministic retry blocking.
 - New background runs persist a root task plus a small starter DAG with dependencies, required tools, risk, acceptance criteria, attempt count, failure reason, diagnosis, retry-strategy fields, and graph-runtime plan metadata.
 - Ordinary conversation and observations must not write policy memory directly.
 - The Memvid backend must use `.mv2` files and preserve one file per memory layer, including `.nest/memory/self.mv2`.
