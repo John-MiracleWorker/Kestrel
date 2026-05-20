@@ -70,9 +70,15 @@ Implemented foundation:
   - `scripts/eval_memory_router.py --include-behavior-deltas --json` includes advisory counterfactuals only; authority is explicitly `shadow_only`, gate authority remains `mutation_gate`, and policy-write authority is `false`.
 
 - `src/nested_memvid_agent/server_behavior_delta_routes.py`
-  - Adds read-only review API routes for listing behavior deltas, showing one delta with activation/outcome history, and rendering skill-candidate previews.
-  - Mutating review actions (`activate`, `reject`, `rollback`) deliberately return `405 read_only_review_api` in this first UI/API slice.
-  - Integrated into the FastAPI server under `/api/memory/deltas*` without adding activation, rollback, or skill-install side effects.
+  - Adds review API routes for listing behavior deltas, showing one delta with activation/outcome history, and rendering skill-candidate previews.
+  - Mutating review actions (`activate`, `reject`, `rollback`) require exact-call approval in the request body.
+  - Activation is still adjudicated by `MutationGate`; blocked decisions return `409` and leave the delta staged.
+  - Rollback records an auditable `rolled_back` outcome; reject/rollback do not destroy ledger history.
+  - Integrated into the FastAPI server under `/api/memory/deltas*` without adding skill-install side effects.
+
+- `web/src/App.tsx`
+  - Adds a Behavior Deltas Review panel in the Advanced > Memory operator surface.
+  - Displays ledger totals, active/never-activated counts, useful/failure/rollback rates, per-delta risk/status/layer metadata, and the operator reminder that mutation actions require exact-call approval and MutationGate review.
 
 - `src/nested_memvid_agent/skill_validation.py`
   - Holds shared skill-manifest validation so behavior-delta skill previews can validate manifests without importing the full skill/tool/plugin runtime graph.

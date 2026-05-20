@@ -218,6 +218,40 @@ export type SecretRef = {
   source?: string;
 };
 
+
+export type BehaviorDeltaSummary = {
+  delta_id: string;
+  title: string;
+  kind: string;
+  target_layer: string;
+  risk: string;
+  status: string;
+  activation_count: number;
+  outcome_counts: Record<string, number>;
+  useful_rate: number;
+  failure_rate: number;
+  rollback_rate: number;
+  never_activated: boolean;
+  last_activated_at?: string | null;
+  last_outcome_at?: string | null;
+};
+
+export type BehaviorDeltaReport = {
+  summary: {
+    total_deltas: number;
+    active_deltas: number;
+    activated_deltas: number;
+    never_activated: number;
+    useful_rate: number;
+    failure_rate: number;
+    rollback_rate: number;
+    never_activated_rate: number;
+    outcomes: Record<string, number>;
+  };
+  deltas: BehaviorDeltaSummary[];
+  recommendations: string[];
+};
+
 export type MemoryHit = {
   layer: string;
   kind: string;

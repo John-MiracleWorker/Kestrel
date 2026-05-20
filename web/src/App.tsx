@@ -50,6 +50,7 @@ import type {
   AgentLogEvent,
   ApiResult,
   Approval,
+  BehaviorDeltaReport,
   Channel,
   ContextPackResult,
   McpServer,
@@ -269,6 +270,8 @@ export function App() {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [secrets, setSecrets] = useState<SecretRef[]>([]);
   const [memoryLayers, setMemoryLayers] = useState<MemoryLayerStatus[]>([]);
+  const [behaviorDeltaReport, setBehaviorDeltaReport] = useState<BehaviorDeltaReport | null>(null);
+  const [behaviorDeltaError, setBehaviorDeltaError] = useState<string | null>(null);
   const [lessons, setLessons] = useState<Array<Record<string, unknown>>>([]);
   const [failures, setFailures] = useState<Array<Record<string, unknown>>>([]);
   const [logs, setLogs] = useState<AgentLogEvent[]>([]);
@@ -681,13 +684,17 @@ export function App() {
 
   async function refreshAll() {
     await refreshSummary();
-    const [runtimeConfig, selfSnapshot, onboardingSnapshot, logList, lessonList, failureList] = await Promise.all([
+    const [runtimeConfig, selfSnapshot, onboardingSnapshot, logList, lessonList, failureList, deltaReport] = await Promise.all([
       getJson<RuntimeConfig>("/api/runtime/config"),
       getJson<SelfState>("/api/self"),
       getJson<SelfOnboardingState>("/api/self/onboarding"),
       getJson<AgentLogEvent[]>("/api/logs?limit=120"),
       getJson<{ items: Array<Record<string, unknown>> }>("/api/cognition/lessons?k=20"),
-      getJson<{ items: Array<Record<string, unknown>> }>("/api/cognition/failures?k=20")
+      getJson<{ items: Array<Record<string, unknown>> }>("/api/cognition/failures?k=20"),
+      getJson<BehaviorDeltaReport>("/api/memory/deltas?since=all").catch((error) => {
+        setBehaviorDeltaError(error instanceof Error ? error.message : String(error));
+        return null;
+      })
     ]);
     setRuntime(runtimeConfig);
     setSelfState(selfSnapshot);
@@ -705,6 +712,10 @@ export function App() {
     setLogs(logList);
     setLessons(lessonList.items);
     setFailures(failureList.items);
+    if (deltaReport) {
+      setBehaviorDeltaReport(deltaReport);
+      setBehaviorDeltaError(null);
+    }
   }
 
   async function refreshThreadRuns(sessionId: string) {
@@ -1545,6 +1556,7 @@ export function App() {
                 ["approvals", "Approvals"],
                 ["soul", "Soul"],
                 ["memory", "Memory"],
+                ["behavior-deltas", "Behavior Deltas"],
                 ["tools", "Tools"],
                 ["mcp", "MCP"],
                 ["skills", "Skills"],
@@ -1942,6 +1954,37 @@ export function App() {
               <button type="submit">Review Learning Signal</button>
             </form>
             {learningResult && <JsonBlock value={learningResult} />}
+          </Panel>
+
+          <Panel title="Behavior Deltas Review" icon={<ShieldCheck size={19} />}>
+            <section aria-label="Behavior Deltas Review" className="run-detail">
+              <h3>Behavior Deltas Review</h3>
+              <p className="muted">Mutation actions require exact-call approval and MutationGate review.</p>
+              {behaviorDeltaError && <p className="danger-text">Behavior delta ledger unavailable: {behaviorDeltaError}</p>}
+              {behaviorDeltaReport ? (
+                <>
+                  <div className="metric-grid">
+                    <Metric label="Total Deltas" value={behaviorDeltaReport.summary.total_deltas} />
+                    <Metric label="Active" value={behaviorDeltaReport.summary.active_deltas} />
+                    <Metric label="Useful Rate" value={formatPercent(behaviorDeltaReport.summary.useful_rate)} />
+                    <Metric label="Never Activated" value={behaviorDeltaReport.summary.never_activated} />
+                  </div>
+                  <div className="list compact-list">
+                    {behaviorDeltaReport.deltas.slice(0, 12).map((delta) => (
+                      <div className="data-row" key={delta.delta_id}>
+                        <strong>{delta.title}</strong>
+                        <InlineMeta items={[delta.delta_id, `${delta.status} · ${delta.kind} · ${delta.risk}`, `${delta.activation_count} activations`]} />
+                        <p>{`Useful ${formatPercent(delta.useful_rate)} · Failure ${formatPercent(delta.failure_rate)} · Rollback ${formatPercent(delta.rollback_rate)}`}</p>
+                        <StatusBadge value={delta.target_layer} />
+                      </div>
+                    ))}
+                    {behaviorDeltaReport.deltas.length === 0 && <EmptyState>No behavior deltas recorded.</EmptyState>}
+                  </div>
+                </>
+              ) : (
+                <EmptyState>Behavior delta report is loading.</EmptyState>
+              )}
+            </section>
           </Panel>
 
           <Panel title="Lessons & Failures" icon={<TestTube2 size={19} />}>
@@ -3098,6 +3141,11 @@ function asStringArray(value: unknown): string[] {
 
 function scoreLabel(value: unknown): string {
   return typeof value === "number" ? value.toFixed(2) : "";
+}
+
+function formatPercent(value: number): string {
+  if (!Number.isFinite(value)) return "0%";
+  return `${Math.round(value * 100)}%`;
 }
 
 function uniqueStrings(values: string[]): string[] {

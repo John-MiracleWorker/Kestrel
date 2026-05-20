@@ -511,6 +511,22 @@ describe("App", () => {
     expect(screen.getByText("2 provider models")).toBeInTheDocument();
   });
 
+  it("renders behavior delta review panel from the ledger API", async () => {
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+
+    const panel = await screen.findByLabelText("Behavior Deltas Review");
+    expect(within(panel).getByText("Behavior Deltas Review")).toBeInTheDocument();
+    expect(within(panel).getByText("Policy-safe workflow")).toBeInTheDocument();
+    expect(within(panel).getByText("delta_policy_gate_check")).toBeInTheDocument();
+    expect(within(panel).getByText("active · policy · high")).toBeInTheDocument();
+    expect(within(panel).getByText("1 activations")).toBeInTheDocument();
+    expect(within(panel).getByText("Useful 100% · Failure 0% · Rollback 0%")).toBeInTheDocument();
+    expect(within(panel).getByText("Mutation actions require exact-call approval and MutationGate review."));
+  });
+
   it("runs the setup wizard and saves onboarding to Soul memory", async () => {
     const fetchSpy = vi.mocked(fetch);
     onboardingProfile = null;
@@ -755,6 +771,41 @@ function payloadFor(path: string): unknown {
   if (path === "/api/plugins") return [];
   if (path === "/api/channels") return [];
   if (path === "/api/secrets") return secrets;
+
+  if (path === "/api/memory/deltas?since=all") {
+    return {
+      summary: {
+        total_deltas: 1,
+        active_deltas: 1,
+        activated_deltas: 1,
+        never_activated: 0,
+        useful_rate: 1,
+        failure_rate: 0,
+        rollback_rate: 0,
+        never_activated_rate: 0,
+        outcomes: { useful: 1, caused_failure: 0, contradicted: 0, rolled_back: 0 }
+      },
+      deltas: [
+        {
+          delta_id: "delta_policy_gate_check",
+          title: "Policy-safe workflow",
+          kind: "policy",
+          target_layer: "policy",
+          risk: "high",
+          status: "active",
+          activation_count: 1,
+          outcome_counts: { useful: 1, caused_failure: 0, contradicted: 0, rolled_back: 0 },
+          useful_rate: 1,
+          failure_rate: 0,
+          rollback_rate: 0,
+          never_activated: false,
+          last_activated_at: "2026-05-20T00:00:00Z",
+          last_outcome_at: "2026-05-20T00:01:00Z"
+        }
+      ],
+      recommendations: []
+    };
+  }
   if (path === "/api/memory/layers") return [
     { layer: "working", path: "/tmp/working.mv2", exists: true, ok: true, backend: "InMemoryBackend" },
     { layer: "self", path: "/tmp/self.mv2", exists: true, ok: true, backend: "InMemoryBackend" }

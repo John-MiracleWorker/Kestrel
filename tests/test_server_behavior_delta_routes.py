@@ -69,10 +69,11 @@ def test_behavior_delta_review_routes_list_show_and_skill_preview(tmp_path: Path
     assert show_payload["activations"][0]["id"] == "act-1"
     assert show_payload["outcomes"][0]["id"] == "out-1"
     assert show_payload["review_actions"] == {
-        "can_activate": False,
-        "can_reject": False,
+        "can_activate": True,
+        "can_reject": True,
         "can_rollback": False,
-        "reason": "read_only_review_api",
+        "requires_exact_call_approval": True,
+        "authority": "mutation_gate",
     }
     assert preview.status_code == 200
     preview_payload = preview.json()
@@ -81,20 +82,92 @@ def test_behavior_delta_review_routes_list_show_and_skill_preview(tmp_path: Path
     assert "## Trigger" in preview_payload["instructions"]
 
 
-def test_behavior_delta_review_routes_are_read_only_and_return_404(tmp_path: Path) -> None:
+def test_behavior_delta_review_routes_return_404_for_missing_delta(tmp_path: Path) -> None:
     ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "agent.db"))
     client = _client(ledger)
 
     missing = client.get("/api/memory/deltas/missing")
-    activate = client.post("/api/memory/deltas/missing/activate")
-    rollback = client.post("/api/memory/deltas/missing/rollback")
-    reject = client.post("/api/memory/deltas/missing/reject")
+    activate = client.post("/api/memory/deltas/missing/activate", json={"exact_call_approved": True})
+    rollback = client.post("/api/memory/deltas/missing/rollback", json={"exact_call_approved": True})
+    reject = client.post("/api/memory/deltas/missing/reject", json={"exact_call_approved": True})
 
     assert missing.status_code == 404
     assert missing.json()["detail"] == "behavior_delta_not_found"
-    assert activate.status_code == 405
-    assert rollback.status_code == 405
-    assert reject.status_code == 405
+    assert activate.status_code == 404
+    assert rollback.status_code == 404
+    assert reject.status_code == 404
+
+
+def test_behavior_delta_review_actions_require_exact_call_approval(tmp_path: Path) -> None:
+    ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "agent.db"))
+    delta = _delta("delta_action_gate", kind=BehaviorDeltaKind.PROCEDURE, status=BehaviorDeltaStatus.STAGED)
+    ledger.record_delta(delta)
+    client = _client(ledger)
+
+    for action in ("activate", "reject", "rollback"):
+        response = client.post(f"/api/memory/deltas/{delta.id}/{action}", json={"reason": "operator review"})
+        assert response.status_code == 403
+        assert response.json()["detail"] == "exact_call_approval_required"
+    assert ledger.get_delta(delta.id).status == BehaviorDeltaStatus.STAGED
+
+
+def test_behavior_delta_review_actions_reject_and_rollback_with_audit_outcomes(tmp_path: Path) -> None:
+    ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "agent.db"))
+    staged = _delta("delta_reject", kind=BehaviorDeltaKind.PROCEDURE, status=BehaviorDeltaStatus.STAGED)
+    active = _delta("delta_rollback", kind=BehaviorDeltaKind.PROCEDURE, status=BehaviorDeltaStatus.ACTIVE)
+    ledger.record_delta(staged)
+    ledger.record_delta(active)
+    client = _client(ledger)
+
+    reject = client.post(f"/api/memory/deltas/{staged.id}/reject", json={"reason": "operator rejected vague scope", "exact_call_approved": True})
+    rollback = client.post(f"/api/memory/deltas/{active.id}/rollback", json={"reason": "operator saw regression", "exact_call_approved": True})
+
+    assert reject.status_code == 200
+    assert reject.json()["delta"]["status"] == "rejected"
+    assert rollback.status_code == 200
+    assert rollback.json()["delta"]["status"] == "rolled_back"
+    outcomes = ledger.list_outcomes(active.id)
+    assert outcomes[-1].outcome == "rolled_back"
+    assert outcomes[-1].notes == "operator saw regression"
+
+
+def test_behavior_delta_activate_uses_mutation_gate_and_records_decision(tmp_path: Path) -> None:
+    ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "agent.db"))
+    delta = _delta("delta_medium_activate", kind=BehaviorDeltaKind.TOOL_HEURISTIC, status=BehaviorDeltaStatus.STAGED)
+    delta = BehaviorDelta(
+        **{
+            **delta.__dict__,
+            "risk": BehaviorDeltaRisk.MEDIUM,
+            "validation_plan": ValidationPlan(
+                required_checks=("pytest",), replay_scenarios=("validation_retry_strategy",), min_validation_score=0.8, min_repeat_count=1
+            ),
+        }
+    )
+    ledger.record_delta(delta)
+    client = _client(ledger)
+
+    blocked = client.post(
+        f"/api/memory/deltas/{delta.id}/activate",
+        json={"reason": "operator review", "exact_call_approved": True, "validation_score": 0.5, "repeat_count": 1},
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["decision"]["status"] == "staged"
+    assert "validation_score_below_threshold" in blocked.json()["decision"]["blocked_by"]
+    assert ledger.get_delta(delta.id).status == BehaviorDeltaStatus.STAGED
+
+    activated = client.post(
+        f"/api/memory/deltas/{delta.id}/activate",
+        json={
+            "reason": "operator review",
+            "exact_call_approved": True,
+            "validation_score": 0.95,
+            "repeat_count": 1,
+            "replay_passed": True,
+        },
+    )
+    assert activated.status_code == 200
+    assert activated.json()["delta"]["status"] == "active"
+    assert activated.json()["decision"]["status"] == "active"
 
 
 def test_full_server_exposes_behavior_delta_review_routes(tmp_path: Path) -> None:
@@ -117,6 +190,71 @@ def test_full_server_exposes_behavior_delta_review_routes(tmp_path: Path) -> Non
 
     assert response.status_code == 200
     assert response.json()["deltas"][0]["delta_id"] == delta.id
+
+
+def test_full_server_behavior_delta_review_action_cycle_is_audited(tmp_path: Path) -> None:
+    config = AgentConfig(
+        state_path=tmp_path / "agent.db",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        secret_store_path=tmp_path / "secrets.json",
+        skills_dir=tmp_path / "skills",
+        plugins_dir=tmp_path / "plugins",
+        mcp_config_path=tmp_path / "mcp.json",
+        channel_config_path=tmp_path / "channels.json",
+    )
+    ledger = BehaviorDeltaLedger(AgentStateStore(config.state_path))
+    delta = _delta("delta_full_cycle", kind=BehaviorDeltaKind.TOOL_HEURISTIC, status=BehaviorDeltaStatus.STAGED)
+    delta = BehaviorDelta(
+        **{
+            **delta.__dict__,
+            "risk": BehaviorDeltaRisk.MEDIUM,
+            "validation_plan": ValidationPlan(
+                required_checks=("pytest",),
+                replay_scenarios=("validation_retry_strategy",),
+                min_validation_score=0.8,
+                min_repeat_count=1,
+            ),
+        }
+    )
+    ledger.record_delta(delta)
+    client = TestClient(create_app(config))
+
+    listed_before = client.get("/api/memory/deltas", params={"since": "all"})
+    blocked = client.post(
+        f"/api/memory/deltas/{delta.id}/activate",
+        json={"reason": "operator review", "exact_call_approved": True, "validation_score": 0.2, "repeat_count": 1},
+    )
+    activated = client.post(
+        f"/api/memory/deltas/{delta.id}/activate",
+        json={
+            "reason": "operator replay passed",
+            "exact_call_approved": True,
+            "validation_score": 0.91,
+            "repeat_count": 1,
+            "replay_passed": True,
+        },
+    )
+    shown_active = client.get(f"/api/memory/deltas/{delta.id}")
+    rolled_back = client.post(
+        f"/api/memory/deltas/{delta.id}/rollback",
+        json={"reason": "operator deterministic e2e rollback", "exact_call_approved": True, "run_id": "run-e2e"},
+    )
+    listed_after = client.get("/api/memory/deltas", params={"since": "all"})
+
+    assert listed_before.status_code == 200
+    assert listed_before.json()["deltas"][0]["status"] == "staged"
+    assert blocked.status_code == 409
+    assert blocked.json()["decision"]["status"] == "staged"
+    assert activated.status_code == 200
+    assert activated.json()["delta"]["status"] == "active"
+    assert shown_active.status_code == 200
+    assert shown_active.json()["review_actions"]["can_rollback"] is True
+    assert rolled_back.status_code == 200
+    assert rolled_back.json()["delta"]["status"] == "rolled_back"
+    assert listed_after.status_code == 200
+    assert listed_after.json()["deltas"][0]["status"] == "rolled_back"
+    assert listed_after.json()["deltas"][0]["outcome_counts"]["rolled_back"] == 1
 
 
 def _client(ledger: BehaviorDeltaLedger) -> TestClient:
