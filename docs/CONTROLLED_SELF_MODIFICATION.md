@@ -25,6 +25,7 @@ Implemented foundation:
   - Append-only activation records.
   - Append-only outcome records.
   - Summary rates for useful/failure/rollback/never-activated outcomes.
+  - Operator reporting rows with per-delta activation counts, outcome rates, reporting-window filters, and advisory recommendations.
   - Guard against activating terminal deltas without a future explicit override path.
 
 - `src/nested_memvid_agent/behavior_delta_extractor.py`
@@ -350,6 +351,14 @@ python -m pytest -q tests/test_behavior_delta_replay.py
 ```
 
 ### Phase 7: Outcomes and reporting
+
+Status: first CLI/reporting slice implemented. `BehaviorDeltaLedger.report_deltas()` now emits JSON-capable summary and per-delta rows with useful/failure/rollback/never-activated rates, activation counts, reporting-window filtering, and advisory-only recommendations. The CLI exposes this through:
+
+```bash
+nest-agent memory deltas ledger --since 30d --json
+```
+
+The recommendations are intentionally descriptive only; they do not update thresholds, activate deltas, or roll back deltas automatically.
 
 Goal: make behavior-delta utility visible to operators.
 

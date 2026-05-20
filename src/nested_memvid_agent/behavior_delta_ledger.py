@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from .behavior_delta import (
@@ -127,6 +128,68 @@ class BehaviorDeltaSummary:
             "rollback_rate": self.rollback_rate,
             "never_activated_rate": self.never_activated_rate,
             "outcomes": dict(self.outcome_counts),
+        }
+
+
+@dataclass(frozen=True)
+class BehaviorDeltaReportRow:
+    delta_id: str
+    title: str
+    kind: str
+    target_layer: str
+    risk: str
+    status: str
+    activation_count: int
+    outcome_counts: dict[str, int]
+    never_activated: bool
+    last_activated_at: str | None = None
+    last_outcome_at: str | None = None
+
+    @property
+    def useful_rate(self) -> float:
+        return _rate(self.outcome_counts.get("useful", 0), max(1, sum(self.outcome_counts.values())))
+
+    @property
+    def failure_rate(self) -> float:
+        return _rate(
+            self.outcome_counts.get("caused_failure", 0) + self.outcome_counts.get("contradicted", 0),
+            max(1, sum(self.outcome_counts.values())),
+        )
+
+    @property
+    def rollback_rate(self) -> float:
+        return _rate(self.outcome_counts.get("rolled_back", 0), max(1, sum(self.outcome_counts.values())))
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "delta_id": self.delta_id,
+            "title": self.title,
+            "kind": self.kind,
+            "target_layer": self.target_layer,
+            "risk": self.risk,
+            "status": self.status,
+            "activation_count": self.activation_count,
+            "outcome_counts": dict(self.outcome_counts),
+            "useful_rate": self.useful_rate,
+            "failure_rate": self.failure_rate,
+            "rollback_rate": self.rollback_rate,
+            "never_activated": self.never_activated,
+            "last_activated_at": self.last_activated_at,
+            "last_outcome_at": self.last_outcome_at,
+        }
+
+
+@dataclass(frozen=True)
+class BehaviorDeltaReport:
+    summary: BehaviorDeltaSummary
+    rows: tuple[BehaviorDeltaReportRow, ...]
+    recommendations: tuple[str, ...]
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "summary": self.summary.to_payload(),
+            "deltas": [row.to_payload() for row in self.rows],
+            "recommendations": list(self.recommendations),
         }
 
 
@@ -355,6 +418,39 @@ class BehaviorDeltaLedger:
             never_activated=len(deltas) - len(activated_delta_ids),
             outcome_counts=dict(outcome_counts),
         )
+    def report_deltas(self, *, since: datetime | str | None = None) -> BehaviorDeltaReport:
+        cutoff = _coerce_datetime(since)
+        rows: list[BehaviorDeltaReportRow] = []
+        for delta in self.list_deltas():
+            activations = [item for item in self.list_activations(delta.id) if _is_at_or_after(item.activated_at, cutoff)]
+            outcomes = [item for item in self.list_outcomes(delta.id) if _is_at_or_after(item.recorded_at, cutoff)]
+            in_scope = _is_at_or_after(delta.created_at, cutoff) or bool(activations) or bool(outcomes)
+            if not in_scope:
+                continue
+            counts = Counter({kind: 0 for kind in OUTCOME_KINDS})
+            for outcome in outcomes:
+                counts[outcome.outcome] += 1
+            rows.append(
+                BehaviorDeltaReportRow(
+                    delta_id=delta.id,
+                    title=delta.title,
+                    kind=delta.kind.value,
+                    target_layer=delta.target_layer.value,
+                    risk=delta.risk.value,
+                    status=delta.status.value,
+                    activation_count=len(activations),
+                    outcome_counts=dict(counts),
+                    never_activated=len(activations) == 0,
+                    last_activated_at=activations[-1].activated_at if activations else None,
+                    last_outcome_at=outcomes[-1].recorded_at if outcomes else None,
+                )
+            )
+        summary = _summary_from_report_rows(rows)
+        return BehaviorDeltaReport(
+            summary=summary,
+            rows=tuple(rows),
+            recommendations=tuple(_behavior_delta_recommendations(rows)),
+        )
 
 
 def _delta_values(delta: BehaviorDelta) -> tuple[Any, ...]:
@@ -445,6 +541,66 @@ def _evidence_from_payload(payload: dict[str, Any]) -> EvidenceRef:
         locator=str(payload["locator"]),
         quote=None if payload.get("quote") is None else str(payload["quote"]),
     )
+
+
+def _summary_from_report_rows(rows: list[BehaviorDeltaReportRow]) -> BehaviorDeltaSummary:
+    if not rows:
+        return BehaviorDeltaSummary(
+            total_deltas=0,
+            active_deltas=0,
+            activated_deltas=0,
+            never_activated=0,
+            outcome_counts={kind: 0 for kind in OUTCOME_KINDS},
+        )
+    counts = Counter({kind: 0 for kind in OUTCOME_KINDS})
+    for row in rows:
+        counts.update(row.outcome_counts)
+    return BehaviorDeltaSummary(
+        total_deltas=len(rows),
+        active_deltas=sum(1 for row in rows if row.status == BehaviorDeltaStatus.ACTIVE.value),
+        activated_deltas=sum(1 for row in rows if row.activation_count > 0),
+        never_activated=sum(1 for row in rows if row.never_activated),
+        outcome_counts=dict(counts),
+    )
+
+
+def _behavior_delta_recommendations(rows: list[BehaviorDeltaReportRow]) -> list[str]:
+    recommendations: list[str] = []
+    for row in rows:
+        failures = row.outcome_counts.get("caused_failure", 0) + row.outcome_counts.get("contradicted", 0)
+        useful = row.outcome_counts.get("useful", 0)
+        if failures > useful:
+            recommendations.append(
+                f"Review behavior delta {row.delta_id}: failure outcomes exceed useful outcomes; consider validation, rollback, or keeping it staged."
+            )
+        elif row.status == BehaviorDeltaStatus.ACTIVE.value and row.never_activated:
+            recommendations.append(
+                f"Review behavior delta {row.delta_id}: active but never activated in this reporting window."
+            )
+    return recommendations
+
+
+def _coerce_datetime(value: datetime | str | None) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = value.strip()
+        if not raw or raw.lower() in {"all", "all-time", "all_time"}:
+            return None
+        parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _is_at_or_after(raw: str | None, cutoff: datetime | None) -> bool:
+    if cutoff is None:
+        return True
+    if raw is None:
+        return False
+    return _coerce_datetime(raw) >= cutoff  # type: ignore[operator]
 
 
 def _rate(count: int, total: int) -> float:

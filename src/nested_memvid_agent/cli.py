@@ -189,6 +189,10 @@ def main() -> None:
     deltas_propose.add_argument("--backend", choices=["memory", "memvid"], default="memory")
     deltas_propose.add_argument("--dry-run", action="store_true")
     deltas_propose.add_argument("--json", action="store_true")
+    deltas_ledger = deltas_sub.add_parser("ledger")
+    deltas_ledger.add_argument("--state-path", type=Path, default=Path(".nest/state/agent.db"))
+    deltas_ledger.add_argument("--since", default="30d")
+    deltas_ledger.add_argument("--json", action="store_true")
 
     compile_cmd = sub.add_parser("compile-context")
     _add_common_args(compile_cmd)
@@ -683,29 +687,68 @@ def _ledger_for_memory_command(args: argparse.Namespace) -> PromotionLedger | No
 
 
 def _handle_behavior_deltas_command(args: argparse.Namespace) -> None:
-    if args.deltas_cmd != "propose":
-        raise SystemExit(f"Unknown behavior-delta command: {args.deltas_cmd}")
-    summary = summarize_run_capsule(runs_dir=args.runs_dir, run_id=args.run_id, backend=args.backend)
+    if args.deltas_cmd == "propose":
+        summary = summarize_run_capsule(runs_dir=args.runs_dir, run_id=args.run_id, backend=args.backend)
+        ledger = BehaviorDeltaLedger(AgentStateStore(args.state_path))
+        extractor = BehaviorDeltaExtractor(ledger=ledger)
+        proposals = extractor.propose_from_signals(
+            summary.learning_signals,
+            run_id=args.run_id,
+            dry_run=bool(args.dry_run),
+        )
+        payload = {
+            "run_id": args.run_id,
+            "dry_run": bool(args.dry_run),
+            "proposal_count": len(proposals),
+            "proposals": [delta.to_metadata() for delta in proposals],
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2))
+            return
+        action = "Would record" if args.dry_run else "Recorded"
+        print(f"{action} {len(proposals)} behavior delta proposal(s) for run {args.run_id}.")
+        for delta in proposals:
+            print(f"- {delta.id} [{delta.kind.value}/{delta.risk.value}] {delta.title}")
+        return
+    if args.deltas_cmd == "ledger":
+        _print_behavior_delta_ledger(args)
+        return
+    raise SystemExit(f"Unknown behavior-delta command: {args.deltas_cmd}")
+
+
+def _print_behavior_delta_ledger(args: argparse.Namespace) -> None:
     ledger = BehaviorDeltaLedger(AgentStateStore(args.state_path))
-    extractor = BehaviorDeltaExtractor(ledger=ledger)
-    proposals = extractor.propose_from_signals(
-        summary.learning_signals,
-        run_id=args.run_id,
-        dry_run=bool(args.dry_run),
-    )
-    payload = {
-        "run_id": args.run_id,
-        "dry_run": bool(args.dry_run),
-        "proposal_count": len(proposals),
-        "proposals": [delta.to_metadata() for delta in proposals],
-    }
+    report = ledger.report_deltas(since=_parse_since(args.since))
+    payload = report.to_payload()
     if args.json:
         print(json.dumps(payload, indent=2))
         return
-    action = "Would record" if args.dry_run else "Recorded"
-    print(f"{action} {len(proposals)} behavior delta proposal(s) for run {args.run_id}.")
-    for delta in proposals:
-        print(f"- {delta.id} [{delta.kind.value}/{delta.risk.value}] {delta.title}")
+    scope = f"last {args.since}" if _parse_since(args.since) is not None else "all time"
+    print(f"Behavior delta ledger - {scope}")
+    print()
+    rows = payload["deltas"]
+    if not rows:
+        print("No behavior delta ledger entries.")
+        return
+    summary = payload["summary"]
+    print(
+        "Summary: "
+        f"total={summary['total_deltas']} active={summary['active_deltas']} "
+        f"useful_rate={summary['useful_rate']:.1%} failure_rate={summary['failure_rate']:.1%} "
+        f"rollback_rate={summary['rollback_rate']:.1%} never_activated_rate={summary['never_activated_rate']:.1%}"
+    )
+    print()
+    for row in rows:
+        print(
+            f"- {row['delta_id']} [{row['kind']}/{row['risk']}/{row['status']}] "
+            f"activations={row['activation_count']} useful={row['outcome_counts'].get('useful', 0)} "
+            f"failures={row['outcome_counts'].get('caused_failure', 0) + row['outcome_counts'].get('contradicted', 0)} "
+            f"rollback={row['outcome_counts'].get('rolled_back', 0)}"
+        )
+    if payload["recommendations"]:
+        print()
+        for recommendation in payload["recommendations"]:
+            print(f"Recommendation: {recommendation}")
 
 
 def _print_promotion_ledger(args: argparse.Namespace) -> None:
