@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -397,6 +398,16 @@ def _load_capsule_payload(path: Path, *, backend: str) -> dict[str, object]:
                 payload = _payload_from_record(record, run_id=path.parent.name)
                 if payload is not None:
                     return payload
+        iter_records = getattr(capsule_backend, "iter_records", None)
+        if callable(iter_records):
+            indexed_records = iter_records()
+            if isinstance(indexed_records, Iterable):
+                for record in indexed_records:
+                    if not isinstance(record, MemoryRecord):
+                        continue
+                    payload = _payload_from_record(record, run_id=path.parent.name)
+                    if payload is not None:
+                        return payload
         for query in (
             f"capsule_{path.parent.name}",
             f"Run capsule: {path.parent.name}",

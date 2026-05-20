@@ -18,6 +18,7 @@ from nested_memvid_agent.context_packer import ContextPacker, ContextPackRequest
 from nested_memvid_agent.event_bus import RunEventBus
 from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS
 from nested_memvid_agent.mcp_manager import MCPManager
+from nested_memvid_agent.llm.model_catalog import PROVIDER_OPTIONS
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.nested_learning import LearningSignal, NestedLearningKernel
 from nested_memvid_agent.run_manager import RunManager
@@ -70,7 +71,7 @@ def main() -> None:
     parser.add_argument("--memory-dir", type=Path, default=Path("./tmp-golden/memory"))
     parser.add_argument(
         "--provider",
-        choices=["mock", "openai", "openai-compatible", "openrouter", "ollama", "anthropic", "gemini", "codex-cli"],
+        choices=PROVIDER_OPTIONS,
         default="mock",
     )
     parser.add_argument("--model", default="mock")

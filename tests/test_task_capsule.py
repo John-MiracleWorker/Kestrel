@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from nested_memvid_agent.models import MemoryLayer
+from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
 from nested_memvid_agent.task_capsule import (
     extract_learning_signals,
     summarize_run_capsule,
@@ -101,3 +101,42 @@ def test_capsule_root_links_to_candidate_frames(tmp_path: Path) -> None:
     assert '"frame_type": "skill_card"' in raw
     assert '"parent_ids": [' in raw
     assert '"child_ids": [' in raw
+
+
+def test_summarize_prefers_exact_iter_records_before_snippet_search(monkeypatch, tmp_path: Path) -> None:
+    import nested_memvid_agent.task_capsule as task_capsule
+
+    run_id = "run_exact_index"
+    capsule_path = tmp_path / "runs" / run_id / "complete.mv2"
+    capsule_path.parent.mkdir(parents=True)
+    capsule_path.touch()
+    payload = (
+        '{"run_id":"run_exact_index","objective":"Exact index capsule",'
+        '"final_assistant_response":"Done",'
+        '"candidate_facts":["Exact iter_records payload should win over snippets."]}'
+    )
+
+    class FakeCapsuleBackend:
+        def iter_records(self):
+            return [
+                MemoryRecord(
+                    id=f"capsule_{run_id}",
+                    title=f"Run capsule: {run_id}",
+                    content=payload,
+                    layer=MemoryLayer.EPISODIC,
+                    kind=MemoryKind.SUMMARY,
+                )
+            ]
+
+        def find(self, query: str, k: int = 8):
+            return []
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(task_capsule, "_open_capsule_backend", lambda path, backend: FakeCapsuleBackend())
+
+    summary = summarize_run_capsule(runs_dir=tmp_path / "runs", run_id=run_id, backend="memvid")
+
+    assert "Objective: Exact index capsule" in summary.summary
+    assert len(summary.learning_signals) == 1

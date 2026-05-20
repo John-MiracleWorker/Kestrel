@@ -88,6 +88,35 @@ RUN_PROVIDER_INTEGRATION=1 python -m pytest -q tests/integration/test_provider_l
 
 Each provider case also requires its own credentials or endpoint variables. The harness covers OpenAI, Anthropic, Gemini, OpenAI-compatible endpoints, Ollama, OpenRouter, and Codex CLI, and skips cases whose required environment is missing.
 
+## Live Learning E2E Eval
+
+Use `scripts/run_live_learning_eval.py` when you need to prove a real provider can drive Kestrel's learning and safety surfaces, not just answer a smoke prompt. It uses isolated memory, log, state, workspace, and secret-store paths under the output root and never needs access to the operator's real `.nest` runtime state.
+
+Recommended Ollama Cloud path:
+
+```bash
+export OLLAMA_API_KEY=...  # do not commit or paste this into logs
+export KESTREL_IT_OLLAMA_CLOUD_MODEL="gpt-oss:120b"
+python scripts/run_live_learning_eval.py \
+  --provider ollama-cloud \
+  --backend memory \
+  --output-root ./tmp-live-kestrel/memory-live \
+  --timeout-seconds 180
+```
+
+Full substrate path:
+
+```bash
+python scripts/run_live_learning_eval.py \
+  --provider ollama-cloud \
+  --model "$KESTREL_IT_OLLAMA_CLOUD_MODEL" \
+  --backend memvid \
+  --output-root ./tmp-live-kestrel/memvid-live \
+  --timeout-seconds 180
+```
+
+The live E2E cases cover provider handshake, durable memory retrieval after reopen, correction-frame capture, nested-learning promotion gates, task-capsule learning-signal extraction, unapproved high-risk tool blocking, and behavior-delta activation logging. Missing credentials/model configuration are reported by env-var name only; secret values are not printed.
+
 ## Golden Evals
 
 Golden evals are in `scripts/run_golden_evals.py` and cover agent behavior across turns, safety gates, memory use, consolidation expectations, provider/tool-call accuracy, durable plan completion, repair success, approval correctness, honest failure reporting, latency, cost, and repo-regression guardrails. The output includes per-case scores plus scored category summaries.
