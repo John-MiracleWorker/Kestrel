@@ -48,6 +48,11 @@ Implemented foundation:
   - Priority order: policy > self > procedural > semantic > episodic > working.
   - Activation logging is idempotent per run/delta when enabled.
 
+- `src/nested_memvid_agent/behavior_delta_skill.py`
+  - Renders instruction-only skill-candidate previews from `BehaviorDeltaKind.SKILL_CANDIDATE` deltas.
+  - Produces a validated skill manifest plus `SKILL.md` preview sections for trigger, procedure, verification, pitfalls, evidence, and safety.
+  - Ignores executable runtime metadata from learned deltas and never writes skill files or installs code.
+
 - `src/nested_memvid_agent/config.py`
   - Adds default-off `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=0`.
   - Adds `NEST_AGENT_MAX_ACTIVE_DELTAS_PER_RUN=8`.
@@ -376,6 +381,14 @@ Reporting requirements:
 - No automatic threshold tuning.
 
 ### Phase 8: Skill integration
+
+Status: first preview-only slice implemented. `BehaviorDeltaKind.SKILL_CANDIDATE` deltas can now render a validated instruction-only skill manifest and `SKILL.md` preview without writing files, installing the skill, or generating executable code. The CLI exposes this through:
+
+```bash
+nest-agent memory deltas skill-preview <delta_id> --json
+```
+
+The preview remains non-installable (`installable=false`). Any actual skill installation must continue through the existing validation and approval-gated skill install path.
 
 Goal: allow procedural deltas to become skill candidates without automatic executable install.
 

@@ -18,6 +18,7 @@ from .agent import NestedMV2Agent
 from .app_factory import build_agent
 from .behavior_delta_extractor import BehaviorDeltaExtractor
 from .behavior_delta_ledger import BehaviorDeltaLedger
+from .behavior_delta_skill import render_skill_candidate_preview
 from .channels import ChannelManager, ChannelPayloadError
 from .config import AgentConfig
 from .context_compiler import ContextCompiler
@@ -193,6 +194,12 @@ def main() -> None:
     deltas_ledger.add_argument("--state-path", type=Path, default=Path(".nest/state/agent.db"))
     deltas_ledger.add_argument("--since", default="30d")
     deltas_ledger.add_argument("--json", action="store_true")
+    deltas_skill_preview = deltas_sub.add_parser("skill-preview")
+    deltas_skill_preview.add_argument("delta_id")
+    deltas_skill_preview.add_argument("--state-path", type=Path, default=Path(".nest/state/agent.db"))
+    deltas_skill_preview.add_argument("--skills-dir", type=Path, default=Path(".nest/skills"))
+    deltas_skill_preview.add_argument("--skill-id")
+    deltas_skill_preview.add_argument("--json", action="store_true")
 
     compile_cmd = sub.add_parser("compile-context")
     _add_common_args(compile_cmd)
@@ -713,7 +720,34 @@ def _handle_behavior_deltas_command(args: argparse.Namespace) -> None:
     if args.deltas_cmd == "ledger":
         _print_behavior_delta_ledger(args)
         return
+    if args.deltas_cmd == "skill-preview":
+        _print_behavior_delta_skill_preview(args)
+        return
     raise SystemExit(f"Unknown behavior-delta command: {args.deltas_cmd}")
+
+
+def _print_behavior_delta_skill_preview(args: argparse.Namespace) -> None:
+    ledger = BehaviorDeltaLedger(AgentStateStore(args.state_path))
+    delta = ledger.get_delta(args.delta_id)
+    if delta is None:
+        raise SystemExit(f"Unknown behavior delta: {args.delta_id}")
+    preview = render_skill_candidate_preview(delta, skill_id=args.skill_id)
+    payload = preview.to_payload()
+    payload["skills_dir"] = str(args.skills_dir)
+    payload["message"] = "Preview only; no skill files were written and no executable code was generated."
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return
+    print(f"Skill candidate preview for {delta.id}")
+    print(f"Installable: {preview.installable}")
+    print(f"Validation: {'ok' if preview.validation['ok'] else 'failed'}")
+    if preview.validation["errors"]:
+        print("Errors: " + ", ".join(preview.validation["errors"]))
+    print()
+    print("Manifest:")
+    print(json.dumps(preview.manifest, indent=2))
+    print()
+    print(preview.instructions)
 
 
 def _print_behavior_delta_ledger(args: argparse.Namespace) -> None:
