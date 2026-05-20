@@ -24,8 +24,9 @@ def build_agent(
     active_state = state or AgentStateStore(config.state_path)
     memory = build_memory_system(config.backend, config.memory_dir, specs=specs, ledger=PromotionLedger(active_state))
     llm = build_llm_provider(config)
-    base_registry = tools or build_default_tools()
+    base_registry: ToolRegistry = tools or build_default_tools()
     # Wrap with transparent retry layer for transient failures
+    registry: ToolRegistry
     if config.tool_retry_max_attempts > 0:
         registry = RetryingRegistry(
             base_registry,

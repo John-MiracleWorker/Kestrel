@@ -498,7 +498,7 @@ class ChannelManager:
         return replace(channel, settings=settings)
 
 
-def _pending_approvals(run_payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _pending_approvals(run_payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     approvals = run_payload.get("approvals")
     if not isinstance(approvals, list):
         return []

@@ -42,10 +42,10 @@ from .server_support import (
     execution_response as _execution_response,
 )
 from .server_support import (
-    hostname_from_header as _hostname_from_header,
+    host_is_trusted as _host_is_trusted,
 )
 from .server_support import (
-    host_is_trusted as _host_is_trusted,
+    hostname_from_header as _hostname_from_header,
 )
 from .server_support import (
     hostname_from_url as _hostname_from_url,

@@ -7,7 +7,8 @@ from collections import Counter
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, cast
 
 import numpy as np
 
@@ -27,25 +28,21 @@ _RRF_K = 60
 # Normalization heuristics
 _BM25_SCORE_CAP = 10.0
 
+_EMBEDDING_MODEL_CACHE: dict[str, Any] = {}
+_EMBEDDING_MODEL_LOCK = Lock()
 
-def _get_embedding_model(model_name: str = "all-MiniLM-L6-v2"):
+
+def _get_embedding_model(model_name: str = "all-MiniLM-L6-v2") -> Any:
     """Lazy singleton for the sentence-transformers embedding model."""
-    import threading
 
-    cache = getattr(_get_embedding_model, "_cache", {})
-    lock = getattr(_get_embedding_model, "_lock", threading.Lock())
-    if not hasattr(_get_embedding_model, "_cache"):
-        _get_embedding_model._cache = cache
-        _get_embedding_model._lock = lock
-
-    with lock:
-        if model_name not in cache:
+    with _EMBEDDING_MODEL_LOCK:
+        if model_name not in _EMBEDDING_MODEL_CACHE:
             try:
                 from sentence_transformers import SentenceTransformer
             except ImportError as exc:
                 raise RuntimeError("sentence-transformers is required for vector search") from exc
-            cache[model_name] = SentenceTransformer(model_name)
-        return cache[model_name]
+            _EMBEDDING_MODEL_CACHE[model_name] = SentenceTransformer(model_name)
+        return _EMBEDDING_MODEL_CACHE[model_name]
 
 
 class _BM25Index:
@@ -195,7 +192,7 @@ class InMemoryBackend(MemoryBackend):
 
     def _encode(self, text: str) -> np.ndarray:
         model = _get_embedding_model(self._embedding_model_name)
-        return model.encode(text, convert_to_numpy=True, normalize_embeddings=False)
+        return cast(np.ndarray, model.encode(text, convert_to_numpy=True, normalize_embeddings=False))
 
     def _maybe_index_vector(self, record: MemoryRecord) -> None:
         if self._vector_index is None:

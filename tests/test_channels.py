@@ -11,8 +11,16 @@ import pytest
 
 from nested_memvid_agent.agent import NestedMV2Agent
 from nested_memvid_agent.channels import ChannelEndpointConfig, ChannelManager
-from nested_memvid_agent.channels.adapters import ChannelAdapter, DiscordAdapter, GenericWebhookAdapter
-from nested_memvid_agent.channels.models import ChannelDelivery, ChannelInboundMessage, ChannelOutboundMessage
+from nested_memvid_agent.channels.adapters import (
+    ChannelAdapter,
+    DiscordAdapter,
+    GenericWebhookAdapter,
+)
+from nested_memvid_agent.channels.models import (
+    ChannelDelivery,
+    ChannelInboundMessage,
+    ChannelOutboundMessage,
+)
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.runtime_models import AgentTurnResult, ToolCall, ToolExecution
 from nested_memvid_agent.server import create_app
@@ -54,7 +62,7 @@ def test_telegram_channel_sends_typing_action_before_agent_reply(tmp_path: Path,
     class FakeResponse:
         status = 200
 
-        def __enter__(self) -> "FakeResponse":
+        def __enter__(self) -> FakeResponse:
             return self
 
         def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
@@ -66,8 +74,8 @@ def test_telegram_channel_sends_typing_action_before_agent_reply(tmp_path: Path,
     def fake_urlopen(request: object, timeout: int) -> FakeResponse:
         calls.append(
             {
-                "url": getattr(request, "full_url"),
-                "payload": json.loads(getattr(request, "data").decode("utf-8")),
+                "url": request.full_url,
+                "payload": json.loads(request.data.decode("utf-8")),
                 "timeout": timeout,
             }
         )
@@ -110,7 +118,7 @@ def test_telegram_channel_reports_tool_progress_before_agent_reply(tmp_path: Pat
     class FakeResponse:
         status = 200
 
-        def __enter__(self) -> "FakeResponse":
+        def __enter__(self) -> FakeResponse:
             return self
 
         def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
@@ -122,8 +130,8 @@ def test_telegram_channel_reports_tool_progress_before_agent_reply(tmp_path: Pat
     def fake_urlopen(request: object, timeout: int) -> FakeResponse:
         calls.append(
             {
-                "url": getattr(request, "full_url"),
-                "payload": json.loads(getattr(request, "data").decode("utf-8")),
+                "url": request.full_url,
+                "payload": json.loads(request.data.decode("utf-8")),
                 "timeout": timeout,
             }
         )
