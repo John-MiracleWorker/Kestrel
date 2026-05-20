@@ -8,7 +8,7 @@ Core principle:
 Memory is not storage. Memory is a controlled, evidence-backed behavior-change system.
 ```
 
-This document is the repo-local foundation for the remaining controlled self-modification phases. It reflects the current Kestrel contracts after the initial behavior-delta schema, ledger, proposal-extraction, and mutation-gate slices.
+This document is the repo-local foundation for the remaining controlled self-modification phases. It reflects the current Kestrel contracts after the initial behavior-delta schema, ledger, proposal-extraction, mutation-gate, and behavior-compiler slices.
 
 ## Current baseline
 
@@ -40,6 +40,17 @@ Implemented foundation:
   - Policy and approval-gate deltas require explicit instruction or reviewed-rule evidence, policy-layer targeting, policy activation enablement, replay pass, approval, exact-call approval, and rollback support.
   - Critical deltas remain staged/recommendation-only unless explicitly enabled by a future caller path.
 
+- `src/nested_memvid_agent/behavior_compiler.py`
+  - Default-off compiler for active, relevant, evidence-backed behavior deltas.
+  - Structured sections for policy constraints, self-model rules, procedures, tool heuristics, context-packing rules, retrieval priorities, corrections, skill candidates, and delta evidence.
+  - Relevance matching across objective/query, task type, tool names, memory layers, risk tags, and path globs.
+  - Priority order: policy > self > procedural > semantic > episodic > working.
+  - Activation logging is idempotent per run/delta when enabled.
+
+- `src/nested_memvid_agent/config.py`
+  - Adds default-off `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=0`.
+  - Adds `NEST_AGENT_MAX_ACTIVE_DELTAS_PER_RUN=8`.
+
 - `src/nested_memvid_agent/state_store.py`
   - Schema version `11` adds:
     - `behavior_delta_ledger`
@@ -48,10 +59,9 @@ Implemented foundation:
 
 Still intentionally not implemented:
 
-- No runtime behavior compilation.
 - No automatic behavior-delta activation.
 - No replay validation.
-- No context-compiler integration with behavior deltas.
+- No context-compiler/runtime integration with behavior deltas.
 - No policy-promotion behavior changes.
 - No hidden system-prompt rewrite path.
 - No replacement or weakening of the `.mv2` durable-memory contract.
@@ -135,9 +145,9 @@ Can this learning signal become a memory record?
 Can this behavior delta become active runtime behavior?
 ```
 
-### Future `BehaviorCompiler`
+### `BehaviorCompiler`
 
-The behavior compiler will transform selected active deltas into structured runtime instructions. It should remain separate from `ContextPacker`.
+The behavior compiler transforms selected active deltas into structured runtime instructions. It remains separate from `ContextPacker` and is not yet wired into the runtime context path.
 
 `ContextPacker` retrieves and packs memory context.
 
@@ -274,6 +284,8 @@ python -m pytest -q tests/test_behavior_delta.py tests/test_behavior_delta_ledge
 ```
 
 ### Phase 5: Behavior compiler
+
+Status: first backend slice implemented. `BehaviorCompiler` can compile active, relevant, evidence-backed deltas from the ledger into structured sections behind a default-off config flag. It can log activations once per run/delta. It is not yet integrated into `ContextCompiler` or the live runtime prompt path.
 
 Goal: compile relevant active deltas into bounded runtime instructions behind a default-off flag.
 
