@@ -214,54 +214,72 @@ class NestedMV2Agent:
 
         final_content = ""
         stop_reason = "complete"
+        direct_tool_call = _direct_command_tool_call(user_message)
         for round_index in range(self.config.max_tool_rounds + 1):
-            self._event(
-                "llm.request",
-                {
-                    "session_id": session,
-                    "run_id": active_run_id,
-                    "round_index": round_index,
-                    "message_count": len(messages),
-                    "tool_count": len(self.tools.specs()),
-                    "stream": self.config.stream,
-                },
-            )
-            try:
-                response = self._generate_response(messages, self.tools.specs(), stream_handler)
-            except ProviderError as exc:
-                error = _provider_error_payload(exc)
-                self._event("llm.error", {"session_id": session, "run_id": active_run_id, **error})
-                self._event("runtime.error", {"session_id": session, "run_id": active_run_id, **error})
+            if direct_tool_call is not None and round_index == 0:
                 self._event(
-                    "diagnosis.classified",
+                    "command.routed",
                     {
                         "session_id": session,
                         "run_id": active_run_id,
-                        "source": "provider",
-                        **classify_failure(f"Provider error {error['code']}: {error['message']}", source="provider").to_payload(),
+                        "command": "search",
+                        "tool": direct_tool_call.name,
                     },
                 )
-                failure_frame_id = f"{turn_frame_id}_provider_error"
-                child_frame_ids.append(failure_frame_id)
-                memory_writes.append(
-                    self._write_frame(
-                        layer=MemoryLayer.WORKING,
-                        kind=MemoryKind.FAILURE,
-                        title="Provider failure",
-                        content=f"{error['code']}: {error['message']}",
-                        frame_type="failure_note",
-                        frame_id=failure_frame_id,
-                        confidence=0.72,
-                        session_id=session,
-                        parent_ids=(summary_frame_id,),
-                        source_uri=f"provider://{self.config.provider}/{self.config.model}",
-                        source_span={"round_index": round_index, "retryable": error["retryable"]},
-                        source=source,
-                    )
+                response = LLMResponse(
+                    content="Direct command routed to `memory.search`.",
+                    tool_calls=(direct_tool_call,),
+                    finish_reason="tool_calls",
+                    raw={"direct_command": "search"},
                 )
-                final_content = f"Provider error ({error['code']}): {error['message']}"
-                stop_reason = "provider_error"
-                break
+            else:
+                self._event(
+                    "llm.request",
+                    {
+                        "session_id": session,
+                        "run_id": active_run_id,
+                        "round_index": round_index,
+                        "message_count": len(messages),
+                        "tool_count": len(self.tools.specs()),
+                        "stream": self.config.stream,
+                    },
+                )
+                try:
+                    response = self._generate_response(messages, self.tools.specs(), stream_handler)
+                except ProviderError as exc:
+                    error = _provider_error_payload(exc)
+                    self._event("llm.error", {"session_id": session, "run_id": active_run_id, **error})
+                    self._event("runtime.error", {"session_id": session, "run_id": active_run_id, **error})
+                    self._event(
+                        "diagnosis.classified",
+                        {
+                            "session_id": session,
+                            "run_id": active_run_id,
+                            "source": "provider",
+                            **classify_failure(f"Provider error {error['code']}: {error['message']}", source="provider").to_payload(),
+                        },
+                    )
+                    failure_frame_id = f"{turn_frame_id}_provider_error"
+                    child_frame_ids.append(failure_frame_id)
+                    memory_writes.append(
+                        self._write_frame(
+                            layer=MemoryLayer.WORKING,
+                            kind=MemoryKind.FAILURE,
+                            title="Provider failure",
+                            content=f"{error['code']}: {error['message']}",
+                            frame_type="failure_note",
+                            frame_id=failure_frame_id,
+                            confidence=0.72,
+                            session_id=session,
+                            parent_ids=(summary_frame_id,),
+                            source_uri=f"provider://{self.config.provider}/{self.config.model}",
+                            source_span={"round_index": round_index, "retryable": error["retryable"]},
+                            source=source,
+                        )
+                    )
+                    final_content = f"Provider error ({error['code']}): {error['message']}"
+                    stop_reason = "provider_error"
+                    break
             self._event(
                 "llm.response",
                 {
@@ -526,6 +544,10 @@ class NestedMV2Agent:
                 final_content = response.content or "Waiting for approval before continuing."
                 stop_reason = "approval_required"
                 break
+            if direct_tool_call is not None and round_index == 0:
+                final_content = executions[-1].content if executions else response.content
+                stop_reason = "complete" if executions and executions[-1].success else "tool_error"
+                break
         else:
             stop_reason = "loop_exhausted"
 
@@ -751,6 +773,20 @@ def _looks_like_correction(text: str) -> bool:
         "remember:",
     )
     return any(marker in lowered for marker in markers)
+
+
+def _direct_command_tool_call(user_message: str) -> ToolCall | None:
+    stripped = user_message.strip()
+    lowered = stripped.lower()
+    if lowered.startswith("/search "):
+        query = stripped[len("/search ") :].strip()
+    elif lowered.startswith("/memory search "):
+        query = stripped[len("/memory search ") :].strip()
+    else:
+        return None
+    if not query:
+        return None
+    return ToolCall(name="memory.search", arguments={"query": query, "k": 5}, id=f"direct_search_{uuid4().hex}")
 
 
 def _context_with_behavior_deltas(context_prompt: str, behavior_delta_text: str) -> str:

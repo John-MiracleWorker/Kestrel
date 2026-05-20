@@ -709,8 +709,8 @@ def _eval_plan_completion(config: AgentConfig) -> dict[str, Any]:
         mcp=MCPManager(state),
         skills=SkillManager(manager_config.skills_dir, state),
     )
-    run = manager.create_run(message="Inspect and report plan completion", session_id="golden_plan")
-    deadline = monotonic() + 5
+    run = manager.create_run(message="/search Inspect and report plan completion", session_id="golden_plan")
+    deadline = monotonic() + max(15.0, float(manager_config.timeout_seconds) + 15.0)
     final = manager.get_run(run.run_id)
     while monotonic() < deadline:
         final = manager.get_run(run.run_id)

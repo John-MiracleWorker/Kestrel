@@ -38,6 +38,37 @@ def test_default_communication_contract_rejects_flat_greeting_posture() -> None:
     assert "not a ticket intake form" in contract
 
 
+def test_agent_routes_search_slash_command_without_llm(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    memory.put(
+        MemoryRecord(
+            id="rec_slash_search",
+            layer=MemoryLayer.SEMANTIC,
+            kind=MemoryKind.FACT,
+            title="Needle fact",
+            content="slash command needle result",
+            confidence=0.9,
+            importance=0.8,
+        )
+    )
+    agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=memory,
+            llm=MockLLMProvider([LLMResponse(content="should not be used")]),
+            tools=build_default_tools(),
+            config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
+        )
+    )
+
+    result = agent.chat("/search slash command needle", session_id="test")
+
+    assert result.stop_reason == "complete"
+    assert len(result.tool_executions) == 1
+    assert result.tool_executions[0].call.name == "memory.search"
+    assert result.tool_executions[0].success is True
+    assert "slash command needle result" in result.assistant_message
+
+
 def test_agent_chat_writes_working_and_episodic_memory(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     agent = NestedMV2Agent(
