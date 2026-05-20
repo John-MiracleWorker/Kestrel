@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 _TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 
 
@@ -816,6 +816,9 @@ class AgentStateStore:
             if current < 10:
                 _apply_schema_v10(conn)
                 current = 10
+            if current < 11:
+                _apply_schema_v11(conn)
+                current = 11
             if current < SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported schema migration target: {current} -> {SCHEMA_VERSION}")
             if current == SCHEMA_VERSION:
@@ -1099,6 +1102,62 @@ def _apply_schema_v10(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_promotion_ledger_target_layer ON promotion_ledger(target_layer);
         CREATE INDEX IF NOT EXISTS idx_promotion_ledger_promoted_at ON promotion_ledger(promoted_at);
         CREATE INDEX IF NOT EXISTS idx_promotion_outcomes_promotion_id ON promotion_outcomes(promotion_id);
+        """
+    )
+
+
+def _apply_schema_v11(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS behavior_delta_ledger (
+            delta_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            target_layer TEXT NOT NULL,
+            risk TEXT NOT NULL,
+            status TEXT NOT NULL,
+            title TEXT NOT NULL,
+            trigger_json TEXT NOT NULL,
+            behavior_change TEXT NOT NULL,
+            validation_plan_json TEXT NOT NULL,
+            rollback_plan_json TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            importance REAL NOT NULL,
+            created_from_run_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            expires_at TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS behavior_delta_activations (
+            id TEXT PRIMARY KEY,
+            delta_id TEXT NOT NULL,
+            run_id TEXT,
+            task_id TEXT,
+            objective TEXT,
+            activated_at TEXT NOT NULL,
+            activation_reason TEXT NOT NULL,
+            compiled_section TEXT NOT NULL,
+            FOREIGN KEY(delta_id) REFERENCES behavior_delta_ledger(delta_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS behavior_delta_outcomes (
+            id TEXT PRIMARY KEY,
+            delta_id TEXT NOT NULL,
+            run_id TEXT,
+            outcome TEXT NOT NULL,
+            evidence_ref_json TEXT,
+            notes TEXT NOT NULL DEFAULT '',
+            recorded_at TEXT NOT NULL,
+            FOREIGN KEY(delta_id) REFERENCES behavior_delta_ledger(delta_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_behavior_delta_ledger_status ON behavior_delta_ledger(status);
+        CREATE INDEX IF NOT EXISTS idx_behavior_delta_ledger_kind ON behavior_delta_ledger(kind);
+        CREATE INDEX IF NOT EXISTS idx_behavior_delta_ledger_target_layer ON behavior_delta_ledger(target_layer);
+        CREATE INDEX IF NOT EXISTS idx_behavior_delta_activations_delta_id ON behavior_delta_activations(delta_id);
+        CREATE INDEX IF NOT EXISTS idx_behavior_delta_outcomes_delta_id ON behavior_delta_outcomes(delta_id);
         """
     )
 

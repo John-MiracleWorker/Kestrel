@@ -355,7 +355,7 @@ def test_state_store_initializes_version_and_indexes(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     state = AgentStateStore(db_path)
 
-    assert state.schema_version() == 10
+    assert state.schema_version() == 11
     with sqlite3.connect(db_path) as conn:
         run_indexes = {row[1] for row in conn.execute("PRAGMA index_list('runs')").fetchall()}
         approval_indexes = {row[1] for row in conn.execute("PRAGMA index_list('approval_requests')").fetchall()}
