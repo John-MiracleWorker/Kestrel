@@ -1,0 +1,429 @@
+# Controlled Self-Modification
+
+Kestrel's controlled self-modification work is intentionally conservative. The goal is not to let an LLM rewrite itself. The goal is to let Kestrel propose bounded behavior changes, persist them with evidence, validate them, activate them under gates, measure whether they help, and roll them back without destroying the audit trail.
+
+Core principle:
+
+```text
+Memory is not storage. Memory is a controlled, evidence-backed behavior-change system.
+```
+
+This document is the repo-local foundation for the remaining controlled self-modification phases. It reflects the current Kestrel contracts after the initial behavior-delta schema and ledger slices.
+
+## Current baseline
+
+Implemented foundation:
+
+- `src/nested_memvid_agent/behavior_delta.py`
+  - Typed behavior-delta schema.
+  - Safe defaults: proposed status, disable-able rollback plan, zero activation stats.
+  - Serialization to and from `MemoryRecord.metadata["behavior_delta"]`-style payloads.
+  - Mapping to existing `MemoryKind` values without extending `MemoryKind`.
+
+- `src/nested_memvid_agent/behavior_delta_ledger.py`
+  - SQLite control-plane persistence for behavior deltas.
+  - Append-only activation records.
+  - Append-only outcome records.
+  - Summary rates for useful/failure/rollback/never-activated outcomes.
+  - Guard against activating terminal deltas without a future explicit override path.
+
+- `src/nested_memvid_agent/state_store.py`
+  - Schema version `11` adds:
+    - `behavior_delta_ledger`
+    - `behavior_delta_activations`
+    - `behavior_delta_outcomes`
+
+Still intentionally not implemented:
+
+- No runtime behavior compilation.
+- No automatic behavior-delta activation.
+- No policy-promotion behavior changes.
+- No hidden system-prompt rewrite path.
+- No replacement or weakening of the `.mv2` durable-memory contract.
+
+## Non-negotiable invariants
+
+These invariants apply to every future phase:
+
+1. `.mv2` remains the canonical durable memory substrate.
+2. SQLite remains control-plane state only, not retrieval memory.
+3. Existing `MemoryKind` should not be extended for behavior deltas unless a later test proves it is unavoidable.
+4. A behavior delta without evidence cannot become active.
+5. A behavior delta without rollback metadata cannot become active.
+6. Ordinary conversation, ordinary observation, or a single run success cannot create active policy behavior.
+7. Policy-affecting deltas require explicit instruction or reviewed rule evidence, high validation, replay checks, config enablement, exact-call approval, and rollback support.
+8. The LLM may propose behavior changes; Kestrel gates, validates, activates, logs, measures, and rolls them back.
+9. ORACLE or learned routing may recommend or shadow-evaluate behavior-delta utility, but must not gain policy-write authority.
+10. Skills generated from behavior deltas must remain proposals until manifest validation and approval-gated install.
+
+## Conceptual pipeline
+
+```text
+Run trace / complete.mv2 capsule
+    -> Proposal extractor
+    -> BehaviorDelta(PROPOSED)
+    -> BehaviorDeltaLedger
+    -> MutationGate
+    -> STAGED / REJECTED / needs replay / needs approval
+    -> Replay validation
+    -> ACTIVE delta if gates pass
+    -> BehaviorCompiler
+    -> Structured runtime instructions only when relevant
+    -> Activation log
+    -> Outcome ledger
+    -> Operator reporting and shadow recommendations
+```
+
+The first two implementation slices created the typed proposal object and the ledger. Future work should connect the pipeline in small, test-first steps.
+
+## Data model responsibilities
+
+### `BehaviorDelta`
+
+A `BehaviorDelta` represents a proposed or active behavior change. It must answer:
+
+- What future condition activates this?
+- What behavior changes when it activates?
+- Which memory layer owns the behavior?
+- What evidence supports it?
+- How risky is it?
+- What validation is required?
+- How do we know if it helped?
+- How can it be disabled or rolled back?
+
+The schema module owns only type validation and serialization. It must not decide activation.
+
+### `BehaviorDeltaLedger`
+
+The ledger owns durable control-plane state:
+
+- proposed/staged/active/rejected/rolled-back/expired delta records,
+- activation history,
+- outcome history,
+- summary reporting.
+
+The ledger must stay append-friendly. Rejections and failures are training data, not garbage.
+
+### Future `MutationGate`
+
+The mutation gate will decide whether a delta can be staged, rejected, or considered for activation. It should sit above `NestedLearningKernel`, not replace it.
+
+`NestedLearningKernel` answers:
+
+```text
+Can this learning signal become a memory record?
+```
+
+`MutationGate` answers:
+
+```text
+Can this behavior delta become active runtime behavior?
+```
+
+### Future `BehaviorCompiler`
+
+The behavior compiler will transform selected active deltas into structured runtime instructions. It should remain separate from `ContextPacker`.
+
+`ContextPacker` retrieves and packs memory context.
+
+`BehaviorCompiler` compiles validated behavior deltas into bounded instructions such as:
+
+```text
+ACTIVE POLICY CONSTRAINTS:
+- Preserve .mv2 as canonical memory. Vector sidecars must be rebuildable and keyed to .mv2 records.
+
+ACTIVE PROCEDURES:
+- Before retrying a failed validation command, compare the previous command and require a changed strategy.
+
+DELTA EVIDENCE:
+- delta_example: explicit user directive / replay scenario pass
+```
+
+## Feature flags
+
+Future runtime activation must be default-off until tests prove safety.
+
+Recommended flags:
+
+```text
+NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=0
+NEST_AGENT_MAX_ACTIVE_DELTAS_PER_RUN=8
+NEST_AGENT_ALLOW_POLICY_DELTAS=0
+```
+
+Rules:
+
+- Disabled behavior deltas must produce identical runtime context to the current compiler path.
+- Enabled behavior deltas must still activate only relevant, active, evidence-backed deltas.
+- Policy-delta activation needs a separate explicit flag and exact-call approval path.
+
+## Risk model
+
+- `LOW`
+  - Formatting preferences, small context hints, low-impact procedural reminders.
+  - Can be staged with evidence; activation still requires tests once compilation exists.
+
+- `MEDIUM`
+  - Tool heuristics, debugging checklists, retrieval/context-packing preferences.
+  - Requires validation or replay before activation.
+
+- `HIGH`
+  - Approval behavior, repair workflow constraints, policy-like runtime behavior.
+  - Requires explicit approval, replay, and rollback support.
+
+- `CRITICAL`
+  - Policy writes, self-modification rules, code mutation authority, system-prompt affecting behavior.
+  - Recommendation-only unless an explicit future policy path enables, validates, approves, and logs the exact activation.
+
+## Phase roadmap
+
+### Phase 3: Proposal extraction
+
+Goal: produce `BehaviorDelta(PROPOSED)` records from evidence without activation.
+
+Files likely involved:
+
+- Create: `src/nested_memvid_agent/behavior_delta_extractor.py`
+- Modify only if needed: `src/nested_memvid_agent/task_capsule.py`
+- Add tests: `tests/test_behavior_delta_extractor.py`
+
+Initial accepted sources:
+
+- explicit user instruction,
+- task capsule reusable lessons,
+- repeated failed tool attempts,
+- repeated successful procedures,
+- repair review artifacts,
+- user corrections.
+
+Extractor requirements:
+
+- Never activates a delta.
+- Rejects vague proposals such as `be more careful`.
+- Requires non-empty trigger, behavior change, evidence refs, target layer, risk, validation plan, and rollback plan.
+- Writes proposals to the ledger only through an explicit caller path or dry-run command.
+
+Validation target:
+
+```bash
+python -m compileall -q src tests scripts
+python -m pytest -q tests/test_behavior_delta.py tests/test_behavior_delta_ledger.py tests/test_behavior_delta_extractor.py
+```
+
+### Phase 4: Mutation gate
+
+Goal: evaluate behavior deltas by risk, evidence, validation, approval, and rollback requirements.
+
+Files likely involved:
+
+- Create: `src/nested_memvid_agent/mutation_gate.py`
+- Add tests: `tests/test_mutation_gate.py`
+
+Core API shape:
+
+```python
+@dataclass(frozen=True)
+class MutationDecision:
+    accepted: bool
+    status: BehaviorDeltaStatus
+    reason: str
+    requires_replay: bool
+    requires_human_approval: bool
+    requires_exact_call_approval: bool
+    blocked_by: tuple[str, ...] = ()
+```
+
+Mutation gate requirements:
+
+- Low-risk deltas can stage with evidence.
+- Medium-risk deltas require validation or replay before activation.
+- High-risk deltas require explicit approval and replay.
+- Critical deltas remain recommendation-only unless a future explicit policy path permits them.
+- Policy and approval-gate deltas cannot become active without explicit instruction/review evidence, target layer `policy`, high validation score, replay pass, config enablement, exact-call approval, and rollback support.
+
+Validation target:
+
+```bash
+python -m compileall -q src tests scripts
+python -m pytest -q tests/test_behavior_delta.py tests/test_behavior_delta_ledger.py tests/test_mutation_gate.py
+```
+
+### Phase 5: Behavior compiler
+
+Goal: compile relevant active deltas into bounded runtime instructions behind a default-off flag.
+
+Files likely involved:
+
+- Create: `src/nested_memvid_agent/behavior_compiler.py`
+- Modify: context compiler integration point only after disabled-flag parity tests exist.
+- Add tests: `tests/test_behavior_compiler.py`
+
+Compiler requirements:
+
+- Include only active deltas.
+- Include only relevant deltas for the current task/objective/tool/path/layer context.
+- Cap active deltas per run.
+- Deduplicate overlapping instructions.
+- Prioritize policy > self > procedural > semantic > episodic > working.
+- Log one activation per run per delta.
+- Refuse silent policy activation without evidence.
+- Disabled flag must preserve byte-for-byte or semantically equivalent current behavior.
+
+Validation target:
+
+```bash
+NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=0 python -m pytest -q tests/test_context_compiler.py tests/test_behavior_compiler.py
+NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=1 python -m pytest -q tests/test_behavior_compiler.py
+```
+
+### Phase 6: Replay validation
+
+Goal: compare baseline behavior vs behavior-with-delta using deterministic scenarios.
+
+Files likely involved:
+
+- Create: `scripts/eval_behavior_deltas.py`
+- Create fixtures under: `tests/evals/behavior_deltas/`
+- Add tests: `tests/test_behavior_delta_replay.py`
+
+Replay requirements:
+
+- Use mock providers wherever possible.
+- Emit structured JSON results.
+- Fail policy/approval-gate scenarios on any gate violation.
+- Include at least:
+  - policy write requires approval,
+  - `.mv2` canonical memory constraint,
+  - repeated validation retry requires changed strategy.
+
+Validation target:
+
+```bash
+python scripts/eval_behavior_deltas.py --scenario tests/evals/behavior_deltas/policy_write_requires_approval.json --provider mock
+python -m pytest -q tests/test_behavior_delta_replay.py
+```
+
+### Phase 7: Outcomes and reporting
+
+Goal: make behavior-delta utility visible to operators.
+
+Files likely involved:
+
+- Extend: `src/nested_memvid_agent/behavior_delta_ledger.py`
+- Add CLI/API only after ledger reporting tests exist.
+- Add tests: `tests/test_behavior_delta_reporting.py`
+
+Reporting requirements:
+
+- JSON-capable summaries.
+- Rates for useful, failure, rollback, never activated.
+- Advisory recommendations only.
+- No automatic threshold tuning.
+
+### Phase 8: Skill integration
+
+Goal: allow procedural deltas to become skill candidates without automatic executable install.
+
+Files likely involved:
+
+- Create or extend a skill preview helper.
+- Integrate with existing skill manifest validation and `skill.install` approval gates.
+- Add tests: `tests/test_behavior_delta_skill_candidates.py`
+
+Skill candidate requirements:
+
+- Render `SKILL.md` preview with trigger, procedure, verification, pitfalls, evidence.
+- Do not install executable code automatically.
+- Failed validation keeps candidate staged or rejected.
+- Activation/outcome tracking remains tied to the originating delta.
+
+### Phase 9: ORACLE shadow integration
+
+Goal: include behavior-delta outcome features in learned-routing evaluation while keeping gates rule-based.
+
+Files likely involved:
+
+- Extend: `src/nested_memvid_agent/learned_routing.py`
+- Extend: `scripts/eval_memory_router.py` or add a behavior-delta-specific shadow eval.
+
+ORACLE requirements:
+
+- Shadow-only.
+- Can recommend, abstain, and provide counterfactuals.
+- Must not decide policy activation.
+- Must not bypass `MutationGate`.
+
+### Phase 10: Review UI/API
+
+Goal: make controlled self-modification visible and reviewable.
+
+Files likely involved:
+
+- API routes for list/show/replay/activate/reject/rollback.
+- Web workbench panel after backend and CLI are stable.
+
+UI/API requirements:
+
+- No hidden active deltas.
+- Show evidence refs, risk, status, replay result, validation requirements, activation history, and outcome stats.
+- High-risk deltas must visibly show approval requirements.
+- Rollback must be obvious and auditable.
+
+## Suggested implementation sequence
+
+Future work should proceed in small test-first slices:
+
+1. Add extractor tests for explicit instruction parsing and vague proposal rejection.
+2. Implement the minimal proposal extractor.
+3. Add dry-run proposal CLI tests.
+4. Add mutation gate tests for low/medium/high/critical tiers.
+5. Implement `MutationGate` without activation side effects.
+6. Add disabled-flag parity tests for context compilation.
+7. Implement `BehaviorCompiler` behind `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=0` default.
+8. Add activation logging tests.
+9. Add replay fixtures and script.
+10. Add reporting and operator review surfaces.
+
+Each slice should end with a narrow commit and targeted validation before broad suite runs.
+
+## Definition of done for controlled self-modification
+
+The full project is done when Kestrel can demonstrate this loop:
+
+1. A run produces an evidence-rich trace or capsule.
+2. Kestrel extracts a specific behavior-change proposal.
+3. The proposal is typed, risk-classified, and linked to evidence.
+4. The mutation gate stages, rejects, or requires validation.
+5. Replay validation compares baseline vs delta behavior.
+6. An approved active delta is compiled into a future run only when relevant.
+7. Activation is logged.
+8. Outcomes are recorded.
+9. Ledger reporting shows whether the delta helped, failed, or was never useful.
+10. Rollback can disable the delta without destroying audit history.
+
+## Validation commands
+
+Use narrow tests while developing, then broaden before committing:
+
+```bash
+python -m compileall -q src tests scripts
+python -m pytest -q tests/test_behavior_delta.py tests/test_behavior_delta_ledger.py tests/test_nested_learning.py
+python -m pytest -q
+python scripts/run_golden_evals.py --backend memory --provider mock
+PYTHONPATH=src python -m nested_memvid_agent.cli chat --backend memory --provider mock --message "hello"
+```
+
+If web/API files are touched:
+
+```bash
+npm run test --prefix web
+npm run build --prefix web
+```
+
+If installer/startup files are touched:
+
+```bash
+bash -n install.sh
+KESTREL_DRY_RUN=1 bash install.sh
+KESTREL_DRY_RUN=1 KESTREL_START_SERVER=0 bash install.sh
+```
