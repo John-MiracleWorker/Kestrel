@@ -2,14 +2,30 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+from nested_memvid_agent.behavior_delta import (
+    BehaviorDelta,
+    BehaviorDeltaKind,
+    BehaviorDeltaRisk,
+    BehaviorDeltaStatus,
+    TriggerSpec,
+    ValidationPlan,
+)
+from nested_memvid_agent.behavior_delta_ledger import (
+    BehaviorDeltaActivation,
+    BehaviorDeltaLedger,
+    BehaviorDeltaOutcome,
+)
 from nested_memvid_agent.learned_routing import (
     OutcomeCalibratedRouter,
     RoutingExample,
+    behavior_delta_shadow_examples_from_ledger,
+    evaluate_behavior_delta_shadow_examples,
     evaluate_routing_examples,
     routing_example_from_decision,
 )
-from nested_memvid_agent.models import MemoryKind, MemoryLayer
+from nested_memvid_agent.models import EvidenceRef, MemoryKind, MemoryLayer
 from nested_memvid_agent.nested_learning import LearningSignal, NestedLearningKernel
+from nested_memvid_agent.state_store import AgentStateStore
 
 
 def test_shadow_router_records_counterfactual_without_changing_rule_decision() -> None:
@@ -138,6 +154,97 @@ def test_replay_eval_can_show_oracle_utility_lift_on_synthetic_history() -> None
     assert payload["improvement"]["passes"] is True
 
 
+def test_behavior_delta_shadow_examples_include_outcome_features_without_authority(tmp_path) -> None:
+    ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "agent.db"))
+    delta = _behavior_delta(
+        "delta_policy_guard",
+        kind=BehaviorDeltaKind.POLICY,
+        target_layer=MemoryLayer.POLICY,
+        risk=BehaviorDeltaRisk.HIGH,
+        status=BehaviorDeltaStatus.ACTIVE,
+    )
+    ledger.record_delta(delta)
+    ledger.record_activation(
+        BehaviorDeltaActivation(
+            id="act-1",
+            delta_id=delta.id,
+            run_id="run-1",
+            task_id="task-1",
+            objective="modify policy memory",
+            activated_at="2026-05-20T00:00:00+00:00",
+            activation_reason="matched policy task",
+            compiled_section="ACTIVE POLICY CONSTRAINTS",
+        )
+    )
+    ledger.record_outcome(
+        BehaviorDeltaOutcome(
+            id="out-1",
+            delta_id=delta.id,
+            run_id="run-1",
+            outcome="useful",
+            recorded_at="2026-05-20T00:01:00+00:00",
+            evidence_ref=EvidenceRef(source="replay", locator="policy_write_requires_approval"),
+        )
+    )
+
+    examples = behavior_delta_shadow_examples_from_ledger(ledger)
+    report = evaluate_behavior_delta_shadow_examples(examples)
+    payload = report.to_payload()
+
+    assert len(examples) == 1
+    features = examples[0].features
+    assert features["delta_kind"] == "policy"
+    assert features["target_layer"] == "policy"
+    assert features["risk"] == "high"
+    assert features["activation_count"] == 1.0
+    assert features["useful_rate"] == 1.0
+    assert features["failure_rate"] == 0.0
+    assert features["trigger_specificity"] > 0.0
+    assert examples[0].recommendation in {"keep_active", "monitor"}
+    assert examples[0].authority == "shadow_only"
+    assert payload["authority"] == "shadow_only"
+    assert payload["gate_authority"] == "mutation_gate"
+    assert payload["policy_write_authority"] is False
+    assert payload["counterfactuals"][0]["decision"] in {"keep_active", "monitor"}
+
+
+def test_behavior_delta_shadow_recommends_review_for_failed_active_delta(tmp_path) -> None:
+    ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "agent.db"))
+    delta = _behavior_delta(
+        "delta_bad_tool_rule",
+        kind=BehaviorDeltaKind.TOOL_HEURISTIC,
+        target_layer=MemoryLayer.PROCEDURAL,
+        risk=BehaviorDeltaRisk.MEDIUM,
+        status=BehaviorDeltaStatus.ACTIVE,
+    )
+    ledger.record_delta(delta)
+    ledger.record_activation(
+        BehaviorDeltaActivation(
+            id="act-1",
+            delta_id=delta.id,
+            run_id="run-1",
+            task_id="task-1",
+            objective="retry validation",
+            activated_at="2026-05-20T00:00:00+00:00",
+            activation_reason="matched validation retry",
+            compiled_section="ACTIVE TOOL HEURISTICS",
+        )
+    )
+    ledger.record_outcome(
+        BehaviorDeltaOutcome(id="out-1", delta_id=delta.id, run_id="run-1", outcome="caused_failure", recorded_at="2026-05-20T00:01:00+00:00")
+    )
+    ledger.record_outcome(
+        BehaviorDeltaOutcome(id="out-2", delta_id=delta.id, run_id="run-2", outcome="contradicted", recorded_at="2026-05-20T00:02:00+00:00")
+    )
+
+    report = evaluate_behavior_delta_shadow_examples(behavior_delta_shadow_examples_from_ledger(ledger)).to_payload()
+
+    assert report["counterfactuals"][0]["decision"] == "review_or_rollback"
+    assert report["counterfactuals"][0]["actionable"] is False
+    assert report["counterfactuals"][0]["authority"] == "shadow_only"
+    assert report["summary"]["review_or_rollback"] == 1
+
+
 def test_router_model_state_round_trips_through_payload() -> None:
     examples = (
         _example("episodic-win", target=MemoryLayer.EPISODIC, reward=0.95, outcomes=("useful",)),
@@ -157,6 +264,40 @@ def test_router_model_state_round_trips_through_payload() -> None:
     assert after.target_layer == before.target_layer
     assert after.expected_utility == before.expected_utility
     assert after.guardrail_blocks == before.guardrail_blocks
+
+
+def _behavior_delta(
+    delta_id: str,
+    *,
+    kind: BehaviorDeltaKind,
+    target_layer: MemoryLayer,
+    risk: BehaviorDeltaRisk,
+    status: BehaviorDeltaStatus,
+) -> BehaviorDelta:
+    return BehaviorDelta(
+        id=delta_id,
+        title=f"Shadow delta {delta_id}",
+        kind=kind,
+        target_layer=target_layer,
+        risk=risk,
+        status=status,
+        trigger=TriggerSpec(
+            query_patterns=("policy", "validation", "retry"),
+            task_types=("repair",),
+            tool_names=("shell.run",),
+            memory_layers=(target_layer,),
+            risk_tags=(risk.value,),
+            semantic_hint="Use for behavior-delta ORACLE shadow evaluation fixtures.",
+        ),
+        behavior_change="When the trigger matches, apply the staged behavior change under existing gates.",
+        evidence_refs=(EvidenceRef(source="test", locator=delta_id),),
+        validation_plan=ValidationPlan(
+            required_checks=("unit",),
+            replay_scenarios=("shadow_fixture",),
+            min_validation_score=0.8,
+            min_repeat_count=1,
+        ),
+    )
 
 
 def _example(

@@ -5,6 +5,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from .behavior_delta import BehaviorDeltaStatus
+from .behavior_delta_ledger import BehaviorDeltaLedger
 from .layers import DEFAULT_LAYER_SPECS, LayerSpec
 from .models import MemoryKind, MemoryLayer
 from .nested_learning import LearningAction, LearningDecision, LearningSignal
@@ -104,6 +106,44 @@ class RouteStats:
             never_retrieved_rate=float(payload.get("never_retrieved_rate", 0.0)),
             useful_rate=float(payload.get("useful_rate", 0.0)),
         )
+
+
+@dataclass(frozen=True)
+class BehaviorDeltaShadowExample:
+    delta_id: str
+    features: dict[str, RoutingFeature]
+    recommendation: str
+    authority: str = "shadow_only"
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "delta_id": self.delta_id,
+            "features": dict(self.features),
+            "decision": self.recommendation,
+            "authority": self.authority,
+            "actionable": False,
+        }
+
+
+@dataclass(frozen=True)
+class BehaviorDeltaShadowEvaluation:
+    examples: tuple[BehaviorDeltaShadowExample, ...]
+
+    def to_payload(self) -> dict[str, Any]:
+        counts = Counter(example.recommendation for example in self.examples)
+        return {
+            "authority": "shadow_only",
+            "gate_authority": "mutation_gate",
+            "policy_write_authority": False,
+            "summary": {
+                "examples": len(self.examples),
+                "keep_active": counts.get("keep_active", 0),
+                "monitor": counts.get("monitor", 0),
+                "review_or_rollback": counts.get("review_or_rollback", 0),
+                "needs_more_data": counts.get("needs_more_data", 0),
+            },
+            "counterfactuals": [example.to_payload() for example in self.examples],
+        }
 
 
 @dataclass(frozen=True)
@@ -355,6 +395,23 @@ def signal_features(
     return features
 
 
+def behavior_delta_shadow_examples_from_ledger(ledger: BehaviorDeltaLedger) -> tuple[BehaviorDeltaShadowExample, ...]:
+    """Build ORACLE shadow-only behavior-delta utility examples.
+
+    These examples are advisory counterfactuals only. They do not activate,
+    reject, roll back, tune thresholds, or bypass MutationGate decisions.
+    """
+
+    rows = ledger.report_deltas(since=None).rows
+    return tuple(_behavior_delta_shadow_example(row, ledger) for row in rows)
+
+
+def evaluate_behavior_delta_shadow_examples(
+    examples: Iterable[BehaviorDeltaShadowExample],
+) -> BehaviorDeltaShadowEvaluation:
+    return BehaviorDeltaShadowEvaluation(examples=tuple(examples))
+
+
 def routing_examples_from_ledger(ledger: PromotionLedger) -> tuple[RoutingExample, ...]:
     entries = ledger._entries(since=None, target_layer=None, outcome=None)
     outcomes = ledger._outcomes_for_entries([entry.promotion_id for entry in entries], outcome=None)
@@ -425,6 +482,66 @@ def evaluate_routing_examples(
         ),
     }
     return RoutingEvaluation(baseline=baseline, oracle=oracle, improvement=improvement)
+
+
+def _behavior_delta_shadow_example(row: Any, ledger: BehaviorDeltaLedger) -> BehaviorDeltaShadowExample:
+    delta = ledger.get_delta(row.delta_id)
+    if delta is None:
+        raise KeyError(f"Unknown behavior delta in report row: {row.delta_id}")
+    outcome_total = max(1, sum(row.outcome_counts.values()))
+    useful = row.outcome_counts.get("useful", 0)
+    failures = row.outcome_counts.get("caused_failure", 0) + row.outcome_counts.get("contradicted", 0)
+    rolled_back = row.outcome_counts.get("rolled_back", 0)
+    features: dict[str, RoutingFeature] = {
+        "delta_kind": row.kind,
+        "target_layer": row.target_layer,
+        "risk": row.risk,
+        "status": row.status,
+        "status_is_terminal": row.status in {
+            BehaviorDeltaStatus.REJECTED.value,
+            BehaviorDeltaStatus.ROLLED_BACK.value,
+            BehaviorDeltaStatus.EXPIRED.value,
+        },
+        "validation_score": delta.validation_plan.min_validation_score,
+        "repeat_count": float(delta.validation_plan.min_repeat_count),
+        "explicit_instruction": bool(delta.metadata.get("explicit_instruction") or delta.validation_plan.requires_human_approval),
+        "activation_count": float(row.activation_count),
+        "useful_rate": round(useful / outcome_total, 4),
+        "failure_rate": round(failures / outcome_total, 4),
+        "rollback_rate": round(rolled_back / outcome_total, 4),
+        "never_activated_rate": 1.0 if row.never_activated else 0.0,
+        "trigger_specificity": _behavior_delta_trigger_specificity(delta),
+    }
+    return BehaviorDeltaShadowExample(
+        delta_id=row.delta_id,
+        features=features,
+        recommendation=_behavior_delta_shadow_recommendation(features),
+    )
+
+
+def _behavior_delta_shadow_recommendation(features: dict[str, RoutingFeature]) -> str:
+    if _feature_float(features, "failure_rate", 0.0) > _feature_float(features, "useful_rate", 0.0):
+        return "review_or_rollback"
+    if _feature_bool(features, "status_is_terminal"):
+        return "monitor"
+    if _feature_float(features, "never_activated_rate", 0.0) >= 1.0:
+        return "needs_more_data"
+    if _feature_float(features, "useful_rate", 0.0) >= 0.75 and _feature_float(features, "activation_count", 0.0) > 0:
+        return "keep_active"
+    return "monitor"
+
+
+def _behavior_delta_trigger_specificity(delta: Any) -> float:
+    trigger = delta.trigger
+    count = len(trigger.query_patterns)
+    count += len(trigger.task_types)
+    count += len(trigger.tool_names)
+    count += len(trigger.memory_layers)
+    count += len(trigger.path_globs)
+    count += len(trigger.risk_tags)
+    if trigger.semantic_hint:
+        count += 1
+    return round(min(count / 10.0, 1.0), 4)
 
 
 def _routing_example_from_entry(entry: PromotionEntry, outcomes: list[PromotionOutcome]) -> RoutingExample:

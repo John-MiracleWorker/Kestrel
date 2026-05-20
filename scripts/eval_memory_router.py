@@ -9,9 +9,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from nested_memvid_agent.learned_routing import (
     OutcomeCalibratedRouter,
+    behavior_delta_shadow_examples_from_ledger,
+    evaluate_behavior_delta_shadow_examples,
     evaluate_routing_examples,
     routing_examples_from_ledger,
 )
+from nested_memvid_agent.behavior_delta_ledger import BehaviorDeltaLedger
 from nested_memvid_agent.promotion_ledger import PromotionLedger
 from nested_memvid_agent.state_store import AgentStateStore
 
@@ -27,6 +30,7 @@ def main() -> int:
     parser.add_argument("--confidence-threshold", type=float, default=0.65)
     parser.add_argument("--activation-margin", type=float, default=0.05)
     parser.add_argument("--min-examples-per-target", type=int, default=3)
+    parser.add_argument("--include-behavior-deltas", action="store_true")
     parser.add_argument("--fail-on-regression", action="store_true")
     args = parser.parse_args()
 
@@ -41,6 +45,10 @@ def main() -> int:
     )
     report = evaluate_routing_examples(examples, router, min_utility_delta=args.min_utility_delta)
     payload = report.to_payload()
+    if args.include_behavior_deltas:
+        delta_ledger = BehaviorDeltaLedger(AgentStateStore(args.state_db))
+        delta_examples = behavior_delta_shadow_examples_from_ledger(delta_ledger)
+        payload["behavior_delta_shadow"] = evaluate_behavior_delta_shadow_examples(delta_examples).to_payload()
     if args.json:
         print(json.dumps(payload, indent=2))
         return 1 if args.fail_on_regression and not payload["improvement"]["passes"] else 0
@@ -58,6 +66,15 @@ def main() -> int:
     print(f"ORACLE abstention rate: {payload['oracle']['abstention_rate']}")
     print(f"ORACLE gate violations: {payload['oracle']['gate_violations']}")
     print(f"Passes: {payload['improvement']['passes']}")
+    if "behavior_delta_shadow" in payload:
+        delta_shadow = payload["behavior_delta_shadow"]
+        print()
+        print("Behavior-delta ORACLE shadow")
+        print(f"Authority: {delta_shadow['authority']}")
+        print(f"Gate authority: {delta_shadow['gate_authority']}")
+        print(f"Policy write authority: {delta_shadow['policy_write_authority']}")
+        print(f"Examples: {delta_shadow['summary']['examples']}")
+        print(f"Review/rollback recommendations: {delta_shadow['summary']['review_or_rollback']}")
     return 1 if args.fail_on_regression and not payload["improvement"]["passes"] else 0
 
 

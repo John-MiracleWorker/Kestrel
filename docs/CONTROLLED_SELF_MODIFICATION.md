@@ -64,6 +64,11 @@ Implemented foundation:
   - Emits structured JSON with baseline score, delta score, improvement, expected-behavior hits, gate violations, and pass/fail.
   - Includes initial fixtures for policy approval gates, `.mv2` canonical memory, and repeated validation retry strategy.
 
+- `src/nested_memvid_agent/learned_routing.py` / `scripts/eval_memory_router.py`
+  - Existing ORACLE memory-routing eval remains rule/ledger calibrated.
+  - Adds behavior-delta shadow examples from the behavior-delta ledger: kind, target layer, risk, validation score, repeat count, explicit instruction signal, activation count, useful/failure/rollback/never-activated rates, and trigger specificity.
+  - `scripts/eval_memory_router.py --include-behavior-deltas --json` includes advisory counterfactuals only; authority is explicitly `shadow_only`, gate authority remains `mutation_gate`, and policy-write authority is `false`.
+
 - `src/nested_memvid_agent/state_store.py`
   - Schema version `11` adds:
     - `behavior_delta_ledger`
@@ -406,6 +411,8 @@ Skill candidate requirements:
 - Activation/outcome tracking remains tied to the originating delta.
 
 ### Phase 9: ORACLE shadow integration
+
+Status: first shadow-only behavior-delta utility slice implemented. Learned routing can now extract behavior-delta counterfactual examples from the delta ledger and include them in `eval_memory_router.py --include-behavior-deltas --json`. The output is advisory only: `authority=shadow_only`, `gate_authority=mutation_gate`, and `policy_write_authority=false`.
 
 Goal: include behavior-delta outcome features in learned-routing evaluation while keeping gates rule-based.
 
