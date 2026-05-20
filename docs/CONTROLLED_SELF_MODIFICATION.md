@@ -8,7 +8,7 @@ Core principle:
 Memory is not storage. Memory is a controlled, evidence-backed behavior-change system.
 ```
 
-This document is the repo-local foundation for the remaining controlled self-modification phases. It reflects the current Kestrel contracts after the initial behavior-delta schema and ledger slices.
+This document is the repo-local foundation for the remaining controlled self-modification phases. It reflects the current Kestrel contracts after the initial behavior-delta schema, ledger, proposal-extraction, and mutation-gate slices.
 
 ## Current baseline
 
@@ -33,6 +33,13 @@ Implemented foundation:
   - Vague candidates are rejected before they become `BehaviorDelta` objects.
   - Optional ledger recording is explicit; dry-run remains the CLI default for safe review.
 
+- `src/nested_memvid_agent/mutation_gate.py`
+  - Rule-based activation gate for proposed behavior deltas.
+  - Low-risk deltas stage without automatic activation.
+  - Medium-risk deltas require validation/replay before activation.
+  - Policy and approval-gate deltas require explicit instruction or reviewed-rule evidence, policy-layer targeting, policy activation enablement, replay pass, approval, exact-call approval, and rollback support.
+  - Critical deltas remain staged/recommendation-only unless explicitly enabled by a future caller path.
+
 - `src/nested_memvid_agent/state_store.py`
   - Schema version `11` adds:
     - `behavior_delta_ledger`
@@ -43,8 +50,8 @@ Still intentionally not implemented:
 
 - No runtime behavior compilation.
 - No automatic behavior-delta activation.
-- No mutation-gate activation decisions.
 - No replay validation.
+- No context-compiler integration with behavior deltas.
 - No policy-promotion behavior changes.
 - No hidden system-prompt rewrite path.
 - No replacement or weakening of the `.mv2` durable-memory contract.
@@ -112,9 +119,9 @@ The ledger owns durable control-plane state:
 
 The ledger must stay append-friendly. Rejections and failures are training data, not garbage.
 
-### Future `MutationGate`
+### `MutationGate`
 
-The mutation gate will decide whether a delta can be staged, rejected, or considered for activation. It should sit above `NestedLearningKernel`, not replace it.
+The mutation gate evaluates whether a behavior delta can remain staged, must be rejected, or has enough evidence to be considered active by a future caller. It sits above `NestedLearningKernel`, not in place of it.
 
 `NestedLearningKernel` answers:
 
@@ -227,6 +234,8 @@ python -m pytest -q tests/test_behavior_delta.py tests/test_behavior_delta_ledge
 ```
 
 ### Phase 4: Mutation gate
+
+Status: first backend slice implemented. `MutationGate` evaluates proposed deltas by risk, evidence, validation score, replay status, approval metadata, policy enablement, exact-call approval, and rollback support. It returns a `MutationDecision` only; it does not write the ledger, compile behavior, or alter runtime context.
 
 Goal: evaluate behavior deltas by risk, evidence, validation, approval, and rollback requirements.
 
