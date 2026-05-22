@@ -111,6 +111,11 @@ const autonomyOptions = [
   { value: "manual", label: "Manual" },
   { value: "autonomous", label: "Autopilot" }
 ];
+type PreparedToolPreview = {
+  name: string;
+  args: Record<string, unknown>;
+};
+const exactCallPreviewMessage = "Invoking this request will create or require approval before execution; it has not run yet.";
 const toolPermissionDefinitions = [
   {
     key: "allow_shell",
@@ -335,6 +340,7 @@ export function App() {
 
   const [toolName, setToolName] = useState("");
   const [toolArgs, setToolArgs] = useState("{}");
+  const [preparedToolPreview, setPreparedToolPreview] = useState<PreparedToolPreview | null>(null);
   const [toolResult, setToolResult] = useState<Record<string, unknown> | null>(null);
   const [toolFilter, setToolFilter] = useState("");
   const [toolSourceFilter, setToolSourceFilter] = useState("all");
@@ -1033,6 +1039,7 @@ export function App() {
     event.preventDefault();
     await guarded(async () => {
       const args = readJson<Record<string, unknown>>(toolArgs, {});
+      setPreparedToolPreview(null);
       const result = await postJson<Record<string, unknown>>(`/api/tools/${encodeURIComponent(toolName)}/invoke`, {
         arguments: args,
         session_id: activeRun?.session_id ?? "manual",
@@ -1777,6 +1784,7 @@ export function App() {
               onPrepareTool={(name, args) => {
                 setToolName(name);
                 setToolArgs(JSON.stringify(args, null, 2));
+                setPreparedToolPreview({ name, args });
               }}
             />
             <TaskList title="Approval blocked" tasks={taskGraph?.approval_blocked_tasks ?? []} onApprove={approveTask} />
@@ -2105,6 +2113,7 @@ export function App() {
                   value={toolName}
                   onChange={(event) => {
                     const selected = tools.find((tool) => tool.name === event.target.value);
+                    setPreparedToolPreview(null);
                     setToolName(event.target.value);
                     setToolArgs(JSON.stringify(schemaDefault(selected?.parameters), null, 2));
                   }}
@@ -2117,8 +2126,16 @@ export function App() {
               </Field>
 
               <Field label="Arguments JSON">
-                <textarea value={toolArgs} onChange={(event) => setToolArgs(event.target.value)} rows={8} />
+                <textarea
+                  value={toolArgs}
+                  onChange={(event) => {
+                    setPreparedToolPreview(null);
+                    setToolArgs(event.target.value);
+                  }}
+                  rows={8}
+                />
               </Field>
+              {preparedToolPreview && <ExactCallApprovalPreview preview={preparedToolPreview} />}
               <button type="submit" disabled={!toolName}>Invoke Tool</button>
             </form>
             <div className="field-row compact">
@@ -3105,6 +3122,20 @@ function SetupWizard({
         </form>
       </section>
     </div>
+  );
+}
+
+function ExactCallApprovalPreview({ preview }: { preview: PreparedToolPreview }) {
+  return (
+    <section aria-label="Exact-call approval preview" className="run-detail exact-call-preview">
+      <div className="run-title">
+        <h3>{`Prepared exact-call request: ${preview.name}`}</h3>
+        <StatusBadge value="not executed" />
+      </div>
+      <p>{exactCallPreviewMessage}</p>
+      <a className="btn subtle" href="#tools">Review prepared request in tool form</a>
+      <JsonBlock value={preview.args} maxHeight="180px" />
+    </section>
   );
 }
 
