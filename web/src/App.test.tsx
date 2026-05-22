@@ -396,11 +396,19 @@ describe("App", () => {
     const commitArgs = JSON.parse(toolArgsInput.value);
     expect(commitArgs).toMatchObject({ repair_review_id: "review_action123" });
     expect(String(commitArgs.message)).toContain("review_action123");
+    let preview = screen.getByLabelText("Exact-call approval preview");
+    expect(within(preview).getByText("Prepared exact-call request: git.commit")).toBeInTheDocument();
+    expect(within(preview).getByText("Invoking this request will create or require approval before execution; it has not run yet.")).toBeInTheDocument();
+    expect(within(preview).getByRole("link", { name: /review prepared request in tool form/i })).toHaveAttribute("href", "#tools");
+    expect(within(preview).getByText(/review_action123/)).toBeInTheDocument();
 
     fireEvent.click(within(panel).getByRole("button", { name: /prepare exact-call repair.rollback/i }));
     expect(screen.getByLabelText("Tool")).toHaveValue("repair.rollback");
     const rollbackArgs = JSON.parse(toolArgsInput.value);
     expect(rollbackArgs).toMatchObject({ review_id: "review_action123", reason: "Rollback reviewed repair review_action123" });
+    preview = screen.getByLabelText("Exact-call approval preview");
+    expect(within(preview).getByText("Prepared exact-call request: repair.rollback")).toBeInTheDocument();
+    expect(within(preview).getByText(/Rollback reviewed repair review_action123/)).toBeInTheDocument();
     expect(fetchSpy.mock.calls.some(([path, init]) => String(path).includes("/api/tools/") && init?.method === "POST")).toBe(false);
   });
 
