@@ -5,15 +5,20 @@ import json
 import os
 import sys
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from nested_memvid_agent.app_factory import build_agent
+from nested_memvid_agent.behavior_compiler import (
+    BehaviorCompiler,
+    BehaviorCompilerConfig,
+    BehaviorCompileRequest,
+)
 from nested_memvid_agent.behavior_delta import (
     BehaviorDelta,
     BehaviorDeltaKind,
@@ -23,7 +28,6 @@ from nested_memvid_agent.behavior_delta import (
     ValidationPlan,
 )
 from nested_memvid_agent.behavior_delta_ledger import BehaviorDeltaLedger
-from nested_memvid_agent.behavior_compiler import BehaviorCompileRequest, BehaviorCompiler, BehaviorCompilerConfig
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.llm.factory import build_llm_provider
 from nested_memvid_agent.llm.model_catalog import DEFAULT_API_KEY_ENVS, PROVIDER_OPTIONS

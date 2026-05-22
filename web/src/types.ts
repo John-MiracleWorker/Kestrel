@@ -448,4 +448,24 @@ export type SelfOnboardingSaveResult = {
   memory: Record<string, unknown>;
 };
 
+export type SetupReadinessStatus = "pass" | "warn" | "fail";
+
+export type SetupReadinessCheck = {
+  check_id: string;
+  title: string;
+  status: SetupReadinessStatus;
+  detail: string;
+  recovery: string;
+};
+
+export type SetupReadinessReport = {
+  schema: string;
+  ready: boolean;
+  pass_count: number;
+  warn_count: number;
+  fail_count: number;
+  checks: SetupReadinessCheck[];
+  next_action: string;
+};
+
 export type ApiResult = Record<string, unknown>;

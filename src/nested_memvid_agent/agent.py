@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -9,9 +9,9 @@ from typing import Any
 from uuid import uuid4
 
 from .behavior_compiler import (
-    BehaviorCompileRequest,
     BehaviorCompiler,
     BehaviorCompilerConfig,
+    BehaviorCompileRequest,
     CompiledBehavior,
     ToolPreflightContext,
 )
@@ -918,7 +918,7 @@ def _tool_touched_paths(arguments: dict[str, Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(path for path in paths if path))
 
 
-def _command_path_candidates(command: list[object]) -> list[str]:
+def _command_path_candidates(command: Sequence[object]) -> list[str]:
     candidates: list[str] = []
     for item in command:
         text = str(item)

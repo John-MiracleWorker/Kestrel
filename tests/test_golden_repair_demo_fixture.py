@@ -5,7 +5,6 @@ import subprocess  # nosec B404 - tests execute the local fixture in a temp copy
 import sys
 from pathlib import Path
 
-
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "examples" / "golden_repair_demo"
 
 

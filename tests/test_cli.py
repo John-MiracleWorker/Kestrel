@@ -11,7 +11,13 @@ from pytest import MonkeyPatch, raises
 
 from nested_memvid_agent.cli import _validate_server_bind, main
 from nested_memvid_agent.config import AgentConfig
-from nested_memvid_agent.models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
+from nested_memvid_agent.models import (
+    EvidenceRef,
+    MemoryKind,
+    MemoryLayer,
+    MemoryRecord,
+    RetrievalQuery,
+)
 from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.promotion_ledger import PromotionEntry, PromotionLedger
 from nested_memvid_agent.state_store import AgentStateStore
@@ -220,7 +226,10 @@ def test_learning_dashboard_subcommand_reports_headline_numbers(
         TriggerSpec,
         ValidationPlan,
     )
-    from nested_memvid_agent.behavior_delta_ledger import BehaviorDeltaActivation, BehaviorDeltaLedger
+    from nested_memvid_agent.behavior_delta_ledger import (
+        BehaviorDeltaActivation,
+        BehaviorDeltaLedger,
+    )
 
     state_path = tmp_path / "state.db"
     ledger = BehaviorDeltaLedger(AgentStateStore(state_path))

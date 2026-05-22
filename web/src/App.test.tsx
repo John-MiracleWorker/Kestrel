@@ -559,6 +559,12 @@ describe("App", () => {
     render(<App />);
 
     expect(await screen.findByRole("heading", { name: "Meet your Kestrel" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "First-run readiness" })).toBeInTheDocument();
+    expect(screen.getByText("5 pass · 2 warn · 1 fail")).toBeInTheDocument();
+    expect(screen.getByText("Provider configuration")).toBeInTheDocument();
+    expect(screen.getByText("Workspace")).toBeInTheDocument();
+    expect(screen.getByText("Fix failing setup checks before starting the golden local workflow.")).toBeInTheDocument();
+    expect(fetchSpy.mock.calls.some(([path]) => path === "/api/product/setup")).toBe(true);
     fireEvent.change(screen.getByLabelText("Agent name"), { target: { value: "Northstar" } });
     fireEvent.change(screen.getByLabelText("Your name"), { target: { value: "Taylor" } });
     fireEvent.change(screen.getByLabelText("What should it call you?"), { target: { value: "Tay" } });
@@ -883,6 +889,39 @@ function payloadFor(path: string): unknown {
       profile: onboardingProfile,
       personas: personaPayload(),
       reflection: onboardingProfile ? "Relevant Soul/self memory: Kestrel onboarding profile" : "No validated Soul/self memory matched the query yet."
+    };
+  }
+  if (path === "/api/product/setup") {
+    return {
+      schema: "kestrel.setup_readiness.v1",
+      ready: false,
+      pass_count: 5,
+      warn_count: 2,
+      fail_count: 1,
+      next_action: "Fix failing setup checks before starting the golden local workflow.",
+      checks: [
+        {
+          check_id: "provider_configuration",
+          title: "Provider configuration",
+          status: "pass",
+          detail: "Mock provider is selected, so deterministic first-run smoke tests can run without credentials.",
+          recovery: "Choose a live provider later and rerun setup readiness before claiming provider support."
+        },
+        {
+          check_id: "workspace",
+          title: "Workspace",
+          status: "fail",
+          detail: "Workspace `/tmp/missing` does not exist.",
+          recovery: "Create the workspace or pass `--workspace` pointing at the repo/project Kestrel should operate on."
+        },
+        {
+          check_id: "memory_storage",
+          title: "Memory storage",
+          status: "warn",
+          detail: "Memory directory is not present yet. Path: `/tmp/memory`.",
+          recovery: "Run `nest-agent init` or start a local run so Kestrel can initialize memory layers."
+        }
+      ]
     };
   }
   if (path === "/api/runtime/config") {

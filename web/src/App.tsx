@@ -69,6 +69,7 @@ import type {
   SelfOnboardingSaveResult,
   SelfOnboardingState,
   Session,
+  SetupReadinessReport,
   SecretRef,
   Skill,
   SkillDiscoveryReport,
@@ -257,6 +258,7 @@ export function App() {
   const [runtimeSettingsResult, setRuntimeSettingsResult] = useState<Record<string, unknown> | null>(null);
   const [selfState, setSelfState] = useState<SelfState | null>(null);
   const [onboardingState, setOnboardingState] = useState<SelfOnboardingState | null>(null);
+  const [setupReadiness, setSetupReadiness] = useState<SetupReadinessReport | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
   const [setupDismissed, setSetupDismissed] = useState(() => localStorage.getItem(SETUP_DISMISSED_KEY) === "1");
   const [setupDraft, setSetupDraft] = useState<SetupDraft>(emptySetupDraft);
@@ -687,10 +689,24 @@ export function App() {
 
   async function refreshAll() {
     await refreshSummary();
-    const [runtimeConfig, selfSnapshot, onboardingSnapshot, logList, lessonList, failureList, deltaReport, learningReport] = await Promise.all([
+    const [
+      runtimeConfig,
+      selfSnapshot,
+      onboardingSnapshot,
+      setupReadinessReport,
+      logList,
+      lessonList,
+      failureList,
+      deltaReport,
+      learningReport
+    ] = await Promise.all([
       getJson<RuntimeConfig>("/api/runtime/config"),
       getJson<SelfState>("/api/self"),
       getJson<SelfOnboardingState>("/api/self/onboarding"),
+      getJson<SetupReadinessReport>("/api/product/setup").catch((error) => {
+        reportError(error);
+        return null;
+      }),
       getJson<AgentLogEvent[]>("/api/logs?limit=120"),
       getJson<{ items: Array<Record<string, unknown>> }>("/api/cognition/lessons?k=20"),
       getJson<{ items: Array<Record<string, unknown>> }>("/api/cognition/failures?k=20"),
@@ -706,6 +722,7 @@ export function App() {
     setRuntime(runtimeConfig);
     setSelfState(selfSnapshot);
     setOnboardingState(onboardingSnapshot);
+    setSetupReadiness(setupReadinessReport);
     const savedSettings = runtimeSettingsFrom(runtimeConfig);
     setProvider(String(savedSettings.provider ?? runtimeConfig.provider?.name ?? "mock"));
     setModel(String(savedSettings.model ?? runtimeConfig.provider?.model ?? "mock"));
@@ -2912,6 +2929,7 @@ export function App() {
           draft={setupDraft}
           personas={personaPresets}
           existingProfile={onboardingProfile}
+          setupReadiness={setupReadiness}
           userDisplayName={userDisplayName}
           onChange={setSetupDraft}
           onSubmit={saveSetup}
@@ -2926,6 +2944,7 @@ function SetupWizard({
   draft,
   personas,
   existingProfile,
+  setupReadiness,
   userDisplayName,
   onChange,
   onSubmit,
@@ -2934,6 +2953,7 @@ function SetupWizard({
   draft: SetupDraft;
   personas: PersonaPreset[];
   existingProfile: OnboardingProfile | null;
+  setupReadiness: SetupReadinessReport | null;
   userDisplayName: string;
   onChange: (draft: SetupDraft) => void;
   onSubmit: (event: FormEvent) => void;
@@ -2960,6 +2980,32 @@ function SetupWizard({
         </header>
 
         <form className="setup-grid" onSubmit={onSubmit}>
+          <div className="setup-section setup-readiness-panel">
+            <h2>First-run readiness</h2>
+            {setupReadiness ? (
+              <>
+                <div className="readiness-summary">
+                  <StatusBadge value={setupReadiness.ready ? "ready" : "not ready"} />
+                  <span>{setupReadiness.pass_count} pass · {setupReadiness.warn_count} warn · {setupReadiness.fail_count} fail</span>
+                </div>
+                <p className="setup-hint">{setupReadiness.next_action}</p>
+                <div className="readiness-check-list">
+                  {setupReadiness.checks.slice(0, 4).map((check) => (
+                    <article className="readiness-check" key={check.check_id}>
+                      <div>
+                        <strong>{check.title}</strong>
+                        <p>{check.detail}</p>
+                      </div>
+                      <StatusBadge value={check.status} />
+                    </article>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <EmptyState>Setup readiness has not loaded yet.</EmptyState>
+            )}
+          </div>
+
           <div className="setup-section">
             <h2>Names</h2>
             <div className="field-row">

@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 from pytest import MonkeyPatch
 
-from nested_memvid_agent.behavior_delta import BehaviorDeltaKind, BehaviorDeltaRisk, BehaviorDeltaStatus
+from nested_memvid_agent.behavior_delta import (
+    BehaviorDeltaKind,
+    BehaviorDeltaRisk,
+    BehaviorDeltaStatus,
+)
 from nested_memvid_agent.behavior_delta_extractor import (
     BehaviorDeltaExtractor,
     extract_behavior_deltas_from_capsule,

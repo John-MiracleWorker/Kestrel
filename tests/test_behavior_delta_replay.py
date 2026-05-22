@@ -5,7 +5,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from scripts.eval_behavior_deltas import evaluate_behavior_delta_agent_scenario, evaluate_behavior_delta_scenario, load_scenario
+from scripts.eval_behavior_deltas import (
+    evaluate_behavior_delta_agent_scenario,
+    evaluate_behavior_delta_scenario,
+    load_scenario,
+)
 
 
 def test_policy_replay_passes_with_delta_and_baseline_scores_lower() -> None:

@@ -408,7 +408,7 @@ class BehaviorDeltaLedger:
                 delta_ids,
             ).fetchall()
         activated_delta_ids = {str(row["delta_id"]) for row in activation_rows if int(row["count"]) > 0}
-        outcome_counts = Counter({kind: 0 for kind in OUTCOME_KINDS})
+        outcome_counts: Counter[str] = Counter({kind: 0 for kind in OUTCOME_KINDS})
         for row in outcome_rows:
             outcome_counts[str(row["outcome"])] += int(row["count"])
         return BehaviorDeltaSummary(
@@ -416,7 +416,7 @@ class BehaviorDeltaLedger:
             active_deltas=sum(1 for delta in deltas if delta.status == BehaviorDeltaStatus.ACTIVE),
             activated_deltas=len(activated_delta_ids),
             never_activated=len(deltas) - len(activated_delta_ids),
-            outcome_counts=dict(outcome_counts),
+            outcome_counts={str(kind): count for kind, count in outcome_counts.items()},
         )
     def report_deltas(self, *, since: datetime | str | None = None) -> BehaviorDeltaReport:
         cutoff = _coerce_datetime(since)
@@ -427,7 +427,7 @@ class BehaviorDeltaLedger:
             in_scope = _is_at_or_after(delta.created_at, cutoff) or bool(activations) or bool(outcomes)
             if not in_scope:
                 continue
-            counts = Counter({kind: 0 for kind in OUTCOME_KINDS})
+            counts: Counter[str] = Counter({kind: 0 for kind in OUTCOME_KINDS})
             for outcome in outcomes:
                 counts[outcome.outcome] += 1
             rows.append(
@@ -439,7 +439,7 @@ class BehaviorDeltaLedger:
                     risk=delta.risk.value,
                     status=delta.status.value,
                     activation_count=len(activations),
-                    outcome_counts=dict(counts),
+                    outcome_counts={str(kind): count for kind, count in counts.items()},
                     never_activated=len(activations) == 0,
                     last_activated_at=activations[-1].activated_at if activations else None,
                     last_outcome_at=outcomes[-1].recorded_at if outcomes else None,
@@ -552,7 +552,7 @@ def _summary_from_report_rows(rows: list[BehaviorDeltaReportRow]) -> BehaviorDel
             never_activated=0,
             outcome_counts={kind: 0 for kind in OUTCOME_KINDS},
         )
-    counts = Counter({kind: 0 for kind in OUTCOME_KINDS})
+    counts: Counter[str] = Counter({kind: 0 for kind in OUTCOME_KINDS})
     for row in rows:
         counts.update(row.outcome_counts)
     return BehaviorDeltaSummary(
@@ -560,7 +560,7 @@ def _summary_from_report_rows(rows: list[BehaviorDeltaReportRow]) -> BehaviorDel
         active_deltas=sum(1 for row in rows if row.status == BehaviorDeltaStatus.ACTIVE.value),
         activated_deltas=sum(1 for row in rows if row.activation_count > 0),
         never_activated=sum(1 for row in rows if row.never_activated),
-        outcome_counts=dict(counts),
+        outcome_counts={str(kind): count for kind, count in counts.items()},
     )
 
 

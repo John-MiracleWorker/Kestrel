@@ -13,9 +13,9 @@ sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from nested_memvid_agent.behavior_compiler import (  # noqa: E402
-    BehaviorCompileRequest,
     BehaviorCompiler,
     BehaviorCompilerConfig,
+    BehaviorCompileRequest,
 )
 from nested_memvid_agent.behavior_delta import BehaviorDeltaStatus  # noqa: E402
 from nested_memvid_agent.behavior_delta_extractor import BehaviorDeltaExtractor  # noqa: E402
