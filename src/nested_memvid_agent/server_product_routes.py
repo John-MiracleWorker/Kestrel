@@ -18,11 +18,11 @@ def register_product_routes(
     router = APIRouter()
     dependencies = [Depends(auth_dependency)] if auth_dependency is not None else []
 
-    @router.get("/api/product/readiness", dependencies=dependencies)  # type: ignore[misc]
+    @router.get("/api/product/readiness", dependencies=dependencies)
     def product_readiness() -> dict[str, object]:
         return build_product_readiness_report().to_dict()
 
-    @router.get("/api/product/setup", dependencies=dependencies)  # type: ignore[misc]
+    @router.get("/api/product/setup", dependencies=dependencies)
     def product_setup() -> dict[str, object]:
         config = active_config() if active_config is not None else AgentConfig.from_env()
         return build_setup_readiness_report(config).to_dict()

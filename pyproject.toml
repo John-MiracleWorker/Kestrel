@@ -53,3 +53,7 @@ exclude = ["build", "dist"]
 [[tool.mypy.overrides]]
 module = ["uvicorn"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["numpy", "sentence_transformers"]
+ignore_missing_imports = true

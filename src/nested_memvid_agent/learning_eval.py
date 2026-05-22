@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 from .app_factory import build_agent
@@ -63,15 +63,14 @@ class LearningEvalStep:
     artifacts: dict[str, str] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, Any]:
-        return redact_secrets(
-            {
-                "name": self.name,
-                "status": self.status,
-                "message": self.message,
-                "metrics": self.metrics,
-                "artifacts": self.artifacts,
-            }
-        )
+        payload = {
+            "name": self.name,
+            "status": self.status,
+            "message": self.message,
+            "metrics": self.metrics,
+            "artifacts": self.artifacts,
+        }
+        return cast(dict[str, Any], redact_secrets(payload))
 
 
 @dataclass(frozen=True)
@@ -256,7 +255,7 @@ class LearningEvalResult:
             "outcomes": list(self.outcomes),
             "failures": list(self.failures),
         }
-        return redact_secrets(payload)
+        return cast(dict[str, Any], redact_secrets(payload))
 
 
 @dataclass(frozen=True)
@@ -288,7 +287,7 @@ class LearningEvalReport:
             "results": [result.to_payload() for result in self.results],
             "report_path": str(self.report_path) if self.report_path else None,
         }
-        return redact_secrets(payload)
+        return cast(dict[str, Any], redact_secrets(payload))
 
 
 class EvalLimitExceeded(RuntimeError):
@@ -477,8 +476,8 @@ def run_learning_eval(scenario: LearningEvalScenario, options: LearningEvalOptio
 
     status: StageStatus = "fail" if failures or any(stage.status == "fail" for stage in stages) else "pass"
     report = ctx.ledger.report_deltas().to_payload()
-    activation_payloads = []
-    outcome_payloads = []
+    activation_payloads: list[dict[str, Any]] = []
+    outcome_payloads: list[dict[str, Any]] = []
     for delta in ctx.ledger.list_deltas():
         activation_payloads.extend(item.to_payload() for item in ctx.ledger.list_activations(delta.id))
         outcome_payloads.extend(item.to_payload() for item in ctx.ledger.list_outcomes(delta.id))
@@ -748,7 +747,8 @@ def _stage_mutation_gate(ctx: _RunContext) -> LearningEvalStep:
         decision = decisions[delta.id]
         if decision.status == BehaviorDeltaStatus.ACTIVE and not ctx.scenario.controlled_activation:
             continue
-        if ctx.ledger.get_delta(delta.id) is not None and ctx.ledger.get_delta(delta.id).status != decision.status:
+        stored_delta = ctx.ledger.get_delta(delta.id)
+        if stored_delta is not None and stored_delta.status != decision.status:
             ctx.ledger.update_delta_status(delta.id, decision.status, reason=f"learning eval mutation gate: {decision.reason}")
     expected = ctx.scenario.expected_gate_status
     observed = {decision.status.value for decision in decisions.values()}
@@ -1252,11 +1252,19 @@ def _optional_str(value: object) -> str | None:
 
 
 def _optional_int(value: object) -> int | None:
-    return None if value is None else int(value)
+    if value is None:
+        return None
+    if isinstance(value, str | bytes | bytearray | int | float):
+        return int(value)
+    raise TypeError(f"expected int-compatible value, got {type(value).__name__}")
 
 
 def _optional_float(value: object) -> float | None:
-    return None if value is None else float(value)
+    if value is None:
+        return None
+    if isinstance(value, str | bytes | bytearray | int | float):
+        return float(value)
+    raise TypeError(f"expected float-compatible value, got {type(value).__name__}")
 
 
 def _usage_cost(usage: dict[str, Any]) -> float:
@@ -1269,8 +1277,8 @@ def _usage_cost(usage: dict[str, Any]) -> float:
 
 def _error_message(exc: Exception) -> str:
     if isinstance(exc, ProviderError):
-        return redact_secrets(f"provider error ({exc.code}): {exc}")
-    return redact_secrets(f"{type(exc).__name__}: {exc}")
+        return cast(str, redact_secrets(f"provider error ({exc.code}): {exc}"))
+    return cast(str, redact_secrets(f"{type(exc).__name__}: {exc}"))
 
 
 _SECRET_PATTERNS = (
