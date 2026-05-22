@@ -2601,6 +2601,41 @@ textarea.input {
   margin: 0;
 }
 
+.setup-readiness-panel {
+  background: rgba(79, 70, 229, 0.06);
+}
+
+.readiness-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.readiness-check-list {
+  display: grid;
+  gap: 10px;
+}
+
+.readiness-check {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+}
+
+.readiness-check p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
 .setup-actions {
   padding: 18px 32px 24px;
   display: flex;
