@@ -1,0 +1,9 @@
+diff --git a/src/demo_math/calculator.py b/src/demo_math/calculator.py
+--- a/src/demo_math/calculator.py
++++ b/src/demo_math/calculator.py
+@@ -7,4 +7,4 @@ def add(left: int, right: int) -> int:
+ 
+ def subtract(left: int, right: int) -> int:
+     # Seeded defect: subtraction should subtract the right operand.
+-    return left + right
++    return left - right
