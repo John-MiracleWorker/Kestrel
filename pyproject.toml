@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [{ name = "Nested Learning Agent scaffold" }]
-dependencies = []
+dependencies = ["numpy>=1.26"]
 
 [project.optional-dependencies]
 memvid = ["memvid-sdk>=2.0"]
@@ -33,7 +33,7 @@ nested_memvid_agent = ["prompts/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 addopts = "-q"
 
 [tool.ruff]
