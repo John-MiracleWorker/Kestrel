@@ -2022,6 +2022,58 @@ def test_repair_scheduler_tasks_use_git_worktree_by_default(tmp_path: Path) -> N
     assert persisted.result["worker_isolation"]["workspace"] == isolation["workspace"]
 
 
+def test_repair_scheduler_tasks_reuse_one_git_worktree_across_repair_dag(tmp_path: Path) -> None:
+    if shutil.which("git") is None:
+        raise AssertionError("git is required for repair isolation tests")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "kestrel@example.test")
+    _git(repo, "config", "user.name", "Kestrel Test")
+    (repo / "README.md").write_text("shared repair workspace\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "initial")
+
+    manager = _manager(
+        tmp_path,
+        enable_autonomous_scheduler=True,
+        max_scheduler_tasks=2,
+        max_scheduler_cycles=5,
+    )
+    manager.config = AgentConfig(
+        **{
+            **manager.config.__dict__,
+            "workspace": repo,
+            "worker_worktree_dir": tmp_path / "worker-worktrees",
+            "enable_worker_isolation": False,
+        }
+    )
+    run = manager.create_run(
+        message="Fix a failing test, validate it, and commit it",
+        session_id="session",
+        workspace=repo,
+    )
+    blocked = _wait_for_status(manager, run.run_id, {"completed", "failed", "blocked"})
+    assert blocked["status"] == "blocked"
+    graph = manager.task_graph(run.run_id)
+    prepare_task = graph["approval_blocked_tasks"][0]
+    assert prepare_task["title"] == "Prepare repair isolation"
+
+    prepare_result = manager.approve_task(run.run_id, str(prepare_task["task_id"]))
+    prepare_isolation = prepare_result["scheduler"]["executed"][0]["worker_isolation"]
+    next_graph = manager.task_graph(run.run_id)
+    patch_task = next_graph["approval_blocked_tasks"][0]
+    assert patch_task["title"] == "Apply repair patch"
+
+    patch_result = manager.approve_task(run.run_id, str(patch_task["task_id"]))
+    patch_isolation = patch_result["scheduler"]["executed"][0]["worker_isolation"]
+
+    assert patch_isolation["workspace"] == prepare_isolation["workspace"]
+    assert patch_isolation["branch"] == prepare_isolation["branch"]
+    assert patch_isolation["worker_id"] == prepare_isolation["worker_id"] == "repair"
+    assert len(list((tmp_path / "worker-worktrees" / run.run_id).iterdir())) == 1
+
+
 def test_run_manager_trace_includes_context_memory_and_tool_events(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     run = manager.create_run(message="hello", session_id="session")
