@@ -799,12 +799,13 @@ class RunManager:
         worktree_root = config.worker_worktree_dir
         if not worktree_root.is_absolute():
             worktree_root = run_workspace / worktree_root
+        isolation_worker_id = "repair" if task is not None and _task_requires_default_worker_isolation(task) else worker_id
         isolation = prepare_git_worktree(
             workspace=run_workspace,
             worktree_root=worktree_root,
             branch_prefix=config.worker_branch_prefix,
             run_id=run_id,
-            worker_id=worker_id,
+            worker_id=isolation_worker_id,
         )
         payload = isolation.to_payload()
         self.events.publish(run_id, "worker.isolated", payload)

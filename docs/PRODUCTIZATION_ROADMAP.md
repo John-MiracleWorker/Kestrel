@@ -268,7 +268,7 @@ Tasks:
 2. Add first-run setup wizard checks for provider, memory, workspace, and permissions. ✅ Non-secret CLI/API setup readiness checks now load into the guided UI setup wizard.
 3. Create a demo repo fixture with known failure and expected repair. ✅ `examples/golden_repair_demo` seeds a deterministic failing test plus expected fix patch.
 4. Finish branch/worktree isolated repair run as the default for code modification. ✅ Repair/code-modification scheduler tasks now default to git worktree isolation when the workspace supports worktrees.
-5. Persist a coherent repair workspace across the full repair DAG instead of creating a separate worker worktree per isolated task.
+5. Persist a coherent repair workspace across the full repair DAG instead of creating a separate worker worktree per isolated task. ✅ Repair DAG tasks now reuse one coherent git worktree for the run.
 6. Add patch review UI with validation and rollback state.
 7. Add support bundle export.
 
