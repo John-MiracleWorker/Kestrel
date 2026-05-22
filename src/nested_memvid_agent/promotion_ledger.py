@@ -128,11 +128,166 @@ class LedgerSummary:
         }
 
 
+
+@dataclass(frozen=True)
+class LearningDashboardHeadline:
+    auto_activations: int
+    rollbacks: int
+    false_positive_rate: float
+    activations_then_rolled_back: int
+    average_time_to_rollback_hours: float | None
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "auto_activations": self.auto_activations,
+            "rollbacks": self.rollbacks,
+            "false_positive_rate": round(self.false_positive_rate, 4),
+            "activations_then_rolled_back": self.activations_then_rolled_back,
+            "average_time_to_rollback_hours": self.average_time_to_rollback_hours,
+        }
+
+
+@dataclass(frozen=True)
+class LearningDashboardLayer:
+    layer: MemoryLayer
+    activations: int
+    auto_activations: int
+    rollbacks: int
+    false_positive_rate: float
+    activations_then_rolled_back: int
+    average_time_to_rollback_hours: float | None
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "layer": self.layer.value,
+            "activations": self.activations,
+            "auto_activations": self.auto_activations,
+            "rollbacks": self.rollbacks,
+            "false_positive_rate": round(self.false_positive_rate, 4),
+            "activations_then_rolled_back": self.activations_then_rolled_back,
+            "average_time_to_rollback_hours": self.average_time_to_rollback_hours,
+        }
+
+
+@dataclass(frozen=True)
+class LearningDashboard:
+    since: str | None
+    headline: LearningDashboardHeadline
+    layers: tuple[LearningDashboardLayer, ...]
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "since": self.since,
+            "headline": self.headline.to_payload(),
+            "layers": [layer.to_payload() for layer in self.layers],
+        }
+
 class PromotionLedger:
     """SQLite-backed promotion ledger stored in the existing AgentStateStore DB."""
 
     def __init__(self, state: AgentStateStore) -> None:
         self.state = state
+
+
+    def learning_dashboard(self, since: datetime | None = None) -> LearningDashboard:
+        """Aggregate behavior-delta learning activity for operator dashboards.
+
+        This is read-only scaffolding for autonomous-learning rollout stages. It
+        derives headline and per-layer metrics from existing behavior-delta
+        tables and does not mutate runtime behavior or schema.
+        """
+        since_raw = since.isoformat() if since else None
+        with self.state._connect() as conn:
+            deltas = conn.execute(
+                "SELECT delta_id, target_layer FROM behavior_delta_ledger"
+            ).fetchall()
+            delta_layers = {str(row["delta_id"]): MemoryLayer(str(row["target_layer"])) for row in deltas}
+            activation_query = "SELECT delta_id, activation_reason, activated_at FROM behavior_delta_activations"
+            activation_params: list[object] = []
+            if since_raw is not None:
+                activation_query += " WHERE activated_at >= ?"
+                activation_params.append(since_raw)
+            activations = conn.execute(activation_query, activation_params).fetchall()
+            outcome_query = "SELECT delta_id, outcome, recorded_at FROM behavior_delta_outcomes"
+            outcome_params: list[object] = []
+            if since_raw is not None:
+                outcome_query += " WHERE recorded_at >= ?"
+                outcome_params.append(since_raw)
+            outcomes = conn.execute(outcome_query, outcome_params).fetchall()
+
+        layer_stats: dict[MemoryLayer, dict[str, Any]] = {}
+        activated_delta_ids: set[str] = set()
+        auto_delta_ids: set[str] = set()
+        activation_times: dict[str, list[datetime]] = defaultdict(list)
+        for row in activations:
+            delta_id = str(row["delta_id"])
+            layer = delta_layers.get(delta_id)
+            if layer is None:
+                continue
+            stats = layer_stats.setdefault(layer, _empty_learning_layer_stats())
+            stats["activations"] += 1
+            activated_delta_ids.add(delta_id)
+            reason = str(row["activation_reason"]).lower()
+            if reason.startswith("auto_") or "auto_activated" in reason:
+                stats["auto_activations"] += 1
+                auto_delta_ids.add(delta_id)
+            activation_times[delta_id].append(_parse_time(str(row["activated_at"])))
+
+        false_positive_delta_ids: set[str] = set()
+        rolled_back_delta_ids: set[str] = set()
+        rollback_hours: list[float] = []
+        for row in outcomes:
+            delta_id = str(row["delta_id"])
+            layer = delta_layers.get(delta_id)
+            if layer is None:
+                continue
+            stats = layer_stats.setdefault(layer, _empty_learning_layer_stats())
+            outcome = str(row["outcome"])
+            if outcome in {"caused_failure", "contradicted"}:
+                stats["false_positive_delta_ids"].add(delta_id)
+                false_positive_delta_ids.add(delta_id)
+            if outcome == "rolled_back":
+                stats["rollbacks"] += 1
+                stats["rolled_back_delta_ids"].add(delta_id)
+                rolled_back_delta_ids.add(delta_id)
+                recorded_at = _parse_time(str(row["recorded_at"]))
+                prior = [item for item in activation_times.get(delta_id, []) if item <= recorded_at]
+                if prior:
+                    hours = max((recorded_at - max(prior)).total_seconds() / 3600, 0.0)
+                    stats["rollback_hours"].append(hours)
+                    rollback_hours.append(hours)
+
+        layers: list[LearningDashboardLayer] = []
+        for layer, stats in sorted(layer_stats.items(), key=lambda item: item[0].value):
+            activated_count = max(1, len({delta_id for delta_id in delta_layers if delta_layers[delta_id] == layer and delta_id in activated_delta_ids}))
+            layer_rollback_hours = stats["rollback_hours"]
+            layers.append(
+                LearningDashboardLayer(
+                    layer=layer,
+                    activations=int(stats["activations"]),
+                    auto_activations=int(stats["auto_activations"]),
+                    rollbacks=int(stats["rollbacks"]),
+                    false_positive_rate=round(len(stats["false_positive_delta_ids"]) / activated_count, 4),
+                    activations_then_rolled_back=len(stats["rolled_back_delta_ids"]),
+                    average_time_to_rollback_hours=(
+                        round(sum(layer_rollback_hours) / len(layer_rollback_hours), 2) if layer_rollback_hours else None
+                    ),
+                )
+            )
+        denominator = max(1, len(activated_delta_ids))
+        return LearningDashboard(
+            since=since_raw,
+            headline=LearningDashboardHeadline(
+                auto_activations=sum(row.auto_activations for row in layers),
+                rollbacks=sum(row.rollbacks for row in layers),
+                false_positive_rate=round(len(false_positive_delta_ids) / denominator, 4),
+                activations_then_rolled_back=len(rolled_back_delta_ids),
+                average_time_to_rollback_hours=(
+                    round(sum(rollback_hours) / len(rollback_hours), 2) if rollback_hours else None
+                ),
+            ),
+            layers=tuple(layers),
+        )
 
     def record_promotion(self, entry: PromotionEntry) -> None:
         with self.state._connect() as conn:
@@ -308,6 +463,17 @@ def make_outcome(
         recorded_at=utc_now(),
     )
 
+
+
+def _empty_learning_layer_stats() -> dict[str, Any]:
+    return {
+        "activations": 0,
+        "auto_activations": 0,
+        "rollbacks": 0,
+        "false_positive_delta_ids": set(),
+        "rolled_back_delta_ids": set(),
+        "rollback_hours": [],
+    }
 
 def _entry_from_row(row: Any) -> PromotionEntry:
     return PromotionEntry(

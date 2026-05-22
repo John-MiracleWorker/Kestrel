@@ -14,6 +14,7 @@ from .mcp_manager import MCPManager
 from .models import MemoryLayer, RetrievalQuery
 from .orchestrator import build_memory_system
 from .plugin_manager import PluginError, PluginManager
+from .promotion_ledger import PromotionLedger
 from .run_manager import RunManager
 from .runtime_settings import (
     RuntimeSettingsStore,
@@ -102,6 +103,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
             ToolInvokeRequest,
         )
         from .server_observability_routes import register_observability_routes
+        from .server_product_routes import register_product_routes
         from .server_runtime_routes import register_runtime_routes
         from .server_secret_routes import register_secret_routes
         from .server_tool_routes import register_tool_routes, tool_invoke_response
@@ -261,6 +263,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         http_exception=HTTPException,
         secret_broker=secret_broker,
     )
+    register_product_routes(app)
     register_channel_routes(
         app,
         http_exception=HTTPException,
@@ -348,6 +351,12 @@ def create_app(config: AgentConfig | None = None) -> Any:
         runs=runs,
     )
     register_behavior_delta_routes(app, http_exception=HTTPException, ledger=BehaviorDeltaLedger(state))
+
+
+    @app.get("/api/learning/dashboard")  # type: ignore[untyped-decorator]
+    def learning_dashboard(since: str = "30d") -> dict[str, object]:
+        ledger = PromotionLedger(state)
+        return ledger.learning_dashboard(since=_parse_since_window(since)).to_payload()
 
     register_tool_routes(app, runs=runs)
 
@@ -876,3 +885,22 @@ def create_app(config: AgentConfig | None = None) -> Any:
             return FileResponse(web_dist / "index.html")
 
     return app
+
+
+def _parse_since_window(raw: str | None) -> Any:
+    from datetime import UTC, datetime, timedelta
+
+    if raw is None:
+        return datetime.now(UTC) - timedelta(days=30)
+    value = raw.strip()
+    if not value or value.lower() in {"all", "all-time", "all_time"}:
+        return None
+    now = datetime.now(UTC)
+    if value.endswith("d") and value[:-1].isdigit():
+        return now - timedelta(days=int(value[:-1]))
+    if value.endswith("h") and value[:-1].isdigit():
+        return now - timedelta(hours=int(value[:-1]))
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)

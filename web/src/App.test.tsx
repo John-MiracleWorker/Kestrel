@@ -194,6 +194,32 @@ describe("App", () => {
     expect(results.violations).toEqual([]);
   });
 
+  it("renders Stitch command-center cockpit surfaces", async () => {
+    const { container } = render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Ask Kestrel" })).toBeInTheDocument();
+    expect(container.querySelector(".stitch-command-deck")).toBeInTheDocument();
+    expect(screen.getByText("Command Center")).toBeInTheDocument();
+    expect(screen.getByText("Task Capsules")).toBeInTheDocument();
+    expect(screen.getByText("Mutation Gate")).toBeInTheDocument();
+    expect(screen.getByText("ORACLE Shadow")).toBeInTheDocument();
+    expect(screen.getByText("Kernel")).toBeInTheDocument();
+    expect(screen.getByText("Registry")).toBeInTheDocument();
+  });
+
+
+  it("renders the Learning Dashboard panel under behavior deltas", async () => {
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+
+    expect(await screen.findByRole("heading", { name: "Learning Dashboard" })).toBeInTheDocument();
+    expect(screen.getByText("Auto-activations")).toBeInTheDocument();
+    expect(screen.getByText("Activations then rolled back"));
+    expect(screen.getByText("procedural"));
+  });
+
   it("creates a new local thread and sends without manual session, provider, or model fields", async () => {
     const fetchSpy = vi.mocked(fetch);
     render(<App />);
@@ -522,7 +548,7 @@ describe("App", () => {
     expect(within(panel).getByText("Policy-safe workflow")).toBeInTheDocument();
     expect(within(panel).getByText("delta_policy_gate_check")).toBeInTheDocument();
     expect(within(panel).getByText("active · policy · high")).toBeInTheDocument();
-    expect(within(panel).getByText("1 activations")).toBeInTheDocument();
+    expect(within(panel).getAllByText("1 activations").length).toBeGreaterThan(0);
     expect(within(panel).getByText("Useful 100% · Failure 0% · Rollback 0%")).toBeInTheDocument();
     expect(within(panel).getByText("Mutation actions require exact-call approval and MutationGate review."));
   });
@@ -771,6 +797,31 @@ function payloadFor(path: string): unknown {
   if (path === "/api/plugins") return [];
   if (path === "/api/channels") return [];
   if (path === "/api/secrets") return secrets;
+
+
+  if (path === "/api/learning/dashboard?since=all") {
+    return {
+      since: null,
+      headline: {
+        auto_activations: 1,
+        rollbacks: 0,
+        false_positive_rate: 0,
+        activations_then_rolled_back: 0,
+        average_time_to_rollback_hours: null
+      },
+      layers: [
+        {
+          layer: "procedural",
+          activations: 1,
+          auto_activations: 1,
+          rollbacks: 0,
+          false_positive_rate: 0,
+          activations_then_rolled_back: 0,
+          average_time_to_rollback_hours: null
+        }
+      ]
+    };
+  }
 
   if (path === "/api/memory/deltas?since=all") {
     return {

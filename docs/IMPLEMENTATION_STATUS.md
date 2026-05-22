@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-05-20
+Last updated: 2026-05-21
 
 This repository is a working local agent scaffold, not a finished Hermes/OpenClaw agent. The status below is intentionally literal so future Codex passes can harden the right layers without treating roadmap items as done.
 
@@ -71,6 +71,8 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Explicit `/search <query>` and `/memory search <query>` commands route deterministically to `memory.search`, reducing live-provider tool-choice variance for operator/eval search tasks.
 - `scripts/run_live_learning_eval.py` provides an isolated live-provider learning/safety E2E harness covering provider smoke, durable memory reopen, correction frames, NestedLearningKernel gates, task-capsule extraction, approval blocking, and behavior-delta activation logging.
 - `scripts/eval_learning_architecture.py` provides the integrated learning-architecture eval harness for setup, provider smoke, agent turn, `complete.mv2` capsule, behavior-delta proposal extraction, MutationGate decisions, replay comparison, behavior compilation, tool-aware preflight activation, outcome ledger recording, and rollback verification. Mock runs are deterministic; live OpenAI/OpenAI-compatible runs are skipped by default behind `RUN_LIVE_LEARNING_EVALS=1`, call/cost/time guards, and report redaction.
+- Stage 1 autonomous-learning hardening is landed as observability/config scaffolding only: `nest-agent learning dashboard`, `GET /api/learning/dashboard`, and the Advanced web Learning Dashboard render existing behavior-delta activation/outcome aggregates, while new autonomous flags (`enable_auto_activate_low_risk_deltas`, `enable_auto_skill_materialization`, `enable_auto_consolidation_shadow`, `enable_auto_consolidation_apply`, `enable_diagnosis_to_patch`) remain default-off.
+- Productization tracking now has a canonical roadmap (`docs/PRODUCTIZATION_ROADMAP.md`) plus a read-only product-readiness report exposed through `nest-agent product readiness` and `GET /api/product/readiness`; it classifies local stability, golden repair, learning, auth/workspaces, sandboxing, provider certification, UX, operations, channels, and metrics as ready/partial/missing without changing runtime behavior.
 - Ollama Cloud with `gpt-oss:120b` has been locally validated through live learning E2E and full golden evals on both memory and Memvid backends.
 
 ## Partially Implemented

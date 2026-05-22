@@ -11,7 +11,7 @@ from pytest import MonkeyPatch, raises
 
 from nested_memvid_agent.cli import _validate_server_bind, main
 from nested_memvid_agent.config import AgentConfig
-from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
+from nested_memvid_agent.models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.promotion_ledger import PromotionEntry, PromotionLedger
 from nested_memvid_agent.state_store import AgentStateStore
@@ -173,6 +173,61 @@ def test_memory_ledger_subcommand_reports_promotions(
     assert "Promotion ledger" in output
     assert "episodic->procedural" in output
     assert "False-positive rate" in output
+
+
+def test_learning_dashboard_subcommand_reports_headline_numbers(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object
+) -> None:
+    from nested_memvid_agent.behavior_delta import (
+        BehaviorDelta,
+        BehaviorDeltaKind,
+        BehaviorDeltaRisk,
+        BehaviorDeltaStatus,
+        TriggerSpec,
+        ValidationPlan,
+    )
+    from nested_memvid_agent.behavior_delta_ledger import BehaviorDeltaActivation, BehaviorDeltaLedger
+
+    state_path = tmp_path / "state.db"
+    ledger = BehaviorDeltaLedger(AgentStateStore(state_path))
+    delta = BehaviorDelta(
+        id="delta-cli-auto",
+        title="CLI auto",
+        kind=BehaviorDeltaKind.PROCEDURE,
+        target_layer=MemoryLayer.PROCEDURAL,
+        risk=BehaviorDeltaRisk.LOW,
+        status=BehaviorDeltaStatus.ACTIVE,
+        trigger=TriggerSpec(task_types=("debugging",)),
+        behavior_change="Use the safer retry procedure.",
+        evidence_refs=(EvidenceRef(source="test", locator="fixture"),),
+        validation_plan=ValidationPlan(),
+        metadata={"draft": True},
+    )
+    ledger.record_delta(delta)
+    ledger.record_activation(
+        BehaviorDeltaActivation(
+            id="act-cli",
+            delta_id=delta.id,
+            run_id="run-cli",
+            task_id=None,
+            objective="debug",
+            activated_at="2026-05-21T00:00:00+00:00",
+            activation_reason="auto_activated_low_risk_threshold_met",
+            compiled_section="ACTIVE PROCEDURES",
+        )
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["nest-agent", "learning", "dashboard", "--state-path", str(state_path), "--since", "all"],
+    )
+
+    main()
+
+    output = capsys.readouterr().out
+    assert "Learning dashboard" in output
+    assert "Auto-activations: 1" in output
+    assert "procedural" in output
 
 
 def test_tools_subcommand_lists_risk_levels(monkeypatch: MonkeyPatch, capsys: object) -> None:
@@ -687,3 +742,26 @@ def test_chat_help_slash_command(tmp_path: Path, monkeypatch: MonkeyPatch, capsy
     assert "Available slash commands:" in output
     assert "/status" in output
     assert "/approve <approval_id>" in output
+
+
+def test_product_readiness_subcommand_reports_status(monkeypatch: MonkeyPatch, capsys: object) -> None:
+    monkeypatch.setattr(sys, "argv", ["nest-agent", "product", "readiness"])
+
+    main()
+
+    output = capsys.readouterr().out
+    assert "Product readiness" in output
+    assert "Product ready: no" in output
+    assert "Production auth, users, and workspaces: missing" in output
+    assert "Safe autonomous learning: partial" in output
+
+
+def test_product_readiness_subcommand_can_emit_json(monkeypatch: MonkeyPatch, capsys: object) -> None:
+    monkeypatch.setattr(sys, "argv", ["nest-agent", "product", "readiness", "--json"])
+
+    main()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == "kestrel.product_readiness.v1"
+    assert payload["headline"]["product_ready"] is False
+    assert any(category["category_id"] == "golden_repair_workflow" for category in payload["categories"])

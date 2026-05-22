@@ -23,6 +23,11 @@ TOOL_PERMISSION_FIELDS = {
     "allow_executable_skills",
     "allow_web",
     "allow_self_modification",
+    "enable_auto_activate_low_risk_deltas",
+    "enable_auto_skill_materialization",
+    "enable_auto_consolidation_shadow",
+    "enable_auto_consolidation_apply",
+    "enable_diagnosis_to_patch",
 }
 
 
@@ -46,6 +51,11 @@ class RuntimeSettings:
     allow_executable_skills: bool = False
     allow_web: bool = False
     allow_self_modification: bool = False
+    enable_auto_activate_low_risk_deltas: bool = False
+    enable_auto_skill_materialization: bool = False
+    enable_auto_consolidation_shadow: bool = False
+    enable_auto_consolidation_apply: bool = False
+    enable_diagnosis_to_patch: bool = False
     updated_at: str | None = None
 
     @classmethod
@@ -69,6 +79,11 @@ class RuntimeSettings:
             allow_executable_skills=config.allow_executable_skills,
             allow_web=config.allow_web,
             allow_self_modification=config.allow_self_modification,
+            enable_auto_activate_low_risk_deltas=config.enable_auto_activate_low_risk_deltas,
+            enable_auto_skill_materialization=config.enable_auto_skill_materialization,
+            enable_auto_consolidation_shadow=config.enable_auto_consolidation_shadow,
+            enable_auto_consolidation_apply=config.enable_auto_consolidation_apply,
+            enable_diagnosis_to_patch=config.enable_diagnosis_to_patch,
         )
 
     @classmethod
@@ -137,6 +152,11 @@ def apply_runtime_settings(config: AgentConfig, settings: RuntimeSettings) -> Ag
         allow_executable_skills=settings.allow_executable_skills,
         allow_web=settings.allow_web,
         allow_self_modification=settings.allow_self_modification,
+        enable_auto_activate_low_risk_deltas=settings.enable_auto_activate_low_risk_deltas,
+        enable_auto_skill_materialization=settings.enable_auto_skill_materialization,
+        enable_auto_consolidation_shadow=settings.enable_auto_consolidation_shadow,
+        enable_auto_consolidation_apply=settings.enable_auto_consolidation_apply,
+        enable_diagnosis_to_patch=settings.enable_diagnosis_to_patch,
         # `require_api_auth` is launch-time security policy and must not be
         # overridden by persisted runtime settings.
     )
@@ -193,6 +213,11 @@ def _normalize_settings(settings: RuntimeSettings) -> RuntimeSettings:
         allow_executable_skills=_clean_bool(settings.allow_executable_skills),
         allow_web=_clean_bool(settings.allow_web),
         allow_self_modification=_clean_bool(settings.allow_self_modification),
+        enable_auto_activate_low_risk_deltas=_clean_bool(settings.enable_auto_activate_low_risk_deltas),
+        enable_auto_skill_materialization=_clean_bool(settings.enable_auto_skill_materialization),
+        enable_auto_consolidation_shadow=_clean_bool(settings.enable_auto_consolidation_shadow),
+        enable_auto_consolidation_apply=_clean_bool(settings.enable_auto_consolidation_apply),
+        enable_diagnosis_to_patch=_clean_bool(settings.enable_diagnosis_to_patch),
         updated_at=str(settings.updated_at) if settings.updated_at else None,
     )
 

@@ -181,7 +181,7 @@ Landed:
 - Approval routes.
 - Memory/context routes.
 - Skills registry and upload/install path.
-- Behavior-delta review API, approval-gated actions, and web review panel.
+- Behavior-delta review API, approval-gated actions, web review panel, read-only Learning Dashboard aggregates, and read-only product-readiness report API.
 - Managed stdio MCP sessions and gated integration fixture.
 - Multi-channel ingress and generic HMAC webhook verification.
 - Local bearer/API-key auth option.

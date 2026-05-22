@@ -257,6 +257,65 @@ def test_full_server_behavior_delta_review_action_cycle_is_audited(tmp_path: Pat
     assert listed_after.json()["deltas"][0]["outcome_counts"]["rolled_back"] == 1
 
 
+def test_full_server_learning_dashboard_reports_empty_and_auth_required(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("NEST_AGENT_API_TOKEN", "test-token")
+    config = AgentConfig(
+        state_path=tmp_path / "agent.db",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        secret_store_path=tmp_path / "secrets.json",
+        skills_dir=tmp_path / "skills",
+        plugins_dir=tmp_path / "plugins",
+        mcp_config_path=tmp_path / "mcp.json",
+        channel_config_path=tmp_path / "channels.json",
+        require_api_auth=True,
+    )
+    client = TestClient(create_app(config))
+
+    unauthorized = client.get("/api/learning/dashboard")
+    authorized = client.get("/api/learning/dashboard", headers={"X-Kestrel-API-Key": "test-token"})
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+    assert authorized.json()["headline"]["auto_activations"] == 0
+    assert authorized.json()["layers"] == []
+
+
+def test_full_server_learning_dashboard_reports_behavior_delta_activity(tmp_path: Path) -> None:
+    config = AgentConfig(
+        state_path=tmp_path / "agent.db",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        secret_store_path=tmp_path / "secrets.json",
+        skills_dir=tmp_path / "skills",
+        plugins_dir=tmp_path / "plugins",
+        mcp_config_path=tmp_path / "mcp.json",
+        channel_config_path=tmp_path / "channels.json",
+    )
+    ledger = BehaviorDeltaLedger(AgentStateStore(config.state_path))
+    delta = _delta("delta_dashboard", kind=BehaviorDeltaKind.PROCEDURE, status=BehaviorDeltaStatus.ACTIVE)
+    ledger.record_delta(delta)
+    ledger.record_activation(
+        BehaviorDeltaActivation(
+            id="act-dashboard",
+            delta_id=delta.id,
+            run_id="run-dashboard",
+            task_id=None,
+            objective="debug",
+            activated_at="2026-05-21T00:00:00+00:00",
+            activation_reason="auto_activated_low_risk_threshold_met",
+            compiled_section="ACTIVE PROCEDURES",
+        )
+    )
+    client = TestClient(create_app(config))
+
+    response = client.get("/api/learning/dashboard", params={"since": "all"})
+
+    assert response.status_code == 200
+    assert response.json()["headline"]["auto_activations"] == 1
+    assert response.json()["layers"][0]["layer"] == "procedural"
+
+
 def _client(ledger: BehaviorDeltaLedger) -> TestClient:
     app = FastAPI()
     register_behavior_delta_routes(app, http_exception=HTTPException, ledger=ledger)
@@ -287,3 +346,25 @@ def _delta(delta_id: str, *, kind: BehaviorDeltaKind, status: BehaviorDeltaStatu
             min_repeat_count=1,
         ),
     )
+
+
+def test_full_server_product_readiness_route_reports_product_gap(tmp_path: Path) -> None:
+    config = AgentConfig(
+        state_path=tmp_path / "agent.db",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        secret_store_path=tmp_path / "secrets.json",
+        skills_dir=tmp_path / "skills",
+        plugins_dir=tmp_path / "plugins",
+        mcp_config_path=tmp_path / "mcp.json",
+        channel_config_path=tmp_path / "channels.json",
+    )
+    client = TestClient(create_app(config))
+
+    response = client.get("/api/product/readiness")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schema"] == "kestrel.product_readiness.v1"
+    assert payload["headline"]["product_ready"] is False
+    assert any(category["category_id"] == "production_auth_workspaces" for category in payload["categories"])

@@ -30,6 +30,7 @@ from .mcp_manager import MCPManager
 from .models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from .orchestrator import build_memory_system
 from .plugin_manager import PluginError, PluginManager
+from .product_readiness import build_product_readiness_report
 from .promotion_ledger import OUTCOME_KINDS, PromotionLedger
 from .run_manager import RunManager
 from .runtime_models import LLMStreamEvent, ToolCall
@@ -200,6 +201,19 @@ def main() -> None:
     deltas_skill_preview.add_argument("--skills-dir", type=Path, default=Path(".nest/skills"))
     deltas_skill_preview.add_argument("--skill-id")
     deltas_skill_preview.add_argument("--json", action="store_true")
+
+
+    learning_cmd = sub.add_parser("learning")
+    learning_sub = learning_cmd.add_subparsers(dest="learning_cmd", required=True)
+    learning_dashboard = learning_sub.add_parser("dashboard")
+    learning_dashboard.add_argument("--state-path", type=Path, default=Path(".nest/state/agent.db"))
+    learning_dashboard.add_argument("--since", default="30d")
+    learning_dashboard.add_argument("--json", action="store_true")
+
+    product_cmd = sub.add_parser("product")
+    product_sub = product_cmd.add_subparsers(dest="product_cmd", required=True)
+    product_readiness = product_sub.add_parser("readiness")
+    product_readiness.add_argument("--json", action="store_true")
 
     compile_cmd = sub.add_parser("compile-context")
     _add_common_args(compile_cmd)
@@ -437,6 +451,14 @@ def main() -> None:
 
     if args.cmd == "eval":
         _run_eval_command(config)
+        return
+
+    if args.cmd == "learning" and args.learning_cmd == "dashboard":
+        _print_learning_dashboard(args)
+        return
+
+    if args.cmd == "product" and args.product_cmd == "readiness":
+        _print_product_readiness(args)
         return
 
     if args.cmd == "memory" and args.memory_cmd == "ledger":
@@ -724,6 +746,53 @@ def _handle_behavior_deltas_command(args: argparse.Namespace) -> None:
         _print_behavior_delta_skill_preview(args)
         return
     raise SystemExit(f"Unknown behavior-delta command: {args.deltas_cmd}")
+
+
+def _print_learning_dashboard(args: argparse.Namespace) -> None:
+    ledger = PromotionLedger(AgentStateStore(args.state_path))
+    dashboard = ledger.learning_dashboard(since=_parse_since(args.since))
+    payload = dashboard.to_payload()
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return
+    scope = f"last {args.since}" if _parse_since(args.since) is not None else "all time"
+    headline = payload["headline"]
+    print(f"Learning dashboard - {scope}")
+    print(f"Auto-activations: {headline['auto_activations']}")
+    print(f"Rollbacks: {headline['rollbacks']}")
+    print(f"False-positive rate: {headline['false_positive_rate']:.1%}")
+    print(f"Activations then rolled back: {headline['activations_then_rolled_back']}")
+    avg = headline["average_time_to_rollback_hours"]
+    print(f"Average time to rollback: {'n/a' if avg is None else str(avg) + 'h'}")
+    if not payload["layers"]:
+        print("No learning activity recorded.")
+        return
+    print()
+    print(f"{'Layer':<14} {'Acts':>5} {'Auto':>5} {'Rollbacks':>10} {'FP Rate':>8}")
+    for row in payload["layers"]:
+        print(
+            f"{row['layer']:<14} {row['activations']:>5} {row['auto_activations']:>5} "
+            f"{row['rollbacks']:>10} {row['false_positive_rate']:>7.1%}"
+        )
+
+
+def _print_product_readiness(args: argparse.Namespace) -> None:
+    report = build_product_readiness_report()
+    payload = report.to_dict()
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return
+    headline = payload["headline"]
+    print("Product readiness")
+    print(f"Product ready: {'yes' if headline['product_ready'] else 'no'}")
+    print(
+        f"Categories: {headline['ready_count']} ready, "
+        f"{headline['partial_count']} partial, {headline['missing_count']} missing"
+    )
+    print()
+    for category in payload["categories"]:
+        print(f"{category['title']}: {category['status']}")
+        print(f"  Next: {category['next_action']}")
 
 
 def _print_behavior_delta_skill_preview(args: argparse.Namespace) -> None:

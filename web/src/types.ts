@@ -252,6 +252,27 @@ export type BehaviorDeltaReport = {
   recommendations: string[];
 };
 
+
+export type LearningDashboard = {
+  since?: string | null;
+  headline: {
+    auto_activations: number;
+    rollbacks: number;
+    false_positive_rate: number;
+    activations_then_rolled_back: number;
+    average_time_to_rollback_hours?: number | null;
+  };
+  layers: Array<{
+    layer: string;
+    activations: number;
+    auto_activations: number;
+    rollbacks: number;
+    false_positive_rate: number;
+    activations_then_rolled_back: number;
+    average_time_to_rollback_hours?: number | null;
+  }>;
+};
+
 export type MemoryHit = {
   layer: string;
   kind: string;

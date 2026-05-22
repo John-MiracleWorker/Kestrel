@@ -201,6 +201,16 @@ Raw expansion happens through `context.expand` when needed rather than dumping f
 
 Behavior-delta runtime wiring is default-off via `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=0`. When enabled, active relevant deltas are compiled into structured runtime instructions, activation rows are logged once per run/delta, and tool-aware preflight passes advisory instructions through the tool context without bypassing capability flags or exact-call approval gates. Proposed/staged deltas are never auto-activated, and policy-affecting deltas still require MutationGate approval, exact-call review actions, evidence, validation, and rollback metadata.
 
+Stage 1 autonomous-learning hardening adds read-only observability and kill-switch scaffolding only. `/api/learning/dashboard` and `nest-agent learning dashboard` aggregate existing behavior-delta activation/outcome rows into headline counts (auto-activations, rollbacks, false-positive rate, activations-then-rolled-back, average time-to-rollback) plus per-layer breakdowns. No schema migration or runtime behavior change is introduced by the dashboard.
+
+Autonomous-learning rollout flags currently default off:
+
+- `enable_auto_activate_low_risk_deltas` / `NEST_AGENT_ENABLE_AUTO_ACTIVATE_LOW_RISK_DELTAS=0`: future gate for LOW-risk behavior-delta auto-activation after validation, replay, repeat evidence, and rollback checks. Rollback command when enabled: set `NEST_AGENT_ENABLE_AUTO_ACTIVATE_LOW_RISK_DELTAS=0`, restart, then roll back individual active deltas through the existing delta rollback endpoint/CLI.
+- `enable_auto_skill_materialization` / `NEST_AGENT_ENABLE_AUTO_SKILL_MATERIALIZATION=0`: future gate for instruction-runtime skill materialization from repeatedly successful procedures. Rollback command when enabled: set `NEST_AGENT_ENABLE_AUTO_SKILL_MATERIALIZATION=0`, restart, then disable/remove individual skills through the skills panel.
+- `enable_auto_consolidation_shadow` / `NEST_AGENT_ENABLE_AUTO_CONSOLIDATION_SHADOW=0`: future gate for end-of-run consolidation shadow decisions that do not write memory. Rollback command when enabled: set `NEST_AGENT_ENABLE_AUTO_CONSOLIDATION_SHADOW=0` and restart.
+- `enable_auto_consolidation_apply` / `NEST_AGENT_ENABLE_AUTO_CONSOLIDATION_APPLY=0`: future gate for applying validated consolidation decisions. It does not unlock policy writes. Rollback command when enabled: set `NEST_AGENT_ENABLE_AUTO_CONSOLIDATION_APPLY=0`, restart, then use existing promotion-ledger reversal tooling where available.
+- `enable_diagnosis_to_patch` / `NEST_AGENT_ENABLE_DIAGNOSIS_TO_PATCH=0`: future gate for diagnosis-to-patch DAG preparation. It does not auto-commit. Rollback command when enabled: set `NEST_AGENT_ENABLE_DIAGNOSIS_TO_PATCH=0`, restart, then clean up in-flight repair branches through existing `repair.rollback`.
+
 ## Scheduler and Subagents
 
 Background runs seed a root task and a small deterministic task DAG. The graph runtime records planner metadata on the root task, executes the chat loop through the executor node, gates completion through the reviewer node, and records recovery metadata when approvals or failures block progress. The scheduler can execute approved ready tasks when `enable_autonomous_scheduler` or `NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER` is enabled.

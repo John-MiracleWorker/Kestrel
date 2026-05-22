@@ -64,6 +64,11 @@ class AgentConfig:
     enable_auto_compact: bool = False
     auto_compact_apply: bool = False
     enable_behavior_deltas: bool = False
+    enable_auto_activate_low_risk_deltas: bool = False
+    enable_auto_skill_materialization: bool = False
+    enable_auto_consolidation_shadow: bool = False
+    enable_auto_consolidation_apply: bool = False
+    enable_diagnosis_to_patch: bool = False
     max_active_deltas_per_run: int = 8
     context_pack_token_budget: int = 6000
     context_pack_expand_raw: bool = False
@@ -159,6 +164,11 @@ class AgentConfig:
             enable_auto_compact=_env_bool("NEST_AGENT_ENABLE_AUTO_COMPACT"),
             auto_compact_apply=_env_bool("NEST_AGENT_AUTO_COMPACT_APPLY"),
             enable_behavior_deltas=_env_bool("NEST_AGENT_ENABLE_BEHAVIOR_DELTAS"),
+            enable_auto_activate_low_risk_deltas=_env_bool("NEST_AGENT_ENABLE_AUTO_ACTIVATE_LOW_RISK_DELTAS"),
+            enable_auto_skill_materialization=_env_bool("NEST_AGENT_ENABLE_AUTO_SKILL_MATERIALIZATION"),
+            enable_auto_consolidation_shadow=_env_bool("NEST_AGENT_ENABLE_AUTO_CONSOLIDATION_SHADOW"),
+            enable_auto_consolidation_apply=_env_bool("NEST_AGENT_ENABLE_AUTO_CONSOLIDATION_APPLY"),
+            enable_diagnosis_to_patch=_env_bool("NEST_AGENT_ENABLE_DIAGNOSIS_TO_PATCH"),
             max_active_deltas_per_run=_env_int("NEST_AGENT_MAX_ACTIVE_DELTAS_PER_RUN", 8),
             context_pack_token_budget=_env_int("NEST_AGENT_CONTEXT_PACK_TOKEN_BUDGET", 6000),
             context_pack_expand_raw=_env_bool("NEST_AGENT_CONTEXT_PACK_EXPAND_RAW"),

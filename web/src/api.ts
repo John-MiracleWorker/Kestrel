@@ -71,6 +71,10 @@ function safeParse(text: string): unknown {
   }
 }
 
+export async function getLearningDashboard<T>(since = "all"): Promise<T> {
+  return getJson<T>(`/api/learning/dashboard${queryString({ since })}`);
+}
+
 export function queryString(params: Record<string, string | number | boolean | null | undefined>): string {
   const search = new URLSearchParams();
   Object.entries(params).forEach(([key, value]) => {

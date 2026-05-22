@@ -31,7 +31,7 @@ import {
   X
 } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { ApiAuthError, deleteJson, getJson, postJson, putJson, queryString, subscribeJsonEvents } from "./api";
+import { ApiAuthError, deleteJson, getJson, getLearningDashboard, postJson, putJson, queryString, subscribeJsonEvents } from "./api";
 import { getApiToken, setApiToken } from "./auth";
 import { EmptyState, Field, InlineMeta, JsonBlock, Panel, StatusBadge } from "./components";
 import {
@@ -51,6 +51,7 @@ import type {
   ApiResult,
   Approval,
   BehaviorDeltaReport,
+  LearningDashboard,
   Channel,
   ContextPackResult,
   McpServer,
@@ -272,6 +273,8 @@ export function App() {
   const [memoryLayers, setMemoryLayers] = useState<MemoryLayerStatus[]>([]);
   const [behaviorDeltaReport, setBehaviorDeltaReport] = useState<BehaviorDeltaReport | null>(null);
   const [behaviorDeltaError, setBehaviorDeltaError] = useState<string | null>(null);
+  const [learningDashboard, setLearningDashboard] = useState<LearningDashboard | null>(null);
+  const [learningDashboardError, setLearningDashboardError] = useState<string | null>(null);
   const [lessons, setLessons] = useState<Array<Record<string, unknown>>>([]);
   const [failures, setFailures] = useState<Array<Record<string, unknown>>>([]);
   const [logs, setLogs] = useState<AgentLogEvent[]>([]);
@@ -684,7 +687,7 @@ export function App() {
 
   async function refreshAll() {
     await refreshSummary();
-    const [runtimeConfig, selfSnapshot, onboardingSnapshot, logList, lessonList, failureList, deltaReport] = await Promise.all([
+    const [runtimeConfig, selfSnapshot, onboardingSnapshot, logList, lessonList, failureList, deltaReport, learningReport] = await Promise.all([
       getJson<RuntimeConfig>("/api/runtime/config"),
       getJson<SelfState>("/api/self"),
       getJson<SelfOnboardingState>("/api/self/onboarding"),
@@ -693,6 +696,10 @@ export function App() {
       getJson<{ items: Array<Record<string, unknown>> }>("/api/cognition/failures?k=20"),
       getJson<BehaviorDeltaReport>("/api/memory/deltas?since=all").catch((error) => {
         setBehaviorDeltaError(error instanceof Error ? error.message : String(error));
+        return null;
+      }),
+      getLearningDashboard<LearningDashboard>("all").catch((error) => {
+        setLearningDashboardError(error instanceof Error ? error.message : String(error));
         return null;
       })
     ]);
@@ -715,6 +722,10 @@ export function App() {
     if (deltaReport) {
       setBehaviorDeltaReport(deltaReport);
       setBehaviorDeltaError(null);
+    }
+    if (learningReport) {
+      setLearningDashboard(learningReport);
+      setLearningDashboardError(null);
     }
   }
 
@@ -1339,6 +1350,10 @@ export function App() {
   const providerConfigured = Boolean(runtimeProvider.api_key_configured);
   const memoryBackend = memoryLayers.some((layer) => layer.backend.toLowerCase().includes("memvid")) ? "Memvid" : "In-memory";
   const statusSummary = `${memoryBackend.toLowerCase()} · ${provider} · ${autonomyLabel(autonomyMode)}`;
+  const activeDeltaCount = behaviorDeltaReport?.summary.active_deltas ?? 0;
+  const totalDeltaCount = behaviorDeltaReport?.summary.total_deltas ?? 0;
+  const pendingApprovalCount = approvals.filter((approval) => approval.status === "pending").length;
+  const oracleShadowLabel = `${events.filter((event) => event.type.includes("oracle") || event.type.includes("routing")).length} observations`;
   const onboardingProfile = onboardingState?.profile ?? null;
   const personaPresets = onboardingState?.personas?.length ? onboardingState.personas : defaultPersonaPresets;
   const agentDisplayName = String(onboardingProfile?.agent_name || selfState?.identity?.name || "Kestrel");
@@ -1396,11 +1411,17 @@ export function App() {
       <a className="skip-link" href="#workspace">Skip to workspace</a>
       <aside className="rail" aria-label="Threads">
         <div className="rail-head">
-          <h2>Threads <small>{threadSummaries.length}</small></h2>
+          <h2>Command Center <small>{threadSummaries.length}</small></h2>
           <button type="button" className="new-chat" onClick={createNewThread} title="New chat">
             <MessageCircle size={16} />
           </button>
         </div>
+        <nav className="stitch-rail-nav" aria-label="Runtime surfaces">
+          <button type="button" className="active" onClick={() => routeToSection("chat")}><TerminalSquare size={15} /> Kernel</button>
+          <button type="button" onClick={() => { routeToSection("advanced"); window.setTimeout(() => scrollToElement("memory"), 0); }}><Database size={15} /> Memory</button>
+          <button type="button" onClick={() => { routeToSection("advanced"); window.setTimeout(() => scrollToElement("tools"), 0); }}><PlugZap size={15} /> Registry</button>
+          <button type="button" onClick={() => { routeToSection("advanced"); window.setTimeout(() => scrollToElement("behavior-deltas"), 0); }}><GitBranch size={15} /> Ledger</button>
+        </nav>
         <div className="rail-search">
           <Search size={14} />
           <input type="text" placeholder="Search threads..." />
@@ -1452,6 +1473,28 @@ export function App() {
             </button>
           </div>
         </header>
+
+        <section className="stitch-command-deck" aria-label="Command Center">
+          <div className="stitch-hero-card">
+            <div>
+              <span className="stitch-kicker"><span aria-hidden="true"></span> Active Run</span>
+              <h2>{activeRun ? "Run selected" : "Ready for controlled work"}</h2>
+              <p>{activeRun ? `${activeRun.run_id} · ${activeRun.workspace || "configured workspace"}` : "Start a run, inspect evidence, or review gated mutations from one cockpit."}</p>
+            </div>
+            <StatusBadge value={activeRun?.status ?? "ready"} />
+          </div>
+          <div className="stitch-stat-grid">
+            <Metric label="Task Capsules" value={runs.length} />
+            <Metric label="Mutation Gate" value={`${activeDeltaCount}/${totalDeltaCount}`} />
+            <Metric label="Approvals" value={pendingApprovalCount} />
+            <Metric label="Tools Online" value={enabledToolCount} />
+          </div>
+          <div className="stitch-oracle-card">
+            <span className="stitch-kicker"><Route size={13} /> ORACLE Shadow</span>
+            <strong>{oracleShadowLabel}</strong>
+            <p>Routing remains advisory. Policy writes stay behind exact-call gates.</p>
+          </div>
+        </section>
 
         <div className="announcer" aria-live="polite">
           {notice}
@@ -1969,6 +2012,34 @@ export function App() {
                     <Metric label="Useful Rate" value={formatPercent(behaviorDeltaReport.summary.useful_rate)} />
                     <Metric label="Never Activated" value={behaviorDeltaReport.summary.never_activated} />
                   </div>
+
+                  <section aria-label="Learning Dashboard" className="run-detail">
+                    <h3>Learning Dashboard</h3>
+                    <p className="muted">Read-only rollout telemetry for autonomous learning defaults and rollback safety.</p>
+                    {learningDashboardError && <p className="danger-text">Learning dashboard unavailable: {learningDashboardError}</p>}
+                    {learningDashboard ? (
+                      <>
+                        <div className="metric-grid">
+                          <Metric label="Auto-activations" value={learningDashboard.headline.auto_activations} />
+                          <Metric label="Rollbacks" value={learningDashboard.headline.rollbacks} />
+                          <Metric label="FP Rate" value={formatPercent(learningDashboard.headline.false_positive_rate)} />
+                          <Metric label="Activations then rolled back" value={learningDashboard.headline.activations_then_rolled_back} />
+                        </div>
+                        <div className="list compact-list">
+                          {learningDashboard.layers.map((layer) => (
+                            <div className="data-row" key={layer.layer}>
+                              <strong>{layer.layer}</strong>
+                              <InlineMeta items={[`${layer.activations} activations`, `${layer.auto_activations} auto`, `${layer.rollbacks} rollbacks`]} />
+                              <p>{`False positives ${formatPercent(layer.false_positive_rate)} · rollback avg ${layer.average_time_to_rollback_hours ?? "n/a"}h`}</p>
+                            </div>
+                          ))}
+                          {learningDashboard.layers.length === 0 && <EmptyState>No learning dashboard activity recorded.</EmptyState>}
+                        </div>
+                      </>
+                    ) : (
+                      <EmptyState>Learning dashboard is loading.</EmptyState>
+                    )}
+                  </section>
                   <div className="list compact-list">
                     {behaviorDeltaReport.deltas.slice(0, 12).map((delta) => (
                       <div className="data-row" key={delta.delta_id}>

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from nested_memvid_agent.backends.in_memory import InMemoryBackend
 from nested_memvid_agent.layers import LayeredMemorySystem
-from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
+from nested_memvid_agent.models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord
 from nested_memvid_agent.promotion_ledger import PromotionEntry, PromotionLedger, PromotionOutcome
 from nested_memvid_agent.state_store import AgentStateStore
 
@@ -127,6 +127,114 @@ def test_ledger_summary_respects_since_layer_and_outcome_filters(tmp_path: Path)
     assert summary.rows[0].target_layer == MemoryLayer.PROCEDURAL
     assert summary.rows[0].promoted == 1
     assert summary.rows[0].outcome_counts["corrected"] == 1
+
+
+def test_learning_dashboard_aggregates_behavior_delta_outcomes_by_layer(tmp_path: Path) -> None:
+    from nested_memvid_agent.behavior_delta import (
+        BehaviorDelta,
+        BehaviorDeltaKind,
+        BehaviorDeltaRisk,
+        BehaviorDeltaStatus,
+        TriggerSpec,
+        ValidationPlan,
+    )
+    from nested_memvid_agent.behavior_delta_ledger import (
+        BehaviorDeltaActivation,
+        BehaviorDeltaLedger,
+        BehaviorDeltaOutcome,
+    )
+
+    state = AgentStateStore(tmp_path / "state.db")
+    delta_ledger = BehaviorDeltaLedger(state)
+    now = datetime.now(UTC)
+    auto_delta = BehaviorDelta(
+        id="delta-auto",
+        title="Retry safer",
+        kind=BehaviorDeltaKind.PROCEDURE,
+        target_layer=MemoryLayer.PROCEDURAL,
+        risk=BehaviorDeltaRisk.LOW,
+        status=BehaviorDeltaStatus.ACTIVE,
+        trigger=TriggerSpec(task_types=("debugging",)),
+        behavior_change="Change strategy before retrying validation.",
+        evidence_refs=(EvidenceRef(source="test", locator="fixture"),),
+        validation_plan=ValidationPlan(),
+        metadata={"draft": True},
+        created_at=(now - timedelta(hours=3)).isoformat(),
+        updated_at=(now - timedelta(hours=3)).isoformat(),
+    )
+    rolled_back_delta = BehaviorDelta(
+        id="delta-rolled",
+        title="Bad hint",
+        kind=BehaviorDeltaKind.PROCEDURE,
+        target_layer=MemoryLayer.SEMANTIC,
+        risk=BehaviorDeltaRisk.LOW,
+        status=BehaviorDeltaStatus.ROLLED_BACK,
+        trigger=TriggerSpec(task_types=("debugging",)),
+        behavior_change="Prefer a bad hint.",
+        evidence_refs=(EvidenceRef(source="test", locator="fixture"),),
+        validation_plan=ValidationPlan(),
+        metadata={"draft": True},
+        created_at=(now - timedelta(hours=2)).isoformat(),
+        updated_at=(now - timedelta(hours=2)).isoformat(),
+    )
+    delta_ledger.record_delta(auto_delta)
+    delta_ledger.record_delta(rolled_back_delta)
+    delta_ledger.record_activation(
+        BehaviorDeltaActivation(
+            id="act-auto",
+            delta_id=auto_delta.id,
+            run_id="run-1",
+            task_id=None,
+            objective="debug",
+            activated_at=(now - timedelta(hours=2)).isoformat(),
+            activation_reason="auto_activated_low_risk_threshold_met",
+            compiled_section="ACTIVE PROCEDURES",
+        )
+    )
+    delta_ledger.record_activation(
+        BehaviorDeltaActivation(
+            id="act-rolled",
+            delta_id=rolled_back_delta.id,
+            run_id="run-2",
+            task_id=None,
+            objective="debug",
+            activated_at=(now - timedelta(hours=1)).isoformat(),
+            activation_reason="operator activated",
+            compiled_section="ACTIVE PROCEDURES",
+        )
+    )
+    delta_ledger.record_outcome(
+        BehaviorDeltaOutcome(
+            id="out-rolled",
+            delta_id=rolled_back_delta.id,
+            run_id="run-2",
+            outcome="rolled_back",
+            notes="operator rollback",
+            recorded_at=now.isoformat(),
+        )
+    )
+    delta_ledger.record_outcome(
+        BehaviorDeltaOutcome(
+            id="out-failure",
+            delta_id=rolled_back_delta.id,
+            run_id="run-2",
+            outcome="caused_failure",
+            notes="false positive",
+            recorded_at=now.isoformat(),
+        )
+    )
+
+    dashboard = PromotionLedger(state).learning_dashboard(since=now - timedelta(days=1))
+
+    assert dashboard.headline.auto_activations == 1
+    assert dashboard.headline.rollbacks == 1
+    assert dashboard.headline.activations_then_rolled_back == 1
+    assert dashboard.headline.false_positive_rate == 0.5
+    assert dashboard.headline.average_time_to_rollback_hours == 1.0
+    by_layer = {row.layer: row for row in dashboard.layers}
+    assert by_layer[MemoryLayer.PROCEDURAL].auto_activations == 1
+    assert by_layer[MemoryLayer.SEMANTIC].rollbacks == 1
+    assert by_layer[MemoryLayer.SEMANTIC].false_positive_rate == 1.0
 
 
 def _entry(
