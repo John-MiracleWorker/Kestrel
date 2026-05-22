@@ -6,7 +6,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from nested_memvid_agent.config import AgentConfig
-from nested_memvid_agent.product_readiness import ProductReadinessStatus, build_product_readiness_report
+from nested_memvid_agent.product_readiness import (
+    ProductReadinessStatus,
+    build_product_readiness_report,
+)
 from nested_memvid_agent.server_product_routes import register_product_routes
 from nested_memvid_agent.setup_readiness import SetupReadinessStatus, build_setup_readiness_report
 

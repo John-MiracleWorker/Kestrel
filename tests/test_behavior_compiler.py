@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from nested_memvid_agent.behavior_compiler import (
+    BehaviorCompiler,
+    BehaviorCompilerConfig,
+    BehaviorCompileRequest,
+    ToolPreflightContext,
+)
 from nested_memvid_agent.behavior_delta import (
     BehaviorDelta,
     BehaviorDeltaKind,
@@ -11,12 +17,6 @@ from nested_memvid_agent.behavior_delta import (
     ValidationPlan,
 )
 from nested_memvid_agent.behavior_delta_ledger import BehaviorDeltaLedger
-from nested_memvid_agent.behavior_compiler import (
-    BehaviorCompiler,
-    BehaviorCompilerConfig,
-    BehaviorCompileRequest,
-    ToolPreflightContext,
-)
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.models import EvidenceRef, MemoryLayer
 from nested_memvid_agent.state_store import AgentStateStore

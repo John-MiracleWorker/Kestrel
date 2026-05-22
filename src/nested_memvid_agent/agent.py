@@ -9,9 +9,9 @@ from typing import Any
 from uuid import uuid4
 
 from .behavior_compiler import (
-    BehaviorCompileRequest,
     BehaviorCompiler,
     BehaviorCompilerConfig,
+    BehaviorCompileRequest,
     CompiledBehavior,
     ToolPreflightContext,
 )

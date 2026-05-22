@@ -7,6 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from nested_memvid_agent.behavior_delta_ledger import BehaviorDeltaLedger
 from nested_memvid_agent.learned_routing import (
     OutcomeCalibratedRouter,
     behavior_delta_shadow_examples_from_ledger,
@@ -14,7 +15,6 @@ from nested_memvid_agent.learned_routing import (
     evaluate_routing_examples,
     routing_examples_from_ledger,
 )
-from nested_memvid_agent.behavior_delta_ledger import BehaviorDeltaLedger
 from nested_memvid_agent.promotion_ledger import PromotionLedger
 from nested_memvid_agent.state_store import AgentStateStore
 

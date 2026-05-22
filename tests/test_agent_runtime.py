@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
+from pathlib import Path
 
 from nested_memvid_agent.agent import AgentDependencies, NestedMV2Agent
 from nested_memvid_agent.behavior_delta import (
@@ -34,10 +34,10 @@ from nested_memvid_agent.self_profile import (
     onboarding_record_content,
     soul_communication_contract_from_hits,
 )
+from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.tools.base import AgentTool, ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
 from nested_memvid_agent.tools.registry import ToolRegistry
-from nested_memvid_agent.state_store import AgentStateStore
 
 
 def test_default_communication_contract_rejects_flat_greeting_posture() -> None:

@@ -4,7 +4,6 @@ import json
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Any
 
 from .behavior_delta import (
     BehaviorDelta,

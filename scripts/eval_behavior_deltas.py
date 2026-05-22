@@ -13,9 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from nested_memvid_agent.app_factory import build_agent  # noqa: E402
 from nested_memvid_agent.behavior_compiler import (  # noqa: E402
-    BehaviorCompileRequest,
     BehaviorCompiler,
     BehaviorCompilerConfig,
+    BehaviorCompileRequest,
 )
 from nested_memvid_agent.behavior_delta import (  # noqa: E402
     BehaviorDelta,

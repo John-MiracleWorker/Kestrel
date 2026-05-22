@@ -73,8 +73,8 @@ def create_app(config: AgentConfig | None = None) -> Any:
         responses_module = import_module("starlette.responses")
         staticfiles_module = import_module("starlette.staticfiles")
         cors_module = import_module("starlette.middleware.cors")
-        from .server_channel_routes import register_channel_routes
         from .server_behavior_delta_routes import register_behavior_delta_routes
+        from .server_channel_routes import register_channel_routes
         from .server_diagnosis_routes import register_diagnosis_routes
         from .server_mcp_routes import register_mcp_routes
         from .server_models import (
