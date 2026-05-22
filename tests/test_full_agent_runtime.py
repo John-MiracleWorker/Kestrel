@@ -1972,6 +1972,56 @@ def test_autonomous_scheduler_blocks_for_task_approval_and_resumes(tmp_path: Pat
     assert next_blocked_titles == ["Apply repair patch"]
 
 
+def test_repair_scheduler_tasks_use_git_worktree_by_default(tmp_path: Path) -> None:
+    if shutil.which("git") is None:
+        raise AssertionError("git is required for repair isolation tests")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "kestrel@example.test")
+    _git(repo, "config", "user.name", "Kestrel Test")
+    (repo / "README.md").write_text("repair isolation\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "initial")
+
+    manager = _manager(
+        tmp_path,
+        enable_autonomous_scheduler=True,
+        max_scheduler_tasks=2,
+        max_scheduler_cycles=5,
+    )
+    manager.config = AgentConfig(
+        **{
+            **manager.config.__dict__,
+            "workspace": repo,
+            "worker_worktree_dir": tmp_path / "worker-worktrees",
+            "enable_worker_isolation": False,
+        }
+    )
+    run = manager.create_run(
+        message="Fix a failing test, validate it, and commit it",
+        session_id="session",
+        workspace=repo,
+    )
+    blocked = _wait_for_status(manager, run.run_id, {"completed", "failed", "blocked"})
+    assert blocked["status"] == "blocked"
+    graph = manager.task_graph(run.run_id)
+    prepare_task = graph["approval_blocked_tasks"][0]
+    assert prepare_task["title"] == "Prepare repair isolation"
+
+    approved = manager.approve_task(run.run_id, str(prepare_task["task_id"]))
+
+    executed = approved["scheduler"]["executed"]
+    assert executed[0]["status"] == "completed"
+    isolation = executed[0]["worker_isolation"]
+    assert isolation["mode"] == "git-worktree"
+    assert Path(isolation["workspace"]).exists()
+    assert isolation["branch"].startswith("kestrel/worker/")
+    persisted = manager.state.get_task_node(str(executed[0]["task_id"]))
+    assert persisted.result is not None
+    assert persisted.result["worker_isolation"]["workspace"] == isolation["workspace"]
+
+
 def test_run_manager_trace_includes_context_memory_and_tool_events(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     run = manager.create_run(message="hello", session_id="session")

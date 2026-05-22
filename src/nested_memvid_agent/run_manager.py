@@ -644,7 +644,7 @@ class RunManager:
         worker_isolation: dict[str, str] | None = None
         agent: NestedMV2Agent | None = None
         try:
-            config, worker_isolation = self._worker_config(config, run_id=run_id, worker_id=subagent_id)
+            config, worker_isolation = self._worker_config(config, run_id=run_id, worker_id=subagent_id, task_id=subagent.task_id)
             agent = self._build_agent(config)
             prompt = _subagent_prompt(subagent.profile, subagent.goal)
             result = agent.chat(
@@ -711,7 +711,7 @@ class RunManager:
         worker_isolation: dict[str, str] | None = None
         agent: NestedMV2Agent | None = None
         try:
-            config, worker_isolation = self._worker_config(config, run_id=run.run_id, worker_id=subagent.subagent_id)
+            config, worker_isolation = self._worker_config(config, run_id=run.run_id, worker_id=subagent.subagent_id, task_id=task.task_id)
             agent = self._build_agent(config)
             result = agent.chat(
                 _task_execution_prompt(task),
@@ -786,11 +786,16 @@ class RunManager:
         *,
         run_id: str,
         worker_id: str,
+        task_id: str | None = None,
     ) -> tuple[AgentConfig, dict[str, str] | None]:
-        if not config.enable_worker_isolation:
-            return config, None
         run = self.state.get_run(run_id)
         run_workspace = Path(run.workspace)
+        task = self.state.get_task_node(task_id) if task_id else None
+        should_isolate = config.enable_worker_isolation or (
+            task is not None and _task_requires_default_worker_isolation(task) and _workspace_supports_git_worktree(run_workspace)
+        )
+        if not should_isolate:
+            return config, None
         worktree_root = config.worker_worktree_dir
         if not worktree_root.is_absolute():
             worktree_root = run_workspace / worktree_root
@@ -1068,6 +1073,20 @@ def _task_scheduler_reason(task: TaskNodeRecord, by_id: dict[str, TaskNodeRecord
 
 def _dependencies_completed(task: TaskNodeRecord, by_id: dict[str, TaskNodeRecord]) -> bool:
     return all(by_id.get(dependency) and by_id[dependency].status == "completed" for dependency in task.dependencies)
+
+
+def _task_requires_default_worker_isolation(task: TaskNodeRecord) -> bool:
+    repair_tool_prefixes = ("repair.",)
+    code_mutation_tools = {"patch.apply", "git.commit", "git.create_local_branch", "git.export_patch"}
+    if any(tool.startswith(repair_tool_prefixes) or tool in code_mutation_tools for tool in task.required_tools):
+        return True
+    text = f"{task.title} {task.goal}".lower()
+    return "repair" in text and any(term in text for term in ("patch", "branch", "worktree", "commit", "validate"))
+
+
+def _workspace_supports_git_worktree(workspace: Path) -> bool:
+    git_marker = workspace / ".git"
+    return git_marker.exists()
 
 
 def _initial_task_plan(message: str) -> list[dict[str, Any]]:

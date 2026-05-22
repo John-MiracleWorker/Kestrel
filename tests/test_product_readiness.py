@@ -53,6 +53,11 @@ def test_product_readiness_category_payloads_include_evidence_and_next_actions()
     assert any("behavior" in item.lower() for item in learning.evidence)
     assert any("auto-activate" in item.lower() for item in learning.remaining_work)
 
+    repair = report.category("golden_repair_workflow")
+    assert repair.status == ProductReadinessStatus.PARTIAL
+    assert any("default" in item.lower() and "worktree" in item.lower() for item in repair.evidence)
+    assert not any("default" in item.lower() and "worktree" in item.lower() for item in repair.remaining_work)
+
 
 def test_product_readiness_report_serializes_to_public_dict() -> None:
     report = build_product_readiness_report()

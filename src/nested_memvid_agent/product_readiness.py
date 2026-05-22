@@ -99,12 +99,13 @@ def build_product_readiness_report() -> ProductReadinessReport:
             evidence=(
                 "Repair primitives, repair branch gates, review artifacts, rollback artifacts, and exact-call approval gates exist.",
                 "Task graph and scheduler records exist with planner/executor/reviewer/recovery nodes.",
+                "Repair/code-modification scheduler tasks now default to git worktree isolation when the workspace supports worktrees, even if general worker isolation is disabled.",
             ),
             remaining_work=(
-                "Make branch/worktree isolated repair the default for code-modification runs.",
                 "Complete patch proposal, validation, review, approval, commit, and optional PR flow in one polished path.",
+                "Persist one coherent repair workspace across the full repair DAG instead of treating each isolated worker as a separate slice.",
             ),
-            next_action="Create a demo repo fixture and an end-to-end repair workflow test that drives plan -> patch -> validation -> review -> approved commit.",
+            next_action="Drive the demo repo fixture through an end-to-end repair workflow test that proves plan -> patch -> validation -> review -> approved commit.",
         ),
         ProductReadinessCategory(
             category_id="safe_autonomous_learning",
