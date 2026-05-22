@@ -1772,7 +1772,13 @@ export function App() {
               <button type="button" disabled={!activeRun} onClick={() => runScheduler("step")}>Step</button>
               <button type="button" disabled={!activeRun} onClick={() => runScheduler("run")}>Run Until Idle</button>
             </div>
-            <RepairPatchReview tasks={taskGraph?.tasks ?? []} />
+            <RepairPatchReview
+              tasks={taskGraph?.tasks ?? []}
+              onPrepareTool={(name, args) => {
+                setToolName(name);
+                setToolArgs(JSON.stringify(args, null, 2));
+              }}
+            />
             <TaskList title="Approval blocked" tasks={taskGraph?.approval_blocked_tasks ?? []} onApprove={approveTask} />
             <TaskList title="Ready" tasks={taskGraph?.ready_tasks ?? []} onApprove={approveTask} />
             <TaskList title="All tasks" tasks={taskGraph?.tasks ?? []} onApprove={approveTask} />
@@ -3102,7 +3108,13 @@ function SetupWizard({
   );
 }
 
-function RepairPatchReview({ tasks }: { tasks: TaskNode[] }) {
+function RepairPatchReview({
+  tasks,
+  onPrepareTool
+}: {
+  tasks: TaskNode[];
+  onPrepareTool: (name: string, args: Record<string, unknown>) => void;
+}) {
   const repairTasks = tasks.filter((task) =>
     (task.required_tools ?? []).some((tool) => tool.startsWith("repair.") || tool === "git.commit")
   );
@@ -3128,6 +3140,19 @@ function RepairPatchReview({ tasks }: { tasks: TaskNode[] }) {
   const rollbackId = String(rollbackResult?.rollback_id ?? "pending");
   const restoredFiles = asStringArray(rollbackResult?.restored_files);
   const artifactPath = String(rollbackResult?.artifact_path ?? ".nest/repair_rollbacks");
+  const hasReviewArtifact = reviewId !== "pending";
+  const prepareCommit = () => {
+    onPrepareTool("git.commit", {
+      message: `repair: commit reviewed changes for ${reviewId}`,
+      repair_review_id: reviewId
+    });
+  };
+  const prepareRollback = () => {
+    onPrepareTool("repair.rollback", {
+      reason: `Rollback reviewed repair ${reviewId}`,
+      review_id: reviewId
+    });
+  };
 
   return (
     <section aria-label="Repair Patch Review" className="run-detail repair-review-panel">
@@ -3150,6 +3175,9 @@ function RepairPatchReview({ tasks }: { tasks: TaskNode[] }) {
             <InlineMeta items={[reviewTask.status, reviewTask.profile, commitApprovalRequired ? "exact-call commit approval" : "commit gate pending"]} />
             <p>{`Review gate: ${reviewId} · ${commitApprovalRequired ? "commit approval required" : "commit gate pending"}`}</p>
             <p>{`Diff ${diffHash} · ${changedFiles.length ? changedFiles.join(", ") : "no changed files recorded"}`}</p>
+            <button type="button" className="btn subtle" disabled={!hasReviewArtifact} onClick={prepareCommit}>
+              Prepare exact-call git.commit request
+            </button>
           </div>
         )}
         {rollbackTask && (
@@ -3158,6 +3186,9 @@ function RepairPatchReview({ tasks }: { tasks: TaskNode[] }) {
             <InlineMeta items={[rollbackTask.status, rollbackTask.risk, rollbackTask.approved ? "approved" : "approval required"]} />
             <p>{`Rollback state: ${rollbackTask.status} · ${rollbackId}`}</p>
             <p>{`Restores ${restoredFiles.length ? restoredFiles.join(", ") : "recorded repair files"} and preserves ${artifactPath}`}</p>
+            <button type="button" className="btn subtle" disabled={!hasReviewArtifact} onClick={prepareRollback}>
+              Prepare exact-call repair.rollback request
+            </button>
           </div>
         )}
       </div>
