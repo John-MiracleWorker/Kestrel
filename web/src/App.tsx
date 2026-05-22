@@ -1772,6 +1772,7 @@ export function App() {
               <button type="button" disabled={!activeRun} onClick={() => runScheduler("step")}>Step</button>
               <button type="button" disabled={!activeRun} onClick={() => runScheduler("run")}>Run Until Idle</button>
             </div>
+            <RepairPatchReview tasks={taskGraph?.tasks ?? []} />
             <TaskList title="Approval blocked" tasks={taskGraph?.approval_blocked_tasks ?? []} onApprove={approveTask} />
             <TaskList title="Ready" tasks={taskGraph?.ready_tasks ?? []} onApprove={approveTask} />
             <TaskList title="All tasks" tasks={taskGraph?.tasks ?? []} onApprove={approveTask} />
@@ -3099,6 +3100,82 @@ function SetupWizard({
       </section>
     </div>
   );
+}
+
+function RepairPatchReview({ tasks }: { tasks: TaskNode[] }) {
+  const repairTasks = tasks.filter((task) =>
+    (task.required_tools ?? []).some((tool) => tool.startsWith("repair.") || tool === "git.commit")
+  );
+  if (repairTasks.length === 0) return null;
+
+  const validationTask = repairTasks.find((task) => taskUsesTool(task, "repair.validate") || taskUsesTool(task, "repair.orchestrate_validate"));
+  const reviewTask = repairTasks.find((task) => taskUsesTool(task, "repair.review"));
+  const rollbackTask = repairTasks.find((task) => taskUsesTool(task, "repair.rollback"));
+
+  const validationResult = validationTask?.result ?? null;
+  const validation = readRecord(validationResult?.validation);
+  const validationSuccess = validation?.success === true;
+  const validationCommand = formatCommand(validation?.command);
+
+  const reviewResult = reviewTask?.result ?? null;
+  const reviewId = String(reviewResult?.review_id ?? "pending");
+  const diffHash = String(reviewResult?.diff_hash ?? "pending");
+  const changedFiles = asStringArray(reviewResult?.changed_files);
+  const commitGate = readRecord(reviewResult?.commit_gate);
+  const commitApprovalRequired = commitGate?.approval_required_before_commit === true;
+
+  const rollbackResult = rollbackTask?.result ?? null;
+  const rollbackId = String(rollbackResult?.rollback_id ?? "pending");
+  const restoredFiles = asStringArray(rollbackResult?.restored_files);
+  const artifactPath = String(rollbackResult?.artifact_path ?? ".nest/repair_rollbacks");
+
+  return (
+    <section aria-label="Repair Patch Review" className="run-detail repair-review-panel">
+      <div className="run-title">
+        <h3>Repair Patch Review</h3>
+        <StatusBadge value={reviewTask?.status ?? validationTask?.status ?? "pending"} />
+      </div>
+      <p className="muted">Validation, reviewer gate, and rollback evidence for the selected repair DAG.</p>
+      <div className="list compact-list">
+        {validationTask && (
+          <div className="data-row">
+            <strong>{validationSuccess ? "Validation passed" : "Validation pending"}</strong>
+            <InlineMeta items={[validationTask.status, validationTask.risk, validationTask.scheduler_reason]} />
+            <p>{`${validationSuccess ? "Validation passed" : "Validation state"}: ${validationCommand || validationTask.title}`}</p>
+          </div>
+        )}
+        {reviewTask && (
+          <div className="data-row">
+            <strong>Review gate</strong>
+            <InlineMeta items={[reviewTask.status, reviewTask.profile, commitApprovalRequired ? "exact-call commit approval" : "commit gate pending"]} />
+            <p>{`Review gate: ${reviewId} · ${commitApprovalRequired ? "commit approval required" : "commit gate pending"}`}</p>
+            <p>{`Diff ${diffHash} · ${changedFiles.length ? changedFiles.join(", ") : "no changed files recorded"}`}</p>
+          </div>
+        )}
+        {rollbackTask && (
+          <div className="data-row">
+            <strong>Rollback state</strong>
+            <InlineMeta items={[rollbackTask.status, rollbackTask.risk, rollbackTask.approved ? "approved" : "approval required"]} />
+            <p>{`Rollback state: ${rollbackTask.status} · ${rollbackId}`}</p>
+            <p>{`Restores ${restoredFiles.length ? restoredFiles.join(", ") : "recorded repair files"} and preserves ${artifactPath}`}</p>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function taskUsesTool(task: TaskNode, toolName: string): boolean {
+  return (task.required_tools ?? []).includes(toolName);
+}
+
+function readRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function formatCommand(value: unknown): string {
+  if (Array.isArray(value)) return value.map((part) => String(part)).filter(Boolean).join(" ");
+  return typeof value === "string" ? value : "";
 }
 
 function TaskList({ title, tasks, onApprove }: { title: string; tasks: TaskNode[]; onApprove: (task: TaskNode) => void }) {

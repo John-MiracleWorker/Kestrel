@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import axe from "axe-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import type { Approval, Run, SecretRef, Session, Skill, Tool, TraceEvent } from "./types";
+import type { Approval, Run, SecretRef, Session, Skill, TaskGraph, Tool, TraceEvent } from "./types";
 
 const baseRun: Run = {
   run_id: "run_1",
@@ -64,6 +64,7 @@ let onboardingProfile: Record<string, unknown> | null;
 let eventSources: MockEventSource[];
 let eventId: number;
 let traceTimelines: Record<string, TraceEvent[]>;
+let taskGraphs: Record<string, TaskGraph>;
 
 describe("App", () => {
   beforeEach(() => {
@@ -165,6 +166,7 @@ describe("App", () => {
         }
       ]
     };
+    taskGraphs = {};
     vi.stubGlobal("fetch", vi.fn(fetchMock));
     vi.stubGlobal("EventSource", MockEventSource);
   });
@@ -218,6 +220,98 @@ describe("App", () => {
     expect(screen.getByText("Auto-activations")).toBeInTheDocument();
     expect(screen.getByText("Activations then rolled back"));
     expect(screen.getByText("procedural"));
+  });
+
+  it("surfaces repair patch review validation and rollback state from the task graph", async () => {
+    const repairRun: Run = {
+      ...baseRun,
+      run_id: "run_repair",
+      message: "Repair calculator add",
+      session_id: "session_repair",
+      assistant_message: "Repair ready for review"
+    };
+    runs = [repairRun];
+    sessions = [
+      {
+        session_id: "session_repair",
+        run_count: 1,
+        status_counts: { completed: 1 },
+        latest_run_id: "run_repair",
+        latest_status: "completed",
+        latest_message: "Repair calculator add",
+        created_at: repairRun.created_at,
+        updated_at: repairRun.updated_at
+      }
+    ];
+    sessionRuns = { session_repair: [repairRun] };
+    approvals = [];
+    taskGraphs.run_repair = {
+      tasks: [
+        {
+          task_id: "validate",
+          title: "Validate repair",
+          goal: "Run targeted validation",
+          profile: "worker",
+          status: "completed",
+          approved: true,
+          required_tools: ["repair.validate"],
+          risk: "high",
+          attempt_count: 1,
+          result: {
+            validation: { success: true, command: ["python", "-m", "pytest", "tests/test_calculator.py", "-q"] },
+            next_action: "create_repair_review_before_commit"
+          }
+        },
+        {
+          task_id: "review",
+          title: "Review repair before commit",
+          goal: "Create durable review artifact",
+          profile: "reviewer",
+          status: "completed",
+          approved: true,
+          required_tools: ["repair.review"],
+          risk: "medium",
+          attempt_count: 1,
+          result: {
+            review_id: "review_abc123",
+            diff_hash: "deadbeefcafebabe",
+            changed_files: ["src/calculator.py"],
+            commit_gate: { approval_required_before_commit: true }
+          }
+        },
+        {
+          task_id: "rollback",
+          title: "Rollback stale repair",
+          goal: "Restore tracked repair changes",
+          profile: "worker",
+          status: "ready",
+          approved: false,
+          required_tools: ["repair.rollback"],
+          risk: "high",
+          attempt_count: 0,
+          result: {
+            rollback_id: "rollback_abc123",
+            restored_files: ["src/calculator.py"],
+            artifact_path: ".nest/repair_rollbacks/rollback_abc123.json"
+          }
+        }
+      ],
+      ready_tasks: [],
+      approval_blocked_tasks: [],
+      subagents: []
+    };
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+
+    const panel = await screen.findByLabelText("Repair Patch Review");
+    expect(within(panel).getByText("Validation passed: python -m pytest tests/test_calculator.py -q")).toBeInTheDocument();
+    expect(within(panel).getByText("Review gate: review_abc123 · commit approval required")).toBeInTheDocument();
+    expect(within(panel).getByText("Diff deadbeefcafebabe · src/calculator.py")).toBeInTheDocument();
+    expect(within(panel).getByText("Rollback state: ready · rollback_abc123")).toBeInTheDocument();
+    expect(within(panel).getByText("Restores src/calculator.py and preserves .nest/repair_rollbacks/rollback_abc123.json")).toBeInTheDocument();
   });
 
   it("creates a new local thread and sends without manual session, provider, or model fields", async () => {
@@ -989,8 +1083,9 @@ function payloadFor(path: string): unknown {
   if (path === "/api/logs?limit=120") return [];
   if (path === "/api/cognition/lessons?k=20") return { items: [] };
   if (path === "/api/cognition/failures?k=20") return { items: [] };
-  if (path.match(/^\/api\/runs\/run_[a-z0-9]+\/task-graph$/)) {
-    return { tasks: [], ready_tasks: [], approval_blocked_tasks: [], subagents: [] };
+  const graphMatch = path.match(/^\/api\/runs\/(run_[a-z0-9]+)\/task-graph$/);
+  if (graphMatch) {
+    return taskGraphs[graphMatch[1]] ?? { tasks: [], ready_tasks: [], approval_blocked_tasks: [], subagents: [] };
   }
   const traceMatch = path.match(/^\/api\/runs\/([^/]+)\/trace\?limit=700$/);
   if (traceMatch) {
