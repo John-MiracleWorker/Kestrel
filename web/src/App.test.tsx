@@ -314,6 +314,96 @@ describe("App", () => {
     expect(within(panel).getByText("Restores src/calculator.py and preserves .nest/repair_rollbacks/rollback_abc123.json")).toBeInTheDocument();
   });
 
+  it("prepares exact-call repair commit and rollback tool requests without invoking them", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    const repairRun: Run = {
+      ...baseRun,
+      run_id: "run_repairactions",
+      message: "Repair calculator add",
+      session_id: "session_repair_actions",
+      assistant_message: "Repair ready for exact-call action"
+    };
+    runs = [repairRun];
+    sessions = [
+      {
+        session_id: "session_repair_actions",
+        run_count: 1,
+        status_counts: { completed: 1 },
+        latest_run_id: "run_repairactions",
+        latest_status: "completed",
+        latest_message: "Repair calculator add",
+        created_at: repairRun.created_at,
+        updated_at: repairRun.updated_at
+      }
+    ];
+    sessionRuns = { session_repair_actions: [repairRun] };
+    approvals = [];
+    toolsPayload = [
+      ...toolsPayload,
+      { name: "git.commit", description: "Commit reviewed repair.", risk: "high", requires_approval: true, source: "builtin", capabilities: ["git"], enabled: true, enablement_flag: null },
+      { name: "repair.rollback", description: "Rollback repair.", risk: "high", requires_approval: true, source: "builtin", capabilities: ["safe-repair"], enabled: true, enablement_flag: null }
+    ];
+    taskGraphs.run_repairactions = {
+      tasks: [
+        {
+          task_id: "review",
+          title: "Review repair before commit",
+          goal: "Create durable review artifact",
+          profile: "reviewer",
+          status: "completed",
+          approved: true,
+          required_tools: ["repair.review"],
+          risk: "medium",
+          attempt_count: 1,
+          result: {
+            review_id: "review_action123",
+            diff_hash: "feedfacecafebeef",
+            changed_files: ["src/calculator.py"],
+            commit_gate: { approval_required_before_commit: true }
+          }
+        },
+        {
+          task_id: "rollback",
+          title: "Rollback stale repair",
+          goal: "Restore tracked repair changes",
+          profile: "worker",
+          status: "ready",
+          approved: false,
+          required_tools: ["repair.rollback"],
+          risk: "high",
+          attempt_count: 0,
+          result: {
+            rollback_id: "rollback_action123",
+            restored_files: ["src/calculator.py"],
+            artifact_path: ".nest/repair_rollbacks/rollback_action123.json"
+          }
+        }
+      ],
+      ready_tasks: [],
+      approval_blocked_tasks: [],
+      subagents: []
+    };
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+    const panel = await screen.findByLabelText("Repair Patch Review");
+
+    fireEvent.click(within(panel).getByRole("button", { name: /prepare exact-call git.commit/i }));
+    expect(screen.getByLabelText("Tool")).toHaveValue("git.commit");
+    const toolArgsInput = screen.getAllByLabelText("Arguments JSON")[0] as HTMLTextAreaElement;
+    const commitArgs = JSON.parse(toolArgsInput.value);
+    expect(commitArgs).toMatchObject({ repair_review_id: "review_action123" });
+    expect(String(commitArgs.message)).toContain("review_action123");
+
+    fireEvent.click(within(panel).getByRole("button", { name: /prepare exact-call repair.rollback/i }));
+    expect(screen.getByLabelText("Tool")).toHaveValue("repair.rollback");
+    const rollbackArgs = JSON.parse(toolArgsInput.value);
+    expect(rollbackArgs).toMatchObject({ review_id: "review_action123", reason: "Rollback reviewed repair review_action123" });
+    expect(fetchSpy.mock.calls.some(([path, init]) => String(path).includes("/api/tools/") && init?.method === "POST")).toBe(false);
+  });
+
   it("creates a new local thread and sends without manual session, provider, or model fields", async () => {
     const fetchSpy = vi.mocked(fetch);
     render(<App />);
