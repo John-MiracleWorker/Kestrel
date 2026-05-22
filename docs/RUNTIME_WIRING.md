@@ -51,7 +51,7 @@ nest-agent approvals --backend memory --json
 nest-agent approve <approval_id> --backend memory --json
 ```
 
-The FastAPI server exposes the same state through run, event, approval, scheduler, memory, context, skill, MCP, behavior-delta, plugin, and channel routes.
+The FastAPI server exposes the same state through run, event, approval, scheduler, memory, context, skill, MCP, behavior-delta, plugin, product readiness/setup, and channel routes.
 
 Soul/self routes expose the same non-secret runtime model as the CLI: `/api/self`, `/api/self/remember`, `/api/self/propose-change`, `/api/web/search`, and `/api/web/fetch`.
 

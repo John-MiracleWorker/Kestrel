@@ -83,12 +83,12 @@ def build_product_readiness_report() -> ProductReadinessReport:
             title="Local product stability",
             status=ProductReadinessStatus.PARTIAL,
             evidence=(
-                "CLI, local FastAPI server, React workbench, installer checks, Docker/Compose artifacts, mock smoke tests, and Memvid/memory backends exist.",
+                "CLI, local FastAPI server, React workbench, installer checks, Docker/Compose artifacts, mock smoke tests, first-run setup readiness checks, and Memvid/memory backends exist.",
                 "Current validation commands include compileall, pytest, golden evals, learning-architecture evals, CLI mock chat, web tests, and web build.",
             ),
             remaining_work=(
                 "Make fresh install and first-run setup boringly reliable across supported environments.",
-                "Add support bundle export and clearer setup recovery messages.",
+                "Wire setup readiness into a guided first-run flow and add support bundle export.",
             ),
             next_action="Build a first-run setup/readiness wizard that validates provider, workspace, memory, state, and permissions.",
         ),

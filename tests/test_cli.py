@@ -45,6 +45,40 @@ def test_memory_verify_subcommand_reports_layers(tmp_path: Path, monkeypatch: Mo
     assert "policy: ok" in output
 
 
+def test_product_setup_subcommand_reports_first_run_checks(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object
+) -> None:
+    _clear_nest_agent_env(monkeypatch)
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "nest-agent",
+            "product",
+            "setup",
+            "--provider",
+            "mock",
+            "--workspace",
+            str(tmp_path),
+            "--memory-dir",
+            str(memory_dir),
+            "--state-path",
+            str(state_dir / "agent.db"),
+            "--json",
+        ],
+    )
+
+    main()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == "kestrel.setup_readiness.v1"
+    assert any(check["check_id"] == "provider_configuration" for check in payload["checks"])
+
+
 def test_memory_doctor_subcommand_is_dry_run_by_default(
     tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object
 ) -> None:

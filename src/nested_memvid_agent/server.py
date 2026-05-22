@@ -263,7 +263,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         http_exception=HTTPException,
         secret_broker=secret_broker,
     )
-    register_product_routes(app)
+    register_product_routes(app, active_config=lambda: active_config)
     register_channel_routes(
         app,
         http_exception=HTTPException,

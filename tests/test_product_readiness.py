@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.product_readiness import ProductReadinessStatus, build_product_readiness_report
+from nested_memvid_agent.server_product_routes import register_product_routes
+from nested_memvid_agent.setup_readiness import SetupReadinessStatus, build_setup_readiness_report
 
 
 def test_product_readiness_report_exposes_all_productization_categories() -> None:
@@ -51,3 +59,68 @@ def test_product_readiness_report_serializes_to_public_dict() -> None:
     assert payload["headline"]["product_ready"] is False
     assert payload["categories"][0]["status"] in {"ready", "partial", "missing"}
     assert all(category["next_action"] for category in payload["categories"])
+
+
+def test_setup_readiness_reports_first_run_prerequisites(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+
+    report = build_setup_readiness_report(
+        AgentConfig(
+            provider="mock",
+            model="mock",
+            workspace=tmp_path,
+            memory_dir=memory_dir,
+            state_path=state_dir / "agent.db",
+            log_dir=logs_dir,
+            enable_worker_isolation=True,
+            require_api_auth=False,
+        )
+    )
+
+    assert report.schema == "kestrel.setup_readiness.v1"
+    assert report.fail_count == 0
+    assert report.ready is True
+    checks = {check.check_id: check for check in report.checks}
+    assert checks["provider_configuration"].status == SetupReadinessStatus.PASS
+    assert checks["memory_storage"].status == SetupReadinessStatus.PASS
+    assert checks["api_auth"].status == SetupReadinessStatus.WARN
+
+
+def test_setup_readiness_flags_missing_workspace_and_provider_secret(tmp_path: Path) -> None:
+    report = build_setup_readiness_report(
+        AgentConfig(
+            provider="openai",
+            model="gpt-4.1-mini",
+            api_key_env="MISSING_KES_TEST_TOKEN",
+            workspace=tmp_path / "missing-workspace",
+            memory_dir=tmp_path / "missing-memory",
+            state_path=tmp_path / "missing-state" / "agent.db",
+            log_dir=tmp_path / "missing-logs",
+        )
+    )
+
+    assert report.ready is False
+    checks = {check.check_id: check for check in report.checks}
+    assert checks["provider_configuration"].status == SetupReadinessStatus.FAIL
+    assert checks["workspace"].status == SetupReadinessStatus.FAIL
+    assert checks["memory_storage"].status == SetupReadinessStatus.WARN
+    assert "MISSING_KES_TEST_TOKEN" in checks["provider_configuration"].detail
+
+
+def test_product_setup_route_uses_active_config(tmp_path: Path) -> None:
+    app = FastAPI()
+    config = AgentConfig(provider="mock", workspace=tmp_path, memory_dir=tmp_path / "memory")
+    register_product_routes(app, active_config=lambda: config)
+    client = TestClient(app)
+
+    response = client.get("/api/product/setup")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schema"] == "kestrel.setup_readiness.v1"
+    assert any(check["check_id"] == "workspace" for check in payload["checks"])

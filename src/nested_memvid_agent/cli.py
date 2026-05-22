@@ -34,6 +34,7 @@ from .product_readiness import build_product_readiness_report
 from .promotion_ledger import OUTCOME_KINDS, PromotionLedger
 from .run_manager import RunManager
 from .runtime_models import LLMStreamEvent, ToolCall
+from .setup_readiness import build_setup_readiness_report
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore
 from .task_capsule import summarize_run_capsule
@@ -214,6 +215,9 @@ def main() -> None:
     product_sub = product_cmd.add_subparsers(dest="product_cmd", required=True)
     product_readiness = product_sub.add_parser("readiness")
     product_readiness.add_argument("--json", action="store_true")
+    product_setup = product_sub.add_parser("setup")
+    _add_agent_args(product_setup)
+    product_setup.add_argument("--json", action="store_true")
 
     compile_cmd = sub.add_parser("compile-context")
     _add_common_args(compile_cmd)
@@ -459,6 +463,10 @@ def main() -> None:
 
     if args.cmd == "product" and args.product_cmd == "readiness":
         _print_product_readiness(args)
+        return
+
+    if args.cmd == "product" and args.product_cmd == "setup":
+        _print_setup_readiness(config, args)
         return
 
     if args.cmd == "memory" and args.memory_cmd == "ledger":
@@ -793,6 +801,24 @@ def _print_product_readiness(args: argparse.Namespace) -> None:
     for category in payload["categories"]:
         print(f"{category['title']}: {category['status']}")
         print(f"  Next: {category['next_action']}")
+
+
+def _print_setup_readiness(config: AgentConfig, args: argparse.Namespace) -> None:
+    report = build_setup_readiness_report(config)
+    payload = report.to_dict()
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return
+    print("First-run setup readiness")
+    print(f"Ready: {'yes' if payload['ready'] else 'no'}")
+    print(f"Checks: {payload['pass_count']} pass, {payload['warn_count']} warn, {payload['fail_count']} fail")
+    print(f"Next: {payload['next_action']}")
+    print()
+    for check in payload["checks"]:
+        print(f"{check['title']}: {check['status']}")
+        print(f"  Detail: {check['detail']}")
+        if check["status"] != "pass":
+            print(f"  Recovery: {check['recovery']}")
 
 
 def _print_behavior_delta_skill_preview(args: argparse.Namespace) -> None:

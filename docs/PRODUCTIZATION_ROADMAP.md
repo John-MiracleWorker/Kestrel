@@ -264,8 +264,8 @@ Build the golden local developer workflow.
 
 Tasks:
 
-1. Add a product-readiness checklist/report across CLI/API/UI.
-2. Add first-run setup wizard checks for provider, memory, workspace, and permissions.
+1. Add a product-readiness checklist/report across CLI/API/UI. ✅ CLI/API/UI readiness dashboard landed.
+2. Add first-run setup wizard checks for provider, memory, workspace, and permissions. ✅ Non-secret CLI/API setup readiness checks landed; guided UI wiring remains.
 3. Create a demo repo fixture with known failure and expected repair.
 4. Finish branch/worktree isolated repair run as the default for code modification.
 5. Add patch review UI with validation and rollback state.
