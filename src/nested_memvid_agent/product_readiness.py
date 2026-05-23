@@ -83,14 +83,14 @@ def build_product_readiness_report() -> ProductReadinessReport:
             title="Local product stability",
             status=ProductReadinessStatus.PARTIAL,
             evidence=(
-                "CLI, local FastAPI server, React workbench, installer checks, Docker/Compose artifacts, mock smoke tests, first-run setup readiness checks, and Memvid/memory backends exist.",
+                "CLI, local FastAPI server, React workbench, installer checks, Docker/Compose artifacts, mock smoke tests, first-run setup readiness checks, support bundle export, and Memvid/memory backends exist.",
                 "Current validation commands include compileall, pytest, golden evals, learning-architecture evals, CLI mock chat, web tests, and web build.",
             ),
             remaining_work=(
                 "Make fresh install and first-run setup boringly reliable across supported environments.",
-                "Wire setup readiness into a guided first-run flow and add support bundle export.",
+                "Keep tightening setup recovery, support bundle contents, and first-run golden workflow guidance.",
             ),
-            next_action="Build a first-run setup/readiness wizard that validates provider, workspace, memory, state, and permissions.",
+            next_action="Build the next guided first-run step around repository baseline scan and golden repair handoff.",
         ),
         ProductReadinessCategory(
             category_id="golden_repair_workflow",
@@ -181,11 +181,12 @@ def build_product_readiness_report() -> ProductReadinessReport:
             status=ProductReadinessStatus.PARTIAL,
             evidence=(
                 "Makefile, Dockerfile, Docker Compose, .env example, deployment docs, memory operations docs, and release checklist exist.",
+                "Support bundle export can gather redacted setup/readiness, runtime, git, state, and log-tail metadata from CLI/API.",
             ),
             remaining_work=(
-                "Add upgrade/migration rollback checks, memory backup/restore validation, process supervision, health-check gates, and support bundle export.",
+                "Add upgrade/migration rollback checks, memory backup/restore validation, process supervision, and health-check gates.",
             ),
-            next_action="Add a support bundle/export command that gathers non-secret config, health, logs, traces, and readiness status.",
+            next_action="Add upgrade and memory backup/restore validation to release gates.",
         ),
         ProductReadinessCategory(
             category_id="channels_ingress",

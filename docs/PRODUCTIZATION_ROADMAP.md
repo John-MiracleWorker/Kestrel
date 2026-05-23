@@ -204,7 +204,7 @@ Required work:
 - `.mv2` memory backup/restore.
 - Health checks and process supervision.
 - Logs/traces export.
-- Support bundle generation.
+- Support bundle generation. ✅ CLI/API export now writes a redacted diagnostic archive with readiness, runtime, git, state-summary, and log-tail metadata.
 
 Acceptance criteria:
 
@@ -270,7 +270,7 @@ Tasks:
 4. Finish branch/worktree isolated repair run as the default for code modification. ✅ Repair/code-modification scheduler tasks now default to git worktree isolation when the workspace supports worktrees.
 5. Persist a coherent repair workspace across the full repair DAG instead of creating a separate worker worktree per isolated task. ✅ Repair DAG tasks now reuse one coherent git worktree for the run.
 6. Add patch review UI with validation and rollback state.
-7. Add support bundle export.
+7. Add support bundle export. ✅ `nest-agent product support-bundle` and `POST /api/product/support-bundle` now generate redacted local diagnostic archives.
 
 - `examples/golden_repair_demo/` — deterministic fixture repo with one failing test and `expected_fix.patch` for the golden repair journey.
 

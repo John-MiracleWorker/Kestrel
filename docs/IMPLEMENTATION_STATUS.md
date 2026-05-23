@@ -74,6 +74,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Stage 1 autonomous-learning hardening is landed as observability/config scaffolding only: `nest-agent learning dashboard`, `GET /api/learning/dashboard`, and the Advanced web Learning Dashboard render existing behavior-delta activation/outcome aggregates, while new autonomous flags (`enable_auto_activate_low_risk_deltas`, `enable_auto_skill_materialization`, `enable_auto_consolidation_shadow`, `enable_auto_consolidation_apply`, `enable_diagnosis_to_patch`) remain default-off.
 - Productization tracking now has a canonical roadmap (`docs/PRODUCTIZATION_ROADMAP.md`) plus a read-only product-readiness report exposed through `nest-agent product readiness` and `GET /api/product/readiness`; it classifies local stability, golden repair, learning, auth/workspaces, sandboxing, provider certification, UX, operations, channels, and metrics as ready/partial/missing without changing runtime behavior.
 - First-run setup readiness checks now inspect non-secret local prerequisites through `nest-agent product setup` and `GET /api/product/setup`, covering provider configuration, workspace, memory/state/log paths, dangerous-action gates, worker isolation, and local API auth without mutating setup state or exposing secrets. The guided web setup wizard loads that report and surfaces pass/warn/fail counts plus the highest-priority checks before saving onboarding to Soul memory.
+- Support bundle export now writes a redacted local diagnostic archive through `nest-agent product support-bundle` and `POST /api/product/support-bundle`, including product/setup readiness, runtime metadata, git status, state-table counts, log file metadata, and a bounded redacted event-log tail.
 - `examples/golden_repair_demo` provides a deterministic broken-then-fixed repository fixture for the golden repair workflow, including a failing subtraction test and an `expected_fix.patch`; the main test suite verifies the fixture fails before the patch and passes after it.
 - Ollama Cloud with `gpt-oss:120b` has been locally validated through live learning E2E and full golden evals on both memory and Memvid backends.
 
@@ -121,6 +122,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - The Memvid backend must use `.mv2` files and preserve one file per memory layer, including `.nest/memory/self.mv2`.
 - `complete.mv2` is a run artifact under `.nest/runs/{run_id}/`, not a permanent memory layer.
 - SQLite is control-plane state only. It is not the retrieval memory substrate.
+- Support bundle exports are diagnostic artifacts only: they report environment-variable presence, redact common secret patterns, summarize state tables, and do not include raw broker vault contents or `.mv2` memory files.
 - Mock-provider tests are the default fast validation path; Memvid integration remains behind `RUN_MEMVID_INTEGRATION=1`.
 - Provider fallback only runs for `ProviderError(retryable=True)` failures; non-retryable errors fail fast and preserve the original provider error.
 - MCP tools remain approval-by-default unless a server is explicitly configured to trust its manifest; dangerous tool names/descriptions such as file writes, deletes, shell execution, patching, committing, or secrets are promoted to high risk during vetting.
@@ -134,6 +136,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 python -m compileall -q src tests scripts
 python -m pytest -q
 PYTHONPATH=src python -m nested_memvid_agent.cli product setup --backend memory --provider mock --json
+PYTHONPATH=src python -m nested_memvid_agent.cli product support-bundle --backend memory --provider mock --output /tmp/kestrel-support.zip --json
 python scripts/eval_learning_architecture.py --provider mock --backend memory --all --json
 python scripts/run_golden_evals.py --backend memory --provider mock
 PYTHONPATH=src python -m nested_memvid_agent.cli chat --backend memory --provider mock --message "hello"

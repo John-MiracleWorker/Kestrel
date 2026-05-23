@@ -60,6 +60,10 @@ def test_product_readiness_category_payloads_include_evidence_and_next_actions()
     assert not any("default" in item.lower() and "worktree" in item.lower() for item in repair.remaining_work)
     assert not any("coherent" in item.lower() and "worktree" in item.lower() for item in repair.remaining_work)
 
+    operations = report.category("operations_release_engineering")
+    assert any("support bundle" in item.lower() for item in operations.evidence)
+    assert not any("support bundle" in item.lower() for item in operations.remaining_work)
+
 
 def test_product_readiness_report_serializes_to_public_dict() -> None:
     report = build_product_readiness_report()

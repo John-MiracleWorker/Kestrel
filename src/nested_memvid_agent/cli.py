@@ -37,6 +37,7 @@ from .runtime_models import LLMStreamEvent, ToolCall
 from .setup_readiness import build_setup_readiness_report
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore
+from .support_bundle import export_support_bundle
 from .task_capsule import summarize_run_capsule
 from .tools.base import ToolContext
 from .tools.builtin import build_default_tools
@@ -218,6 +219,11 @@ def main() -> None:
     product_setup = product_sub.add_parser("setup")
     _add_agent_args(product_setup)
     product_setup.add_argument("--json", action="store_true")
+    product_support = product_sub.add_parser("support-bundle")
+    _add_agent_args(product_support)
+    product_support.add_argument("--output", type=Path)
+    product_support.add_argument("--log-tail", type=int, default=100)
+    product_support.add_argument("--json", action="store_true")
 
     compile_cmd = sub.add_parser("compile-context")
     _add_common_args(compile_cmd)
@@ -467,6 +473,10 @@ def main() -> None:
 
     if args.cmd == "product" and args.product_cmd == "setup":
         _print_setup_readiness(config, args)
+        return
+
+    if args.cmd == "product" and args.product_cmd == "support-bundle":
+        _print_support_bundle(config, args)
         return
 
     if args.cmd == "memory" and args.memory_cmd == "ledger":
@@ -819,6 +829,21 @@ def _print_setup_readiness(config: AgentConfig, args: argparse.Namespace) -> Non
         print(f"  Detail: {check['detail']}")
         if check["status"] != "pass":
             print(f"  Recovery: {check['recovery']}")
+
+
+def _print_support_bundle(config: AgentConfig, args: argparse.Namespace) -> None:
+    result = export_support_bundle(
+        config,
+        output_path=args.output,
+        log_tail=args.log_tail,
+    )
+    payload = result.to_dict()
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return
+    print("Support bundle exported")
+    print(f"Path: {payload['bundle_path']}")
+    print(f"Entries: {len(payload['entries'])}")
 
 
 def _print_behavior_delta_skill_preview(args: argparse.Namespace) -> None:

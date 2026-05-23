@@ -51,7 +51,7 @@ nest-agent approvals --backend memory --json
 nest-agent approve <approval_id> --backend memory --json
 ```
 
-The FastAPI server exposes the same state through run, event, approval, scheduler, memory, context, skill, MCP, behavior-delta, plugin, product readiness/setup, and channel routes.
+The FastAPI server exposes the same state through run, event, approval, scheduler, memory, context, skill, MCP, behavior-delta, plugin, product readiness/setup/support-bundle, and channel routes.
 
 Soul/self routes expose the same non-secret runtime model as the CLI: `/api/self`, `/api/self/remember`, `/api/self/propose-change`, `/api/web/search`, and `/api/web/fetch`.
 
@@ -257,5 +257,9 @@ MCP `secret_env` values are redacted in API responses, included in configuration
 `NEST_AGENT_SECRET_BACKEND=json` is the default local-file backend. `NEST_AGENT_SECRET_BACKEND=keyring` or `--secret-backend keyring` stores raw values through the optional OS keyring provider and keeps only metadata in the JSON vault; if the optional `keyring` package cannot be imported, Kestrel falls back to the JSON backend.
 
 Plugin-provided MCP stdio servers carry `connect_requires_approval` vetting metadata. Connect, test, sync, and invoke paths refuse to start the process until `POST /api/mcp/servers/{server_id}/approve-connect` records approval for the current command hash.
+
+## Support Bundle Wiring
+
+`nest-agent product support-bundle` and `POST /api/product/support-bundle` write a local zip archive under the requested output path or `.nest/support-bundles/` by default. The archive is diagnostic only: it includes product/setup readiness, runtime metadata with environment-variable presence only, git status, SQLite table counts, log file metadata, and a bounded redacted `events.jsonl` tail. It does not include raw Secret Broker vault contents, raw environment variable values, or `.mv2` memory files.
 
 SSE and streamable HTTP transports share manager concepts but still need real fixtures and soak testing.

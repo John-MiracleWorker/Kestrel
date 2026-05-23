@@ -180,6 +180,16 @@ nest-agent approve <approval_id> --backend memory --json
 nest-agent status <run_id> --backend memory --json --events
 ```
 
+Productization and support checks:
+
+```bash
+nest-agent product readiness --json
+nest-agent product setup --backend memory --provider mock --json
+nest-agent product support-bundle --backend memory --provider mock --output /tmp/kestrel-support.zip --json
+```
+
+Support bundles are redacted diagnostic archives. They include readiness reports, runtime metadata, git status, state-table counts, log file metadata, and a bounded redacted event-log tail; they do not include raw Secret Broker vault contents, raw environment variable values, or `.mv2` memory files.
+
 Plugin registry commands:
 
 ```bash

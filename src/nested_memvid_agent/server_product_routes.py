@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends
 from .config import AgentConfig
 from .product_readiness import build_product_readiness_report
 from .setup_readiness import build_setup_readiness_report
+from .support_bundle import export_support_bundle
 
 
 def register_product_routes(
@@ -26,5 +27,10 @@ def register_product_routes(
     def product_setup() -> dict[str, object]:
         config = active_config() if active_config is not None else AgentConfig.from_env()
         return build_setup_readiness_report(config).to_dict()
+
+    @router.post("/api/product/support-bundle", dependencies=dependencies)
+    def product_support_bundle(log_tail: int = 100) -> dict[str, object]:
+        config = active_config() if active_config is not None else AgentConfig.from_env()
+        return export_support_bundle(config, log_tail=log_tail).to_dict()
 
     app.include_router(router)  # type: ignore[attr-defined]
