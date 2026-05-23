@@ -412,6 +412,91 @@ describe("App", () => {
     expect(fetchSpy.mock.calls.some(([path, init]) => String(path).includes("/api/tools/") && init?.method === "POST")).toBe(false);
   });
 
+  it("submits a prepared repair commit request into a pending approval card with exact arguments", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    const repairRun: Run = {
+      ...baseRun,
+      run_id: "run_repairapproval",
+      session_id: "session_repair_approval",
+      message: "Repair calculator add",
+      assistant_message: "Reviewed repair ready for commit.",
+      status: "blocked",
+      stop_reason: "tool_approval_required",
+      created_at: "2026-05-16T00:20:00Z",
+      updated_at: "2026-05-16T00:20:00Z"
+    };
+    sessions = [
+      {
+        session_id: "session_repair_approval",
+        run_count: 1,
+        status_counts: { blocked: 1 },
+        latest_run_id: "run_repairapproval",
+        latest_status: "blocked",
+        latest_message: "Repair calculator add",
+        created_at: repairRun.created_at,
+        updated_at: repairRun.updated_at
+      }
+    ];
+    sessionRuns = { session_repair_approval: [repairRun] };
+    runs = [repairRun];
+    approvals = [];
+    toolsPayload = [
+      ...toolsPayload,
+      { name: "git.commit", description: "Commit reviewed repair.", risk: "high", requires_approval: true, source: "builtin", capabilities: ["git"], enabled: true, enablement_flag: null }
+    ];
+    taskGraphs.run_repairapproval = {
+      tasks: [
+        {
+          task_id: "review",
+          title: "Review repair before commit",
+          goal: "Create durable review artifact",
+          profile: "reviewer",
+          status: "completed",
+          approved: true,
+          required_tools: ["repair.review"],
+          risk: "medium",
+          attempt_count: 1,
+          result: {
+            review_id: "review_approval123",
+            diff_hash: "feedfacecafebeef",
+            changed_files: ["src/calculator.py"],
+            commit_gate: { approval_required_before_commit: true }
+          }
+        }
+      ],
+      ready_tasks: [],
+      approval_blocked_tasks: [],
+      subagents: []
+    };
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+    const panel = await screen.findByLabelText("Repair Patch Review");
+    fireEvent.click(within(panel).getByRole("button", { name: /prepare exact-call git.commit/i }));
+    const preparedArgs = JSON.parse((screen.getAllByLabelText("Arguments JSON")[0] as HTMLTextAreaElement).value);
+
+    fireEvent.click(screen.getByRole("button", { name: /invoke tool/i }));
+
+    await waitFor(() => {
+      const invokeCall = fetchSpy.mock.calls.find(
+        ([path, init]) => path === "/api/tools/git.commit/invoke" && init?.method === "POST"
+      );
+      expect(invokeCall).toBeDefined();
+      expect(JSON.parse(String(invokeCall?.[1]?.body ?? "{}"))).toMatchObject({
+        run_id: "run_repairapproval",
+        session_id: "session_repair_approval",
+        arguments: preparedArgs
+      });
+    });
+    const approvalCard = await screen.findByRole("group", { name: /approval for git.commit/i });
+    expect(within(approvalCard).getByText("git.commit")).toBeInTheDocument();
+    expect(within(approvalCard).getByText(/High risk/i)).toBeInTheDocument();
+    expect(within(approvalCard).getByText(/review_approval123/)).toBeInTheDocument();
+    expect(within(approvalCard).getByText(new RegExp(String(preparedArgs.message)))).toBeInTheDocument();
+  });
+
   it("creates a new local thread and sends without manual session, provider, or model fields", async () => {
     const fetchSpy = vi.mocked(fetch);
     render(<App />);
@@ -890,6 +975,31 @@ async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<
   if (path.match(/^\/api\/approvals\/approval_1\/decision$/) && init?.method === "POST") {
     approvals = [];
     return jsonResponse({ ...pendingApproval, status: "approved", decision: JSON.parse(String(init.body ?? "{}")) });
+  }
+  if (path === "/api/tools/git.commit/invoke" && init?.method === "POST") {
+    const body = JSON.parse(String(init.body ?? "{}"));
+    const approval: Approval = {
+      approval_id: "approval_repair_commit",
+      run_id: body.run_id,
+      tool_call_id: "tool_repair_commit",
+      tool_name: "git.commit",
+      arguments: body.arguments,
+      risk: "high",
+      status: "pending",
+      decision: null,
+      result: null,
+      created_at: "2026-05-16T00:21:00Z",
+      updated_at: "2026-05-16T00:21:00Z"
+    };
+    approvals = [approval];
+    return jsonResponse({
+      tool: "git.commit",
+      tool_call_id: approval.tool_call_id,
+      success: false,
+      content: "Approval required for git.commit.",
+      data: { approval_id: approval.approval_id, status: "pending" },
+      error: "approval_required"
+    });
   }
   if (path === "/api/secrets" && init?.method === "POST") {
     const body = JSON.parse(String(init.body ?? "{}"));
