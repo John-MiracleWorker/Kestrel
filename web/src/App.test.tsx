@@ -773,6 +773,104 @@ describe("App", () => {
     });
   });
 
+  it("approves repair commit cards with immutable approval arguments after tool form edits", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    const exactCommitArgs = {
+      repair_review_id: "review_decision_commit",
+      message: "repair: commit exactly reviewed diff"
+    };
+    approvals = [
+      {
+        approval_id: "approval_repair_commit_decision",
+        run_id: "run_2",
+        tool_call_id: "tool_repair_commit_decision",
+        tool_name: "git.commit",
+        arguments: exactCommitArgs,
+        risk: "high",
+        status: "pending",
+        created_at: "2026-05-16T00:30:00Z",
+        updated_at: "2026-05-16T00:30:00Z"
+      }
+    ];
+
+    render(<App />);
+
+    await screen.findByText("Needs approval");
+    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+    fireEvent.change(screen.getAllByLabelText("Arguments JSON")[0], {
+      target: {
+        value: JSON.stringify(
+          { repair_review_id: "edited_form_review", message: "edited form state must not be approved" },
+          null,
+          2
+        )
+      }
+    });
+
+    const approvalCard = screen.getAllByRole("group", { name: /approval for git.commit/i })[0];
+    fireEvent.click(within(approvalCard).getByRole("button", { name: /approve/i }));
+
+    await waitFor(() => {
+      const decisionCall = fetchSpy.mock.calls.find(
+        ([path, init]) => path === "/api/approvals/approval_repair_commit_decision/decision" && init?.method === "POST"
+      );
+      expect(decisionCall).toBeDefined();
+      expect(JSON.parse(String(decisionCall?.[1]?.body ?? "{}"))).toEqual({
+        approved: true,
+        arguments: exactCommitArgs
+      });
+    });
+  });
+
+  it("approves repair rollback cards with immutable approval arguments after tool form edits", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    const exactRollbackArgs = {
+      review_id: "review_decision_rollback",
+      reason: "Rollback the reviewed repair only"
+    };
+    approvals = [
+      {
+        approval_id: "approval_repair_rollback_decision",
+        run_id: "run_2",
+        tool_call_id: "tool_repair_rollback_decision",
+        tool_name: "repair.rollback",
+        arguments: exactRollbackArgs,
+        risk: "high",
+        status: "pending",
+        created_at: "2026-05-16T00:31:00Z",
+        updated_at: "2026-05-16T00:31:00Z"
+      }
+    ];
+
+    render(<App />);
+
+    await screen.findByText("Needs approval");
+    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+    fireEvent.change(screen.getAllByLabelText("Arguments JSON")[0], {
+      target: {
+        value: JSON.stringify(
+          { review_id: "edited_form_review", reason: "edited form state must not be approved" },
+          null,
+          2
+        )
+      }
+    });
+
+    const approvalCard = screen.getAllByRole("group", { name: /approval for repair.rollback/i })[0];
+    fireEvent.click(within(approvalCard).getByRole("button", { name: /approve/i }));
+
+    await waitFor(() => {
+      const decisionCall = fetchSpy.mock.calls.find(
+        ([path, init]) => path === "/api/approvals/approval_repair_rollback_decision/decision" && init?.method === "POST"
+      );
+      expect(decisionCall).toBeDefined();
+      expect(JSON.parse(String(decisionCall?.[1]?.body ?? "{}"))).toEqual({
+        approved: true,
+        arguments: exactRollbackArgs
+      });
+    });
+  });
+
   it("stores secrets through the broker without rendering raw values", async () => {
     const fetchSpy = vi.mocked(fetch);
     render(<App />);
