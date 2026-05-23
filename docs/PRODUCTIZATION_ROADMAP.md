@@ -271,6 +271,7 @@ Tasks:
 5. Persist a coherent repair workspace across the full repair DAG instead of creating a separate worker worktree per isolated task. ✅ Repair DAG tasks now reuse one coherent git worktree for the run.
 6. Add patch review UI with validation and rollback state.
 7. Add support bundle export. ✅ `nest-agent product support-bundle` and `POST /api/product/support-bundle` now generate redacted local diagnostic archives.
+8. Add provider certification reporting. ✅ `nest-agent product provider-certification` and `GET /api/product/provider-certification` now expose redacted per-provider status and live-validation commands.
 
 - `examples/golden_repair_demo/` — deterministic fixture repo with one failing test and `expected_fix.patch` for the golden repair journey.
 

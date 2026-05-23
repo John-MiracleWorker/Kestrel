@@ -185,10 +185,13 @@ Productization and support checks:
 ```bash
 nest-agent product readiness --json
 nest-agent product setup --backend memory --provider mock --json
+nest-agent product provider-certification --backend memory --provider mock --json
 nest-agent product support-bundle --backend memory --provider mock --output /tmp/kestrel-support.zip --json
 ```
 
 Support bundles are redacted diagnostic archives. They include readiness reports, runtime metadata, git status, state-table counts, log file metadata, and a bounded redacted event-log tail; they do not include raw Secret Broker vault contents, raw environment variable values, or `.mv2` memory files.
+
+Provider certification reports are read-only and redacted. They record per-provider readiness, credential/base-url presence, manual host checks, and the validation commands needed before treating live providers as release-certified.
 
 Plugin registry commands:
 

@@ -83,7 +83,7 @@ def build_product_readiness_report() -> ProductReadinessReport:
             title="Local product stability",
             status=ProductReadinessStatus.PARTIAL,
             evidence=(
-                "CLI, local FastAPI server, React workbench, installer checks, Docker/Compose artifacts, mock smoke tests, first-run setup readiness checks, support bundle export, and Memvid/memory backends exist.",
+                "CLI, local FastAPI server, React workbench, installer checks, Docker/Compose artifacts, mock smoke tests, first-run setup readiness checks, provider certification report, support bundle export, and Memvid/memory backends exist.",
                 "Current validation commands include compileall, pytest, golden evals, learning-architecture evals, CLI mock chat, web tests, and web build.",
             ),
             remaining_work=(
@@ -155,12 +155,13 @@ def build_product_readiness_report() -> ProductReadinessReport:
             evidence=(
                 "Mock provider is deterministic; OpenAI, OpenAI-compatible, Anthropic, Gemini, OpenRouter/Ollama aliases, Ollama Cloud, and Codex CLI paths exist.",
                 "Live learning and provider integration harnesses are present but opt-in.",
+                "`nest-agent product provider-certification` and `GET /api/product/provider-certification` expose a redacted per-provider status report.",
             ),
             remaining_work=(
                 "Run credentialed CI/release validation across the full provider matrix.",
-                "Add provider-specific golden suites and release certification reports.",
+                "Add provider-specific golden suites and promote live validation results into release certification evidence.",
             ),
-            next_action="Create a provider certification command/report that records pass/fail status per provider without exposing secrets.",
+            next_action="Wire credentialed provider matrix results into release gates without exposing secrets.",
         ),
         ProductReadinessCategory(
             category_id="product_ux_onboarding",

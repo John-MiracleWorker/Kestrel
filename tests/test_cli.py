@@ -808,3 +808,16 @@ def test_product_readiness_subcommand_can_emit_json(monkeypatch: MonkeyPatch, ca
     assert payload["schema"] == "kestrel.product_readiness.v1"
     assert payload["headline"]["product_ready"] is False
     assert any(category["category_id"] == "golden_repair_workflow" for category in payload["categories"])
+
+
+def test_product_provider_certification_subcommand_can_emit_json(
+    monkeypatch: MonkeyPatch, capsys: object
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["nest-agent", "product", "provider-certification", "--json"])
+
+    main()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == "kestrel.provider_certification.v1"
+    assert payload["headline"]["release_certified"] is False
+    assert any(provider["provider"] == "mock" for provider in payload["providers"])

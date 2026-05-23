@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends
 
 from .config import AgentConfig
 from .product_readiness import build_product_readiness_report
+from .provider_certification import build_provider_certification_report
 from .setup_readiness import build_setup_readiness_report
 from .support_bundle import export_support_bundle
 
@@ -27,6 +28,11 @@ def register_product_routes(
     def product_setup() -> dict[str, object]:
         config = active_config() if active_config is not None else AgentConfig.from_env()
         return build_setup_readiness_report(config).to_dict()
+
+    @router.get("/api/product/provider-certification", dependencies=dependencies)
+    def product_provider_certification() -> dict[str, object]:
+        config = active_config() if active_config is not None else AgentConfig.from_env()
+        return build_provider_certification_report(config).to_dict()
 
     @router.post("/api/product/support-bundle", dependencies=dependencies)
     def product_support_bundle(log_tail: int = 100) -> dict[str, object]:

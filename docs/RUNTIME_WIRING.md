@@ -51,7 +51,7 @@ nest-agent approvals --backend memory --json
 nest-agent approve <approval_id> --backend memory --json
 ```
 
-The FastAPI server exposes the same state through run, event, approval, scheduler, memory, context, skill, MCP, behavior-delta, plugin, product readiness/setup/support-bundle, and channel routes.
+The FastAPI server exposes the same state through run, event, approval, scheduler, memory, context, skill, MCP, behavior-delta, plugin, product readiness/setup/provider-certification/support-bundle, and channel routes.
 
 Soul/self routes expose the same non-secret runtime model as the CLI: `/api/self`, `/api/self/remember`, `/api/self/propose-change`, `/api/web/search`, and `/api/web/fetch`.
 
@@ -259,6 +259,8 @@ MCP `secret_env` values are redacted in API responses, included in configuration
 Plugin-provided MCP stdio servers carry `connect_requires_approval` vetting metadata. Connect, test, sync, and invoke paths refuse to start the process until `POST /api/mcp/servers/{server_id}/approve-connect` records approval for the current command hash.
 
 ## Support Bundle Wiring
+
+`nest-agent product provider-certification` and `GET /api/product/provider-certification` expose a redacted provider matrix. The report marks deterministic mock coverage as certified, records credential/base-url presence for real providers, identifies host-local manual checks such as `codex-cli`, and returns the live-validation commands needed to turn configured providers into release evidence. It never returns raw API keys.
 
 `nest-agent product support-bundle` and `POST /api/product/support-bundle` write a local zip archive under the requested output path or `.nest/support-bundles/` by default. The archive is diagnostic only: it includes product/setup readiness, runtime metadata with environment-variable presence only, git status, SQLite table counts, log file metadata, and a bounded redacted `events.jsonl` tail. It does not include raw Secret Broker vault contents, raw environment variable values, or `.mv2` memory files.
 

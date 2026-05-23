@@ -32,6 +32,7 @@ from .orchestrator import build_memory_system
 from .plugin_manager import PluginError, PluginManager
 from .product_readiness import build_product_readiness_report
 from .promotion_ledger import OUTCOME_KINDS, PromotionLedger
+from .provider_certification import build_provider_certification_report
 from .run_manager import RunManager
 from .runtime_models import LLMStreamEvent, ToolCall
 from .setup_readiness import build_setup_readiness_report
@@ -219,6 +220,9 @@ def main() -> None:
     product_setup = product_sub.add_parser("setup")
     _add_agent_args(product_setup)
     product_setup.add_argument("--json", action="store_true")
+    product_provider_certification = product_sub.add_parser("provider-certification")
+    _add_agent_args(product_provider_certification)
+    product_provider_certification.add_argument("--json", action="store_true")
     product_support = product_sub.add_parser("support-bundle")
     _add_agent_args(product_support)
     product_support.add_argument("--output", type=Path)
@@ -473,6 +477,10 @@ def main() -> None:
 
     if args.cmd == "product" and args.product_cmd == "setup":
         _print_setup_readiness(config, args)
+        return
+
+    if args.cmd == "product" and args.product_cmd == "provider-certification":
+        _print_provider_certification(config, args)
         return
 
     if args.cmd == "product" and args.product_cmd == "support-bundle":
@@ -829,6 +837,26 @@ def _print_setup_readiness(config: AgentConfig, args: argparse.Namespace) -> Non
         print(f"  Detail: {check['detail']}")
         if check["status"] != "pass":
             print(f"  Recovery: {check['recovery']}")
+
+
+def _print_provider_certification(config: AgentConfig, args: argparse.Namespace) -> None:
+    report = build_provider_certification_report(config)
+    payload = report.to_dict()
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return
+    headline = payload["headline"]
+    print("Provider certification")
+    print(f"Release certified: {'yes' if headline['release_certified'] else 'no'}")
+    print(
+        f"Providers: {headline['certified_count']} certified, "
+        f"{headline['configured_count']} configured, {headline['blocked_count']} blocked, "
+        f"{headline['manual_validation_required_count']} manual"
+    )
+    print()
+    for provider in payload["providers"]:
+        print(f"{provider['provider']}: {provider['status']}")
+        print(f"  Next: {provider['next_action']}")
 
 
 def _print_support_bundle(config: AgentConfig, args: argparse.Namespace) -> None:

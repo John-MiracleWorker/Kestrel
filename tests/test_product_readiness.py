@@ -4,11 +4,16 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pytest import MonkeyPatch
 
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.product_readiness import (
     ProductReadinessStatus,
     build_product_readiness_report,
+)
+from nested_memvid_agent.provider_certification import (
+    ProviderCertificationStatus,
+    build_provider_certification_report,
 )
 from nested_memvid_agent.server_product_routes import register_product_routes
 from nested_memvid_agent.setup_readiness import SetupReadinessStatus, build_setup_readiness_report
@@ -138,3 +143,48 @@ def test_product_setup_route_uses_active_config(tmp_path: Path) -> None:
     payload = response.json()
     assert payload["schema"] == "kestrel.setup_readiness.v1"
     assert any(check["check_id"] == "workspace" for check in payload["checks"])
+
+
+def test_provider_certification_report_is_redacted_and_actionable(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-proj-providerCertificationSecret123456")
+
+    report = build_provider_certification_report(
+        AgentConfig(
+            provider="openai",
+            model="gpt-test",
+            api_key_env="OPENAI_API_KEY",
+            workspace=tmp_path,
+        )
+    )
+    payload = report.to_dict()
+
+    assert payload["schema"] == "kestrel.provider_certification.v1"
+    assert payload["headline"]["total_providers"] >= 10
+    assert "sk-proj-providerCertificationSecret" not in str(payload)
+
+    providers = {provider["provider"]: provider for provider in payload["providers"]}
+    assert providers["mock"]["status"] == ProviderCertificationStatus.CERTIFIED.value
+    assert providers["openai"]["status"] == ProviderCertificationStatus.CONFIGURED.value
+    assert providers["openai"]["api_key_env"] == {"name": "OPENAI_API_KEY", "present": True}
+    assert providers["anthropic"]["status"] == ProviderCertificationStatus.BLOCKED.value
+    assert providers["anthropic"]["api_key_env"]["present"] is False
+    assert providers["codex-cli"]["status"] in {
+        ProviderCertificationStatus.CONFIGURED.value,
+        ProviderCertificationStatus.MANUAL_VALIDATION_REQUIRED.value,
+    }
+
+
+def test_product_provider_certification_route_uses_active_config(tmp_path: Path) -> None:
+    app = FastAPI()
+    config = AgentConfig(provider="mock", workspace=tmp_path)
+    register_product_routes(app, active_config=lambda: config)
+    client = TestClient(app)
+
+    response = client.get("/api/product/provider-certification")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schema"] == "kestrel.provider_certification.v1"
+    assert any(provider["provider"] == "mock" for provider in payload["providers"])
