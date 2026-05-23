@@ -3268,10 +3268,10 @@ function TaskList({ title, tasks, onApprove }: { title: string; tasks: TaskNode[
 
 function ApprovalCard({ approval, onApprove }: { approval: Approval; onApprove: (approval: Approval, approved: boolean) => void }) {
   return (
-    <article className="approval-card">
+    <article className="approval-card" role="group" aria-label={`Approval for ${approval.tool_name}`}>
       <div>
         <strong>{approval.tool_name}</strong>
-        <InlineMeta items={[approval.risk, approval.run_id, approval.tool_call_id]} />
+        <InlineMeta items={[riskLabel(approval.risk), approval.run_id, approval.tool_call_id]} />
       </div>
       <JsonBlock value={approval.arguments} maxHeight="160px" />
       <div className="page-actions">
