@@ -907,6 +907,7 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "codex-cli" } });
     fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-5.4" } });
     fireEvent.change(screen.getByLabelText("Temperature"), { target: { value: "0.7" } });
+    fireEvent.change(screen.getByLabelText("Max tool calls"), { target: { value: "12" } });
     fireEvent.click(screen.getByRole("button", { name: "Manual" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Stream responses" }));
     fireEvent.click(screen.getByRole("button", { name: "Memvid" }));
@@ -922,6 +923,7 @@ describe("App", () => {
         provider: "codex-cli",
         model: "gpt-5.4",
         temperature: 0.7,
+        max_tool_rounds: 12,
         backend: "memvid",
         memory_dir: "/tmp/memory",
         workspace: "/tmp/kestrel",

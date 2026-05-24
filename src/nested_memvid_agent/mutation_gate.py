@@ -20,6 +20,7 @@ class MutationGateEvidence:
     explicit_instruction: bool = False
     reviewed_rule: bool = False
     replay_passed: bool = False
+    auto_activate_low_risk_enabled: bool = False
     policy_delta_activation_enabled: bool = False
     critical_delta_activation_enabled: bool = False
     exact_call_approved: bool = False
@@ -59,7 +60,7 @@ class MutationGate:
             BehaviorDeltaRisk.HIGH,
             BehaviorDeltaRisk.CRITICAL,
         }
-        requires_exact_call_approval = plan.requires_exact_call_approval or delta.risk in {
+        requires_exact_call_approval = plan.requires_exact_call_approval or is_policy_delta or delta.risk in {
             BehaviorDeltaRisk.HIGH,
             BehaviorDeltaRisk.CRITICAL,
         }
@@ -97,7 +98,23 @@ class MutationGate:
             if requires_exact_call_approval and not evidence.exact_call_approved:
                 blockers.append("exact_call_approval_missing")
 
-        if delta.risk == BehaviorDeltaRisk.LOW:
+        if delta.risk == BehaviorDeltaRisk.LOW and blockers:
+            return MutationDecision(
+                accepted=True,
+                status=BehaviorDeltaStatus.STAGED,
+                reason="Low-risk behavior delta staged; activation is blocked until gate requirements pass.",
+                requires_replay=requires_replay and "replay_not_passed" in blockers,
+                requires_human_approval=requires_human_approval
+                and (
+                    "human_approval_missing" in blockers
+                    or "missing_explicit_policy_instruction" in blockers
+                ),
+                requires_exact_call_approval=requires_exact_call_approval
+                and "exact_call_approval_missing" in blockers,
+                blocked_by=tuple(blockers),
+            )
+
+        if delta.risk == BehaviorDeltaRisk.LOW and not evidence.auto_activate_low_risk_enabled:
             return MutationDecision(
                 accepted=True,
                 status=BehaviorDeltaStatus.STAGED,
@@ -107,6 +124,17 @@ class MutationGate:
                 requires_exact_call_approval=requires_exact_call_approval
                 and "exact_call_approval_missing" in blockers,
                 blocked_by=tuple(blockers),
+            )
+
+        if delta.risk == BehaviorDeltaRisk.LOW:
+            return MutationDecision(
+                accepted=True,
+                status=BehaviorDeltaStatus.ACTIVE,
+                reason="Low-risk behavior delta satisfies autonomous activation requirements.",
+                requires_replay=False,
+                requires_human_approval=False,
+                requires_exact_call_approval=False,
+                blocked_by=(),
             )
 
         if blockers:

@@ -306,6 +306,7 @@ export function App() {
   const [provider, setProvider] = useState("mock");
   const [model, setModel] = useState("mock");
   const [temperature, setTemperature] = useState("0.2");
+  const [maxToolRounds, setMaxToolRounds] = useState("6");
   const [modelCatalogs, setModelCatalogs] = useState<Record<string, ProviderModelCatalog>>({});
   const [modelCatalogLoading, setModelCatalogLoading] = useState(false);
   const [autonomyMode, setAutonomyMode] = useState("background");
@@ -733,6 +734,7 @@ export function App() {
     setProvider(String(savedSettings.provider ?? runtimeConfig.provider?.name ?? "mock"));
     setModel(String(savedSettings.model ?? runtimeConfig.provider?.model ?? "mock"));
     setTemperature(formatTemperature(savedSettings.temperature ?? runtimeConfig.provider?.temperature ?? 0.2));
+    setMaxToolRounds(formatToolRounds(savedSettings.max_tool_rounds ?? runtimeConfig.limits?.max_tool_rounds ?? 6));
     setWorkspace(String(savedSettings.workspace ?? runtimeConfig.paths?.workspace ?? ""));
     setAutonomyMode(validAutonomyMode(savedSettings.autonomy_mode, "background"));
     setMemoryBackendDraft(String(savedSettings.backend ?? "").toLowerCase() === "memvid" ? "Memvid" : "In-memory");
@@ -813,6 +815,7 @@ export function App() {
         provider,
         model: model.trim() || "mock",
         temperature: coerceTemperature(temperature),
+        max_tool_rounds: coerceToolRounds(maxToolRounds),
         backend: memoryBackendDraft === "Memvid" ? "memvid" : "memory",
         memory_dir: String(savedSettings.memory_dir ?? currentRuntime?.paths?.memory_dir ?? ".nest/memory"),
         workspace: workspace.trim() || String(currentRuntime?.paths?.workspace ?? "."),
@@ -2630,6 +2633,19 @@ export function App() {
                     />
                   </label>
                   <label>
+                    Max tool calls
+                    <input
+                      className="input num"
+                      type="number"
+                      aria-label="Max tool calls"
+                      min="0"
+                      max="50"
+                      step="1"
+                      value={maxToolRounds}
+                      onChange={(event) => setMaxToolRounds(event.target.value)}
+                    />
+                  </label>
+                  <label>
                     API key env
                     <input className="input mono" type="text" value={String(runtimeProvider.api_key_env ?? "")} placeholder="not required" readOnly />
                   </label>
@@ -3467,6 +3483,16 @@ function coerceTemperature(value: unknown): number {
 
 function formatTemperature(value: unknown): string {
   return String(coerceTemperature(value));
+}
+
+function coerceToolRounds(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 6;
+  return Math.min(50, Math.max(0, Math.trunc(parsed)));
+}
+
+function formatToolRounds(value: unknown): string {
+  return String(coerceToolRounds(value));
 }
 
 function modelsForProvider(provider: string, catalogs: Record<string, ProviderModelCatalog>): string[] {

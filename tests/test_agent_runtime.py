@@ -661,6 +661,58 @@ def test_agent_behavior_delta_preflight_enabled_reaches_tool_context_and_loop(tm
     )
 
 
+def test_agent_auto_activates_validated_low_risk_delta_before_compile(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.db"
+    ledger = BehaviorDeltaLedger(AgentStateStore(state_path))
+    delta = BehaviorDelta(
+        id="delta_auto_validate",
+        title="Inspect validation before retry",
+        kind=BehaviorDeltaKind.PROCEDURE,
+        target_layer=MemoryLayer.PROCEDURAL,
+        risk=BehaviorDeltaRisk.LOW,
+        status=BehaviorDeltaStatus.STAGED,
+        trigger=TriggerSpec(query_patterns=("validation",), task_types=("debugging",)),
+        behavior_change="When validation fails, inspect the prior command before retrying.",
+        evidence_refs=(EvidenceRef(source="fixture", locator="delta_auto_validate", quote="validated low-risk lesson"),),
+        validation_plan=ValidationPlan(
+            required_checks=("behavior_delta_review",),
+            min_validation_score=0.6,
+            min_repeat_count=1,
+        ),
+        metadata={"validation_score": 0.86, "repeat_count": 1},
+    )
+    ledger.record_delta(delta)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    event_log = JsonlEventLog(tmp_path / "logs" / "events.jsonl")
+    agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=memory,
+            llm=MockLLMProvider([LLMResponse(content="I will inspect first.")]),
+            tools=ToolRegistry(),
+            config=AgentConfig(
+                memory_dir=tmp_path / "memory",
+                log_dir=tmp_path / "logs",
+                state_path=state_path,
+                enable_behavior_deltas=True,
+                enable_auto_activate_low_risk_deltas=True,
+            ),
+            event_log=event_log,
+        )
+    )
+
+    result = agent.chat("validation failed; decide how to retry", session_id="test", run_id="run_auto")
+
+    stored = ledger.get_delta(delta.id)
+    assert stored is not None
+    assert stored.status == BehaviorDeltaStatus.ACTIVE
+    assert "ACTIVE PROCEDURES" in result.context_prompt
+    assert "inspect the prior command" in result.context_prompt
+    activations = ledger.list_activations(delta.id)
+    assert activations[0].activation_reason == "auto_activated_low_risk_threshold_met"
+    assert activations[0].run_id == "run_auto"
+    assert any(event.type == "behavior_delta.auto_activate" for event in event_log.tail(limit=50))
+
+
 def test_agent_behavior_delta_policy_preflight_does_not_bypass_approval_gate(tmp_path: Path) -> None:
     state_path = tmp_path / "state.db"
     ledger = BehaviorDeltaLedger(AgentStateStore(state_path))

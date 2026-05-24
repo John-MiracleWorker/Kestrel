@@ -9,10 +9,12 @@ from typing import Any, Literal
 from .behavior_delta import (
     BehaviorDelta,
     BehaviorDeltaKind,
+    BehaviorDeltaRisk,
     BehaviorDeltaStatus,
     behavior_delta_from_metadata,
 )
 from .models import EvidenceRef, MemoryLayer
+from .mutation_gate import MutationGate, MutationGateEvidence
 from .state_store import AgentStateStore, utc_now
 
 BehaviorDeltaOutcomeKind = Literal[
@@ -198,6 +200,53 @@ class BehaviorDeltaLedger:
 
     def __init__(self, state: AgentStateStore) -> None:
         self.state = state
+
+    def auto_activate_low_risk_deltas(
+        self,
+        *,
+        run_id: str | None = None,
+        task_id: str | None = None,
+        objective: str | None = None,
+    ) -> list[BehaviorDelta]:
+        """Promote eligible low-risk deltas through the mutation gate.
+
+        This path is intentionally narrow. Callers must decide whether the
+        feature flag is enabled before invoking it; the ledger still verifies
+        low-risk status, evidence, validation thresholds, rollback support, and
+        policy gates before making any delta active.
+        """
+
+        gate = MutationGate()
+        activated: list[BehaviorDelta] = []
+        for delta in self.list_deltas():
+            if delta.status not in {BehaviorDeltaStatus.PROPOSED, BehaviorDeltaStatus.STAGED}:
+                continue
+            if delta.risk != BehaviorDeltaRisk.LOW:
+                continue
+            decision = gate.evaluate(delta, _auto_activation_evidence(delta))
+            if decision.status != BehaviorDeltaStatus.ACTIVE:
+                continue
+            updated = self.update_delta_status(
+                delta.id,
+                BehaviorDeltaStatus.ACTIVE,
+                reason=decision.reason,
+            )
+            activation_id = f"auto_activate_{delta.id}"
+            if not any(item.id == activation_id for item in self.list_activations(delta.id)):
+                self.record_activation(
+                    BehaviorDeltaActivation(
+                        id=activation_id,
+                        delta_id=delta.id,
+                        run_id=run_id,
+                        task_id=task_id,
+                        objective=objective,
+                        activated_at=utc_now(),
+                        activation_reason="auto_activated_low_risk_threshold_met",
+                        compiled_section=f"AUTO ACTIVATION: {delta.kind.value}",
+                    )
+                )
+            activated.append(updated)
+        return activated
 
     def record_delta(self, delta: BehaviorDelta) -> None:
         with self.state._connect() as conn:
@@ -578,6 +627,53 @@ def _behavior_delta_recommendations(rows: list[BehaviorDeltaReportRow]) -> list[
                 f"Review behavior delta {row.delta_id}: active but never activated in this reporting window."
             )
     return recommendations
+
+
+def _auto_activation_evidence(delta: BehaviorDelta) -> MutationGateEvidence:
+    metadata = delta.metadata
+    return MutationGateEvidence(
+        validation_score=_metadata_float(metadata.get("validation_score"), 0.0),
+        repeat_count=_metadata_int(metadata.get("repeat_count"), 0),
+        explicit_instruction=_metadata_bool(metadata.get("explicit_instruction")),
+        reviewed_rule=_metadata_bool(metadata.get("reviewed_rule")),
+        replay_passed=_metadata_bool(
+            metadata.get("replay_passed"),
+            default=not delta.validation_plan.replay_scenarios,
+        ),
+        auto_activate_low_risk_enabled=True,
+    )
+
+
+def _metadata_bool(value: object, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _metadata_float(value: object, default: float) -> float:
+    if value is None or isinstance(value, bool):
+        return default
+    if not isinstance(value, int | float | str):
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _metadata_int(value: object, default: int) -> int:
+    if value is None or isinstance(value, bool):
+        return default
+    if not isinstance(value, int | float | str):
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def _coerce_datetime(value: datetime | str | None) -> datetime | None:

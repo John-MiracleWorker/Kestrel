@@ -336,7 +336,9 @@ nest-agent channel \
 
 Outbound delivery is disabled by default. To send real replies, configure `.nest/config/channels.json` from `config/channels.example.json`, set the relevant secret environment variable, enable that channel's `send_enabled` or `auto_reply`, and start with `--enable-channel-delivery`.
 
-Generic/custom webhooks can require HMAC-SHA256 signatures through the channel `settings.signature_secret_env` setting.
+Telegram can also act as a single-owner admin surface when the Telegram channel includes `settings.admin_user_ids` (or `owner_user_ids`) and Kestrel is started with the run manager/server path. Owner-only commands are deterministic slash commands plus inline buttons: `/status`, `/runs`, `/run <run_id>`, `/cancel <run_id>`, `/approve <approval_id>`, `/deny <approval_id>`, and `/help`. Pending approval buttons and `/approve` use the exact stored approval arguments; non-owner admin commands/callbacks are denied before creating or resuming a run.
+
+Generic/custom webhooks can require HMAC-SHA256 signatures through the channel `settings.signature_secret_env` setting. Telegram webhook deployments should set `settings.signature_provider=telegram` and `settings.signature_secret_env` so the public route verifies Telegram's `X-Telegram-Bot-Api-Secret-Token` header.
 
 ## Safety Model
 

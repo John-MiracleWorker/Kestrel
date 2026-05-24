@@ -131,7 +131,7 @@ python scripts/eval_learning_architecture.py \
 
 Interpret failures by stage. A provider-smoke failure means provider setup or credentials are wrong. A capsule/proposal failure means the trace did not contain specific enough evidence. A mutation-gate failure means the expected gate status did not match the supplied evidence. A replay failure means the proposed behavior does not improve the deterministic expectation or trips a forbidden behavior. A preflight failure means the active delta did not match the tool context or activation dedupe broke. A rollback failure means audit history or future compilation semantics regressed.
 
-The harness does not auto-tune thresholds, does not auto-activate proposed or staged deltas, does not rewrite hidden system prompts, does not grant policy-write authority, and does not replace `.mv2` as canonical memory.
+The harness does not auto-tune thresholds, does not grant policy-write authority, does not rewrite hidden system prompts, and does not replace `.mv2` as canonical memory. Low-risk proposed or staged deltas can auto-activate only in the runtime path when the default-off low-risk auto-activation flag is enabled and `MutationGate` evidence requirements pass.
 
 ## Tuning Playbook
 

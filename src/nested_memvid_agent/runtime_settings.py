@@ -39,6 +39,7 @@ class RuntimeSettings:
     memory_dir: str
     workspace: str
     temperature: float
+    max_tool_rounds: int
     stream: bool
     require_api_auth: bool
     autonomy_mode: str = "background"
@@ -67,6 +68,7 @@ class RuntimeSettings:
             memory_dir=str(config.memory_dir),
             workspace=str(config.workspace),
             temperature=config.temperature,
+            max_tool_rounds=config.max_tool_rounds,
             stream=config.stream,
             require_api_auth=config.require_api_auth,
             autonomy_mode=autonomy_mode,
@@ -142,6 +144,7 @@ def apply_runtime_settings(config: AgentConfig, settings: RuntimeSettings) -> Ag
         backend=settings.backend,
         memory_dir=Path(settings.memory_dir),
         workspace=Path(settings.workspace),
+        max_tool_rounds=settings.max_tool_rounds,
         stream=settings.stream,
         allow_shell=settings.allow_shell,
         allow_file_write=settings.allow_file_write,
@@ -171,6 +174,7 @@ def merge_runtime_settings(config: AgentConfig, current: RuntimeSettings, raw: d
         "memory_dir",
         "workspace",
         "temperature",
+        "max_tool_rounds",
         "stream",
         "autonomy_mode",
         *TOOL_PERMISSION_FIELDS,
@@ -201,6 +205,7 @@ def _normalize_settings(settings: RuntimeSettings) -> RuntimeSettings:
         memory_dir=memory_dir,
         workspace=workspace,
         temperature=_clean_temperature(settings.temperature),
+        max_tool_rounds=_clean_int_range(settings.max_tool_rounds, "max_tool_rounds", minimum=0, maximum=50),
         stream=_clean_bool(settings.stream),
         require_api_auth=_clean_bool(settings.require_api_auth),
         autonomy_mode=autonomy_mode,
@@ -249,3 +254,15 @@ def _clean_temperature(value: object) -> float:
     if temperature < 0 or temperature > 2:
         raise ValueError("temperature must be between 0 and 2")
     return temperature
+
+
+def _clean_int_range(value: object, field: str, *, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int | str):
+        raise ValueError(f"{field} must be an integer")
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an integer") from exc
+    if parsed < minimum or parsed > maximum:
+        raise ValueError(f"{field} must be between {minimum} and {maximum}")
+    return parsed

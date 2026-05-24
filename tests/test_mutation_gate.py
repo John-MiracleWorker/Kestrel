@@ -64,6 +64,59 @@ def test_low_risk_delta_stages_without_replay_requirement() -> None:
     assert decision.blocked_by == ()
 
 
+def test_low_risk_delta_can_auto_activate_when_enabled_and_validated() -> None:
+    delta = _delta(
+        risk=BehaviorDeltaRisk.LOW,
+        validation_plan=ValidationPlan(
+            required_checks=("behavior_delta_review",),
+            replay_scenarios=("low_risk_replay",),
+            min_validation_score=0.75,
+            min_repeat_count=2,
+        ),
+    )
+
+    decision = MutationGate().evaluate(
+        delta,
+        MutationGateEvidence(
+            validation_score=0.9,
+            repeat_count=2,
+            replay_passed=True,
+            auto_activate_low_risk_enabled=True,
+        ),
+    )
+
+    assert decision.accepted is True
+    assert decision.status == BehaviorDeltaStatus.ACTIVE
+    assert decision.requires_replay is False
+    assert decision.requires_human_approval is False
+    assert decision.requires_exact_call_approval is False
+    assert decision.blocked_by == ()
+
+
+def test_low_risk_policy_delta_does_not_auto_activate_without_policy_gates() -> None:
+    delta = _delta(
+        kind=BehaviorDeltaKind.POLICY,
+        risk=BehaviorDeltaRisk.LOW,
+        target_layer=MemoryLayer.POLICY,
+        validation_plan=ValidationPlan(min_validation_score=0.75, min_repeat_count=1),
+    )
+
+    decision = MutationGate().evaluate(
+        delta,
+        MutationGateEvidence(
+            validation_score=0.95,
+            repeat_count=1,
+            replay_passed=True,
+            auto_activate_low_risk_enabled=True,
+        ),
+    )
+
+    assert decision.accepted is True
+    assert decision.status == BehaviorDeltaStatus.STAGED
+    assert "missing_explicit_policy_instruction" in decision.blocked_by
+    assert "policy_delta_activation_disabled" in decision.blocked_by
+
+
 def test_medium_risk_delta_stages_and_requires_replay_when_validation_is_incomplete() -> None:
     delta = _delta(risk=BehaviorDeltaRisk.MEDIUM)
 

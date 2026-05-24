@@ -121,6 +121,41 @@ def test_status_update_records_reason_metadata(tmp_path: Path) -> None:
     assert updated.metadata["previous_status"] == BehaviorDeltaStatus.PROPOSED.value
 
 
+def test_auto_activate_low_risk_deltas_only_promotes_safe_validated_deltas(tmp_path: Path) -> None:
+    ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "state.db"))
+    ready = _auto_delta(
+        "delta_ready",
+        metadata={"validation_score": 0.86, "repeat_count": 1},
+    )
+    under_validated = _auto_delta(
+        "delta_under_validated",
+        metadata={"validation_score": 0.2, "repeat_count": 1},
+    )
+    missing_validation = _auto_delta("delta_missing_validation")
+    policy = _auto_delta(
+        "delta_policy",
+        kind=BehaviorDeltaKind.POLICY,
+        target_layer=MemoryLayer.POLICY,
+        metadata={"validation_score": 1.0, "repeat_count": 1},
+    )
+    ledger.record_delta(ready)
+    ledger.record_delta(under_validated)
+    ledger.record_delta(missing_validation)
+    ledger.record_delta(policy)
+
+    activated = ledger.auto_activate_low_risk_deltas(run_id="run-auto", objective="validate retries")
+
+    assert [delta.id for delta in activated] == ["delta_ready"]
+    assert ledger.get_delta("delta_ready").status == BehaviorDeltaStatus.ACTIVE  # type: ignore[union-attr]
+    assert ledger.get_delta("delta_under_validated").status == BehaviorDeltaStatus.STAGED  # type: ignore[union-attr]
+    assert ledger.get_delta("delta_missing_validation").status == BehaviorDeltaStatus.STAGED  # type: ignore[union-attr]
+    assert ledger.get_delta("delta_policy").status == BehaviorDeltaStatus.STAGED  # type: ignore[union-attr]
+    activations = ledger.list_activations("delta_ready")
+    assert len(activations) == 1
+    assert activations[0].activation_reason == "auto_activated_low_risk_threshold_met"
+    assert activations[0].run_id == "run-auto"
+
+
 def test_activation_and_outcome_records_are_append_only(tmp_path: Path) -> None:
     ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "state.db"))
     delta = _delta(status=BehaviorDeltaStatus.ACTIVE)
@@ -243,3 +278,32 @@ def test_summary_reports_useful_failure_rollback_and_never_activated_rates(tmp_p
     assert payload["outcomes"]["useful"] == 1
     assert payload["outcomes"]["caused_failure"] == 1
     assert payload["outcomes"]["rolled_back"] == 1
+
+
+def _auto_delta(
+    delta_id: str,
+    *,
+    kind: BehaviorDeltaKind = BehaviorDeltaKind.PROCEDURE,
+    target_layer: MemoryLayer = MemoryLayer.PROCEDURAL,
+    metadata: dict[str, object] | None = None,
+) -> BehaviorDelta:
+    return BehaviorDelta(
+        id=delta_id,
+        title="Validated low-risk delta",
+        kind=kind,
+        target_layer=target_layer,
+        risk=BehaviorDeltaRisk.LOW,
+        status=BehaviorDeltaStatus.STAGED,
+        trigger=TriggerSpec(query_patterns=("validate",), task_types=("debugging",)),
+        behavior_change="When validation fails, inspect the prior command before retrying.",
+        evidence_refs=(EvidenceRef(source="test", locator=delta_id, quote="validated low-risk lesson"),),
+        validation_plan=ValidationPlan(
+            required_checks=("behavior_delta_review",),
+            min_validation_score=0.6,
+            min_repeat_count=1,
+        ),
+        rollback_plan=RollbackPlan(can_disable=True),
+        confidence=0.72,
+        importance=0.7,
+        metadata=metadata or {},
+    )

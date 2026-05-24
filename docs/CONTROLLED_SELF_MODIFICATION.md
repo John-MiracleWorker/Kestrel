@@ -27,6 +27,7 @@ Implemented foundation:
   - Summary rates for useful/failure/rollback/never-activated outcomes.
   - Operator reporting rows with per-delta activation counts, outcome rates, reporting-window filters, and advisory recommendations.
   - Guard against activating terminal deltas without a future explicit override path.
+  - Opt-in low-risk auto-activation helper that still routes every candidate through `MutationGate` and records `auto_activated_low_risk_threshold_met` audit rows.
 
 - `src/nested_memvid_agent/behavior_delta_extractor.py`
   - Proposal-only extraction from task capsule payloads and learning signals.
@@ -36,7 +37,7 @@ Implemented foundation:
 
 - `src/nested_memvid_agent/mutation_gate.py`
   - Rule-based activation gate for proposed behavior deltas.
-  - Low-risk deltas stage without automatic activation.
+  - Low-risk deltas stage by default, and can activate automatically only when the explicit low-risk auto-activation flag is supplied by a caller and validation/replay/repeat evidence passes.
   - Medium-risk deltas require validation/replay before activation.
   - Policy and approval-gate deltas require explicit instruction or reviewed-rule evidence, policy-layer targeting, policy activation enablement, replay pass, approval, exact-call approval, and rollback support.
   - Critical deltas remain staged/recommendation-only unless explicitly enabled by a future caller path.
@@ -55,6 +56,7 @@ Implemented foundation:
 
 - `src/nested_memvid_agent/config.py`
   - Adds default-off `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=0`.
+  - Adds default-off `NEST_AGENT_ENABLE_AUTO_ACTIVATE_LOW_RISK_DELTAS=0`.
   - Adds `NEST_AGENT_MAX_ACTIVE_DELTAS_PER_RUN=8`.
 
 - `scripts/eval_behavior_deltas.py`
@@ -98,7 +100,7 @@ Implemented foundation:
 
 Still intentionally not implemented:
 
-- No automatic behavior-delta activation.
+- No always-on behavior-delta activation. Automatic activation is opt-in, low-risk only, mutation-gated, and auditable.
 - No live provider evals in normal CI; live validation is opt-in/local and must use isolated memory directories.
 - No policy-promotion behavior changes.
 - No hidden system-prompt rewrite path.
@@ -210,6 +212,7 @@ Recommended flags:
 
 ```text
 NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=0
+NEST_AGENT_ENABLE_AUTO_ACTIVATE_LOW_RISK_DELTAS=0
 NEST_AGENT_MAX_ACTIVE_DELTAS_PER_RUN=8
 NEST_AGENT_ALLOW_POLICY_DELTAS=0
 ```
@@ -218,6 +221,7 @@ Rules:
 
 - Disabled behavior deltas must produce identical runtime context to the current compiler path.
 - Enabled behavior deltas must still activate only relevant, active, evidence-backed deltas.
+- Low-risk auto-activation must stay disabled unless `NEST_AGENT_ENABLE_AUTO_ACTIVATE_LOW_RISK_DELTAS=1`; even then it must not activate policy, high-risk, critical, unevidenced, under-validated, or non-disableable deltas.
 - Policy-delta activation needs a separate explicit flag and exact-call approval path.
 
 ## Risk model
@@ -346,7 +350,7 @@ Compiler requirements:
 - Tool-call preflight must remain gated by `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS`.
 - Tool-call preflight must match deterministic triggers only: tool names, path globs, memory layers, risk tags, task types, and objective/query patterns.
 - Tool-call preflight logs one activation per run/tool-call/delta combination with matched trigger reasons such as `matched_tool_name`, `matched_path_glob`, `matched_memory_layer`, `matched_risk_tag`, and `matched_query_pattern`.
-- Tool-call preflight is advisory. It does not auto-activate proposed or staged deltas, does not rewrite the system prompt, does not write policy memory, and does not bypass capability or exact-call approval gates.
+- Tool-call preflight is advisory. It does not auto-activate proposed or staged deltas, does not rewrite the system prompt, does not write policy memory, and does not bypass capability or exact-call approval gates. The separate opt-in low-risk auto-activation path runs before behavior compilation and still uses `MutationGate`.
 - Broad automatic blocking is still out of scope; only the existing deterministic unchanged-retry gate may block repeated same-action retries.
 
 Validation target:
@@ -514,7 +518,7 @@ UI/API requirements:
 Future work should proceed in small test-first slices:
 
 1. Broaden proposal extraction fixtures for explicit instructions, repair review artifacts, repeated success, and user corrections.
-2. Add replay-trigger API/CLI wiring without auto-activation.
+2. Add replay-trigger API/CLI wiring without broadening activation authority beyond the existing low-risk gated path.
 3. Add approval-gated skill install from validated skill candidates.
 4. Expand learning-architecture eval fixtures and provider/backend matrix.
 5. Add richer outcome recording and operator reports.

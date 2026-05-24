@@ -54,9 +54,10 @@ def test_product_readiness_category_payloads_include_evidence_and_next_actions()
     assert auth.next_action
 
     learning = report.category("safe_autonomous_learning")
-    assert learning.status == ProductReadinessStatus.PARTIAL
+    assert learning.status == ProductReadinessStatus.READY
     assert any("behavior" in item.lower() for item in learning.evidence)
-    assert any("auto-activate" in item.lower() for item in learning.remaining_work)
+    assert any("auto-activation" in item.lower() for item in learning.evidence)
+    assert not any("auto-activate" in item.lower() for item in learning.remaining_work)
 
     repair = report.category("golden_repair_workflow")
     assert repair.status == ProductReadinessStatus.PARTIAL

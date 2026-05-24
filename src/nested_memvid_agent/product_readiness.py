@@ -110,16 +110,16 @@ def build_product_readiness_report() -> ProductReadinessReport:
         ProductReadinessCategory(
             category_id="safe_autonomous_learning",
             title="Safe autonomous learning",
-            status=ProductReadinessStatus.PARTIAL,
+            status=ProductReadinessStatus.READY,
             evidence=(
                 "Behavior-delta schema, ledger, proposal extraction, mutation gate, compiler, activation logs, outcomes, rollback, and learning dashboard exist.",
                 "Runtime behavior-delta compilation is feature-flagged and high-risk/policy deltas remain approval-gated.",
+                "Default-off low-risk auto-activation runs before behavior compilation, requires explicit validation metadata through the mutation gate, and records auto_activated audit rows for the learning dashboard.",
             ),
             remaining_work=(
-                "Auto-activate low-risk validated behavior deltas after validation thresholds and repeat evidence are satisfied.",
-                "Add validation-window tracking before marking autonomous learning slices complete.",
+                "Continue expanding validation-window analytics and live-provider regression coverage as learning volume grows.",
             ),
-            next_action="Implement the low-risk auto-activation path behind its default-off flag, with disabled-flag regression tests and rollback proof.",
+            next_action="Exercise opt-in low-risk auto-activation in live-provider evals and monitor dashboard false-positive and rollback rates.",
         ),
         ProductReadinessCategory(
             category_id="production_auth_workspaces",

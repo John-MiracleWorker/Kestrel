@@ -169,6 +169,21 @@ class NestedMV2Agent:
 
         compiled = self.compiler.compile(objective=user_message, query=user_message)
         if self.behavior_compiler is not None:
+            if self.config.enable_auto_activate_low_risk_deltas:
+                auto_activated = self.behavior_compiler.ledger.auto_activate_low_risk_deltas(
+                    run_id=active_run_id,
+                    objective=user_message,
+                )
+                if auto_activated:
+                    self._event(
+                        "behavior_delta.auto_activate",
+                        {
+                            "session_id": session,
+                            "run_id": active_run_id,
+                            "delta_ids": [delta.id for delta in auto_activated],
+                            "count": len(auto_activated),
+                        },
+                    )
             behavior_deltas = self.behavior_compiler.compile(
                 BehaviorCompileRequest(
                     objective=user_message,

@@ -80,7 +80,7 @@ Goal: move from advisory memory to learning that acts by default only where safe
 
 Required work:
 
-- Auto-activate low-risk validated behavior deltas.
+- Auto-activate low-risk validated behavior deltas. ✅ Implemented behind `NEST_AGENT_ENABLE_AUTO_ACTIVATE_LOW_RISK_DELTAS=0`, with `MutationGate` checks and audit rows.
 - Keep medium-risk deltas staged for review.
 - Keep high-risk and policy deltas approval-gated.
 - Record outcomes for every active delta.
@@ -279,8 +279,8 @@ Tasks:
 
 Tasks:
 
-1. Auto-activate low-risk validated behavior deltas.
-2. Add validation-window tracking before marking learning complete.
+1. Auto-activate low-risk validated behavior deltas. ✅ Implemented behind the default-off low-risk auto-activation flag.
+2. Expand validation-window analytics and live-provider regression coverage.
 3. Add one-click rollback in UI.
 4. Add repeated-task improvement report.
 5. Add behavior-delta replay suite to release validation.

@@ -98,6 +98,16 @@ class ChannelManager:
         self._event("channel.receive", inbound.to_public_dict())
         requested_send = channel.auto_reply if send is None else send
         dry_run, blocked_reason = self._delivery_gate(channel, requested=requested_send)
+        if channel.provider == "telegram" and self.run_manager is not None:
+            admin_result = self._handle_telegram_admin_command(
+                channel,
+                adapter,
+                inbound,
+                dry_run=dry_run,
+                blocked_reason=blocked_reason,
+            )
+            if admin_result is not None:
+                return admin_result
         adapter.notify_processing_started(
             channel,
             inbound,
@@ -333,6 +343,133 @@ class ChannelManager:
                 {"channel": inbound.channel, "conversation_id": inbound.conversation_id, "run_id": run_id, "error": str(exc)},
             )
 
+    def _handle_telegram_admin_command(
+        self,
+        channel: ChannelEndpointConfig,
+        adapter: ChannelAdapter,
+        inbound: ChannelInboundMessage,
+        *,
+        dry_run: bool,
+        blocked_reason: str | None,
+    ) -> ChannelProcessResult | None:
+        command, argument = _telegram_admin_command(inbound.text)
+        if command is None:
+            return None
+        if self.run_manager is None:
+            raise ChannelPayloadError("Run manager is required for Telegram admin commands.")
+        owners = _telegram_owner_ids(channel)
+        if not owners or str(inbound.user_id or "").strip() not in owners:
+            return self._telegram_admin_result(
+                channel,
+                adapter,
+                inbound,
+                text="Telegram admin command denied: sender is not a configured Kestrel owner.",
+                stop_reason="admin_unauthorized",
+                dry_run=dry_run,
+                blocked_reason=blocked_reason,
+            )
+
+        try:
+            text, metadata = self._execute_telegram_admin_command(command, argument)
+        except ValueError as exc:
+            text, metadata = str(exc), {}
+        return self._telegram_admin_result(
+            channel,
+            adapter,
+            inbound,
+            text=text,
+            stop_reason="admin_command",
+            dry_run=dry_run,
+            blocked_reason=blocked_reason,
+            metadata=metadata,
+        )
+
+    def _execute_telegram_admin_command(self, command: str, argument: str) -> tuple[str, dict[str, Any]]:
+        if self.run_manager is None:
+            raise ChannelPayloadError("Run manager is required for Telegram admin commands.")
+        if command in {"help", "admin"}:
+            return (_telegram_admin_help(), {})
+        if command == "status":
+            runs = _safe_list_runs(self.run_manager)
+            approvals = _safe_list_approvals(self.run_manager, status="pending")
+            return (_telegram_status_text(runs, approvals), {"reply_markup": _admin_approval_reply_markup(approvals)})
+        if command == "runs":
+            return (_telegram_runs_text(_safe_list_runs(self.run_manager)), {})
+        if command == "run":
+            run_id = argument.strip()
+            if not run_id:
+                raise ValueError("Usage: /run <run_id>")
+            return (_telegram_run_text(self.run_manager.get_run(run_id)), {})
+        if command == "cancel":
+            run_id = argument.strip()
+            if not run_id:
+                raise ValueError("Usage: /cancel <run_id>")
+            payload = self.run_manager.cancel_run(run_id)
+            return (f"Cancelled {payload.get('run_id', run_id)}.", {})
+        if command in {"approve", "deny"}:
+            approval_id = argument.strip().split()[0] if argument.strip() else ""
+            if not approval_id:
+                raise ValueError(f"Usage: /{command} <approval_id>")
+            return self._decide_telegram_approval(approval_id, approved=command == "approve")
+        raise ValueError(f"Unknown Telegram admin command: /{command}")
+
+    def _decide_telegram_approval(self, approval_id: str, *, approved: bool) -> tuple[str, dict[str, Any]]:
+        if self.run_manager is None:
+            raise ChannelPayloadError("Run manager is required for Telegram admin commands.")
+        pending = _find_pending_approval(self.run_manager, approval_id)
+        arguments = dict(pending.get("arguments") or {}) if pending else None
+        decision = self.run_manager.decide_approval(approval_id, approved=approved, arguments=arguments if approved else None)
+        if approved:
+            run_id = str(decision.get("run_id") or "")
+            if run_id:
+                run_payload = self._wait_for_run_payload(run_id)
+                assistant = str(run_payload.get("assistant_message") or "").strip()
+                if str(run_payload.get("status") or "") == "completed" and assistant:
+                    return assistant, {"approval_decision": decision}
+        action = "Approved" if approved else "Denied"
+        suffix = " Continuing…" if approved else ""
+        return f"{action} {approval_id}.{suffix}", {"approval_decision": decision}
+
+    def _telegram_admin_result(
+        self,
+        channel: ChannelEndpointConfig,
+        adapter: ChannelAdapter,
+        inbound: ChannelInboundMessage,
+        *,
+        text: str,
+        stop_reason: str,
+        dry_run: bool,
+        blocked_reason: str | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> ChannelProcessResult:
+        outbound = ChannelOutboundMessage(
+            channel=inbound.channel,
+            channel_id=inbound.channel_id,
+            conversation_id=inbound.conversation_id,
+            reply_to_message_id=inbound.message_id,
+            text=text,
+            metadata=metadata or {},
+        )
+        delivery = adapter.deliver(
+            channel,
+            outbound,
+            dry_run=dry_run,
+            timeout_seconds=self.config.channel_send_timeout_seconds,
+            blocked_reason=blocked_reason,
+        )
+        turn = AgentTurnResult(
+            session_id=inbound.session_id,
+            user_message=inbound.text,
+            assistant_message=text,
+            tool_executions=(),
+            context_chars=0,
+            memory_writes=(),
+            stop_reason=stop_reason,
+            run_id="",
+            source=inbound.to_turn_source(),
+        )
+        return ChannelProcessResult(inbound=inbound, outbound=outbound, delivery=delivery, turn=turn)
+
     def _handle_telegram_approval_callback(
         self,
         channel: ChannelEndpointConfig,
@@ -345,6 +482,32 @@ class ChannelManager:
             raise ChannelPayloadError("Run manager is required for channel approval prompts.")
         callback = _dict_or_empty(payload.get("callback_query"))
         data = str(callback.get("data") or "")
+        if not _telegram_owner_authorized(channel, _optional_str(_dict_or_empty(callback.get("from")).get("id"))):
+            message = _dict_or_empty(callback.get("message"))
+            chat = _dict_or_empty(message.get("chat"))
+            conversation_id = str(chat.get("id") or "")
+            if not conversation_id:
+                raise ChannelPayloadError("Telegram callback did not include a chat id.")
+            inbound = ChannelInboundMessage(
+                channel="telegram",
+                channel_id=channel.id,
+                conversation_id=conversation_id,
+                user_id=_optional_str(_dict_or_empty(callback.get("from")).get("id")),
+                message_id=_optional_str(message.get("message_id")),
+                text=data,
+                metadata={"callback_query_id": _optional_str(callback.get("id"))},
+            )
+            requested_send = channel.auto_reply if send is None else send
+            dry_run, blocked_reason = self._delivery_gate(channel, requested=requested_send)
+            return self._telegram_admin_result(
+                channel,
+                adapter,
+                inbound,
+                text="Telegram admin action denied: sender is not a configured Kestrel owner.",
+                stop_reason="admin_unauthorized",
+                dry_run=dry_run,
+                blocked_reason=blocked_reason,
+            )
         if data.startswith("kestrel_approve:"):
             approval_id = data.removeprefix("kestrel_approve:")
             approved = True
@@ -557,6 +720,135 @@ def _progress_text(event_type: str, payload: dict[str, Any]) -> str | None:
         error = str(payload.get("error") or "failed").strip()
         return f"⚠️ Tool failed: {tool} ({error})"
     return None
+
+
+def _telegram_admin_command(text: str) -> tuple[str | None, str]:
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return None, ""
+    head, _, rest = stripped.partition(" ")
+    command = head[1:].split("@", 1)[0].strip().lower()
+    if command in {"status", "runs", "run", "cancel", "approve", "deny", "help", "admin"}:
+        return command, rest.strip()
+    return None, ""
+
+
+def _telegram_owner_authorized(channel: ChannelEndpointConfig, user_id: str | None) -> bool:
+    owners = _telegram_owner_ids(channel)
+    if not owners:
+        return True
+    return str(user_id or "").strip() in owners
+
+
+def _telegram_owner_ids(channel: ChannelEndpointConfig) -> set[str]:
+    values: list[object] = []
+    for key in ("admin_user_ids", "owner_user_ids", "telegram_owner_ids"):
+        configured = channel.settings.get(key)
+        if configured is not None:
+            values.append(configured)
+    ids: set[str] = set()
+    for value in values:
+        if isinstance(value, (list, tuple, set)):
+            candidates = value
+        else:
+            candidates = str(value).split(",")
+        ids.update(str(item).strip() for item in candidates if str(item).strip())
+    return ids
+
+
+def _safe_list_runs(run_manager: Any) -> list[dict[str, Any]]:
+    list_runs = getattr(run_manager, "list_runs")
+    return [dict(item) for item in list_runs()]
+
+
+def _safe_list_approvals(run_manager: Any, *, status: str | None = None) -> list[dict[str, Any]]:
+    list_approvals = getattr(run_manager, "list_approvals")
+    try:
+        rows = list_approvals(status=status)
+    except TypeError:
+        rows = list_approvals()
+    approvals = [dict(item) for item in rows]
+    if status is not None:
+        approvals = [item for item in approvals if item.get("status") == status]
+    return approvals
+
+
+def _find_pending_approval(run_manager: Any, approval_id: str) -> dict[str, Any] | None:
+    for approval in _safe_list_approvals(run_manager, status="pending"):
+        if str(approval.get("approval_id") or "") == approval_id:
+            return approval
+    return None
+
+
+def _telegram_admin_help() -> str:
+    return "\n".join(
+        [
+            "Kestrel Telegram Admin commands:",
+            "/status — runtime summary and pending approval buttons",
+            "/runs — recent runs",
+            "/run <run_id> — inspect one run",
+            "/cancel <run_id> — cancel a run",
+            "/approve <approval_id> — approve exact pending arguments",
+            "/deny <approval_id> — deny a pending approval",
+        ]
+    )
+
+
+def _telegram_status_text(runs: list[dict[str, Any]], approvals: list[dict[str, Any]]) -> str:
+    counts: dict[str, int] = {}
+    for run in runs:
+        status = str(run.get("status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    lines = ["Kestrel Telegram Admin", f"Runs: {len(runs)}"]
+    for status in sorted(counts):
+        lines.append(f"- {status}: {counts[status]}")
+    lines.append(f"Pending approvals: {len(approvals)}")
+    for approval in approvals[:5]:
+        lines.append(
+            f"- {approval.get('approval_id')} — {approval.get('tool_name', 'tool')} ({approval.get('risk', 'unknown')})"
+        )
+    return "\n".join(lines)
+
+
+def _telegram_runs_text(runs: list[dict[str, Any]]) -> str:
+    if not runs:
+        return "No Kestrel runs recorded."
+    lines = ["Recent Kestrel runs:"]
+    for run in runs[:8]:
+        lines.append(
+            f"- {run.get('run_id')} — {run.get('status', 'unknown')} — {str(run.get('message') or '')[:80]}"
+        )
+    return "\n".join(lines)
+
+
+def _telegram_run_text(run: Mapping[str, Any]) -> str:
+    lines = [f"Run {run.get('run_id')} — {run.get('status', 'unknown')}"]
+    if run.get("message"):
+        lines.append(f"Message: {run.get('message')}")
+    if run.get("assistant_message"):
+        lines.append(f"Assistant: {run.get('assistant_message')}")
+    if run.get("error"):
+        lines.append(f"Error: {run.get('error')}")
+    pending = _pending_approvals(run)
+    if pending:
+        lines.append(f"Pending approvals: {len(pending)}")
+    return "\n".join(lines)
+
+
+def _admin_approval_reply_markup(approvals: list[dict[str, Any]]) -> dict[str, Any] | None:
+    buttons = []
+    for approval in approvals[:3]:
+        approval_id = str(approval.get("approval_id") or "").strip()
+        if not approval_id:
+            continue
+        tool = str(approval.get("tool_name") or "tool")
+        buttons.append(
+            [
+                {"text": f"Approve {tool}"[:64], "callback_data": f"kestrel_approve:{approval_id}"},
+                {"text": "Deny", "callback_data": f"kestrel_deny:{approval_id}"},
+            ]
+        )
+    return {"inline_keyboard": buttons} if buttons else None
 
 
 def load_channel_configs(path: Path) -> list[ChannelEndpointConfig]:

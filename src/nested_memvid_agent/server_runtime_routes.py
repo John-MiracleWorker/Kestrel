@@ -164,6 +164,7 @@ def register_runtime_routes(
                 "backend": next_config.backend,
                 "memory_dir": str(next_config.memory_dir),
                 "workspace": str(next_config.workspace),
+                "max_tool_rounds": next_config.max_tool_rounds,
                 "stream": next_config.stream,
                 "require_api_auth": next_config.require_api_auth,
                 "allow_shell": next_config.allow_shell,

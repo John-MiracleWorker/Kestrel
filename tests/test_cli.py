@@ -796,7 +796,7 @@ def test_product_readiness_subcommand_reports_status(monkeypatch: MonkeyPatch, c
     assert "Product readiness" in output
     assert "Product ready: no" in output
     assert "Production auth, users, and workspaces: missing" in output
-    assert "Safe autonomous learning: partial" in output
+    assert "Safe autonomous learning: ready" in output
 
 
 def test_product_readiness_subcommand_can_emit_json(monkeypatch: MonkeyPatch, capsys: object) -> None:

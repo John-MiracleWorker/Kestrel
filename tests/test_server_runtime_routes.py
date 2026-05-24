@@ -108,6 +108,7 @@ def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> 
             "backend": "memvid",
             "memory_dir": str(tmp_path / "mv2"),
             "workspace": str(tmp_path / "workspace"),
+            "max_tool_rounds": 12,
             "stream": True,
             "require_api_auth": False,
             "autonomy_mode": "manual",
@@ -133,6 +134,7 @@ def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> 
     assert active_config.model == "gpt-5.4"
     assert active_config.temperature == 0.7
     assert active_config.backend == "memvid"
+    assert active_config.max_tool_rounds == 12
     assert active_config.stream is True
     assert active_config.require_api_auth is config.require_api_auth
     assert active_config.allow_shell is True
@@ -152,9 +154,11 @@ def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> 
     assert runtime_payload["provider"]["model"] == "gpt-5.4"
     assert runtime_payload["provider"]["temperature"] == 0.7
     assert runtime_payload["provider"]["stream"] is True
+    assert runtime_payload["limits"]["max_tool_rounds"] == 12
     assert runtime_payload["paths"]["workspace"] == str(tmp_path / "workspace")
     assert runtime_payload["settings"]["runtime"]["persisted"] is True
     assert runtime_payload["settings"]["runtime"]["temperature"] == 0.7
+    assert runtime_payload["settings"]["runtime"]["max_tool_rounds"] == 12
     assert runtime_payload["settings"]["runtime"]["allow_shell"] is True
     assert runtime_payload["feature_flags"]["allow_shell"] is True
 
@@ -190,6 +194,7 @@ def test_runtime_settings_store_loads_saved_config_on_restart(tmp_path) -> None:
             memory_dir=str(tmp_path / "mv2"),
             workspace=str(tmp_path),
             temperature=0.7,
+            max_tool_rounds=11,
             stream=True,
             require_api_auth=False,
             autonomy_mode="manual",
@@ -207,6 +212,7 @@ def test_runtime_settings_store_loads_saved_config_on_restart(tmp_path) -> None:
     assert restarted_config.temperature == 0.7
     assert restarted_config.backend == "memvid"
     assert restarted_config.memory_dir == tmp_path / "mv2"
+    assert restarted_config.max_tool_rounds == 11
     assert restarted_config.stream is True
     assert restarted_config.require_api_auth is config.require_api_auth
     assert restarted_config.allow_shell is True

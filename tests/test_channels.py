@@ -726,6 +726,194 @@ def test_telegram_run_manager_sends_followup_when_run_finishes_after_initial_tim
     assert adapter.outbounds[1].metadata["followup"] is True
 
 
+def test_telegram_admin_command_requires_configured_owner(tmp_path: Path) -> None:
+    class FakeRunManager:
+        def create_run(self, **kwargs: Any) -> object:
+            raise AssertionError("admin commands must not fall through to an agent run")
+
+    manager = ChannelManager(
+        _config(tmp_path),
+        run_manager=FakeRunManager(),
+        channel_configs=[
+            ChannelEndpointConfig(
+                id="telegram",
+                provider="telegram",
+                auto_reply=True,
+                settings={"admin_user_ids": ["777"]},
+            )
+        ],
+    )
+
+    result = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "message": {
+                "message_id": 55,
+                "text": "/status",
+                "chat": {"id": 12345, "type": "private"},
+                "from": {"id": 999},
+            }
+        },
+        send=True,
+    )
+
+    assert result.turn.stop_reason == "admin_unauthorized"
+    assert result.outbound.text == "Telegram admin command denied: sender is not a configured Kestrel owner."
+
+
+def test_telegram_admin_status_command_reports_runs_and_pending_approvals(tmp_path: Path) -> None:
+    class FakeRunManager:
+        def create_run(self, **kwargs: Any) -> object:
+            raise AssertionError("admin commands must not create a normal run")
+
+        def list_runs(self) -> list[dict[str, Any]]:
+            return [
+                {"run_id": "run_done", "status": "completed", "message": "done", "updated_at": "2026-05-24T01:00:00Z"},
+                {"run_id": "run_blocked", "status": "blocked", "message": "needs approval", "updated_at": "2026-05-24T02:00:00Z"},
+            ]
+
+        def list_approvals(self) -> list[dict[str, Any]]:
+            return [
+                {
+                    "approval_id": "approval_123",
+                    "run_id": "run_blocked",
+                    "tool_name": "file.write",
+                    "risk": "high",
+                    "status": "pending",
+                }
+            ]
+
+    manager = ChannelManager(
+        _config(tmp_path),
+        run_manager=FakeRunManager(),
+        channel_configs=[
+            ChannelEndpointConfig(
+                id="telegram",
+                provider="telegram",
+                auto_reply=True,
+                settings={"admin_user_ids": ["777"]},
+            )
+        ],
+    )
+
+    result = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "message": {
+                "message_id": 55,
+                "text": "/status",
+                "chat": {"id": 12345, "type": "private"},
+                "from": {"id": 777},
+            }
+        },
+        send=True,
+    )
+
+    assert result.turn.stop_reason == "admin_command"
+    assert "Kestrel Telegram Admin" in result.outbound.text
+    assert "completed: 1" in result.outbound.text
+    assert "blocked: 1" in result.outbound.text
+    assert "Pending approvals: 1" in result.outbound.text
+    assert result.delivery.request_json["reply_markup"] == {
+        "inline_keyboard": [
+            [
+                {"text": "Approve file.write", "callback_data": "kestrel_approve:approval_123"},
+                {"text": "Deny", "callback_data": "kestrel_deny:approval_123"},
+            ]
+        ]
+    }
+
+
+def test_telegram_admin_approval_command_uses_owner_and_exact_pending_arguments(tmp_path: Path) -> None:
+    class FakeRunManager:
+        def __init__(self) -> None:
+            self.decisions: list[tuple[str, bool, dict[str, Any] | None]] = []
+
+        def list_approvals(self) -> list[dict[str, Any]]:
+            return [
+                {
+                    "approval_id": "approval_123",
+                    "run_id": "run_blocked",
+                    "tool_name": "file.write",
+                    "risk": "high",
+                    "status": "pending",
+                    "arguments": {"path": "demo.txt", "content": "hi"},
+                }
+            ]
+
+        def decide_approval(self, approval_id: str, *, approved: bool, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+            self.decisions.append((approval_id, approved, arguments))
+            return {"approval_id": approval_id, "run_id": "run_blocked", "status": "approved"}
+
+        def get_run(self, run_id: str) -> dict[str, Any]:
+            return {"run_id": run_id, "status": "completed", "assistant_message": "approved result"}
+
+    fake_runs = FakeRunManager()
+    manager = ChannelManager(
+        _config(tmp_path),
+        run_manager=fake_runs,
+        channel_configs=[
+            ChannelEndpointConfig(
+                id="telegram",
+                provider="telegram",
+                auto_reply=True,
+                settings={"admin_user_ids": ["777"]},
+            )
+        ],
+    )
+
+    result = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "message": {
+                "message_id": 55,
+                "text": "/approve approval_123",
+                "chat": {"id": 12345, "type": "private"},
+                "from": {"id": 777},
+            }
+        },
+        send=True,
+    )
+
+    assert fake_runs.decisions == [("approval_123", True, {"path": "demo.txt", "content": "hi"})]
+    assert result.outbound.text == "approved result"
+
+
+def test_telegram_approval_callback_rejects_non_owner_when_owner_is_configured(tmp_path: Path) -> None:
+    class FakeRunManager:
+        def decide_approval(self, approval_id: str, *, approved: bool, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+            raise AssertionError("non-owner callback must not decide approval")
+
+    manager = ChannelManager(
+        _config(tmp_path),
+        run_manager=FakeRunManager(),
+        channel_configs=[
+            ChannelEndpointConfig(
+                id="telegram",
+                provider="telegram",
+                auto_reply=True,
+                settings={"admin_user_ids": ["777"]},
+            )
+        ],
+    )
+
+    result = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "callback_query": {
+                "id": "callback_1",
+                "data": "kestrel_approve:approval_123",
+                "from": {"id": 999},
+                "message": {"message_id": 56, "chat": {"id": 12345, "type": "private"}},
+            }
+        },
+        send=True,
+    )
+
+    assert result.turn.stop_reason == "admin_unauthorized"
+    assert result.outbound.text == "Telegram admin action denied: sender is not a configured Kestrel owner."
+
+
 def test_channel_manager_reuses_agent_for_hot_path(tmp_path: Path) -> None:
     created = 0
 
