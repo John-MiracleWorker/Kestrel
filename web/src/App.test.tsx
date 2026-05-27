@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import axe from "axe-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import type { Approval, Run, SecretRef, Session, Skill, TaskGraph, Tool, TraceEvent } from "./types";
+import type { Approval, Channel, Run, SecretRef, Session, Skill, TaskGraph, Tool, TraceEvent } from "./types";
 
 const baseRun: Run = {
   run_id: "run_1",
@@ -57,6 +57,7 @@ let runs: Run[];
 let sessions: Session[];
 let sessionRuns: Record<string, Run[]>;
 let approvals: Approval[];
+let channelsPayload: Channel[];
 let secrets: SecretRef[];
 let toolsPayload: Tool[];
 let skillsPayload: Skill[];
@@ -96,6 +97,7 @@ describe("App", () => {
       session_2: [otherRun]
     };
     approvals = [pendingApproval];
+    channelsPayload = [];
     secrets = [];
     toolsPayload = [
       {
@@ -717,6 +719,22 @@ describe("App", () => {
     expect(within(activity).getByText("7 passed")).toBeInTheDocument();
   });
 
+  it("shows a typing indicator while an active run has no visible events yet", async () => {
+    sessionRuns.session_1 = [{ ...baseRun, status: "running", assistant_message: "", stop_reason: "" }];
+    runs = [sessionRuns.session_1[0], otherRun];
+    sessions = [
+      { ...sessions[1], latest_run_id: "run_1", latest_status: "running", latest_message: "Inspect the repo" },
+      sessions[0]
+    ];
+    approvals = [];
+    traceTimelines.run_1 = [];
+
+    render(<App />);
+
+    await screen.findByText("Inspect the repo");
+    expect(await screen.findByLabelText("Kestrel is responding")).toHaveTextContent("Working");
+  });
+
   it("hydrates thinking and tool use from the selected run trace", async () => {
     sessionRuns.session_1 = [{ ...baseRun, status: "completed", assistant_message: "Done", stop_reason: "complete" }];
     runs = [sessionRuns.session_1[0], otherRun];
@@ -937,6 +955,57 @@ describe("App", () => {
       expect(body.allow_codex_cli).toBe(false);
     });
     expect(await screen.findByText("Settings saved and applied to new runs.")).toBeInTheDocument();
+  });
+
+  it("renders guided Telegram channel setup and webhook controls", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    channelsPayload = [
+      {
+        id: "telegram",
+        provider: "telegram",
+        enabled: true,
+        send_enabled: true,
+        auto_reply: true,
+        token_env: "TELEGRAM_BOT_TOKEN",
+        webhook_url_env: null,
+        settings: {
+          admin_enabled: true,
+          owner_user_ids: ["777"],
+          signature_secret_env: "TELEGRAM_WEBHOOK_SECRET"
+        },
+        env_status: {
+          token_env_configured: true,
+          signature_secret_env_configured: true
+        }
+      }
+    ];
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    await screen.findByRole("heading", { name: /settings/i });
+
+    const card = await screen.findByRole("group", { name: /telegram setup/i });
+    expect(within(card).getByText("owner 777")).toBeInTheDocument();
+    expect(within(card).getByText("token configured")).toBeInTheDocument();
+    expect(within(card).getByText("signature configured")).toBeInTheDocument();
+
+    fireEvent.change(within(card).getByLabelText("Telegram public webhook URL"), {
+      target: { value: "https://kestrel.example/api/channels/telegram/webhook?channel_id=telegram" }
+    });
+    fireEvent.click(within(card).getByRole("button", { name: /set webhook/i }));
+
+    await waitFor(() => {
+      const setupCall = fetchSpy.mock.calls.find(
+        ([path, init]) => path === "/api/channels/telegram/telegram/set-webhook" && init?.method === "POST"
+      );
+      expect(setupCall).toBeDefined();
+      expect(JSON.parse(String(setupCall?.[1]?.body ?? "{}"))).toEqual({
+        url: "https://kestrel.example/api/channels/telegram/webhook?channel_id=telegram",
+        drop_pending_updates: false
+      });
+    });
   });
 
   it("reports skills discovery results instead of making discover look idle", async () => {
@@ -1257,6 +1326,15 @@ async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<
       runtime: body
     });
   }
+  const telegramWebhookMatch = path.match(/^\/api\/channels\/([^/]+)\/telegram\/(webhook-info|set-webhook|delete-webhook|test-message)$/);
+  if (telegramWebhookMatch) {
+    return jsonResponse({
+      ok: true,
+      channel_id: decodeURIComponent(telegramWebhookMatch[1]),
+      method: telegramWebhookMatch[2],
+      delivery: { sent: true, request_json: {} }
+    });
+  }
   if (path === "/api/self/onboarding" && init?.method === "POST") {
     const body = JSON.parse(String(init.body ?? "{}"));
     onboardingProfile = {
@@ -1329,7 +1407,7 @@ function payloadFor(path: string): unknown {
   if (path === "/api/mcp/servers") return [];
   if (path === "/api/skills") return skillsPayload;
   if (path === "/api/plugins") return [];
-  if (path === "/api/channels") return [];
+  if (path === "/api/channels") return channelsPayload;
   if (path === "/api/secrets") return secrets;
 
 

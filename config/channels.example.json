@@ -6,7 +6,13 @@
       "enabled": true,
       "send_enabled": false,
       "auto_reply": false,
-      "token_env": "TELEGRAM_BOT_TOKEN"
+      "token_env": "TELEGRAM_BOT_TOKEN",
+      "settings": {
+        "admin_enabled": false,
+        "owner_user_ids": [],
+        "signature_provider": "telegram",
+        "signature_secret_env": "TELEGRAM_WEBHOOK_SECRET"
+      }
     },
     {
       "id": "discord",

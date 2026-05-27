@@ -149,6 +149,11 @@ def create_app(config: AgentConfig | None = None) -> Any:
         runs.config = next_config
         channels.config = next_config
 
+    channels.configure_runtime_settings(
+        settings_store=runtime_settings_store,
+        config_update_handler=update_active_config,
+    )
+
     def require_api_auth(
         authorization: str | None = Header(default=None),
         x_kestrel_api_key: str | None = Header(default=None),
@@ -605,10 +610,13 @@ def create_app(config: AgentConfig | None = None) -> Any:
         query: str,
         layers: list[str] | None = None,
         k: int = 8,
+        mode: str = "auto",
         include_inactive: bool = False,
     ) -> list[dict[str, object]]:
         if k < 1 or k > 50:
             raise HTTPException(status_code=400, detail="k must be between 1 and 50")
+        if mode not in {"auto", "lex", "vec", "vector", "hybrid"}:
+            raise HTTPException(status_code=400, detail="mode must be auto, lex, vector, or hybrid")
         agent = build_agent(active_config, tools=runs.build_registry(), state=state)
         try:
             selected_layers = (
@@ -619,6 +627,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
                     query=query,
                     layers=selected_layers,
                     k_per_layer=k,
+                    mode=mode,
                     include_inactive=include_inactive,
                 )
             )
@@ -628,6 +637,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
                     "kind": hit.record.kind.value,
                     "title": hit.record.title,
                     "score": hit.score,
+                    "source_backend": hit.source_backend,
                     "snippet": hit.snippet or hit.record.content[:500],
                     "record_id": hit.record.id,
                 }
@@ -640,10 +650,14 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
     @app.get("/api/memory/search")  # type: ignore[untyped-decorator]
     def search_memory_get(
-        query: str, layers: str | None = None, k: int = 8, include_inactive: bool = False
+        query: str,
+        layers: str | None = None,
+        k: int = 8,
+        mode: str = "auto",
+        include_inactive: bool = False,
     ) -> list[dict[str, object]]:
         return _search_memory(
-            query=query, layers=_csv_layers(layers), k=k, include_inactive=include_inactive
+            query=query, layers=_csv_layers(layers), k=k, mode=mode, include_inactive=include_inactive
         )
 
     @app.post("/api/memory/search")  # type: ignore[untyped-decorator]
@@ -652,6 +666,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
             query=request.query,
             layers=request.layers,
             k=request.k,
+            mode=request.mode,
             include_inactive=request.include_inactive,
         )
 
@@ -668,6 +683,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         agent = build_agent(active_config, tools=runs.build_registry(), state=state)
         try:
             verify = agent.memory.verify_all()
+            vector_status = agent.memory.vector_index_status()
             rows: list[dict[str, object]] = []
             for layer in MemoryLayer:
                 backend = agent.memory.backends[layer]
@@ -679,6 +695,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
                         "exists": path.exists(),
                         "ok": bool(verify.get(layer, False)),
                         "backend": type(backend).__name__,
+                        "vector": vector_status[layer].to_payload(),
                     }
                 )
             return rows

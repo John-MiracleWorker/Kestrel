@@ -70,19 +70,30 @@ Recommendations in this command are deterministic heuristics only. Kestrel never
 
 ```json
 {
-  "procedural": {
+  "semantic": {
+    "search_mode": "hybrid",
     "vector": {
       "enabled": true,
       "embedding_provider": "local",
-      "index_path": "procedural.vec"
+      "embedding_model": "all-MiniLM-L6-v2",
+      "index_path": "semantic.mv2.vector.sqlite"
     }
   }
 }
 ```
 
-Procedural lesson recall asks for hybrid retrieval when local vector settings are available, then falls back to lexical record iteration when they are not. This is intentionally scoped to procedural lessons so equivalent failure lessons with different wording can merge without changing working, episodic, semantic, self, or policy defaults.
+Hybrid retrieval rank-fuses exact `.mv2` lexical hits with local vector-sidecar hits. `mode=lex` bypasses vectors. `mode=vector` searches only the sidecar. Policy memory remains lexical-only even if vector fields are present.
 
-Local embeddings require the optional `sentence-transformers` dependency supported by the Memvid SDK path, plus `vector.embedding_provider: "local"` and a `vector.index_path` in the procedural layer config. Policy memory remains lexical even if vector fields are present.
+Local embeddings require the optional `sentence-transformers` dependency, plus `vector.embedding_provider: "local"` and a `vector.index_path` in the layer config. Sidecars are SQLite files stored beside the `.mv2` layers, contain embeddings keyed by `.mv2` record ID and content hash, and do not store raw memory text.
+
+Inspect and rebuild sidecars with:
+
+```bash
+nest-agent memory vector status --backend memvid --memory-dir .nest/memory --layer-config .nest/config/layers.json
+nest-agent memory vector rebuild --backend memvid --memory-dir .nest/memory --layer-config .nest/config/layers.json --layer semantic
+```
+
+Procedural lesson recall asks for hybrid retrieval when local vector settings are available, then falls back to lexical record iteration when they are not.
 
 ## Backup
 

@@ -32,6 +32,13 @@ class ChannelConfigRequest(BaseModel):
     settings: dict[str, Any] = Field(default_factory=dict)
 
 
+class TelegramWebhookRequest(BaseModel):
+    url: str = ""
+    chat_id: str = ""
+    text: str = "Kestrel Telegram channel test."
+    drop_pending_updates: bool = False
+
+
 class ToolInvokeRequest(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
     session_id: str = "manual"
@@ -85,6 +92,7 @@ class MemorySearchRequest(BaseModel):
     query: str
     layers: list[str] | None = None
     k: int = 8
+    mode: str = "auto"
     include_inactive: bool = False
 
 

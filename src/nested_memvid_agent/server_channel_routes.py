@@ -2,7 +2,7 @@ import json
 from typing import Any, cast
 
 from .channels import ChannelPayloadError
-from .server_models import ChannelConfigRequest, ChannelIngestRequest
+from .server_models import ChannelConfigRequest, ChannelIngestRequest, TelegramWebhookRequest
 from .server_support import known_secret_env_names, request_headers
 
 
@@ -97,6 +97,54 @@ def register_channel_routes(
             return {"ok": True}
         except KeyError as exc:
             raise http_exception(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/channels/{channel_id}/telegram/webhook-info")  # type: ignore[untyped-decorator]
+    def telegram_webhook_info(channel_id: str) -> dict[str, object]:
+        try:
+            return cast(dict[str, object], channels.telegram_webhook_info(channel_id))
+        except (KeyError, ChannelPayloadError, ValueError) as exc:
+            raise http_exception(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/channels/{channel_id}/telegram/set-webhook")  # type: ignore[untyped-decorator]
+    def telegram_set_webhook(channel_id: str, request: TelegramWebhookRequest) -> dict[str, object]:
+        try:
+            return cast(
+                dict[str, object],
+                channels.telegram_set_webhook(
+                    channel_id,
+                    url=request.url,
+                    drop_pending_updates=request.drop_pending_updates,
+                ),
+            )
+        except (KeyError, ChannelPayloadError, ValueError) as exc:
+            raise http_exception(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/channels/{channel_id}/telegram/delete-webhook")  # type: ignore[untyped-decorator]
+    def telegram_delete_webhook(channel_id: str, request: TelegramWebhookRequest) -> dict[str, object]:
+        try:
+            return cast(
+                dict[str, object],
+                channels.telegram_delete_webhook(
+                    channel_id,
+                    drop_pending_updates=request.drop_pending_updates,
+                ),
+            )
+        except (KeyError, ChannelPayloadError, ValueError) as exc:
+            raise http_exception(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/channels/{channel_id}/telegram/test-message")  # type: ignore[untyped-decorator]
+    def telegram_test_message(channel_id: str, request: TelegramWebhookRequest) -> dict[str, object]:
+        try:
+            return cast(
+                dict[str, object],
+                channels.telegram_test_message(
+                    channel_id,
+                    chat_id=request.chat_id,
+                    text=request.text,
+                ),
+            )
+        except (KeyError, ChannelPayloadError, ValueError) as exc:
+            raise http_exception(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/channels/ingest")  # type: ignore[untyped-decorator]
     async def ingest_channel(http_request: Request) -> dict[str, object]:  # type: ignore[valid-type]

@@ -4,7 +4,7 @@ Last updated: 2026-05-20
 
 Kestrel uses Memvid v2 `.mv2` files as its durable retrieval-memory substrate. Do not build against deprecated QR/video-frame Memvid v1 behavior, and do not replace `.mv2` memory with SQLite, Postgres, Chroma, FAISS, or JSON logs.
 
-SQLite is used only for control-plane state such as runs, approvals, MCP servers, skills, task nodes, subagent records, promotion ledgers, and behavior-delta ledgers.
+SQLite is used for control-plane state such as runs, approvals, MCP servers, skills, task nodes, subagent records, promotion ledgers, and behavior-delta ledgers. The only retrieval exception is an explicitly configured rebuildable vector sidecar per layer. A sidecar is keyed to `.mv2` record IDs and content hashes, stores embeddings instead of raw memory text, and can be deleted/rebuilt without losing memory.
 
 ## Current Adapter
 
@@ -55,6 +55,14 @@ Each `.mv2` file may have a companion exact-record sidecar:
 
 The sidecar stores canonical `MemoryRecord` snapshots and inactive/tombstoned IDs. It exists so exact-record APIs can survive close/reopen boundaries; Memvid `.mv2` remains the retrieval substrate for search. Do not replace retrieval memory with the sidecar, and do not create QR/video-frame v1 storage.
 
+Configured non-policy layers may also have a disposable vector sidecar:
+
+```text
+.nest/memory/semantic.mv2.vector.sqlite
+```
+
+Vector sidecars are local SQLite indexes of embedding blobs keyed by record ID and content hash. They do not store raw memory text. If the sidecar is stale or missing, rebuild it from `.mv2` plus the exact-record sidecar; do not treat it as backup memory.
+
 ## Data-Loss Rules
 
 - Never call `create(path)` when `path` already exists.
@@ -98,7 +106,7 @@ Layer defaults should stay conservative:
 - Procedural: auto by default; hybrid only with explicit local vector layer config.
 - Policy: lexical exactness preferred.
 
-The current adapter uses the SDK's returned hits directly and normalizes metadata instead of forcing layer-specific scope filtering.
+Hybrid retrieval rank-fuses lexical `.mv2` hits with vector-sidecar hits at the layered memory router. `mode=lex` bypasses vector sidecars, and policy memory is forced lexical even if vector fields are present. The Memvid adapter still uses the SDK's returned hits directly and normalizes metadata instead of forcing layer-specific scope filtering.
 
 ## CLI and Tools
 
@@ -109,6 +117,8 @@ nest-agent init --backend memvid --memory-dir .nest/memory
 nest-agent memory verify --backend memvid --memory-dir .nest/memory
 nest-agent memory doctor --backend memvid --memory-dir .nest/memory
 nest-agent memory inspect --backend memvid --memory-dir .nest/memory "policy promotion"
+nest-agent memory vector status --backend memvid --memory-dir .nest/memory --layer-config .nest/config/layers.json
+nest-agent memory vector rebuild --backend memvid --memory-dir .nest/memory --layer-config .nest/config/layers.json --layer semantic
 ```
 
 Built-in tools:

@@ -93,6 +93,7 @@ class AgentConfig:
     llm_turn_summaries: bool = False
     memory_seal_write_threshold: int = 50
     memory_seal_interval_seconds: float = 10.0
+    enabled_tools: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> AgentConfig:
@@ -180,6 +181,7 @@ class AgentConfig:
             llm_turn_summaries=_env_bool("NEST_AGENT_LLM_TURN_SUMMARIES"),
             memory_seal_write_threshold=_env_int("NEST_AGENT_MEMORY_SEAL_WRITE_THRESHOLD", 50),
             memory_seal_interval_seconds=_env_float("NEST_AGENT_MEMORY_SEAL_INTERVAL_SECONDS", 10.0),
+            enabled_tools=_env_csv("NEST_AGENT_ENABLED_TOOLS", ()),
         )
 
     @classmethod
@@ -206,7 +208,7 @@ class AgentConfig:
         for key, value in raw.items():
             if key in path_fields and value is not None:
                 normalized[key] = Path(value)
-            elif key in {"protected_branches", "trusted_hosts", "cors_origins"} and isinstance(value, list):
+            elif key in {"protected_branches", "trusted_hosts", "cors_origins", "enabled_tools"} and isinstance(value, list):
                 normalized[key] = tuple(str(item) for item in value)
             else:
                 normalized[key] = value

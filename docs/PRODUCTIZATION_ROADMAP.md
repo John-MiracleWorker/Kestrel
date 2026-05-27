@@ -217,12 +217,15 @@ Goal: make Telegram/Discord/webhooks safe production surfaces.
 Required work:
 
 - Bot identity verification.
+- Telegram webhook setup/status/test helpers with secret-token verification. ✅
+- Single-owner Telegram admin gating with natural-language read actions and inline-confirmed writes. ✅
 - Platform-specific rate-limit behavior.
 - Retry/backoff.
 - Threading correctness.
 - Attachment handling.
 - Per-channel permissions and memory boundaries.
 - Command confirmation for dangerous operations.
+- Refuse raw secret entry through non-local chat surfaces. ✅
 - Secret rotation for webhook/HMAC secrets.
 
 Acceptance criteria:

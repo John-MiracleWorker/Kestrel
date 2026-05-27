@@ -90,6 +90,8 @@ Public channel webhook endpoints reject unsigned payloads by default. Set channe
 
 Generic/custom channel endpoints can require HMAC-SHA256 signatures by setting channel `settings.signature_secret_env`. The signature is computed over the raw HTTP body bytes and sent in `X-Kestrel-Signature` as either a hex digest or `sha256=<digest>`. GitHub uses `X-Hub-Signature-256`; Stripe uses `Stripe-Signature` with timestamp tolerance; Discord uses Ed25519 and requires `settings.discord_public_key` plus optional PyNaCl support, not an HMAC secret.
 
+Telegram admin mode is single-owner only until production auth/workspaces land. Configure `settings.admin_enabled=true` and `settings.owner_user_ids`; non-owner messages and callback actions are denied before creating or resuming runs. Natural-language admin writes create inline confirmation previews, and raw secrets are refused in Telegram because Telegram chat history is not a local secret-entry surface.
+
 An explicit unknown `channel_id` is rejected instead of being treated as an ephemeral local channel. This keeps signed webhook configuration from being bypassed by choosing a new ID.
 
 ## Memory and Behavior-Delta Safety

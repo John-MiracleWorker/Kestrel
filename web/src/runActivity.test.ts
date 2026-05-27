@@ -74,6 +74,50 @@ describe("run activity helpers", () => {
     ]);
   });
 
+  it("surfaces orchestration spans and streamed tool calls as visible activity", () => {
+    const events: TraceEvent[] = [
+      event(1, "span.started", { span_type: "plan", name: "PlannerNode" }),
+      event(2, "orchestration.plan", { task_count: 3 }),
+      event(3, "assistant.tool_call", { tool: "memory.search", arguments: { query: "repo", k: 5 } }),
+      event(4, "span.finished", { span_type: "llm.request", name: "ExecutorNode", status: "completed" })
+    ];
+
+    expect(activityItemsForEvents(events)).toEqual([
+      {
+        id: "1",
+        kind: "thinking",
+        label: "Planning",
+        meta: "PlannerNode",
+        detail: "",
+        status: "running"
+      },
+      {
+        id: "2",
+        kind: "thinking",
+        label: "Plan updated",
+        meta: "3 tasks",
+        detail: "",
+        status: "info"
+      },
+      {
+        id: "3",
+        kind: "tool",
+        label: "Preparing memory.search",
+        meta: "query, k",
+        detail: "",
+        status: "running"
+      },
+      {
+        id: "4",
+        kind: "thinking",
+        label: "Model call finished",
+        meta: "ExecutorNode",
+        detail: "completed",
+        status: "completed"
+      }
+    ]);
+  });
+
   it("checks run ownership and argument summaries", () => {
     expect(eventBelongsToRun(event(1, "run.started", {}, "run_1"), "run_1")).toBe(true);
     expect(eventBelongsToRun(event(1, "run.started", { run_id: "run_2" }, "run_1"), "run_2")).toBe(true);

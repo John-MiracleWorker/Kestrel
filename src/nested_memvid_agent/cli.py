@@ -149,6 +149,7 @@ def main() -> None:
     _add_common_args(memory_search)
     memory_search.add_argument("query")
     memory_search.add_argument("--k", type=int, default=8)
+    memory_search.add_argument("--mode", choices=["auto", "lex", "vec", "vector", "hybrid"], default="auto")
     memory_verify = memory_sub.add_parser("verify")
     _add_common_args(memory_verify)
     memory_doctor = memory_sub.add_parser("doctor")
@@ -158,7 +159,17 @@ def main() -> None:
     _add_common_args(memory_inspect)
     memory_inspect.add_argument("query")
     memory_inspect.add_argument("--k", type=int, default=8)
+    memory_inspect.add_argument("--mode", choices=["auto", "lex", "vec", "vector", "hybrid"], default="auto")
     memory_inspect.add_argument("--include-inactive", action="store_true")
+    memory_vector = memory_sub.add_parser("vector")
+    vector_sub = memory_vector.add_subparsers(dest="vector_cmd", required=True)
+    vector_status = vector_sub.add_parser("status")
+    _add_common_args(vector_status)
+    vector_status.add_argument("--json", action="store_true")
+    vector_rebuild = vector_sub.add_parser("rebuild")
+    _add_common_args(vector_rebuild)
+    vector_rebuild.add_argument("--layer", choices=[layer.value for layer in MemoryLayer])
+    vector_rebuild.add_argument("--json", action="store_true")
     memory_consolidate = memory_sub.add_parser("consolidate")
     _add_common_args(memory_consolidate)
     memory_consolidate.add_argument("query")
@@ -339,7 +350,15 @@ def main() -> None:
     channel.add_argument("channel_provider", help="Channel provider: telegram, discord, webhook, or custom.")
     channel.add_argument("--channel-id", help="Configured channel id. Defaults to provider.")
     channel.add_argument("--send", action="store_true", help="Request outbound delivery after the agent responds.")
-    payload_group = channel.add_mutually_exclusive_group(required=True)
+    channel.add_argument(
+        "--telegram-webhook-action",
+        choices=["info", "set", "delete", "test"],
+        help="Run Telegram webhook setup/status action instead of ingesting a payload.",
+    )
+    channel.add_argument("--webhook-url", help="Public Telegram webhook URL for --telegram-webhook-action set.")
+    channel.add_argument("--test-chat-id", help="Telegram chat id for --telegram-webhook-action test.")
+    channel.add_argument("--test-text", default="Kestrel Telegram channel test.")
+    payload_group = channel.add_mutually_exclusive_group(required=False)
     payload_group.add_argument("--payload", help="Inbound channel payload as JSON.")
     payload_group.add_argument("--payload-file", type=Path, help="Path to inbound channel payload JSON, or '-' for stdin.")
 
@@ -428,18 +447,40 @@ def main() -> None:
         return
 
     if args.cmd == "channel":
-        channel_manager = ChannelManager(config)
-        try:
-            result = channel_manager.handle_payload(
-                provider=args.channel_provider,
-                channel_id=args.channel_id,
-                payload=_load_channel_payload(args),
-                send=args.send,
-            )
-        except ChannelPayloadError as exc:
-            raise SystemExit(str(exc)) from exc
-        print(json.dumps(result.to_public_dict(), indent=2))
-        return
+            channel_manager = ChannelManager(config)
+            try:
+                if args.telegram_webhook_action:
+                    channel_id = args.channel_id or args.channel_provider
+                    if args.telegram_webhook_action == "info":
+                        webhook_result = channel_manager.telegram_webhook_info(channel_id)
+                    elif args.telegram_webhook_action == "set":
+                        if not args.webhook_url:
+                            raise SystemExit("--webhook-url is required for --telegram-webhook-action set")
+                        webhook_result = channel_manager.telegram_set_webhook(channel_id, url=args.webhook_url)
+                    elif args.telegram_webhook_action == "delete":
+                        webhook_result = channel_manager.telegram_delete_webhook(channel_id)
+                    else:
+                        if not args.test_chat_id:
+                            raise SystemExit("--test-chat-id is required for --telegram-webhook-action test")
+                        webhook_result = channel_manager.telegram_test_message(
+                            channel_id,
+                            chat_id=args.test_chat_id,
+                            text=args.test_text,
+                        )
+                    print(json.dumps(webhook_result, indent=2))
+                    return
+                if args.payload is None and args.payload_file is None:
+                    raise SystemExit("channel payload required: pass --payload/--payload-file or --telegram-webhook-action")
+                process_result = channel_manager.handle_payload(
+                    provider=args.channel_provider,
+                    channel_id=args.channel_id,
+                    payload=_load_channel_payload(args),
+                    send=args.send,
+                )
+            except ChannelPayloadError as exc:
+                raise SystemExit(str(exc)) from exc
+            print(json.dumps(process_result.to_public_dict(), indent=2))
+            return
 
     if args.cmd == "tools":
         specs = [spec.to_public_dict() for spec in build_default_tools().specs()]
@@ -499,11 +540,21 @@ def main() -> None:
     memory = build_memory_system(backend, memory_dir, specs=_specs_from_config(config), ledger=ledger)
     try:
         if args.cmd == "memory":
+            if args.memory_cmd == "vector":
+                if args.vector_cmd == "status":
+                    _print_vector_status(memory, json_output=args.json)
+                    return
+                if args.vector_cmd == "rebuild":
+                    layers = (MemoryLayer(args.layer),) if args.layer else None
+                    _print_vector_rebuild(memory, layers=layers, json_output=args.json)
+                    return
+                raise SystemExit(f"Unknown vector command: {args.vector_cmd}")
             if args.memory_cmd in {"search", "inspect"}:
                 hits = memory.retrieve(
                     RetrievalQuery(
                         query=args.query,
                         k_per_layer=args.k,
+                        mode=args.mode,
                         include_inactive=bool(getattr(args, "include_inactive", False)),
                     )
                 )
@@ -512,6 +563,7 @@ def main() -> None:
                         "layer": hit.record.layer.value,
                         "kind": hit.record.kind.value,
                         "score": hit.score,
+                        "source_backend": hit.source_backend,
                         "title": hit.record.title,
                         "id": hit.record.id,
                         "snippet": hit.snippet or hit.record.content[:500],
@@ -1025,6 +1077,47 @@ def _load_channel_payload(args: argparse.Namespace) -> dict[str, Any]:
 def _print_verify_results(results: dict[MemoryLayer, bool]) -> None:
     for layer, ok in results.items():
         print(f"{layer.value}: {'ok' if ok else 'failed'}")
+
+
+def _print_vector_status(memory: Any, *, json_output: bool) -> None:
+    payload = {
+        "layers": {
+            layer.value: status.to_payload()
+            for layer, status in memory.vector_index_status().items()
+        }
+    }
+    if json_output:
+        print(json.dumps(payload, indent=2))
+        return
+    for layer, status in payload["layers"].items():
+        enabled = "enabled" if status["enabled"] else f"disabled: {status['disabled_reason']}"
+        print(
+            f"{layer}: {enabled}, indexed={status['indexed_count']}, "
+            f"stale={status['stale_count']}, missing={status['missing_count']}"
+        )
+
+
+def _print_vector_rebuild(
+    memory: Any,
+    *,
+    layers: tuple[MemoryLayer, ...] | None,
+    json_output: bool,
+) -> None:
+    payload = {
+        "rebuilt": {
+            layer.value: status.to_payload()
+            for layer, status in memory.rebuild_vector_indexes(layers).items()
+        }
+    }
+    if json_output:
+        print(json.dumps(payload, indent=2))
+        return
+    for layer, status in payload["rebuilt"].items():
+        enabled = "rebuilt" if status["enabled"] else f"skipped: {status['disabled_reason']}"
+        print(
+            f"{layer}: {enabled}, indexed={status['indexed_count']}, "
+            f"stale={status['stale_count']}, missing={status['missing_count']}"
+        )
 
 
 def _doctor_memory(memory: object, *, dry_run: bool) -> dict[str, Any]:

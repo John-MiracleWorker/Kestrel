@@ -471,6 +471,7 @@ class RunManager:
             build_agent=self._build_agent,
             approval_handler=self._approval_handler,
             stream_handler_factory=self._stream_handler,
+            progress_handler_factory=self._progress_handler,
             publish_turn_observability=self._publish_turn_observability,
             publish_tool_executions=self._publish_tool_execution_events,
             complete_capsule=self._complete_capsule,
@@ -555,6 +556,7 @@ class RunManager:
                 run_id=run_id,
                 approval_handler=self._approval_handler,
                 stream_handler=self._stream_handler(run_id),
+                progress_handler=self._progress_handler(run_id),
             )
             if self._is_cancelled(run_id):
                 return
@@ -656,6 +658,7 @@ class RunManager:
                 run_id=run_id,
                 approval_handler=self._approval_handler,
                 stream_handler=self._stream_handler(run_id),
+                progress_handler=self._progress_handler(run_id),
             )
             self._publish_turn_observability(run_id, result)
             updated = self.state.update_subagent_run(subagent_id, status="completed", result=result.assistant_message)
@@ -722,6 +725,7 @@ class RunManager:
                 run_id=run.run_id,
                 approval_handler=self._approval_handler,
                 stream_handler=self._stream_handler(run.run_id),
+                progress_handler=self._progress_handler(run.run_id),
             )
             self._publish_turn_observability(run.run_id, result)
             status = "blocked" if result.stop_reason == "approval_required" else "completed"
@@ -874,8 +878,24 @@ class RunManager:
 
         return handle
 
+    def _progress_handler(self, run_id: str) -> Callable[[str, dict[str, Any]], None]:
+        def handle(event_type: str, payload: dict[str, Any]) -> None:
+            if event_type != "tool.request":
+                return
+            self.events.publish(
+                run_id,
+                "tool.started",
+                {
+                    "tool": str(payload.get("tool") or payload.get("tool_name") or "tool"),
+                    "tool_call_id": str(payload.get("tool_call_id") or ""),
+                    "arguments": payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {},
+                },
+            )
+
+        return handle
+
     def build_registry(self) -> ToolRegistry:
-        registry = build_default_tools()
+        registry = build_default_tools(self.config.enabled_tools)
         self.plugins.sync_all()
         self.skills.discover()
         for adapter in [*self.mcp.tool_adapters(), *self.skills.tool_adapters()]:

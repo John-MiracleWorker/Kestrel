@@ -217,6 +217,48 @@ class TelegramAdapter(ChannelAdapter):
         return _post_json(delivery, timeout_seconds=timeout_seconds)
 
 
+def telegram_api_request(
+    config: ChannelEndpointConfig,
+    method: str,
+    payload: dict[str, Any],
+    *,
+    dry_run: bool,
+    timeout_seconds: int,
+    blocked_reason: str | None = None,
+) -> ChannelDelivery:
+    token_env = config.token_env or "TELEGRAM_BOT_TOKEN"
+    token = _configured_secret(config, token_env)
+    request_json = dict(payload)
+    if not dry_run and not token:
+        return ChannelDelivery(
+            channel="telegram",
+            channel_id=config.id,
+            conversation_id="",
+            sent=False,
+            dry_run=False,
+            endpoint=f"https://api.telegram.org/bot<token>/{method}",
+            request_json=_redact_delivery_request(request_json),
+            error=f"Missing Telegram bot token environment variable: {token_env}",
+            blocked_reason=blocked_reason,
+        )
+    endpoint = f"https://api.telegram.org/bot<token>/{method}"
+    if not dry_run and token:
+        request_json["_request_url"] = f"https://api.telegram.org/bot{token}/{method}"
+    delivery = ChannelDelivery(
+        channel="telegram",
+        channel_id=config.id,
+        conversation_id="",
+        sent=False,
+        dry_run=dry_run,
+        endpoint=endpoint,
+        request_json=request_json,
+        blocked_reason=blocked_reason,
+    )
+    if dry_run or delivery.error is not None:
+        return _copy_delivery(delivery)
+    return _post_json(delivery, timeout_seconds=timeout_seconds)
+
+
 class DiscordAdapter(ChannelAdapter):
     provider = "discord"
 
@@ -430,12 +472,25 @@ def _copy_delivery(
         sent=delivery.sent if sent is None else sent,
         dry_run=delivery.dry_run,
         endpoint=delivery.endpoint,
-        request_json={key: value for key, value in delivery.request_json.items() if key != "_request_url"},
+        request_json=_redact_delivery_request(
+            {key: value for key, value in delivery.request_json.items() if key != "_request_url"}
+        ),
         status_code=delivery.status_code if status_code is None else status_code,
         response_text=delivery.response_text if response_text is None else response_text,
         error=delivery.error if error is None else error,
         blocked_reason=delivery.blocked_reason,
     )
+
+
+def _redact_delivery_request(payload: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key, value in payload.items():
+        lowered = key.lower()
+        if "secret" in lowered or lowered.endswith("token") or "token" in lowered:
+            safe[key] = "<configured>" if value else value
+        else:
+            safe[key] = value
+    return safe
 
 
 def _configured_webhook_url(config: ChannelEndpointConfig, default_env: str) -> str | None:

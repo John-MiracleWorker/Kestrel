@@ -4,19 +4,29 @@ import hashlib
 import hmac
 import json
 import os
+import queue
+import re
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from threading import RLock, Thread
 from typing import Any
+from uuid import uuid4
 
 from ..agent import NestedMV2Agent
 from ..app_factory import build_agent
 from ..config import AgentConfig
 from ..event_log import AgentEvent, JsonlEventLog
 from ..runtime_models import AgentTurnResult
-from .adapters import ChannelAdapter, ChannelPayloadError, GenericWebhookAdapter, default_adapters
+from .adapters import (
+    ChannelAdapter,
+    ChannelPayloadError,
+    GenericWebhookAdapter,
+    default_adapters,
+    telegram_api_request,
+)
 from .models import (
     ChannelEndpointConfig,
     ChannelInboundMessage,
@@ -53,6 +63,18 @@ class ChannelManager:
         self.run_manager = run_manager
         self._agent: NestedMV2Agent | None = None
         self._agent_lock = RLock()
+        self._pending_admin_confirmations: dict[str, dict[str, Any]] = {}
+        self._runtime_settings_store: Any | None = None
+        self._config_update_handler: Callable[[AgentConfig], None] | None = None
+
+    def configure_runtime_settings(
+        self,
+        *,
+        settings_store: Any | None,
+        config_update_handler: Callable[[AgentConfig], None] | None,
+    ) -> None:
+        self._runtime_settings_store = settings_store
+        self._config_update_handler = config_update_handler
 
     def list_channels(self) -> list[dict[str, Any]]:
         return [channel.to_public_dict() for channel in sorted(self.channels.values(), key=lambda item: item.id)]
@@ -74,6 +96,86 @@ class ChannelManager:
             raise KeyError(f"Unknown channel: {channel_id}")
         del self.channels[channel_id]
         save_channel_configs(self.config.channel_config_path, list(self.channels.values()))
+
+    def telegram_webhook_info(self, channel_id: str) -> dict[str, Any]:
+        channel = self._resolved_telegram_channel(channel_id)
+        delivery = telegram_api_request(
+            channel,
+            "getWebhookInfo",
+            {},
+            dry_run=False,
+            timeout_seconds=self.config.channel_send_timeout_seconds,
+        )
+        return {"ok": delivery.sent, "channel_id": channel.id, "method": "getWebhookInfo", "delivery": delivery.to_public_dict()}
+
+    def telegram_set_webhook(
+        self,
+        channel_id: str,
+        *,
+        url: str,
+        drop_pending_updates: bool = False,
+    ) -> dict[str, Any]:
+        channel = self._resolved_telegram_channel(channel_id)
+        clean_url = url.strip()
+        if not clean_url:
+            raise ChannelPayloadError("Telegram webhook URL is required.")
+        from ..net_safety import public_url_allowed
+
+        safe_url, unsafe_reason = public_url_allowed(clean_url, require_https=True)
+        if not safe_url:
+            raise ChannelPayloadError(unsafe_reason)
+        payload: dict[str, Any] = {
+            "url": clean_url,
+            "drop_pending_updates": bool(drop_pending_updates),
+            "allowed_updates": ["message", "edited_message", "callback_query"],
+        }
+        secret_env = str(channel.settings.get("signature_secret_env") or "").strip()
+        if secret_env:
+            secret = _channel_secret_value(channel, secret_env)
+            if not secret:
+                raise ChannelPayloadError(f"Missing Telegram webhook secret token environment variable: {secret_env}")
+            payload["secret_token"] = secret
+        delivery = telegram_api_request(
+            channel,
+            "setWebhook",
+            payload,
+            dry_run=False,
+            timeout_seconds=self.config.channel_send_timeout_seconds,
+        )
+        return {"ok": delivery.sent, "channel_id": channel.id, "method": "setWebhook", "delivery": delivery.to_public_dict()}
+
+    def telegram_delete_webhook(
+        self,
+        channel_id: str,
+        *,
+        drop_pending_updates: bool = False,
+    ) -> dict[str, Any]:
+        channel = self._resolved_telegram_channel(channel_id)
+        delivery = telegram_api_request(
+            channel,
+            "deleteWebhook",
+            {"drop_pending_updates": bool(drop_pending_updates)},
+            dry_run=False,
+            timeout_seconds=self.config.channel_send_timeout_seconds,
+        )
+        return {"ok": delivery.sent, "channel_id": channel.id, "method": "deleteWebhook", "delivery": delivery.to_public_dict()}
+
+    def telegram_test_message(self, channel_id: str, *, chat_id: str, text: str) -> dict[str, Any]:
+        channel = self._resolved_telegram_channel(channel_id)
+        outbound = ChannelOutboundMessage(
+            channel="telegram",
+            channel_id=channel.id,
+            conversation_id=chat_id,
+            text=text.strip() or "Kestrel Telegram channel test.",
+        )
+        adapter = self._adapter_for("telegram")
+        delivery = adapter.deliver(
+            channel,
+            outbound,
+            dry_run=False,
+            timeout_seconds=self.config.channel_send_timeout_seconds,
+        )
+        return {"ok": delivery.sent, "channel_id": channel.id, "method": "sendMessage", "delivery": delivery.to_public_dict()}
 
     def handle_payload(
         self,
@@ -183,6 +285,14 @@ class ChannelManager:
             raise ChannelPayloadError("Run manager is required for channel approval prompts.")
         run = self.run_manager.create_run(message=inbound.text, session_id=inbound.session_id)
         run_id = str(getattr(run, "run_id", "") or "")
+        self._start_run_progress_watcher(
+            channel,
+            adapter,
+            inbound,
+            run_id,
+            dry_run=dry_run,
+            blocked_reason=blocked_reason,
+        )
         run_payload = self._wait_for_run_payload(run_id)
         status = str(run_payload.get("status") or "")
         assistant, metadata = self._run_reply(run_id, run_payload, fallback_to_working=True)
@@ -264,11 +374,127 @@ class ChannelManager:
             reply_markup = _approval_reply_markup(pending)
             if reply_markup:
                 metadata["reply_markup"] = reply_markup
+        elif stop_reason == "max_tool_rounds":
+            assistant = self._max_tool_rounds_reply(run_id, run_payload)
         elif status == "failed" and not assistant:
             assistant = f"Kestrel run failed: {run_payload.get('error') or stop_reason}"
         elif not assistant and fallback_to_working:
             assistant = "Kestrel accepted the request and is still working."
         return assistant, metadata
+
+    def _max_tool_rounds_reply(self, run_id: str, run_payload: Mapping[str, Any]) -> str:
+        summary = ""
+        if self.run_manager is not None:
+            state = getattr(self.run_manager, "state", None)
+            list_run_steps = getattr(state, "list_run_steps", None)
+            if callable(list_run_steps):
+                try:
+                    steps = list_run_steps(run_id, limit=200)
+                    summary = _run_steps_tool_summary(steps if isinstance(steps, list) else [])
+                except Exception:  # pragma: no cover - best effort user-facing summary
+                    summary = ""
+        original = str(run_payload.get("assistant_message") or run_payload.get("error") or "").strip()
+        lines = [
+            "Reached the tool-iteration limit before Kestrel produced a final answer.",
+        ]
+        if summary:
+            lines.append(summary)
+        if original and original != "Stopped after max tool rounds.":
+            lines.append(f"Last note: {original}")
+        lines.append("Try a narrower request, or ask Kestrel to continue from the last run after the tool budget is raised.")
+        return "\n\n".join(lines)
+
+    def _start_run_progress_watcher(
+        self,
+        channel: ChannelEndpointConfig,
+        adapter: ChannelAdapter,
+        inbound: ChannelInboundMessage,
+        run_id: str,
+        *,
+        dry_run: bool,
+        blocked_reason: str | None,
+    ) -> None:
+        events = getattr(self.run_manager, "events", None) if self.run_manager is not None else None
+        subscribe = getattr(events, "subscribe", None)
+        if not callable(subscribe):
+            return
+        try:
+            subscriber = subscribe(run_id, after_id=0)
+        except Exception as exc:  # pragma: no cover - defensive logging for optional progress surface
+            self._event("channel.progress.subscribe_error", {"channel": inbound.channel, "conversation_id": inbound.conversation_id, "run_id": run_id, "error": str(exc)})
+            return
+        thread = Thread(
+            target=self._deliver_run_progress_events,
+            args=(channel, adapter, inbound, run_id, events, subscriber),
+            kwargs={"dry_run": dry_run, "blocked_reason": blocked_reason},
+            name=f"channel-progress-{run_id}",
+            daemon=True,
+        )
+        thread.start()
+
+    def _deliver_run_progress_events(
+        self,
+        channel: ChannelEndpointConfig,
+        adapter: ChannelAdapter,
+        inbound: ChannelInboundMessage,
+        run_id: str,
+        events: Any,
+        subscriber: Any,
+        *,
+        dry_run: bool,
+        blocked_reason: str | None,
+    ) -> None:
+        terminal_events = {"run.completed", "run.failed", "run.blocked", "run.cancelled"}
+        deadline = time.monotonic() + max(float(self.config.timeout_seconds), float(self.config.channel_send_timeout_seconds), 0.1)
+        seen: set[tuple[str, str, str]] = set()
+        progress_events: list[tuple[str, dict[str, Any]]] = []
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    event = subscriber.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                event_type = str(getattr(event, "type", "") or "")
+                payload = getattr(event, "payload", {})
+                if not isinstance(payload, dict):
+                    payload = {}
+                if event_type in terminal_events:
+                    self._notify_progress_summary(
+                        adapter,
+                        channel,
+                        inbound,
+                        progress_events,
+                        dry_run=dry_run,
+                        blocked_reason=blocked_reason,
+                    )
+                    return
+                progress_type = _run_event_to_progress_type(event_type)
+                if progress_type is None:
+                    continue
+                tool = str(payload.get("tool") or payload.get("tool_name") or "").strip()
+                tool_call_id = str(payload.get("tool_call_id") or "").strip()
+                key = (progress_type, tool, tool_call_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                progress_events.append((progress_type, payload))
+            self._notify_progress_summary(
+                adapter,
+                channel,
+                inbound,
+                progress_events,
+                dry_run=dry_run,
+                blocked_reason=blocked_reason,
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging for daemon thread
+            self._event("channel.progress.error", {"channel": inbound.channel, "conversation_id": inbound.conversation_id, "run_id": run_id, "error": str(exc)})
+        finally:
+            unsubscribe = getattr(events, "unsubscribe", None)
+            if callable(unsubscribe):
+                try:
+                    unsubscribe(run_id, subscriber)
+                except Exception:
+                    return
 
     def _start_run_followup(
         self,
@@ -352,7 +578,7 @@ class ChannelManager:
         dry_run: bool,
         blocked_reason: str | None,
     ) -> ChannelProcessResult | None:
-        command, argument = _telegram_admin_command(inbound.text)
+        command, argument = _telegram_admin_intent(inbound.text, natural_language=_telegram_admin_enabled(channel))
         if command is None:
             return None
         if self.run_manager is None:
@@ -365,6 +591,31 @@ class ChannelManager:
                 inbound,
                 text="Telegram admin command denied: sender is not a configured Kestrel owner.",
                 stop_reason="admin_unauthorized",
+                dry_run=dry_run,
+                blocked_reason=blocked_reason,
+            )
+
+        if command == "secret_rejected":
+            return self._telegram_admin_result(
+                channel,
+                adapter,
+                inbound,
+                text=_telegram_secret_rejection_text(),
+                stop_reason="admin_secret_rejected",
+                dry_run=dry_run,
+                blocked_reason=blocked_reason,
+            )
+        if command == "set_max_tool_rounds":
+            value = _parse_positive_int(argument, "max tool calls")
+            return self._telegram_admin_confirmation_result(
+                channel,
+                adapter,
+                inbound,
+                action={
+                    "type": "set_max_tool_rounds",
+                    "value": value,
+                    "description": f"Set max tool calls to {value}",
+                },
                 dry_run=dry_run,
                 blocked_reason=blocked_reason,
             )
@@ -382,6 +633,50 @@ class ChannelManager:
             dry_run=dry_run,
             blocked_reason=blocked_reason,
             metadata=metadata,
+        )
+
+    def _telegram_admin_confirmation_result(
+        self,
+        channel: ChannelEndpointConfig,
+        adapter: ChannelAdapter,
+        inbound: ChannelInboundMessage,
+        *,
+        action: dict[str, Any],
+        dry_run: bool,
+        blocked_reason: str | None,
+    ) -> ChannelProcessResult:
+        confirmation_id = uuid4().hex[:12]
+        self._pending_admin_confirmations[confirmation_id] = {
+            **action,
+            "created_at": time.time(),
+            "owner_user_id": inbound.user_id,
+        }
+        description = str(action.get("description") or "Apply Telegram admin action")
+        text = "\n".join(
+            [
+                "Confirm Telegram admin action:",
+                description,
+                "No change has been applied yet.",
+            ]
+        )
+        return self._telegram_admin_result(
+            channel,
+            adapter,
+            inbound,
+            text=text,
+            stop_reason="admin_confirmation_required",
+            dry_run=dry_run,
+            blocked_reason=blocked_reason,
+            metadata={
+                "reply_markup": {
+                    "inline_keyboard": [
+                        [
+                            {"text": "Confirm", "callback_data": f"kestrel_admin_confirm:{confirmation_id}"},
+                            {"text": "Cancel", "callback_data": f"kestrel_admin_cancel:{confirmation_id}"},
+                        ]
+                    ]
+                }
+            },
         )
 
     def _execute_telegram_admin_command(self, command: str, argument: str) -> tuple[str, dict[str, Any]]:
@@ -429,6 +724,31 @@ class ChannelManager:
         action = "Approved" if approved else "Denied"
         suffix = " Continuing…" if approved else ""
         return f"{action} {approval_id}.{suffix}", {"approval_decision": decision}
+
+    def _apply_telegram_admin_action(self, action: Mapping[str, Any]) -> str:
+        action_type = str(action.get("type") or "")
+        if action_type == "set_max_tool_rounds":
+            value = _parse_positive_int(action.get("value"), "max tool calls")
+            self._apply_max_tool_rounds(value)
+            return f"Max tool calls set to {value}."
+        return f"Unsupported Telegram admin action: {action_type}"
+
+    def _apply_max_tool_rounds(self, value: int) -> None:
+        next_config = replace(self.config, max_tool_rounds=value)
+        if self._runtime_settings_store is not None:
+            from ..runtime_settings import apply_runtime_settings, merge_runtime_settings
+
+            current = self._runtime_settings_store.load(self.config)
+            saved = self._runtime_settings_store.save(
+                merge_runtime_settings(self.config, current, {"max_tool_rounds": value})
+            )
+            next_config = apply_runtime_settings(self.config, saved)
+        if self._config_update_handler is not None:
+            self._config_update_handler(next_config)
+        else:
+            self.config = next_config
+            if self.run_manager is not None and hasattr(self.run_manager, "config"):
+                self.run_manager.config = next_config
 
     def _telegram_admin_result(
         self,
@@ -488,6 +808,9 @@ class ChannelManager:
             conversation_id = str(chat.get("id") or "")
             if not conversation_id:
                 raise ChannelPayloadError("Telegram callback did not include a chat id.")
+            requested_send = channel.auto_reply if send is None else send
+            dry_run, blocked_reason = self._delivery_gate(channel, requested=requested_send)
+            self._answer_telegram_callback(channel, callback, dry_run=dry_run, blocked_reason=blocked_reason)
             inbound = ChannelInboundMessage(
                 channel="telegram",
                 channel_id=channel.id,
@@ -497,8 +820,6 @@ class ChannelManager:
                 text=data,
                 metadata={"callback_query_id": _optional_str(callback.get("id"))},
             )
-            requested_send = channel.auto_reply if send is None else send
-            dry_run, blocked_reason = self._delivery_gate(channel, requested=requested_send)
             return self._telegram_admin_result(
                 channel,
                 adapter,
@@ -508,6 +829,8 @@ class ChannelManager:
                 dry_run=dry_run,
                 blocked_reason=blocked_reason,
             )
+        if data.startswith("kestrel_admin_confirm:") or data.startswith("kestrel_admin_cancel:"):
+            return self._handle_telegram_admin_confirmation_callback(channel, adapter, callback, data, send=send)
         if data.startswith("kestrel_approve:"):
             approval_id = data.removeprefix("kestrel_approve:")
             approved = True
@@ -541,6 +864,7 @@ class ChannelManager:
         )
         requested_send = channel.auto_reply if send is None else send
         dry_run, blocked_reason = self._delivery_gate(channel, requested=requested_send)
+        self._answer_telegram_callback(channel, callback, dry_run=dry_run, blocked_reason=blocked_reason)
         outbound = ChannelOutboundMessage(
             channel="telegram",
             channel_id=channel.id,
@@ -568,6 +892,89 @@ class ChannelManager:
         )
         return ChannelProcessResult(inbound=inbound, outbound=outbound, delivery=delivery, turn=turn)
 
+    def _handle_telegram_admin_confirmation_callback(
+        self,
+        channel: ChannelEndpointConfig,
+        adapter: ChannelAdapter,
+        callback: dict[str, Any],
+        data: str,
+        *,
+        send: bool | None,
+    ) -> ChannelProcessResult:
+        if data.startswith("kestrel_admin_confirm:"):
+            confirmation_id = data.removeprefix("kestrel_admin_confirm:")
+            confirmed = True
+        else:
+            confirmation_id = data.removeprefix("kestrel_admin_cancel:")
+            confirmed = False
+        message = _dict_or_empty(callback.get("message"))
+        chat = _dict_or_empty(message.get("chat"))
+        conversation_id = str(chat.get("id") or "")
+        if not conversation_id:
+            raise ChannelPayloadError("Telegram callback did not include a chat id.")
+        inbound = ChannelInboundMessage(
+            channel="telegram",
+            channel_id=channel.id,
+            conversation_id=conversation_id,
+            user_id=_optional_str(_dict_or_empty(callback.get("from")).get("id")),
+            message_id=_optional_str(message.get("message_id")),
+            text=data,
+            metadata={"callback_query_id": _optional_str(callback.get("id")), "confirmation_id": confirmation_id},
+        )
+        requested_send = channel.auto_reply if send is None else send
+        dry_run, blocked_reason = self._delivery_gate(channel, requested=requested_send)
+        self._answer_telegram_callback(channel, callback, dry_run=dry_run, blocked_reason=blocked_reason)
+        action = self._pending_admin_confirmations.pop(confirmation_id, None)
+        if action is None:
+            text = "Telegram admin confirmation expired or was already used."
+            stop_reason = "admin_confirmation_missing"
+        elif not confirmed:
+            text = "Telegram admin action cancelled."
+            stop_reason = "admin_action_cancelled"
+        else:
+            text = self._apply_telegram_admin_action(action)
+            stop_reason = "admin_action_confirmed"
+        return self._telegram_admin_result(
+            channel,
+            adapter,
+            inbound,
+            text=text,
+            stop_reason=stop_reason,
+            dry_run=dry_run,
+            blocked_reason=blocked_reason,
+        )
+
+    def _answer_telegram_callback(
+        self,
+        channel: ChannelEndpointConfig,
+        callback: Mapping[str, Any],
+        *,
+        dry_run: bool,
+        blocked_reason: str | None,
+    ) -> None:
+        callback_id = _optional_str(callback.get("id"))
+        if not callback_id:
+            return
+        delivery = telegram_api_request(
+            channel,
+            "answerCallbackQuery",
+            {"callback_query_id": callback_id},
+            dry_run=dry_run,
+            timeout_seconds=self.config.channel_send_timeout_seconds,
+            blocked_reason=blocked_reason,
+        )
+        self._event(
+            "channel.callback.answer",
+            {
+                "channel": "telegram",
+                "channel_id": channel.id,
+                "sent": delivery.sent,
+                "dry_run": delivery.dry_run,
+                "error": delivery.error,
+                "blocked_reason": delivery.blocked_reason,
+            },
+        )
+
     def close(self) -> None:
         with self._agent_lock:
             agent = self._agent
@@ -593,6 +1000,12 @@ class ChannelManager:
             if candidate.provider == provider:
                 return candidate
         return ChannelEndpointConfig(id=provider, provider=provider)
+
+    def _resolved_telegram_channel(self, channel_id: str) -> ChannelEndpointConfig:
+        channel = self._resolve_channel(provider="telegram", channel_id=channel_id)
+        if channel.provider != "telegram":
+            raise ChannelPayloadError(f"Channel is not a Telegram channel: {channel.id}")
+        return self._with_resolved_secrets(channel)
 
     def _adapter_for(self, provider: str) -> ChannelAdapter:
         return self.adapters.get(provider, self.adapters.get("generic", GenericWebhookAdapter()))
@@ -636,6 +1049,42 @@ class ChannelManager:
                 "conversation_id": inbound.conversation_id,
                 "event_type": event_type,
                 "text": text,
+                "sent": delivery.sent if delivery is not None else False,
+                "dry_run": delivery.dry_run if delivery is not None else dry_run,
+                "error": delivery.error if delivery is not None else None,
+                "blocked_reason": delivery.blocked_reason if delivery is not None else blocked_reason,
+            },
+        )
+
+    def _notify_progress_summary(
+        self,
+        adapter: ChannelAdapter,
+        channel: ChannelEndpointConfig,
+        inbound: ChannelInboundMessage,
+        events: list[tuple[str, dict[str, Any]]],
+        *,
+        dry_run: bool,
+        blocked_reason: str | None,
+    ) -> None:
+        text = _progress_summary_text(events)
+        if not text:
+            return
+        delivery = adapter.notify_progress(
+            channel,
+            inbound,
+            text,
+            dry_run=dry_run,
+            timeout_seconds=self.config.channel_send_timeout_seconds,
+            blocked_reason=blocked_reason,
+        )
+        self._event(
+            "channel.progress.summary",
+            {
+                "channel": inbound.channel,
+                "channel_id": inbound.channel_id,
+                "conversation_id": inbound.conversation_id,
+                "text": text,
+                "event_count": len(events),
                 "sent": delivery.sent if delivery is not None else False,
                 "dry_run": delivery.dry_run if delivery is not None else dry_run,
                 "error": delivery.error if delivery is not None else None,
@@ -708,6 +1157,16 @@ def _optional_str(value: object) -> str | None:
     return text or None
 
 
+def _run_event_to_progress_type(event_type: str) -> str | None:
+    if event_type in {"tool.started", "assistant.tool_call"}:
+        return "tool.request"
+    if event_type in {"tool.completed", "tool.executed"}:
+        return "tool.result"
+    if event_type == "tool.failed":
+        return "tool.error"
+    return None
+
+
 def _progress_text(event_type: str, payload: dict[str, Any]) -> str | None:
     tool = str(payload.get("tool") or "").strip()
     if not tool:
@@ -722,15 +1181,118 @@ def _progress_text(event_type: str, payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _telegram_admin_command(text: str) -> tuple[str | None, str]:
+def _progress_summary_text(events: list[tuple[str, dict[str, Any]]]) -> str | None:
+    completed = [payload for event_type, payload in events if event_type == "tool.result"]
+    failed = [payload for event_type, payload in events if event_type == "tool.error"]
+    if not completed and not failed:
+        return None
+    tools = sorted({str(payload.get("tool") or "tool").strip() or "tool" for payload in completed + failed})
+    parts: list[str] = []
+    if completed:
+        noun = "call" if len(completed) == 1 else "calls"
+        parts.append(f"{len(completed)} {noun} completed")
+    if failed:
+        noun = "call" if len(failed) == 1 else "calls"
+        parts.append(f"{len(failed)} {noun} failed")
+    return f"🧰 Tool activity: {', '.join(parts)}. Tools: {', '.join(tools)}."
+
+
+def _run_steps_tool_summary(steps: list[dict[str, Any]]) -> str:
+    tool_events: list[dict[str, Any]] = []
+    for step in steps:
+        event_type = str(step.get("type") or "")
+        if not event_type.startswith("tool."):
+            continue
+        payload = step.get("payload")
+        if isinstance(payload, dict):
+            tool_events.append(payload)
+    if not tool_events:
+        return ""
+    counts = Counter(str(payload.get("tool") or "tool").strip() or "tool" for payload in tool_events)
+    tools = ", ".join(f"{tool} ×{count}" for tool, count in sorted(counts.items()))
+    errors = sorted({str(payload.get("error") or "").strip() for payload in tool_events if str(payload.get("error") or "").strip()})
+    summary = f"Tool summary: {len(tool_events)} tool events. Tools: {tools}."
+    if errors:
+        summary += f" Errors: {', '.join(errors)}."
+    return summary
+
+
+def _telegram_admin_intent(text: str, *, natural_language: bool) -> tuple[str | None, str]:
     stripped = text.strip()
-    if not stripped.startswith("/"):
+    if stripped.startswith("/"):
+        head, _, rest = stripped.partition(" ")
+        command = head[1:].split("@", 1)[0].strip().lower()
+        if command in {"status", "runs", "run", "cancel", "approve", "deny", "help", "admin"}:
+            return command, rest.strip()
         return None, ""
-    head, _, rest = stripped.partition(" ")
-    command = head[1:].split("@", 1)[0].strip().lower()
-    if command in {"status", "runs", "run", "cancel", "approve", "deny", "help", "admin"}:
-        return command, rest.strip()
+    if not natural_language:
+        return None, ""
+    lowered = stripped.lower()
+    if _looks_like_raw_secret_request(stripped):
+        return "secret_rejected", ""
+    max_tool_match = re.search(r"(?:max(?:imum)?\s+)?tool\s+(?:calls?|rounds?|iterations?)\D+(\d{1,2})", lowered)
+    if max_tool_match and any(term in lowered for term in ("set", "increase", "raise", "change", "bump")):
+        return "set_max_tool_rounds", max_tool_match.group(1)
+    run_id = _first_run_id(stripped)
+    approval_id = _first_approval_id(stripped)
+    if approval_id and any(term in lowered for term in ("approve", "allow", "yes")):
+        return "approve", approval_id
+    if approval_id and any(term in lowered for term in ("deny", "reject", "no")):
+        return "deny", approval_id
+    if run_id and any(term in lowered for term in ("cancel", "stop")):
+        return "cancel", run_id
+    if run_id and any(term in lowered for term in ("show", "inspect", "status")):
+        return "run", run_id
+    if "recent run" in lowered or "list run" in lowered or lowered in {"runs", "show runs"}:
+        return "runs", ""
+    if "status" in lowered or "health" in lowered or "pending approval" in lowered:
+        return "status", ""
+    if "admin help" in lowered or lowered in {"help", "what can you do"}:
+        return "help", ""
     return None, ""
+
+
+def _telegram_admin_enabled(channel: ChannelEndpointConfig) -> bool:
+    configured = channel.settings.get("admin_enabled")
+    if isinstance(configured, bool):
+        return configured
+    if isinstance(configured, str):
+        return configured.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(_telegram_owner_ids(channel))
+
+
+def _looks_like_raw_secret_request(text: str) -> bool:
+    lowered = text.lower()
+    if not any(term in lowered for term in ("token", "api key", "apikey", "secret", "password")):
+        return False
+    return bool(re.search(r"\b(set|store|save|change|update)\b.+\b(to|as)\b\s+\S{8,}", lowered))
+
+
+def _first_run_id(text: str) -> str:
+    match = re.search(r"\brun_[a-zA-Z0-9_:-]+\b", text)
+    return match.group(0) if match else ""
+
+
+def _first_approval_id(text: str) -> str:
+    match = re.search(r"\bapproval_[a-zA-Z0-9_:-]+\b", text)
+    return match.group(0) if match else ""
+
+
+def _parse_positive_int(value: object, name: str) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except ValueError as exc:
+        raise ValueError(f"Invalid {name}: {value}") from exc
+    if parsed < 0 or parsed > 50:
+        raise ValueError(f"Invalid {name}: {parsed}. Use a value from 0 to 50.")
+    return parsed
+
+
+def _telegram_secret_rejection_text() -> str:
+    return (
+        "Raw secrets are not accepted through Telegram. Store tokens and API keys "
+        "through the local Kestrel UI or CLI secret broker, then use Telegram to check status."
+    )
 
 
 def _telegram_owner_authorized(channel: ChannelEndpointConfig, user_id: str | None) -> bool:
@@ -757,16 +1319,14 @@ def _telegram_owner_ids(channel: ChannelEndpointConfig) -> set[str]:
 
 
 def _safe_list_runs(run_manager: Any) -> list[dict[str, Any]]:
-    list_runs = getattr(run_manager, "list_runs")
-    return [dict(item) for item in list_runs()]
+    return [dict(item) for item in run_manager.list_runs()]
 
 
 def _safe_list_approvals(run_manager: Any, *, status: str | None = None) -> list[dict[str, Any]]:
-    list_approvals = getattr(run_manager, "list_approvals")
     try:
-        rows = list_approvals(status=status)
+        rows = run_manager.list_approvals(status=status)
     except TypeError:
-        rows = list_approvals()
+        rows = run_manager.list_approvals()
     approvals = [dict(item) for item in rows]
     if status is not None:
         approvals = [item for item in approvals if item.get("status") == status]

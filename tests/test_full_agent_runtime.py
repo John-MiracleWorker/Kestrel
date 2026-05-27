@@ -1644,6 +1644,9 @@ def test_full_agent_flow_blocks_approves_resumes_traces_and_capsules(tmp_path: P
     assert len(approvals) == 1
     approval = approvals[0]
     assert approval["tool_name"] == "test.run"
+    blocked_event_types = [event["type"] for event in manager.state.list_run_steps(run.run_id)]
+    assert "tool.started" in blocked_event_types
+    assert blocked_event_types.index("tool.started") < blocked_event_types.index("approval.requested")
 
     manager.decide_approval(approval["approval_id"], approved=True, arguments=approval["arguments"])
     final = _wait_for_status(manager, run.run_id, {"completed", "failed"})

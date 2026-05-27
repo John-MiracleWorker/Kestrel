@@ -65,7 +65,7 @@ Run capsules live separately:
 .nest/runs/{run_id}/complete.mv2
 ```
 
-Do not use Memvid v1 QR/video behavior. Do not build around vector databases. Do not replace `.mv2` memory with SQLite/Postgres/Chroma/FAISS/JSON. SQLite is control-plane state only.
+Do not use Memvid v1 QR/video behavior. Do not replace `.mv2` memory with SQLite/Postgres/Chroma/FAISS/JSON. SQLite is control-plane state only, except for explicitly configured rebuildable vector sidecar indexes keyed to `.mv2` record IDs and content hashes. Sidecars are disposable search accelerators, never canonical memory.
 
 Never call `create(path)` on an existing `.mv2` file.
 

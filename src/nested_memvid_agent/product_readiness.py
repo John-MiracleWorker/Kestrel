@@ -194,12 +194,12 @@ def build_product_readiness_report() -> ProductReadinessReport:
             title="Channels and external ingress",
             status=ProductReadinessStatus.PARTIAL,
             evidence=(
-                "Telegram, Discord-shaped, and generic webhook ingress exist with dry-run replies and HMAC support for generic channels.",
+                "Telegram, Discord-shaped, and generic webhook ingress exist. Telegram now has single-owner admin gating, natural-language read/admin intents, inline-confirmed writes for settings changes, webhook setup helpers, and Telegram secret-token verification.",
             ),
             remaining_work=(
-                "Add platform-native bot identity verification, rate-limit handling, threading correctness, attachment handling, per-channel permissions, and secret rotation.",
+                "Add durable per-channel permissions/workspace boundaries, platform-specific rate-limit behavior, threading correctness, attachment handling, and secret rotation.",
             ),
-            next_action="Harden Telegram/channel production identity verification and rate-limit behavior before treating channels as product-ready.",
+            next_action="Add durable channel permission boundaries and platform rate-limit handling before treating channels as product-ready.",
         ),
         ProductReadinessCategory(
             category_id="metrics_proof",

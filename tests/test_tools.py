@@ -7,6 +7,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import sleep
+from typing import Any, cast
 
 import pytest
 from pytest import MonkeyPatch
@@ -14,6 +15,7 @@ from pytest import MonkeyPatch
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.orchestrator import build_memory_system
+from nested_memvid_agent.run_manager import RunManager
 from nested_memvid_agent.runtime_models import ToolCall, ToolExecution, ToolSpec
 from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.tools.base import AgentTool, ToolContext
@@ -35,6 +37,53 @@ class SlowTool(AgentTool):
             success=True,
             content="finished",
         )
+
+
+def test_build_default_tools_can_be_limited_to_named_subset() -> None:
+    registry = build_default_tools(("memory.search", "file.read"))
+
+    names = [spec.name for spec in registry.specs()]
+
+    assert names == ["memory.search", "file.read"]
+    assert registry.spec_for("memory.search") is not None
+    assert registry.spec_for("shell.run") is None
+
+
+def test_run_manager_registry_honors_enabled_tools_config(tmp_path: Path) -> None:
+    class _Events:
+        pass
+
+    class _Plugins:
+        def sync_all(self) -> None:
+            pass
+
+    class _Skills:
+        def discover(self) -> None:
+            pass
+
+        def tool_adapters(self) -> list[AgentTool]:
+            return []
+
+    class _MCP:
+        def tool_adapters(self) -> list[AgentTool]:
+            return []
+
+    manager = RunManager(
+        config=AgentConfig(
+            memory_dir=tmp_path / "memory",
+            state_path=tmp_path / "state.db",
+            enabled_tools=("memory.search", "file.read"),
+        ),
+        state=AgentStateStore(tmp_path / "state.db"),
+        events=cast(Any, _Events()),
+        mcp=cast(Any, _MCP()),
+        skills=cast(Any, _Skills()),
+        plugins=cast(Any, _Plugins()),
+    )
+
+    names = [spec.name for spec in manager.build_registry().specs()]
+
+    assert names == ["memory.search", "file.read"]
 
 
 def test_tool_registry_times_out_slow_tools(tmp_path: Path) -> None:

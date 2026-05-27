@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import queue
+import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -503,6 +506,73 @@ def test_server_exposes_channel_ingest_route(tmp_path: Path) -> None:
     assert payload["delivery"]["dry_run"] is True
 
 
+def test_server_exposes_telegram_webhook_setup_routes_redacting_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:ABC-super-secret")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "telegram-secret-token")
+    calls: list[dict[str, Any]] = []
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self) -> FakeResponse:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"ok":true,"result":{"url":"https://kestrel.example/telegram"}}'
+
+    def fake_urlopen(request: object, timeout: int) -> FakeResponse:
+        body = request.data.decode("utf-8") if getattr(request, "data", None) else "{}"
+        calls.append({"url": request.full_url, "payload": json.loads(body), "timeout": timeout})
+        return FakeResponse()
+
+    monkeypatch.setattr("nested_memvid_agent.net_safety.public_url_allowed", lambda url, require_https=False: (True, ""))
+    monkeypatch.setattr("nested_memvid_agent.channels.adapters.urlopen", fake_urlopen)
+    channel = {
+        "id": "telegram",
+        "provider": "telegram",
+        "enabled": True,
+        "send_enabled": True,
+        "auto_reply": True,
+        "token_env": "TELEGRAM_BOT_TOKEN",
+        "settings": {
+            "admin_enabled": True,
+            "owner_user_ids": ["777"],
+            "signature_provider": "telegram",
+            "signature_secret_env": "TELEGRAM_WEBHOOK_SECRET",
+        },
+    }
+    (tmp_path / "channels.json").write_text(json.dumps({"channels": [channel]}), encoding="utf-8")
+    config = replace(
+        _config(tmp_path),
+        channel_config_path=tmp_path / "channels.json",
+        enable_channel_delivery=True,
+    )
+    client = TestClient(create_app(config))
+
+    response = client.post(
+        "/api/channels/telegram/telegram/set-webhook",
+        json={"url": "https://kestrel.example/api/channels/telegram/webhook?channel_id=telegram"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["method"] == "setWebhook"
+    assert payload["delivery"]["endpoint"] == "https://api.telegram.org/bot<token>/setWebhook"
+    encoded = json.dumps(payload)
+    assert "123456:ABC-super-secret" not in encoded
+    assert "telegram-secret-token" not in encoded
+    assert payload["delivery"]["request_json"]["secret_token"] == "<configured>"
+    assert calls[0]["url"] == "https://api.telegram.org/bot123456:ABC-super-secret/setWebhook"
+    assert calls[0]["payload"]["secret_token"] == "telegram-secret-token"
+
+
 def test_server_rejects_untrusted_host_and_origin(tmp_path: Path) -> None:
     from fastapi.testclient import TestClient
 
@@ -726,6 +796,160 @@ def test_telegram_run_manager_sends_followup_when_run_finishes_after_initial_tim
     assert adapter.outbounds[1].metadata["followup"] is True
 
 
+def test_telegram_run_manager_batches_tool_progress_before_final_reply(tmp_path: Path) -> None:
+    class FakeRun:
+        run_id = "run_progress_managed"
+        session_id = "channel:telegram:12345"
+
+    class FakeEvents:
+        def __init__(self) -> None:
+            self.subscribers: list[queue.Queue[object]] = []
+
+        def subscribe(self, run_id: str, after_id: int = 0) -> queue.Queue[object]:
+            assert run_id == "run_progress_managed"
+            assert after_id == 0
+            subscriber: queue.Queue[object] = queue.Queue()
+            self.subscribers.append(subscriber)
+            return subscriber
+
+        def unsubscribe(self, run_id: str, subscriber: queue.Queue[object]) -> None:
+            assert run_id == "run_progress_managed"
+
+    class FakeRunManager:
+        def __init__(self) -> None:
+            self.events = FakeEvents()
+
+        def create_run(self, **kwargs: Any) -> FakeRun:
+            return FakeRun()
+
+        def get_run(self, run_id: str) -> dict[str, Any]:
+            assert run_id == "run_progress_managed"
+            return {"run_id": run_id, "status": "running", "assistant_message": ""}
+
+    class CaptureTelegramAdapter(ChannelAdapter):
+        provider = "telegram"
+
+        def __init__(self) -> None:
+            self.outbounds: list[ChannelOutboundMessage] = []
+
+        def parse_inbound(self, config: ChannelEndpointConfig, payload: dict[str, Any]) -> ChannelInboundMessage:
+            return ChannelInboundMessage(
+                channel="telegram",
+                channel_id=config.id,
+                conversation_id="12345",
+                user_id="777",
+                message_id="55",
+                text="please inspect",
+            )
+
+        def build_delivery(
+            self,
+            config: ChannelEndpointConfig,
+            outbound: ChannelOutboundMessage,
+            *,
+            dry_run: bool,
+            blocked_reason: str | None = None,
+        ) -> ChannelDelivery:
+            self.outbounds.append(outbound)
+            return ChannelDelivery(
+                channel="telegram",
+                channel_id=config.id,
+                conversation_id=outbound.conversation_id,
+                sent=True,
+                dry_run=dry_run,
+                endpoint="capture://telegram",
+                request_json={"text": outbound.text, **outbound.metadata},
+                blocked_reason=blocked_reason,
+            )
+
+    fake_runs = FakeRunManager()
+    adapter = CaptureTelegramAdapter()
+    cfg = replace(_config(tmp_path), channel_send_timeout_seconds=1, timeout_seconds=1)
+    manager = ChannelManager(
+        cfg,
+        adapters={"telegram": adapter},
+        run_manager=fake_runs,
+        channel_configs=[ChannelEndpointConfig(id="telegram", provider="telegram", send_enabled=True, auto_reply=True)],
+    )
+
+    def fake_wait_for_run_payload(run_id: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        deadline = time.monotonic() + 1
+        while not fake_runs.events.subscribers and time.monotonic() < deadline:
+            time.sleep(0.01)
+        subscriber = fake_runs.events.subscribers[0]
+        for index in range(3):
+            subscriber.put(SimpleNamespace(type="tool.started", payload={"tool": "file.read", "tool_call_id": f"tool_read_{index}"}))
+            subscriber.put(SimpleNamespace(type="tool.completed", payload={"tool": "file.read", "tool_call_id": f"tool_read_{index}"}))
+        subscriber.put(SimpleNamespace(type="run.completed", payload={"stop_reason": "complete"}))
+        deadline = time.monotonic() + 1
+        while len(adapter.outbounds) < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return {
+            "run_id": run_id,
+            "status": "completed",
+            "stop_reason": "complete",
+            "assistant_message": "Done after using a tool.",
+        }
+
+    manager._wait_for_run_payload = fake_wait_for_run_payload  # type: ignore[method-assign]
+
+    result = manager.handle_payload(provider="telegram", payload={"message": {"text": "please inspect"}}, send=True)
+
+    assert result.outbound.text == "Done after using a tool."
+    assert [outbound.text for outbound in adapter.outbounds] == [
+        "🧰 Tool activity: 3 calls completed. Tools: file.read.",
+        "Done after using a tool.",
+    ]
+
+
+def test_telegram_max_tool_rounds_reply_includes_run_summary(tmp_path: Path) -> None:
+    class FakeState:
+        def list_run_steps(self, run_id: str, limit: int = 200) -> list[dict[str, Any]]:
+            assert run_id == "run_exhausted"
+            return [
+                {
+                    "type": "tool.executed",
+                    "payload": {"tool": "file.read", "success": True},
+                },
+                {
+                    "type": "tool.executed",
+                    "payload": {"tool": "repo.search", "success": True},
+                },
+                {
+                    "type": "tool.failed",
+                    "payload": {"tool": "file.read", "error": "file_read_failed"},
+                },
+            ]
+
+    class FakeRunManager:
+        state = FakeState()
+
+    manager = ChannelManager(
+        _config(tmp_path),
+        run_manager=FakeRunManager(),
+        channel_configs=[ChannelEndpointConfig(id="telegram", provider="telegram", send_enabled=True, auto_reply=True)],
+    )
+
+    text, metadata = manager._run_reply(
+        "run_exhausted",
+        {
+            "run_id": "run_exhausted",
+            "status": "failed",
+            "stop_reason": "max_tool_rounds",
+            "assistant_message": "Stopped after max tool rounds.",
+            "error": "Stopped after max tool rounds.",
+        },
+        fallback_to_working=False,
+    )
+
+    assert metadata["stop_reason"] == "max_tool_rounds"
+    assert "Reached the tool-iteration limit" in text
+    assert "Tool summary: 3 tool events" in text
+    assert "file.read ×2" in text
+    assert "repo.search ×1" in text
+    assert "file_read_failed" in text
+
+
 def test_telegram_admin_command_requires_configured_owner(tmp_path: Path) -> None:
     class FakeRunManager:
         def create_run(self, **kwargs: Any) -> object:
@@ -877,6 +1101,103 @@ def test_telegram_admin_approval_command_uses_owner_and_exact_pending_arguments(
 
     assert fake_runs.decisions == [("approval_123", True, {"path": "demo.txt", "content": "hi"})]
     assert result.outbound.text == "approved result"
+
+
+def test_telegram_natural_language_max_tool_calls_requires_confirmation(tmp_path: Path) -> None:
+    class FakeRunManager:
+        def __init__(self) -> None:
+            self.config = _config(tmp_path)
+
+        def create_run(self, **kwargs: Any) -> object:
+            raise AssertionError("natural-language admin settings changes must not create a normal run")
+
+    fake_runs = FakeRunManager()
+    manager = ChannelManager(
+        _config(tmp_path),
+        run_manager=fake_runs,
+        channel_configs=[
+            ChannelEndpointConfig(
+                id="telegram",
+                provider="telegram",
+                auto_reply=True,
+                settings={"admin_enabled": True, "owner_user_ids": ["777"]},
+            )
+        ],
+    )
+
+    preview = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "message": {
+                "message_id": 55,
+                "text": "increase max tool calls to 12",
+                "chat": {"id": 12345, "type": "private"},
+                "from": {"id": 777},
+            }
+        },
+        send=True,
+    )
+
+    assert preview.turn.stop_reason == "admin_confirmation_required"
+    assert "Confirm Telegram admin action" in preview.outbound.text
+    assert "Set max tool calls to 12" in preview.outbound.text
+    assert manager.config.max_tool_rounds != 12
+    confirm_data = preview.delivery.request_json["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+    assert str(confirm_data).startswith("kestrel_admin_confirm:")
+
+    applied = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "callback_query": {
+                "id": "callback_confirm",
+                "data": confirm_data,
+                "from": {"id": 777},
+                "message": {"message_id": 56, "chat": {"id": 12345, "type": "private"}},
+            }
+        },
+        send=True,
+    )
+
+    assert applied.turn.stop_reason == "admin_action_confirmed"
+    assert applied.outbound.text == "Max tool calls set to 12."
+    assert manager.config.max_tool_rounds == 12
+    assert fake_runs.config.max_tool_rounds == 12
+
+
+def test_telegram_natural_language_raw_secret_is_rejected(tmp_path: Path) -> None:
+    class FakeRunManager:
+        def create_run(self, **kwargs: Any) -> object:
+            raise AssertionError("raw secret admin text must not create a normal run")
+
+    manager = ChannelManager(
+        _config(tmp_path),
+        run_manager=FakeRunManager(),
+        channel_configs=[
+            ChannelEndpointConfig(
+                id="telegram",
+                provider="telegram",
+                auto_reply=True,
+                settings={"admin_enabled": True, "owner_user_ids": ["777"]},
+            )
+        ],
+    )
+
+    result = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "message": {
+                "message_id": 55,
+                "text": "set TELEGRAM_BOT_TOKEN to 123456:ABC-super-secret",
+                "chat": {"id": 12345, "type": "private"},
+                "from": {"id": 777},
+            }
+        },
+        send=True,
+    )
+
+    assert result.turn.stop_reason == "admin_secret_rejected"
+    assert "Raw secrets are not accepted through Telegram" in result.outbound.text
+    assert "123456:ABC-super-secret" not in result.outbound.text
 
 
 def test_telegram_approval_callback_rejects_non_owner_when_owner_is_configured(tmp_path: Path) -> None:

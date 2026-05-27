@@ -336,7 +336,16 @@ nest-agent channel \
 
 Outbound delivery is disabled by default. To send real replies, configure `.nest/config/channels.json` from `config/channels.example.json`, set the relevant secret environment variable, enable that channel's `send_enabled` or `auto_reply`, and start with `--enable-channel-delivery`.
 
-Telegram can also act as a single-owner admin surface when the Telegram channel includes `settings.admin_user_ids` (or `owner_user_ids`) and Kestrel is started with the run manager/server path. Owner-only commands are deterministic slash commands plus inline buttons: `/status`, `/runs`, `/run <run_id>`, `/cancel <run_id>`, `/approve <approval_id>`, `/deny <approval_id>`, and `/help`. Pending approval buttons and `/approve` use the exact stored approval arguments; non-owner admin commands/callbacks are denied before creating or resuming a run.
+Telegram can also act as a single-owner admin surface when the Telegram channel includes `settings.admin_enabled=true` plus `settings.owner_user_ids` (or `admin_user_ids`) and Kestrel is started with the run manager/server path. Owner-only admin supports deterministic slash commands and bounded natural-language requests such as "show status" or "increase max tool calls to 12." Write actions return an inline confirmation preview before mutation; raw secrets are never accepted through Telegram and should be entered through the local UI/CLI Secret Broker.
+
+The server exposes Telegram setup helpers for webhook deployments:
+
+```text
+GET  /api/channels/{channel_id}/telegram/webhook-info
+POST /api/channels/{channel_id}/telegram/set-webhook
+POST /api/channels/{channel_id}/telegram/delete-webhook
+POST /api/channels/{channel_id}/telegram/test-message
+```
 
 Generic/custom webhooks can require HMAC-SHA256 signatures through the channel `settings.signature_secret_env` setting. Telegram webhook deployments should set `settings.signature_provider=telegram` and `settings.signature_secret_env` so the public route verifies Telegram's `X-Telegram-Bot-Api-Secret-Token` header.
 

@@ -14,6 +14,7 @@ from .backends.base import MemoryBackend
 from .context_frames import MV2ContextFrame, make_conflict_set_frame, to_memory_record
 from .models import MemoryHit, MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from .promotion_ledger import PromotionEntry, PromotionLedger, make_outcome
+from .vector_sidecar import TextEmbedder, VectorSidecar, VectorSidecarStatus, make_local_embedder
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class LayerSpec:
     search_mode: str = "auto"
     vector_search_enabled: bool = False
     vector_embedding_provider: str | None = None
+    vector_embedding_model: str | None = None
     vector_index_path: str | None = None
     hybrid_search_enabled: bool = False
 
@@ -132,6 +134,7 @@ class LayeredMemorySystem:
         backends: dict[MemoryLayer, MemoryBackend],
         specs: dict[MemoryLayer, LayerSpec] | None = None,
         ledger: PromotionLedger | None = None,
+        vector_sidecars: dict[MemoryLayer, VectorSidecar] | None = None,
     ) -> None:
         self.specs = specs or DEFAULT_LAYER_SPECS
         missing = set(self.specs) - set(backends)
@@ -140,6 +143,7 @@ class LayeredMemorySystem:
             raise ValueError(f"Missing backends for layers: {missing_names}")
         self.backends = backends
         self.ledger = ledger
+        self.vector_sidecars = vector_sidecars or {}
         self._writes_since_seal = 0
         self._dirty_layers: set[MemoryLayer] = set()
         self._last_seal_monotonic = time.monotonic()
@@ -151,20 +155,24 @@ class LayeredMemorySystem:
         backend_factory: type[MemoryBackend],
         specs: dict[MemoryLayer, LayerSpec] | None = None,
         ledger: PromotionLedger | None = None,
+        vector_embedder: TextEmbedder | None = None,
         **backend_kwargs: object,
     ) -> LayeredMemorySystem:
         layer_specs = specs or DEFAULT_LAYER_SPECS
         memory_dir.mkdir(parents=True, exist_ok=True)
         backends: dict[MemoryLayer, MemoryBackend] = {}
+        vector_sidecars: dict[MemoryLayer, VectorSidecar] = {}
         for layer, spec in layer_specs.items():
             path = memory_dir / spec.mv2_file
             layer_backend_kwargs = dict(backend_kwargs)
-            if spec.vector_search_enabled and spec.vector_embedding_provider == "local":
-                layer_backend_kwargs.setdefault("enable_vec", True)
             backend = backend_factory(path=path, layer=layer, **layer_backend_kwargs)
             backend.open()
             backends[layer] = backend
-        return cls(backends=backends, specs=layer_specs, ledger=ledger)
+            sidecar = _make_vector_sidecar(memory_dir=memory_dir, mv2_path=path, spec=spec, embedder=vector_embedder)
+            if sidecar is not None:
+                sidecar.open()
+                vector_sidecars[layer] = sidecar
+        return cls(backends=backends, specs=layer_specs, ledger=ledger, vector_sidecars=vector_sidecars)
 
     def put(self, record: MemoryRecord) -> str:
         record, conflict_frame, conflicts = self._with_conflict_metadata(record)
@@ -183,12 +191,15 @@ class LayeredMemorySystem:
             return confirmed_twin.id
         record_id = self.backends[record.layer].put(record)
         self._note_write(record.layer)
+        self._update_vector_sidecar(record)
         self._record_promotion(record, record_id=record_id)
         self._record_conflict_outcomes(record, conflicts)
         if conflict_frame is not None:
             conflict_frame.confidence = max(conflict_frame.confidence, spec.min_write_confidence)
-            self.backends[conflict_frame.layer].put(to_memory_record(conflict_frame))
+            conflict_record = to_memory_record(conflict_frame)
+            self.backends[conflict_frame.layer].put(conflict_record)
             self._note_write(conflict_frame.layer)
+            self._update_vector_sidecar(conflict_record)
         return record_id
 
     def upsert(self, record: MemoryRecord) -> str:
@@ -208,12 +219,15 @@ class LayeredMemorySystem:
             return confirmed_twin.id
         record_id = self.backends[record.layer].upsert(record)
         self._note_write(record.layer)
+        self._update_vector_sidecar(record)
         self._record_promotion(record, record_id=record_id)
         self._record_conflict_outcomes(record, conflicts)
         if conflict_frame is not None:
             conflict_frame.confidence = max(conflict_frame.confidence, spec.min_write_confidence)
-            self.backends[conflict_frame.layer].upsert(to_memory_record(conflict_frame))
+            conflict_record = to_memory_record(conflict_frame)
+            self.backends[conflict_frame.layer].upsert(conflict_record)
             self._note_write(conflict_frame.layer)
+            self._update_vector_sidecar(conflict_record)
         return record_id
 
     def tombstone(
@@ -228,6 +242,7 @@ class LayeredMemorySystem:
         changed = self.backends[layer].tombstone(record_id, reason=reason, superseded_by=superseded_by)
         if changed:
             self._note_write(layer)
+            self._tombstone_vector_sidecar(layer, record_id)
             promotion_id = None if record is None else _promotion_id(record)
             if promotion_id:
                 if reason == "corrected":
@@ -280,7 +295,8 @@ class LayeredMemorySystem:
             spec = self.specs[layer]
             k = min(query.k_per_layer, spec.retrieval_k)
             hits.extend(
-                self.backends[layer].find(
+                self._find_layer_hits(
+                    layer=layer,
                     query=query.query,
                     k=k,
                     mode=_resolved_search_mode(spec, query.mode),
@@ -369,9 +385,36 @@ class LayeredMemorySystem:
         self.maybe_seal_all(force=True)
         for backend in self.backends.values():
             backend.close()
+        for sidecar in self.vector_sidecars.values():
+            sidecar.close()
 
     def iter_layers(self) -> Iterable[tuple[MemoryLayer, LayerSpec]]:
         return self.specs.items()
+
+    def vector_index_status(self) -> dict[MemoryLayer, VectorSidecarStatus]:
+        statuses: dict[MemoryLayer, VectorSidecarStatus] = {}
+        for layer in self.specs:
+            sidecar = self.vector_sidecars.get(layer)
+            if sidecar is None:
+                reason = "policy memory is lexical-only" if layer == MemoryLayer.POLICY else "vector sidecar not configured"
+                statuses[layer] = VectorSidecarStatus.disabled(layer, reason)
+                continue
+            statuses[layer] = sidecar.status(records=tuple(self.backends[layer].iter_records(include_inactive=True)))
+        return statuses
+
+    def rebuild_vector_indexes(
+        self,
+        layers: tuple[MemoryLayer, ...] | None = None,
+    ) -> dict[MemoryLayer, VectorSidecarStatus]:
+        selected_layers = layers or tuple(self.vector_sidecars)
+        rebuilt: dict[MemoryLayer, VectorSidecarStatus] = {}
+        for layer in selected_layers:
+            sidecar = self.vector_sidecars.get(layer)
+            if sidecar is None:
+                rebuilt[layer] = VectorSidecarStatus.disabled(layer, "vector sidecar not configured")
+                continue
+            rebuilt[layer] = sidecar.rebuild(tuple(self.backends[layer].iter_records(include_inactive=True)))
+        return rebuilt
 
     def _with_conflict_metadata(self, record: MemoryRecord) -> tuple[MemoryRecord, MV2ContextFrame | None, list[MemoryRecord]]:
         if not _eligible_for_conflict_detection(record):
@@ -402,6 +445,88 @@ class LayeredMemorySystem:
     def _note_write(self, layer: MemoryLayer) -> None:
         self._writes_since_seal += 1
         self._dirty_layers.add(layer)
+
+    def _update_vector_sidecar(self, record: MemoryRecord) -> None:
+        sidecar = self.vector_sidecars.get(record.layer)
+        if sidecar is not None:
+            sidecar.upsert(record)
+
+    def _tombstone_vector_sidecar(self, layer: MemoryLayer, record_id: str) -> None:
+        sidecar = self.vector_sidecars.get(layer)
+        if sidecar is not None:
+            sidecar.tombstone(record_id)
+
+    def _find_layer_hits(
+        self,
+        *,
+        layer: MemoryLayer,
+        query: str,
+        k: int,
+        mode: str,
+        min_relevancy: float,
+        include_inactive: bool,
+    ) -> list[MemoryHit]:
+        sidecar = self.vector_sidecars.get(layer)
+        if mode in {"vec", "vector"}:
+            return self._find_vector_sidecar_hits(
+                layer=layer,
+                query=query,
+                k=k,
+                min_relevancy=min_relevancy,
+                include_inactive=include_inactive,
+            )
+        if mode == "hybrid" and sidecar is not None:
+            lexical_hits = self.backends[layer].find(
+                query=query,
+                k=k,
+                mode="lex",
+                min_relevancy=min_relevancy,
+                include_inactive=include_inactive,
+            )
+            vector_hits = self._find_vector_sidecar_hits(
+                layer=layer,
+                query=query,
+                k=k,
+                min_relevancy=min_relevancy,
+                include_inactive=include_inactive,
+            )
+            return _fuse_memory_hits(lexical_hits, vector_hits, k=k)
+        backend_mode = "lex" if mode == "hybrid" else mode
+        return self.backends[layer].find(
+            query=query,
+            k=k,
+            mode=backend_mode,
+            min_relevancy=min_relevancy,
+            include_inactive=include_inactive,
+        )
+
+    def _find_vector_sidecar_hits(
+        self,
+        *,
+        layer: MemoryLayer,
+        query: str,
+        k: int,
+        min_relevancy: float,
+        include_inactive: bool,
+    ) -> list[MemoryHit]:
+        sidecar = self.vector_sidecars.get(layer)
+        if sidecar is None:
+            return []
+        hits: list[MemoryHit] = []
+        for vector_hit in sidecar.search(query, k=k, min_score=min_relevancy, include_inactive=include_inactive):
+            record = self.backends[layer].get_record(vector_hit.record_id, include_inactive=include_inactive)
+            if record is None:
+                continue
+            hits.append(
+                MemoryHit(
+                    record=record,
+                    score=vector_hit.score,
+                    source_backend="vector_sidecar",
+                    frame_id=record.id,
+                    snippet=record.content[:220],
+                )
+            )
+        return hits
 
     def _requires_eager_seal(self) -> bool:
         return any(backend.__class__.__name__ == "InMemoryBackend" for backend in self.backends.values())
@@ -468,6 +593,7 @@ def load_layer_specs(path: Path) -> dict[MemoryLayer, LayerSpec]:
         vector: dict[str, object] = vector_payload if isinstance(vector_payload, dict) else {}
         vector_enabled = bool(vector.get("enabled", payload.get("vector_search_enabled", False)))
         provider = _optional_str(vector.get("embedding_provider", payload.get("vector_embedding_provider")))
+        embedding_model = _optional_str(vector.get("embedding_model", payload.get("vector_embedding_model")))
         index_path = _optional_str(vector.get("index_path", payload.get("vector_index_path")))
         local_vector_enabled = bool(vector_enabled and provider == "local" and index_path)
         search_mode = str(payload.get("search_mode", base.search_mode))
@@ -494,10 +620,34 @@ def load_layer_specs(path: Path) -> dict[MemoryLayer, LayerSpec]:
             search_mode=search_mode,
             vector_search_enabled=local_vector_enabled,
             vector_embedding_provider=provider if local_vector_enabled else None,
+            vector_embedding_model=embedding_model if local_vector_enabled else None,
             vector_index_path=index_path if local_vector_enabled else None,
             hybrid_search_enabled=local_vector_enabled and search_mode == "hybrid",
         )
     return specs
+
+
+def _make_vector_sidecar(
+    *,
+    memory_dir: Path,
+    mv2_path: Path,
+    spec: LayerSpec,
+    embedder: TextEmbedder | None,
+) -> VectorSidecar | None:
+    if spec.layer == MemoryLayer.POLICY:
+        return None
+    if not spec.vector_search_enabled or spec.vector_embedding_provider != "local" or not spec.vector_index_path:
+        return None
+    index_path = Path(spec.vector_index_path)
+    if not index_path.is_absolute():
+        index_path = memory_dir / index_path
+    return VectorSidecar(
+        path=index_path,
+        layer=spec.layer,
+        embedder=embedder or make_local_embedder(spec.vector_embedding_model),
+        mv2_path=mv2_path,
+        provider=spec.vector_embedding_provider,
+    )
 
 
 def _resolved_search_mode(spec: LayerSpec, requested_mode: str) -> str:
@@ -507,6 +657,17 @@ def _resolved_search_mode(spec: LayerSpec, requested_mode: str) -> str:
     if mode in {"vec", "vector", "hybrid"} and not spec.vector_search_enabled:
         return "lex"
     return mode
+
+
+def _fuse_memory_hits(lexical_hits: list[MemoryHit], vector_hits: list[MemoryHit], *, k: int) -> list[MemoryHit]:
+    by_id: dict[str, MemoryHit] = {}
+    for hit in lexical_hits:
+        by_id[hit.record.id] = hit
+    for hit in vector_hits:
+        existing = by_id.get(hit.record.id)
+        if existing is None or hit.score > existing.score:
+            by_id[hit.record.id] = hit
+    return sorted(by_id.values(), key=lambda hit: (hit.score, hit.record.importance), reverse=True)[:k]
 
 
 def _eligible_for_conflict_detection(record: MemoryRecord) -> bool:

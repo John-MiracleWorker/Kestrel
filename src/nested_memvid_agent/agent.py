@@ -356,6 +356,7 @@ class NestedMV2Agent:
                             "run_id": active_run_id,
                             "tool": call.name,
                             "tool_call_id": call.id,
+                            "arguments": call.arguments,
                         },
                     )
                 if call.id in approved_tool_call_ids:

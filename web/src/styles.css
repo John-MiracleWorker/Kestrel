@@ -1488,6 +1488,18 @@ textarea.input {
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
+.telegram-setup-row {
+  grid-column: 2 / 4;
+  display: grid;
+  gap: 10px;
+  padding-top: 4px;
+}
+.telegram-setup-row label {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
 
 /* ---------- danger zone ---------- */
 

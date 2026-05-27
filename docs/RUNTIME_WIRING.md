@@ -254,6 +254,8 @@ MCP `secret_env` values are redacted in API responses, included in configuration
 
 `NEST_AGENT_SECRET_STORE_PATH` points to a local Secret Broker vault. `POST /api/secrets` accepts the raw value through the trusted backend flow and returns only metadata. `GET /api/secrets`, channel `env_status`, MCP `secret_env_status`, runtime config, and self-inspection never return raw values. Channels resolve configured env names through the broker at delivery/signature-verification time; MCP stdio servers resolve `secret://...` references into child process environment variables at launch.
 
+Telegram admin mode remains a channel-local bridge, not production auth. The Telegram channel can be configured with `settings.admin_enabled=true`, `settings.owner_user_ids`, and `settings.signature_provider=telegram`; owner natural-language admin writes are staged behind inline confirmation callbacks, while raw secret values are refused and must be entered through local Secret Broker surfaces.
+
 `NEST_AGENT_SECRET_BACKEND=json` is the default local-file backend. `NEST_AGENT_SECRET_BACKEND=keyring` or `--secret-backend keyring` stores raw values through the optional OS keyring provider and keeps only metadata in the JSON vault; if the optional `keyring` package cannot be imported, Kestrel falls back to the JSON backend.
 
 Plugin-provided MCP stdio servers carry `connect_requires_approval` vetting metadata. Connect, test, sync, and invoke paths refuse to start the process until `POST /api/mcp/servers/{server_id}/approve-connect` records approval for the current command hash.

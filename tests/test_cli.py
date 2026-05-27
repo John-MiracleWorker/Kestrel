@@ -7,10 +7,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 from pytest import MonkeyPatch, raises
 
 from nested_memvid_agent.cli import _validate_server_bind, main
 from nested_memvid_agent.config import AgentConfig
+from nested_memvid_agent.layers import load_layer_specs
 from nested_memvid_agent.models import (
     EvidenceRef,
     MemoryKind,
@@ -21,6 +23,19 @@ from nested_memvid_agent.models import (
 from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.promotion_ledger import PromotionEntry, PromotionLedger
 from nested_memvid_agent.state_store import AgentStateStore
+
+
+class _ConceptEmbedder:
+    model_name = "concept-test"
+
+    def embed(self, text: str) -> np.ndarray:
+        vector = np.zeros(1, dtype=np.float32)
+        synonyms = {"pythonpath": 0, "module": 0, "sys": 0}
+        for raw in text.lower().replace(".", " ").split():
+            idx = synonyms.get(raw.strip())
+            if idx is not None:
+                vector[idx] = 1.0
+        return vector
 
 
 def _clear_nest_agent_env(monkeypatch: MonkeyPatch) -> None:
@@ -85,6 +100,72 @@ def test_product_setup_subcommand_reports_first_run_checks(
     assert any(check["check_id"] == "provider_configuration" for check in payload["checks"])
 
 
+def test_channel_telegram_set_webhook_cli_redacts_secrets(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object
+) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:ABC-super-secret")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "telegram-secret-token")
+    channels_path = tmp_path / "channels.json"
+    channels_path.write_text(
+        json.dumps(
+            {
+                "channels": [
+                    {
+                        "id": "telegram",
+                        "provider": "telegram",
+                        "token_env": "TELEGRAM_BOT_TOKEN",
+                        "settings": {
+                            "signature_provider": "telegram",
+                            "signature_secret_env": "TELEGRAM_WEBHOOK_SECRET",
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self) -> FakeResponse:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"ok":true,"result":true}'
+
+    monkeypatch.setattr("nested_memvid_agent.net_safety.public_url_allowed", lambda url, require_https=False: (True, ""))
+    monkeypatch.setattr("nested_memvid_agent.channels.adapters.urlopen", lambda request, timeout: FakeResponse())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "nest-agent",
+            "channel",
+            "--backend",
+            "memory",
+            "--channels-config",
+            str(channels_path),
+            "telegram",
+            "--telegram-webhook-action",
+            "set",
+            "--webhook-url",
+            "https://kestrel.example/api/channels/telegram/webhook?channel_id=telegram",
+        ],
+    )
+
+    main()
+
+    output = capsys.readouterr().out
+    assert '"method": "setWebhook"' in output
+    assert "123456:ABC-super-secret" not in output
+    assert "telegram-secret-token" not in output
+    assert '"secret_token": "<configured>"' in output
+
+
 def test_memory_doctor_subcommand_is_dry_run_by_default(
     tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object
 ) -> None:
@@ -107,6 +188,97 @@ def test_memory_doctor_subcommand_is_dry_run_by_default(
     output = capsys.readouterr().out
     assert '"working"' in output
     assert '"doctor_available": false' in output
+
+
+def test_memory_vector_subcommands_report_status_and_rebuild(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: object,
+) -> None:
+    monkeypatch.setattr(
+        "nested_memvid_agent.layers.make_local_embedder",
+        lambda model_name=None: _ConceptEmbedder(),
+    )
+    memory_dir = tmp_path / "memory"
+    layer_config = tmp_path / "layers.json"
+    layer_config.write_text(
+        json.dumps(
+            {
+                "semantic": {
+                    "search_mode": "hybrid",
+                    "vector": {
+                        "enabled": True,
+                        "embedding_provider": "local",
+                        "embedding_model": "concept-test",
+                        "index_path": "semantic.mv2.vector.sqlite",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory = build_memory_system("memory", memory_dir, specs=load_layer_specs(layer_config))
+    memory.put(
+        MemoryRecord(
+            id="pythonpath-fix",
+            title="Python path import fix",
+            content="Set PYTHONPATH before pytest invocations.",
+            layer=MemoryLayer.SEMANTIC,
+            kind=MemoryKind.FACT,
+            confidence=0.9,
+        )
+    )
+    memory.close_all()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "nest-agent",
+            "memory",
+            "vector",
+            "status",
+            "--backend",
+            "memory",
+            "--memory-dir",
+            str(memory_dir),
+            "--layer-config",
+            str(layer_config),
+            "--json",
+        ],
+    )
+
+    main()
+
+    status_payload = json.loads(capsys.readouterr().out)
+    assert status_payload["layers"]["semantic"]["enabled"] is True
+    assert status_payload["layers"]["semantic"]["indexed_count"] == 1
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "nest-agent",
+            "memory",
+            "vector",
+            "rebuild",
+            "--backend",
+            "memory",
+            "--memory-dir",
+            str(memory_dir),
+            "--layer-config",
+            str(layer_config),
+            "--layer",
+            "semantic",
+            "--json",
+        ],
+    )
+
+    main()
+
+    rebuild_payload = json.loads(capsys.readouterr().out)
+    assert rebuild_payload["rebuilt"]["semantic"]["indexed_count"] == 1
+    assert rebuild_payload["rebuilt"]["semantic"]["stale_count"] == 0
 
 
 def test_memory_correct_subcommand_supersedes_target(

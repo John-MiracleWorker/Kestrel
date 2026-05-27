@@ -3,10 +3,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from nested_memvid_agent.backends.memvid_backend import MemvidBackend
-from nested_memvid_agent.layers import LayeredMemorySystem
+from nested_memvid_agent.layers import LayeredMemorySystem, load_layer_specs
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 
 pytestmark = pytest.mark.skipif(
@@ -75,3 +76,84 @@ def test_memvid_layered_memory_creates_one_mv2_per_layer_and_reopens_existing_fi
         assert inactive_hits
     finally:
         final.close_all()
+
+
+def test_memvid_layered_memory_uses_rebuildable_vector_sidecar(tmp_path: Path) -> None:
+    layer_config = tmp_path / "layers.json"
+    layer_config.write_text(
+        """
+        {
+          "semantic": {
+            "search_mode": "hybrid",
+            "vector": {
+              "enabled": true,
+              "embedding_provider": "local",
+              "embedding_model": "concept-test",
+              "index_path": "semantic.mv2.vector.sqlite"
+            }
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+    specs = load_layer_specs(layer_config)
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path / "memory",
+        MemvidBackend,
+        specs=specs,
+        vector_embedder=_ConceptEmbedder(),
+    )
+    try:
+        memory.put(
+            MemoryRecord(
+                id="memvid-vector-fact",
+                title="Python path import fix",
+                content="Set PYTHONPATH before pytest invocations.",
+                layer=MemoryLayer.SEMANTIC,
+                kind=MemoryKind.FACT,
+                confidence=0.92,
+            )
+        )
+        memory.seal_all()
+        status = memory.vector_index_status()[MemoryLayer.SEMANTIC]
+        assert status.enabled is True
+        assert status.indexed_count == 1
+    finally:
+        memory.close_all()
+
+    sidecar_path = tmp_path / "memory" / "semantic.mv2.vector.sqlite"
+    assert sidecar_path.exists()
+    assert b"Set PYTHONPATH before pytest invocations" not in sidecar_path.read_bytes()
+
+    reopened = LayeredMemorySystem.from_backend_factory(
+        tmp_path / "memory",
+        MemvidBackend,
+        specs=specs,
+        vector_embedder=_ConceptEmbedder(),
+    )
+    try:
+        hits = reopened.retrieve(
+            RetrievalQuery(
+                query="module discovery needs sys route",
+                layers=(MemoryLayer.SEMANTIC,),
+                mode="hybrid",
+            )
+        )
+        assert hits
+        assert hits[0].record.id == "memvid-vector-fact"
+        assert hits[0].source_backend == "vector_sidecar"
+    finally:
+        reopened.close_all()
+
+
+class _ConceptEmbedder:
+    model_name = "concept-test"
+
+    def embed(self, text: str) -> np.ndarray:
+        vector = np.zeros(1, dtype=np.float32)
+        synonyms = {"pythonpath": 0, "module": 0, "sys": 0}
+        for raw in text.lower().replace(".", " ").split():
+            idx = synonyms.get(raw.strip())
+            if idx is not None:
+                vector[idx] = 1.0
+        return vector

@@ -179,27 +179,54 @@ const defaultToolPermissions = Object.fromEntries(
 ) as ToolPermissionDraft;
 const HASH_ROUTING_ENABLED = typeof navigator === "undefined" || !navigator.userAgent.toLowerCase().includes("jsdom");
 const runEventTypes = [
+  "run.queued",
   "run.started",
+  "run.turn_completed",
   "run.completed",
   "run.blocked",
   "run.failed",
   "run.cancelled",
+  "orchestration.plan",
+  "review.completed",
+  "span.started",
+  "span.finished",
   "approval.requested",
   "approval.approved",
   "approval.denied",
+  "approval.wait",
   "tool.started",
   "tool.completed",
   "tool.failed",
+  "tool.request",
+  "tool.executed",
   "assistant.token",
   "assistant.tool_call",
+  "assistant.provider_error",
+  "assistant.usage",
   "context.compile",
   "memory.write",
+  "capsule.completed",
+  "capsule.failed",
+  "memory.compact",
+  "behavior_delta.preflight",
+  "retry.blocked",
+  "lesson.preflight",
+  "lesson.created",
+  "lesson.recall",
+  "failure.episode",
   "diagnosis.classified",
   "scheduler.step",
   "scheduler.run",
+  "task.started",
   "task.approved",
+  "task.completed",
+  "task.blocked",
+  "task.failed",
+  "subagent.queued",
   "subagent.started",
   "subagent.completed",
+  "subagent.blocked",
+  "worker.isolated",
   "subagent.failed"
 ];
 const SETUP_DISMISSED_KEY = "kestrel.setup.dismissed";
@@ -386,6 +413,8 @@ export function App() {
   const [channelSettings, setChannelSettings] = useState("{}");
   const [channelPayload, setChannelPayload] = useState('{\n  "conversation_id": "local-thread",\n  "text": "hello from the UI"\n}');
   const [channelResult, setChannelResult] = useState<Record<string, unknown> | null>(null);
+  const [telegramWebhookUrl, setTelegramWebhookUrl] = useState("");
+  const [telegramActionResult, setTelegramActionResult] = useState<Record<string, unknown> | null>(null);
   const [secretName, setSecretName] = useState("TELEGRAM_BOT_TOKEN");
   const [secretPurpose, setSecretPurpose] = useState("Enable Telegram channel delivery.");
   const [secretValue, setSecretValue] = useState("");
@@ -1263,6 +1292,44 @@ export function App() {
     });
   }
 
+  async function telegramWebhookInfo(channel: Channel) {
+    await guarded(async () => {
+      const result = await getJson<Record<string, unknown>>(`/api/channels/${encodeURIComponent(channel.id)}/telegram/webhook-info`);
+      setTelegramActionResult(result);
+    }, "Telegram webhook info loaded.");
+  }
+
+  async function telegramSetWebhook(channel: Channel) {
+    await guarded(async () => {
+      const result = await postJson<Record<string, unknown>>(`/api/channels/${encodeURIComponent(channel.id)}/telegram/set-webhook`, {
+        url: telegramWebhookUrl,
+        drop_pending_updates: false
+      });
+      setTelegramActionResult(result);
+    }, "Telegram webhook updated.");
+  }
+
+  async function telegramDeleteWebhook(channel: Channel) {
+    await guarded(async () => {
+      const result = await postJson<Record<string, unknown>>(`/api/channels/${encodeURIComponent(channel.id)}/telegram/delete-webhook`, {
+        drop_pending_updates: false
+      });
+      setTelegramActionResult(result);
+    }, "Telegram webhook removed.");
+  }
+
+  function telegramOwnerLabels(channel: Channel): string[] {
+    const raw = channel.settings?.owner_user_ids ?? channel.settings?.admin_user_ids ?? channel.settings?.telegram_owner_ids;
+    const values = Array.isArray(raw) ? raw : typeof raw === "string" ? raw.split(",") : [];
+    return values.map((item) => String(item).trim()).filter(Boolean).map((item) => `owner ${item}`);
+  }
+
+  function channelEnvFlag(channel: Channel, key: string): boolean {
+    const status = channel.env_status;
+    if (!status || typeof status !== "object") return false;
+    return Boolean((status as Record<string, unknown>)[key]);
+  }
+
   async function saveSecret(event: FormEvent) {
     event.preventDefault();
     await guarded(async () => {
@@ -1556,7 +1623,7 @@ export function App() {
 
                       <strong>Kestrel</strong>
                       <p>{assistantTextForRun(run, activeRun?.run_id, streamedAssistant)}</p>
-                      {run.run_id === activeRun?.run_id && <LiveRunActivity events={activeRunEvents} />}
+                      {run.run_id === activeRun?.run_id && <LiveRunActivity run={run} events={activeRunEvents} />}
                     </article>
                   </div>
                 ))
@@ -2800,17 +2867,49 @@ export function App() {
               <div className="section-body">
                 {channels.length === 0 && <EmptyState>No channels configured.</EmptyState>}
                 {channels.map((channel) => (
-                  <article className="channel-card" key={channel.id}>
+                  <article
+                    className="channel-card"
+                    key={channel.id}
+                    role={channel.provider === "telegram" ? "group" : undefined}
+                    aria-label={channel.provider === "telegram" ? "Telegram setup" : undefined}
+                  >
                     <span className="channel-icon"><Bell size={16} /></span>
                     <div className="channel-meta">
                       <strong>{channel.id}</strong>
                       <span className="env">{channel.provider} · {channel.token_env || channel.webhook_url_env || "no env binding"}</span>
+                      {channel.provider === "telegram" && (
+                        <div className="inline-meta">
+                          <StatusBadge value={channelEnvFlag(channel, "token_env_configured") ? "token configured" : "token missing"} />
+                          <StatusBadge value={channelEnvFlag(channel, "signature_secret_env_configured") ? "signature configured" : "signature missing"} />
+                          {telegramOwnerLabels(channel).map((owner) => <span className="chip" key={owner}>{owner}</span>)}
+                        </div>
+                      )}
                     </div>
                     <div className="channel-toggles">
                       <span className="mini"><label>enabled</label><StatusBadge value={channel.enabled} /></span>
                       <span className="mini"><label>send</label><StatusBadge value={channel.send_enabled} /></span>
                       <button className="btn" type="button" onClick={() => { loadChannel(channel); jumpToAdvanced("channels"); }}>Edit</button>
                     </div>
+                    {channel.provider === "telegram" && (
+                      <div className="telegram-setup-row">
+                        <label>
+                          Telegram public webhook URL
+                          <input
+                            className="input"
+                            aria-label="Telegram public webhook URL"
+                            value={telegramWebhookUrl}
+                            onChange={(event) => setTelegramWebhookUrl(event.target.value)}
+                            placeholder="https://your-public-host/api/channels/telegram/webhook?channel_id=telegram"
+                          />
+                        </label>
+                        <div className="page-actions">
+                          <button className="btn" type="button" onClick={() => telegramWebhookInfo(channel)}>Webhook info</button>
+                          <button className="btn primary" type="button" onClick={() => telegramSetWebhook(channel)} disabled={!telegramWebhookUrl.trim()}>Set webhook</button>
+                          <button className="btn" type="button" onClick={() => telegramDeleteWebhook(channel)}>Delete webhook</button>
+                        </div>
+                        {telegramActionResult && <JsonBlock value={telegramActionResult} maxHeight="180px" />}
+                      </div>
+                    )}
                   </article>
                 ))}
               </div>
@@ -3318,9 +3417,10 @@ function ApprovalCardInline({ approval, onApprove }: { approval: Approval; onApp
   );
 }
 
-function LiveRunActivity({ events }: { events: TraceEvent[] }) {
+function LiveRunActivity({ run, events }: { run: Run; events: TraceEvent[] }) {
   const items = activityItemsForEvents(events);
-  if (items.length === 0) return null;
+  const isRunning = run.status === "queued" || run.status === "running";
+  if (items.length === 0 && !isRunning) return null;
   return (
     <div className="activity" aria-label="Live run activity" aria-live="polite">
       <div className="act-heading">
@@ -3339,6 +3439,20 @@ function LiveRunActivity({ events }: { events: TraceEvent[] }) {
           </span>
         </div>
       ))}
+      {isRunning && <TypingIndicator />}
+    </div>
+  );
+}
+
+function TypingIndicator() {
+  return (
+    <div className="typing" aria-label="Kestrel is responding">
+      <span>Working</span>
+      <span className="dots" aria-hidden="true">
+        <span></span>
+        <span></span>
+        <span></span>
+      </span>
     </div>
   );
 }

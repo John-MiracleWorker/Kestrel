@@ -278,6 +278,7 @@ export type MemoryHit = {
   kind: string;
   title: string;
   score: number;
+  source_backend?: string;
   snippet: string;
   record_id?: string;
 };
@@ -288,6 +289,7 @@ export type MemoryLayerStatus = {
   exists: boolean;
   ok: boolean;
   backend: string;
+  vector?: Record<string, unknown>;
 };
 
 export type ContextPackResult = {

@@ -30,7 +30,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Skills now have a first manifest validation gate plus persisted validation/provenance metadata for discovered instruction capsules, and discovery returns structured counts, empty-directory messages, and validation errors.
 - Local FastAPI control plane with background runs, SSE events, approvals, tools, MCP registry, skills registry/discovery reports, Secret Broker metadata routes, memory search, Soul/self routes, gated web routes, non-secret runtime config, channel CRUD, plugin/skill detail, memory inspect, cognition lesson/failure lists, and diagnosis classify/recall routes.
 - Local operator web UI now exposes the implemented Kestrel runtime surfaces: provider/model/workspace run controls, real task graph and scheduler controls, approvals/history, Soul/self inspection and memory capture, gated web search, memory/context/lesson/failure views, filterable tool inventory, tool invocation, Secret Broker setup, MCP create/edit/lifecycle/manual invoke, skills discovery status, plugins, channels, observability, and non-secret runtime settings.
-- Multi-channel ingress for Telegram Bot API updates, Discord message/interaction-shaped payloads, and generic/custom webhooks, with CLI and API routes.
+- Multi-channel ingress for Telegram Bot API updates, Discord message/interaction-shaped payloads, and generic/custom webhooks, with CLI and API routes. Telegram also has webhook setup/status helpers, single-owner admin gating, natural-language admin reads, and inline-confirmed settings writes.
 - SQLite state store for runs, run steps, approvals, MCP servers, skills, plugins, task nodes, subagent runs, trace spans, promotion ledger outcomes, and behavior-delta ledger records, now initialized through schema version `11`.
 - Paper-guided nested learning kernel with context-flow metadata, optimizer traces, conservative continuum-memory routing, and a `memory.learn` tool/API path.
 - Closed-loop learning instrumentation now records promotion decisions, later outcomes, false-positive rates, never-retrieved compaction, and deterministic operator recommendations through `nest-agent memory ledger`.
@@ -38,7 +38,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Backend-neutral memory mutation now supports `upsert`, `tombstone`, `iter_records`, `get_record`, inactive-record filtering, correction frames, conflict-set frames, and audit retrieval with `include_inactive`.
 - Lesson cards deduplicate similar same-category procedures, merge validation evidence refs, and update cumulative success/failure repeat counts instead of creating repeated procedural duplicates.
 - Retention compaction can summarize and tombstone TTL-eligible working/episodic records through `memory.compact` / `nest-agent memory compact`; it is dry-run by default and skips stable layers by default.
-- Hybrid/vector retrieval is config-gated through layer specs and only enables local vector settings explicitly; policy memory remains lexical.
+- Hybrid/vector retrieval is config-gated through layer specs and uses rebuildable SQLite vector sidecars keyed to `.mv2` record IDs/content hashes; policy memory remains lexical.
 - Run-scoped `complete.mv2` task capsules, preview-only capsule summaries, dry-run consolidation decisions, and approval-gated capsule apply.
 - MCP server records now track health metadata, tool counts, capabilities, last sync/seen/call/error timestamps, session state, failure counts, and latency.
 - MCP server records now persist vetting metadata: transport/network exposure, secret-env requirements, per-tool risk/approval classification, risk reasons, and recommended trust posture.
@@ -92,7 +92,7 @@ This repository is a working local agent scaffold, not a finished Hermes/OpenCla
 - Self-modification: the runtime can inspect itself, record validated Soul/self memories, and capture approval-gated self-change requests. Actual code changes still have to flow through existing repair and commit gates; policy writes still require explicit policy gates.
 - Safe repair: branch preparation, patch application, targeted validation, diagnosis-gated retry assessment, status reporting, and rollback primitives exist. Full autonomous patch proposal, reviewer gating, and approval-before-commit orchestration are still incomplete.
 - Subagents: local subagent runs can be queued, tracked, and executed by scheduler runs until idle. The graph runtime can assign work to task/subagent records, and scheduler/subagent task execution can opt into git worktree isolation. Codex-backed worker fan-out, merge/review handling for worker branches, and fully dynamic DAG rewriting are still next steps.
-- Channels: inbound normalization, dry-run reply payloads, and generic HMAC webhook verification are implemented. Production bot identity verification, Discord Gateway reads, and channel-specific rate-limit handling still need hardening.
+- Channels: inbound normalization, dry-run reply payloads, generic HMAC webhook verification, Telegram secret-token verification, Telegram webhook setup helpers, and single-owner Telegram admin confirmation are implemented. Discord Gateway reads, durable channel/workspace permissions, attachments, and channel-specific rate-limit handling still need hardening.
 
 ## Not Done Yet
 

@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .agent import NestedMV2Agent, StreamHandler
+from .agent import NestedMV2Agent, ProgressHandler, StreamHandler
 from .config import AgentConfig
 from .diagnosis import classify_failure
 from .runtime_models import AgentTurnResult, ToolExecution
@@ -39,6 +39,7 @@ class GraphRuntimeServices:
     build_agent: Callable[[AgentConfig], NestedMV2Agent]
     approval_handler: ApprovalHandler
     stream_handler_factory: Callable[[str], StreamHandler]
+    progress_handler_factory: Callable[[str], ProgressHandler]
     publish_turn_observability: Callable[[str, AgentTurnResult], None]
     publish_tool_executions: Callable[[str, tuple[ToolExecution, ...]], None]
     complete_capsule: Callable[[str, AgentConfig, NestedMV2Agent, AgentTurnResult], None]
@@ -113,6 +114,7 @@ class ExecutorNode:
                     run_id=ctx.run_id,
                     approval_handler=services.approval_handler,
                     stream_handler=services.stream_handler_factory(ctx.run_id),
+                    progress_handler=services.progress_handler_factory(ctx.run_id),
                 )
             except Exception as exc:  # noqa: BLE001 - durable graph records and recovers below
                 ctx.exception = exc
