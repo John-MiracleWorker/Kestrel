@@ -1,36 +1,80 @@
 # Kestrel
 
-Kestrel is a local-first, memory-native agent runtime built around Nested Learning-inspired memory layers and Memvid v2 `.mv2` files.
+<p align="center">
+  <strong>Local-first AI engineering agent that learns from its work.</strong>
+</p>
 
-It is not only a memory library and not only a chatbot wrapper. The current repo contains a conversational CLI, a FastAPI/web control plane, provider adapters, a tool registry with approval gates, managed MCP stdio sessions, skill loading, task capsules, a conservative consolidation pipeline, and a deterministic test path.
+<p align="center">
+  <a href="https://github.com/John-MiracleWorker/Kestrel/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/John-MiracleWorker/Kestrel/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
+  <img alt="Memvid v2" src="https://img.shields.io/badge/Memory-Memvid%20v2%20.mv2-6f42c1">
+  <img alt="Local first" src="https://img.shields.io/badge/Runtime-local--first-059669">
+  <img alt="Status alpha" src="https://img.shields.io/badge/Status-alpha-f59e0b">
+  <img alt="License Apache-2.0" src="https://img.shields.io/badge/License-Apache--2.0-blue">
+</p>
 
-Kestrel is still an alpha runtime. It is useful for local development and hardening work, but it is not yet a production multi-user agent platform.
+Kestrel is a memory-native agent runtime for developers who want an AI agent they can run locally, inspect deeply, and improve deliberately. It combines a conversational CLI, a local web workbench, layered Memvid v2 `.mv2` memory, tool approvals, task capsules, behavior-delta learning, managed MCP sessions, provider adapters, and deterministic evals.
 
-## What Works Now
+It is not a chatbot wrapper and not just a memory library. Kestrel is built around a stricter product promise:
 
-- CLI chat with in-memory or Memvid `.mv2` memory.
-- One-shot GitHub installer for the local Memvid-backed agent runtime; the installer uses `mock` only for deterministic smoke checks.
-- Deterministic mock provider for tests and golden evals.
-- OpenAI Responses provider with streaming deltas when the SDK stream surface is available.
-- OpenAI-compatible chat completions provider for local/model-server endpoints.
-- Local Codex CLI provider for using `codex exec` as the response engine.
-- Retryable provider fallback wrapper and provider capability metadata.
-- One permanent `.mv2` file per memory layer: working, episodic, semantic, procedural, self, and policy.
-- MV2 context frames plus a token-aware pseudo-context packer with evidence pointers, conflict warnings, and on-demand raw expansion.
-- Run-scoped `complete.mv2` task capsules for reviewable learning signals, plus behavior-delta proposal/replay/ledger/review flows for controlled self-modification.
-- Nested Learning kernel with context-flow metadata, optimizer traces, promotion gates, and explicit policy-write constraints.
-- Built-in tools for memory, context, repo search and file metadata, patching, tests, linting, git status/diff/log/show/commit, Memvid verify/doctor/stats, diagnosis, repair, Soul/self inspection, gated web context, skills, plugins, MCP registry inspection, project scripts, and Codex CLI delegation.
-- Exact-call approval gates for high-risk tools, including shell, file writes, patching, tests/lint, repair mutations, commits, skill installs, plugin review/install, behavior-delta review actions, imports, and Codex CLI delegation.
-- SQLite control-plane state for runs, approvals, MCP servers, skills, plugins, task nodes, subagents, and replay-safe terminal transitions. SQLite is not the retrieval memory store.
-- Local FastAPI/web workbench with background runs, SSE timeline events, approvals, Soul/self views, gated web search, memory/context tools, behavior-delta review, MCP controls, skills, plugins, subagents, and scheduler actions.
-- Managed stdio MCP sessions with lazy connect/disconnect/restart/health, tool discovery, vetting metadata, and approval-by-default risk normalization.
-- Experimental plugin registry/CLI/API/web review flow that can inspect GitHub plugin manifests, report dependency/isolation blockers, and materialize plugin-provided skills and MCP server entries.
-- Multi-channel ingress for Telegram-shaped, Discord-shaped, webhook, and custom payloads, with outbound delivery disabled by default.
-- Optional autonomous scheduler that drains approved ready tasks within bounded task/cycle limits.
-- Safe repair primitives with branch isolation, diagnosis-gated validation, reviewer artifacts, and commit gates for repair branches.
-- Live-provider validation harnesses: provider integration tests, full golden evals, and isolated live-learning E2E checks validated locally with Ollama Cloud + `gpt-oss:120b` on memory and Memvid backends.
+> Repeated engineering work should make the agent safer and more capable through evidence-backed, auditable, reversible learning.
 
-See `docs/IMPLEMENTATION_STATUS.md` for the detailed truth table.
+Kestrel is still an alpha runtime. It is useful for local development, experiments, and hardening work; it is not yet a hosted or production multi-user agent platform.
+
+## Start Here
+
+Install the local agent, initialize `.mv2` memory, build the workbench, run a deterministic smoke check, and open the app:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | bash
+```
+
+Then choose a real provider when you are ready to work:
+
+```bash
+cd "${KESTREL_HOME:-$HOME/.kestrel-agent}"
+.venv/bin/nest-agent chat --backend memvid --memory-dir .nest/memory --provider codex-cli --model gpt-5.5
+```
+
+The installer uses `mock` only for deterministic health checks. High-risk tools, outbound channels, web access, plugin installs, commits, pushes, and self-modification all stay disabled until explicitly configured and approved.
+
+## Why Kestrel
+
+- **Memory with structure:** working, episodic, semantic, procedural, self, and policy memory live in separate Memvid v2 `.mv2` files with different promotion gates.
+- **Learning you can audit:** run-scoped `complete.mv2` capsules, promotion ledgers, validation evidence, behavior deltas, replay, rollback, and activation metrics keep learning inspectable.
+- **Actions you approve:** shell, patching, file writes, tests, commits, plugin installs, MCP tools, Codex CLI delegation, and self-change requests use capability flags plus exact-call approval gates.
+- **A real operator cockpit:** the FastAPI/web workbench exposes runs, traces, approvals, memory/context search, Soul/self views, MCP controls, plugins, skills, channels, scheduler actions, and support diagnostics.
+- **Deterministic by default:** the mock backend and mock LLM keep tests and golden evals reproducible, while live provider checks stay behind explicit integration flags.
+
+## Product Surface
+
+| Surface | What it gives you today |
+| --- | --- |
+| Conversational agent | `nest-agent chat` with in-memory or Memvid-backed memory, provider selection, tool use, and interactive commands. |
+| Local workbench | Browser UI for background runs, SSE timelines, approvals, tools, memory, behavior deltas, MCP, skills, plugins, channels, scheduler controls, and setup readiness. |
+| Durable memory | One `.mv2` file per nested layer, MV2 context frames, token-aware packing, lexical-first retrieval, optional vector sidecars, and explicit policy-write constraints. |
+| Controlled learning | Task capsules, promotion gates, validation metadata, behavior-delta proposal/replay/review, low-risk auto-activation behind flags, and rollback paths. |
+| Safe tools | Built-in repo, memory, diagnosis, repair, validation, git, web-context, plugin, skill, MCP, and Codex CLI tools with risk classification and approval boundaries. |
+| Extensibility | Managed stdio MCP sessions, local skills, and an experimental GitHub plugin review/install flow that reports provenance, risk, dependencies, and enable blockers. |
+| Channels | Telegram-shaped, Discord-shaped, generic webhook, and custom JSON ingress, with outbound delivery disabled by default and Telegram admin writes requiring confirmation. |
+| Release evidence | `pytest`, `ruff`, `mypy`, web tests/builds, golden evals, Memvid integration tests, provider integration tests, support bundles, and product-readiness reports. |
+
+## How A Run Feels
+
+1. Ask Kestrel to inspect, repair, explain, or continue work in a local repository.
+2. Watch the plan, task graph, tool calls, traces, and approval waits in the workbench.
+3. Approve high-risk actions only when the exact requested call and arguments look right.
+4. Review outputs, validation, memory writes, behavior-delta candidates, and rollback evidence.
+5. Let validated lessons influence future runs without allowing hidden policy writes or unreviewed self-modification.
+
+## Documentation Map
+
+- `docs/IMPLEMENTATION_STATUS.md` is the detailed truth table for what is working, partial, or not done.
+- `docs/ARCHITECTURE.md` explains the local runtime and memory/control-plane split.
+- `docs/MEMORY_OPERATIONS.md` covers `.mv2` backup, restore, verification, and migration.
+- `docs/SECURITY.md` documents local-first safety boundaries, auth, webhook signatures, secrets, and high-risk tools.
+- `docs/PRODUCTIZATION_ROADMAP.md` tracks the path from alpha runtime to dependable product.
+- `docs/DEPLOYMENT.md` covers local installs, Docker, Compose, providers, and runtime checks.
 
 ## Memory Layout
 
