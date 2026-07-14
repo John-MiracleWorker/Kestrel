@@ -44,6 +44,9 @@ jobs:
       - name: Install web dependencies
         run: npm ci
         working-directory: web
+      - name: Audit web dependencies
+        run: npm audit --audit-level=high
+        working-directory: web
       - name: Test web
         run: npm test
         working-directory: web
