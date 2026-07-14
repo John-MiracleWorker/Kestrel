@@ -10,6 +10,7 @@ from .behavior_delta_ledger import BehaviorDeltaLedger
 from .channels import ChannelManager
 from .config import AgentConfig
 from .event_bus import RunEventBus
+from .llm.model_catalog import DEFAULT_API_KEY_ENVS
 from .mcp_manager import MCPManager
 from .models import MemoryLayer, RetrievalQuery
 from .orchestrator import build_memory_system
@@ -136,11 +137,18 @@ def create_app(config: AgentConfig | None = None) -> Any:
     skills = SkillManager(active_config.skills_dir, state)
     plugins = PluginManager(active_config.plugins_dir, state)
     runs = RunManager(
-        config=active_config, state=state, events=events, mcp=mcp, skills=skills, plugins=plugins
+        config=active_config,
+        state=state,
+        events=events,
+        mcp=mcp,
+        skills=skills,
+        plugins=plugins,
+        secret_resolver=secret_broker.resolve,
     )
     channels = ChannelManager(active_config, secret_resolver=secret_broker.resolve, run_manager=runs)
     secret_broker.register_allowed_env_names(
         _known_secret_env_names(channels.list_channels(), mcp.list_servers())
+        | _provider_secret_env_names(active_config)
     )
 
     def update_active_config(next_config: AgentConfig) -> None:
@@ -148,6 +156,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         active_config = next_config
         runs.config = next_config
         channels.config = next_config
+        secret_broker.register_allowed_env_names(_provider_secret_env_names(next_config))
 
     channels.configure_runtime_settings(
         settings_store=runtime_settings_store,
@@ -260,6 +269,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         state=state,
         settings_store=runtime_settings_store,
         on_config_update=update_active_config,
+        secret_broker=secret_broker,
         http_exception=HTTPException,
     )
 
@@ -268,7 +278,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         http_exception=HTTPException,
         secret_broker=secret_broker,
     )
-    register_product_routes(app, active_config=lambda: active_config)
+    register_product_routes(app, active_config=lambda: active_config, secret_resolver=secret_broker.resolve)
     register_channel_routes(
         app,
         http_exception=HTTPException,
@@ -617,7 +627,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
             raise HTTPException(status_code=400, detail="k must be between 1 and 50")
         if mode not in {"auto", "lex", "vec", "vector", "hybrid"}:
             raise HTTPException(status_code=400, detail="mode must be auto, lex, vector, or hybrid")
-        agent = build_agent(active_config, tools=runs.build_registry(), state=state)
+        agent = build_agent(active_config, tools=runs.build_registry(), state=state, secret_resolver=secret_broker.resolve)
         try:
             selected_layers = (
                 tuple(MemoryLayer(layer) for layer in layers) if layers else tuple(MemoryLayer)
@@ -672,7 +682,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
     @app.get("/api/memory/verify")  # type: ignore[untyped-decorator]
     def verify_memory() -> dict[str, bool]:
-        agent = build_agent(active_config, tools=runs.build_registry(), state=state)
+        agent = build_agent(active_config, tools=runs.build_registry(), state=state, secret_resolver=secret_broker.resolve)
         try:
             return {layer.value: ok for layer, ok in agent.memory.verify_all().items()}
         finally:
@@ -680,7 +690,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
     @app.get("/api/memory/layers")  # type: ignore[untyped-decorator]
     def memory_layers() -> list[dict[str, object]]:
-        agent = build_agent(active_config, tools=runs.build_registry(), state=state)
+        agent = build_agent(active_config, tools=runs.build_registry(), state=state, secret_resolver=secret_broker.resolve)
         try:
             verify = agent.memory.verify_all()
             vector_status = agent.memory.vector_index_status()
@@ -885,8 +895,8 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
     register_diagnosis_routes(app, runs=runs)
 
-    web_dist = Path(__file__).resolve().parents[2] / "web" / "dist"
-    if web_dist.exists():
+    web_dist = _resolve_web_dist()
+    if web_dist is not None:
         assets = web_dist / "assets"
         if assets.exists():
             app.mount("/assets", StaticFiles(directory=assets), name="assets")
@@ -902,6 +912,23 @@ def create_app(config: AgentConfig | None = None) -> Any:
             return FileResponse(web_dist / "index.html")
 
     return app
+
+
+def _resolve_web_dist() -> Path | None:
+    module_path = Path(__file__).resolve()
+    candidates = (
+        module_path.parent / "web_dist",
+        module_path.parents[2] / "web" / "dist",
+    )
+    return next((candidate for candidate in candidates if (candidate / "index.html").is_file()), None)
+
+
+def _provider_secret_env_names(config: AgentConfig) -> set[str]:
+    names = {value for value in DEFAULT_API_KEY_ENVS.values() if value}
+    for value in (config.api_key_env, config.fallback_api_key_env):
+        if value:
+            names.add(value)
+    return names
 
 
 def _parse_since_window(raw: str | None) -> Any:

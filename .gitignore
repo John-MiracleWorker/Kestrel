@@ -18,6 +18,7 @@ tmp-golden/
 htmlcov/
 web/node_modules/
 web/dist/
+src/nested_memvid_agent/web_dist/
 web/.vite/
 *.tsbuildinfo
 runs/

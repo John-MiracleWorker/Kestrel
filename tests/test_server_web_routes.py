@@ -1,6 +1,10 @@
+from pathlib import Path
+
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import nested_memvid_agent.server as server_module
 from nested_memvid_agent.runtime_models import ToolCall, ToolExecution
 from nested_memvid_agent.server_web_routes import register_web_routes
 
@@ -21,6 +25,25 @@ class _FakeRuns:
             content="ok",
             data={"result": kwargs["tool_name"]},
         )
+
+
+def test_web_dist_resolution_prefers_packaged_assets_and_falls_back_to_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_server = tmp_path / "site" / "nested_memvid_agent" / "server.py"
+    package_dist = fake_server.parent / "web_dist"
+    source_dist = fake_server.parents[2] / "web" / "dist"
+    package_dist.mkdir(parents=True)
+    source_dist.mkdir(parents=True)
+    (package_dist / "index.html").write_text("packaged", encoding="utf-8")
+    (source_dist / "index.html").write_text("source", encoding="utf-8")
+    monkeypatch.setattr(server_module, "__file__", str(fake_server))
+
+    assert server_module._resolve_web_dist() == package_dist
+
+    (package_dist / "index.html").unlink()
+    assert server_module._resolve_web_dist() == source_dist
 
 
 def test_web_routes_delegate_to_gated_tools_with_optional_limits() -> None:

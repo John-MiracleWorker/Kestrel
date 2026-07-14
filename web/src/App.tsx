@@ -31,6 +31,8 @@ import {
   X
 } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { ApiAuthError, deleteJson, getJson, getLearningDashboard, postJson, putJson, queryString, subscribeJsonEvents } from "./api";
 import { getApiToken, setApiToken } from "./auth";
 import { EmptyState, Field, InlineMeta, JsonBlock, Panel, StatusBadge } from "./components";
@@ -80,29 +82,78 @@ import type {
   TraceEvent
 } from "./types";
 
-const providerOptions = [
-  "mock",
-  "openai",
-  "openai-compatible",
-  "openrouter",
-  "deepseek",
-  "kimi",
-  "ollama",
-  "ollama-cloud",
-  "anthropic",
-  "gemini",
-  "codex-cli"
+type ProviderOption = {
+  value: string;
+  label: string;
+  group: "Local" | "Cloud" | "Advanced";
+  baseUrl?: string;
+  apiKeyEnv?: string;
+  requiresKey?: boolean;
+};
+
+const providerOptions: ProviderOption[] = [
+  { value: "lm-studio", label: "LM Studio", group: "Local", baseUrl: "http://localhost:1234/v1" },
+  { value: "ollama", label: "Ollama (local)", group: "Local", baseUrl: "http://localhost:11434/v1" },
+  { value: "openai", label: "OpenAI", group: "Cloud", apiKeyEnv: "OPENAI_API_KEY", requiresKey: true },
+  {
+    value: "anthropic",
+    label: "Claude / Anthropic",
+    group: "Cloud",
+    apiKeyEnv: "ANTHROPIC_API_KEY",
+    requiresKey: true
+  },
+  { value: "grok", label: "Grok / xAI", group: "Cloud", baseUrl: "https://api.x.ai/v1", apiKeyEnv: "XAI_API_KEY", requiresKey: true },
+  { value: "gemini", label: "Gemini", group: "Cloud", apiKeyEnv: "GEMINI_API_KEY", requiresKey: true },
+  {
+    value: "ollama-cloud",
+    label: "Ollama Cloud",
+    group: "Cloud",
+    baseUrl: "https://ollama.com/api",
+    apiKeyEnv: "OLLAMA_API_KEY",
+    requiresKey: true
+  },
+  {
+    value: "openrouter",
+    label: "OpenRouter",
+    group: "Cloud",
+    baseUrl: "https://openrouter.ai/api/v1",
+    apiKeyEnv: "OPENROUTER_API_KEY",
+    requiresKey: true
+  },
+  {
+    value: "deepseek",
+    label: "DeepSeek",
+    group: "Cloud",
+    baseUrl: "https://api.deepseek.com",
+    apiKeyEnv: "DEEPSEEK_API_KEY",
+    requiresKey: true
+  },
+  {
+    value: "kimi",
+    label: "Kimi",
+    group: "Cloud",
+    baseUrl: "https://api.moonshot.ai/v1",
+    apiKeyEnv: "MOONSHOT_API_KEY",
+    requiresKey: true
+  },
+  { value: "openai-compatible", label: "Custom OpenAI-compatible", group: "Advanced" },
+  { value: "codex-cli", label: "Codex CLI", group: "Advanced" },
+  { value: "mock", label: "Mock test mode", group: "Advanced" }
 ];
+const providerOptionMap = Object.fromEntries(providerOptions.map((item) => [item.value, item]));
+const providerGroups: Array<ProviderOption["group"]> = ["Local", "Cloud", "Advanced"];
 const modelSuggestionsByProvider: Record<string, string[]> = {
   mock: ["mock"],
+  "lm-studio": ["local-model"],
+  ollama: ["llama3.1", "qwen2.5-coder", "mistral"],
   openai: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
   "openai-compatible": ["local-model"],
+  "ollama-cloud": ["gpt-oss:120b", "gpt-oss:20b"],
   openrouter: ["openai/gpt-5.5", "anthropic/claude-sonnet-4.5"],
   deepseek: ["deepseek-v4-pro", "deepseek-v4-flash"],
   kimi: ["kimi-k2.6", "kimi-k2.5"],
-  ollama: ["llama3.1", "qwen2.5-coder", "mistral"],
-  "ollama-cloud": ["gpt-oss:120b", "gpt-oss:20b"],
   anthropic: ["claude-sonnet-4.5", "claude-opus-4.1"],
+  grok: ["grok-4.3", "grok-build-0.1", "grok-4.20"],
   gemini: ["gemini-2.5-pro", "gemini-2.5-flash"],
   "codex-cli": ["gpt-5.5", "gpt-5.4"]
 };
@@ -116,6 +167,12 @@ type PreparedToolPreview = {
   args: Record<string, unknown>;
 };
 const exactCallPreviewMessage = "Invoking this request will create or require approval before execution; it has not run yet.";
+const markdownComponents: Components = {
+  a({ node: _node, ...props }) {
+    return <a {...props} target="_blank" rel="noreferrer" />;
+  }
+};
+const markdownPlugins = [remarkGfm];
 const toolPermissionDefinitions = [
   {
     key: "allow_shell",
@@ -321,10 +378,11 @@ export function App() {
   const [localThreads, setLocalThreads] = useState<ThreadSummary[]>([]);
   const activeRunIdRef = useRef<string | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
+  const activeSectionRef = useRef<"chat" | "advanced" | "settings">("chat");
+  const idleRefreshInFlightRef = useRef(false);
   const memoryBackendHydratedRef = useRef(false);
   const setupDraftHydratedRef = useRef(false);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
   const [activeSection, setActiveSection] = useState<"chat" | "advanced" | "settings">("chat");
 
   const [message, setMessage] = useState("");
@@ -332,6 +390,10 @@ export function App() {
   const [workspace, setWorkspace] = useState("");
   const [provider, setProvider] = useState("mock");
   const [model, setModel] = useState("mock");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [apiKeyEnv, setApiKeyEnv] = useState("");
+  const [providerKeyValue, setProviderKeyValue] = useState("");
+  const [providerSecretResult, setProviderSecretResult] = useState<SecretRef | null>(null);
   const [temperature, setTemperature] = useState("0.2");
   const [maxToolRounds, setMaxToolRounds] = useState("6");
   const [modelCatalogs, setModelCatalogs] = useState<Record<string, ProviderModelCatalog>>({});
@@ -569,11 +631,15 @@ export function App() {
   }
 
   function chooseProvider(nextProvider: string) {
-    const previousProvider = provider;
+    const nextOption = providerOptionMap[nextProvider];
     setProvider(nextProvider);
+    setBaseUrl(nextOption?.baseUrl ?? "");
+    setApiKeyEnv(nextOption?.apiKeyEnv ?? "");
+    setProviderKeyValue("");
+    setProviderSecretResult(null);
     const suggestions = modelsForProvider(nextProvider, modelCatalogs);
     setModel((current) => {
-      if (!current.trim() || isKnownProviderModel(previousProvider, current, modelCatalogs)) {
+      if (!current.trim() || !isKnownProviderModel(nextProvider, current, modelCatalogs)) {
         return suggestions[0] ?? current;
       }
       return current;
@@ -585,6 +651,7 @@ export function App() {
     try {
       const catalog = await getJson<ProviderModelCatalog>(`/api/runtime/models${queryString({ provider: nextProvider })}`);
       setModelCatalogs((catalogs) => ({ ...catalogs, [catalog.provider]: catalog }));
+      setApiKeyEnv((current) => current.trim() || catalog.api_key_env || providerOptionMap[catalog.provider]?.apiKeyEnv || "");
       setModel((current) => {
         if (!catalog.models.length || !catalog.ok) return current;
         const staticModels = modelSuggestionsByProvider[catalog.provider] ?? [];
@@ -623,6 +690,10 @@ export function App() {
   }, [activeRunId]);
 
   useEffect(() => {
+    activeSectionRef.current = activeSection;
+  }, [activeSection]);
+
+  useEffect(() => {
     if (!onboardingState) return;
     if (onboardingState.profile && !setupDraftHydratedRef.current) {
       setSetupDraft(setupDraftFromProfile(onboardingState.profile));
@@ -635,7 +706,7 @@ export function App() {
 
   useEffect(() => {
     refreshAll().catch(reportError);
-    const timer = window.setInterval(() => refreshSummary().catch(reportError), 3500);
+    const timer = window.setInterval(() => refreshIdleSummary().catch(reportError), 3500);
     return () => window.clearInterval(timer);
   }, []);
 
@@ -669,13 +740,42 @@ export function App() {
     const appendEvent = (parsed: TraceEvent) => {
       setEvents((rows) => [...rows.slice(-120), parsed]);
       if (parsed.type !== "assistant.token") {
-        refreshSummary().catch(reportError);
+        refreshChatSummary().catch(reportError);
         refreshRunDetails(activeRun.run_id).catch(reportError);
         refreshThreadRuns(activeRun.session_id).catch(reportError);
       }
     };
     return subscribeJsonEvents<TraceEvent>(`/api/runs/${activeRun.run_id}/events`, runEventTypes, appendEvent, reportError);
   }, [activeRun?.run_id]);
+
+  function applyRunSessionSelection(runList: Run[], sessionList: Session[], pendingApprovalList: Approval[]) {
+    const selectedSessionId = activeSessionIdRef.current;
+    const selectedRunId = activeRunIdRef.current;
+    if (!selectedSessionId && sessionList.length > 0) {
+      const pendingRunIds = new Set(pendingApprovalList.map((approval) => approval.run_id));
+      const attentionRun = runList.find((run) => pendingRunIds.has(run.run_id));
+      const initialSession = attentionRun
+        ? sessionList.find((session) => session.session_id === attentionRun.session_id) ?? sessionList[0]
+        : sessionList[0];
+      selectSessionId(initialSession.session_id);
+      selectRunId(attentionRun?.run_id ?? initialSession.latest_run_id);
+    } else if (selectedSessionId && !selectedRunId) {
+      const selectedSession = sessionList.find((session) => session.session_id === selectedSessionId);
+      if (selectedSession?.latest_run_id) selectRunId(selectedSession.latest_run_id);
+    }
+  }
+
+  async function refreshChatSummary() {
+    const [runList, sessionList, pendingApprovalList] = await Promise.all([
+      getJson<Run[]>("/api/runs"),
+      getJson<Session[]>("/api/sessions"),
+      getJson<Approval[]>("/api/approvals?status=pending")
+    ]);
+    setRuns(runList);
+    setSessions(sessionList);
+    setApprovals(pendingApprovalList);
+    applyRunSessionSelection(runList, sessionList, pendingApprovalList);
+  }
 
   async function refreshSummary() {
     const [runList, sessionList, toolList, pendingApprovalList, approvalList, mcpList, skillList, pluginList, channelList, secretList, layerList] =
@@ -707,19 +807,20 @@ export function App() {
       setMemoryBackendDraft(layerList.some((layer) => layer.backend.toLowerCase().includes("memvid")) ? "Memvid" : "In-memory");
       memoryBackendHydratedRef.current = true;
     }
-    const selectedSessionId = activeSessionIdRef.current;
-    const selectedRunId = activeRunIdRef.current;
-    if (!selectedSessionId && sessionList.length > 0) {
-      const pendingRunIds = new Set(pendingApprovalList.map((approval) => approval.run_id));
-      const attentionRun = runList.find((run) => pendingRunIds.has(run.run_id));
-      const initialSession = attentionRun
-        ? sessionList.find((session) => session.session_id === attentionRun.session_id) ?? sessionList[0]
-        : sessionList[0];
-      selectSessionId(initialSession.session_id);
-      selectRunId(attentionRun?.run_id ?? initialSession.latest_run_id);
-    } else if (selectedSessionId && !selectedRunId) {
-      const selectedSession = sessionList.find((session) => session.session_id === selectedSessionId);
-      if (selectedSession?.latest_run_id) selectRunId(selectedSession.latest_run_id);
+    applyRunSessionSelection(runList, sessionList, pendingApprovalList);
+  }
+
+  async function refreshIdleSummary() {
+    if (idleRefreshInFlightRef.current) return;
+    idleRefreshInFlightRef.current = true;
+    try {
+      if (activeSectionRef.current === "advanced") {
+        await refreshSummary();
+      } else {
+        await refreshChatSummary();
+      }
+    } finally {
+      idleRefreshInFlightRef.current = false;
     }
   }
 
@@ -760,8 +861,14 @@ export function App() {
     setOnboardingState(onboardingSnapshot);
     setSetupReadiness(setupReadinessReport);
     const savedSettings = runtimeSettingsFrom(runtimeConfig);
-    setProvider(String(savedSettings.provider ?? runtimeConfig.provider?.name ?? "mock"));
+    const nextProvider = String(savedSettings.provider ?? runtimeConfig.provider?.name ?? "mock");
+    const nextProviderOption = providerOptionMap[nextProvider];
+    setProvider(nextProvider);
     setModel(String(savedSettings.model ?? runtimeConfig.provider?.model ?? "mock"));
+    setBaseUrl(String(savedSettings.base_url ?? nextProviderOption?.baseUrl ?? ""));
+    setApiKeyEnv(String(savedSettings.api_key_env ?? runtimeConfig.provider?.api_key_env ?? nextProviderOption?.apiKeyEnv ?? ""));
+    setProviderSecretResult(null);
+    setProviderKeyValue("");
     setTemperature(formatTemperature(savedSettings.temperature ?? runtimeConfig.provider?.temperature ?? 0.2));
     setMaxToolRounds(formatToolRounds(savedSettings.max_tool_rounds ?? runtimeConfig.limits?.max_tool_rounds ?? 6));
     setWorkspace(String(savedSettings.workspace ?? runtimeConfig.paths?.workspace ?? ""));
@@ -843,6 +950,8 @@ export function App() {
       const result = await putJson<Record<string, unknown>>("/api/runtime/settings", {
         provider,
         model: model.trim() || "mock",
+        base_url: baseUrl.trim() || null,
+        api_key_env: apiKeyEnv.trim() || null,
         temperature: coerceTemperature(temperature),
         max_tool_rounds: coerceToolRounds(maxToolRounds),
         backend: memoryBackendDraft === "Memvid" ? "memvid" : "memory",
@@ -856,6 +965,23 @@ export function App() {
       setRuntimeSettingsResult(result);
       await refreshAll();
     }, "Settings saved and applied to new runs.");
+  }
+
+  async function storeProviderKey() {
+    const targetEnv = apiKeyEnv.trim();
+    if (!targetEnv || !providerKeyValue.trim()) return;
+    await guarded(async () => {
+      const result = await postJson<SecretRef>("/api/secrets", {
+        name: targetEnv,
+        purpose: `Enable ${providerDisplayName} as an LLM provider.`,
+        value: providerKeyValue,
+        validate: true
+      });
+      setProviderSecretResult(result);
+      setProviderKeyValue("");
+      await refreshProviderModels(provider);
+      await refreshSummary();
+    }, "Provider key stored.");
   }
 
   async function guarded(action: () => Promise<void>, success?: string) {
@@ -876,7 +1002,7 @@ export function App() {
       const payload: Record<string, unknown> = {
         message,
         session_id: targetSessionId,
-        autonomy_mode: autonomyMode
+        autonomy_mode: submissionAutonomyMode(autonomyMode)
       };
       if (workspace.trim()) payload.workspace = workspace.trim();
       const runtimeProvider = String((runtime as RuntimeConfig | null)?.provider?.name ?? "");
@@ -1441,9 +1567,14 @@ export function App() {
   const runtimeLimits = runtimeConfig?.limits ?? {};
   const runtimePaths = runtimeConfig?.paths ?? {};
   const featureFlags = runtimeConfig?.feature_flags ?? {};
-  const providerConfigured = Boolean(runtimeProvider.api_key_configured);
-  const memoryBackend = memoryLayers.some((layer) => layer.backend.toLowerCase().includes("memvid")) ? "Memvid" : "In-memory";
-  const statusSummary = `${memoryBackend.toLowerCase()} · ${provider} · ${autonomyLabel(autonomyMode)}`;
+  const selectedProviderOption = providerOptionMap[provider] ?? null;
+  const providerDisplayName = selectedProviderOption?.label ?? provider;
+  const selectedProviderCatalog = providerCatalog?.provider === provider ? providerCatalog : null;
+  const providerRequiresKey = Boolean(selectedProviderOption?.requiresKey || apiKeyEnv.trim());
+  const providerKeyConfigured =
+    selectedProviderCatalog?.api_key_configured ??
+    (String(runtimeProvider.name ?? "") === provider ? Boolean(runtimeProvider.api_key_configured) : false);
+  const providerKeyStatus = providerRequiresKey ? (providerKeyConfigured ? "configured" : "missing") : "not needed";
   const activeDeltaCount = behaviorDeltaReport?.summary.active_deltas ?? 0;
   const totalDeltaCount = behaviorDeltaReport?.summary.total_deltas ?? 0;
   const pendingApprovalCount = approvals.filter((approval) => approval.status === "pending").length;
@@ -1452,6 +1583,10 @@ export function App() {
   const personaPresets = onboardingState?.personas?.length ? onboardingState.personas : defaultPersonaPresets;
   const agentDisplayName = String(onboardingProfile?.agent_name || selfState?.identity?.name || "Kestrel");
   const userDisplayName = String(onboardingProfile?.preferred_name || onboardingProfile?.user_name || "");
+  const simpleStatus = simpleChatStatus(activeRun, pendingApprovalCount, setupReadiness);
+  const chatIntro = userDisplayName
+    ? `Ready when you are, ${userDisplayName}.`
+    : "Ready when you are.";
 
   return (
     <>
@@ -1475,7 +1610,7 @@ export function App() {
             <button type="button" className="setup-button" onClick={() => setSetupOpen(true)}>
               <Sparkles size={14} /> Setup
             </button>
-            <span className="status-pill"><span className="status-dot"></span>{statusSummary}</span>
+            <span className="status-pill"><span className="status-dot"></span>{simpleStatus.label}</span>
           </div>
         </div>
       </header>
@@ -1505,17 +1640,11 @@ export function App() {
       <a className="skip-link" href="#workspace">Skip to workspace</a>
       <aside className="rail" aria-label="Threads">
         <div className="rail-head">
-          <h2>Command Center <small>{threadSummaries.length}</small></h2>
+          <h2>Chats <small>{threadSummaries.length}</small></h2>
           <button type="button" className="new-chat" onClick={createNewThread} title="New chat">
             <MessageCircle size={16} />
           </button>
         </div>
-        <nav className="stitch-rail-nav" aria-label="Runtime surfaces">
-          <button type="button" className="active" onClick={() => routeToSection("chat")}><TerminalSquare size={15} /> Kernel</button>
-          <button type="button" onClick={() => { routeToSection("advanced"); window.setTimeout(() => scrollToElement("memory"), 0); }}><Database size={15} /> Memory</button>
-          <button type="button" onClick={() => { routeToSection("advanced"); window.setTimeout(() => scrollToElement("tools"), 0); }}><PlugZap size={15} /> Registry</button>
-          <button type="button" onClick={() => { routeToSection("advanced"); window.setTimeout(() => scrollToElement("behavior-deltas"), 0); }}><GitBranch size={15} /> Ledger</button>
-        </nav>
         <div className="rail-search">
           <Search size={14} />
           <input type="text" placeholder="Search threads..." />
@@ -1530,9 +1659,9 @@ export function App() {
             >
               <span>
                 <strong>{thread.title}</strong>
-                <small>{thread.latest_message !== thread.title ? thread.latest_message : `${thread.run_count} runs`}</small>
+                <small>{thread.latest_message !== thread.title ? thread.latest_message : messageCountLabel(thread.run_count)}</small>
               </span>
-              <StatusBadge value={thread.run_count ? thread.latest_status : "ready"} />
+              <StatusBadge value={thread.run_count ? simpleThreadStatus(thread.latest_status) : "Ready"} />
             </button>
           ))}
           {threadSummaries.length === 0 && <EmptyState>No threads yet.</EmptyState>}
@@ -1542,53 +1671,32 @@ export function App() {
       <main className="conversation" id="workspace">
         {activeSection === "chat" && (
           <>
-        <header className="conv-head" data-section="chat">
+        <header className="conv-head simple-conv-head" data-section="chat">
           <div>
-            <h1>Ask {agentDisplayName} <em>{activeRun?.status ? `· ${activeRun.status}` : ""}</em></h1>
-            <div className="conv-meta">
-              <span>{activeThread ? `Thread: ${activeThread.title}` : "New thread"}</span>
+            <h1>Ask {agentDisplayName}</h1>
+            <div className="conv-meta simple-meta">
+              <span>{activeThread ? "Current chat" : "New chat"}</span>
               <span className="sep">·</span>
-              <span className="mono">{activeThread?.session_id ?? "draft"}</span>
-              <span className="sep">·</span>
-              <span>{activeThread ? `${activeThread.run_count} runs` : "ready"}</span>
-              <span className="sep">·</span>
-              <span>{provider} · {model}</span>
-              <span className="sep">·</span>
-              <span className="tag ghost">Mode: {autonomyLabel(autonomyMode)}</span>
+              <span>{activeRun ? simpleStatus.detail : chatIntro}</span>
             </div>
           </div>
-          <div className="conv-tools">
-            <StatusBadge value={activeRun?.status ?? "ready"} />
-            <button type="button" onClick={() => setInspectorOpen((open) => !open)}>
-              <PanelRightOpen size={15} /> Inspector
-            </button>
+          <div className="conv-tools simple-conv-tools">
+            <StatusBadge value={simpleStatus.label} />
+            {setupReadiness && !setupReadiness.ready && (
+              <button type="button" onClick={() => setSetupOpen(true)}>
+                <Sparkles size={15} /> Setup
+              </button>
+            )}
+            {activeRun && (
+              <button type="button" onClick={() => setInspectorOpen((open) => !open)}>
+                <PanelRightOpen size={15} /> Details
+              </button>
+            )}
             <button type="button" onClick={() => refreshAll().catch(reportError)}>
               <RefreshCw size={15} /> Refresh
             </button>
           </div>
         </header>
-
-        <section className="stitch-command-deck" aria-label="Command Center">
-          <div className="stitch-hero-card">
-            <div>
-              <span className="stitch-kicker"><span aria-hidden="true"></span> Active Run</span>
-              <h2>{activeRun ? "Run selected" : "Ready for controlled work"}</h2>
-              <p>{activeRun ? `${activeRun.run_id} · ${activeRun.workspace || "configured workspace"}` : "Start a run, inspect evidence, or review gated mutations from one cockpit."}</p>
-            </div>
-            <StatusBadge value={activeRun?.status ?? "ready"} />
-          </div>
-          <div className="stitch-stat-grid">
-            <Metric label="Task Capsules" value={runs.length} />
-            <Metric label="Mutation Gate" value={`${activeDeltaCount}/${totalDeltaCount}`} />
-            <Metric label="Approvals" value={pendingApprovalCount} />
-            <Metric label="Tools Online" value={enabledToolCount} />
-          </div>
-          <div className="stitch-oracle-card">
-            <span className="stitch-kicker"><Route size={13} /> ORACLE Shadow</span>
-            <strong>{oracleShadowLabel}</strong>
-            <p>Routing remains advisory. Policy writes stay behind exact-call gates.</p>
-          </div>
-        </section>
 
         <div className="announcer" aria-live="polite">
           {notice}
@@ -1622,7 +1730,7 @@ export function App() {
                     <article className="msg kestrel">
 
                       <strong>Kestrel</strong>
-                      <p>{assistantTextForRun(run, activeRun?.run_id, streamedAssistant)}</p>
+                      <MarkdownMessage text={assistantTextForRun(run, activeRun?.run_id, streamedAssistant)} />
                       {run.run_id === activeRun?.run_id && <LiveRunActivity run={run} events={activeRunEvents} />}
                     </article>
                   </div>
@@ -1686,6 +1794,27 @@ export function App() {
                 </button>
               </div>
             </header>
+            <section className="stitch-command-deck advanced-overview" aria-label="Advanced overview">
+              <div className="stitch-hero-card">
+                <div>
+                  <span className="stitch-kicker"><span aria-hidden="true"></span> Command Center</span>
+                  <h2>{activeRun ? "Run selected" : "Runtime cockpit"}</h2>
+                  <p>{activeRun ? `${activeRun.run_id} · ${activeRun.workspace || "configured workspace"}` : "Inspect evidence, memory, tools, gates, and runtime internals from here."}</p>
+                </div>
+                <StatusBadge value={activeRun?.status ?? "ready"} />
+              </div>
+              <div className="stitch-stat-grid">
+                <Metric label="Task Capsules" value={runs.length} />
+                <Metric label="Mutation Gate" value={`${activeDeltaCount}/${totalDeltaCount}`} />
+                <Metric label="Approvals" value={pendingApprovalCount} />
+                <Metric label="Tools Online" value={enabledToolCount} />
+              </div>
+              <div className="stitch-oracle-card">
+                <span className="stitch-kicker"><Route size={13} /> ORACLE Shadow</span>
+                <strong>{oracleShadowLabel}</strong>
+                <p>Routing remains advisory. Policy writes stay behind exact-call gates.</p>
+              </div>
+            </section>
             <nav className="section-index" aria-label="Advanced section index">
               {[
                 ["runtime", "Run agent"],
@@ -1725,11 +1854,7 @@ export function App() {
                 </Field>
                 <Field label="Provider">
                   <select value={provider} onChange={(event) => chooseProvider(event.target.value)}>
-                    {providerOptions.map((item) => (
-                      <option key={item} value={item}>
-                        {item}
-                      </option>
-                    ))}
+                    <ProviderSelectOptions />
                   </select>
                 </Field>
                 <Field label="Model" hint={providerCatalog?.error ?? modelCatalogLabel}>
@@ -1805,7 +1930,7 @@ export function App() {
                   </article>
                   <article className="msg kestrel">
                     <strong>Kestrel</strong>
-                    <p>{activeRun.assistant_message || streamedAssistant || activeRun.stop_reason || "Working..."}</p>
+                    <MarkdownMessage text={activeRun.assistant_message || streamedAssistant || activeRun.stop_reason || "Working..."} />
                   </article>
                 </div>
                 {proofOfWork && (
@@ -2664,7 +2789,7 @@ export function App() {
                   <label>
                     Provider
                     <select className="select" value={provider} onChange={(event) => chooseProvider(event.target.value)}>
-                      {providerOptions.map((item) => <option key={item} value={item}>{item}</option>)}
+                      <ProviderSelectOptions />
                     </select>
                   </label>
                   <label>
@@ -2685,6 +2810,52 @@ export function App() {
                     <datalist id="settings-models">
                       {modelSuggestions.map((item) => <option key={`settings-${provider}-${item}`} value={item} />)}
                     </datalist>
+                  </label>
+                  <label>
+                    Base URL
+                    <input
+                      className="input mono"
+                      type="text"
+                      value={baseUrl}
+                      placeholder={selectedProviderOption?.baseUrl ?? "not required"}
+                      onChange={(event) => setBaseUrl(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    API key env
+                    <input
+                      className="input mono"
+                      type="text"
+                      value={apiKeyEnv}
+                      placeholder={providerRequiresKey ? "API_KEY_ENV" : "not required"}
+                      onChange={(event) => setApiKeyEnv(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    Provider API key
+                    <div className="model-picker">
+                      <input
+                        className="input mono"
+                        type="password"
+                        aria-label="Provider API key"
+                        value={providerKeyValue}
+                        placeholder={providerRequiresKey ? `Paste ${apiKeyEnv || "provider key"}` : "No key needed"}
+                        disabled={!apiKeyEnv.trim()}
+                        autoComplete="off"
+                        onChange={(event) => setProviderKeyValue(event.target.value)}
+                      />
+                      <button
+                        type="button"
+                        className="btn"
+                        disabled={!apiKeyEnv.trim() || !providerKeyValue.trim()}
+                        onClick={() => storeProviderKey().catch(reportError)}
+                      >
+                        Store provider key
+                      </button>
+                    </div>
+                    <span className="model-picker-meta">
+                      {providerRequiresKey ? (providerSecretResult?.secret_ref ?? "Stored in secret broker") : "No key needed"}
+                    </span>
                   </label>
                   <label>
                     Temperature
@@ -2713,12 +2884,8 @@ export function App() {
                     />
                   </label>
                   <label>
-                    API key env
-                    <input className="input mono" type="text" value={String(runtimeProvider.api_key_env ?? "")} placeholder="not required" readOnly />
-                  </label>
-                  <label>
-                    Configured
-                    <span className="settings-status"><StatusBadge value={providerConfigured ? "configured" : "missing"} /></span>
+                    Key status
+                    <span className="settings-status"><StatusBadge value={providerKeyStatus} /></span>
                   </label>
                 </div>
                 <div className="row">
@@ -3015,9 +3182,9 @@ export function App() {
         )}
       </main>
       {activeSection === "chat" && inspectorOpen && (
-        <aside className="inspector" aria-label="Inspector">
+        <aside className="inspector" aria-label="Run details">
           <div className="inspector-head">
-            <h2>Inspector</h2>
+            <h2>Run details</h2>
             <button type="button" aria-label="Close panel" onClick={() => setInspectorOpen(false)}>
               <X size={15} />
             </button>
@@ -3417,6 +3584,16 @@ function ApprovalCardInline({ approval, onApprove }: { approval: Approval; onApp
   );
 }
 
+function MarkdownMessage({ text }: { text: string }) {
+  return (
+    <div className="markdown-message">
+      <ReactMarkdown remarkPlugins={markdownPlugins} components={markdownComponents}>
+        {text}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 function LiveRunActivity({ run, events }: { run: Run; events: TraceEvent[] }) {
   const items = activityItemsForEvents(events);
   const isRunning = run.status === "queued" || run.status === "running";
@@ -3521,6 +3698,59 @@ function extractProofOfWork(trace: RunTrace | null): Record<string, unknown> | n
   return null;
 }
 
+function simpleChatStatus(
+  activeRun: Run | null,
+  pendingApprovalCount: number,
+  setupReadiness: SetupReadinessReport | null
+): { label: string; detail: string } {
+  if (pendingApprovalCount > 0) {
+    return {
+      label: "Needs approval",
+      detail: "Review the request before Kestrel continues."
+    };
+  }
+  if (activeRun?.status === "queued" || activeRun?.status === "running") {
+    return {
+      label: "Working",
+      detail: "Kestrel is working and will show progress here."
+    };
+  }
+  if (activeRun?.status === "blocked") {
+    return {
+      label: "Needs attention",
+      detail: "Kestrel needs a decision before continuing."
+    };
+  }
+  if (activeRun?.status === "failed") {
+    return {
+      label: "Needs attention",
+      detail: activeRun.error || "The last run failed."
+    };
+  }
+  if (setupReadiness && !setupReadiness.ready) {
+    return {
+      label: "Needs setup",
+      detail: setupReadiness.next_action || "Finish setup before relying on this Kestrel."
+    };
+  }
+  return {
+    label: "Ready",
+    detail: activeRun ? "Kestrel is ready for the next message." : "Start a chat to begin."
+  };
+}
+
+function simpleThreadStatus(status: string): string {
+  if (status === "queued" || status === "running") return "Working";
+  if (status === "blocked") return "Needs approval";
+  if (status === "failed") return "Needs attention";
+  if (status === "cancelled") return "Cancelled";
+  return "Ready";
+}
+
+function messageCountLabel(count: number): string {
+  return `${count} ${count === 1 ? "message" : "messages"}`;
+}
+
 function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.map((item) => String(item)).filter(Boolean) : [];
 }
@@ -3609,6 +3839,24 @@ function formatToolRounds(value: unknown): string {
   return String(coerceToolRounds(value));
 }
 
+function ProviderSelectOptions() {
+  return (
+    <>
+      {providerGroups.map((group) => (
+        <optgroup key={group} label={group}>
+          {providerOptions
+            .filter((option) => option.group === group)
+            .map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+        </optgroup>
+      ))}
+    </>
+  );
+}
+
 function modelsForProvider(provider: string, catalogs: Record<string, ProviderModelCatalog>): string[] {
   const catalogModels = catalogs[provider]?.models ?? [];
   return catalogModels.length ? catalogModels : (modelSuggestionsByProvider[provider] ?? []);
@@ -3662,6 +3910,11 @@ function splitSetupList(value: string): string[] {
 function validAutonomyMode(value: unknown, fallback: string): string {
   const mode = String(value ?? "");
   return mode === "background" || mode === "manual" || mode === "autonomous" ? mode : fallback;
+}
+
+function submissionAutonomyMode(value: string): string {
+  if (value === "manual") return "manual";
+  return "autonomous";
 }
 
 function autonomyLabel(value: string): string {

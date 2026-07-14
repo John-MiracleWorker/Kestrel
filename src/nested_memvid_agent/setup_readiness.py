@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -55,7 +56,14 @@ class SetupReadinessReport:
         }
 
 
-def build_setup_readiness_report(config: AgentConfig) -> SetupReadinessReport:
+SecretResolver = Callable[[str | None], str | None]
+
+
+def build_setup_readiness_report(
+    config: AgentConfig,
+    *,
+    secret_resolver: SecretResolver | None = None,
+) -> SetupReadinessReport:
     """Inspect non-secret first-run prerequisites for the local product surface.
 
     The report is deliberately safe for API/UI display: it checks only paths,
@@ -63,7 +71,7 @@ def build_setup_readiness_report(config: AgentConfig) -> SetupReadinessReport:
     never returns secret values and never creates or mutates files/directories.
     """
     checks = (
-        _provider_check(config),
+        _provider_check(config, secret_resolver=secret_resolver),
         _workspace_check(config.workspace),
         _directory_check(
             "memory_storage",
@@ -110,7 +118,7 @@ def build_setup_readiness_report(config: AgentConfig) -> SetupReadinessReport:
     )
 
 
-def _provider_check(config: AgentConfig) -> SetupReadinessCheck:
+def _provider_check(config: AgentConfig, *, secret_resolver: SecretResolver | None = None) -> SetupReadinessCheck:
     provider = config.provider.strip() or "mock"
     if provider == "mock":
         return SetupReadinessCheck(
@@ -120,20 +128,20 @@ def _provider_check(config: AgentConfig) -> SetupReadinessCheck:
             "Mock provider is selected, so deterministic first-run smoke tests can run without credentials.",
             "Choose a live provider later and rerun setup readiness before claiming provider support.",
         )
-    if provider in {"openai-compatible", "ollama", "ollama-cloud", "openrouter"} and config.base_url:
+    if provider in {"openai-compatible", "lm-studio", "ollama"} and config.base_url:
         return SetupReadinessCheck(
             "provider_configuration",
             "Provider configuration",
             SetupReadinessStatus.PASS,
             f"{provider} has a configured base URL and model `{config.model}`.",
-            "If the provider requires credentials, set the configured API-key environment variable before live validation.",
+            "If the provider requires credentials, store the provider key in Settings or set the configured environment variable before live validation.",
         )
-    if config.api_key_env and os.getenv(config.api_key_env):
+    if config.api_key_env and _secret_configured(config.api_key_env, secret_resolver=secret_resolver):
         return SetupReadinessCheck(
             "provider_configuration",
             "Provider configuration",
             SetupReadinessStatus.PASS,
-            f"{provider} has model `{config.model}` and API-key environment variable `{config.api_key_env}` is present.",
+            f"{provider} has model `{config.model}` and provider key `{config.api_key_env}` is available.",
             "Run the provider smoke/golden eval before release certification.",
         )
     if config.api_key_env:
@@ -141,16 +149,26 @@ def _provider_check(config: AgentConfig) -> SetupReadinessCheck:
             "provider_configuration",
             "Provider configuration",
             SetupReadinessStatus.FAIL,
-            f"{provider} expects API-key environment variable `{config.api_key_env}`, but it is not set.",
-            f"Set `{config.api_key_env}` or switch to `--provider mock` for deterministic first-run checks.",
+            f"{provider} expects provider key `{config.api_key_env}`, but it is not stored in Settings or set in the environment.",
+            f"Store `{config.api_key_env}` in Settings, set it in the environment, or switch to `--provider mock` for deterministic first-run checks.",
         )
     return SetupReadinessCheck(
         "provider_configuration",
         "Provider configuration",
         SetupReadinessStatus.WARN,
-        f"{provider} is selected with model `{config.model}`, but no API-key env or local base URL is configured.",
-        "Set `--api-key-env`, `--base-url`, or use `--provider mock` until live provider validation is ready.",
+        f"{provider} is selected with model `{config.model}`, but no provider key name or local base URL is configured.",
+        "Choose a provider key name in Settings, set `--base-url`, or use `--provider mock` until live provider validation is ready.",
     )
+
+
+def _secret_configured(name_or_ref: str | None, *, secret_resolver: SecretResolver | None = None) -> bool:
+    if not name_or_ref:
+        return False
+    if secret_resolver is not None:
+        resolved = secret_resolver(name_or_ref)
+        if resolved:
+            return True
+    return bool(os.getenv(name_or_ref))
 
 
 def _workspace_check(path: Path) -> SetupReadinessCheck:

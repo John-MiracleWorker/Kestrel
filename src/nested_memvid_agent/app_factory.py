@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from .agent import AgentDependencies, NestedMV2Agent
 from .config import AgentConfig
 from .event_log import JsonlEventLog
@@ -17,13 +19,14 @@ def build_agent(
     tools: ToolRegistry | None = None,
     *,
     state: AgentStateStore | None = None,
+    secret_resolver: Callable[[str | None], str | None] | None = None,
 ) -> NestedMV2Agent:
     config.memory_dir.mkdir(parents=True, exist_ok=True)
     config.log_dir.mkdir(parents=True, exist_ok=True)
     specs = load_layer_specs(config.layer_config_path) if config.layer_config_path else None
     active_state = state or AgentStateStore(config.state_path)
     memory = build_memory_system(config.backend, config.memory_dir, specs=specs, ledger=PromotionLedger(active_state))
-    llm = build_llm_provider(config)
+    llm = build_llm_provider(config, secret_resolver=secret_resolver)
     base_registry: ToolRegistry = tools or build_default_tools(config.enabled_tools)
     # Wrap with transparent retry layer for transient failures
     registry: ToolRegistry

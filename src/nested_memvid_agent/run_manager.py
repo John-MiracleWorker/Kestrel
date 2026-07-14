@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -43,6 +44,7 @@ class RunManager:
         mcp: MCPManager,
         skills: SkillManager,
         plugins: PluginManager | None = None,
+        secret_resolver: Callable[[str | None], str | None] | None = None,
     ) -> None:
         self.config = config
         self.state = state
@@ -50,6 +52,7 @@ class RunManager:
         self.mcp = mcp
         self.skills = skills
         self.plugins = plugins or PluginManager(config.plugins_dir, state)
+        self.secret_resolver = secret_resolver
         self._lock = Lock()
         self._threads: dict[str, Thread] = {}
         self._cancelled: set[str] = set()
@@ -98,8 +101,13 @@ class RunManager:
             },
             acceptance_criteria=["User objective is addressed or explicitly blocked with next steps."],
         )
+        recent_messages = [
+            prior.message
+            for prior in self.state.list_runs_for_session(run.session_id)
+            if prior.run_id != run_id and prior.message.strip()
+        ][-5:]
         if normalized_autonomy != "manual":
-            planned_tasks = _initial_task_plan(message)
+            planned_tasks = _initial_task_plan(message, recent_messages=recent_messages)
         else:
             planned_tasks = []
         for planned in planned_tasks:
@@ -224,14 +232,9 @@ class RunManager:
         active_config = self.config
         if run_id:
             run = self.state.get_run(run_id)
-            active_config = replace(
-                self.config,
-                workspace=Path(run.workspace),
-                provider=run.provider,
-                model=run.model,
-            )
+            active_config = self._config_for_run(run)
         registry = self.build_registry()
-        agent = build_agent(active_config, tools=registry, state=self.state)
+        agent = build_agent(active_config, tools=registry, state=self.state, secret_resolver=self.secret_resolver)
         try:
             call = ToolCall(name=tool_name, arguments=arguments)
             spans = SpanRecorder(state=self.state, events=self.events)
@@ -424,7 +427,7 @@ class RunManager:
         task = self.state.update_task_node(task_id, approved=True, status="approved")
         self.events.publish(run_id, "task.approved", asdict(task))
         payload = asdict(task)
-        if self.config.enable_autonomous_scheduler:
+        if self._run_uses_autonomous_scheduler(run_id):
             self.state.transition_run(run_id, "running", stop_reason="task_approved")
             scheduler = self.run_scheduler_until_idle(run_id)
             final_status, stop_reason = _scheduler_run_outcome(scheduler)
@@ -455,8 +458,8 @@ class RunManager:
             goal=goal,
             status="queued",
         )
-        config = replace(self.config, workspace=Path(run.workspace), provider=run.provider, model=run.model)
         self.events.publish(run_id, "subagent.queued", asdict(subagent))
+        config = self._config_for_run(run)
         self._start_thread(subagent.subagent_id, self._run_subagent, config, subagent.subagent_id, run_id, run.session_id)
         return asdict(subagent)
 
@@ -496,7 +499,7 @@ class RunManager:
         if self._is_cancelled(run_id):
             return
         run = self.state.get_run(run_id)
-        config = replace(self.config, workspace=Path(run.workspace), provider=run.provider, model=run.model)
+        config = self._config_for_run(run)
         if run.status in _TERMINAL_RUN_STATUSES:
             self._run_approved_tool_without_continuation(config, approval, arguments, run.session_id)
             return
@@ -713,7 +716,7 @@ class RunManager:
         )
         self.events.publish(run.run_id, "task.started", _task_payload(running))
         self.events.publish(run.run_id, "subagent.started", asdict(subagent))
-        config = replace(self.config, workspace=Path(run.workspace), provider=run.provider, model=run.model)
+        config = self._config_for_run(run)
         worker_isolation: dict[str, str] | None = None
         agent: NestedMV2Agent | None = None
         try:
@@ -859,7 +862,24 @@ class RunManager:
         )
 
     def _build_agent(self, config: AgentConfig) -> NestedMV2Agent:
-        return build_agent(config, tools=self.build_registry(), state=self.state)
+        return build_agent(config, tools=self.build_registry(), state=self.state, secret_resolver=self.secret_resolver)
+
+    def _config_for_run(self, run: RunRecord) -> AgentConfig:
+        return replace(
+            self.config,
+            workspace=Path(run.workspace),
+            provider=run.provider,
+            model=run.model,
+            enable_autonomous_scheduler=self._run_uses_autonomous_scheduler(run.run_id),
+        )
+
+    def _run_uses_autonomous_scheduler(self, run_id: str) -> bool:
+        if self.config.enable_autonomous_scheduler:
+            return True
+        return any(
+            _is_root_objective_task(task) and (task.plan or {}).get("autonomy_mode") == "autonomous"
+            for task in self.state.list_task_nodes(run_id)
+        )
 
     def _stream_handler(self, run_id: str) -> Callable[[LLMStreamEvent], None]:
         def handle(event: LLMStreamEvent) -> None:
@@ -1113,7 +1133,7 @@ def _workspace_supports_git_worktree(workspace: Path) -> bool:
     return git_marker.exists()
 
 
-def _initial_task_plan(message: str) -> list[dict[str, Any]]:
+def _initial_task_plan(message: str, *, recent_messages: list[str] | tuple[str, ...] = ()) -> list[dict[str, Any]]:
     """Create a conservative persisted starter plan for new background runs.
 
     The live agent still does the real work. These deterministic nodes give the
@@ -1121,6 +1141,7 @@ def _initial_task_plan(message: str) -> list[dict[str, Any]]:
     of leaving every run as one opaque root task.
     """
     objective = message.strip() or "User objective"
+    planning_context = "\n".join([*recent_messages, objective])
     inspect_id = f"task_{uuid4().hex}"
     validate_id = f"task_{uuid4().hex}"
     if _looks_like_repair_commit_request(objective):
@@ -1190,6 +1211,54 @@ def _initial_task_plan(message: str) -> list[dict[str, Any]]:
                 "acceptance_criteria": ["git.commit includes the current repair.review id and still requires exact-call approval."],
             },
         ]
+    if _looks_like_artifact_build_request(planning_context):
+        create_id = f"task_{uuid4().hex}"
+        review_id = f"task_{uuid4().hex}"
+        return [
+            {
+                "task_id": inspect_id,
+                "title": "Inspect build context",
+                "goal": f"Gather relevant files, constraints, and prior work before creating an artifact for: {objective}",
+                "profile": "worker",
+                "dependencies": [],
+                "required_tools": ["repo.map", "file.list", "memory.search", "context.pack"],
+                "risk": "low",
+                "acceptance_criteria": ["Relevant workspace context is identified before changing files."],
+            },
+            {
+                "task_id": create_id,
+                "title": "Create artifact",
+                "goal": f"Create the requested artifact for: {objective}",
+                "profile": "worker",
+                "dependencies": [inspect_id],
+                "required_tools": ["file.write", "patch.apply", "tool.registry"],
+                "risk": "high",
+                "acceptance_criteria": [
+                    "Artifact files are created under the workspace, or an explicit blocker is recorded.",
+                    "High-risk file changes remain behind task/tool approval gates.",
+                ],
+            },
+            {
+                "task_id": validate_id,
+                "title": "Validate artifact",
+                "goal": f"Inspect or run the most relevant validation for the created artifact: {objective}",
+                "profile": "worker",
+                "dependencies": [create_id],
+                "required_tools": ["file.read", "file.stat", "project.scripts", "test.run", "lint.run"],
+                "risk": "low",
+                "acceptance_criteria": ["Created files are inspected or validated, and any remaining risks are explicit."],
+            },
+            {
+                "task_id": review_id,
+                "title": "Review outcome",
+                "goal": f"Review whether the artifact satisfies: {objective}",
+                "profile": "reviewer",
+                "dependencies": [validate_id],
+                "required_tools": ["file.read", "git.diff"],
+                "risk": "low",
+                "acceptance_criteria": ["Artifact path, validation evidence, and next steps are explicit."],
+            },
+        ]
     return [
         {
             "task_id": inspect_id,
@@ -1234,6 +1303,38 @@ def _looks_like_repair_commit_request(message: str) -> bool:
         and any(term in normalized for term in commit_terms)
         and any(term in normalized for term in validation_terms)
     )
+
+
+def _looks_like_artifact_build_request(message: str) -> bool:
+    normalized = message.lower()
+    action_terms = ("build", "create", "make", "generate", "implement", "ship", "scaffold")
+    artifact_terms = (
+        "app",
+        "application",
+        "artifact",
+        "component",
+        "game",
+        "page",
+        "program",
+        "project",
+        "random",
+        "site",
+        "something",
+        "tool",
+        "website",
+        "whimsical",
+    )
+    continuation_terms = ("continue", "go", "go for it", "keep going", "resume", "do it")
+    has_artifact_goal = _contains_term(normalized, action_terms) and _contains_term(normalized, artifact_terms)
+    has_recent_artifact_context = _contains_term(normalized, artifact_terms) and _contains_term(
+        normalized,
+        continuation_terms,
+    )
+    return has_artifact_goal or has_recent_artifact_context
+
+
+def _contains_term(text: str, terms: tuple[str, ...]) -> bool:
+    return any(re.search(rf"\b{re.escape(term)}\b", text) for term in terms)
 
 
 def _trace_category(event: dict[str, Any]) -> str:

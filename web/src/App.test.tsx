@@ -188,7 +188,12 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: /send/i })).toBeDisabled();
     expect(screen.getByText("Safe Auto")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /advanced/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /inspector/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /chats/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /details/i })).toBeInTheDocument();
+    expect(screen.queryByText("Command Center")).not.toBeInTheDocument();
+    expect(screen.queryByText("Kernel")).not.toBeInTheDocument();
+    expect(screen.queryByText("Registry")).not.toBeInTheDocument();
+    expect(screen.queryByText("ORACLE Shadow")).not.toBeInTheDocument();
 
     const results = await axe.run(container, {
       rules: {
@@ -198,17 +203,89 @@ describe("App", () => {
     expect(results.violations).toEqual([]);
   });
 
-  it("renders Stitch command-center cockpit surfaces", async () => {
+  it("keeps idle chat polling lightweight", async () => {
+    const intervalCallbacks: Array<() => void> = [];
+    vi.spyOn(window, "setInterval").mockImplementation((handler: TimerHandler, timeout?: number) => {
+      if (typeof handler === "function" && timeout === 3500) {
+        intervalCallbacks.push(() => handler());
+      }
+      return 1 as unknown as ReturnType<typeof window.setInterval>;
+    });
+    vi.spyOn(window, "clearInterval").mockImplementation(() => undefined);
+    const fetchSpy = vi.mocked(fetch);
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Ask Kestrel" })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(fetchSpy.mock.calls.some(([path]) => String(path).includes("/trace?limit=700"))).toBe(true);
+    });
+    expect(intervalCallbacks).toHaveLength(1);
+
+    fetchSpy.mockClear();
+    intervalCallbacks[0]();
+
+    await waitFor(() => {
+      expect(fetchSpy.mock.calls.some(([path]) => path === "/api/runs")).toBe(true);
+    });
+    const idlePaths = fetchSpy.mock.calls.map(([path]) => String(path));
+    expect(idlePaths).toEqual(expect.arrayContaining(["/api/runs", "/api/sessions", "/api/approvals?status=pending"]));
+    expect(idlePaths).not.toContain("/api/tools");
+    expect(idlePaths).not.toContain("/api/mcp/servers");
+    expect(idlePaths).not.toContain("/api/skills");
+    expect(idlePaths).not.toContain("/api/plugins");
+    expect(idlePaths).not.toContain("/api/channels");
+    expect(idlePaths).not.toContain("/api/secrets");
+    expect(idlePaths).not.toContain("/api/memory/layers");
+  });
+
+  it("renders assistant markdown as rich chat prose", async () => {
+    runs = [
+      {
+        ...baseRun,
+        assistant_message: "Pick one:\n\n1. **Duck Compiler** — turns English into bytecode.\n2. `Bureaucratic Moon` — files forms in orbit."
+      }
+    ];
+    sessions = [
+      {
+        session_id: "session_1",
+        run_count: 1,
+        status_counts: { completed: 1 },
+        latest_run_id: "run_1",
+        latest_status: "completed",
+        latest_message: "Inspect the repo",
+        created_at: baseRun.created_at,
+        updated_at: baseRun.updated_at
+      }
+    ];
+    sessionRuns = { session_1: runs };
+
     const { container } = render(<App />);
 
     expect(await screen.findByRole("heading", { name: "Ask Kestrel" })).toBeInTheDocument();
-    expect(container.querySelector(".stitch-command-deck")).toBeInTheDocument();
+    await screen.findByText("Duck Compiler");
+    const assistantMessage = container.querySelector(".msg.kestrel .markdown-message");
+    expect(assistantMessage).toBeInTheDocument();
+    expect(assistantMessage?.querySelector("ol")).toBeInTheDocument();
+    expect(assistantMessage?.querySelector("strong")?.textContent).toBe("Duck Compiler");
+    expect(assistantMessage?.querySelector("code")?.textContent).toBe("Bureaucratic Moon");
+    expect(assistantMessage?.textContent).not.toContain("**Duck Compiler**");
+  });
+
+  it("renders Advanced command-center cockpit surfaces", async () => {
+    const { container } = render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Ask Kestrel" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+
+    expect(await screen.findByRole("heading", { name: /advanced/i })).toBeInTheDocument();
+    expect(container.querySelector(".advanced-overview")).toBeInTheDocument();
     expect(screen.getByText("Command Center")).toBeInTheDocument();
     expect(screen.getByText("Task Capsules")).toBeInTheDocument();
     expect(screen.getByText("Mutation Gate")).toBeInTheDocument();
     expect(screen.getByText("ORACLE Shadow")).toBeInTheDocument();
-    expect(screen.getByText("Kernel")).toBeInTheDocument();
-    expect(screen.getByText("Registry")).toBeInTheDocument();
+    expect(screen.getByText("Memory")).toBeInTheDocument();
+    expect(screen.getAllByText("Tools").length).toBeGreaterThan(0);
   });
 
 
@@ -615,7 +692,7 @@ describe("App", () => {
       const body = JSON.parse(String(runCall?.[1]?.body ?? "{}"));
       expect(body.message).toBe("Build a parser");
       expect(body.session_id).toMatch(/^thread_/);
-      expect(body.autonomy_mode).toBe("background");
+      expect(body.autonomy_mode).toBe("autonomous");
       expect(body).not.toHaveProperty("provider");
       expect(body).not.toHaveProperty("model");
     });
@@ -629,12 +706,12 @@ describe("App", () => {
 
     expect(within(screen.getByLabelText("Conversation threads")).getByRole("button", { name: /new chat/i })).toHaveClass("active");
     expect(screen.getByText("Tell Kestrel what to do.")).toBeInTheDocument();
-    expect(screen.getByText("No run selected.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /details/i })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /refresh/i }));
     await waitFor(() => {
       expect(within(screen.getByLabelText("Conversation threads")).getByRole("button", { name: /new chat/i })).toHaveClass("active");
-      expect(screen.getByText("No run selected.")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /details/i })).not.toBeInTheDocument();
     });
 
     const transcript = screen.getByLabelText("Conversation transcript");
@@ -773,7 +850,7 @@ describe("App", () => {
     const fetchSpy = vi.mocked(fetch);
     render(<App />);
 
-    await screen.findByText("Needs approval");
+    expect((await screen.findAllByText("Needs approval")).length).toBeGreaterThan(0);
     const approvalCard = screen.getByRole("group", { name: /approval for shell.run/i });
     expect(within(approvalCard).getByText("shell.run")).toBeInTheDocument();
     expect(within(approvalCard).getByText("High risk")).toBeInTheDocument();
@@ -813,7 +890,7 @@ describe("App", () => {
 
     render(<App />);
 
-    await screen.findByText("Needs approval");
+    expect((await screen.findAllByText("Needs approval")).length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
     fireEvent.change(screen.getAllByLabelText("Arguments JSON")[0], {
       target: {
@@ -862,7 +939,7 @@ describe("App", () => {
 
     render(<App />);
 
-    await screen.findByText("Needs approval");
+    expect((await screen.findAllByText("Needs approval")).length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
     fireEvent.change(screen.getAllByLabelText("Arguments JSON")[0], {
       target: {
@@ -1084,6 +1161,77 @@ describe("App", () => {
     expect(screen.getByText("2 provider models")).toBeInTheDocument();
   });
 
+  it("offers friendly local and cloud providers and stores provider keys through the broker", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    await screen.findByRole("heading", { name: /settings/i });
+
+    expect(screen.getByRole("option", { name: /LM Studio/i })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Ollama \(local\)/i })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Claude \/ Anthropic/i })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Grok \/ xAI/i })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Gemini/i })).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "lm-studio" } });
+    await waitFor(() => {
+      expect(fetchSpy.mock.calls.some(([path]) => path === "/api/runtime/models?provider=lm-studio")).toBe(true);
+    });
+    expect(screen.getByDisplayValue("http://localhost:1234/v1")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("local-model")).toBeInTheDocument();
+    expect(screen.getByText("No key needed")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "grok" } });
+    await waitFor(() => {
+      expect(fetchSpy.mock.calls.some(([path]) => path === "/api/runtime/models?provider=grok")).toBe(true);
+    });
+    expect(screen.getByDisplayValue("https://api.x.ai/v1")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("XAI_API_KEY")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("grok-4.3")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Provider API key"), { target: { value: "xai-super-secret" } });
+    fireEvent.click(screen.getByRole("button", { name: /store provider key/i }));
+
+    await waitFor(() => {
+      const secretCall = fetchSpy.mock.calls.find(([path, init]) => path === "/api/secrets" && init?.method === "POST");
+      expect(secretCall).toBeDefined();
+      expect(JSON.parse(String(secretCall?.[1]?.body ?? "{}"))).toEqual({
+        name: "XAI_API_KEY",
+        purpose: "Enable Grok / xAI as an LLM provider.",
+        value: "xai-super-secret",
+        validate: true
+      });
+    });
+    expect(screen.queryByText("xai-super-secret")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /save settings/i }));
+    await waitFor(() => {
+      const saveCall = fetchSpy.mock.calls.find(([path, init]) => path === "/api/runtime/settings" && init?.method === "PUT");
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(String(saveCall?.[1]?.body ?? "{}"))).toMatchObject({
+        provider: "grok",
+        model: "grok-4.3",
+        base_url: "https://api.x.ai/v1",
+        api_key_env: "XAI_API_KEY"
+      });
+    });
+  });
+
+  it("replaces an incompatible model when switching friendly providers", async () => {
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    await screen.findByRole("heading", { name: /settings/i });
+
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "deepseek-v4-pro" } });
+    fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "grok" } });
+
+    expect(await screen.findByDisplayValue("grok-4.3")).toBeInTheDocument();
+  });
+
   it("renders behavior delta review panel from the ledger API", async () => {
     render(<App />);
 
@@ -1298,11 +1446,12 @@ async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<
   }
   if (path === "/api/secrets" && init?.method === "POST") {
     const body = JSON.parse(String(init.body ?? "{}"));
+    const secretId = String(body.name ?? "secret").toLowerCase().replace(/[^a-z0-9_.-]+/g, "_");
     const secret: SecretRef = {
-      id: "telegram_bot_token",
+      id: secretId,
       name: body.name,
       purpose: body.purpose,
-      secret_ref: "secret://telegram_bot_token",
+      secret_ref: `secret://${secretId}`,
       configured: true,
       validated: Boolean(body.validate),
       last_validated_at: "2026-05-16T00:10:00Z",
@@ -1567,6 +1716,7 @@ function payloadFor(path: string): unknown {
     const modelsByProvider: Record<string, string[]> = {
       mock: ["mock"],
       openai: ["gpt-5.5", "gpt-5.4"],
+      "lm-studio": ["local-model"],
       "openai-compatible": ["local-model"],
       openrouter: ["openai/gpt-5.5", "anthropic/claude-sonnet-4.5"],
       deepseek: ["deepseek-v4-pro", "deepseek-v4-flash"],
@@ -1574,6 +1724,7 @@ function payloadFor(path: string): unknown {
       ollama: ["llama3.1", "qwen2.5-coder"],
       "ollama-cloud": ["gpt-oss:120b", "gpt-oss:20b"],
       anthropic: ["claude-sonnet-4.5"],
+      grok: ["grok-4.3", "grok-build-0.1"],
       gemini: ["gemini-2.5-pro"],
       "codex-cli": ["gpt-5.5", "gpt-5.4"]
     };
@@ -1622,7 +1773,12 @@ function payloadFor(path: string): unknown {
 
 function apiKeyEnvForProvider(provider: string): string | null {
   const apiKeyEnvs: Record<string, string> = {
+    openai: "OPENAI_API_KEY",
+    openrouter: "OPENROUTER_API_KEY",
     "ollama-cloud": "OLLAMA_API_KEY",
+    anthropic: "ANTHROPIC_API_KEY",
+    grok: "XAI_API_KEY",
+    gemini: "GEMINI_API_KEY",
     deepseek: "DEEPSEEK_API_KEY",
     kimi: "MOONSHOT_API_KEY"
   };

@@ -16,6 +16,7 @@ def register_product_routes(
     app: object,
     auth_dependency: Callable[..., Any] | None = None,
     active_config: Callable[[], AgentConfig] | None = None,
+    secret_resolver: Callable[[str | None], str | None] | None = None,
 ) -> None:
     router = APIRouter()
     dependencies = [Depends(auth_dependency)] if auth_dependency is not None else []
@@ -27,7 +28,7 @@ def register_product_routes(
     @router.get("/api/product/setup", dependencies=dependencies)
     def product_setup() -> dict[str, object]:
         config = active_config() if active_config is not None else AgentConfig.from_env()
-        return build_setup_readiness_report(config).to_dict()
+        return build_setup_readiness_report(config, secret_resolver=secret_resolver).to_dict()
 
     @router.get("/api/product/provider-certification", dependencies=dependencies)
     def product_provider_certification() -> dict[str, object]:

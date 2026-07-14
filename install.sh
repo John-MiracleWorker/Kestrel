@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 DEFAULT_REPO="https://github.com/John-MiracleWorker/Kestrel.git"
 DEFAULT_HOME="${HOME}/.kestrel-agent"
-DEFAULT_EXTRAS="memvid,openai,server,mcp,dev"
+DEFAULT_EXTRAS="memvid,openai,server,mcp"
 DEFAULT_PORT="8765"
 DEFAULT_START_SERVER="0"
 DEFAULT_OPEN_BROWSER="0"
@@ -21,7 +21,7 @@ Environment options:
   KESTREL_REPO          Git repository URL or local path. Defaults to https://github.com/John-MiracleWorker/Kestrel.git.
   KESTREL_REF           Git ref to install. Defaults to main.
   KESTREL_PYTHON        Python 3.11+ interpreter path/name to use.
-  KESTREL_EXTRAS        Python extras to install. Defaults to memvid,openai,server,mcp,dev.
+  KESTREL_EXTRAS        Python extras to install. Defaults to memvid,openai,server,mcp.
   KESTREL_SKIP_WEB      Set to 1/true to skip npm ci and web build.
   KESTREL_SKIP_SMOKE    Set to 1/true to skip doctor/chat smoke checks.
   KESTREL_START_SERVER  Set to 1/true to launch the local server and web UI. Defaults to 0.
