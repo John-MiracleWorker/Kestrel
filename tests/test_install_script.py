@@ -242,6 +242,13 @@ def test_install_script_detects_python_311_without_bare_python_default() -> None
     assert "python -m venv" not in text
 
 
+def test_install_script_clears_pythonpath_before_creating_the_venv() -> None:
+    text = INSTALL.read_text(encoding="utf-8")
+
+    assert "unset PYTHONPATH" in text
+    assert text.index("unset PYTHONPATH") < text.index('PYTHON_BIN="$(detect_python)"')
+
+
 def test_install_script_launches_server_detached_and_checks_health() -> None:
     text = INSTALL.read_text(encoding="utf-8")
 
@@ -261,6 +268,8 @@ def test_install_script_launches_server_detached_and_checks_health() -> None:
 )
 def test_install_from_local_repo_smoke_with_memvid(tmp_path: Path) -> None:
     source_repo = _current_tree_git_repo(tmp_path)
+    external_pythonpath = tmp_path / "external-pythonpath"
+    external_pythonpath.mkdir()
     result = _run_install(
         env={
             "KESTREL_HOME": str(tmp_path / "installed"),
@@ -268,8 +277,25 @@ def test_install_from_local_repo_smoke_with_memvid(tmp_path: Path) -> None:
             "KESTREL_REF": "HEAD",
             "KESTREL_SKIP_WEB": "1",
             "KESTREL_START_SERVER": "0",
+            "PYTHONPATH": str(external_pythonpath),
         }
     )
 
     assert result.returncode == 0, result.stderr
     assert "Kestrel install complete" in result.stdout
+    installed_python = tmp_path / "installed" / ".venv" / "bin" / "python"
+    dependency_probe = subprocess.run(
+        [
+            str(installed_python),
+            "-c",
+            (
+                "from importlib.metadata import version; "
+                "print(version('openai'), version('anthropic'), version('google-genai'))"
+            ),
+        ],
+        env={**os.environ, "PYTHONPATH": ""},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert dependency_probe.returncode == 0, dependency_probe.stderr

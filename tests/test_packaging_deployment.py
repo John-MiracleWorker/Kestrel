@@ -11,7 +11,7 @@ def test_package_metadata_identifies_kestrel_release() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     project = pyproject["project"]
 
-    assert project["version"] == "0.2.0"
+    assert project["version"] == "0.2.1"
     assert project["description"].startswith("Kestrel:")
     assert project["urls"]["Repository"] == "https://github.com/John-MiracleWorker/Kestrel"
     assert project["urls"]["Issues"] == "https://github.com/John-MiracleWorker/Kestrel/issues"
@@ -115,6 +115,7 @@ def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
     assert 'tags: ["v*"]' in workflow
+    assert "npm audit --audit-level=high" in workflow
     assert "npm run build" in workflow
     assert "Stage web workbench in Python package" in workflow
     assert "src/nested_memvid_agent/web_dist" in workflow
@@ -137,6 +138,7 @@ def test_ci_runs_isolated_python_tests_and_web_build() -> None:
     assert 'node-version: "22"' in ci
     assert "cache-dependency-path: web/package-lock.json" in ci
     assert "run: npm ci" in ci
+    assert "run: npm audit --audit-level=high" in ci
     assert "run: npm test" in ci
     assert "run: npm run build" in ci
     assert "run: docker build -t kestrel-agent:ci ." in ci

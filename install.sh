@@ -421,6 +421,10 @@ main() {
   KESTREL_SERVER_SESSION="${KESTREL_SERVER_SESSION:-$DEFAULT_SERVER_SESSION}"
   KESTREL_SERVER_LOG="${KESTREL_SERVER_LOG:-${KESTREL_HOME}/.nest/server.log}"
   KESTREL_SERVER_PID="${KESTREL_SERVER_PID:-${KESTREL_HOME}/.nest/server.pid}"
+  # Keep the dedicated Kestrel virtual environment isolated from the caller's
+  # Python packages. An inherited PYTHONPATH can make pip incorrectly treat
+  # dependencies from another environment as already installed.
+  unset PYTHONPATH
   PYTHON_BIN="$(detect_python)"
   readonly KESTREL_HOME KESTREL_REPO KESTREL_REF KESTREL_EXTRAS KESTREL_PORT KESTREL_START_SERVER KESTREL_OPEN_BROWSER KESTREL_SERVER_SESSION KESTREL_SERVER_LOG KESTREL_SERVER_PID PYTHON_BIN
 
