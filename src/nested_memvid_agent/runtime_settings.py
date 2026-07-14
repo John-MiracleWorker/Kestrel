@@ -42,6 +42,8 @@ class RuntimeSettings:
     max_tool_rounds: int
     stream: bool
     require_api_auth: bool
+    base_url: str | None = None
+    api_key_env: str | None = None
     autonomy_mode: str = "background"
     allow_shell: bool = False
     allow_file_write: bool = False
@@ -71,6 +73,8 @@ class RuntimeSettings:
             max_tool_rounds=config.max_tool_rounds,
             stream=config.stream,
             require_api_auth=config.require_api_auth,
+            base_url=config.base_url,
+            api_key_env=config.api_key_env,
             autonomy_mode=autonomy_mode,
             allow_shell=config.allow_shell,
             allow_file_write=config.allow_file_write,
@@ -140,6 +144,8 @@ def apply_runtime_settings(config: AgentConfig, settings: RuntimeSettings) -> Ag
         config,
         provider=settings.provider,
         model=settings.model,
+        base_url=settings.base_url,
+        api_key_env=settings.api_key_env,
         temperature=settings.temperature,
         backend=settings.backend,
         memory_dir=Path(settings.memory_dir),
@@ -170,6 +176,8 @@ def merge_runtime_settings(config: AgentConfig, current: RuntimeSettings, raw: d
     for key in {
         "provider",
         "model",
+        "base_url",
+        "api_key_env",
         "backend",
         "memory_dir",
         "workspace",
@@ -201,6 +209,8 @@ def _normalize_settings(settings: RuntimeSettings) -> RuntimeSettings:
         settings,
         provider=provider,
         model=model,
+        base_url=_clean_optional(settings.base_url),
+        api_key_env=_clean_optional(settings.api_key_env),
         backend=backend,
         memory_dir=memory_dir,
         workspace=workspace,
@@ -232,6 +242,11 @@ def _clean_required(value: object, field: str) -> str:
     if not rendered:
         raise ValueError(f"{field} is required")
     return rendered
+
+
+def _clean_optional(value: object) -> str | None:
+    rendered = str(value or "").strip()
+    return rendered or None
 
 
 def _clean_bool(value: object) -> bool:

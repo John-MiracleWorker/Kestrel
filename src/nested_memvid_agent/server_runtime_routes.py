@@ -16,6 +16,7 @@ def register_runtime_routes(
     state: Any,
     settings_store: RuntimeSettingsStore | None = None,
     on_config_update: Any | None = None,
+    secret_broker: Any | None = None,
     http_exception: Any | None = None,
 ) -> None:
     @app.get("/api/health")  # type: ignore[untyped-decorator]
@@ -42,12 +43,12 @@ def register_runtime_routes(
                 "model": config.model,
                 "base_url_configured": bool(config.base_url),
                 "api_key_env": provider_env,
-                "api_key_configured": bool(provider_env and os.getenv(provider_env)),
+                "api_key_configured": _secret_configured(secret_broker, provider_env),
                 "fallback_provider": config.fallback_provider,
                 "fallback_model": config.fallback_model,
                 "fallback_base_url_configured": bool(config.fallback_base_url),
                 "fallback_api_key_env": fallback_env,
-                "fallback_api_key_configured": bool(fallback_env and os.getenv(fallback_env)),
+                "fallback_api_key_configured": _secret_configured(secret_broker, fallback_env),
                 "stream": config.stream,
                 "temperature": config.temperature,
                 "timeout_seconds": config.timeout_seconds,
@@ -129,10 +130,11 @@ def register_runtime_routes(
     @app.get("/api/runtime/models")  # type: ignore[untyped-decorator]
     def runtime_models(provider: str | None = None) -> dict[str, object]:
         config = _active_config(active_config)
+        secret_resolver = getattr(secret_broker, "resolve", None)
         if provider:
-            catalog = model_catalog_for_provider(config, provider)
+            catalog = model_catalog_for_provider(config, provider, secret_resolver=secret_resolver)
             return catalog.to_public_dict()
-        return {"providers": [catalog.to_public_dict() for catalog in all_model_catalogs(config)]}
+        return {"providers": [catalog.to_public_dict() for catalog in all_model_catalogs(config, secret_resolver=secret_resolver)]}
 
     @app.get("/api/runtime/settings")  # type: ignore[untyped-decorator]
     def get_runtime_settings() -> dict[str, object]:
@@ -161,6 +163,8 @@ def register_runtime_routes(
             "runtime": {
                 "provider": next_config.provider,
                 "model": next_config.model,
+                "base_url": next_config.base_url,
+                "api_key_env": next_config.api_key_env,
                 "backend": next_config.backend,
                 "memory_dir": str(next_config.memory_dir),
                 "workspace": str(next_config.workspace),
@@ -189,6 +193,17 @@ def _require_settings_store(store: RuntimeSettingsStore | None, http_exception: 
     if store is None:
         _raise(http_exception, 503, "runtime_settings_store_unavailable")
     return store
+
+
+def _secret_configured(secret_broker: Any | None, name_or_ref: str | None) -> bool:
+    if not name_or_ref:
+        return False
+    if secret_broker is not None and hasattr(secret_broker, "status"):
+        try:
+            return bool(secret_broker.status(name_or_ref).get("configured"))
+        except Exception:  # noqa: BLE001 - status should never break runtime config
+            return bool(os.getenv(name_or_ref))
+    return bool(os.getenv(name_or_ref))
 
 
 def _raise(http_exception: Any | None, status_code: int, detail: str) -> NoReturn:

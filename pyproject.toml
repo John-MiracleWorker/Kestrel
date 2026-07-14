@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nested-memvid-agent"
-version = "0.1.0"
-description = "Nested Learning-inspired agent memory scaffold using Memvid .mv2 files as portable memory layers."
+version = "0.2.0"
+description = "Kestrel: a local-first, memory-native AI engineering agent runtime."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
-authors = [{ name = "Nested Learning Agent scaffold" }]
+authors = [{ name = "Kestrel Contributors" }]
 dependencies = ["numpy>=1.26"]
 
 [project.optional-dependencies]
@@ -19,17 +19,22 @@ anthropic = ["anthropic>=0.39"]
 gemini = ["google-genai>=0.3"]
 server = ["fastapi>=0.110", "uvicorn>=0.29"]
 mcp = ["mcp>=1.0"]
-dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.10", "bandit>=1.7", "fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27"]
+dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.10", "bandit>=1.7", "build>=1.2", "fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27"]
 
 [project.scripts]
 nested-memvid = "nested_memvid_agent.cli:main"
 nest-agent = "nested_memvid_agent.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/John-MiracleWorker/Kestrel"
+Repository = "https://github.com/John-MiracleWorker/Kestrel"
+Issues = "https://github.com/John-MiracleWorker/Kestrel/issues"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-nested_memvid_agent = ["prompts/*.md"]
+nested_memvid_agent = ["prompts/*.md", "web_dist/index.html", "web_dist/assets/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

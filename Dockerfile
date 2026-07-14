@@ -37,7 +37,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     NEST_AGENT_AUTO_CONSOLIDATION_DRY_RUN=true \
     NEST_AGENT_REQUIRE_API_AUTH=true
 
-ARG INSTALL_EXTRAS=server,mcp,memvid,openai
+ARG INSTALL_EXTRAS=server,mcp,memvid,openai,anthropic,gemini
 
 WORKDIR /app
 RUN groupadd --system kestrel && useradd --system --gid kestrel --home-dir /app kestrel

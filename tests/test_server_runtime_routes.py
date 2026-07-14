@@ -15,6 +15,17 @@ class _FakeState:
         return 10
 
 
+class _FakeSecretBroker:
+    def __init__(self, configured: set[str] | None = None) -> None:
+        self.configured = configured or set()
+
+    def status(self, name_or_ref: str | None) -> dict[str, object]:
+        return {"configured": bool(name_or_ref in self.configured), "source_env": name_or_ref}
+
+    def resolve(self, name_or_ref: str | None) -> str | None:
+        return "broker-secret" if name_or_ref in self.configured else None
+
+
 def test_runtime_routes_report_health_and_redacted_config(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("KESTREL_TEST_API_KEY", "raw-secret-value")
     config = AgentConfig(
@@ -69,6 +80,57 @@ def test_runtime_models_route_returns_static_and_dynamic_catalogs(tmp_path) -> N
     assert "ollama-cloud" in providers
     assert "deepseek" in providers
     assert "kimi" in providers
+
+
+def test_runtime_models_route_includes_local_and_grok_provider_choices(tmp_path) -> None:
+    config = AgentConfig(memory_dir=tmp_path / "memory", state_path=tmp_path / "state.db")
+    app = FastAPI()
+    register_runtime_routes(app, active_config=config, state=_FakeState())
+    client = TestClient(app)
+
+    lm_studio_catalog = client.get("/api/runtime/models?provider=lm-studio")
+    grok_catalog = client.get("/api/runtime/models?provider=grok")
+    all_catalogs = client.get("/api/runtime/models")
+
+    assert lm_studio_catalog.status_code == 200
+    assert lm_studio_catalog.json()["fallback_models"] == ["local-model"]
+    assert lm_studio_catalog.json()["base_url_configured"] is True
+    assert lm_studio_catalog.json()["api_key_env"] is None
+    assert grok_catalog.status_code == 200
+    assert grok_catalog.json()["models"] == ["grok-4.3", "grok-build-0.1", "grok-4.20"]
+    assert grok_catalog.json()["api_key_env"] == "XAI_API_KEY"
+    assert grok_catalog.json()["base_url_configured"] is True
+    providers = {item["provider"] for item in all_catalogs.json()["providers"]}
+    assert {"lm-studio", "ollama", "ollama-cloud", "openai", "anthropic", "grok", "gemini"} <= providers
+
+
+def test_runtime_routes_use_broker_status_for_provider_key_without_leaking_value(tmp_path) -> None:
+    config = AgentConfig(
+        provider="grok",
+        model="grok-4.3",
+        base_url="https://api.x.ai/v1",
+        api_key_env="XAI_API_KEY",
+        memory_dir=tmp_path / "memory",
+        state_path=tmp_path / "state.db",
+    )
+    app = FastAPI()
+    register_runtime_routes(
+        app,
+        active_config=config,
+        state=_FakeState(),
+        secret_broker=_FakeSecretBroker({"XAI_API_KEY"}),
+    )
+    client = TestClient(app)
+
+    runtime = client.get("/api/runtime/config")
+    catalog = client.get("/api/runtime/models?provider=grok")
+
+    assert runtime.status_code == 200
+    assert runtime.json()["provider"]["api_key_configured"] is True
+    assert "broker-secret" not in runtime.text
+    assert catalog.status_code == 200
+    assert catalog.json()["api_key_configured"] is True
+    assert "broker-secret" not in catalog.text
 
 
 def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> None:
@@ -161,6 +223,58 @@ def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> 
     assert runtime_payload["settings"]["runtime"]["max_tool_rounds"] == 12
     assert runtime_payload["settings"]["runtime"]["allow_shell"] is True
     assert runtime_payload["feature_flags"]["allow_shell"] is True
+
+
+def test_runtime_settings_save_persists_provider_endpoint_and_key_env(tmp_path) -> None:
+    config = AgentConfig(
+        memory_dir=tmp_path / "memory",
+        state_path=tmp_path / "state.db",
+        log_dir=tmp_path / "logs",
+    )
+    store = RuntimeSettingsStore(tmp_path / "config" / "runtime_settings.json")
+    active_config = config
+
+    def get_config() -> AgentConfig:
+        return active_config
+
+    def update_config(next_config: AgentConfig) -> None:
+        nonlocal active_config
+        active_config = next_config
+
+    app = FastAPI()
+    register_runtime_routes(
+        app,
+        active_config=get_config,
+        state=_FakeState(),
+        settings_store=store,
+        on_config_update=update_config,
+        http_exception=HTTPException,
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+
+    saved = client.put(
+        "/api/runtime/settings",
+        json={
+            "provider": "ollama-cloud",
+            "model": "gpt-oss:120b",
+            "base_url": "https://ollama.com/api",
+            "api_key_env": "OLLAMA_API_KEY",
+        },
+    )
+
+    assert saved.status_code == 200
+    payload = saved.json()
+    assert payload["settings"]["base_url"] == "https://ollama.com/api"
+    assert payload["settings"]["api_key_env"] == "OLLAMA_API_KEY"
+    assert active_config.provider == "ollama-cloud"
+    assert active_config.model == "gpt-oss:120b"
+    assert active_config.base_url == "https://ollama.com/api"
+    assert active_config.api_key_env == "OLLAMA_API_KEY"
+
+    runtime = client.get("/api/runtime/config")
+    runtime_payload = runtime.json()
+    assert runtime_payload["provider"]["base_url_configured"] is True
+    assert runtime_payload["provider"]["api_key_env"] == "OLLAMA_API_KEY"
 
 
 def test_runtime_settings_rejects_launch_controlled_api_auth_toggle(tmp_path) -> None:

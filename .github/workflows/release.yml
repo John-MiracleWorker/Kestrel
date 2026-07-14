@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-release:
+    runs-on: ubuntu-latest
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify tag matches package version
+        run: |
+          VERSION="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$GITHUB_REF_NAME" = "v$VERSION"
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+      - name: Validate Python package
+        run: |
+          python -m compileall -q src tests scripts
+          ruff check scripts src tests
+          mypy src
+          pytest -q
+          python scripts/run_golden_evals.py --backend memory --provider mock
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Validate and build web workbench
+        working-directory: web
+        run: |
+          npm ci
+          npm test
+          npm run build
+      - name: Stage web workbench in Python package
+        run: |
+          rm -rf src/nested_memvid_agent/web_dist
+          mkdir -p src/nested_memvid_agent/web_dist
+          cp -R web/dist/. src/nested_memvid_agent/web_dist/
+
+      - name: Build Python release artifacts
+        run: python -m build --outdir dist
+      - name: Stage version-pinned installer
+        run: |
+          cp install.sh dist/install.sh
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path("dist/install.sh")
+          text = path.read_text(encoding="utf-8")
+          marker = 'KESTREL_REF="${KESTREL_REF:-main}"'
+          pinned = 'KESTREL_REF="${KESTREL_REF:-' + os.environ["GITHUB_REF_NAME"] + '}"'
+          if marker not in text:
+              raise SystemExit("installer ref marker not found")
+          path.write_text(text.replace(marker, pinned, 1), encoding="utf-8")
+          PY
+      - name: Smoke-test built wheel
+        run: |
+          python -m venv /tmp/kestrel-release-smoke
+          wheels=(dist/*.whl)
+          /tmp/kestrel-release-smoke/bin/python -m pip install "${wheels[0]}[server]"
+          /tmp/kestrel-release-smoke/bin/nest-agent doctor --backend memory --memory-dir /tmp/kestrel-release-memory --provider mock --model mock
+          /tmp/kestrel-release-smoke/bin/nest-agent chat --backend memory --memory-dir /tmp/kestrel-release-chat --provider mock --model mock --message "release wheel smoke"
+          (
+            cd /tmp
+            /tmp/kestrel-release-smoke/bin/nest-agent server \
+              --backend memory \
+              --memory-dir /tmp/kestrel-release-server/memory \
+              --state-path /tmp/kestrel-release-server/state/agent.sqlite3 \
+              --log-dir /tmp/kestrel-release-server/logs \
+              --secret-store-path /tmp/kestrel-release-server/secrets/store.json \
+              --provider mock \
+              --model mock \
+              --host 127.0.0.1 \
+              --port 8878
+          ) >/tmp/kestrel-release-server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:8878/ >/tmp/kestrel-release-index.html; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8878/ | grep -q '<div id="root"></div>'
+          kill "$server_pid"
+          trap - EXIT
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --verify-tag
+          --generate-notes
+          --title "Kestrel $GITHUB_REF_NAME"

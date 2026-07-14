@@ -7,6 +7,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_package_metadata_identifies_kestrel_release() -> None:
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    project = pyproject["project"]
+
+    assert project["version"] == "0.2.0"
+    assert project["description"].startswith("Kestrel:")
+    assert project["urls"]["Repository"] == "https://github.com/John-MiracleWorker/Kestrel"
+    assert project["urls"]["Issues"] == "https://github.com/John-MiracleWorker/Kestrel/issues"
+
+
 def test_package_includes_runtime_prompt_data() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
@@ -14,7 +24,10 @@ def test_package_includes_runtime_prompt_data() -> None:
     dev_deps = pyproject["project"]["optional-dependencies"]["dev"]
 
     assert "prompts/*.md" in package_data["nested_memvid_agent"]
+    assert "web_dist/index.html" in package_data["nested_memvid_agent"]
+    assert "web_dist/assets/*" in package_data["nested_memvid_agent"]
     assert any(str(dep).startswith("bandit>=") for dep in dev_deps)
+    assert any(str(dep).startswith("build>=") for dep in dev_deps)
 
 
 def test_dockerfile_keeps_safe_runtime_defaults() -> None:
@@ -36,6 +49,7 @@ def test_dockerfile_keeps_safe_runtime_defaults() -> None:
     assert "NEST_AGENT_ALLOW_MCP_NETWORK_ENDPOINTS=false" in dockerfile
     assert "NEST_AGENT_REQUIRE_API_AUTH=true" in dockerfile
     assert "NEST_AGENT_API_TOKEN" in dockerfile
+    assert "ARG INSTALL_EXTRAS=server,mcp,memvid,openai,anthropic,gemini" in dockerfile
     assert "--backend\", \"memvid\"" in dockerfile
     assert "\"--require-api-auth\"" in dockerfile
 
@@ -44,6 +58,7 @@ def test_compose_binds_localhost_and_persists_data_volume() -> None:
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 
     assert "127.0.0.1:8765:8765" in compose
+    assert "INSTALL_EXTRAS: server,mcp,memvid,openai,anthropic,gemini" in compose
     assert "kestrel-data:/data" in compose
     assert "NEST_AGENT_BACKEND: memvid" in compose
     assert 'NEST_AGENT_ALLOW_SHELL: "false"' in compose
@@ -75,13 +90,43 @@ def test_deployment_docs_cover_release_and_memory_operations() -> None:
     checklist = (ROOT / "docs" / "RELEASE_CHECKLIST.md").read_text(encoding="utf-8")
 
     assert "curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | bash" in deployment
+    assert "KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash" in deployment
+    assert "does not start the server" in deployment
     assert "KESTREL_DRY_RUN=1 bash install.sh" in checklist
-    assert "python -m pip install -e '.[memvid,openai,server,mcp,dev]'" in deployment
+    assert "python -m pip install -e '.[memvid,openai,anthropic,gemini,server,mcp,dev]'" in deployment
     assert "docker run --rm kestrel-agent:local" in deployment
     assert "OpenAI-compatible local servers" in deployment
+    assert "`Authorization: Bearer REDACTED` on API requests." in deployment
     assert "Never call `create(path)` on an existing `.mv2` file." in memory_ops
     assert "NEST_AGENT_ALLOW_SHELL=false" in security
     assert "RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid" in checklist
+
+
+def test_one_shot_docs_match_safe_opt_in_server_defaults() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+
+    for document in (readme, deployment):
+        assert "does not start the server or open a browser unless explicitly enabled" in document
+        assert "KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash install.sh" in document
+
+
+def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    assert 'tags: ["v*"]' in workflow
+    assert "npm run build" in workflow
+    assert "Stage web workbench in Python package" in workflow
+    assert "src/nested_memvid_agent/web_dist" in workflow
+    assert "python -m build" in workflow
+    assert "release wheel smoke" in workflow
+    assert "curl -fsS http://127.0.0.1:8878/" in workflow
+    assert "Verify tag matches package version" in workflow
+    assert 'test "$GITHUB_REF_NAME" = "v$VERSION"' in workflow
+    assert "Stage version-pinned installer" in workflow
+    assert 'os.environ["GITHUB_REF_NAME"]' in workflow
+    assert "gh release create \"$GITHUB_REF_NAME\" dist/*" in workflow
+    assert "gh release create" in workflow
 
 
 def test_ci_runs_isolated_python_tests_and_web_build() -> None:

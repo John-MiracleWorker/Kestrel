@@ -1665,6 +1665,11 @@ textarea.input {
   background: var(--paper);
 }
 
+.model-picker .btn {
+  min-height: 38px;
+  white-space: nowrap;
+}
+
 .model-picker input {
   width: 100%;
 }
@@ -2137,6 +2142,150 @@ textarea.input {
   font-size: 15.5px;
   line-height: 1.65;
   color: var(--ink-soft);
+}
+
+.msg.kestrel > .markdown-message {
+  font-size: 15.5px;
+  line-height: 1.65;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.markdown-message > :first-child,
+.markdown-message li > :first-child {
+  margin-top: 0;
+}
+
+.markdown-message > :last-child,
+.markdown-message li > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-message p {
+  margin: 0 0 12px;
+}
+
+.markdown-message h1,
+.markdown-message h2,
+.markdown-message h3,
+.markdown-message h4 {
+  margin: 20px 0 8px;
+  color: var(--ink);
+  font-family: var(--serif);
+  font-weight: 600;
+  line-height: 1.22;
+  letter-spacing: 0;
+}
+
+.markdown-message h1 { font-size: 22px; }
+.markdown-message h2 { font-size: 19px; }
+.markdown-message h3 { font-size: 17px; }
+.markdown-message h4 { font-size: 15.5px; }
+
+.markdown-message strong {
+  color: var(--ink);
+  font-weight: 650;
+}
+
+.markdown-message em {
+  color: var(--ink);
+}
+
+.markdown-message ul,
+.markdown-message ol {
+  margin: 6px 0 14px;
+  padding-left: 24px;
+}
+
+.markdown-message ul {
+  list-style: disc;
+}
+
+.markdown-message ol {
+  list-style: decimal;
+}
+
+.markdown-message li {
+  padding-left: 4px;
+  margin: 4px 0;
+}
+
+.markdown-message li::marker {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.markdown-message code {
+  font-family: var(--mono);
+  font-size: 0.88em;
+  background: rgba(21,23,26,0.06);
+  color: var(--ink);
+  padding: 2px 5px;
+  border-radius: 4px;
+}
+
+.markdown-message pre {
+  margin: 12px 0 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: #f7f7f4;
+  overflow-x: auto;
+}
+
+.markdown-message pre code {
+  display: block;
+  padding: 0;
+  background: transparent;
+  border-radius: 0;
+  white-space: pre;
+}
+
+.markdown-message blockquote {
+  margin: 12px 0 16px;
+  padding: 2px 0 2px 14px;
+  border-left: 3px solid var(--rule-strong);
+  color: var(--muted);
+}
+
+.markdown-message a {
+  color: var(--accent-ink);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.markdown-message hr {
+  border: 0;
+  border-top: 1px solid var(--rule);
+  margin: 18px 0;
+}
+
+.markdown-message table {
+  display: block;
+  max-width: 100%;
+  margin: 12px 0 16px;
+  border-collapse: collapse;
+  overflow-x: auto;
+  font-size: 14px;
+}
+
+.markdown-message th,
+.markdown-message td {
+  border: 1px solid var(--rule);
+  padding: 7px 9px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown-message th {
+  color: var(--ink);
+  background: rgba(21,23,26,0.04);
+  font-weight: 650;
+}
+
+.markdown-message input[type="checkbox"] {
+  margin-right: 7px;
+  transform: translateY(1px);
 }
 
 .composer {
@@ -3151,6 +3300,193 @@ body {
 .badge.good { border-color: rgba(126, 231, 135, 0.35); }
 .badge.warn { color: var(--warn); border-color: rgba(255, 209, 102, 0.35); }
 .badge.danger { border-color: rgba(255, 180, 171, 0.35); }
+
+/* ---------- simple chat mode ---------- */
+body:has(.chat-shell[data-active-section="chat"]) {
+  background: #f7f8f5;
+  color: #1f2726;
+}
+
+body:has(.chat-shell[data-active-section="chat"]) .topbar {
+  background: rgba(247, 248, 245, 0.94);
+  border-bottom-color: #dce4de;
+  box-shadow: 0 1px 0 rgba(41, 57, 53, 0.04);
+}
+
+body:has(.chat-shell[data-active-section="chat"]) .brand-name,
+body:has(.chat-shell[data-active-section="chat"]) .primary-nav button.active {
+  color: #1f2726;
+}
+
+body:has(.chat-shell[data-active-section="chat"]) .brand-tag,
+body:has(.chat-shell[data-active-section="chat"]) .primary-nav button,
+body:has(.chat-shell[data-active-section="chat"]) .topbar-meta {
+  color: #66736f;
+}
+
+body:has(.chat-shell[data-active-section="chat"]) .setup-button,
+body:has(.chat-shell[data-active-section="chat"]) .status-pill {
+  background: #ffffff;
+  color: #25322f;
+  border-color: #d5ded8;
+}
+
+body:has(.chat-shell[data-active-section="chat"]) .status-dot {
+  background: #2f8a70;
+  box-shadow: 0 0 0 3px rgba(47, 138, 112, 0.14);
+}
+
+.chat-shell[data-active-section="chat"] {
+  background: #f7f8f5;
+}
+
+.chat-shell[data-active-section="chat"] .rail,
+.chat-shell[data-active-section="chat"] .inspector {
+  background: #edf2ee;
+  border-color: #d5ded8;
+  color: #1f2726;
+  box-shadow: none;
+}
+
+.chat-shell[data-active-section="chat"] .rail-head h2,
+.chat-shell[data-active-section="chat"] .inspector h2,
+.chat-shell[data-active-section="chat"] .thread-button strong,
+.chat-shell[data-active-section="chat"] .conv-head h1,
+.chat-shell[data-active-section="chat"] .msg.user > p,
+.chat-shell[data-active-section="chat"] .msg.kestrel > p,
+.chat-shell[data-active-section="chat"] .msg.kestrel > .markdown-message,
+.chat-shell[data-active-section="chat"] .markdown-message h1,
+.chat-shell[data-active-section="chat"] .markdown-message h2,
+.chat-shell[data-active-section="chat"] .markdown-message h3,
+.chat-shell[data-active-section="chat"] .markdown-message h4,
+.chat-shell[data-active-section="chat"] .markdown-message strong,
+.chat-shell[data-active-section="chat"] .markdown-message em,
+.chat-shell[data-active-section="chat"] .act-row .text strong {
+  color: #1f2726;
+}
+
+.chat-shell[data-active-section="chat"] .rail-head h2 small,
+.chat-shell[data-active-section="chat"] .thread-button small,
+.chat-shell[data-active-section="chat"] .conv-meta,
+.chat-shell[data-active-section="chat"] .msg > strong,
+.chat-shell[data-active-section="chat"] .act-row .text,
+.chat-shell[data-active-section="chat"] .markdown-message li::marker,
+.chat-shell[data-active-section="chat"] .markdown-message blockquote,
+.chat-shell[data-active-section="chat"] .typing {
+  color: #66736f;
+}
+
+.chat-shell[data-active-section="chat"] .markdown-message code {
+  background: rgba(31, 39, 38, 0.07);
+  color: #1f2726;
+}
+
+.chat-shell[data-active-section="chat"] .markdown-message pre {
+  background: #eef3ef;
+  border-color: #d5ded8;
+}
+
+.chat-shell[data-active-section="chat"] .markdown-message th,
+.chat-shell[data-active-section="chat"] .markdown-message td {
+  border-color: #d5ded8;
+}
+
+.chat-shell[data-active-section="chat"] .markdown-message th {
+  color: #1f2726;
+  background: rgba(47, 138, 112, 0.08);
+}
+
+.chat-shell[data-active-section="chat"] .rail-search input,
+.chat-shell[data-active-section="chat"] .composer textarea,
+.chat-shell[data-active-section="chat"] .mode-select select {
+  background: #ffffff;
+  color: #1f2726;
+  border-color: #d5ded8;
+}
+
+.chat-shell[data-active-section="chat"] .rail-search input:focus,
+.chat-shell[data-active-section="chat"] .composer textarea:focus,
+.chat-shell[data-active-section="chat"] .mode-select select:focus {
+  border-color: #2f8a70;
+  background: #ffffff;
+  box-shadow: 0 0 0 3px rgba(47, 138, 112, 0.14);
+}
+
+.chat-shell[data-active-section="chat"] .thread-button:hover {
+  background: rgba(47, 138, 112, 0.08);
+}
+
+.chat-shell[data-active-section="chat"] .thread-button.active,
+.chat-shell[data-active-section="chat"] .new-chat,
+.chat-shell[data-active-section="chat"] .conv-head,
+.chat-shell[data-active-section="chat"] .composer,
+.chat-shell[data-active-section="chat"] .activity,
+.chat-shell[data-active-section="chat"] .approval-card,
+.chat-shell[data-active-section="chat"] .trace-row,
+.chat-shell[data-active-section="chat"] .task-card {
+  background: #ffffff;
+  border-color: #d5ded8;
+  box-shadow: 0 14px 36px rgba(41, 57, 53, 0.08);
+}
+
+.chat-shell[data-active-section="chat"] .conversation {
+  background: #f7f8f5;
+  color: #1f2726;
+}
+
+.chat-shell[data-active-section="chat"] .simple-conv-head {
+  border-bottom-color: #dce4de;
+  padding-block: 20px 16px;
+}
+
+.chat-shell[data-active-section="chat"] .simple-conv-head h1 {
+  font-size: 25px;
+  letter-spacing: 0;
+}
+
+.chat-shell[data-active-section="chat"] .simple-meta {
+  gap: 6px 10px;
+}
+
+.chat-shell[data-active-section="chat"] .simple-conv-tools button,
+.chat-shell[data-active-section="chat"] .conv-tools button {
+  background: #ffffff;
+  color: #25322f;
+  border-color: #d5ded8;
+}
+
+.chat-shell[data-active-section="chat"] .simple-conv-tools button:hover,
+.chat-shell[data-active-section="chat"] .conv-tools button:hover {
+  color: #1f5f4e;
+  border-color: #2f8a70;
+}
+
+.chat-shell[data-active-section="chat"] .composer button[type="submit"] {
+  background: #2f8a70;
+  border-color: #2f8a70;
+  color: #ffffff;
+}
+
+.chat-shell[data-active-section="chat"] .badge {
+  background: #ffffff;
+}
+
+.chat-shell[data-active-section="chat"] .badge.good,
+.chat-shell[data-active-section="chat"] .badge.neutral {
+  color: #1f5f4e;
+  border-color: rgba(47, 138, 112, 0.32);
+}
+
+.chat-shell[data-active-section="chat"] .json-block {
+  background: #f2f6f3;
+  color: #25322f;
+  border-color: #d5ded8;
+}
+
+.advanced-overview {
+  padding: 0 0 28px;
+  margin: -28px 0 24px;
+}
 
 @media (max-width: 1180px) {
   .stitch-command-deck {

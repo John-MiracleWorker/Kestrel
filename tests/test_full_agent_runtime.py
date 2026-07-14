@@ -1950,6 +1950,78 @@ def test_autonomous_scheduler_completes_low_risk_run_without_manual_steps(tmp_pa
     assert graph["approval_blocked_tasks"] == []
 
 
+def test_autonomous_build_request_blocks_for_artifact_approval(tmp_path: Path) -> None:
+    manager = _manager(
+        tmp_path,
+        max_scheduler_tasks=2,
+        max_scheduler_cycles=5,
+    )
+    run = manager.create_run(
+        message="Build a tiny random web page",
+        session_id="session",
+        autonomy_mode="autonomous",
+    )
+    final = _wait_for_status(manager, run.run_id, {"completed", "failed", "blocked"})
+
+    assert final["status"] == "blocked"
+    assert final["stop_reason"] == "task_approval_required"
+    graph = manager.task_graph(run.run_id)
+    blocked_titles = [task["title"] for task in graph["approval_blocked_tasks"]]
+    assert blocked_titles == ["Create artifact"]
+
+
+def test_per_run_autonomous_task_approval_resumes_when_global_scheduler_is_disabled(tmp_path: Path) -> None:
+    manager = _manager(
+        tmp_path,
+        enable_autonomous_scheduler=False,
+        max_scheduler_tasks=4,
+        max_scheduler_cycles=8,
+    )
+    run = manager.create_run(
+        message="Build a tiny random web page",
+        session_id="session",
+        autonomy_mode="autonomous",
+    )
+    _wait_for_status(manager, run.run_id, {"completed", "failed", "blocked"})
+    blocked_task = manager.task_graph(run.run_id)["approval_blocked_tasks"][0]
+
+    approved = manager.approve_task(run.run_id, blocked_task["task_id"])
+
+    assert approved["scheduler"]["stop_reason"] == "idle"
+    assert manager.get_run(run.run_id)["status"] == "completed"
+    assert manager.task_graph(run.run_id)["approval_blocked_tasks"] == []
+
+
+def test_autonomous_continue_build_request_uses_recent_session_context(tmp_path: Path) -> None:
+    manager = _manager(
+        tmp_path,
+        max_scheduler_tasks=2,
+        max_scheduler_cycles=5,
+    )
+    manager.state.create_run(
+        run_id="run_prior_build_request",
+        message="Build a tiny random web page",
+        session_id="session",
+        workspace=str(tmp_path),
+        model="mock",
+    )
+
+    run = manager.create_run(
+        message="just go for it",
+        session_id="session",
+        autonomy_mode="autonomous",
+    )
+    final = _wait_for_status(manager, run.run_id, {"completed", "failed", "blocked"})
+
+    assert final["status"] == "blocked"
+    assert final["stop_reason"] == "task_approval_required"
+    graph = manager.task_graph(run.run_id)
+    child_titles = [task["title"] for task in graph["tasks"][1:]]
+    assert child_titles[:2] == ["Inspect build context", "Create artifact"]
+    blocked_titles = [task["title"] for task in graph["approval_blocked_tasks"]]
+    assert blocked_titles == ["Create artifact"]
+
+
 def test_autonomous_scheduler_blocks_for_task_approval_and_resumes(tmp_path: Path) -> None:
     manager = _manager(
         tmp_path,

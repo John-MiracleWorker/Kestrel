@@ -13,7 +13,7 @@ install:
 	$(PIP) install -e '.[dev]'
 
 install-dev:
-	$(PIP) install -e '.[memvid,openai,server,mcp,dev]'
+	$(PIP) install -e '.[memvid,openai,anthropic,gemini,server,mcp,dev]'
 
 install-memvid:
 	$(PIP) install -e '.[dev,memvid]'

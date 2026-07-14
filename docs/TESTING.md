@@ -10,7 +10,7 @@ Kestrel's fast test path is deterministic: it uses `InMemoryBackend` plus the mo
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e '.[memvid,openai,server,mcp,dev]'
+python -m pip install -e '.[memvid,openai,anthropic,gemini,server,mcp,dev]'
 npm install --prefix web
 ```
 
@@ -42,7 +42,7 @@ CI runs the web app in its own Node 22 job with `npm ci`, `npm test`, and `npm r
 
 ## Installer Validation
 
-Fast installer tests cover shell syntax, help text, dry-run defaults, Python 3.11+ detection, safe Memvid/mock commands, default detached server/web UI launch planning, opt-out server launch behavior, and refusal to overwrite non-git nonempty directories:
+Fast installer tests cover shell syntax, help text, dry-run defaults, Python 3.11+ detection, safe Memvid/mock commands, opt-in detached server/web UI launch planning, disabled-by-default server behavior, and refusal to overwrite non-git nonempty directories:
 
 ```bash
 python -m pytest -q tests/test_install_script.py

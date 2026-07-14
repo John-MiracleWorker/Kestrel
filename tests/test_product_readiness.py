@@ -132,6 +132,50 @@ def test_setup_readiness_flags_missing_workspace_and_provider_secret(tmp_path: P
     assert "MISSING_KES_TEST_TOKEN" in checks["provider_configuration"].detail
 
 
+def test_setup_readiness_accepts_broker_resolved_provider_secret(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+
+    report = build_setup_readiness_report(
+        AgentConfig(
+            provider="ollama-cloud",
+            model="gpt-oss:120b",
+            api_key_env="OLLAMA_API_KEY",
+            workspace=tmp_path,
+            memory_dir=memory_dir,
+            state_path=state_dir / "agent.db",
+            log_dir=logs_dir,
+        ),
+        secret_resolver=lambda name: "raw-broker-secret" if name == "OLLAMA_API_KEY" else None,
+    )
+
+    checks = {check.check_id: check for check in report.checks}
+    assert checks["provider_configuration"].status == SetupReadinessStatus.PASS
+    assert "OLLAMA_API_KEY" in checks["provider_configuration"].detail
+    assert "raw-broker-secret" not in checks["provider_configuration"].detail
+
+
+def test_setup_readiness_requires_openrouter_secret_even_with_default_base_url(tmp_path: Path) -> None:
+    report = build_setup_readiness_report(
+        AgentConfig(
+            provider="openrouter",
+            model="openai/gpt-5.5",
+            base_url="https://openrouter.ai/api/v1",
+            api_key_env="MISSING_OPENROUTER_TEST_KEY",
+            workspace=tmp_path,
+            memory_dir=tmp_path / "memory",
+        )
+    )
+
+    checks = {check.check_id: check for check in report.checks}
+    assert checks["provider_configuration"].status == SetupReadinessStatus.FAIL
+    assert "MISSING_OPENROUTER_TEST_KEY" in checks["provider_configuration"].detail
+
+
 def test_product_setup_route_uses_active_config(tmp_path: Path) -> None:
     app = FastAPI()
     config = AgentConfig(provider="mock", workspace=tmp_path, memory_dir=tmp_path / "memory")
