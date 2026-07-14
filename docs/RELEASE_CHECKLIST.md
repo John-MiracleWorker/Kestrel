@@ -32,7 +32,7 @@ python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss
 ## Packaging Validation
 
 ```bash
-python -m pip install -e '.[memvid,openai,server,mcp,dev]'
+python -m pip install -e '.[memvid,openai,anthropic,gemini,server,mcp,dev]'
 nest-agent doctor --backend memory --provider mock
 nest-agent chat --backend memory --provider mock --message "packaging smoke"
 bash -n install.sh

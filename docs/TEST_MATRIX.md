@@ -117,7 +117,7 @@ The web package uses Vite, React, and TypeScript. The test command currently per
 ## Packaging Validation
 
 ```bash
-python -m pip install -e '.[memvid,openai,server,mcp,dev]'
+python -m pip install -e '.[memvid,openai,anthropic,gemini,server,mcp,dev]'
 nest-agent doctor --backend memory --provider mock
 nest-agent chat --backend memory --provider mock --message "packaging smoke"
 docker build -t kestrel-agent:local .

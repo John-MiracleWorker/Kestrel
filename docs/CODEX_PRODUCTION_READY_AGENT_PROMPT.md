@@ -1110,7 +1110,7 @@ RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid
 And these user flows work:
 
 ```bash
-pip install -e '.[memvid,openai,server,mcp,dev]'
+pip install -e '.[memvid,openai,anthropic,gemini,server,mcp,dev]'
 
 nest-agent init --backend memvid --memory-dir .nest/memory
 

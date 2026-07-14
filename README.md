@@ -163,7 +163,7 @@ Manual development install:
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e '.[memvid,openai,server,mcp,dev]'
+python -m pip install -e '.[memvid,openai,anthropic,gemini,server,mcp,dev]'
 npm install --prefix web
 npm run build --prefix web
 ```

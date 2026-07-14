@@ -3,7 +3,7 @@ services:
     build:
       context: .
       args:
-        INSTALL_EXTRAS: server,mcp,memvid,openai
+        INSTALL_EXTRAS: server,mcp,memvid,openai,anthropic,gemini
     image: kestrel-agent:local
     ports:
       - "127.0.0.1:8765:8765"

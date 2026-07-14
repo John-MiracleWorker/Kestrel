@@ -175,8 +175,8 @@ def test_install_defaults_exclude_development_dependencies() -> None:
     result = _run_install(args=["--help"])
 
     assert result.returncode == 0
-    assert "Defaults to memvid,openai,server,mcp." in result.stdout
-    assert "memvid,openai,server,mcp,dev" not in result.stdout
+    assert "Defaults to memvid,openai,anthropic,gemini,server,mcp." in result.stdout
+    assert "memvid,openai,anthropic,gemini,server,mcp,dev" not in result.stdout
 
 
 def test_install_dry_run_uses_memvid_mock_defaults(tmp_path: Path) -> None:
@@ -190,7 +190,7 @@ def test_install_dry_run_uses_memvid_mock_defaults(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "DRY RUN" in result.stdout
     assert "https://github.com/John-MiracleWorker/Kestrel.git" in result.stdout
-    assert ".[memvid,openai,server,mcp]" in result.stdout
+    assert ".[memvid,openai,anthropic,gemini,server,mcp]" in result.stdout
     assert "nest-agent init --backend memvid --memory-dir .nest/memory" in result.stdout
     assert "nest-agent memory verify --backend memvid --memory-dir .nest/memory" in result.stdout
     assert 'nest-agent chat --backend memory --memory-dir .nest/install-smoke-memory --provider mock --model mock --message "hello from one-shot install"' in result.stdout

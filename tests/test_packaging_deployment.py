@@ -49,6 +49,7 @@ def test_dockerfile_keeps_safe_runtime_defaults() -> None:
     assert "NEST_AGENT_ALLOW_MCP_NETWORK_ENDPOINTS=false" in dockerfile
     assert "NEST_AGENT_REQUIRE_API_AUTH=true" in dockerfile
     assert "NEST_AGENT_API_TOKEN" in dockerfile
+    assert "ARG INSTALL_EXTRAS=server,mcp,memvid,openai,anthropic,gemini" in dockerfile
     assert "--backend\", \"memvid\"" in dockerfile
     assert "\"--require-api-auth\"" in dockerfile
 
@@ -57,6 +58,7 @@ def test_compose_binds_localhost_and_persists_data_volume() -> None:
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 
     assert "127.0.0.1:8765:8765" in compose
+    assert "INSTALL_EXTRAS: server,mcp,memvid,openai,anthropic,gemini" in compose
     assert "kestrel-data:/data" in compose
     assert "NEST_AGENT_BACKEND: memvid" in compose
     assert 'NEST_AGENT_ALLOW_SHELL: "false"' in compose
@@ -91,7 +93,7 @@ def test_deployment_docs_cover_release_and_memory_operations() -> None:
     assert "KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash" in deployment
     assert "does not start the server" in deployment
     assert "KESTREL_DRY_RUN=1 bash install.sh" in checklist
-    assert "python -m pip install -e '.[memvid,openai,server,mcp,dev]'" in deployment
+    assert "python -m pip install -e '.[memvid,openai,anthropic,gemini,server,mcp,dev]'" in deployment
     assert "docker run --rm kestrel-agent:local" in deployment
     assert "OpenAI-compatible local servers" in deployment
     assert "`Authorization: Bearer REDACTED` on API requests." in deployment
