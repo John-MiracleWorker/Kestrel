@@ -6,6 +6,7 @@ import platform
 import sqlite3
 import subprocess
 import zipfile
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -223,7 +224,7 @@ def _state_summary(path: Path) -> dict[str, Any]:
             "tables": {name: 0 for name in _STATE_TABLES},
         }
     try:
-        with sqlite3.connect(resolved.resolve().as_uri() + "?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(resolved.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
             conn.row_factory = sqlite3.Row
             schema_version = _schema_version(conn)
             tables = {name: _table_count(conn, name) for name in _STATE_TABLES}

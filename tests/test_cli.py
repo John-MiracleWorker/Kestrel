@@ -751,7 +751,7 @@ def test_doctor_default_memory_dir_is_nest_memory(
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["memory"]["backend"] == "memory"
-    assert payload["memory"]["path"] == ".nest/memory"
+    assert Path(payload["memory"]["path"]) == Path(".nest") / "memory"
 
 
 def test_run_subcommand_reports_structured_turn(tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object) -> None:

@@ -24,6 +24,31 @@ def test_concurrent_fresh_database_initialization_is_serialized(tmp_path: Path) 
     assert all(store.health_snapshot()["ok"] is True for store in stores)
 
 
+def test_initialization_closes_every_sqlite_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.db"
+    real_connect = sqlite3.connect
+    connections: list[sqlite3.Connection] = []
+
+    def tracking_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = real_connect(*args, **kwargs)  # type: ignore[arg-type]
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.state_store.sqlite3.connect",
+        tracking_connect,
+    )
+
+    AgentStateStore(path)
+
+    assert len(connections) >= 2
+    for connection in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connection.execute("SELECT 1")
+
+
 def test_state_store_rejects_unsupported_future_schema(tmp_path: Path) -> None:
     path = tmp_path / "state.db"
     with sqlite3.connect(path) as conn:

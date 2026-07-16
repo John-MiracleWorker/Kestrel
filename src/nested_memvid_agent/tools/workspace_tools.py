@@ -107,7 +107,12 @@ class FindFilesTool(AgentTool):
                     continue
                 if kind == "dir" and not path.is_dir():
                     continue
-                rows.append({"path": str(path.relative_to(workspace)), "type": "dir" if path.is_dir() else "file"})
+                rows.append(
+                    {
+                        "path": path.relative_to(workspace).as_posix(),
+                        "type": "dir" if path.is_dir() else "file",
+                    }
+                )
             return self._result(call, success=True, content=json.dumps(rows, indent=2), data={"matches": rows})
         except Exception as exc:  # noqa: BLE001
             return self._result(call, success=False, content=str(exc), error="file_find_failed")
@@ -141,7 +146,7 @@ class FileStatTool(AgentTool):
             if not path.exists():
                 return self._result(call, success=False, content=f"Path not found: {arguments.get('path', '')}", error="not_found")
             stat = path.stat()
-            rel = str(path.relative_to(context.workspace.resolve()))
+            rel = path.relative_to(context.workspace.resolve()).as_posix()
             payload: dict[str, Any] = {
                 "path": rel,
                 "type": "dir" if path.is_dir() else "file",
@@ -220,7 +225,7 @@ class RepoSearchTool(AgentTool):
                         continue
                     for lineno, line in enumerate(text.splitlines(), start=1):
                         if query_lower in line.lower():
-                            rows.append({"path": str(rel), "line": lineno, "text": line[:400]})
+                            rows.append({"path": rel.as_posix(), "line": lineno, "text": line[:400]})
                             if len(rows) >= max_results:
                                 return self._result(
                                     call,
@@ -268,7 +273,12 @@ class RepoMapTool(AgentTool):
                     dirs[:] = []
                     continue
                 for dirname in dirs:
-                    rows.append({"path": str((current / dirname).relative_to(workspace)), "type": "dir"})
+                    rows.append(
+                        {
+                            "path": (current / dirname).relative_to(workspace).as_posix(),
+                            "type": "dir",
+                        }
+                    )
                     if len(rows) >= max_entries:
                         return self._result(call, success=True, content=json.dumps(rows, indent=2), data={"entries": rows})
                 for filename in sorted(files):
@@ -278,7 +288,13 @@ class RepoMapTool(AgentTool):
                     item_stat = item.lstat()
                     if not stat.S_ISREG(item_stat.st_mode):
                         continue
-                    rows.append({"path": str(item.relative_to(workspace)), "type": "file", "bytes": item_stat.st_size})
+                    rows.append(
+                        {
+                            "path": item.relative_to(workspace).as_posix(),
+                            "type": "file",
+                            "bytes": item_stat.st_size,
+                        }
+                    )
                     if len(rows) >= max_entries:
                         return self._result(call, success=True, content=json.dumps(rows, indent=2), data={"entries": rows})
             return self._result(call, success=True, content=json.dumps(rows, indent=2), data={"entries": rows})

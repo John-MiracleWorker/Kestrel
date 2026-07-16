@@ -14,6 +14,7 @@ from .event_log import redact_secrets
 from .layers import DEFAULT_LAYER_SPECS
 from .llm.factory import provider_health_id
 from .llm.resilience import global_provider_health_registry
+from .process_liveness import process_is_alive
 
 _PROCESS_STARTED = monotonic()
 _MEMORY_HEALTH_LOCK = Lock()
@@ -309,12 +310,8 @@ def _run_has_fresh_lease(run: Any) -> bool:
         return False
     parts = str(owner).split("_", 2)
     if len(parts) == 3 and parts[0] == "manager" and parts[1].isdigit():
-        try:
-            os.kill(int(parts[1]), 0)
-        except ProcessLookupError:
+        if process_is_alive(int(parts[1])) is not True:
             return False
-        except PermissionError:
-            pass
     try:
         expiry = datetime.fromisoformat(str(expires).replace("Z", "+00:00"))
     except ValueError:

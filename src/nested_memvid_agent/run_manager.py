@@ -27,6 +27,7 @@ from .mcp_manager import MCPManager
 from .models import MemoryLayer
 from .nested_learning import NestedLearningKernel
 from .plugin_manager import PluginManager
+from .process_liveness import process_is_alive
 from .retention import RetentionCompactor
 from .runtime_models import AgentTurnResult, LLMStreamEvent, ToolCall, ToolExecution, ToolSpec
 from .runtime_settings import RuntimeSettings, apply_runtime_settings, runtime_settings_snapshot
@@ -2659,13 +2660,7 @@ def _lease_owner_is_alive(owner: str | None) -> bool | None:
     match = re.fullmatch(r"manager_(\d+)_[A-Za-z0-9]+", owner or "")
     if match is None:
         return None
-    try:
-        os.kill(int(match.group(1)), 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    return process_is_alive(int(match.group(1)))
 
 
 def _worker_is_live(owner: str, heartbeat_at: str, *, ttl_seconds: float) -> bool:

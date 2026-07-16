@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -49,7 +50,12 @@ def test_codex_cli_provider_reads_output_last_message(tmp_path: Path, monkeypatc
     assert command[-1] == "-"
     kwargs = captured["kwargs"]
     assert isinstance(kwargs, dict)
-    assert kwargs["start_new_session"] is True
+    if os.name == "nt":
+        assert kwargs["creationflags"] == subprocess.CREATE_NEW_PROCESS_GROUP
+        assert "start_new_session" not in kwargs
+    else:
+        assert kwargs["start_new_session"] is True
+        assert "creationflags" not in kwargs
     assert captured["timeout"] == 123
     assert "Kestrel Tool Registry" in str(captured["input"])
 

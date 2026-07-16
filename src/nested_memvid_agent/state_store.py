@@ -1946,9 +1946,13 @@ class AgentStateStore:
     def _enable_wal_mode(self) -> None:
         for attempt in range(10):
             try:
-                with sqlite3.connect(self.path, timeout=5.0) as conn:
-                    conn.execute("PRAGMA busy_timeout=5000")
-                    mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                conn = sqlite3.connect(self.path, timeout=5.0)
+                try:
+                    with conn:
+                        conn.execute("PRAGMA busy_timeout=5000")
+                        mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                finally:
+                    conn.close()
                 if mode is not None and str(mode[0]).lower() == "wal":
                     return
             except sqlite3.OperationalError as exc:
