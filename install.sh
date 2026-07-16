@@ -223,7 +223,7 @@ install_web_deps() {
 verify_installed_runtime() {
   run .venv/bin/nest-agent --help
   run .venv/bin/python -c 'import importlib.util, nested_memvid_agent; required=("fastapi","mcp","memvid_sdk","uvicorn"); missing=[name for name in required if importlib.util.find_spec(name) is None]; assert not missing, f"missing runtime modules: {missing}"; assert nested_memvid_agent.__file__'
-  if ! is_true "${KESTREL_SKIP_WEB:-}"; then
+  if ! is_true "${KESTREL_SKIP_WEB:-}" && ! is_true "${KESTREL_DRY_RUN:-}"; then
     [[ -s web/dist/index.html ]] || die "Web workbench build is missing web/dist/index.html"
   fi
 }

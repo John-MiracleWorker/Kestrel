@@ -34,12 +34,18 @@ def _clean_kestrel_env() -> dict[str, str]:
     }
 
 
-def _run_install(*, env: dict[str, str] | None = None, args: list[str] | None = None) -> subprocess.CompletedProcess[str]:
+def _run_install(
+    *,
+    env: dict[str, str] | None = None,
+    args: list[str] | None = None,
+    install: Path = INSTALL,
+    cwd: Path = ROOT,
+) -> subprocess.CompletedProcess[str]:
     install_env = os.environ.copy()
     install_env.update(env or {})
     return subprocess.run(
-        ["bash", str(INSTALL), *(args or [])],
-        cwd=ROOT,
+        ["bash", str(install), *(args or [])],
+        cwd=cwd,
         env=install_env,
         text=True,
         capture_output=True,
@@ -404,6 +410,23 @@ def test_install_dry_run_can_disable_server_autostart(tmp_path: Path) -> None:
     assert "server auto-start: disabled" in result.stdout
     assert "browser open: disabled" in result.stdout
     assert "health check: skipped" in result.stdout
+
+
+def test_install_dry_run_does_not_require_simulated_web_build_output(tmp_path: Path) -> None:
+    source = _current_tree_git_repo(tmp_path)
+
+    assert not (source / "web" / "dist" / "index.html").exists()
+    result = _run_install(
+        env={
+            "KESTREL_DRY_RUN": "1",
+            "KESTREL_HOME": str(tmp_path / "kestrel-home"),
+        },
+        install=source / "install.sh",
+        cwd=source,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "npm run build --prefix web" in result.stdout
 
 
 def test_install_refuses_non_git_nonempty_target_even_in_dry_run(tmp_path: Path) -> None:
