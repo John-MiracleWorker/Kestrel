@@ -26,7 +26,8 @@ Kestrel `v0.3.0` is the stable release for its supported deployment profile: one
 The one-shot Bash installer supports macOS and Linux, including Linux inside WSL.
 On native Windows, open a WSL distro before running it; Git Bash and the Windows
 `bash.exe` launcher are not supported installer environments. The Python runtime
-and published wheel continue to be tested on Windows.
+continues to be tested on native Windows; the published universal wheel is built,
+installed, and smoke-tested in the isolated Linux release environment.
 
 Install the latest published release (`v0.3.0`), initialize `.mv2` memory, build the workbench, run a deterministic smoke check, and explicitly open the localhost app:
 

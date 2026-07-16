@@ -8,7 +8,8 @@ Memvid `.mv2` memory, localhost binding, no shell/file-write/policy/Codex high-r
 The one-shot Bash installer supports macOS and Linux, including Linux inside WSL.
 Native Windows users must open a WSL distro first; Git Bash and the Windows
 `bash.exe` launcher are not supported installer environments. The Python runtime
-and published wheel are still validated on Windows.
+is still validated on native Windows; the published universal wheel is built,
+installed, and smoke-tested in the isolated Linux release environment.
 
 For a local Memvid-backed Kestrel install:
 
@@ -19,6 +20,12 @@ curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.3.0/i
 The installer clones or updates `https://github.com/John-MiracleWorker/Kestrel.git` into `${KESTREL_HOME:-$HOME/.kestrel-agent}`, detects Python 3.11 or newer, creates `.venv`, installs `.[memvid,openai,anthropic,gemini,server,mcp]`, runs `npm ci --prefix web`, builds the web workbench, initializes `.nest/memory` with Memvid `.mv2` layers, verifies memory, and runs doctor plus a deterministic `mock` chat smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. The smoke check proves the CLI path without requiring secrets; it is not the recommended provider for real use.
 
 Production installs must pin both the installer URL and `KESTREL_REF` to an immutable published tag. `main` is a development source, not the published release channel. `v0.3.0` is the latest published release for the supported local/private deployment profile.
+
+The GitHub release also publishes the universal wheel, source distribution,
+version-pinned installer, hash-locked default dependency manifest,
+CycloneDX SBOM, and `SHA256SUMS`. The dependency audit and SBOM are generated
+from the same isolated wheel environment described by `requirements-release.txt`,
+not from the development/test environment.
 
 To install and explicitly launch the localhost workbench in one command:
 

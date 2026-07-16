@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 import tomllib
 from pathlib import Path
@@ -142,7 +143,14 @@ def test_one_shot_docs_match_safe_opt_in_server_defaults() -> None:
 
 def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+    default_extras_match = re.search(r'^DEFAULT_EXTRAS="([^"]+)"$', installer, flags=re.MULTILINE)
+    release_extras_match = re.search(r'^\s+RELEASE_EXTRAS: "([^"]+)"$', workflow, flags=re.MULTILINE)
 
+    assert default_extras_match is not None
+    assert release_extras_match is not None
+    assert release_extras_match.group(1) == default_extras_match.group(1)
+    assert not re.search(r"uses:\s+[^\s#]+@v\d+", workflow)
     assert 'tags: ["v*"]' in workflow
     assert "npm audit --audit-level=high" in workflow
     assert "npm run build" in workflow
@@ -153,10 +161,22 @@ def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     assert "curl -fsS http://127.0.0.1:8878/" in workflow
     assert "Verify tag matches package version" in workflow
     assert 'test "$GITHUB_REF_NAME" = "v$VERSION"' in workflow
+    assert "uv lock --check" in workflow
+    assert "uv export --frozen --no-dev --no-emit-local" in workflow
+    assert "--require-hashes" in workflow
+    assert "requirements-release.txt" in workflow
+    assert "python -m pip_audit --path" in workflow
+    assert "cyclonedx-py environment /tmp/kestrel-release-smoke/bin/python" in workflow
+    assert '"nested-memvid-agent"' in workflow
+    assert '"google-genai"' in workflow
     assert "Stage version-pinned installer" in workflow
     assert 'os.environ["GITHUB_REF_NAME"]' in workflow
+    assert 'os.environ["RELEASE_EXTRAS"]' in workflow
+    assert "Defaults to {tag}." in workflow
+    assert "requirements-release.txt *.whl *.tar.gz sbom.cdx.json" in workflow
     assert "gh release create \"$GITHUB_REF_NAME\" dist/*" in workflow
     assert "gh release create" in workflow
+    assert 'extra_args+=(--extra "$extra")' in workflow
 
 
 def test_ci_runs_isolated_python_tests_and_web_build() -> None:
