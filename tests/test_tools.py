@@ -293,12 +293,19 @@ def test_subprocess_timeout_kills_term_ignoring_descendants(tmp_path: Path) -> N
         )
 
     child_pid = int(child_pid_path.read_text(encoding="utf-8"))
-    try:
-        os.kill(child_pid, 0)
-    except ProcessLookupError:
-        pass
+    for _ in range(20):
+        status = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(child_pid)],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        process_state = status.stdout.strip()
+        if status.returncode != 0 or not process_state or process_state.startswith("Z"):
+            break
+        sleep(0.05)
     else:
-        pytest.fail("TERM-ignoring descendant survived tool timeout")
+        pytest.fail(f"TERM-ignoring descendant survived tool timeout in state {process_state}")
 
 
 def test_subprocess_tool_timeout_kills_child_process_and_caps_requested_timeout(
