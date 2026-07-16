@@ -9,7 +9,7 @@
   <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
   <img alt="Memvid v2" src="https://img.shields.io/badge/Memory-Memvid%20v2%20.mv2-6f42c1">
   <img alt="Local first" src="https://img.shields.io/badge/Runtime-local--first-059669">
-  <img alt="Status local release candidate" src="https://img.shields.io/badge/Status-local%20release%20candidate-f59e0b">
+  <img alt="Status stable local release" src="https://img.shields.io/badge/Status-v0.3.0%20stable-059669">
   <img alt="License Apache-2.0" src="https://img.shields.io/badge/License-Apache--2.0-blue">
 </p>
 
@@ -19,14 +19,14 @@ It is not a chatbot wrapper and not just a memory library. Kestrel is built arou
 
 > Repeated engineering work should make the agent safer and more capable through evidence-backed, auditable, reversible learning.
 
-Kestrel's current working tree is a release candidate for its supported deployment profile: one trusted user, one Kestrel server/worker process, and one local or privately networked node. It is not a hosted/team or multi-tenant Internet service. The candidate package version is `0.3.0.dev0`; `v0.2.1` remains the latest published release until exact-byte CI, review, versioning, and publication complete.
+Kestrel `v0.3.0` is the stable release for its supported deployment profile: one trusted user, one Kestrel server/worker process, and one local or privately networked node. It is not a hosted/team or multi-tenant Internet service.
 
 ## Start Here
 
-Install the latest published release (`v0.2.1`), initialize `.mv2` memory, build the workbench, run a deterministic smoke check, and explicitly open the localhost app. This command does not install the uncommitted `0.3.0.dev0` candidate described below:
+Install the latest published release (`v0.3.0`), initialize `.mv2` memory, build the workbench, run a deterministic smoke check, and explicitly open the localhost app:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.2.1/install.sh | KESTREL_REF=v0.2.1 KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.3.0/install.sh | KESTREL_REF=v0.3.0 KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
 Omit the two launch variables for an install-only run that starts no server.
@@ -116,7 +116,7 @@ Important storage rules:
 One-shot local install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.2.1/install.sh | KESTREL_REF=v0.2.1 bash
+curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.3.0/install.sh | KESTREL_REF=v0.3.0 bash
 ```
 
 The installer clones or updates Kestrel in `${KESTREL_HOME:-$HOME/.kestrel-agent}`, finds Python 3.11 or newer without relying on bare `python`, installs the Memvid/OpenAI/server/MCP extras, builds the web workbench, initializes `.nest/memory/*.mv2`, verifies memory, and runs a deterministic `mock` CLI smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. `mock` is a zero-secret health check, not the intended operating mode. The installer does not ask for secrets or enable high-risk tools.
@@ -126,7 +126,7 @@ Production installs must pin both the installer URL and `KESTREL_REF` to an immu
 Install and explicitly launch the localhost workbench in one command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.2.1/install.sh | KESTREL_REF=v0.2.1 KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.3.0/install.sh | KESTREL_REF=v0.3.0 KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
 Useful installer options:

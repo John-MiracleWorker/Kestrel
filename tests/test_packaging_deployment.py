@@ -11,7 +11,7 @@ def test_package_metadata_identifies_kestrel_release() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     project = pyproject["project"]
 
-    assert project["version"] == "0.3.0.dev0"
+    assert project["version"] == "0.3.0"
     assert project["description"].startswith("Kestrel:")
     assert project["urls"]["Repository"] == "https://github.com/John-MiracleWorker/Kestrel"
     assert project["urls"]["Issues"] == "https://github.com/John-MiracleWorker/Kestrel/issues"
@@ -115,8 +115,8 @@ def test_deployment_docs_cover_release_and_memory_operations() -> None:
     checklist = (ROOT / "docs" / "RELEASE_CHECKLIST.md").read_text(encoding="utf-8")
 
     assert (
-        "curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.2.1/install.sh "
-        "| KESTREL_REF=v0.2.1 bash"
+        "curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.3.0/install.sh "
+        "| KESTREL_REF=v0.3.0 bash"
     ) in deployment
     assert "/Kestrel/main/install.sh" not in deployment
     assert "KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash" in deployment

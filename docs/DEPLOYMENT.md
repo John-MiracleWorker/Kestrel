@@ -8,17 +8,17 @@ Memvid `.mv2` memory, localhost binding, no shell/file-write/policy/Codex high-r
 For a local Memvid-backed Kestrel install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.2.1/install.sh | KESTREL_REF=v0.2.1 bash
+curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.3.0/install.sh | KESTREL_REF=v0.3.0 bash
 ```
 
 The installer clones or updates `https://github.com/John-MiracleWorker/Kestrel.git` into `${KESTREL_HOME:-$HOME/.kestrel-agent}`, detects Python 3.11 or newer, creates `.venv`, installs `.[memvid,openai,anthropic,gemini,server,mcp]`, runs `npm ci --prefix web`, builds the web workbench, initializes `.nest/memory` with Memvid `.mv2` layers, verifies memory, and runs doctor plus a deterministic `mock` chat smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. The smoke check proves the CLI path without requiring secrets; it is not the recommended provider for real use.
 
-Production installs must pin both the installer URL and `KESTREL_REF` to an immutable published tag. `main` is a development source, not the published release channel. The current candidate working tree is not published as `0.3.0`; `v0.2.1` remains the latest published release.
+Production installs must pin both the installer URL and `KESTREL_REF` to an immutable published tag. `main` is a development source, not the published release channel. `v0.3.0` is the latest published release for the supported local/private deployment profile.
 
 To install and explicitly launch the localhost workbench in one command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.2.1/install.sh | KESTREL_REF=v0.2.1 KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.3.0/install.sh | KESTREL_REF=v0.3.0 KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
 Useful options:
@@ -26,7 +26,7 @@ Useful options:
 ```bash
 KESTREL_DRY_RUN=1 bash install.sh
 KESTREL_HOME="$HOME/dev/kestrel" bash install.sh
-KESTREL_REF=v0.2.1 bash install.sh
+KESTREL_REF=v0.3.0 bash install.sh
 KESTREL_SKIP_WEB=1 bash install.sh
 KESTREL_SKIP_SMOKE=1 bash install.sh
 KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash install.sh
