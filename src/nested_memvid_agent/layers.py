@@ -14,6 +14,7 @@ from .backends.base import MemoryBackend
 from .context_frames import MV2ContextFrame, make_conflict_set_frame, to_memory_record
 from .models import MemoryHit, MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from .promotion_ledger import PromotionEntry, PromotionLedger, make_outcome
+from .security_boundary import sanitize_memory_record
 from .vector_sidecar import TextEmbedder, VectorSidecar, VectorSidecarStatus, make_local_embedder
 
 
@@ -162,19 +163,38 @@ class LayeredMemorySystem:
         memory_dir.mkdir(parents=True, exist_ok=True)
         backends: dict[MemoryLayer, MemoryBackend] = {}
         vector_sidecars: dict[MemoryLayer, VectorSidecar] = {}
-        for layer, spec in layer_specs.items():
-            path = memory_dir / spec.mv2_file
-            layer_backend_kwargs = dict(backend_kwargs)
-            backend = backend_factory(path=path, layer=layer, **layer_backend_kwargs)
-            backend.open()
-            backends[layer] = backend
-            sidecar = _make_vector_sidecar(memory_dir=memory_dir, mv2_path=path, spec=spec, embedder=vector_embedder)
-            if sidecar is not None:
-                sidecar.open()
-                vector_sidecars[layer] = sidecar
+        try:
+            for layer, spec in layer_specs.items():
+                path = memory_dir / spec.mv2_file
+                layer_backend_kwargs = dict(backend_kwargs)
+                backend = backend_factory(path=path, layer=layer, **layer_backend_kwargs)
+                backends[layer] = backend
+                backend.open()
+                sidecar = _make_vector_sidecar(
+                    memory_dir=memory_dir,
+                    mv2_path=path,
+                    spec=spec,
+                    embedder=vector_embedder,
+                )
+                if sidecar is not None:
+                    vector_sidecars[layer] = sidecar
+                    sidecar.open()
+        except Exception:
+            for sidecar in reversed(tuple(vector_sidecars.values())):
+                try:
+                    sidecar.close()
+                except Exception:
+                    pass
+            for backend in reversed(tuple(backends.values())):
+                try:
+                    backend.close()
+                except Exception:
+                    pass
+            raise
         return cls(backends=backends, specs=layer_specs, ledger=ledger, vector_sidecars=vector_sidecars)
 
     def put(self, record: MemoryRecord) -> str:
+        record = sanitize_memory_record(record)
         record, conflict_frame, conflicts = self._with_conflict_metadata(record)
         spec = self.specs[record.layer]
         if record.confidence < spec.min_write_confidence:
@@ -203,6 +223,7 @@ class LayeredMemorySystem:
         return record_id
 
     def upsert(self, record: MemoryRecord) -> str:
+        record = sanitize_memory_record(record)
         record, conflict_frame, conflicts = self._with_conflict_metadata(record)
         spec = self.specs[record.layer]
         if record.confidence < spec.min_write_confidence:
@@ -382,11 +403,25 @@ class LayeredMemorySystem:
         return {layer: backend.verify() for layer, backend in self.backends.items()}
 
     def close_all(self) -> None:
-        self.maybe_seal_all(force=True)
+        first_error: Exception | None = None
+        try:
+            self.maybe_seal_all(force=True)
+        except Exception as exc:
+            first_error = exc
         for backend in self.backends.values():
-            backend.close()
+            try:
+                backend.close()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
         for sidecar in self.vector_sidecars.values():
-            sidecar.close()
+            try:
+                sidecar.close()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def iter_layers(self) -> Iterable[tuple[MemoryLayer, LayerSpec]]:
         return self.specs.items()

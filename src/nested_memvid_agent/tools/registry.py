@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from queue import Empty, Queue
 from threading import Thread
 from typing import Any
@@ -7,11 +8,24 @@ from typing import Any
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
 from .base import AgentTool, ToolContext
 
+CapabilityGate = Callable[[ToolSpec], tuple[bool, str]]
+
 
 class ToolRegistry:
-    def __init__(self) -> None:
+    def __init__(self, *, capability_gate: CapabilityGate | None = None) -> None:
         self._tools: dict[str, AgentTool] = {}
         self._aliases: dict[str, str] = {}
+        self._capability_gate = capability_gate
+
+    def set_capability_gate(self, gate: CapabilityGate | None) -> None:
+        """Install a live, fail-closed gate for operator capability policy.
+
+        The callback is intentionally evaluated for both discovery and execution.
+        A registry that was built before a capability was disabled therefore cannot
+        be used to bypass the current control-plane decision.
+        """
+
+        self._capability_gate = gate
 
     def register(self, tool: AgentTool) -> None:
         if tool.spec.name in self._tools:
@@ -23,6 +37,14 @@ class ToolRegistry:
             self._aliases[alias] = tool.spec.name
 
     def specs(self) -> list[ToolSpec]:
+        specs = self.all_specs()
+        if self._capability_gate is None:
+            return specs
+        return [spec for spec in specs if self._capability_gate(spec)[0]]
+
+    def all_specs(self) -> list[ToolSpec]:
+        """Return the stable catalog, including operator-disabled tools."""
+
         return [tool.spec for tool in self._tools.values()]
 
     def spec_for(self, name: str) -> ToolSpec | None:
@@ -32,6 +54,13 @@ class ToolRegistry:
             if canonical is not None:
                 tool = self._tools.get(canonical)
         return None if tool is None else tool.spec
+
+    def canonical_name(self, name: str) -> str | None:
+        """Resolve a public name or alias to the canonical registered tool name."""
+
+        if name in self._tools:
+            return name
+        return self._aliases.get(name)
 
     def execute(self, call: ToolCall, context: ToolContext) -> ToolExecution:
         if not isinstance(call.arguments, dict):
@@ -48,6 +77,15 @@ class ToolRegistry:
         if tool is None:
             return _failure(call, content=f"Unknown tool: {call.name}", error="unknown_tool")
 
+        if self._capability_gate is not None:
+            enabled, disabled_reason = self._capability_gate(tool.spec)
+            if not enabled:
+                return _failure(
+                    call,
+                    content=disabled_reason or f"Tool {tool.spec.name} is disabled by capability policy.",
+                    error="tool_disabled",
+                )
+
         if not context.tool_specs:
             context.tool_specs = tuple(self.specs())
 
@@ -59,7 +97,7 @@ class ToolRegistry:
         if not enabled:
             return _failure(call, content=disabled_reason, error="tool_disabled")
 
-        if tool.spec.requires_approval and context.config.require_approval_for_high_risk_tools:
+        if tool.spec.requires_approval or tool.spec.risk in {"high", "critical"}:
             if _is_exact_call_approved(call, arguments, context):
                 return _run_tool(tool, call, arguments, context)
             if context.approval_handler is not None:
@@ -192,6 +230,7 @@ _NON_RETRYABLE_ERRORS = frozenset({
     "tool_disabled",
     "invalid_tool_arguments",
     "retry_blocked",
+    "sensitive_tool_arguments_rejected",
     "path_sandbox_violation",
 })
 
@@ -245,19 +284,31 @@ class RetryingRegistry(ToolRegistry):
     def register(self, tool: Any) -> None:
         self._inner.register(tool)
 
+    def set_capability_gate(self, gate: CapabilityGate | None) -> None:
+        self._inner.set_capability_gate(gate)
+
     def specs(self) -> list[ToolSpec]:
         return self._inner.specs()
+
+    def all_specs(self) -> list[ToolSpec]:
+        return self._inner.all_specs()
 
     def spec_for(self, name: str) -> ToolSpec | None:
         return self._inner.spec_for(name)
 
+    def canonical_name(self, name: str) -> str | None:
+        return self._inner.canonical_name(name)
+
     def execute(self, call: ToolCall, context: ToolContext) -> ToolExecution:
         last_execution: ToolExecution | None = None
+        spec = self._inner.spec_for(call.name)
         for attempt in range(1, self._max_attempts + 1):
             execution = self._inner.execute(call, context)
             if execution.success:
                 return execution
             if not _is_retryable_error(execution):
+                return execution
+            if not _transparent_retry_is_safe(spec):
                 return execution
             last_execution = execution
             if attempt < self._max_attempts and self._backoff_base > 0:
@@ -268,3 +319,10 @@ class RetryingRegistry(ToolRegistry):
         return last_execution if last_execution is not None else _failure(
             call, content="Retry exhausted with no execution.", error="retry_exhausted"
         )
+
+
+def _transparent_retry_is_safe(spec: ToolSpec | None) -> bool:
+    """Allow hidden retries only for trusted, non-approved, non-mutating built-ins."""
+    if spec is None or spec.source != "builtin" or spec.requires_approval:
+        return False
+    return spec.risk == "low" or "read-only" in spec.capabilities

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
+from nested_memvid_agent.runtime_models import ToolCall, ToolExecution
 from nested_memvid_agent.task_capsule import (
     extract_learning_signals,
     summarize_run_capsule,
@@ -101,6 +102,32 @@ def test_capsule_root_links_to_candidate_frames(tmp_path: Path) -> None:
     assert '"frame_type": "skill_card"' in raw
     assert '"parent_ids": [' in raw
     assert '"child_ids": [' in raw
+
+
+def test_capsule_redacts_secrets_from_arguments_outputs_and_candidates(tmp_path: Path) -> None:
+    secret = "opaque-capsule-secret-12345"
+    path = write_run_capsule(
+        runs_dir=tmp_path / "runs",
+        run_id="run_redacted",
+        objective=f"Investigate api_key={secret}",
+        tool_executions=(
+            ToolExecution(
+                call=ToolCall(
+                    name="diagnosis.classify",
+                    arguments={"failure_text": f"Authorization: Bearer {secret}"},
+                ),
+                success=False,
+                content=f"client_secret: {secret}",
+                data={"token": secret},
+                error="diagnostic_failure",
+            ),
+        ),
+        errors_encountered=(f"password={secret}",),
+    )
+
+    raw = path.with_suffix(".memory.json").read_text(encoding="utf-8")
+    assert secret not in raw
+    assert "<redacted>" in raw
 
 
 def test_summarize_prefers_exact_iter_records_before_snippet_search(monkeypatch, tmp_path: Path) -> None:

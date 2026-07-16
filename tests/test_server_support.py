@@ -1,8 +1,16 @@
+import asyncio
+
+import pytest
+
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.runtime_models import ToolCall, ToolExecution
+from nested_memvid_agent.security_boundary import register_secret_value
 from nested_memvid_agent.server_support import (
+    RequestBodyTooLarge,
+    RequestRateLimiter,
     api_auth_error,
     bounded_limit,
+    cache_bounded_request_body,
     csv_layers,
     execution_response,
     host_is_trusted,
@@ -11,6 +19,16 @@ from nested_memvid_agent.server_support import (
     known_secret_env_names,
     tool_response_payload,
 )
+
+
+class _StreamingRequest:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self._body = b""
+
+    async def stream(self):
+        for chunk in self.chunks:
+            yield chunk
 
 
 def test_api_auth_error_accepts_bearer_and_api_key(monkeypatch) -> None:
@@ -39,6 +57,27 @@ def test_server_support_normalizes_request_helpers() -> None:
     assert host_is_trusted("coming-emacs-experienced-dome.trycloudflare.com", ["*.trycloudflare.com"])
     assert not host_is_trusted("trycloudflare.com", ["*.trycloudflare.com"])
     assert not host_is_trusted("evil.example", ["*.trycloudflare.com"])
+    assert host_is_trusted("0.0.0.0", ["0.0.0.0"])
+    assert not host_is_trusted("evil.example", ["0.0.0.0"])
+
+
+def test_cache_bounded_request_body_enforces_streamed_size() -> None:
+    accepted = _StreamingRequest([b"abc", b"def"])
+    assert asyncio.run(cache_bounded_request_body(accepted, limit=6)) == 6
+    assert accepted._body == b"abcdef"
+
+    rejected = _StreamingRequest([b"abc", b"defg"])
+    with pytest.raises(RequestBodyTooLarge):
+        asyncio.run(cache_bounded_request_body(rejected, limit=6))
+
+
+def test_rate_limiter_bounds_attacker_controlled_key_cardinality() -> None:
+    limiter = RequestRateLimiter()
+
+    for index in range(100):
+        limiter.allow(f"client-{index}", limit=10, window_seconds=60, max_keys=4)
+
+    assert limiter.tracked_keys() <= 4
 
 
 def test_server_support_collects_allowed_secret_env_names() -> None:
@@ -67,3 +106,24 @@ def test_server_support_serializes_tool_execution() -> None:
         "error": None,
     }
     assert tool_response_payload(execution) == {"success": True, "hits": [], "content": "ok", "error": None}
+
+
+def test_server_support_redacts_registered_secret_from_all_api_tool_payloads() -> None:
+    secret = "opaque-api-tool-secret-12345"
+    register_secret_value(secret)
+    execution = ToolExecution(
+        call=ToolCall(name="opaque.echo", arguments={"message": secret}, id="call_secret"),
+        success=False,
+        content=f'{{"echo": "{secret}"}}',
+        data={"echo": secret},
+        error=f"failed with {secret}",
+    )
+
+    response = execution_response(execution)
+    structured = tool_response_payload(execution)
+
+    assert secret not in str(response)
+    assert response["content"] == '{"echo": "<redacted>"}'
+    assert response["data"] == {"echo": "<redacted>"}
+    assert response["error"] == "failed with <redacted>"
+    assert structured == {"echo": "<redacted>"}

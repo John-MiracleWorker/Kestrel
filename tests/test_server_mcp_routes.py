@@ -13,6 +13,8 @@ def test_mcp_public_redacts_secret_env_to_status_metadata() -> None:
     payload = mcp_public(
         {
             "id": "local-mcp",
+            "env": {"LOG_LEVEL": "debug"},
+            "args": ["--safe-flag"],
             "secret_env": {
                 "API_TOKEN": "secret://configured",
                 "PLAIN_ENV": "PLAIN_ENV_NAME",
@@ -22,6 +24,10 @@ def test_mcp_public_redacts_secret_env_to_status_metadata() -> None:
     )
 
     assert "secret_env" not in payload
+    assert "env" not in payload
+    assert "args" not in payload
+    assert payload["env_keys"] == ["LOG_LEVEL"]
+    assert payload["argument_count"] == 1
     assert payload["secret_env_status"] == {
         "API_TOKEN": {
             "source_env": "secret://configured",

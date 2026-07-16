@@ -1,4 +1,4 @@
-PYTHON ?= python
+PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 PIP ?= $(PYTHON) -m pip
 NEST_AGENT ?= $(PYTHON) -m nested_memvid_agent.cli
 RUFF ?= $(PYTHON) -m ruff

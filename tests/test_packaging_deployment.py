@@ -11,7 +11,7 @@ def test_package_metadata_identifies_kestrel_release() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     project = pyproject["project"]
 
-    assert project["version"] == "0.2.1"
+    assert project["version"] == "0.3.0.dev0"
     assert project["description"].startswith("Kestrel:")
     assert project["urls"]["Repository"] == "https://github.com/John-MiracleWorker/Kestrel"
     assert project["urls"]["Issues"] == "https://github.com/John-MiracleWorker/Kestrel/issues"
@@ -32,6 +32,7 @@ def test_package_includes_runtime_prompt_data() -> None:
 
 def test_dockerfile_keeps_safe_runtime_defaults() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    command = next(line for line in dockerfile.splitlines() if line.startswith("CMD ["))
 
     assert "FROM node:22-bookworm-slim AS web-build" in dockerfile
     assert "FROM python:3.11-slim AS runtime" in dockerfile
@@ -50,12 +51,33 @@ def test_dockerfile_keeps_safe_runtime_defaults() -> None:
     assert "NEST_AGENT_REQUIRE_API_AUTH=true" in dockerfile
     assert "NEST_AGENT_API_TOKEN" in dockerfile
     assert "ARG INSTALL_EXTRAS=server,mcp,memvid,openai,anthropic,gemini" in dockerfile
-    assert "--backend\", \"memvid\"" in dockerfile
-    assert "\"--require-api-auth\"" in dockerfile
+    assert 'ENTRYPOINT ["/bin/sh", "/app/scripts/docker-entrypoint.sh"]' in dockerfile
+    assert "/api/health/ready" in dockerfile
+    assert '"--require-api-auth"' in command
+    for env_owned_option in ("--backend", "--memory-dir", "--provider", "--model", "--state-path"):
+        assert env_owned_option not in command
+
+
+def test_docker_entrypoint_initializes_memvid_before_default_server() -> None:
+    entrypoint = ROOT / "scripts" / "docker-entrypoint.sh"
+    script = entrypoint.read_text(encoding="utf-8")
+    syntax = subprocess.run(
+        ["sh", "-n", str(entrypoint)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert syntax.returncode == 0, syntax.stderr
+    assert 'if [ "$#" -ge 2 ] && [ "$1" = "nest-agent" ] && [ "$2" = "server" ]' in script
+    assert "nest-agent init" in script
+    assert 'exec "$@"' in script
 
 
 def test_compose_binds_localhost_and_persists_data_volume() -> None:
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    command = compose.split("    command:\n", maxsplit=1)[1].split("    healthcheck:\n", maxsplit=1)[0]
 
     assert "127.0.0.1:8765:8765" in compose
     assert "INSTALL_EXTRAS: server,mcp,memvid,openai,anthropic,gemini" in compose
@@ -70,6 +92,9 @@ def test_compose_binds_localhost_and_persists_data_volume() -> None:
     assert 'NEST_AGENT_REQUIRE_API_AUTH: "true"' in compose
     assert "NEST_AGENT_API_TOKEN: ${NEST_AGENT_API_TOKEN:?Set NEST_AGENT_API_TOKEN for Kestrel API auth}" in compose
     assert "--require-api-auth" in compose
+    assert "/api/health/ready" in compose
+    for env_owned_option in ("--backend", "--memory-dir", "--provider", "--model", "--state-path"):
+        assert env_owned_option not in command
     assert "env_file:" not in compose
 
 
@@ -89,7 +114,11 @@ def test_deployment_docs_cover_release_and_memory_operations() -> None:
     security = (ROOT / "docs" / "SECURITY.md").read_text(encoding="utf-8")
     checklist = (ROOT / "docs" / "RELEASE_CHECKLIST.md").read_text(encoding="utf-8")
 
-    assert "curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | bash" in deployment
+    assert (
+        "curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.2.1/install.sh "
+        "| KESTREL_REF=v0.2.1 bash"
+    ) in deployment
+    assert "/Kestrel/main/install.sh" not in deployment
     assert "KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash" in deployment
     assert "does not start the server" in deployment
     assert "KESTREL_DRY_RUN=1 bash install.sh" in checklist

@@ -365,6 +365,7 @@ def test_full_server_product_readiness_route_reports_product_gap(tmp_path: Path)
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["schema"] == "kestrel.product_readiness.v1"
+    assert payload["schema"] == "kestrel.product_readiness.v2"
+    assert payload["scope"] == "full_product_including_hosted_team"
     assert payload["headline"]["product_ready"] is False
     assert any(category["category_id"] == "production_auth_workspaces" for category in payload["categories"])

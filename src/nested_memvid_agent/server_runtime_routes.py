@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from importlib import metadata as importlib_metadata
 from typing import Any, NoReturn, cast
 
+from .capability_policy import enablement_flag_for_tool
 from .config import AgentConfig
+from .llm.factory import provider_health_id
 from .llm.model_catalog import all_model_catalogs, default_api_key_env, model_catalog_for_provider
-from .runtime_settings import RuntimeSettingsStore, apply_runtime_settings, merge_runtime_settings
+from .llm.resilience import global_provider_health_registry
+from .operational_metrics import readiness_snapshot
+from .runtime_settings import (
+    RuntimeSettingsConflict,
+    RuntimeSettingsStore,
+    apply_runtime_settings,
+    merge_runtime_settings,
+)
 
 
 def register_runtime_routes(
@@ -18,11 +28,34 @@ def register_runtime_routes(
     on_config_update: Any | None = None,
     secret_broker: Any | None = None,
     http_exception: Any | None = None,
+    runs: Any | None = None,
+    provider_probe: Any | None = None,
 ) -> None:
     @app.get("/api/health")  # type: ignore[untyped-decorator]
     def health() -> dict[str, object]:
         config = _active_config(active_config)
         return {"ok": True, "name": config.name}
+
+    @app.get("/api/health/live")  # type: ignore[untyped-decorator]
+    def liveness() -> dict[str, object]:
+        return {"ok": True, "status": "live"}
+
+    @app.get("/api/health/ready")  # type: ignore[untyped-decorator]
+    def readiness() -> dict[str, object]:
+        snapshot = readiness_snapshot(
+            config=_active_config(active_config),
+            state=state,
+            runs=runs,
+        )
+        if not snapshot["ok"] and http_exception is not None:
+            raise http_exception(status_code=503, detail=snapshot)
+        return snapshot
+
+    @app.post("/api/runtime/provider/probe")  # type: ignore[untyped-decorator]
+    def probe_provider() -> dict[str, object]:
+        if provider_probe is None:
+            _raise(http_exception, 501, "provider_probe_unavailable")
+        return cast(dict[str, object], provider_probe())
 
     @app.get("/api/runtime/config")  # type: ignore[untyped-decorator]
     def runtime_config() -> dict[str, object]:
@@ -53,6 +86,20 @@ def register_runtime_routes(
                 "temperature": config.temperature,
                 "timeout_seconds": config.timeout_seconds,
                 "max_retries": config.max_retries,
+                "operational_health": global_provider_health_registry.snapshot(provider_health_id(config)),
+                "fallback_operational_health": global_provider_health_registry.snapshot(
+                    provider_health_id(
+                        replace(
+                            config,
+                            provider=config.fallback_provider,
+                            model=config.fallback_model or config.model,
+                            base_url=config.fallback_base_url,
+                            api_key_env=config.fallback_api_key_env,
+                        )
+                    )
+                )
+                if config.fallback_provider
+                else None,
             },
             "feature_flags": {
                 "allow_shell": config.allow_shell,
@@ -94,6 +141,7 @@ def register_runtime_routes(
                 "max_scheduler_tasks": config.max_scheduler_tasks,
                 "max_scheduler_cycles": config.max_scheduler_cycles,
                 "tool_timeout_seconds": config.tool_timeout_seconds,
+                "approval_ttl_seconds": config.approval_ttl_seconds,
                 "web_timeout_seconds": config.web_timeout_seconds,
                 "web_max_results": config.web_max_results,
                 "web_max_bytes": config.web_max_bytes,
@@ -154,10 +202,35 @@ def register_runtime_routes(
             settings = merge_runtime_settings(config, current, request)
         except ValueError as exc:
             _raise(http_exception, 400, str(exc))
-        saved = store.save(settings)
+        try:
+            saved = store.save(settings, expected_revision=current.revision)
+        except RuntimeSettingsConflict as exc:
+            _raise(http_exception, 409, str(exc))
         next_config = apply_runtime_settings(config, saved)
         if on_config_update is not None:
             on_config_update(next_config)
+        revoked_approvals = 0
+        if runs is not None:
+            registry = runs.build_registry()
+            specs = getattr(registry, "all_specs", registry.specs)()
+            disabled_flags = {
+                flag
+                for spec in specs
+                if (flag := enablement_flag_for_tool(spec)) is not None
+                and bool(getattr(config, flag, False))
+                and not bool(getattr(next_config, flag, False))
+            }
+            affected = {
+                name
+                for spec in specs
+                if enablement_flag_for_tool(spec) in disabled_flags
+                for name in (spec.name, *spec.aliases)
+            }
+            if affected:
+                revoked_approvals = runs.revoke_pending_approvals_for_tools(
+                    affected,
+                    reason="global_capability_disabled",
+                )
         return {
             "settings": saved.to_public_dict(path=store.path, persisted=True),
             "runtime": {
@@ -181,6 +254,7 @@ def register_runtime_routes(
                 "allow_web": next_config.allow_web,
                 "allow_self_modification": next_config.allow_self_modification,
             },
+            "revoked_approvals": revoked_approvals,
         }
 
 

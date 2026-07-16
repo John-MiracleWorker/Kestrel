@@ -1,6 +1,6 @@
 # Runtime Wiring
 
-Last updated: 2026-05-20
+Last updated: 2026-07-16
 
 ## Chat Turn Flow
 
@@ -25,7 +25,7 @@ Last updated: 2026-05-20
    - the portable JSON envelope with tool calls.
 11. Provider output is validated against the active `ToolSpec` registry before tool execution.
 12. Before same-action retries, the retry gate requires a meaningful changed strategy.
-13. ToolRegistry validates schemas, enablement, timeout limits, and approval requirements.
+13. ToolRegistry validates schemas, resolves the live configured/effective capability decision, enforces timeout limits, and checks approval requirements.
 14. Approved/allowed tools execute and return structured results.
 15. Agent writes tool outputs or failures to working memory.
 16. Failed tool attempts are classified, linked to recalled lessons, and written as episodic `FailureEpisode` records.
@@ -51,13 +51,13 @@ nest-agent approvals --backend memory --json
 nest-agent approve <approval_id> --backend memory --json
 ```
 
-The FastAPI server exposes the same state through run, event, approval, scheduler, memory, context, skill, MCP, behavior-delta, plugin, product readiness/setup/provider-certification/support-bundle, and channel routes.
+The FastAPI server exposes the same state through run, event, approval, scheduler, memory, context, skill, MCP, capability catalog/mutation/history, behavior-delta, plugin, product readiness/setup/provider-certification/support-bundle, and channel routes.
 
 Soul/self routes expose the same non-secret runtime model as the CLI: `/api/self`, `/api/self/remember`, `/api/self/propose-change`, `/api/web/search`, and `/api/web/fetch`.
 
 ## State Store
 
-`AgentStateStore` is SQLite control-plane storage, currently schema version 11.
+`AgentStateStore` is SQLite control-plane storage, currently schema version 15.
 
 It stores:
 
@@ -66,6 +66,7 @@ It stores:
 - MCP server records and discovered tools
 - skill records and validation/provenance metadata
 - plugin records and enablement metadata
+- revisioned tool/MCP-server/skill capability overrides and append-only change rows
 - promotion ledger and promotion outcome records
 - behavior-delta ledger, activation records, and outcome records
 - task nodes
@@ -119,13 +120,18 @@ The run timeline remains append-only event history. Trace spans add a durable fl
 
 ## Permission and Approval Model
 
-Low-risk tools can run after argument validation.
+Low-risk tools can run after argument validation only when their effective capability decision is enabled.
 
 High-risk tools require:
 
-1. Capability enablement when the tool has a matching allow flag.
-2. Exact-call approval when `require_approval_for_high_risk_tools` is enabled.
-3. Matching tool-call ID and unchanged arguments at execution time.
+1. An enabled owner switch for the tool and any parent skill/MCP server.
+2. Every matching master allow flag and launch-allowlist prerequisite.
+3. Exact-call approval; this prerequisite cannot be disabled by the per-capability switch.
+4. Matching owner, tool-call ID, arguments, capability revision, and policy/tool-spec/parent digest at execution time.
+
+`GET /api/capabilities` reports owner-desired (`configured_enabled`) and effective state plus blockers. Revision-checked `PUT /api/capabilities/{kind}/{capability_id}` persists the switch and returns HTTP 409 for a stale write; `GET /api/capabilities/history` reads its append-only audit trail. New skills and new dynamic MCP/skill tools start off. New API MCP records are forced off and can only be enabled afterward through that revisioned capability endpoint.
+
+Turning a capability off denies later invocations even through a stale registry, revokes affected pending approvals, and closes a disabled MCP server's managed session. It applies at the future-invocation boundary and does not guarantee cancellation of an arbitrary built-in subprocess already past dispatch. Turning on does not rewrite an active run's snapshotted config or bypass a parent, master flag, resource-integrity check, or exact-call approval.
 
 Examples of high-risk tools:
 
@@ -256,7 +262,7 @@ MCP `secret_env` values are redacted in API responses, included in configuration
 
 Telegram admin mode remains a channel-local bridge, not production auth. The Telegram channel can be configured with `settings.admin_enabled=true`, `settings.owner_user_ids`, and `settings.signature_provider=telegram`; owner natural-language admin writes are staged behind inline confirmation callbacks, while raw secret values are refused and must be entered through local Secret Broker surfaces.
 
-`NEST_AGENT_SECRET_BACKEND=json` is the default local-file backend. `NEST_AGENT_SECRET_BACKEND=keyring` or `--secret-backend keyring` stores raw values through the optional OS keyring provider and keeps only metadata in the JSON vault; if the optional `keyring` package cannot be imported, Kestrel falls back to the JSON backend.
+`NEST_AGENT_SECRET_BACKEND=json` is the default local-file backend. Its vault mutations are cross-process locked and atomically replace the live file from a mode-`0600` temporary file. `NEST_AGENT_SECRET_BACKEND=keyring` or `--secret-backend keyring` stores raw values through the optional OS keyring provider and keeps only metadata in the JSON vault. Explicit keyring selection fails closed when the package or a usable OS keyring backend is unavailable; it never silently falls back to plaintext JSON.
 
 Plugin-provided MCP stdio servers carry `connect_requires_approval` vetting metadata. Connect, test, sync, and invoke paths refuse to start the process until `POST /api/mcp/servers/{server_id}/approve-connect` records approval for the current command hash.
 

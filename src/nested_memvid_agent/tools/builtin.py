@@ -1673,6 +1673,7 @@ def _self_snapshot(
             "allow_web": config.allow_web,
             "allow_self_modification": config.allow_self_modification,
             "require_approval_for_high_risk_tools": config.require_approval_for_high_risk_tools,
+            "approval_ttl_seconds": config.approval_ttl_seconds,
             "web_backend": config.web_backend,
             "web_timeout_seconds": config.web_timeout_seconds,
             "web_max_results": config.web_max_results,

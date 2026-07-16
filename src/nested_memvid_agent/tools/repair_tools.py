@@ -274,7 +274,11 @@ class RepairValidateTool(AgentTool):
                     error="not_repair_branch",
                 )
             completed = _run_subprocess(
-                command, context=context, arguments=arguments, default_timeout=120
+                command,
+                context=context,
+                arguments=arguments,
+                default_timeout=120,
+                sanitize_environment=True,
             )
             content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
             diagnosis = (
@@ -364,7 +368,11 @@ class RepairOrchestrateValidateTool(AgentTool):
                 )
             status = _git_output(context.workspace, ["git", "status", "--porcelain"])
             completed = _run_subprocess(
-                command, context=context, arguments=arguments, default_timeout=120
+                command,
+                context=context,
+                arguments=arguments,
+                default_timeout=120,
+                sanitize_environment=True,
             )
             validation_content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
             validation = {

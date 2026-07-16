@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from .config import AgentConfig
+from .llm.factory import provider_health_id
+from .llm.resilience import global_provider_health_registry
 
 
 class SetupReadinessStatus(StrEnum):
@@ -72,6 +74,7 @@ def build_setup_readiness_report(
     """
     checks = (
         _provider_check(config, secret_resolver=secret_resolver),
+        _provider_operational_check(config),
         _workspace_check(config.workspace),
         _directory_check(
             "memory_storage",
@@ -158,6 +161,43 @@ def _provider_check(config: AgentConfig, *, secret_resolver: SecretResolver | No
         SetupReadinessStatus.WARN,
         f"{provider} is selected with model `{config.model}`, but no provider key name or local base URL is configured.",
         "Choose a provider key name in Settings, set `--base-url`, or use `--provider mock` until live provider validation is ready.",
+    )
+
+
+def _provider_operational_check(config: AgentConfig) -> SetupReadinessCheck:
+    if config.provider == "mock":
+        return SetupReadinessCheck(
+            "provider_operational",
+            "Provider operational health",
+            SetupReadinessStatus.PASS,
+            "Deterministic mock provider is operational for local validation.",
+            "Use a live provider smoke test before claiming external provider readiness.",
+        )
+    health = global_provider_health_registry.snapshot(provider_health_id(config))
+    state = str(health["state"])
+    if state == "healthy":
+        return SetupReadinessCheck(
+            "provider_operational",
+            "Provider operational health",
+            SetupReadinessStatus.PASS,
+            "The configured provider completed a live request successfully in this process.",
+            "No recovery needed.",
+        )
+    if state in {"open", "degraded"}:
+        failure_class = str(health.get("failure_class") or "provider_error")
+        return SetupReadinessCheck(
+            "provider_operational",
+            "Provider operational health",
+            SetupReadinessStatus.FAIL,
+            f"The configured provider is {state}; last failure class: {failure_class}.",
+            "Resolve credentials, rate limits, endpoint availability, or model configuration, then run a live smoke request.",
+        )
+    return SetupReadinessCheck(
+        "provider_operational",
+        "Provider operational health",
+        SetupReadinessStatus.WARN,
+        "Provider configuration exists, but this process has not completed a live request yet.",
+        "Run a minimal live provider smoke request before treating the deployment as ready.",
     )
 
 

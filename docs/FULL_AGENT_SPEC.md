@@ -212,4 +212,4 @@ RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integ
 RUN_PROVIDER_INTEGRATION=1 python -m pytest -q tests/integration/test_provider_live_integration.py
 ```
 
-The runtime is production-ready only when the remaining gaps in `docs/IMPLEMENTATION_STATUS.md` are closed, especially broad credentialed provider CI beyond the locally validated Ollama Cloud path, production auth/isolation, MCP non-stdio transport fixtures, container-grade skill isolation, and Codex-backed isolated worker orchestration.
+The full hosted/team product definition of done requires the remaining gaps in `docs/IMPLEMENTATION_STATUS.md` to close, especially broad credentialed provider CI, hosted identity/isolation, MCP non-stdio transport fixtures, container-grade skill isolation, and Codex-backed distributed worker orchestration. The supported single-user, single-node local/private profile has a narrower exact-byte release gate in `docs/PRODUCTION_OPERATIONS.md`.

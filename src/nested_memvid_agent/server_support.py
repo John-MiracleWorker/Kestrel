@@ -3,12 +3,75 @@ from __future__ import annotations
 import json
 import os
 import secrets
+from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping
+from threading import Lock
+from time import monotonic
 from typing import Any
 from urllib.parse import urlparse
 
 from .config import AgentConfig
 from .secret_broker import is_secret_ref
+from .security_boundary import redact_secrets
+
+
+class RequestRateLimiter:
+    """Small fixed-window limiter for the single-process control plane."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._requests: dict[str, deque[float]] = defaultdict(deque)
+
+    def allow(
+        self,
+        key: str,
+        *,
+        limit: int,
+        window_seconds: float,
+        max_keys: int = 2048,
+    ) -> bool:
+        now = monotonic()
+        cutoff = now - max(0.01, window_seconds)
+        with self._lock:
+            if key not in self._requests and len(self._requests) >= max(1, max_keys):
+                expired = [
+                    existing
+                    for existing, history in self._requests.items()
+                    if not history or history[-1] <= cutoff
+                ]
+                for existing in expired:
+                    self._requests.pop(existing, None)
+                if len(self._requests) >= max(1, max_keys):
+                    if "__overflow_clients__" not in self._requests:
+                        self._requests.pop(next(iter(self._requests)))
+                    key = "__overflow_clients__"
+            history = self._requests[key]
+            while history and history[0] <= cutoff:
+                history.popleft()
+            if len(history) >= max(1, limit):
+                return False
+            history.append(now)
+            return True
+
+    def tracked_keys(self) -> int:
+        with self._lock:
+            return len(self._requests)
+
+
+class RequestBodyTooLarge(ValueError):
+    pass
+
+
+async def cache_bounded_request_body(request: Any, *, limit: int) -> int:
+    """Read and cache an ASGI request body without trusting Content-Length."""
+    maximum = max(1, limit)
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > maximum:
+            raise RequestBodyTooLarge("request body exceeds configured maximum")
+        body.extend(chunk)
+    request._body = bytes(body)
+    return len(body)
 
 
 def api_auth_error(config: AgentConfig, headers: Mapping[str, str]) -> tuple[int, str] | None:
@@ -74,7 +137,7 @@ def host_is_trusted(host: str, trusted_hosts: Iterable[str]) -> bool:
 
     normalized = host.strip().lower().rstrip(".")
     trusted = {item.strip().lower().rstrip(".") for item in trusted_hosts if item.strip()}
-    if "*" in trusted or "0.0.0.0" in trusted or normalized in trusted:
+    if "*" in trusted or normalized in trusted:
         return True
     for item in trusted:
         if not item.startswith("*."):
@@ -108,7 +171,7 @@ def known_secret_env_names(channels: list[dict[str, Any]], servers: list[dict[st
 
 
 def execution_response(execution: Any) -> dict[str, object]:
-    return {
+    payload = {
         "tool": execution.call.name,
         "tool_call_id": execution.call.id,
         "success": execution.success,
@@ -116,6 +179,8 @@ def execution_response(execution: Any) -> dict[str, object]:
         "data": execution.data,
         "error": execution.error,
     }
+    safe_payload = redact_secrets(payload)
+    return dict(safe_payload) if isinstance(safe_payload, dict) else {}
 
 
 def tool_response_payload(execution: Any) -> dict[str, object]:
@@ -123,10 +188,29 @@ def tool_response_payload(execution: Any) -> dict[str, object]:
     if stripped.startswith("{") or stripped.startswith("["):
         payload = json.loads(execution.content)
         if isinstance(payload, dict):
-            return dict(payload)
+            safe_payload = redact_secrets(payload)
+            return dict(safe_payload) if isinstance(safe_payload, dict) else {}
         if isinstance(payload, list):
-            return {"success": execution.success, "items": payload, "error": execution.error}
+            response = {
+                "success": execution.success,
+                "items": payload,
+                "error": execution.error,
+            }
+            safe_response = redact_secrets(response)
+            return dict(safe_response) if isinstance(safe_response, dict) else {}
     data = getattr(execution, "data", None)
     if isinstance(data, dict) and data:
-        return {"success": execution.success, **data, "content": execution.content, "error": execution.error}
-    return {"success": execution.success, "content": execution.content, "error": execution.error}
+        response = {
+            "success": execution.success,
+            **data,
+            "content": execution.content,
+            "error": execution.error,
+        }
+    else:
+        response = {
+            "success": execution.success,
+            "content": execution.content,
+            "error": execution.error,
+        }
+    safe_response = redact_secrets(response)
+    return dict(safe_response) if isinstance(safe_response, dict) else {}

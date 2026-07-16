@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import json
 import stat
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from nested_memvid_agent.secret_broker import KeyringSecretBroker, SecretBroker, build_secret_broker
+from nested_memvid_agent.security_boundary import redact_text
 
 
 class FakeKeyring:
@@ -40,6 +45,7 @@ def test_secret_broker_never_returns_raw_value_in_public_payloads(tmp_path: Path
     assert "123456:ABC-super-secret" not in json.dumps(public)
     assert "123456:ABC-super-secret" not in json.dumps(broker.list_secrets())
     assert "value" not in public
+    assert redact_text("echo=123456:ABC-super-secret", environ={}) == "echo=<redacted>"
 
 
 def test_secret_broker_vault_file_is_owner_only(tmp_path: Path) -> None:
@@ -115,12 +121,107 @@ def test_keyring_secret_broker_delete_removes_keyring_value(tmp_path: Path) -> N
     assert fake_keyring.values == {}
 
 
-def test_build_secret_broker_falls_back_to_json_when_keyring_missing(tmp_path: Path, monkeypatch: object) -> None:
+def test_build_secret_broker_fails_closed_when_keyring_missing(tmp_path: Path, monkeypatch: object) -> None:
     def missing_keyring(_: str) -> Any:
         raise ImportError("missing keyring")
 
     monkeypatch.setattr("nested_memvid_agent.secret_broker.import_module", missing_keyring)  # type: ignore[attr-defined]
 
-    broker = build_secret_broker(tmp_path / "vault.json", backend="keyring")
+    with pytest.raises(RuntimeError, match="keyring package is unavailable"):
+        build_secret_broker(tmp_path / "vault.json", backend="keyring")
 
-    assert type(broker) is SecretBroker
+
+def test_build_secret_broker_fails_closed_without_usable_keyring_backend(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    class UnusableBackend:
+        priority = 0
+
+    class UnusableKeyringModule:
+        @staticmethod
+        def get_keyring() -> UnusableBackend:
+            return UnusableBackend()
+
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "nested_memvid_agent.secret_broker.import_module",
+        lambda _: UnusableKeyringModule(),
+    )
+
+    with pytest.raises(RuntimeError, match="no usable OS keyring backend"):
+        build_secret_broker(tmp_path / "vault.json", backend="keyring")
+
+
+def test_secret_broker_atomic_replace_is_owner_only_before_exposure(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    import nested_memvid_agent.secret_broker as secret_broker_module
+
+    path = tmp_path / "vault.json"
+    observed_modes: list[int] = []
+    real_replace = secret_broker_module.os.replace
+
+    def inspect_replace(source: str | Path, destination: str | Path) -> None:
+        observed_modes.append(stat.S_IMODE(Path(source).stat().st_mode))
+        assert not Path(destination).exists()
+        real_replace(source, destination)
+
+    monkeypatch.setattr(secret_broker_module.os, "replace", inspect_replace)  # type: ignore[attr-defined]
+
+    SecretBroker(path).store_secret(name="TOKEN", purpose="test", value="raw-token-value")
+
+    assert observed_modes == [0o600]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_secret_broker_failed_atomic_replace_preserves_previous_vault(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    import nested_memvid_agent.secret_broker as secret_broker_module
+
+    path = tmp_path / "vault.json"
+    broker = SecretBroker(path)
+    broker.store_secret(name="TOKEN", purpose="test", value="original-token-value")
+
+    def fail_replace(_: str | Path, __: str | Path) -> None:
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr(secret_broker_module.os, "replace", fail_replace)  # type: ignore[attr-defined]
+
+    with pytest.raises(OSError, match="injected replace failure"):
+        broker.store_secret(name="TOKEN", purpose="test", value="replacement-token-value")
+
+    assert broker.resolve("secret://token") == "original-token-value"
+    assert not list(tmp_path.glob(".vault.json.*.tmp"))
+
+
+def test_secret_broker_cross_process_writes_do_not_lose_records(tmp_path: Path) -> None:
+    path = tmp_path / "vault.json"
+    script = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from nested_memvid_agent.secret_broker import SecretBroker\n"
+        "SecretBroker(Path(sys.argv[1])).store_secret("
+        "name=sys.argv[2], purpose='concurrency test', value=sys.argv[3])\n"
+    )
+    processes = [
+        subprocess.Popen(  # noqa: S603 - fixed interpreter and inline test script
+            [sys.executable, "-c", script, str(path), f"TOKEN_{index}", f"secret-value-{index}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for index in range(6)
+    ]
+
+    for process in processes:
+        _, stderr = process.communicate(timeout=15)
+        assert process.returncode == 0, stderr
+
+    broker = SecretBroker(path)
+    assert {item["name"] for item in broker.list_secrets()} == {
+        f"TOKEN_{index}" for index in range(6)
+    }
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600

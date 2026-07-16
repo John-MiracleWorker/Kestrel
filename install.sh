@@ -84,6 +84,25 @@ is_nonempty_dir() {
   [[ -n "$(find "$dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]
 }
 
+is_kestrel_checkout() {
+  local target="$1"
+  [[ -f "${target}/pyproject.toml" ]] || return 1
+  grep -Eq '^[[:space:]]*name[[:space:]]*=[[:space:]]*"nested-memvid-agent"[[:space:]]*$' \
+    "${target}/pyproject.toml"
+}
+
+require_clean_kestrel_checkout() {
+  local target="$1"
+  local status
+  is_kestrel_checkout "$target" ||
+    die "Refusing to update an unrecognized git checkout: ${target}"
+  if ! status="$(git -C "$target" status --porcelain --untracked-files=all)"; then
+    die "Unable to inspect existing Kestrel checkout: ${target}"
+  fi
+  [[ -z "$status" ]] ||
+    die "Refusing to update a dirty Kestrel checkout: ${target}. Commit, stash, or remove local changes first."
+}
+
 python_is_311_or_newer() {
   local candidate="$1"
   "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1
@@ -159,6 +178,7 @@ EOF
 }
 
 ensure_git_target() {
+  local existing_checkout=0
   if [[ -e "$KESTREL_HOME" && ! -d "$KESTREL_HOME" ]]; then
     die "Install target exists and is not a directory: ${KESTREL_HOME}"
   fi
@@ -167,23 +187,21 @@ ensure_git_target() {
   fi
 
   if [[ -d "${KESTREL_HOME}/.git" ]]; then
+    existing_checkout=1
     log "Updating existing Kestrel checkout at ${KESTREL_HOME}"
-    if ! is_true "${KESTREL_DRY_RUN:-}"; then
-      if git -C "$KESTREL_HOME" remote get-url origin >/dev/null 2>&1; then
-        run git -C "$KESTREL_HOME" remote set-url origin "$KESTREL_REPO"
-      else
-        run git -C "$KESTREL_HOME" remote add origin "$KESTREL_REPO"
-      fi
-    else
-      run git -C "$KESTREL_HOME" remote set-url origin "$KESTREL_REPO"
-    fi
+    require_clean_kestrel_checkout "$KESTREL_HOME"
   else
     run mkdir -p "$(dirname "$KESTREL_HOME")"
     run git clone "$KESTREL_REPO" "$KESTREL_HOME"
   fi
 
-  run git -C "$KESTREL_HOME" fetch origin "$KESTREL_REF"
-  run git -C "$KESTREL_HOME" checkout -f FETCH_HEAD
+  # Fetch the requested source directly so an operator-owned `origin` remote is
+  # never rewritten. A second cleanliness check closes the fetch/checkout gap.
+  run git -C "$KESTREL_HOME" fetch "$KESTREL_REPO" "$KESTREL_REF"
+  if [[ "$existing_checkout" -eq 1 ]] && ! is_true "${KESTREL_DRY_RUN:-}"; then
+    require_clean_kestrel_checkout "$KESTREL_HOME"
+  fi
+  run git -C "$KESTREL_HOME" checkout --detach --no-overwrite-ignore FETCH_HEAD
 }
 
 install_python_deps() {
@@ -200,6 +218,14 @@ install_web_deps() {
   command -v npm >/dev/null 2>&1 || die "npm is required for the web workbench. Set KESTREL_SKIP_WEB=1 to skip."
   run npm ci --prefix web
   run npm run build --prefix web
+}
+
+verify_installed_runtime() {
+  run .venv/bin/nest-agent --help
+  run .venv/bin/python -c 'import importlib.util, nested_memvid_agent; required=("fastapi","mcp","memvid_sdk","uvicorn"); missing=[name for name in required if importlib.util.find_spec(name) is None]; assert not missing, f"missing runtime modules: {missing}"; assert nested_memvid_agent.__file__'
+  if ! is_true "${KESTREL_SKIP_WEB:-}"; then
+    [[ -s web/dist/index.html ]] || die "Web workbench build is missing web/dist/index.html"
+  fi
 }
 
 initialize_memory() {
@@ -234,8 +260,7 @@ wait_for_server() {
     return 0
   fi
 
-  local attempt
-  for attempt in $(seq 1 60); do
+  for _ in {1..60}; do
     if server_is_healthy; then
       log "Kestrel server is healthy at $(server_url)"
       return 0
@@ -323,6 +348,7 @@ start_server_detached() {
   log "Server log: ${KESTREL_SERVER_LOG}"
 
   if command -v screen >/dev/null 2>&1; then
+    # shellcheck disable=SC2016  # Inner shell intentionally expands positional parameters.
     run screen -dmS "$KESTREL_SERVER_SESSION" bash -lc 'cd "$1" || exit 1; log_file="$2"; pid_file="$3"; shift 3; "$@" >>"$log_file" 2>&1 & child=$!; printf "%s\n" "$child" >"$pid_file"; wait "$child"' bash "$KESTREL_HOME" "$KESTREL_SERVER_LOG" "$KESTREL_SERVER_PID" "${server_cmd[@]}"
   elif command -v tmux >/dev/null 2>&1; then
     run tmux new-session -d -s "$KESTREL_SERVER_SESSION" "cd $(printf '%q' "$KESTREL_HOME") && $(quote_cmd "${server_cmd[@]}") >>$(printf '%q' "$KESTREL_SERVER_LOG") 2>&1 & child=\$!; printf '%s\\n' \"\$child\" >$(printf '%q' "$KESTREL_SERVER_PID"); wait \"\$child\""
@@ -473,6 +499,7 @@ main() {
 
   install_python_deps
   install_web_deps
+  verify_installed_runtime
   initialize_memory
   run_smoke_checks
   start_server_detached

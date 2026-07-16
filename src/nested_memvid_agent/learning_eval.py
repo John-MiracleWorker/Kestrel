@@ -27,6 +27,7 @@ from .llm.model_catalog import DEFAULT_API_KEY_ENVS, STATIC_MODEL_SUGGESTIONS
 from .models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord
 from .mutation_gate import MutationDecision, MutationGate, MutationGateEvidence
 from .runtime_models import ChatMessage, LLMOptions, ToolCall, ToolExecution
+from .security_boundary import redact_secrets as _boundary_redact_secrets
 from .state_store import AgentStateStore, utc_now
 from .task_capsule import summarize_run_capsule, write_run_capsule
 
@@ -589,25 +590,7 @@ def resolve_eval_model(provider: str, model: str | None) -> str:
 
 
 def redact_secrets(value: Any) -> Any:
-    if isinstance(value, dict):
-        redacted: dict[str, Any] = {}
-        for key, item in value.items():
-            lowered = str(key).lower()
-            if any(token in lowered for token in ("api_key", "authorization", "auth_header", "secret", "token")):
-                if lowered.endswith("_configured") or isinstance(item, bool):
-                    redacted[key] = item
-                else:
-                    redacted[key] = "<redacted>"
-            else:
-                redacted[key] = redact_secrets(item)
-        return redacted
-    if isinstance(value, list):
-        return [redact_secrets(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(redact_secrets(item) for item in value)
-    if isinstance(value, str):
-        return _redact_text(value)
-    return value
+    return _boundary_redact_secrets(value)
 
 
 def _stage_setup(ctx: _RunContext) -> LearningEvalStep:
@@ -1286,13 +1269,6 @@ _SECRET_PATTERNS = (
     re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._-]{8,}"),
     re.compile(r"(?i)((?:api[_-]?key|token|secret|authorization)\s*[:=]\s*)[^\s,;]+"),
 )
-
-
-def _redact_text(text: str) -> str:
-    redacted = _SECRET_PATTERNS[0].sub("sk-<redacted>", text)
-    redacted = _SECRET_PATTERNS[1].sub(r"\1<redacted>", redacted)
-    redacted = _SECRET_PATTERNS[2].sub(r"\1<redacted>", redacted)
-    return redacted
 
 
 def _contains_secret(text: str) -> bool:

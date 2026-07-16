@@ -29,6 +29,12 @@ from nested_memvid_agent.runtime_models import AgentTurnResult, ToolCall, ToolEx
 from nested_memvid_agent.server import create_app
 
 
+@pytest.fixture(autouse=True)
+def _authorized_telegram_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "12345")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "777,999")
+
+
 def test_telegram_channel_payload_runs_agent_and_records_provenance(tmp_path: Path) -> None:
     manager = ChannelManager(_config(tmp_path))
     payload = {
@@ -57,6 +63,67 @@ def test_telegram_channel_payload_runs_agent_and_records_provenance(tmp_path: Pa
     assert user_record["metadata"]["channel_message_id"] == "55"
     assert user_record["evidence"][0]["source"] == "channel:telegram"
 
+
+@pytest.mark.parametrize(
+    ("chat_id", "user_id"),
+    [(99999, 777), (12345, 888)],
+)
+def test_telegram_channel_rejects_senders_outside_environment_allowlists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    chat_id: int,
+    user_id: int,
+) -> None:
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "12345")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "777")
+    manager = ChannelManager(_config(tmp_path))
+
+    with pytest.raises(ValueError, match="not allowed"):
+        manager.handle_payload(
+            provider="telegram",
+            payload={
+                "update_id": 102,
+                "message": {
+                    "message_id": 56,
+                    "text": "untrusted request",
+                    "chat": {"id": chat_id, "type": "private"},
+                    "from": {"id": user_id},
+                },
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("chat_ids", "user_ids"),
+    [(None, None), ("", ""), ("not-a-chat", "not-a-user")],
+)
+def test_telegram_channel_fails_closed_for_missing_empty_or_malformed_allowlists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    chat_ids: str | None,
+    user_ids: str | None,
+) -> None:
+    if chat_ids is None:
+        monkeypatch.delenv("TELEGRAM_ALLOWED_CHAT_IDS", raising=False)
+    else:
+        monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", chat_ids)
+    if user_ids is None:
+        monkeypatch.delenv("TELEGRAM_ALLOWED_USER_IDS", raising=False)
+    else:
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", user_ids)
+    manager = ChannelManager(_config(tmp_path))
+
+    with pytest.raises(ValueError, match="not configured|not allowed"):
+        manager.handle_payload(
+            provider="telegram",
+            payload={
+                "message": {
+                    "text": "must not run",
+                    "chat": {"id": 12345, "type": "private"},
+                    "from": {"id": 777},
+                }
+            },
+        )
 
 def test_telegram_channel_sends_typing_action_before_agent_reply(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:test-token")
@@ -405,6 +472,92 @@ def test_public_channel_webhook_allows_explicit_unsigned_channel(tmp_path: Path)
     assert response.json()["assistant_message"] == "Mock response: unsigned allowed"
 
 
+def test_signed_telegram_webhook_is_the_only_public_api_ingress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("KESTREL_TEST_API_TOKEN", "control-plane-token")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "telegram-webhook-secret")
+    channels = [
+        {
+            "id": "telegram",
+            "provider": "telegram",
+            "enabled": True,
+            "token_env": "TELEGRAM_BOT_TOKEN",
+            "settings": {
+                "allowed_conversation_ids": ["12345"],
+                "allowed_user_ids": ["777"],
+                "signature_provider": "telegram",
+                "signature_secret_env": "TELEGRAM_WEBHOOK_SECRET",
+                "unsigned_allowed": True,
+            },
+        }
+    ]
+    (tmp_path / "channels.json").write_text(
+        json.dumps({"channels": channels}),
+        encoding="utf-8",
+    )
+    config = replace(
+        _config(tmp_path),
+        channel_config_path=tmp_path / "channels.json",
+        require_api_auth=True,
+        api_auth_token_env="KESTREL_TEST_API_TOKEN",
+    )
+    client = TestClient(create_app(config))
+    allowed_payload = {
+        "update_id": 500,
+        "message": {
+            "message_id": 50,
+            "text": "signed request",
+            "chat": {"id": 12345, "type": "private"},
+            "from": {"id": 777},
+        },
+    }
+    auth_headers = {"authorization": "Bearer control-plane-token"}
+    webhook_headers = {"x-telegram-bot-api-secret-token": "telegram-webhook-secret"}
+
+    assert client.get("/api/runs").status_code == 401
+    assert client.get("/api/runs", headers=auth_headers).json() == []
+    assert client.post(
+        "/api/channels/ingest",
+        json={"provider": "telegram", "payload": allowed_payload},
+    ).status_code == 401
+    assert client.post(
+        "/api/channels/telegram/webhook/",
+        json=allowed_payload,
+        headers=webhook_headers,
+    ).status_code == 401
+
+    missing_signature = client.post(
+        "/api/channels/telegram/webhook",
+        json=allowed_payload,
+    )
+    assert missing_signature.status_code == 400
+    assert client.get("/api/runs", headers=auth_headers).json() == []
+
+    denied_payload = json.loads(json.dumps(allowed_payload))
+    denied_payload["message"]["chat"]["id"] = 99999
+    denied = client.post(
+        "/api/channels/telegram/webhook",
+        json=denied_payload,
+        headers=webhook_headers,
+    )
+    assert denied.status_code == 400
+    assert "not allowed" in denied.json()["detail"]
+    assert client.get("/api/runs", headers=auth_headers).json() == []
+
+    accepted = client.post(
+        "/api/channels/telegram/webhook",
+        json=allowed_payload,
+        headers=webhook_headers,
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["session_id"] == "channel:telegram:12345"
+    assert len(client.get("/api/runs", headers=auth_headers).json()) == 1
+
+
 def test_unknown_explicit_channel_id_is_rejected(tmp_path: Path, monkeypatch: object) -> None:
     monkeypatch.setenv("KESTREL_WEBHOOK_SECRET", "secret")  # type: ignore[attr-defined]
     signed = ChannelEndpointConfig(
@@ -588,6 +741,50 @@ def test_server_rejects_untrusted_host_and_origin(tmp_path: Path) -> None:
     assert origin_response.status_code == 403
 
 
+def test_zero_bind_address_is_not_a_trusted_host_wildcard(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    config = replace(
+        _config(tmp_path),
+        trusted_hosts=("0.0.0.0", "localhost", "testserver"),
+    )
+    client = TestClient(create_app(config))
+
+    host_response = client.get("/api/health", headers={"host": "evil.example"})
+    origin_response = client.get(
+        "/api/health",
+        headers={"host": "localhost", "origin": "https://evil.example"},
+    )
+
+    assert host_response.status_code == 400
+    assert origin_response.status_code == 403
+
+
+def test_prometheus_metrics_require_api_auth_when_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("KESTREL_TEST_API_TOKEN", "metrics-token")
+    config = replace(
+        _config(tmp_path),
+        require_api_auth=True,
+        api_auth_token_env="KESTREL_TEST_API_TOKEN",
+    )
+    client = TestClient(create_app(config))
+
+    unauthenticated = client.get("/metrics")
+    authenticated = client.get(
+        "/metrics",
+        headers={"authorization": "Bearer metrics-token"},
+    )
+
+    assert unauthenticated.status_code == 401
+    assert authenticated.status_code == 200
+    assert "kestrel_up 1" in authenticated.text
+
+
 def test_server_accepts_trusted_wildcard_tunnel_host(tmp_path: Path) -> None:
     from fastapi.testclient import TestClient
 
@@ -685,7 +882,15 @@ def test_telegram_approval_callback_decides_pending_approval(tmp_path: Path) -> 
     manager = ChannelManager(
         _config(tmp_path),
         run_manager=fake_runs,
-        channel_configs=[ChannelEndpointConfig(id="telegram", provider="telegram", send_enabled=True, auto_reply=True)],
+        channel_configs=[
+            ChannelEndpointConfig(
+                id="telegram",
+                provider="telegram",
+                send_enabled=True,
+                auto_reply=True,
+                settings={"admin_enabled": True, "owner_user_ids": ["777"]},
+            )
+        ],
     )
 
     result = manager.handle_payload(
@@ -704,6 +909,96 @@ def test_telegram_approval_callback_decides_pending_approval(tmp_path: Path) -> 
 
     assert fake_runs.decisions == [("approval_123", True)]
     assert result.outbound.text == "Approved approval_123. Continuing…"
+
+
+def test_telegram_approval_callback_requires_explicit_admin_enablement(
+    tmp_path: Path,
+) -> None:
+    class FakeRunManager:
+        def decide_approval(
+            self,
+            approval_id: str,
+            *,
+            approved: bool,
+            arguments: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            raise AssertionError("disabled Telegram admin must not decide approvals")
+
+    manager = ChannelManager(
+        _config(tmp_path),
+        run_manager=FakeRunManager(),
+        channel_configs=[
+            ChannelEndpointConfig(
+                id="telegram",
+                provider="telegram",
+                settings={"owner_user_ids": ["777"]},
+            )
+        ],
+    )
+
+    result = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "callback_query": {
+                "id": "callback_disabled_admin",
+                "data": "kestrel_approve:approval_123",
+                "from": {"id": 777},
+                "message": {
+                    "message_id": 56,
+                    "chat": {"id": 12345, "type": "private"},
+                },
+            }
+        },
+        send=True,
+    )
+
+    assert result.turn.stop_reason == "admin_unauthorized"
+    assert result.outbound.text == (
+        "Telegram admin action denied: sender is not a configured Kestrel owner."
+    )
+
+
+def test_telegram_approval_callback_checks_chat_allowlist_before_decision(
+    tmp_path: Path,
+) -> None:
+    class FakeRunManager:
+        def decide_approval(
+            self,
+            approval_id: str,
+            *,
+            approved: bool,
+            arguments: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            raise AssertionError("disallowed callback must not decide an approval")
+
+    manager = ChannelManager(
+        _config(tmp_path),
+        run_manager=FakeRunManager(),
+        channel_configs=[
+            ChannelEndpointConfig(
+                id="telegram",
+                provider="telegram",
+                settings={"owner_user_ids": ["777"]},
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="conversation is not allowed"):
+        manager.handle_payload(
+            provider="telegram",
+            payload={
+                "callback_query": {
+                    "id": "callback_disallowed_chat",
+                    "data": "kestrel_approve:approval_123",
+                    "from": {"id": 777},
+                    "message": {
+                        "message_id": 57,
+                        "chat": {"id": 99999, "type": "private"},
+                    },
+                }
+            },
+            send=True,
+        )
 
 
 def test_telegram_run_manager_sends_followup_when_run_finishes_after_initial_timeout(tmp_path: Path) -> None:
@@ -950,6 +1245,81 @@ def test_telegram_max_tool_rounds_reply_includes_run_summary(tmp_path: Path) -> 
     assert "file_read_failed" in text
 
 
+def test_telegram_allowed_user_is_not_implicitly_an_admin_owner(tmp_path: Path) -> None:
+    class FakeRunManager:
+        def create_run(self, **kwargs: Any) -> object:
+            raise AssertionError("admin commands must not fall through to an agent run")
+
+    manager = ChannelManager(
+        _config(tmp_path),
+        run_manager=FakeRunManager(),
+        channel_configs=[
+            ChannelEndpointConfig(
+                id="telegram",
+                provider="telegram",
+                auto_reply=True,
+            )
+        ],
+    )
+
+    result = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "message": {
+                "message_id": 55,
+                "text": "/status",
+                "chat": {"id": 12345, "type": "private"},
+                "from": {"id": 777},
+            }
+        },
+        send=True,
+    )
+
+    assert result.turn.stop_reason == "admin_disabled"
+    assert result.outbound.text == "Telegram admin command denied: admin mode is disabled."
+
+
+@pytest.mark.parametrize("owners", [[], ["777", "999"]])
+def test_telegram_admin_mode_requires_exactly_one_explicit_owner(
+    tmp_path: Path,
+    owners: list[str],
+) -> None:
+    class FakeRunManager:
+        def create_run(self, **kwargs: Any) -> object:
+            raise AssertionError("admin commands must not fall through to an agent run")
+
+    manager = ChannelManager(
+        _config(tmp_path),
+        run_manager=FakeRunManager(),
+        channel_configs=[
+            ChannelEndpointConfig(
+                id="telegram",
+                provider="telegram",
+                auto_reply=True,
+                settings={"admin_enabled": True, "owner_user_ids": owners},
+            )
+        ],
+    )
+
+    result = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "message": {
+                "message_id": 55,
+                "text": "/status",
+                "chat": {"id": 12345, "type": "private"},
+                "from": {"id": 777},
+            }
+        },
+        send=True,
+    )
+
+    assert result.turn.stop_reason == "admin_unauthorized"
+    assert result.outbound.text == (
+        "Telegram admin command denied: sender is not a configured Kestrel owner."
+    )
+
+
 def test_telegram_admin_command_requires_configured_owner(tmp_path: Path) -> None:
     class FakeRunManager:
         def create_run(self, **kwargs: Any) -> object:
@@ -963,7 +1333,7 @@ def test_telegram_admin_command_requires_configured_owner(tmp_path: Path) -> Non
                 id="telegram",
                 provider="telegram",
                 auto_reply=True,
-                settings={"admin_user_ids": ["777"]},
+                settings={"admin_enabled": True, "admin_user_ids": ["777"]},
             )
         ],
     )
@@ -1015,7 +1385,7 @@ def test_telegram_admin_status_command_reports_runs_and_pending_approvals(tmp_pa
                 id="telegram",
                 provider="telegram",
                 auto_reply=True,
-                settings={"admin_user_ids": ["777"]},
+                settings={"admin_enabled": True, "admin_user_ids": ["777"]},
             )
         ],
     )
@@ -1081,7 +1451,7 @@ def test_telegram_admin_approval_command_uses_owner_and_exact_pending_arguments(
                 id="telegram",
                 provider="telegram",
                 auto_reply=True,
-                settings={"admin_user_ids": ["777"]},
+                settings={"admin_enabled": True, "admin_user_ids": ["777"]},
             )
         ],
     )
@@ -1164,6 +1534,128 @@ def test_telegram_natural_language_max_tool_calls_requires_confirmation(tmp_path
     assert fake_runs.config.max_tool_rounds == 12
 
 
+def test_telegram_admin_confirmation_expires_fail_closed(tmp_path: Path) -> None:
+    class FakeRunManager:
+        def __init__(self) -> None:
+            self.config = _config(tmp_path)
+
+        def create_run(self, **kwargs: Any) -> object:
+            raise AssertionError("admin settings changes must not create a normal run")
+
+    manager = ChannelManager(
+        _config(tmp_path),
+        run_manager=FakeRunManager(),
+        channel_configs=[
+            ChannelEndpointConfig(
+                id="telegram",
+                provider="telegram",
+                auto_reply=True,
+                settings={"admin_enabled": True, "owner_user_ids": ["777"]},
+            )
+        ],
+    )
+    preview = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "message": {
+                "message_id": 55,
+                "text": "increase max tool calls to 12",
+                "chat": {"id": 12345, "type": "private"},
+                "from": {"id": 777},
+            }
+        },
+        send=True,
+    )
+    confirm_data = preview.delivery.request_json["reply_markup"]["inline_keyboard"][0][0][
+        "callback_data"
+    ]
+    confirmation_id = str(confirm_data).removeprefix("kestrel_admin_confirm:")
+    manager._pending_admin_confirmations[confirmation_id]["created_at"] = time.time() - 301
+
+    result = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "callback_query": {
+                "id": "callback_expired",
+                "data": confirm_data,
+                "from": {"id": 777},
+                "message": {
+                    "message_id": 56,
+                    "chat": {"id": 12345, "type": "private"},
+                },
+            }
+        },
+        send=True,
+    )
+
+    assert result.turn.stop_reason == "admin_confirmation_expired"
+    assert manager.config.max_tool_rounds != 12
+
+
+def test_telegram_admin_confirmation_is_bound_to_original_owner(tmp_path: Path) -> None:
+    class FakeRunManager:
+        def __init__(self) -> None:
+            self.config = _config(tmp_path)
+
+        def create_run(self, **kwargs: Any) -> object:
+            raise AssertionError("admin settings changes must not create a normal run")
+
+    manager = ChannelManager(
+        _config(tmp_path),
+        run_manager=FakeRunManager(),
+        channel_configs=[
+            ChannelEndpointConfig(
+                id="telegram",
+                provider="telegram",
+                auto_reply=True,
+                settings={"admin_enabled": True, "owner_user_ids": ["777"]},
+            )
+        ],
+    )
+    preview = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "message": {
+                "message_id": 55,
+                "text": "increase max tool calls to 12",
+                "chat": {"id": 12345, "type": "private"},
+                "from": {"id": 777},
+            }
+        },
+        send=True,
+    )
+    confirm_data = preview.delivery.request_json["reply_markup"]["inline_keyboard"][0][0][
+        "callback_data"
+    ]
+    manager.upsert_channel(
+        {
+            "id": "telegram",
+            "provider": "telegram",
+            "auto_reply": True,
+            "settings": {"admin_enabled": True, "owner_user_ids": ["999"]},
+        }
+    )
+
+    result = manager.handle_payload(
+        provider="telegram",
+        payload={
+            "callback_query": {
+                "id": "callback_new_owner",
+                "data": confirm_data,
+                "from": {"id": 999},
+                "message": {
+                    "message_id": 56,
+                    "chat": {"id": 12345, "type": "private"},
+                },
+            }
+        },
+        send=True,
+    )
+
+    assert result.turn.stop_reason == "admin_confirmation_owner_mismatch"
+    assert manager.config.max_tool_rounds != 12
+
+
 def test_telegram_natural_language_raw_secret_is_rejected(tmp_path: Path) -> None:
     class FakeRunManager:
         def create_run(self, **kwargs: Any) -> object:
@@ -1213,7 +1705,7 @@ def test_telegram_approval_callback_rejects_non_owner_when_owner_is_configured(t
                 id="telegram",
                 provider="telegram",
                 auto_reply=True,
-                settings={"admin_user_ids": ["777"]},
+                settings={"admin_enabled": True, "admin_user_ids": ["777"]},
             )
         ],
     )

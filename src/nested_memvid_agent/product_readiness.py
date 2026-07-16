@@ -52,6 +52,7 @@ class ProductReadinessHeadline:
 @dataclass(frozen=True)
 class ProductReadinessReport:
     schema: str
+    scope: str
     headline: ProductReadinessHeadline
     categories: tuple[ProductReadinessCategory, ...]
 
@@ -64,18 +65,20 @@ class ProductReadinessReport:
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema": self.schema,
+            "scope": self.scope,
             "headline": self.headline.to_dict(),
             "categories": [category.to_dict() for category in self.categories],
         }
 
 
 def build_product_readiness_report() -> ProductReadinessReport:
-    """Return the static productization readiness baseline for the current alpha.
+    """Return the static roadmap baseline for the full hosted/team product scope.
 
     This report is intentionally read-only: it does not inspect secrets, mutate
-    runtime state, or promote any alpha feature to product-ready. Future slices
-    can replace individual evidence strings with live checks as the product
-    surface matures.
+    runtime state, or certify an exact build for deployment. Supported-profile
+    readiness belongs to live setup/health checks and the exact-byte release
+    review; this report also tracks hosted/team capabilities that are outside
+    the supported single-user, single-node profile.
     """
     categories = (
         ProductReadinessCategory(
@@ -123,7 +126,7 @@ def build_product_readiness_report() -> ProductReadinessReport:
         ),
         ProductReadinessCategory(
             category_id="production_auth_workspaces",
-            title="Production auth, users, and workspaces",
+            title="Hosted/team auth, users, and workspaces",
             status=ProductReadinessStatus.MISSING,
             evidence=(
                 "Local bearer/API-key auth exists for the control plane.",
@@ -183,11 +186,13 @@ def build_product_readiness_report() -> ProductReadinessReport:
             evidence=(
                 "Makefile, Dockerfile, Docker Compose, .env example, deployment docs, memory operations docs, and release checklist exist.",
                 "Support bundle export can gather redacted setup/readiness, runtime, git, state, and log-tail metadata from CLI/API.",
+                "Fail-closed upgrade/rollback, checksummed Memvid backup/restore, launchd supervision, health/readiness gates, chaos recovery, and a bounded soak harness exist.",
             ),
             remaining_work=(
-                "Add upgrade/migration rollback checks, memory backup/restore validation, process supervision, and health-check gates.",
+                "Run exact candidate bytes through the supported cross-platform CI matrix and independent review.",
+                "Publish deliberately versioned, tagged, and provenance-backed artifacts only after every release gate passes.",
             ),
-            next_action="Add upgrade and memory backup/restore validation to release gates.",
+            next_action="Commit the reviewed candidate and obtain exact-byte CI evidence before versioning or publication.",
         ),
         ProductReadinessCategory(
             category_id="channels_ingress",
@@ -218,7 +223,8 @@ def build_product_readiness_report() -> ProductReadinessReport:
     partial_count = sum(1 for category in categories if category.status == ProductReadinessStatus.PARTIAL)
     missing_count = sum(1 for category in categories if category.status == ProductReadinessStatus.MISSING)
     return ProductReadinessReport(
-        schema="kestrel.product_readiness.v1",
+        schema="kestrel.product_readiness.v2",
+        scope="full_product_including_hosted_team",
         headline=ProductReadinessHeadline(
             total_categories=len(categories),
             ready_count=ready_count,

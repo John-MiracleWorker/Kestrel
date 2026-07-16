@@ -9,6 +9,8 @@
       "token_env": "TELEGRAM_BOT_TOKEN",
       "settings": {
         "admin_enabled": false,
+        "allowed_conversation_ids": [],
+        "allowed_user_ids": [],
         "owner_user_ids": [],
         "signature_provider": "telegram",
         "signature_secret_env": "TELEGRAM_WEBHOOK_SECRET"

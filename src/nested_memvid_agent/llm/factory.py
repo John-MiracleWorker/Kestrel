@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 
 from ..config import AgentConfig
@@ -11,12 +12,13 @@ from .mock import MockLLMProvider
 from .ollama_provider import OllamaNativeProvider
 from .openai_compatible_provider import OpenAICompatibleProvider
 from .openai_provider import OpenAIResponsesProvider
+from .resilience import ResilientLLMProvider, global_provider_health_registry
 
 SecretResolver = Callable[[str | None], str | None]
 
 
 def build_llm_provider(config: AgentConfig, *, secret_resolver: SecretResolver | None = None) -> LLMProvider:
-    provider = _build_single_provider(
+    provider = _build_resilient_provider(
         config,
         provider=config.provider,
         model=config.model,
@@ -25,16 +27,80 @@ def build_llm_provider(config: AgentConfig, *, secret_resolver: SecretResolver |
         secret_resolver=secret_resolver,
     )
     if config.fallback_provider:
-        fallback = _build_single_provider(
+        fallback = _build_resilient_provider(
             config,
             provider=config.fallback_provider,
             model=config.fallback_model or config.model,
             base_url=config.fallback_base_url,
-            api_key_env=config.fallback_api_key_env or config.api_key_env,
+            api_key_env=config.fallback_api_key_env,
             secret_resolver=secret_resolver,
         )
+        _validate_fallback_compatibility(provider, fallback)
         return FallbackLLMProvider(provider, fallback)
     return provider
+
+
+def _build_resilient_provider(
+    config: AgentConfig,
+    *,
+    provider: str,
+    model: str,
+    base_url: str | None,
+    api_key_env: str | None,
+    secret_resolver: SecretResolver | None,
+) -> LLMProvider:
+    inner = _build_single_provider(
+        config,
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_key_env=api_key_env,
+        secret_resolver=secret_resolver,
+    )
+    return ResilientLLMProvider(
+        inner,
+        provider_id=_provider_identity(provider, model, base_url, api_key_env),
+        registry=global_provider_health_registry,
+        failure_threshold=config.provider_circuit_failure_threshold,
+        cooldown_seconds=config.provider_circuit_cooldown_seconds,
+    )
+
+
+def provider_health_id(config: AgentConfig) -> str:
+    return _provider_identity(
+        str(getattr(config, "provider", "unknown")),
+        str(getattr(config, "model", "unknown")),
+        getattr(config, "base_url", None),
+        getattr(config, "api_key_env", None),
+    )
+
+
+def _provider_identity(
+    provider: str,
+    model: str,
+    base_url: str | None,
+    api_key_env: str | None,
+) -> str:
+    endpoint_identity = f"{base_url or '<default>'}\0{api_key_env or '<provider-default>'}"
+    digest = hashlib.sha256(endpoint_identity.encode("utf-8")).hexdigest()[:12]
+    return f"{provider}:{model}:{digest}"
+
+
+def _validate_fallback_compatibility(primary: LLMProvider, fallback: LLMProvider) -> None:
+    required_capabilities = (
+        "supports_native_tools",
+        "supports_json_mode",
+        "supports_system_messages",
+    )
+    incompatible = [
+        capability
+        for capability in required_capabilities
+        if getattr(primary.capabilities, capability) and not getattr(fallback.capabilities, capability)
+    ]
+    if incompatible:
+        raise ValueError(
+            "Fallback provider is missing required capabilities: " + ", ".join(sorted(incompatible))
+        )
 
 
 def _build_single_provider(

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
+from ..security_boundary import assert_path_not_sensitive
 from .base import AgentTool, ToolContext
 from .patch_helpers import _validate_patch_paths
 from .process_tools import (
@@ -54,6 +55,38 @@ def _is_allowlisted_command(command: list[str], allowed_first_tokens: set[str]) 
     if executable in allowed_first_tokens:
         return True
     return "python" in allowed_first_tokens and _is_python_executable_name(executable)
+
+
+def _validate_allowlisted_path_operands(command: list[str], workspace: Path) -> str | None:
+    """Keep allowlisted file-inspection commands inside the non-sensitive workspace."""
+
+    if not command:
+        return "Missing command"
+    executable = Path(command[0]).name.lower()
+    if executable not in {"cat", "ls"}:
+        return None
+    operands: list[str] = []
+    after_options = False
+    for argument in command[1:]:
+        if argument == "--" and not after_options:
+            after_options = True
+            continue
+        if not after_options and argument.startswith("-"):
+            continue
+        operands.append(argument)
+    if executable == "cat" and not operands:
+        return "cat requires at least one workspace file"
+    for operand in operands:
+        if operand == "-":
+            return "stdin operands are not allowed"
+        candidate = Path(operand)
+        if not candidate.is_absolute():
+            candidate = workspace / candidate
+        try:
+            assert_path_not_sensitive(workspace, candidate, requested_path=operand)
+        except ValueError as exc:
+            return str(exc)
+    return None
 
 
 class ShellRunTool(AgentTool):
@@ -111,6 +144,14 @@ class ShellRunTool(AgentTool):
                 success=False,
                 content="Command is not allowlisted",
                 error="command_not_allowlisted",
+            )
+        path_error = _validate_allowlisted_path_operands(command, context.workspace)
+        if path_error is not None:
+            return self._result(
+                call,
+                success=False,
+                content=path_error,
+                error="path_not_allowed",
             )
         try:
             completed = _run_subprocess(
@@ -328,7 +369,11 @@ class TestRunTool(AgentTool):
         command = _normalize_python_command(command)
         try:
             completed = _run_subprocess(
-                command, context=context, arguments=arguments, default_timeout=120
+                command,
+                context=context,
+                arguments=arguments,
+                default_timeout=120,
+                sanitize_environment=True,
             )
             content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
             return self._result(
@@ -390,7 +435,11 @@ class LintRunTool(AgentTool):
         command = _normalize_python_command(command)
         try:
             completed = _run_subprocess(
-                command, context=context, arguments=arguments, default_timeout=120
+                command,
+                context=context,
+                arguments=arguments,
+                default_timeout=120,
+                sanitize_environment=True,
             )
             content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
             return self._result(

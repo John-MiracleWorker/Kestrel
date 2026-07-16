@@ -51,6 +51,31 @@ def test_default_memory_system_includes_self_layer(tmp_path: Path) -> None:
     assert memory.specs[MemoryLayer.SELF].mv2_file == "self.mv2"
 
 
+def test_memory_system_closes_partially_opened_backends_when_startup_fails(
+    tmp_path: Path,
+) -> None:
+    FailingOpenBackend.closed_layers = []
+
+    with pytest.raises(RuntimeError, match="semantic open failed"):
+        LayeredMemorySystem.from_backend_factory(tmp_path, FailingOpenBackend)
+
+    assert FailingOpenBackend.closed_layers == [
+        MemoryLayer.SEMANTIC,
+        MemoryLayer.EPISODIC,
+        MemoryLayer.WORKING,
+    ]
+
+
+def test_memory_system_closes_every_backend_when_sealing_fails(tmp_path: Path) -> None:
+    FailingSealBackend.closed_layers = []
+    memory = LayeredMemorySystem.from_backend_factory(tmp_path, FailingSealBackend)
+
+    with pytest.raises(RuntimeError, match="working seal failed"):
+        memory.close_all()
+
+    assert set(FailingSealBackend.closed_layers) == set(MemoryLayer)
+
+
 def test_maybe_seal_all_defers_working_memory_until_threshold(tmp_path: Path) -> None:
     CountingBackend.seal_calls = 0
     memory = LayeredMemorySystem.from_backend_factory(tmp_path, CountingBackend)
@@ -175,3 +200,29 @@ class CountingBackend(InMemoryBackend):
 
     def seal(self) -> None:
         type(self).seal_calls += 1
+
+
+class FailingOpenBackend(InMemoryBackend):
+    closed_layers: list[MemoryLayer] = []
+
+    def open(self) -> None:
+        if self.layer == MemoryLayer.SEMANTIC:
+            raise RuntimeError("semantic open failed")
+        super().open()
+
+    def close(self) -> None:
+        type(self).closed_layers.append(self.layer)
+        super().close()
+
+
+class FailingSealBackend(InMemoryBackend):
+    closed_layers: list[MemoryLayer] = []
+
+    def seal(self) -> None:
+        if self.layer == MemoryLayer.WORKING:
+            raise RuntimeError("working seal failed")
+        super().seal()
+
+    def close(self) -> None:
+        type(self).closed_layers.append(self.layer)
+        super().close()

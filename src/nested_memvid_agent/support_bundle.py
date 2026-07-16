@@ -20,6 +20,8 @@ _STATE_TABLES = (
     "runs",
     "run_steps",
     "approval_requests",
+    "capability_overrides",
+    "capability_change_log",
     "mcp_servers",
     "skill_registry",
     "plugin_registry",
@@ -145,6 +147,7 @@ def _runtime_payload(config: AgentConfig) -> dict[str, Any]:
             "allow_web": config.allow_web,
             "allow_self_modification": config.allow_self_modification,
             "require_approval_for_high_risk_tools": config.require_approval_for_high_risk_tools,
+            "approval_ttl_seconds": config.approval_ttl_seconds,
             "require_api_auth": config.require_api_auth,
         },
         "learning_flags": {
@@ -266,7 +269,7 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 
 def _event_tail(path: Path, *, limit: int) -> list[dict[str, Any]]:
     bounded = _bounded_log_tail(limit)
-    if bounded <= 0 or not path.exists():
+    if bounded <= 0 or not _safe_log_file(path, path.parent):
         return []
     lines = path.read_text(encoding="utf-8").splitlines()[-bounded:]
     events: list[dict[str, Any]] = []
@@ -283,10 +286,10 @@ def _event_tail(path: Path, *, limit: int) -> list[dict[str, Any]]:
 
 def _log_files(log_dir: Path) -> list[dict[str, Any]]:
     resolved = log_dir.expanduser()
-    if not resolved.exists() or not resolved.is_dir():
+    if resolved.is_symlink() or not resolved.exists() or not resolved.is_dir():
         return []
     files: list[dict[str, Any]] = []
-    for path in sorted(item for item in resolved.iterdir() if item.is_file()):
+    for path in sorted(item for item in resolved.iterdir() if _safe_log_file(item, resolved)):
         stat = path.stat()
         files.append(
             {
@@ -296,6 +299,17 @@ def _log_files(log_dir: Path) -> list[dict[str, Any]]:
             }
         )
     return files
+
+
+def _safe_log_file(path: Path, root: Path) -> bool:
+    if root.is_symlink() or path.is_symlink() or not path.is_file():
+        return False
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved_path = path.resolve(strict=True)
+    except (FileNotFoundError, RuntimeError):
+        return False
+    return resolved_root in resolved_path.parents
 
 
 def _bounded_log_tail(limit: int) -> int:

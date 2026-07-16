@@ -1,12 +1,16 @@
 import json
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from importlib import import_module
 from pathlib import Path
+from threading import Thread
 from typing import Any
+from uuid import uuid4
 
 from .app_factory import build_agent
 from .behavior_delta_ledger import BehaviorDeltaLedger
+from .capability_policy import parent_resource_digest
 from .channels import ChannelManager
 from .config import AgentConfig
 from .event_bus import RunEventBus
@@ -16,7 +20,7 @@ from .models import MemoryLayer, RetrievalQuery
 from .orchestrator import build_memory_system
 from .plugin_manager import PluginError, PluginManager
 from .promotion_ledger import PromotionLedger
-from .run_manager import RunManager
+from .run_manager import RunCapacityError, RunManager
 from .runtime_settings import (
     RuntimeSettingsStore,
     apply_runtime_settings,
@@ -33,10 +37,18 @@ from .self_profile import (
     persona_presets_public,
 )
 from .server_support import (
+    RequestBodyTooLarge,
+    RequestRateLimiter,
+    request_headers,
+)
+from .server_support import (
     api_auth_error as _api_auth_error,
 )
 from .server_support import (
     bounded_limit as _bounded_limit,
+)
+from .server_support import (
+    cache_bounded_request_body as _cache_bounded_request_body,
 )
 from .server_support import (
     csv_layers as _csv_layers,
@@ -57,13 +69,10 @@ from .server_support import (
     known_secret_env_names as _known_secret_env_names,
 )
 from .server_support import (
-    request_headers,
-)
-from .server_support import (
     tool_response_payload as _tool_response_payload,
 )
 from .skill_manager import SkillManager
-from .state_store import AgentStateStore
+from .state_store import AgentStateStore, CapabilityConflictError
 
 
 def create_app(config: AgentConfig | None = None) -> Any:
@@ -75,6 +84,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         staticfiles_module = import_module("starlette.staticfiles")
         cors_module = import_module("starlette.middleware.cors")
         from .server_behavior_delta_routes import register_behavior_delta_routes
+        from .server_capability_routes import register_capability_routes
         from .server_channel_routes import register_channel_routes
         from .server_diagnosis_routes import register_diagnosis_routes
         from .server_mcp_routes import register_mcp_routes
@@ -223,6 +233,13 @@ def create_app(config: AgentConfig | None = None) -> Any:
     @asynccontextmanager
     async def lifespan(app_instance: Any) -> Any:
         del app_instance
+        if active_config.provider_startup_probe:
+            Thread(
+                target=_probe_provider_health,
+                kwargs={"config": active_config, "secret_resolver": secret_broker.resolve},
+                name="kestrel-provider-startup-probe",
+                daemon=True,
+            ).start()
         try:
             yield
         finally:
@@ -240,6 +257,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    rate_limiter = RequestRateLimiter()
 
     @app.middleware("http")  # type: ignore[untyped-decorator]
     async def local_ingress_guard(request: Any, call_next: Any) -> Any:
@@ -256,12 +274,66 @@ def create_app(config: AgentConfig | None = None) -> Any:
                     {"detail": "untrusted_origin"}, status_code=403
                 )
         path = str(getattr(getattr(request, "url", None), "path", ""))
-        if path == "/api" or path.startswith("/api/"):
-            auth_error = _api_auth_error(active_config, headers)
-            if auth_error is not None:
-                status_code, detail = auth_error
-                return responses_module.JSONResponse({"detail": detail}, status_code=status_code)
+        method = str(getattr(request, "method", "GET")).upper()
+        api_path = path == "/api" or path.startswith("/api/")
+        guarded_path = api_path or path == "/metrics"
+        public_telegram_webhook = (
+            method == "POST" and path == "/api/channels/telegram/webhook"
+        )
+        cors_preflight = (
+            method == "OPTIONS"
+            and bool(origin)
+            and bool(str(headers.get("access-control-request-method", "")).strip())
+        )
+        if guarded_path:
+            if not public_telegram_webhook and not cors_preflight:
+                auth_error = _api_auth_error(active_config, headers)
+                if auth_error is not None:
+                    status_code, detail = auth_error
+                    return responses_module.JSONResponse({"detail": detail}, status_code=status_code)
+            content_length = str(headers.get("content-length", "")).strip()
+            if content_length:
+                try:
+                    request_bytes = int(content_length)
+                except ValueError:
+                    return responses_module.JSONResponse({"detail": "invalid_content_length"}, status_code=400)
+                if request_bytes > active_config.max_request_body_bytes:
+                    return responses_module.JSONResponse({"detail": "request_body_too_large"}, status_code=413)
+            if method not in {"GET", "HEAD", "OPTIONS"}:
+                try:
+                    await _cache_bounded_request_body(
+                        request,
+                        limit=active_config.max_request_body_bytes,
+                    )
+                except RequestBodyTooLarge:
+                    return responses_module.JSONResponse(
+                        {"detail": "request_body_too_large"},
+                        status_code=413,
+                    )
+                client = getattr(request, "client", None)
+                client_host = str(getattr(client, "host", "local"))
+                if not rate_limiter.allow(
+                    client_host,
+                    limit=active_config.api_rate_limit_requests,
+                    window_seconds=active_config.api_rate_limit_window_seconds,
+                    max_keys=active_config.api_rate_limit_max_clients,
+                ):
+                    return responses_module.JSONResponse({"detail": "rate_limit_exceeded"}, status_code=429)
         return await call_next(request)
+
+    @app.middleware("http")  # type: ignore[untyped-decorator]
+    async def request_correlation(request: Any, call_next: Any) -> Any:
+        candidate = str(request.headers.get("x-request-id", "")).strip()
+        request_id = (
+            candidate
+            if 0 < len(candidate) <= 128
+            and all(character.isalnum() or character in "-_." for character in candidate)
+            else f"req_{uuid4().hex}"
+        )
+        request.state.request_id = request_id
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
 
     register_runtime_routes(
         app,
@@ -271,6 +343,11 @@ def create_app(config: AgentConfig | None = None) -> Any:
         on_config_update=update_active_config,
         secret_broker=secret_broker,
         http_exception=HTTPException,
+        runs=runs,
+        provider_probe=lambda: _probe_provider_health(
+            config=active_config,
+            secret_resolver=secret_broker.resolve,
+        ),
     )
 
     register_secret_routes(
@@ -289,14 +366,29 @@ def create_app(config: AgentConfig | None = None) -> Any:
     )
 
     @app.post("/api/runs")  # type: ignore[untyped-decorator]
-    def create_run(request: CreateRunRequest) -> dict[str, object]:
-        run = runs.create_run(
-            message=request.message,
-            session_id=request.session_id,
-            workspace=Path(request.workspace) if request.workspace else None,
-            provider=request.provider,
-            model=request.model,
-            autonomy_mode=request.autonomy_mode,
+    def create_run(
+        request: CreateRunRequest,
+        http_request: Request,  # type: ignore[valid-type]
+    ) -> dict[str, object]:
+        try:
+            run = runs.create_run(
+                message=request.message,
+                session_id=request.session_id,
+                workspace=Path(request.workspace) if request.workspace else None,
+                provider=request.provider,
+                model=request.model,
+                autonomy_mode=request.autonomy_mode,
+            )
+        except RunCapacityError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        runs.events.publish(
+            run.run_id,
+            "request.correlated",
+            {
+                "request_id": str(
+                    getattr(getattr(http_request, "state", None), "request_id", "unknown")
+                )
+            },
         )
         return asdict(run)
 
@@ -339,6 +431,8 @@ def create_app(config: AgentConfig | None = None) -> Any:
             return runs.approve_task(run_id, str(request["task_id"]))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/scheduler/step")  # type: ignore[untyped-decorator]
     def scheduler_step(run_id: str, request: SchedulerStepRequest) -> dict[str, object]:
@@ -346,6 +440,8 @@ def create_app(config: AgentConfig | None = None) -> Any:
             return runs.run_scheduler_step(run_id, max_tasks=request.max_tasks)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/scheduler/run")  # type: ignore[untyped-decorator]
     def scheduler_run(run_id: str, request: SchedulerRunRequest) -> dict[str, object]:
@@ -355,10 +451,12 @@ def create_app(config: AgentConfig | None = None) -> Any:
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     register_observability_routes(
         app,
-        active_config=active_config,
+        active_config=lambda: active_config,
         http_exception=HTTPException,
         streaming_response=StreamingResponse,
         state=state,
@@ -374,6 +472,14 @@ def create_app(config: AgentConfig | None = None) -> Any:
         return ledger.learning_dashboard(since=_parse_since_window(since)).to_payload()
 
     register_tool_routes(app, runs=runs)
+    register_capability_routes(
+        app,
+        http_exception=HTTPException,
+        state=state,
+        runs=runs,
+        mcp=mcp,
+        skills=skills,
+    )
 
     @app.get("/api/self")  # type: ignore[untyped-decorator]
     def inspect_self() -> dict[str, object]:
@@ -447,7 +553,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
     @app.get("/api/approvals")  # type: ignore[untyped-decorator]
     def list_approvals(status: str | None = None) -> list[dict[str, object]]:
-        return state.list_approvals(status=status)
+        return runs.list_approvals(status=status)
 
     @app.post("/api/approvals/{approval_id}/decision")  # type: ignore[untyped-decorator]
     def decide_approval(approval_id: str, request: ApprovalDecisionRequest) -> dict[str, object]:
@@ -494,6 +600,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
     def sync_plugins() -> list[dict[str, object]]:
         require_plugin_install_enabled()
         plugins.sync_all()
+        mcp.close_disabled_sessions()
         return plugins.list_plugins()
 
     @app.post("/api/plugins/{plugin_id}/sync")  # type: ignore[untyped-decorator]
@@ -501,6 +608,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         require_plugin_install_enabled()
         try:
             plugins.sync_plugin(plugin_id)
+            mcp.close_disabled_sessions()
             return plugins.get_plugin(plugin_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -525,6 +633,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         require_plugin_install_enabled()
         try:
             plugin = plugins.set_enabled(plugin_id, True)
+            mcp.close_disabled_sessions()
             audit_plugin("enable", plugin)
             return plugin
         except KeyError as exc:
@@ -536,6 +645,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
     def disable_plugin(plugin_id: str) -> dict[str, object]:
         try:
             plugin = plugins.set_enabled(plugin_id, False)
+            mcp.close_disabled_sessions()
             audit_plugin("disable", plugin)
             return plugin
         except KeyError as exc:
@@ -548,6 +658,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         require_plugin_install_enabled()
         try:
             plugin = plugins.update(plugin_id, ref=request.ref if request else None)
+            mcp.close_disabled_sessions()
             audit_plugin("update", plugin)
             return plugin
         except KeyError as exc:
@@ -558,7 +669,9 @@ def create_app(config: AgentConfig | None = None) -> Any:
     @app.delete("/api/plugins/{plugin_id}")  # type: ignore[untyped-decorator]
     def remove_plugin(plugin_id: str) -> dict[str, object]:
         try:
-            return plugins.remove(plugin_id)
+            result = plugins.remove(plugin_id)
+            mcp.close_disabled_sessions()
+            return result
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -573,6 +686,8 @@ def create_app(config: AgentConfig | None = None) -> Any:
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/skills")  # type: ignore[untyped-decorator]
     def list_skills() -> list[dict[str, object]]:
@@ -601,16 +716,53 @@ def create_app(config: AgentConfig | None = None) -> Any:
     @app.post("/api/skills/{skill_id}/enable")  # type: ignore[untyped-decorator]
     def enable_skill(skill_id: str) -> dict[str, object]:
         try:
-            return skills.set_enabled(skill_id, True)
+            return _set_legacy_skill_enabled(skill_id, enabled=True)
+        except CapabilityConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "capability_revision_conflict", "current": exc.current},
+            ) from exc
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/skills/{skill_id}/disable")  # type: ignore[untyped-decorator]
     def disable_skill(skill_id: str) -> dict[str, object]:
         try:
-            return skills.set_enabled(skill_id, False)
+            return _set_legacy_skill_enabled(skill_id, enabled=False)
+        except CapabilityConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "capability_revision_conflict", "current": exc.current},
+            ) from exc
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    def _set_legacy_skill_enabled(skill_id: str, *, enabled: bool) -> dict[str, object]:
+        """Keep compatibility endpoints inside the audited capability boundary."""
+
+        skill = state.get_skill(skill_id)
+        decision = runs.capabilities.parent_decision(
+            "skill",
+            skill_id,
+            entity_enabled=bool(skill.get("enabled", False)),
+        )
+        state.set_capability_override(
+            "skill",
+            skill_id,
+            enabled,
+            expected_revision=decision.revision,
+            default_enabled=decision.default_enabled,
+            resource_digest=parent_resource_digest(state, "skill", skill_id),
+            updated_by="owner:legacy-skill-endpoint",
+        )
+        updated = skills.set_enabled(skill_id, enabled)
+        if not enabled:
+            registry = runs.build_registry()
+            specs = getattr(registry, "all_specs", registry.specs)()
+            runs.revoke_pending_approvals_for_tools(
+                {spec.name for spec in specs if spec.skill_id == skill_id}
+            )
+        return updated
 
     @app.post("/api/skills/{skill_id}/run")  # type: ignore[untyped-decorator]
     def run_skill(skill_id: str, request: ToolInvokeRequest) -> dict[str, object]:
@@ -921,6 +1073,30 @@ def _resolve_web_dist() -> Path | None:
         module_path.parents[2] / "web" / "dist",
     )
     return next((candidate for candidate in candidates if (candidate / "index.html").is_file()), None)
+
+
+def _probe_provider_health(
+    *,
+    config: AgentConfig,
+    secret_resolver: Callable[[str | None], str | None],
+) -> dict[str, object]:
+    from .llm.factory import build_llm_provider, provider_health_id
+    from .llm.resilience import global_provider_health_registry
+    from .runtime_models import ChatMessage, LLMOptions
+
+    try:
+        provider = build_llm_provider(config, secret_resolver=secret_resolver)
+        provider.generate(
+            [ChatMessage(role="user", content="Reply exactly KESTREL_PROVIDER_OK.")],
+            [],
+            LLMOptions(timeout_seconds=min(30, max(1, config.timeout_seconds))),
+        )
+    except Exception:  # noqa: BLE001
+        # The resilient wrapper records a redacted operational failure in the health registry.
+        pass
+    provider_id = provider_health_id(config)
+    snapshot = global_provider_health_registry.snapshot(provider_id)
+    return {"provider_id": provider_id, "operational": snapshot.get("state") == "healthy", **snapshot}
 
 
 def _provider_secret_env_names(config: AgentConfig) -> set[str]:

@@ -108,7 +108,6 @@ class FallbackLLMProvider(LLMProvider):
                     "from": self.primary.capabilities.name,
                     "to": self.secondary.capabilities.name,
                     "from_error_code": exc.code,
-                    "from_error": str(exc),
                 },
             }
             return LLMResponse(

@@ -45,6 +45,11 @@ class ToolInvokeRequest(BaseModel):
     run_id: str | None = None
 
 
+class CapabilityToggleRequest(BaseModel):
+    enabled: bool
+    expected_revision: int = Field(ge=0)
+
+
 class ApprovalDecisionRequest(BaseModel):
     approved: bool
     arguments: dict[str, Any] | None = None

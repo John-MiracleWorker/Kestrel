@@ -21,7 +21,7 @@ from nested_memvid_agent.behavior_delta_ledger import (
     BehaviorDeltaOutcome,
 )
 from nested_memvid_agent.models import EvidenceRef, MemoryLayer
-from nested_memvid_agent.state_store import AgentStateStore
+from nested_memvid_agent.state_store import SCHEMA_VERSION, AgentStateStore
 
 
 def _delta(
@@ -71,7 +71,7 @@ def test_schema_migration_adds_behavior_delta_tables_and_is_idempotent(tmp_path:
     state = AgentStateStore(db_path)
     AgentStateStore(db_path)
 
-    assert state.schema_version() == 11
+    assert state.schema_version() == SCHEMA_VERSION
     with sqlite3.connect(db_path) as conn:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         indexes = {row[1] for row in conn.execute("PRAGMA index_list('behavior_delta_ledger')")}

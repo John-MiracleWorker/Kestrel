@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 from threading import Thread
 from time import sleep
@@ -136,6 +138,45 @@ def test_memvid_backend_verify_closes_live_handle_before_deep_verify(
     backend.close()
 
 
+def test_memvid_backend_releases_all_locks_when_verify_reopen_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "semantic.mv2"
+    path.write_bytes(b"existing")
+    use_calls = 0
+
+    class FakeMem:
+        def verify(self, *args: object, **kwargs: object) -> dict[str, str]:
+            del args, kwargs
+            return {"overall_status": "passed"}
+
+        def close(self) -> None:
+            return None
+
+    def fake_use(*args: object, **kwargs: object) -> FakeMem:
+        nonlocal use_calls
+        del args, kwargs
+        use_calls += 1
+        if use_calls == 2:
+            raise RuntimeError("reopen failed")
+        return FakeMem()
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.backends.memvid_backend.import_module",
+        lambda name: SimpleNamespace(create=lambda *args, **kwargs: FakeMem(), use=fake_use),
+    )
+    backend = MemvidBackend(path=path, layer=MemoryLayer.SEMANTIC)
+    backend.open()
+
+    with pytest.raises(RuntimeError, match="reopen failed"):
+        backend.verify()
+
+    replacement = MemvidBackend(path=path, layer=MemoryLayer.SEMANTIC)
+    replacement.open()
+    replacement.close()
+    assert use_calls == 3
+
+
 def test_memvid_backend_serializes_same_path_open_in_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -176,6 +217,55 @@ def test_memvid_backend_serializes_same_path_open_in_process(
     assert len(opened) == 2
 
     second.close()
+
+
+def test_memvid_backend_rejects_conflicting_cross_process_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "semantic.mv2"
+    path.write_bytes(b"existing")
+    lock_path = tmp_path / ".semantic.mv2.kestrel.lock"
+    script = """
+import sys
+from pathlib import Path
+from nested_memvid_agent.file_lock import lock_exclusive, unlock
+
+path = Path(sys.argv[1])
+path.touch(mode=0o600, exist_ok=True)
+with path.open("a+") as handle:
+    lock_exclusive(handle)
+    print("ready", flush=True)
+    sys.stdin.read(1)
+    unlock(handle)
+"""
+    process = subprocess.Popen(  # noqa: S603 - fixed interpreter and inline test script
+        [sys.executable, "-c", script, str(lock_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+    assert process.stdout.readline().strip() == "ready"
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.backends.memvid_backend.import_module",
+        lambda name: SimpleNamespace(
+            create=lambda *args, **kwargs: object(),
+            use=lambda *args, **kwargs: SimpleNamespace(close=lambda: None),
+        ),
+    )
+    backend = MemvidBackend(path=path, layer=MemoryLayer.SEMANTIC)
+    try:
+        with pytest.raises(RuntimeError, match="conflicting write access"):
+            backend.open()
+    finally:
+        if process.stdin is not None:
+            process.stdin.write("x")
+            process.stdin.flush()
+        process.wait(timeout=5)
+
+    assert process.returncode == 0
 
 
 def test_memvid_backend_normalizes_find_hits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -328,3 +418,20 @@ def test_memvid_backend_persists_exact_records_and_tombstones_across_reopen(
         assert inactive_hits[0].record.metadata["tombstone_reason"] == "superseded"
     finally:
         reopened.close()
+
+
+def test_memvid_backend_fails_closed_at_layer_capacity(tmp_path: Path) -> None:
+    path = tmp_path / "working.mv2"
+    path.write_bytes(b"1234567890")
+    backend = MemvidBackend(path=path, layer=MemoryLayer.WORKING, max_file_bytes=10)
+    backend.mem = object()
+
+    with pytest.raises(RuntimeError, match="capacity exceeded"):
+        backend.put(
+            MemoryRecord(
+                title="x",
+                content="y",
+                layer=MemoryLayer.WORKING,
+                kind=MemoryKind.OBSERVATION,
+            )
+        )

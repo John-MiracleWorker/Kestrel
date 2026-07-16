@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import signal
 import subprocess  # nosec B404
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -56,28 +59,29 @@ class CodexCLIProvider(LLMProvider):
         with TemporaryDirectory(prefix="kestrel-codex-") as tmpdir:
             output_path = Path(tmpdir) / "last-message.txt"
             command = self._command(output_path)
+            process: subprocess.Popen[str] | None = None
             try:
-                completed = subprocess.run(  # noqa: S603 - fixed executable and argument vector  # nosec B603
-                    command,
-                    cwd=self.workspace,
+                process = _start_process(command, workspace=self.workspace)
+                stdout, stderr = process.communicate(
                     input=prompt,
-                    capture_output=True,
-                    text=True,
                     timeout=active_options.timeout_seconds,
-                    check=False,
                 )
             except FileNotFoundError as exc:
                 raise ProviderError("Codex CLI not found on PATH.", code="codex_cli_not_found") from exc
             except subprocess.TimeoutExpired as exc:
+                if process is not None:
+                    _terminate_process_group(process)
                 raise ProviderError(
                     f"Codex CLI timed out after {active_options.timeout_seconds}s.",
                     code="codex_cli_timeout",
                     retryable=True,
                 ) from exc
 
-            output_text = output_path.read_text(encoding="utf-8").strip() if output_path.exists() else completed.stdout.strip()
-            if completed.returncode != 0:
-                detail = completed.stderr.strip() or completed.stdout.strip() or f"exit_code={completed.returncode}"
+            if process is None:
+                raise ProviderError("Codex CLI failed to start.", code="codex_cli_start_failed")
+            output_text = output_path.read_text(encoding="utf-8").strip() if output_path.exists() else stdout.strip()
+            if process.returncode != 0:
+                detail = stderr.strip() or stdout.strip() or f"exit_code={process.returncode}"
                 raise ProviderError(detail, code="codex_cli_nonzero_exit", retryable=True)
             return parse_agent_response(output_text, tools=tools, strict=True)
 
@@ -104,6 +108,58 @@ class CodexCLIProvider(LLMProvider):
             command.append("--skip-git-repo-check")
         command.append("-")
         return command
+
+
+def _start_process(command: list[str], *, workspace: Path) -> subprocess.Popen[str]:
+    if sys.platform == "win32":
+        return subprocess.Popen(  # noqa: S603 - fixed executable and argument vector  # nosec B603
+            command,
+            cwd=workspace,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+    return subprocess.Popen(  # noqa: S603 - fixed executable and argument vector  # nosec B603
+        command,
+        cwd=workspace,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    if sys.platform == "win32":
+        subprocess.run(  # noqa: S603,S607 - fixed Windows process-tree termination  # nosec B603 B607
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        process.wait(timeout=2.0)
+        return
+    group_id = process.pid
+    try:
+        os.killpg(group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
 
 
 def _format_prompt(messages: list[ChatMessage], tools: list[ToolSpec]) -> str:

@@ -2,31 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from .secret_broker import is_secret_ref
+from .mcp_views import mcp_public, mcp_result_public
 from .server_models import MCPServerRequest, ToolInvokeRequest
-
-
-def mcp_public(server: dict[str, Any], secret_broker: Any) -> dict[str, object]:
-    safe = dict(server)
-    secret_env = dict(safe.pop("secret_env", {}) or {})
-    safe["secret_env_status"] = {
-        str(target): {
-            "source_env": str(source),
-            "secret_ref": str(source) if is_secret_ref(str(source)) else None,
-            "configured": bool(secret_broker.resolve(str(source))),
-            "validated": bool(secret_broker.status(str(source)).get("validated", False)),
-            "last_validated_at": secret_broker.status(str(source)).get("last_validated_at"),
-        }
-        for target, source in sorted(secret_env.items())
-    }
-    return safe
-
-
-def mcp_result_public(result: dict[str, Any], secret_broker: Any) -> dict[str, object]:
-    safe = dict(result)
-    if isinstance(safe.get("server"), dict):
-        safe["server"] = mcp_public(dict(safe["server"]), secret_broker)
-    return safe
 
 
 def register_mcp_routes(
@@ -52,13 +29,21 @@ def register_mcp_routes(
     @app.post("/api/mcp/servers")  # type: ignore[untyped-decorator]
     def add_mcp_server(request: MCPServerRequest) -> dict[str, object]:
         try:
-            return mcp_public(mcp.add_server(request.model_dump()), secret_broker)
+            payload = request.model_dump(exclude_unset=True)
+            # Newly configured external processes/endpoints require an explicit
+            # owner enable action before they can connect.
+            payload["enabled"] = False
+            return mcp_public(mcp.add_server(payload), secret_broker)
         except ValueError as exc:
             raise http_exception(status_code=400, detail=str(exc)) from exc
 
     @app.put("/api/mcp/servers/{server_id}")  # type: ignore[untyped-decorator]
     def update_mcp_server(server_id: str, request: MCPServerRequest) -> dict[str, object]:
-        payload = request.model_dump()
+        payload = request.model_dump(exclude_unset=True)
+        # Enablement is an audited, revisioned policy decision. Configuration
+        # edits must not provide a second path that can bypass the capability
+        # control plane.
+        payload.pop("enabled", None)
         payload["id"] = server_id
         try:
             return mcp_public(mcp.add_server(payload), secret_broker)
@@ -67,7 +52,18 @@ def register_mcp_routes(
 
     @app.delete("/api/mcp/servers/{server_id}")  # type: ignore[untyped-decorator]
     def delete_mcp_server(server_id: str) -> dict[str, bool]:
+        try:
+            server = state.get_mcp_server(server_id)
+        except KeyError as exc:
+            raise http_exception(status_code=404, detail=str(exc)) from exc
         mcp.delete_server(server_id)
+        state.delete_capability_override("mcp_server", server_id, updated_by="owner")
+        for tool in server.get("tools", []):
+            if not isinstance(tool, dict):
+                continue
+            name = str(tool.get("name") or "")
+            if name:
+                state.delete_capability_override("tool", name, updated_by="owner")
         return {"ok": True}
 
     @app.post("/api/mcp/servers/{server_id}/connect")  # type: ignore[untyped-decorator]
@@ -76,6 +72,8 @@ def register_mcp_routes(
             return mcp_result_public(mcp.connect_server(server_id), secret_broker)
         except KeyError as exc:
             raise http_exception(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise http_exception(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/mcp/servers/{server_id}/approve-connect")  # type: ignore[untyped-decorator]
     def approve_mcp_server_connect(server_id: str) -> dict[str, object]:
@@ -99,18 +97,17 @@ def register_mcp_routes(
             return mcp_result_public(mcp.restart_server(server_id), secret_broker)
         except KeyError as exc:
             raise http_exception(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise http_exception(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/mcp/servers/{server_id}/health")  # type: ignore[untyped-decorator]
     def mcp_server_health(server_id: str) -> dict[str, object]:
         try:
-            server = state.get_mcp_server(server_id)
-            return {
-                "ok": server.get("status") != "error",
-                "message": "Stored MCP health snapshot.",
-                "server": mcp_public(server, secret_broker),
-            }
+            return mcp_result_public(mcp.server_health(server_id), secret_broker)
         except KeyError as exc:
             raise http_exception(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise http_exception(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/mcp/servers/{server_id}/sync")  # type: ignore[untyped-decorator]
     def sync_mcp_server(server_id: str) -> dict[str, object]:

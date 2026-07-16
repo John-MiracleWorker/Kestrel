@@ -34,6 +34,7 @@ class GraphRunState:
 @dataclass(frozen=True)
 class GraphRuntimeServices:
     state: AgentStateStore
+    transition_run: Callable[..., RunRecord]
     events: EventPublisher
     spans: SpanRecorder
     build_agent: Callable[[AgentConfig], NestedMV2Agent]
@@ -60,7 +61,10 @@ class PlannerNode:
             parent_span_id=parent_span_id,
             metadata={"session_id": ctx.session_id},
         ) as span:
-            services.state.transition_run(ctx.run_id, "running")
+            running = services.transition_run(ctx.run_id, "running")
+            if running.status != "running":
+                span.set_result(status=running.status, output={"transition_applied": False})
+                return
             services.events.publish(ctx.run_id, "run.started", {"session_id": ctx.session_id})
             tasks = services.state.list_task_nodes(ctx.run_id)
             root = next((task for task in tasks if task.parent_id is None and task.profile == "planner"), None)
@@ -262,7 +266,7 @@ class FinalizerNode:
             ctx.finalized = True
             status = str(ctx.review.get("status") or "failed")
             if status == "blocked" and ctx.result is not None:
-                services.state.transition_run(
+                blocked = services.transition_run(
                     ctx.run_id,
                     "blocked",
                     assistant_message=ctx.result.assistant_message,
@@ -270,12 +274,15 @@ class FinalizerNode:
                     tool_count=len(ctx.result.tool_executions),
                     stop_reason=str(ctx.review.get("stop_reason") or ctx.result.stop_reason),
                 )
+                if blocked.status != "blocked":
+                    span.set_result(status=blocked.status, output={"transition_applied": False})
+                    return
                 services.events.publish(ctx.run_id, "run.blocked", _turn_payload(ctx.result))
                 span.set_result(status="blocked", output={"stop_reason": ctx.review.get("stop_reason")})
                 return
             if status != "completed" or ctx.result is None:
                 error = str(ctx.review.get("error") or "Orchestration failed")
-                services.state.transition_run(
+                failed = services.transition_run(
                     ctx.run_id,
                     "failed",
                     assistant_message=ctx.result.assistant_message if ctx.result is not None else "",
@@ -284,13 +291,16 @@ class FinalizerNode:
                     stop_reason=str(ctx.review.get("stop_reason") or "orchestration_failed"),
                     error=error,
                 )
+                if failed.status != "failed":
+                    span.set_result(status=failed.status, output={"transition_applied": False})
+                    return
                 services.events.publish(ctx.run_id, "run.failed", {"error": error, "review": ctx.review})
                 span.set_result(status="failed", output={"review": ctx.review}, error=error)
                 return
 
             run_status = "running" if ctx.config.enable_autonomous_scheduler else "completed"
             stop_reason = "scheduler_running" if run_status == "running" else ctx.result.stop_reason
-            services.state.transition_run(
+            transitioned = services.transition_run(
                 ctx.run_id,
                 run_status,
                 assistant_message=ctx.result.assistant_message,
@@ -298,6 +308,9 @@ class FinalizerNode:
                 tool_count=len(ctx.result.tool_executions),
                 stop_reason=stop_reason,
             )
+            if transitioned.status != run_status:
+                span.set_result(status=transitioned.status, output={"transition_applied": False})
+                return
             event_type = "run.turn_completed" if ctx.config.enable_autonomous_scheduler else "run.completed"
             services.events.publish(ctx.run_id, event_type, _turn_payload(ctx.result))
             if ctx.config.enable_autonomous_scheduler:
@@ -307,9 +320,24 @@ class FinalizerNode:
                     ctx.config.max_scheduler_cycles,
                 )
                 final_status, scheduler_stop_reason = services.scheduler_outcome(scheduler)
-                services.state.transition_run(ctx.run_id, final_status, stop_reason=scheduler_stop_reason)
-                services.events.publish(ctx.run_id, f"run.{final_status}", {"scheduler": scheduler, "turn": _turn_payload(ctx.result)})
-                span.set_result(status=final_status, output={"stop_reason": scheduler_stop_reason})
+                finalized = services.transition_run(
+                    ctx.run_id,
+                    final_status,
+                    stop_reason=scheduler_stop_reason,
+                )
+                if finalized.status == final_status:
+                    services.events.publish(
+                        ctx.run_id,
+                        f"run.{final_status}",
+                        {"scheduler": scheduler, "turn": _turn_payload(ctx.result)},
+                    )
+                span.set_result(
+                    status=finalized.status,
+                    output={
+                        "stop_reason": scheduler_stop_reason,
+                        "transition_applied": finalized.status == final_status,
+                    },
+                )
                 return
             span.set_result(status="completed", output={"stop_reason": ctx.result.stop_reason})
 

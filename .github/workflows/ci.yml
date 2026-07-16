@@ -9,27 +9,51 @@ on:
 
 jobs:
   python:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: macos-latest
+            python: "3.11"
+          - os: macos-latest
+            python: "3.12"
+          - os: windows-latest
+            python: "3.11"
+    runs-on: ${{ matrix.os }}
     env:
       PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python }}
       - name: Install
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e '.[dev]'
+          python -m pip check
       - name: Compile
         run: python -m compileall -q src tests scripts
       - name: Ruff
         run: ruff check scripts src tests
       - name: Mypy
         run: mypy src
+      - name: Bandit high-severity gate
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
+        run: bandit -q -r src -lll -iii
+      - name: ShellCheck
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
+        run: shellcheck install.sh scripts/*.sh
       - name: Tests
         run: pytest -q
       - name: Golden evals
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
         run: python scripts/run_golden_evals.py --backend memory --provider mock
 
   web:

@@ -34,6 +34,7 @@ class SkillManager:
         self.root = root
         self.state = state
         self.validation_errors: list[dict[str, Any]] = []
+        self.capability_policy: Any | None = None
         self.root.mkdir(parents=True, exist_ok=True)
 
     def discover(self) -> list[dict[str, Any]]:
@@ -74,8 +75,25 @@ class SkillManager:
                 path=skill_dir,
                 manifest=manifest,
                 instructions=instructions,
-                enabled=bool(manifest.get("enabled", True)),
+                # Files discovered from disk are declarative input, not an
+                # authorization grant. New skills start off until the owner
+                # enables them through the capability control plane.
+                enabled=False,
             )
+            # Discovery describes what exists on disk. It must not undo an
+            # explicit operator decision already stored in the control plane.
+            try:
+                capsule = SkillCapsule(
+                    id=capsule.id,
+                    name=capsule.name,
+                    description=capsule.description,
+                    path=capsule.path,
+                    manifest=capsule.manifest,
+                    instructions=capsule.instructions,
+                    enabled=bool(self.state.get_skill(capsule.id)["enabled"]),
+                )
+            except KeyError:
+                pass
             found.append(self.state.upsert_skill(_capsule_to_state(capsule)))
         return found
 
@@ -153,17 +171,32 @@ class SkillManager:
             "provenance": _skill_provenance(skill_dir, manifest_text, instructions),
         }
 
-    def tool_adapters(self) -> list[AgentTool]:
+    def tool_adapters(self, *, include_disabled: bool = False) -> list[AgentTool]:
         adapters: list[AgentTool] = []
         for skill in self.state.list_skills():
-            if skill["enabled"]:
-                adapters.append(SkillToolAdapter(_capsule_from_state(skill)))
+            adapter = SkillToolAdapter(
+                _capsule_from_state(skill), capability_policy=self.capability_policy
+            )
+            parent_enabled = bool(skill["enabled"])
+            if self.capability_policy is not None:
+                parent_enabled = self.capability_policy.parent_decision(
+                    "skill", str(skill["id"]), entity_enabled=parent_enabled
+                ).effective_enabled
+            if include_disabled or (
+                parent_enabled
+                and (
+                    self.capability_policy is None
+                    or self.capability_policy.tool_decision(adapter.spec).effective_enabled
+                )
+            ):
+                adapters.append(adapter)
         return adapters
 
 
 class SkillToolAdapter(AgentTool):
-    def __init__(self, capsule: SkillCapsule) -> None:
+    def __init__(self, capsule: SkillCapsule, *, capability_policy: Any | None = None) -> None:
         self.capsule = capsule
+        self.capability_policy = capability_policy
         risk = str(capsule.manifest.get("risk", "medium"))
         runtime = capsule.manifest.get("runtime", {"type": "instruction"})
         runtime_type = str(runtime.get("type", "instruction")) if isinstance(runtime, dict) else "instruction"
@@ -201,6 +234,15 @@ class SkillToolAdapter(AgentTool):
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         call = ToolCall(name=self.spec.name, arguments=arguments)
+        if self.capability_policy is not None:
+            decision = self.capability_policy.tool_decision(self.spec)
+            if not decision.effective_enabled:
+                return self._result(
+                    call,
+                    success=False,
+                    content=f"Skill is disabled by {', '.join(decision.blocked_by)}.",
+                    error="tool_disabled",
+                )
         task = str(arguments.get("task", "")).strip()
         if not task:
             return self._result(call, success=False, content="Missing skill task.", error="missing_task")

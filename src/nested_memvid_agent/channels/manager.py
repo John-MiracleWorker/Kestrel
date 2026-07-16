@@ -34,6 +34,8 @@ from .models import (
     ChannelProcessResult,
 )
 
+TELEGRAM_ADMIN_CONFIRMATION_TTL_SECONDS = 300.0
+
 AgentFactory = Callable[[AgentConfig], NestedMV2Agent]
 SecretResolver = Callable[[str], str | None]
 
@@ -195,8 +197,10 @@ class ChannelManager:
         _verify_channel_signature(channel, raw_body or b"", headers or {}, require_signature=require_signature)
         adapter = self._adapter_for(channel.provider)
         if channel.provider == "telegram" and "callback_query" in payload and self.run_manager is not None:
+            _enforce_channel_allowlist(channel, _telegram_callback_inbound(channel, payload))
             return self._handle_telegram_approval_callback(channel, adapter, payload, send=send)
         inbound = adapter.parse_inbound(channel, payload)
+        _enforce_channel_allowlist(channel, inbound)
         self._event("channel.receive", inbound.to_public_dict())
         requested_send = channel.auto_reply if send is None else send
         dry_run, blocked_reason = self._delivery_gate(channel, requested=requested_send)
@@ -583,6 +587,16 @@ class ChannelManager:
             return None
         if self.run_manager is None:
             raise ChannelPayloadError("Run manager is required for Telegram admin commands.")
+        if not _telegram_admin_enabled(channel):
+            return self._telegram_admin_result(
+                channel,
+                adapter,
+                inbound,
+                text="Telegram admin command denied: admin mode is disabled.",
+                stop_reason="admin_disabled",
+                dry_run=dry_run,
+                blocked_reason=blocked_reason,
+            )
         owners = _telegram_owner_ids(channel)
         if not owners or str(inbound.user_id or "").strip() not in owners:
             return self._telegram_admin_result(
@@ -928,6 +942,12 @@ class ChannelManager:
         if action is None:
             text = "Telegram admin confirmation expired or was already used."
             stop_reason = "admin_confirmation_missing"
+        elif not _telegram_admin_confirmation_is_current(action):
+            text = "Telegram admin confirmation expired or was already used."
+            stop_reason = "admin_confirmation_expired"
+        elif str(action.get("owner_user_id") or "").strip() != str(inbound.user_id or "").strip():
+            text = "Telegram admin confirmation denied: owner identity changed."
+            stop_reason = "admin_confirmation_owner_mismatch"
         elif not confirmed:
             text = "Telegram admin action cancelled."
             stop_reason = "admin_action_cancelled"
@@ -1258,7 +1278,7 @@ def _telegram_admin_enabled(channel: ChannelEndpointConfig) -> bool:
         return configured
     if isinstance(configured, str):
         return configured.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(_telegram_owner_ids(channel))
+    return False
 
 
 def _looks_like_raw_secret_request(text: str) -> bool:
@@ -1295,10 +1315,70 @@ def _telegram_secret_rejection_text() -> str:
     )
 
 
+def _enforce_channel_allowlist(channel: ChannelEndpointConfig, inbound: ChannelInboundMessage) -> None:
+    if channel.provider != "telegram":
+        return
+    allowed_conversations = _channel_allowed_ids(
+        channel,
+        setting_key="allowed_conversation_ids",
+        env_key="TELEGRAM_ALLOWED_CHAT_IDS",
+    )
+    allowed_users = _channel_allowed_ids(
+        channel,
+        setting_key="allowed_user_ids",
+        env_key="TELEGRAM_ALLOWED_USER_IDS",
+    )
+    if not allowed_conversations or not allowed_users:
+        raise ChannelPayloadError("Telegram ingress allowlists are not configured.")
+    if inbound.conversation_id not in allowed_conversations:
+        raise ChannelPayloadError(f"{channel.provider.capitalize()} conversation is not allowed.")
+    if str(inbound.user_id or "").strip() not in allowed_users:
+        raise ChannelPayloadError(f"{channel.provider.capitalize()} sender is not allowed.")
+
+
+def _telegram_callback_inbound(
+    channel: ChannelEndpointConfig,
+    payload: dict[str, Any],
+) -> ChannelInboundMessage:
+    callback = _dict_or_empty(payload.get("callback_query"))
+    message = _dict_or_empty(callback.get("message"))
+    chat = _dict_or_empty(message.get("chat"))
+    conversation_id = str(chat.get("id") or "").strip()
+    if not conversation_id:
+        raise ChannelPayloadError("Telegram callback did not include a chat id.")
+    return ChannelInboundMessage(
+        channel="telegram",
+        channel_id=channel.id,
+        conversation_id=conversation_id,
+        user_id=_optional_str(_dict_or_empty(callback.get("from")).get("id")),
+        message_id=_optional_str(message.get("message_id")),
+        text=str(callback.get("data") or ""),
+        metadata={"callback_query_id": _optional_str(callback.get("id"))},
+    )
+
+
+def _channel_allowed_ids(
+    channel: ChannelEndpointConfig,
+    *,
+    setting_key: str,
+    env_key: str,
+) -> set[str]:
+    configured = channel.settings.get(setting_key)
+    values = configured if isinstance(configured, (list, tuple, set)) else str(configured or "").split(",")
+    identifiers = {str(value).strip() for value in values if str(value).strip()}
+    if not identifiers and channel.provider == "telegram":
+        identifiers = {
+            value.strip() for value in os.getenv(env_key, "").split(",") if value.strip()
+        }
+    return identifiers
+
+
 def _telegram_owner_authorized(channel: ChannelEndpointConfig, user_id: str | None) -> bool:
+    if not _telegram_admin_enabled(channel):
+        return False
     owners = _telegram_owner_ids(channel)
     if not owners:
-        return True
+        return False
     return str(user_id or "").strip() in owners
 
 
@@ -1315,7 +1395,15 @@ def _telegram_owner_ids(channel: ChannelEndpointConfig) -> set[str]:
         else:
             candidates = str(value).split(",")
         ids.update(str(item).strip() for item in candidates if str(item).strip())
-    return ids
+    return ids if len(ids) == 1 else set()
+
+
+def _telegram_admin_confirmation_is_current(action: Mapping[str, Any]) -> bool:
+    try:
+        age = time.time() - float(action["created_at"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return 0 <= age <= TELEGRAM_ADMIN_CONFIRMATION_TTL_SECONDS
 
 
 def _safe_list_runs(run_manager: Any) -> list[dict[str, Any]]:
@@ -1474,7 +1562,9 @@ def _verify_channel_signature(
 ) -> None:
     secret_env = channel.settings.get("signature_secret_env")
     if not isinstance(secret_env, str) or not secret_env.strip():
-        if require_signature and not _unsigned_allowed(channel):
+        if require_signature and (
+            channel.provider == "telegram" or not _unsigned_allowed(channel)
+        ):
             raise ChannelPayloadError("Unsigned webhooks are disabled for this public endpoint.")
         return
     secret = _channel_secret_value(channel, secret_env.strip())

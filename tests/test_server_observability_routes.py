@@ -11,6 +11,8 @@ from nested_memvid_agent.server_observability_routes import register_observabili
 class _FakeConfig:
     def __init__(self, log_dir: Path) -> None:
         self.log_dir = log_dir
+        self.provider = "mock"
+        self.model = "mock"
 
 
 class _FakeState:
@@ -77,7 +79,12 @@ class _FakeRuns:
 def test_observability_routes_tail_logs_and_trace_with_bounded_limits(tmp_path: Path) -> None:
     log = JsonlEventLog(tmp_path / "logs" / "events.jsonl")
     log.append(AgentEvent(type="turn.start", payload={"message": "hello"}))
-    log.append(AgentEvent(type="memory.write", payload={"text": "Bearer raw-secret-value-12345"}))
+    log.append(
+        AgentEvent(
+            type="memory.write",
+            payload={"text": "Bearer raw-secret-value-12345", "token": "tiny-secret"},
+        )
+    )
 
     app = FastAPI()
     state = _FakeState()
@@ -96,6 +103,8 @@ def test_observability_routes_tail_logs_and_trace_with_bounded_limits(tmp_path: 
 
     trace = client.get("/api/runs/run_ok/trace", params={"limit": 99999})
     logs = client.get("/api/logs", params={"limit": 1})
+    metrics = client.get("/api/metrics")
+    diagnostics = client.get("/api/diagnostics", params={"log_limit": 1})
     missing_trace = client.get("/api/runs/missing/trace")
     missing_events = client.get("/api/runs/missing/events")
 
@@ -105,7 +114,18 @@ def test_observability_routes_tail_logs_and_trace_with_bounded_limits(tmp_path: 
     assert logs.status_code == 200
     assert [event["type"] for event in logs.json()] == ["memory.write"]
     assert "raw-secret-value" not in logs.text
+    assert "tiny-secret" not in logs.text
     assert "<redacted>" in logs.text
+    assert metrics.status_code == 200
+    assert metrics.json()["schema"] == "kestrel.operational_metrics.v1"
+    prometheus = client.get("/metrics")
+    assert prometheus.status_code == 200
+    assert prometheus.headers["content-type"].startswith("text/plain")
+    assert "kestrel_up 1" in prometheus.text
+    assert "kestrel_runs" in prometheus.text
+    assert diagnostics.status_code == 200
+    assert diagnostics.json()["schema"] == "kestrel.diagnostics.v1"
+    assert "raw-secret-value" not in diagnostics.text
     assert missing_trace.status_code == 404
     assert missing_events.status_code == 404
     assert events.subscribed == []
