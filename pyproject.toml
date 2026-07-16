@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [{ name = "Kestrel Contributors" }]
-dependencies = ["numpy>=1.26"]
+dependencies = ["numpy>=1.26,<2.5"]
 
 [project.optional-dependencies]
 runtime = [

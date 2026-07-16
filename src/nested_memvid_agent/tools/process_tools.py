@@ -86,7 +86,7 @@ def _start_subprocess(
     if environment is not None:
         common["env"] = environment
     if sys.platform == "win32":
-        return subprocess.Popen(  # type: ignore[arg-type]  # noqa: S603  # nosec B603
+        return subprocess.Popen(  # noqa: S603  # nosec B603
             command,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             **common,

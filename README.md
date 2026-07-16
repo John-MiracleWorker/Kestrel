@@ -74,7 +74,7 @@ The installer uses `mock` only for deterministic health checks. High-risk tools,
 - `docs/IMPLEMENTATION_STATUS.md` is the detailed truth table for what is working, partial, or not done.
 - `docs/ARCHITECTURE.md` explains the local runtime and memory/control-plane split.
 - `docs/PRODUCTION_OPERATIONS.md` defines health, alerts, backup/restore, upgrade/rollback, failure drills, soak testing, and the release gate.
-- `docs/reviews/2026-07-16-production-readiness.md` records the current supported-profile verification matrix and publication hold; the 2026-07-14 review is historical.
+- `docs/reviews/2026-07-16-production-readiness.md` records the pre-publication supported-profile verification matrix and external gate inventory; the GitHub release workflow is authoritative for published artifact validation.
 - `docs/MEMORY_OPERATIONS.md` covers `.mv2` backup, restore, verification, and migration.
 - `docs/SECURITY.md` documents local-first safety boundaries, auth, webhook signatures, secrets, and high-risk tools.
 - `docs/PRODUCTIZATION_ROADMAP.md` is the long-horizon hosted/team product roadmap.
