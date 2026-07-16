@@ -5,6 +5,11 @@ Memvid `.mv2` memory, localhost binding, no shell/file-write/policy/Codex high-r
 
 ## One-Shot GitHub Install
 
+The one-shot Bash installer supports macOS and Linux, including Linux inside WSL.
+Native Windows users must open a WSL distro first; Git Bash and the Windows
+`bash.exe` launcher are not supported installer environments. The Python runtime
+and published wheel are still validated on Windows.
+
 For a local Memvid-backed Kestrel install:
 
 ```bash

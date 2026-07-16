@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import replace
 
 import pytest
@@ -403,7 +404,8 @@ def test_runtime_settings_store_versions_hashes_and_protects_effective_settings(
     assert payload["revision"] == saved.revision
     assert saved.sources["provider"] == "persisted"
     assert saved.sources["require_api_auth"] == "launch"
-    assert store.path.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert store.path.stat().st_mode & 0o777 == 0o600
 
 
 def test_runtime_settings_store_rejects_unknown_future_schema(tmp_path) -> None:

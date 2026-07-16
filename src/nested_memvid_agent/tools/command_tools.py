@@ -42,6 +42,7 @@ def _remote_mutation_violation(command: list[str]) -> str | None:
 
 
 def _is_python_executable_name(name: str) -> bool:
+    name = name.removesuffix(".exe")
     if name in {"python", "python3"}:
         return True
     suffix = name.removeprefix("python")
@@ -117,7 +118,11 @@ class ShellRunTool(AgentTool):
                 call, success=False, content="command must be list[str]", error="bad_command"
             )
         command = list(command_raw)
-        if command and Path(command[0]).name in {"python", "python3"} and "-c" in command:
+        if (
+            command
+            and _is_python_executable_name(Path(command[0]).name.lower())
+            and "-c" in command
+        ):
             return self._result(
                 call,
                 success=False,

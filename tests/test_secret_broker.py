@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -48,6 +49,7 @@ def test_secret_broker_never_returns_raw_value_in_public_payloads(tmp_path: Path
     assert redact_text("echo=123456:ABC-super-secret", environ={}) == "echo=<redacted>"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows stat modes do not expose NTFS ACLs")
 def test_secret_broker_vault_file_is_owner_only(tmp_path: Path) -> None:
     path = tmp_path / "vault.json"
     broker = SecretBroker(path)
@@ -171,8 +173,10 @@ def test_secret_broker_atomic_replace_is_owner_only_before_exposure(
 
     SecretBroker(path).store_secret(name="TOKEN", purpose="test", value="raw-token-value")
 
-    assert observed_modes == [0o600]
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert len(observed_modes) == 1
+    if os.name != "nt":
+        assert observed_modes == [0o600]
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_secret_broker_failed_atomic_replace_preserves_previous_vault(
@@ -224,4 +228,5 @@ def test_secret_broker_cross_process_writes_do_not_lose_records(tmp_path: Path) 
     assert {item["name"] for item in broker.list_secrets()} == {
         f"TOKEN_{index}" for index in range(6)
     }
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600

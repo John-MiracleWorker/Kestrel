@@ -34,6 +34,9 @@ Environment options:
 
 Safe default runtime:
   backend=memvid, provider=mock, model=mock, high-risk tool flags disabled.
+
+Supported installer platforms:
+  macOS and Linux, including Linux inside WSL. Native Windows is unsupported.
 EOF
 }
 
@@ -44,6 +47,17 @@ log() {
 die() {
   printf '[kestrel-install] ERROR: %s\n' "$*" >&2
   exit 1
+}
+
+require_supported_platform() {
+  local platform
+  platform="$(uname -s 2>/dev/null || true)"
+  case "$platform" in
+    Darwin | Linux) return 0 ;;
+    *)
+      die "install.sh supports macOS and Linux (including Linux inside WSL); native Windows is unsupported. Open a WSL distro and run the installer there."
+      ;;
+  esac
 }
 
 is_true() {
@@ -426,6 +440,8 @@ main() {
     usage
     return 0
   fi
+
+  require_supported_platform
 
   KESTREL_HOME="${KESTREL_HOME:-$DEFAULT_HOME}"
   KESTREL_REPO="${KESTREL_REPO:-$DEFAULT_REPO}"

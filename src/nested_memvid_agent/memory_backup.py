@@ -363,14 +363,13 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.chmod(temporary, 0o600)
-    with temporary.open("rb") as handle:
-        os.fsync(handle.fileno())
+    _fsync_file(temporary)
     os.replace(temporary, path)
     _fsync_directory(path.parent)
 
 
 def _fsync_file(path: Path) -> None:
-    with path.open("rb") as handle:
+    with path.open("r+b") as handle:
         os.fsync(handle.fileno())
 
 

@@ -61,7 +61,7 @@ def post_json(url: str, data: dict[str, object], timeout: int = 300) -> dict[str
 
 def load_offset() -> int | None:
     try:
-        raw = OFFSET_PATH.read_text().strip()
+        raw = OFFSET_PATH.read_text(encoding="utf-8").strip()
         return int(raw) if raw else None
     except FileNotFoundError:
         return None
@@ -71,7 +71,7 @@ def load_offset() -> int | None:
 
 def save_offset(offset: int) -> None:
     OFFSET_PATH.parent.mkdir(parents=True, exist_ok=True)
-    OFFSET_PATH.write_text(str(offset))
+    OFFSET_PATH.write_text(str(offset), encoding="utf-8")
 
 
 def write_health(status: str, *, error_type: str | None = None) -> None:
@@ -88,7 +88,8 @@ def write_health(status: str, *, error_type: str | None = None) -> None:
                     "error_type": error_type,
                 },
                 sort_keys=True,
-            )
+            ),
+            encoding="utf-8",
         )
         os.chmod(temporary, 0o600)
         os.replace(temporary, HEALTH_PATH)

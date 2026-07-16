@@ -14,6 +14,10 @@ START_TELEGRAM = ROOT / "scripts" / "start-telegram-agent.sh"
 START_TELEGRAM_STACK = ROOT / "scripts" / "start-telegram-stack.sh"
 SET_TELEGRAM_WEBHOOK = ROOT / "scripts" / "set-telegram-webhook.sh"
 TELEGRAM_POLLER = ROOT / "scripts" / "telegram-poller.py"
+POSIX_SHELL_ONLY = pytest.mark.skipif(
+    os.name == "nt",
+    reason="installer and operational shell scripts require macOS, Linux, or WSL",
+)
 
 
 def _clean_kestrel_env() -> dict[str, str]:
@@ -126,6 +130,7 @@ def _installed_kestrel_checkout(tmp_path: Path) -> Path:
     return target
 
 
+@POSIX_SHELL_ONLY
 def test_install_script_is_valid_bash() -> None:
     assert INSTALL.exists()
 
@@ -140,6 +145,7 @@ def test_install_script_is_valid_bash() -> None:
     assert result.returncode == 0, result.stderr
 
 
+@POSIX_SHELL_ONLY
 def test_start_telegram_agent_defaults_to_shared_memvid_runtime(tmp_path: Path) -> None:
     env_file = tmp_path / ".env.telegram"
     env_file.write_text("# test env intentionally has no runtime overrides\n", encoding="utf-8")
@@ -170,6 +176,7 @@ def test_start_telegram_agent_defaults_to_shared_memvid_runtime(tmp_path: Path) 
     assert "*.trycloudflare.com" not in result.stdout
 
 
+@POSIX_SHELL_ONLY
 def test_start_telegram_agent_trusts_only_the_configured_public_host(tmp_path: Path) -> None:
     env_file = tmp_path / ".env.telegram"
     env_file.write_text(
@@ -198,6 +205,7 @@ def test_start_telegram_agent_trusts_only_the_configured_public_host(tmp_path: P
     assert "*.trycloudflare.com" not in result.stdout
 
 
+@POSIX_SHELL_ONLY
 def test_start_telegram_agent_requires_control_plane_token_by_default(tmp_path: Path) -> None:
     env_file = tmp_path / ".env.telegram"
     env_file.write_text("# token intentionally absent\n", encoding="utf-8")
@@ -215,6 +223,7 @@ def test_start_telegram_agent_requires_control_plane_token_by_default(tmp_path: 
     assert "Missing API auth token env: NEST_AGENT_API_TOKEN" in result.stderr
 
 
+@POSIX_SHELL_ONLY
 def test_public_telegram_webhook_setup_refuses_disabled_api_auth(tmp_path: Path) -> None:
     env_file = tmp_path / ".env.telegram"
     env_file.write_text(
@@ -279,6 +288,7 @@ def test_telegram_poller_authenticates_local_control_plane_requests(
     assert captured["authorization"] == "Bearer control-plane-token"
 
 
+@POSIX_SHELL_ONLY
 def test_start_telegram_agent_can_use_isolated_memvid_runtime(tmp_path: Path) -> None:
     env_file = tmp_path / ".env.telegram"
     env_file.write_text(
@@ -314,6 +324,7 @@ def test_start_telegram_agent_can_use_isolated_memvid_runtime(tmp_path: Path) ->
     assert "NEST_AGENT_API_KEY_ENV=\n" in result.stdout
 
 
+@POSIX_SHELL_ONLY
 def test_telegram_stack_uses_isolated_runtime_and_bounded_logs() -> None:
     text = START_TELEGRAM_STACK.read_text(encoding="utf-8")
     result = subprocess.run(
@@ -338,6 +349,7 @@ def test_telegram_stack_uses_isolated_runtime_and_bounded_logs() -> None:
     assert 'rotate_log "$POLLER_LOG"' in text
 
 
+@POSIX_SHELL_ONLY
 def test_install_help_documents_github_curl_and_options() -> None:
     result = _run_install(args=["--help"])
 
@@ -362,6 +374,7 @@ def test_install_help_documents_github_curl_and_options() -> None:
         assert option in result.stdout
 
 
+@POSIX_SHELL_ONLY
 def test_install_defaults_exclude_development_dependencies() -> None:
     result = _run_install(args=["--help"])
 
@@ -370,6 +383,7 @@ def test_install_defaults_exclude_development_dependencies() -> None:
     assert "memvid,openai,anthropic,gemini,server,mcp,dev" not in result.stdout
 
 
+@POSIX_SHELL_ONLY
 def test_install_dry_run_uses_memvid_mock_defaults(tmp_path: Path) -> None:
     result = _run_install(
         env={
@@ -397,6 +411,7 @@ def test_install_dry_run_uses_memvid_mock_defaults(tmp_path: Path) -> None:
     assert "NEST_AGENT_ALLOW_PLUGIN_INSTALL=false" in result.stdout
 
 
+@POSIX_SHELL_ONLY
 def test_install_dry_run_can_disable_server_autostart(tmp_path: Path) -> None:
     result = _run_install(
         env={
@@ -412,6 +427,7 @@ def test_install_dry_run_can_disable_server_autostart(tmp_path: Path) -> None:
     assert "health check: skipped" in result.stdout
 
 
+@POSIX_SHELL_ONLY
 def test_install_dry_run_does_not_require_simulated_web_build_output(tmp_path: Path) -> None:
     source = _current_tree_git_repo(tmp_path)
 
@@ -429,6 +445,7 @@ def test_install_dry_run_does_not_require_simulated_web_build_output(tmp_path: P
     assert "npm run build --prefix web" in result.stdout
 
 
+@POSIX_SHELL_ONLY
 def test_install_refuses_non_git_nonempty_target_even_in_dry_run(tmp_path: Path) -> None:
     target = tmp_path / "occupied"
     target.mkdir()
@@ -440,6 +457,7 @@ def test_install_refuses_non_git_nonempty_target_even_in_dry_run(tmp_path: Path)
     assert "Refusing to install into non-git nonempty directory" in result.stderr
 
 
+@POSIX_SHELL_ONLY
 @pytest.mark.parametrize("dirty_kind", ["tracked", "untracked"])
 def test_install_refuses_dirty_existing_checkout_without_overwriting_operator_data(
     tmp_path: Path,
@@ -479,6 +497,7 @@ def test_install_refuses_dirty_existing_checkout_without_overwriting_operator_da
     )
 
 
+@POSIX_SHELL_ONLY
 def test_install_existing_checkout_preserves_origin_and_avoids_forced_checkout(tmp_path: Path) -> None:
     target = _installed_kestrel_checkout(tmp_path)
 
@@ -518,6 +537,8 @@ def test_install_script_detects_python_311_without_bare_python_default() -> None
         assert candidate in text
     assert '"$PYTHON_BIN" -m venv .venv' in text
     assert "python -m venv" not in text
+    assert "require_supported_platform" in text
+    assert "native Windows is unsupported" in text
 
 
 def test_install_script_clears_pythonpath_before_creating_the_venv() -> None:
@@ -540,6 +561,7 @@ def test_install_script_launches_server_detached_and_checks_health() -> None:
     assert "run .venv/bin/nest-agent server --backend memvid" not in text
 
 
+@POSIX_SHELL_ONLY
 @pytest.mark.skipif(
     os.getenv("RUN_MEMVID_INTEGRATION") != "1" or os.getenv("RUN_INSTALLER_INTEGRATION") != "1",
     reason="requires RUN_MEMVID_INTEGRATION=1 and RUN_INSTALLER_INTEGRATION=1",
@@ -604,7 +626,14 @@ def test_launchd_setup_script_is_executable_and_credential_free() -> None:
     script_path = ROOT / "scripts" / "setup-launchd.sh"
     script = script_path.read_text(encoding="utf-8")
 
-    assert script_path.stat().st_mode & 0o111
+    index_entry = subprocess.run(
+        ["git", "ls-files", "--stage", "--", "scripts/setup-launchd.sh"],
+        cwd=ROOT,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.split()
+    assert index_entry[0] == "100755"
     payload_source = script.split("payload =", maxsplit=1)[1].split("}\n", maxsplit=1)[0]
     assert "EnvironmentVariables" not in payload_source
     assert '[[ "${1:-}" == "--check" ]]' in script

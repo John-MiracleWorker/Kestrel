@@ -22,6 +22,40 @@ def _seed_memory(memory_dir: Path, suffix: str = "original") -> None:
         )
 
 
+def test_file_fsync_uses_a_writable_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "payload.mv2"
+    path.write_bytes(b"payload")
+    real_fsync = memory_backup_module.os.fsync
+
+    def require_writable_descriptor(fd: int) -> None:
+        memory_backup_module.os.write(fd, b"")
+        real_fsync(fd)
+
+    monkeypatch.setattr(memory_backup_module.os, "fsync", require_writable_descriptor)
+
+    memory_backup_module._fsync_file(path)
+
+
+def test_atomic_json_fsync_uses_a_writable_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "manifest.json"
+    real_fsync = memory_backup_module.os.fsync
+
+    def require_writable_descriptor(fd: int) -> None:
+        memory_backup_module.os.write(fd, b"")
+        real_fsync(fd)
+
+    monkeypatch.setattr(memory_backup_module.os, "fsync", require_writable_descriptor)
+    monkeypatch.setattr(memory_backup_module, "_fsync_directory", lambda _: None)
+
+    memory_backup_module._write_json_atomic(path, {"ok": True})
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {"ok": True}
+
+
 @pytest.mark.parametrize(
     "backup_relative", [Path("memory/backups"), Path("."), Path("memory")]
 )

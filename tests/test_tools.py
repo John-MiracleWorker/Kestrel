@@ -21,6 +21,7 @@ from nested_memvid_agent.runtime_models import ToolCall, ToolExecution, ToolSpec
 from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.tools.base import AgentTool, ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
+from nested_memvid_agent.tools.command_tools import _is_python_executable_name
 from nested_memvid_agent.tools.process_tools import _run_subprocess, _SubprocessToolTimeout
 from nested_memvid_agent.tools.registry import RetryingRegistry, ToolRegistry
 
@@ -70,6 +71,19 @@ class FlakyRetryTool(AgentTool):
                 error="transient_error",
             )
         return ToolExecution(call=call, success=True, content="ok")
+
+
+@pytest.mark.parametrize(
+    "executable",
+    ["python.exe", "python3.exe", "python3.11.exe", "python", "python3.13"],
+)
+def test_python_executable_allowlist_accepts_cross_platform_names(executable: str) -> None:
+    assert _is_python_executable_name(executable) is True
+
+
+@pytest.mark.parametrize("executable", ["pythonw.exe", "pytest.exe", "python-launcher.exe"])
+def test_python_executable_allowlist_rejects_non_interpreters(executable: str) -> None:
+    assert _is_python_executable_name(executable) is False
 
 
 def test_build_default_tools_can_be_limited_to_named_subset() -> None:
