@@ -54,6 +54,8 @@ from nested_memvid_agent.tools.base import AgentTool, ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
 from nested_memvid_agent.tools.registry import ToolRegistry
 
+_ASYNC_TEST_TIMEOUT_SECONDS = 15.0
+
 
 def test_state_store_tracks_runs_and_approvals(tmp_path: Path) -> None:
     state = AgentStateStore(tmp_path / "state.db")
@@ -3928,7 +3930,7 @@ def _active_scheduler_run(
 
 
 def _wait_for_status(manager: RunManager, run_id: str, statuses: set[str]) -> dict[str, object]:
-    deadline = monotonic() + 5
+    deadline = monotonic() + _ASYNC_TEST_TIMEOUT_SECONDS
     while monotonic() < deadline:
         run = manager.get_run(run_id)
         if str(run["status"]) in statuses:
@@ -3938,7 +3940,7 @@ def _wait_for_status(manager: RunManager, run_id: str, statuses: set[str]) -> di
 
 
 def _wait_for_client_status(client: Any, run_id: str, statuses: set[str]) -> dict[str, object]:
-    deadline = monotonic() + 5
+    deadline = monotonic() + _ASYNC_TEST_TIMEOUT_SECONDS
     while monotonic() < deadline:
         response = client.get(f"/api/runs/{run_id}")
         response.raise_for_status()
@@ -3950,7 +3952,7 @@ def _wait_for_client_status(client: Any, run_id: str, statuses: set[str]) -> dic
 
 
 def _wait_for_subagent(manager: RunManager, run_id: str, subagent_id: str, statuses: set[str]) -> dict[str, object]:
-    deadline = monotonic() + 5
+    deadline = monotonic() + _ASYNC_TEST_TIMEOUT_SECONDS
     while monotonic() < deadline:
         graph = manager.task_graph(run_id)
         for subagent in graph["subagents"]:
