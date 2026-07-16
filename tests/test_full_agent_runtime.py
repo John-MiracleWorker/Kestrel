@@ -490,7 +490,16 @@ def test_startup_reconciliation_fails_dead_workers_and_preserves_live_workers(tm
         worker_owner=manager._lease_owner,
         worker_claim_id="startup-live-claim",
     ):
-        sleep(0.04)
+        deadline = monotonic() + 1.0
+        while monotonic() < deadline:
+            heartbeat_result = state.get_task_node("task_heartbeat").result
+            if (
+                heartbeat_result is not None
+                and heartbeat_result["worker_heartbeat_at"]
+                != "2000-01-01T00:00:00+00:00"
+            ):
+                break
+            sleep(0.01)
     heartbeat_result = state.get_task_node("task_heartbeat").result
     assert heartbeat_result is not None
     assert heartbeat_result["worker_heartbeat_at"] != "2000-01-01T00:00:00+00:00"
@@ -526,8 +535,11 @@ def test_run_manager_heartbeat_renews_and_releases_its_run_lease(tmp_path: Path)
     with manager._run_lease("heartbeat_run", config) as lease:
         assert lease is not None
         first_heartbeat = state.get_run("heartbeat_run").heartbeat_at
-        sleep(0.08)
         renewed = state.get_run("heartbeat_run")
+        deadline = monotonic() + 1.0
+        while renewed.heartbeat_at == first_heartbeat and monotonic() < deadline:
+            sleep(0.01)
+            renewed = state.get_run("heartbeat_run")
         assert renewed.heartbeat_at is not None
         assert renewed.heartbeat_at != first_heartbeat
         assert state.acquire_run_lease("heartbeat_run", owner="competitor", ttl_seconds=1) is None
