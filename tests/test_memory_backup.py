@@ -199,7 +199,7 @@ def test_memory_backup_rejects_symlinked_sources_and_unexpected_manifest_files(
 
 
 @pytest.mark.parametrize("unsafe_path", ["../escape.mv2", "/absolute.mv2", "memory/../escape.mv2"])
-def test_memory_backup_rejects_unsafe_and_duplicate_manifest_targets(tmp_path: Path, unsafe_path: str) -> None:
+def test_memory_backup_rejects_unsafe_manifest_targets(tmp_path: Path, unsafe_path: str) -> None:
     memory_dir = tmp_path / "memory"
     backups = tmp_path / "backups"
     _seed_memory(memory_dir)
@@ -207,17 +207,58 @@ def test_memory_backup_rejects_unsafe_and_duplicate_manifest_targets(tmp_path: P
     manifest = manager.create()
     manifest_path = backups / manifest["backup_id"] / "manifest.json"
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    duplicate = dict(payload["files"][0])
-    payload["files"].append(duplicate)
     payload["files"][0]["path"] = unsafe_path
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
 
     validation = manager.validate(manifest["backup_id"])
 
     assert validation["ok"] is False
-    assert any(error.startswith(("invalid_path:", "duplicate:")) for error in validation["errors"])
+    assert any(error.startswith("invalid_path:") for error in validation["errors"])
     with pytest.raises(MemoryBackupError):
         manager.restore(manifest["backup_id"])
+
+
+def test_memory_backup_rejects_duplicate_manifest_targets(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    backups = tmp_path / "backups"
+    _seed_memory(memory_dir)
+    manager = MemoryBackupManager(memory_dir=memory_dir, backup_root=backups)
+    manifest = manager.create()
+    manifest_path = backups / manifest["backup_id"] / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    duplicate_path = str(payload["files"][0]["path"])
+    payload["files"].append(dict(payload["files"][0]))
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    validation = manager.validate(manifest["backup_id"])
+
+    assert validation["ok"] is False
+    assert f"duplicate:{duplicate_path}" in validation["errors"]
+    with pytest.raises(MemoryBackupError):
+        manager.restore(manifest["backup_id"])
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        "/absolute.mv2",
+        "\\absolute.mv2",
+        "C:/absolute.mv2",
+        "C:drive-relative.mv2",
+        "\\\\server\\share\\escape.mv2",
+        "//server/share/escape.mv2",
+        "memory\\..\\escape.mv2",
+        "memory\\semantic.mv2",
+        "memory/./semantic.mv2",
+        "memory//semantic.mv2",
+        "memory/semantic.mv2/",
+        ".",
+        "\x00.mv2",
+    ],
+)
+def test_safe_manifest_path_rejects_cross_platform_unsafe_syntax(unsafe_path: str) -> None:
+    with pytest.raises(MemoryBackupError, match="Unsafe manifest path"):
+        memory_backup_module._safe_manifest_path(unsafe_path)
 
 
 def test_memory_backup_rejects_hard_linked_backup_payload(tmp_path: Path) -> None:

@@ -7,7 +7,7 @@ import shutil
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from uuid import uuid4
 
@@ -353,10 +353,23 @@ def _sha256(path: Path) -> str:
 
 
 def _safe_manifest_path(value: str) -> Path:
-    path = Path(value)
-    if path.is_absolute() or ".." in path.parts or not path.parts:
+    posix_path = PurePosixPath(value)
+    windows_path = PureWindowsPath(value)
+    if (
+        not value
+        or "\x00" in value
+        or "\\" in value
+        or posix_path.is_absolute()
+        or windows_path.is_absolute()
+        or bool(windows_path.drive)
+        or bool(windows_path.root)
+        or ".." in posix_path.parts
+        or ".." in windows_path.parts
+        or not posix_path.parts
+        or posix_path.as_posix() != value
+    ):
         raise MemoryBackupError(f"Unsafe manifest path: {value}")
-    return path
+    return Path(*posix_path.parts)
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
