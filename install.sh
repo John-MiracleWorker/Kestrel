@@ -12,6 +12,15 @@ DEFAULT_START_SERVER="0"
 DEFAULT_OPEN_BROWSER="0"
 DEFAULT_SERVER_SESSION="kestrel-agent"
 
+RELEASE_TRANSACTION_ACTIVE=0
+RELEASE_VENV_BACKED_UP=0
+RELEASE_VENV_NEW_STARTED=0
+RELEASE_EXISTING_CHECKOUT=0
+RELEASE_ORIGINAL_HEAD=""
+RELEASE_ORIGINAL_BRANCH=""
+RELEASE_VENV_PATH=""
+RELEASE_VENV_PREVIOUS_PATH=""
+
 usage() {
   cat <<'EOF'
 Kestrel one-shot installer
@@ -53,6 +62,83 @@ log() {
 die() {
   printf '[kestrel-install] ERROR: %s\n' "$*" >&2
   exit 1
+}
+
+release_install_exit_trap() {
+  local status="$1"
+  trap - EXIT INT TERM
+  if [[ "$RELEASE_TRANSACTION_ACTIVE" -ne 1 ]]; then
+    exit "$status"
+  fi
+
+  log "Release install failed; restoring the previous checkout and Python environment."
+  if is_true "${KESTREL_DRY_RUN:-}"; then
+    log "DRY RUN: rollback would restore the previous checkout and .venv."
+    exit "$status"
+  fi
+
+  set +e
+  if [[ "$RELEASE_VENV_BACKED_UP" -eq 1 ]] &&
+    [[ -e "$RELEASE_VENV_PREVIOUS_PATH" || -L "$RELEASE_VENV_PREVIOUS_PATH" ]]; then
+    rm -rf -- "$RELEASE_VENV_PATH"
+    if ! mv -- "$RELEASE_VENV_PREVIOUS_PATH" "$RELEASE_VENV_PATH"; then
+      log "WARNING: automatic .venv restore failed; recovery copy remains at ${RELEASE_VENV_PREVIOUS_PATH}."
+    fi
+  elif [[ "$RELEASE_VENV_NEW_STARTED" -eq 1 ]]; then
+    rm -rf -- "$RELEASE_VENV_PATH"
+  elif [[ "$RELEASE_VENV_BACKED_UP" -eq 1 && ! -e "$RELEASE_VENV_PATH" && ! -L "$RELEASE_VENV_PATH" ]]; then
+    log "WARNING: prior .venv backup was not found; inspect ${KESTREL_HOME} before retrying."
+  fi
+  if [[ "$RELEASE_EXISTING_CHECKOUT" -eq 1 && -n "$RELEASE_ORIGINAL_HEAD" ]]; then
+    local restore_ref="$RELEASE_ORIGINAL_HEAD"
+    local checkout_args=(--detach --no-overwrite-ignore "$RELEASE_ORIGINAL_HEAD")
+    if [[ -n "$RELEASE_ORIGINAL_BRANCH" ]]; then
+      restore_ref="$RELEASE_ORIGINAL_BRANCH"
+      checkout_args=(--no-overwrite-ignore "$RELEASE_ORIGINAL_BRANCH")
+    fi
+    if ! git -C "$KESTREL_HOME" checkout "${checkout_args[@]}" >/dev/null 2>&1; then
+      log "WARNING: automatic checkout restore failed; restore commit ${RELEASE_ORIGINAL_HEAD} manually."
+    else
+      log "Restored checkout ${restore_ref}."
+    fi
+  fi
+  exit "$status"
+}
+
+start_release_install_transaction() {
+  RELEASE_TRANSACTION_ACTIVE=1
+  RELEASE_VENV_PATH="${KESTREL_HOME}/.venv"
+  RELEASE_VENV_PREVIOUS_PATH="${KESTREL_HOME}/.venv.release-previous"
+  trap 'release_install_exit_trap "$?"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+prepare_release_venv_replacement() {
+  if [[ -e "$RELEASE_VENV_PREVIOUS_PATH" || -L "$RELEASE_VENV_PREVIOUS_PATH" ]]; then
+    die "A prior release recovery environment already exists: ${RELEASE_VENV_PREVIOUS_PATH}. Restore or remove it before retrying."
+  fi
+  if [[ -e "$RELEASE_VENV_PATH" || -L "$RELEASE_VENV_PATH" ]]; then
+    RELEASE_VENV_BACKED_UP=1
+    if ! run mv -- "$RELEASE_VENV_PATH" "$RELEASE_VENV_PREVIOUS_PATH"; then
+      RELEASE_VENV_BACKED_UP=0
+      die "Unable to preserve the existing Python environment for rollback."
+    fi
+  fi
+  RELEASE_VENV_NEW_STARTED=1
+}
+
+finalize_release_install_transaction() {
+  if [[ "$RELEASE_TRANSACTION_ACTIVE" -ne 1 ]]; then
+    return 0
+  fi
+  RELEASE_TRANSACTION_ACTIVE=0
+  trap - EXIT INT TERM
+  if [[ "$RELEASE_VENV_BACKED_UP" -eq 1 ]]; then
+    if ! run rm -rf -- "$RELEASE_VENV_PREVIOUS_PATH"; then
+      log "WARNING: unable to remove the prior .venv backup: ${RELEASE_VENV_PREVIOUS_PATH}"
+    fi
+  fi
 }
 
 require_supported_platform() {
@@ -238,6 +324,11 @@ ensure_git_target() {
     existing_checkout=1
     log "Updating existing Kestrel checkout at ${KESTREL_HOME}"
     require_clean_kestrel_checkout "$KESTREL_HOME"
+    RELEASE_EXISTING_CHECKOUT=1
+    if ! RELEASE_ORIGINAL_HEAD="$(git -C "$KESTREL_HOME" rev-parse --verify HEAD)"; then
+      die "Unable to record the existing Kestrel checkout for rollback: ${KESTREL_HOME}"
+    fi
+    RELEASE_ORIGINAL_BRANCH="$(git -C "$KESTREL_HOME" symbolic-ref --quiet --short HEAD || true)"
   else
     run mkdir -p "$(dirname "$KESTREL_HOME")"
     run git clone "$KESTREL_REPO" "$KESTREL_HOME"
@@ -260,7 +351,7 @@ verify_release_artifact() {
   expected="$(awk -v name="$filename" '$2 == name {print $1}' "$manifest")"
   [[ "$expected" =~ ^[0-9a-f]{64}$ ]] ||
     die "Missing or invalid checksum for ${filename} in ${manifest}"
-  if ! actual="$(.venv/bin/python -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$artifact")"; then
+  if ! actual="$("$PYTHON_BIN" -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$artifact")"; then
     die "Unable to hash release artifact: ${artifact}"
   fi
   [[ "$actual" == "$expected" ]] || die "Checksum mismatch for release artifact: ${filename}"
@@ -275,9 +366,6 @@ install_python_deps() {
     return 0
   fi
 
-  # A release install starts from a clean environment so stale packages from a
-  # prior source/development install cannot escape the audited dependency set.
-  run "$PYTHON_BIN" -m venv --clear .venv
   local release_dir=".nest/release"
   local requirements_path="${release_dir}/requirements-release.txt"
   local checksums_path="${release_dir}/SHA256SUMS"
@@ -300,6 +388,11 @@ install_python_deps() {
     verify_release_artifact "$checksums_path" "$requirements_path"
     verify_release_artifact "$checksums_path" "$wheel_path"
   fi
+  # Preserve the working environment until every remote artifact has passed
+  # verification, then keep it as a rollback copy until all install smoke
+  # checks complete.
+  prepare_release_venv_replacement
+  run "$PYTHON_BIN" -m venv .venv
   run .venv/bin/python -m pip install --require-hashes -r "$requirements_path"
   run .venv/bin/python -m pip install --no-deps "${wheel_path}[${KESTREL_EXTRAS}]"
   run .venv/bin/python -m pip check
@@ -560,6 +653,9 @@ main() {
   PYTHON_BIN="$(detect_python)"
   readonly KESTREL_HOME KESTREL_REPO KESTREL_REF KESTREL_EXTRAS KESTREL_REQUIREMENTS_URL KESTREL_WHEEL_URL KESTREL_CHECKSUMS_URL KESTREL_PORT KESTREL_START_SERVER KESTREL_OPEN_BROWSER KESTREL_SERVER_SESSION KESTREL_SERVER_LOG KESTREL_SERVER_PID PYTHON_BIN
   validate_release_artifact_config
+  if [[ -n "$KESTREL_WHEEL_URL" ]]; then
+    start_release_install_transaction
+  fi
 
   if is_true "${KESTREL_DRY_RUN:-}"; then
     DRY_RUN_LABEL="yes"
@@ -620,6 +716,7 @@ main() {
   start_server_detached
   open_web_ui
   print_next_steps
+  finalize_release_install_transaction
 }
 
 main "$@"

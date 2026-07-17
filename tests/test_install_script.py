@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import runpy
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -479,7 +481,9 @@ def test_staged_release_installer_uses_verified_locked_artifacts(tmp_path: Path)
     assert "fetch https://github.com/John-MiracleWorker/Kestrel.git v0.3.0" in result.stdout
     assert f"locked requirements: {release_base}/requirements-release.txt" in result.stdout
     assert "verify SHA256SUMS" in result.stdout
-    assert "-m venv --clear .venv" in result.stdout
+    assert result.stdout.index("requirements-release.txt --output") < result.stdout.index(
+        "-m venv .venv"
+    )
     assert "pip install --require-hashes -r .nest/release/requirements-release.txt" in result.stdout
     assert "pip install --no-deps" in result.stdout
     assert "nested_memvid_agent-0.3.0-py3-none-any.whl" in result.stdout
@@ -500,6 +504,138 @@ def test_release_artifact_urls_must_be_complete_and_https(tmp_path: Path) -> Non
 
     assert result.returncode != 0
     assert "must be set together" in result.stderr
+
+
+@POSIX_SHELL_ONLY
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["invalid_wheel", "signal_after_backup", "preexisting_recovery"],
+)
+def test_failed_release_install_restores_checkout_and_existing_venv(
+    tmp_path: Path,
+    failure_mode: str,
+) -> None:
+    source = _current_tree_git_repo(tmp_path)
+    target = _installed_kestrel_checkout(tmp_path)
+    original_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=target,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    original_branch = subprocess.run(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+        cwd=target,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    exclude = target / ".git" / "info" / "exclude"
+    exclude.write_text(".venv/\n.venv.release-previous/\n.nest/\n", encoding="utf-8")
+    sentinel = target / ".venv" / "operator-runtime.txt"
+    sentinel.parent.mkdir()
+    sentinel.write_text("working runtime\n", encoding="utf-8")
+    stale_recovery = target / ".venv.release-previous" / "stale-runtime.txt"
+    if failure_mode == "preexisting_recovery":
+        stale_recovery.parent.mkdir()
+        stale_recovery.write_text("stale recovery\n", encoding="utf-8")
+
+    fixtures = tmp_path / "release-assets"
+    fixtures.mkdir()
+    requirements = fixtures / "requirements-release.txt"
+    requirements.write_text("# intentionally empty test lock\n", encoding="utf-8")
+    wheel = fixtures / "nested_memvid_agent-0.3.0-py3-none-any.whl"
+    wheel.write_bytes(b"intentionally invalid wheel")
+    checksums = fixtures / "SHA256SUMS"
+    checksums.write_text(
+        "\n".join(
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}"
+            for path in (requirements, wheel)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        "url=''\n"
+        "output=''\n"
+        "while [[ $# -gt 0 ]]; do\n"
+        "  case \"$1\" in\n"
+        "    https://*) url=\"$1\"; shift ;;\n"
+        "    --output) output=\"$2\"; shift 2 ;;\n"
+        "    *) shift ;;\n"
+        "  esac\n"
+        "done\n"
+        "cp \"$FIXTURE_DIR/${url##*/}\" \"$output\"\n",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o755)
+    if failure_mode == "signal_after_backup":
+        fake_mv = fake_bin / "mv"
+        fake_mv.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -eu\n"
+            "/bin/mv \"$@\"\n"
+            "if [[ ! -e \"$SIGNAL_MARKER\" ]]; then\n"
+            "  : >\"$SIGNAL_MARKER\"\n"
+            "  kill -TERM \"$PPID\"\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        fake_mv.chmod(0o755)
+    release_base = "https://example.invalid/releases/download/v0.3.0"
+
+    result = _run_install(
+        env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "FIXTURE_DIR": str(fixtures),
+            "SIGNAL_MARKER": str(tmp_path / "signal-injected"),
+            "KESTREL_HOME": str(target),
+            "KESTREL_REPO": str(source),
+            "KESTREL_REF": "HEAD",
+            "KESTREL_PYTHON": sys.executable,
+            "KESTREL_REQUIREMENTS_URL": f"{release_base}/{requirements.name}",
+            "KESTREL_WHEEL_URL": f"{release_base}/{wheel.name}",
+            "KESTREL_CHECKSUMS_URL": f"{release_base}/{checksums.name}",
+            "KESTREL_SKIP_WEB": "1",
+            "KESTREL_SKIP_SMOKE": "1",
+        }
+    )
+
+    assert result.returncode != 0
+    assert "restoring the previous checkout and Python environment" in result.stdout
+    if failure_mode == "signal_after_backup":
+        assert result.returncode == 143
+        assert (tmp_path / "signal-injected").exists()
+    if failure_mode == "preexisting_recovery":
+        assert "prior release recovery environment already exists" in result.stderr
+    assert sentinel.read_text(encoding="utf-8") == "working runtime\n"
+    if failure_mode == "preexisting_recovery":
+        assert stale_recovery.read_text(encoding="utf-8") == "stale recovery\n"
+    else:
+        assert not (target / ".venv.release-previous").exists()
+    restored_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=target,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    assert restored_head == original_head
+    restored_branch = subprocess.run(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+        cwd=target,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    assert restored_branch == original_branch
 
 
 @POSIX_SHELL_ONLY
