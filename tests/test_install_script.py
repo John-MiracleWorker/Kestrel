@@ -361,6 +361,9 @@ def test_install_help_documents_github_curl_and_options() -> None:
         "KESTREL_REF",
         "KESTREL_PYTHON",
         "KESTREL_EXTRAS",
+        "KESTREL_REQUIREMENTS_URL",
+        "KESTREL_WHEEL_URL",
+        "KESTREL_CHECKSUMS_URL",
         "KESTREL_SKIP_WEB",
         "KESTREL_SKIP_SMOKE",
         "KESTREL_START_SERVER",
@@ -443,6 +446,60 @@ def test_install_dry_run_does_not_require_simulated_web_build_output(tmp_path: P
 
     assert result.returncode == 0, result.stderr
     assert "npm run build --prefix web" in result.stdout
+
+
+@POSIX_SHELL_ONLY
+def test_staged_release_installer_uses_verified_locked_artifacts(tmp_path: Path) -> None:
+    staged = tmp_path / "install.sh"
+    text = INSTALL.read_text(encoding="utf-8")
+    release_base = "https://github.com/example/Kestrel/releases/download/v0.3.0"
+    replacements = {
+        'KESTREL_REF="${KESTREL_REF:-main}"': 'KESTREL_REF="${KESTREL_REF:-v0.3.0}"',
+        'DEFAULT_REQUIREMENTS_URL=""': (
+            f'DEFAULT_REQUIREMENTS_URL="{release_base}/requirements-release.txt"'
+        ),
+        'DEFAULT_WHEEL_URL=""': (
+            f'DEFAULT_WHEEL_URL="{release_base}/nested_memvid_agent-0.3.0-py3-none-any.whl"'
+        ),
+        'DEFAULT_CHECKSUMS_URL=""': (
+            f'DEFAULT_CHECKSUMS_URL="{release_base}/SHA256SUMS"'
+        ),
+    }
+    for marker, replacement in replacements.items():
+        assert text.count(marker) == 1
+        text = text.replace(marker, replacement, 1)
+    staged.write_text(text, encoding="utf-8")
+
+    result = _run_install(
+        env={"KESTREL_DRY_RUN": "1", "KESTREL_HOME": str(tmp_path / "kestrel-home")},
+        install=staged,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "fetch https://github.com/John-MiracleWorker/Kestrel.git v0.3.0" in result.stdout
+    assert f"locked requirements: {release_base}/requirements-release.txt" in result.stdout
+    assert "verify SHA256SUMS" in result.stdout
+    assert "-m venv --clear .venv" in result.stdout
+    assert "pip install --require-hashes -r .nest/release/requirements-release.txt" in result.stdout
+    assert "pip install --no-deps" in result.stdout
+    assert "nested_memvid_agent-0.3.0-py3-none-any.whl" in result.stdout
+    assert "Using the workbench bundled in the verified release wheel." in result.stdout
+    assert "pip install -e" not in result.stdout
+    assert "npm ci" not in result.stdout
+
+
+@POSIX_SHELL_ONLY
+def test_release_artifact_urls_must_be_complete_and_https(tmp_path: Path) -> None:
+    result = _run_install(
+        env={
+            "KESTREL_DRY_RUN": "1",
+            "KESTREL_HOME": str(tmp_path / "kestrel-home"),
+            "KESTREL_WHEEL_URL": "https://example.invalid/nested_memvid_agent-0.3.0.whl",
+        }
+    )
+
+    assert result.returncode != 0
+    assert "must be set together" in result.stderr
 
 
 @POSIX_SHELL_ONLY

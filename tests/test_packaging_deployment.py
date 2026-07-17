@@ -116,8 +116,8 @@ def test_deployment_docs_cover_release_and_memory_operations() -> None:
     checklist = (ROOT / "docs" / "RELEASE_CHECKLIST.md").read_text(encoding="utf-8")
 
     assert (
-        "curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.3.0/install.sh "
-        "| KESTREL_REF=v0.3.0 bash"
+        "curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/"
+        "v0.3.0/install.sh | bash"
     ) in deployment
     assert "/Kestrel/main/install.sh" not in deployment
     assert "KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash" in deployment
@@ -166,14 +166,23 @@ def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     assert "--require-hashes" in workflow
     assert "requirements-release.txt" in workflow
     assert "python -m pip_audit --path" in workflow
+    assert "cyclonedx-bom==7.3.0" in workflow
+    assert "pip-audit==2.10.1" in workflow
     assert "cyclonedx-py environment /tmp/kestrel-release-smoke/bin/python" in workflow
     assert '"nested-memvid-agent"' in workflow
     assert '"google-genai"' in workflow
     assert "Stage version-pinned installer" in workflow
     assert 'os.environ["GITHUB_REF_NAME"]' in workflow
     assert 'os.environ["RELEASE_EXTRAS"]' in workflow
+    assert 'DEFAULT_REQUIREMENTS_URL=""' in workflow
+    assert 'DEFAULT_WHEEL_URL=""' in workflow
+    assert 'DEFAULT_CHECKSUMS_URL=""' in workflow
+    assert "{release_base}/install.sh" in workflow
+    assert "${{KESTREL_REF" not in workflow
     assert "Defaults to {tag}." in workflow
-    assert "requirements-release.txt *.whl *.tar.gz sbom.cdx.json" in workflow
+    assert "Validate staged release installer plan" in workflow
+    assert "verify SHA256SUMS" in workflow
+    assert 'sha256sum install.sh requirements-release.txt "${wheels[@]}"' in workflow
     assert "gh release create \"$GITHUB_REF_NAME\" dist/*" in workflow
     assert "gh release create" in workflow
     assert 'extra_args+=(--extra "$extra")' in workflow
@@ -183,7 +192,9 @@ def test_ci_runs_isolated_python_tests_and_web_build() -> None:
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
     assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD: \"1\"" in ci
-    assert "setup-node@v4" in ci
+    assert "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020" in ci
+    assert "go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7" in ci
+    assert "permissions:\n  contents: read" in ci
     assert 'node-version: "22"' in ci
     assert "cache-dependency-path: web/package-lock.json" in ci
     assert "run: npm ci" in ci

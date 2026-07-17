@@ -29,10 +29,10 @@ On native Windows, open a WSL distro before running it; Git Bash and the Windows
 continues to be tested on native Windows; the published universal wheel is built,
 installed, and smoke-tested in the isolated Linux release environment.
 
-Install the latest published release (`v0.3.0`), initialize `.mv2` memory, build the workbench, run a deterministic smoke check, and explicitly open the localhost app:
+Install the latest published release (`v0.3.0`), initialize `.mv2` memory, install the bundled workbench, run a deterministic smoke check, and explicitly open the localhost app:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.3.0/install.sh | KESTREL_REF=v0.3.0 KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.0/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
 Omit the two launch variables for an install-only run that starts no server.
@@ -122,17 +122,17 @@ Important storage rules:
 One-shot local install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.3.0/install.sh | KESTREL_REF=v0.3.0 bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.0/install.sh | bash
 ```
 
-The installer clones or updates Kestrel in `${KESTREL_HOME:-$HOME/.kestrel-agent}`, finds Python 3.11 or newer without relying on bare `python`, installs the Memvid/OpenAI/server/MCP extras, builds the web workbench, initializes `.nest/memory/*.mv2`, verifies memory, and runs a deterministic `mock` CLI smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. `mock` is a zero-secret health check, not the intended operating mode. The installer does not ask for secrets or enable high-risk tools.
+The release installer clones or updates Kestrel in `${KESTREL_HOME:-$HOME/.kestrel-agent}`, pins the checkout to `v0.3.0`, finds Python 3.11 or newer without relying on bare `python`, verifies the published wheel and hash-locked dependencies against `SHA256SUMS`, installs the bundled workbench, initializes `.nest/memory/*.mv2`, verifies memory, and runs a deterministic `mock` CLI smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. `mock` is a zero-secret health check, not the intended operating mode. The installer does not ask for secrets or enable high-risk tools.
 
-Production installs must pin both the installer URL and `KESTREL_REF` to an immutable published tag. `main` is a development source, not the published release channel.
+Production installs should use the immutable GitHub release installer above; it pins the source, wheel, dependency manifest, and checksum manifest to the same tag. `main` is a development source, not the published release channel.
 
 Install and explicitly launch the localhost workbench in one command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/v0.3.0/install.sh | KESTREL_REF=v0.3.0 KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.0/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
 Useful installer options:

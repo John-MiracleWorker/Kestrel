@@ -4,6 +4,9 @@ set -Eeuo pipefail
 DEFAULT_REPO="https://github.com/John-MiracleWorker/Kestrel.git"
 DEFAULT_HOME="${HOME}/.kestrel-agent"
 DEFAULT_EXTRAS="memvid,openai,anthropic,gemini,server,mcp"
+DEFAULT_REQUIREMENTS_URL=""
+DEFAULT_WHEEL_URL=""
+DEFAULT_CHECKSUMS_URL=""
 DEFAULT_PORT="8765"
 DEFAULT_START_SERVER="0"
 DEFAULT_OPEN_BROWSER="0"
@@ -22,6 +25,9 @@ Environment options:
   KESTREL_REF           Git ref to install. Defaults to main.
   KESTREL_PYTHON        Python 3.11+ interpreter path/name to use.
   KESTREL_EXTRAS        Python extras to install. Defaults to memvid,openai,anthropic,gemini,server,mcp.
+  KESTREL_REQUIREMENTS_URL  Hash-locked requirements URL. Release assets set this automatically.
+  KESTREL_WHEEL_URL     Release wheel URL. Release assets set this automatically.
+  KESTREL_CHECKSUMS_URL Release checksum manifest URL. Release assets set this automatically.
   KESTREL_SKIP_WEB      Set to 1/true to skip npm ci and web build.
   KESTREL_SKIP_SMOKE    Set to 1/true to skip doctor/chat smoke checks.
   KESTREL_START_SERVER  Set to 1/true to launch the local server and web UI. Defaults to 0.
@@ -58,6 +64,32 @@ require_supported_platform() {
       die "install.sh supports macOS and Linux (including Linux inside WSL); native Windows is unsupported. Open a WSL distro and run the installer there."
       ;;
   esac
+}
+
+validate_release_artifact_config() {
+  local configured=0
+  [[ -n "$KESTREL_REQUIREMENTS_URL" ]] && configured=$((configured + 1))
+  [[ -n "$KESTREL_WHEEL_URL" ]] && configured=$((configured + 1))
+  [[ -n "$KESTREL_CHECKSUMS_URL" ]] && configured=$((configured + 1))
+
+  if [[ "$configured" -ne 0 && "$configured" -ne 3 ]]; then
+    die "KESTREL_REQUIREMENTS_URL, KESTREL_WHEEL_URL, and KESTREL_CHECKSUMS_URL must be set together."
+  fi
+  if [[ "$configured" -eq 0 ]]; then
+    return 0
+  fi
+  [[ "$KESTREL_EXTRAS" == "$DEFAULT_EXTRAS" ]] ||
+    die "The verified release artifacts support the default extras exactly: ${DEFAULT_EXTRAS}."
+
+  local url
+  for url in "$KESTREL_REQUIREMENTS_URL" "$KESTREL_WHEEL_URL" "$KESTREL_CHECKSUMS_URL"; do
+    [[ "$url" == https://* ]] || die "Release artifact URLs must use HTTPS: ${url}"
+  done
+  command -v curl >/dev/null 2>&1 || die "curl is required to download verified release artifacts."
+
+  local wheel_name="${KESTREL_WHEEL_URL##*/}"
+  [[ "$wheel_name" == nested_memvid_agent-*.whl ]] ||
+    die "Unexpected Kestrel wheel filename: ${wheel_name}"
 }
 
 is_true() {
@@ -173,6 +205,8 @@ print_install_plan() {
   home: ${KESTREL_HOME}
   python: ${PYTHON_BIN}
   extras: .[${KESTREL_EXTRAS}]
+  Python package: ${PYTHON_PACKAGE_LABEL}
+  locked requirements: ${REQUIREMENTS_LABEL}
   memory: .nest/memory
   web build: ${WEB_BUILD_LABEL}
   smoke checks: ${SMOKE_LABEL}
@@ -218,13 +252,64 @@ ensure_git_target() {
   run git -C "$KESTREL_HOME" checkout --detach --no-overwrite-ignore FETCH_HEAD
 }
 
+verify_release_artifact() {
+  local manifest="$1"
+  local artifact="$2"
+  local filename expected actual
+  filename="$(basename "$artifact")"
+  expected="$(awk -v name="$filename" '$2 == name {print $1}' "$manifest")"
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] ||
+    die "Missing or invalid checksum for ${filename} in ${manifest}"
+  if ! actual="$(.venv/bin/python -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$artifact")"; then
+    die "Unable to hash release artifact: ${artifact}"
+  fi
+  [[ "$actual" == "$expected" ]] || die "Checksum mismatch for release artifact: ${filename}"
+}
+
 install_python_deps() {
-  run "$PYTHON_BIN" -m venv .venv
-  run .venv/bin/python -m pip install --upgrade pip
-  run .venv/bin/python -m pip install -e ".[${KESTREL_EXTRAS}]"
+  if [[ -z "$KESTREL_WHEEL_URL" ]]; then
+    run "$PYTHON_BIN" -m venv .venv
+    run .venv/bin/python -m pip install --upgrade pip
+    run .venv/bin/python -m pip install -e ".[${KESTREL_EXTRAS}]"
+    run .venv/bin/python -m pip check
+    return 0
+  fi
+
+  # A release install starts from a clean environment so stale packages from a
+  # prior source/development install cannot escape the audited dependency set.
+  run "$PYTHON_BIN" -m venv --clear .venv
+  local release_dir=".nest/release"
+  local requirements_path="${release_dir}/requirements-release.txt"
+  local checksums_path="${release_dir}/SHA256SUMS"
+  local wheel_name="${KESTREL_WHEEL_URL##*/}"
+  local wheel_path="${release_dir}/${wheel_name}"
+  run mkdir -p "$release_dir"
+  run curl --fail --silent --show-error --location --retry 3 \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    "$KESTREL_REQUIREMENTS_URL" --output "$requirements_path"
+  run curl --fail --silent --show-error --location --retry 3 \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    "$KESTREL_WHEEL_URL" --output "$wheel_path"
+  run curl --fail --silent --show-error --location --retry 3 \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    "$KESTREL_CHECKSUMS_URL" --output "$checksums_path"
+
+  if is_true "${KESTREL_DRY_RUN:-}"; then
+    log "+ verify SHA256SUMS for ${requirements_path} and ${wheel_path}"
+  else
+    verify_release_artifact "$checksums_path" "$requirements_path"
+    verify_release_artifact "$checksums_path" "$wheel_path"
+  fi
+  run .venv/bin/python -m pip install --require-hashes -r "$requirements_path"
+  run .venv/bin/python -m pip install --no-deps "${wheel_path}[${KESTREL_EXTRAS}]"
+  run .venv/bin/python -m pip check
 }
 
 install_web_deps() {
+  if [[ -n "$KESTREL_WHEEL_URL" ]]; then
+    log "Using the workbench bundled in the verified release wheel."
+    return 0
+  fi
   if is_true "${KESTREL_SKIP_WEB:-}"; then
     log "Skipping web install/build because KESTREL_SKIP_WEB is set."
     return 0
@@ -237,7 +322,9 @@ install_web_deps() {
 verify_installed_runtime() {
   run .venv/bin/nest-agent --help
   run .venv/bin/python -c 'import importlib.util, nested_memvid_agent; required=("fastapi","mcp","memvid_sdk","uvicorn"); missing=[name for name in required if importlib.util.find_spec(name) is None]; assert not missing, f"missing runtime modules: {missing}"; assert nested_memvid_agent.__file__'
-  if ! is_true "${KESTREL_SKIP_WEB:-}" && ! is_true "${KESTREL_DRY_RUN:-}"; then
+  if [[ -n "$KESTREL_WHEEL_URL" ]]; then
+    run .venv/bin/python -c 'from importlib.resources import files; assert files("nested_memvid_agent").joinpath("web_dist/index.html").is_file(), "bundled workbench is missing"; import anthropic, fastapi, google.genai, mcp, memvid_sdk, openai, uvicorn'
+  elif ! is_true "${KESTREL_SKIP_WEB:-}" && ! is_true "${KESTREL_DRY_RUN:-}"; then
     [[ -s web/dist/index.html ]] || die "Web workbench build is missing web/dist/index.html"
   fi
 }
@@ -447,6 +534,9 @@ main() {
   KESTREL_REPO="${KESTREL_REPO:-$DEFAULT_REPO}"
   KESTREL_REF="${KESTREL_REF:-main}"
   KESTREL_EXTRAS="${KESTREL_EXTRAS:-$DEFAULT_EXTRAS}"
+  KESTREL_REQUIREMENTS_URL="${KESTREL_REQUIREMENTS_URL-$DEFAULT_REQUIREMENTS_URL}"
+  KESTREL_WHEEL_URL="${KESTREL_WHEEL_URL-$DEFAULT_WHEEL_URL}"
+  KESTREL_CHECKSUMS_URL="${KESTREL_CHECKSUMS_URL-$DEFAULT_CHECKSUMS_URL}"
   KESTREL_PORT="${KESTREL_PORT:-$DEFAULT_PORT}"
   KESTREL_START_SERVER="${KESTREL_START_SERVER:-$DEFAULT_START_SERVER}"
   if is_true "$KESTREL_START_SERVER"; then
@@ -468,7 +558,8 @@ main() {
   # dependencies from another environment as already installed.
   unset PYTHONPATH
   PYTHON_BIN="$(detect_python)"
-  readonly KESTREL_HOME KESTREL_REPO KESTREL_REF KESTREL_EXTRAS KESTREL_PORT KESTREL_START_SERVER KESTREL_OPEN_BROWSER KESTREL_SERVER_SESSION KESTREL_SERVER_LOG KESTREL_SERVER_PID PYTHON_BIN
+  readonly KESTREL_HOME KESTREL_REPO KESTREL_REF KESTREL_EXTRAS KESTREL_REQUIREMENTS_URL KESTREL_WHEEL_URL KESTREL_CHECKSUMS_URL KESTREL_PORT KESTREL_START_SERVER KESTREL_OPEN_BROWSER KESTREL_SERVER_SESSION KESTREL_SERVER_LOG KESTREL_SERVER_PID PYTHON_BIN
+  validate_release_artifact_config
 
   if is_true "${KESTREL_DRY_RUN:-}"; then
     DRY_RUN_LABEL="yes"
@@ -476,9 +567,17 @@ main() {
   else
     DRY_RUN_LABEL="no"
   fi
-  if is_true "${KESTREL_SKIP_WEB:-}"; then
+  if [[ -n "$KESTREL_WHEEL_URL" ]]; then
+    PYTHON_PACKAGE_LABEL="$KESTREL_WHEEL_URL"
+    REQUIREMENTS_LABEL="$KESTREL_REQUIREMENTS_URL"
+    WEB_BUILD_LABEL="bundled in verified release wheel"
+  elif is_true "${KESTREL_SKIP_WEB:-}"; then
+    PYTHON_PACKAGE_LABEL="editable checkout"
+    REQUIREMENTS_LABEL="live resolver (development/source mode)"
     WEB_BUILD_LABEL="skipped"
   else
+    PYTHON_PACKAGE_LABEL="editable checkout"
+    REQUIREMENTS_LABEL="live resolver (development/source mode)"
     WEB_BUILD_LABEL="npm ci --prefix web && npm run build --prefix web"
   fi
   if is_true "${KESTREL_SKIP_SMOKE:-}"; then
@@ -503,7 +602,7 @@ main() {
     WEB_UI_LABEL="skipped"
     SERVER_COMMAND_LABEL="skipped"
   fi
-  readonly DRY_RUN_LABEL WEB_BUILD_LABEL SMOKE_LABEL SERVER_LABEL BROWSER_LABEL HEALTH_CHECK_LABEL WEB_UI_LABEL SERVER_COMMAND_LABEL
+  readonly DRY_RUN_LABEL PYTHON_PACKAGE_LABEL REQUIREMENTS_LABEL WEB_BUILD_LABEL SMOKE_LABEL SERVER_LABEL BROWSER_LABEL HEALTH_CHECK_LABEL WEB_UI_LABEL SERVER_COMMAND_LABEL
 
   print_runtime_defaults
   print_install_plan

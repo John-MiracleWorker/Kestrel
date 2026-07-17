@@ -15,6 +15,8 @@ jobs:
       RELEASE_EXTRAS: "memvid,openai,anthropic,gemini,server,mcp"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -32,7 +34,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e '.[dev,memvid,mcp]'
-          python -m pip install cyclonedx-bom pip-audit
+          python -m pip install 'cyclonedx-bom==7.3.0' 'pip-audit==2.10.1'
       - name: Validate Python package
         run: |
           python -m compileall -q src tests scripts
@@ -78,13 +80,26 @@ jobs:
           path = Path("dist/install.sh")
           text = path.read_text(encoding="utf-8")
           tag = os.environ["GITHUB_REF_NAME"]
+          wheels = list(Path("dist").glob("*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected exactly one wheel, found: {wheels}")
+          release_base = (
+              f"https://github.com/John-MiracleWorker/Kestrel/releases/download/{tag}"
+          )
           expected_extras = f'DEFAULT_EXTRAS="{os.environ["RELEASE_EXTRAS"]}"'
           if expected_extras not in text:
               raise SystemExit("installer default extras do not match the release environment")
           replacements = {
-              'KESTREL_REF="${KESTREL_REF:-main}"': f'KESTREL_REF="${{KESTREL_REF:-{tag}}}"',
+              'KESTREL_REF="${KESTREL_REF:-main}"':
+                  'KESTREL_REF="${KESTREL_REF:-' + tag + '}"',
+              'DEFAULT_REQUIREMENTS_URL=""':
+                  f'DEFAULT_REQUIREMENTS_URL="{release_base}/requirements-release.txt"',
+              'DEFAULT_WHEEL_URL=""':
+                  f'DEFAULT_WHEEL_URL="{release_base}/{wheels[0].name}"',
+              'DEFAULT_CHECKSUMS_URL=""':
+                  f'DEFAULT_CHECKSUMS_URL="{release_base}/SHA256SUMS"',
               "https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh":
-                  f"https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/{tag}/install.sh",
+                  f"{release_base}/install.sh",
               "Defaults to main.": f"Defaults to {tag}.",
           }
           for marker, pinned in replacements.items():
@@ -93,6 +108,15 @@ jobs:
               text = text.replace(marker, pinned, 1)
           path.write_text(text, encoding="utf-8")
           PY
+      - name: Validate staged release installer plan
+        run: |
+          installer_help="$(bash dist/install.sh --help)"
+          grep -Fq "https://github.com/John-MiracleWorker/Kestrel/releases/download/$GITHUB_REF_NAME/install.sh | bash" <<< "$installer_help"
+          installer_plan="$(KESTREL_DRY_RUN=1 KESTREL_HOME=/tmp/kestrel-installer-plan bash dist/install.sh)"
+          grep -Fq "ref: $GITHUB_REF_NAME" <<< "$installer_plan"
+          grep -Fq "verify SHA256SUMS" <<< "$installer_plan"
+          grep -Fq "pip install --require-hashes" <<< "$installer_plan"
+          grep -Fq "pip install --no-deps" <<< "$installer_plan"
       - name: Export locked default release dependencies
         run: |
           extra_args=()
@@ -132,7 +156,7 @@ jobs:
           ) >/tmp/kestrel-release-server.log 2>&1 &
           server_pid=$!
           trap 'kill "$server_pid" 2>/dev/null || true' EXIT
-          for attempt in {1..30}; do
+          for _ in {1..30}; do
             if curl -fsS http://127.0.0.1:8878/ >/tmp/kestrel-release-index.html; then
               break
             fi
@@ -184,7 +208,12 @@ jobs:
         run: |
           (
             cd dist
-            sha256sum install.sh requirements-release.txt *.whl *.tar.gz sbom.cdx.json > SHA256SUMS
+            shopt -s nullglob
+            wheels=(*.whl)
+            sdists=(*.tar.gz)
+            test "${#wheels[@]}" -eq 1
+            test "${#sdists[@]}" -eq 1
+            sha256sum install.sh requirements-release.txt "${wheels[@]}" "${sdists[@]}" sbom.cdx.json > SHA256SUMS
           )
       - name: Publish GitHub release
         env:
