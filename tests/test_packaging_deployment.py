@@ -10,9 +10,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_package_metadata_identifies_kestrel_release() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
     project = pyproject["project"]
+    locked_versions = {package["name"]: package["version"] for package in lock["package"]}
 
-    assert project["version"] == "0.3.0"
+    assert project["version"] == "0.3.1"
+    assert "pip>=26.1.2" in project["dependencies"]
+    assert "setuptools>=83.0.0" in project["dependencies"]
+    assert locked_versions["pip"] == "26.1.2"
+    assert locked_versions["setuptools"] == "83.0.0"
     assert project["description"].startswith("Kestrel:")
     assert project["urls"]["Repository"] == "https://github.com/John-MiracleWorker/Kestrel"
     assert project["urls"]["Issues"] == "https://github.com/John-MiracleWorker/Kestrel/issues"
@@ -117,7 +123,7 @@ def test_deployment_docs_cover_release_and_memory_operations() -> None:
 
     assert (
         "curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/"
-        "v0.3.0/install.sh | bash"
+        "v0.3.1/install.sh | bash"
     ) in deployment
     assert "/Kestrel/main/install.sh" not in deployment
     assert "KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash" in deployment
