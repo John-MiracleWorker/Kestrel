@@ -1,6 +1,6 @@
 # Architecture
 
-Last updated: 2026-05-20
+Last updated: 2026-07-16
 
 ## Goal
 
@@ -102,12 +102,35 @@ The SQLite state store tracks operational state:
 - MCP servers/tools
 - skills and validation/provenance hashes
 - plugins and plugin enablement metadata
+- per-tool, MCP-server, and skill capability overrides
+- append-only capability change history
 - task nodes
 - subagent runs
 - promotion ledger and outcome rows
 - behavior-delta ledger, activation rows, and outcome rows
 
-Terminal run statuses and approval decisions are replay-safe. State migrations currently initialize schema version 11.
+Terminal run statuses and approval decisions are replay-safe. State migrations currently initialize schema version 15. Schema v15 adds compare-and-swap `capability_overrides`, append-only `capability_change_log` rows, and capability revision/resource-digest bindings on approval requests.
+
+## Capability Resolution
+
+The capability control plane separates an owner-desired state from effective authorization:
+
+```text
+effective tool = configured tool switch
+              ∧ current master/config gate
+              ∧ current launch allowlist
+              ∧ effective parent skill or MCP server
+              ∧ effective owning plugin, when present
+              ∧ unchanged tool and parent resource digests
+```
+
+`GET /api/capabilities` returns the server-authoritative catalog with `default_enabled`, `configured_enabled`, `effective_enabled`, `blocked_by`, revision, risk, approval requirement, source, and parent. `PUT /api/capabilities/{kind}/{capability_id}` persists an owner decision only when `expected_revision` matches; a stale revision returns HTTP 409 with the current row. `GET /api/capabilities/history` exposes the append-only change log and accepts kind/capability filters plus a bounded limit.
+
+New skills discovered from disk and newly discovered dynamic skill/MCP tools default off. Every API-created MCP server is forced off until a later revisioned capability decision. A dynamic tool needs both its own effective switch and its parent skill/MCP server. Built-in high/critical-risk tools without a dedicated master flag also default off. The Settings Capability Center renders configured versus effective state and the exact blockers instead of implying that an owner switch overrides a runtime prerequisite.
+
+The execution registry performs a fresh capability decision immediately before dispatch. Therefore disabling is an asymmetric live kill switch: later invocation attempts are denied even through a registry built before the change, affected pending approvals are denied, and disabling an MCP server closes its managed session. Enabling does not rewrite an active run's snapshotted configuration or grant a missing parent/master prerequisite. The API contract is explicitly `future_invocations`; it does not guarantee cancellation of arbitrary built-in subprocesses that were already dispatched.
+
+An approval is valid only for its original exact tool-call ID and arguments, owner principal, capability revision, and digest of the tool specification, active policy gates, and parent MCP/skill resource. Approval continuation re-reads all of them immediately before execution. A changed specification, policy prerequisite, parent configuration, or capability revision invalidates the grant. A resource changed after an enable decision also produces `resource_changed` until the owner reviews and records a fresh decision. Deleting a resource revokes and removes its override so a later resource with the same ID cannot inherit the old grant.
 
 ## Tooling Boundary
 
@@ -116,7 +139,7 @@ Tool execution goes through `ToolRegistry`:
 - argument validation
 - workspace/path safety
 - timeout enforcement
-- capability enablement gates
+- live capability resolution and stale-registry denial
 - exact-call approvals for high-risk tools
 - structured success/failure results
 - failure diagnosis where applicable

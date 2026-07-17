@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import sleep
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 from pytest import MonkeyPatch
@@ -20,7 +21,9 @@ from nested_memvid_agent.runtime_models import ToolCall, ToolExecution, ToolSpec
 from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.tools.base import AgentTool, ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
-from nested_memvid_agent.tools.registry import ToolRegistry
+from nested_memvid_agent.tools.command_tools import _is_python_executable_name
+from nested_memvid_agent.tools.process_tools import _run_subprocess, _SubprocessToolTimeout
+from nested_memvid_agent.tools.registry import RetryingRegistry, ToolRegistry
 
 
 class SlowTool(AgentTool):
@@ -39,6 +42,50 @@ class SlowTool(AgentTool):
         )
 
 
+class FlakyRetryTool(AgentTool):
+    def __init__(
+        self,
+        *,
+        name: str,
+        risk: Literal["low", "medium", "high", "critical"],
+        requires_approval: bool = False,
+    ) -> None:
+        self.spec = ToolSpec(
+            name=name,
+            description="Returns one transient failure before succeeding.",
+            parameters={"type": "object", "properties": {}},
+            risk=risk,
+            requires_approval=requires_approval,
+        )
+        self.calls = 0
+
+    def run(self, arguments: dict[str, object], context: ToolContext) -> ToolExecution:
+        del context
+        self.calls += 1
+        call = ToolCall(name=self.spec.name, arguments=arguments)
+        if self.calls == 1:
+            return ToolExecution(
+                call=call,
+                success=False,
+                content="temporary failure",
+                error="transient_error",
+            )
+        return ToolExecution(call=call, success=True, content="ok")
+
+
+@pytest.mark.parametrize(
+    "executable",
+    ["python.exe", "python3.exe", "python3.11.exe", "python", "python3.13"],
+)
+def test_python_executable_allowlist_accepts_cross_platform_names(executable: str) -> None:
+    assert _is_python_executable_name(executable) is True
+
+
+@pytest.mark.parametrize("executable", ["pythonw.exe", "pytest.exe", "python-launcher.exe"])
+def test_python_executable_allowlist_rejects_non_interpreters(executable: str) -> None:
+    assert _is_python_executable_name(executable) is False
+
+
 def test_build_default_tools_can_be_limited_to_named_subset() -> None:
     registry = build_default_tools(("memory.search", "file.read"))
 
@@ -47,6 +94,136 @@ def test_build_default_tools_can_be_limited_to_named_subset() -> None:
     assert names == ["memory.search", "file.read"]
     assert registry.spec_for("memory.search") is not None
     assert registry.spec_for("shell.run") is None
+
+
+def test_legacy_config_cannot_disable_exact_call_approval() -> None:
+    config = AgentConfig.from_mapping({"require_approval_for_high_risk_tools": False})
+
+    assert config.require_approval_for_high_risk_tools is True
+
+
+def test_registry_requires_approval_for_high_risk_spec_even_when_flag_is_false(
+    tmp_path: Path,
+) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    tool = FlakyRetryTool(name="unsafe.manifest", risk="high", requires_approval=False)
+    registry = ToolRegistry()
+    registry.register(tool)
+
+    result = registry.execute(
+        ToolCall(name=tool.spec.name, arguments={}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.success is False
+    assert result.error == "approval_required"
+    assert tool.calls == 0
+
+
+def test_transparent_retries_never_repeat_high_risk_or_approved_tools(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    inner = ToolRegistry()
+    read_only = FlakyRetryTool(name="safe.read", risk="low")
+    mutating = FlakyRetryTool(name="unsafe.write", risk="high", requires_approval=True)
+    inner.register(read_only)
+    inner.register(mutating)
+    registry = RetryingRegistry(inner, max_attempts=3, backoff_base_seconds=0)
+    context = ToolContext(
+        memory=memory,
+        config=AgentConfig(require_approval_for_high_risk_tools=False),
+        workspace=tmp_path,
+        approved_tool_call_ids=frozenset({"approved_mutation"}),
+        approved_tool_call_arguments={"approved_mutation": {}},
+    )
+
+    safe_result = registry.execute(ToolCall(name="safe.read", arguments={}), context)
+    unsafe_result = registry.execute(
+        ToolCall(name="unsafe.write", arguments={}, id="approved_mutation"), context
+    )
+
+    assert safe_result.success is True
+    assert read_only.calls == 2
+    assert unsafe_result.success is False
+    assert unsafe_result.error == "transient_error"
+    assert mutating.calls == 1
+
+
+def test_file_write_is_atomic_and_rejects_secret_or_symlink_targets(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools(("file.write",))
+    approved_arguments = {
+        "write_safe": {"path": "nested/result.txt", "content": "safe"},
+        "write_secret": {"path": ".nest/secrets/token", "content": "no"},
+        "write_symlink": {"path": "linked/escape.txt", "content": "no"},
+    }
+    context = ToolContext(
+        memory=memory,
+        config=AgentConfig(
+            allow_file_write=True,
+            require_approval_for_high_risk_tools=False,
+        ),
+        workspace=tmp_path,
+        approved_tool_call_ids=frozenset(approved_arguments),
+        approved_tool_call_arguments=approved_arguments,
+    )
+
+    written = registry.execute(
+        ToolCall(
+            name="file.write",
+            arguments={"path": "nested/result.txt", "content": "safe"},
+            id="write_safe",
+        ),
+        context,
+    )
+    assert written.success is True
+    assert (tmp_path / "nested" / "result.txt").read_text() == "safe"
+    assert not list((tmp_path / "nested").glob(".kestrel-write-*"))
+
+    secret = registry.execute(
+        ToolCall(
+            name="file.write",
+            arguments={"path": ".nest/secrets/token", "content": "no"},
+            id="write_secret",
+        ),
+        context,
+    )
+    assert secret.success is False
+    assert not (tmp_path / ".nest" / "secrets" / "token").exists()
+
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
+    linked = registry.execute(
+        ToolCall(
+            name="file.write",
+            arguments={"path": "linked/escape.txt", "content": "no"},
+            id="write_symlink",
+        ),
+        context,
+    )
+    assert linked.success is False
+    assert not (outside / "escape.txt").exists()
+
+
+def test_repo_search_does_not_follow_workspace_file_symlinks(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools(("repo.search",))
+    context = ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path)
+    outside = tmp_path.parent / f"outside-search-{tmp_path.name}.txt"
+    outside.write_text("do-not-leak-this-value", encoding="utf-8")
+    (tmp_path / "leak.txt").symlink_to(outside)
+
+    try:
+        result = registry.execute(
+            ToolCall(name="repo.search", arguments={"query": "do-not-leak"}),
+            context,
+        )
+    finally:
+        outside.unlink(missing_ok=True)
+
+    assert result.success is True
+    assert "do-not-leak-this-value" not in result.content
+    assert result.data == {"matches": []}
 
 
 def test_run_manager_registry_honors_enabled_tools_config(tmp_path: Path) -> None:
@@ -61,11 +238,13 @@ def test_run_manager_registry_honors_enabled_tools_config(tmp_path: Path) -> Non
         def discover(self) -> None:
             pass
 
-        def tool_adapters(self) -> list[AgentTool]:
+        def tool_adapters(self, *, include_disabled: bool = False) -> list[AgentTool]:
+            del include_disabled
             return []
 
     class _MCP:
-        def tool_adapters(self) -> list[AgentTool]:
+        def tool_adapters(self, *, include_disabled: bool = False) -> list[AgentTool]:
+            del include_disabled
             return []
 
     manager = RunManager(
@@ -100,6 +279,47 @@ def test_tool_registry_times_out_slow_tools(tmp_path: Path) -> None:
     assert result.success is False
     assert result.error == "tool_timeout"
     assert "timed out" in result.content
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
+def test_subprocess_timeout_kills_term_ignoring_descendants(tmp_path: Path) -> None:
+    child_pid_path = tmp_path / "child.pid"
+    code = (
+        "import signal,subprocess,sys,time;"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        "child=subprocess.Popen([sys.executable,'-c',"
+        "'import signal,time;signal.signal(signal.SIGTERM, signal.SIG_IGN);time.sleep(30)']);"
+        f"open({str(child_pid_path)!r},'w').write(str(child.pid));"
+        "time.sleep(30)"
+    )
+    context = ToolContext(
+        memory=build_memory_system("memory", tmp_path / "memory"),
+        config=AgentConfig(tool_timeout_seconds=0.2),
+        workspace=tmp_path,
+    )
+
+    with pytest.raises(_SubprocessToolTimeout):
+        _run_subprocess(
+            [sys.executable, "-c", code],
+            context=context,
+            arguments={"timeout": 0.2, "_tool_call_id": "timeout-tree"},
+            default_timeout=1,
+        )
+
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+    for _ in range(20):
+        status = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(child_pid)],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        process_state = status.stdout.strip()
+        if status.returncode != 0 or not process_state or process_state.startswith("Z"):
+            break
+        sleep(0.05)
+    else:
+        pytest.fail(f"TERM-ignoring descendant survived tool timeout in state {process_state}")
 
 
 def test_subprocess_tool_timeout_kills_child_process_and_caps_requested_timeout(
@@ -489,6 +709,99 @@ def test_file_read_rejects_secret_store_path(tmp_path: Path) -> None:
     assert "not allowed" in result.content.lower()
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        ".env.production",
+        ".npmrc",
+        ".pypirc",
+        ".git/config",
+        "nested/secrets/provider.json",
+        "nested/credentials/cloud.json",
+        "keys/release.pem",
+        "client_secret-production.json",
+    ],
+)
+def test_file_read_rejects_sensitive_credential_paths(
+    tmp_path: Path,
+    relative_path: str,
+) -> None:
+    path = tmp_path / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("raw-sensitive-value", encoding="utf-8")
+    memory = build_memory_system("memory", tmp_path / "memory")
+
+    result = build_default_tools().execute(
+        ToolCall(name="file.read", arguments={"path": relative_path}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.success is False
+    assert result.error == "file_read_failed"
+    assert "raw-sensitive-value" not in result.content
+    assert "not allowed" in result.content.lower()
+
+
+def test_file_read_rejects_symlink_and_traversal_aliases_for_sensitive_paths(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".env.local").write_text("OPENAI_API_KEY=raw-secret", encoding="utf-8")
+    (tmp_path / "README.md").write_text("safe", encoding="utf-8")
+    (tmp_path / "visible.txt").symlink_to(tmp_path / ".env.local")
+    (tmp_path / ".env.alias").symlink_to(tmp_path / "README.md")
+    (tmp_path / "nested").mkdir()
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    context = ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path)
+
+    for requested in ("visible.txt", ".env.alias", "nested/../.env.local"):
+        result = registry.execute(
+            ToolCall(name="file.read", arguments={"path": requested}),
+            context,
+        )
+        assert result.success is False, requested
+        assert result.error == "file_read_failed", requested
+        assert "raw-secret" not in result.content
+
+
+def test_file_read_redacts_secret_content_in_an_allowed_file(tmp_path: Path) -> None:
+    secret = "opaque-provider-secret-12345"
+    (tmp_path / "debug.txt").write_text(
+        f"status=failed\nOPENAI_API_KEY={secret}\n",
+        encoding="utf-8",
+    )
+    memory = build_memory_system("memory", tmp_path / "memory")
+
+    result = build_default_tools().execute(
+        ToolCall(name="file.read", arguments={"path": "debug.txt"}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.success is True
+    assert "status=failed" in result.content
+    assert secret not in result.content
+    assert "<redacted>" in result.content
+
+
+def test_repo_search_skips_sensitive_files(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("needle = 'safe'\n", encoding="utf-8")
+    (tmp_path / "credentials.json").write_text(
+        '{"token": "needle-sensitive-value"}',
+        encoding="utf-8",
+    )
+    memory = build_memory_system("memory", tmp_path / "memory")
+
+    result = build_default_tools().execute(
+        ToolCall(name="repo.search", arguments={"query": "needle"}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.success is True
+    assert "app.py" in result.content
+    assert "credentials.json" not in result.content
+    assert "needle-sensitive-value" not in result.content
+
+
 def test_high_risk_tool_requires_enablement(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
@@ -576,6 +889,38 @@ def test_shell_run_python_escape_is_not_allowlisted(
 
     assert result.error == "command_not_allowlisted"
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        ["cat", "../outside.txt"],
+        ["cat", ".env"],
+        ["cat", "-"],
+        ["cat"],
+        ["ls", "/tmp"],
+    ),
+)
+def test_shell_run_file_commands_cannot_escape_or_read_sensitive_paths(
+    tmp_path: Path,
+    command: list[str],
+) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    call = ToolCall(name="shell.run", arguments={"command": command}, id="bounded_shell_path")
+
+    result = build_default_tools().execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_shell=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({call.id}),
+            approved_tool_call_arguments={call.id: call.arguments},
+        ),
+    )
+
+    assert result.success is False
+    assert result.error == "path_not_allowed"
 
 
 def test_remote_publishing_config_is_disabled_by_default_and_env_gated(
@@ -1725,6 +2070,50 @@ def test_lint_run_uses_shell_enablement_and_allowlist(tmp_path: Path) -> None:
 
     assert allowed.success
     assert "exit_code=0" in allowed.content
+
+
+@pytest.mark.parametrize("tool_name", ["test.run", "lint.run"])
+def test_validation_subprocesses_do_not_inherit_credentials(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    tool_name: str,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "opaque-provider-secret-12345")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:telegram-secret-material-value")
+    monkeypatch.setenv("NEST_AGENT_API_TOKEN", "opaque-server-secret-12345")
+    monkeypatch.setenv("SAFE_VALIDATION_FLAG", "present")
+    script = tmp_path / "inspect_environment.py"
+    script.write_text(
+        "import json, os\n"
+        "names = ('OPENAI_API_KEY', 'TELEGRAM_BOT_TOKEN', "
+        "'NEST_AGENT_API_TOKEN', 'SAFE_VALIDATION_FLAG')\n"
+        "print(json.dumps({name: os.environ.get(name) for name in names}))\n",
+        encoding="utf-8",
+    )
+    memory = build_memory_system("memory", tmp_path / "memory")
+    call = ToolCall(
+        name=tool_name,
+        arguments={"command": [sys.executable, str(script)]},
+        id=f"sanitize-{tool_name}",
+    )
+
+    result = build_default_tools().execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_shell=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({call.id}),
+            approved_tool_call_arguments={call.id: call.arguments},
+        ),
+    )
+
+    assert result.success is True
+    assert '"SAFE_VALIDATION_FLAG": "present"' in result.content
+    assert '"OPENAI_API_KEY": null' in result.content
+    assert '"TELEGRAM_BOT_TOKEN": null' in result.content
+    assert '"NEST_AGENT_API_TOKEN": null' in result.content
+    assert "opaque-provider-secret" not in result.content
 
 
 def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_path: Path) -> None:

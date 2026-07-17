@@ -57,6 +57,8 @@ def test_support_bundle_export_writes_redacted_archive(
     assert state_summary["schema_version"] >= 1
     assert state_summary["tables"]["runs"] == 1
     assert state_summary["tables"]["approval_requests"] == 1
+    assert state_summary["tables"]["capability_overrides"] == 1
+    assert state_summary["tables"]["capability_change_log"] == 1
 
 
 def test_product_support_bundle_route_exports_default_bundle(tmp_path: Path) -> None:
@@ -150,6 +152,14 @@ def _seed_state(path: Path) -> None:
         tool_name="shell.run",
         arguments={"command": ["echo", "hello"]},
         risk="high",
+    )
+    state.set_capability_override(
+        "tool",
+        "shell.run",
+        False,
+        expected_revision=0,
+        default_enabled=True,
+        updated_by="support-test",
     )
 
 

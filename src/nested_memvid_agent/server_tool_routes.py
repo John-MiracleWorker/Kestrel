@@ -21,10 +21,18 @@ def register_tool_routes(app: Any, *, runs: Any) -> None:
     @app.get("/api/tools")  # type: ignore[untyped-decorator]
     def list_tools() -> list[dict[str, object]]:
         config = getattr(runs, "config", None)
+        registry = runs.build_registry()
+        catalog = getattr(registry, "all_specs", registry.specs)()
         tools = []
-        for spec in runs.build_registry().specs():
+        for spec in catalog:
             payload = spec.to_public_dict()
-            payload.update(tool_enablement_status(spec, config))
+            policy = getattr(runs, "capabilities", None)
+            if policy is None:
+                payload.update(tool_enablement_status(spec, config))
+            else:
+                decision = policy.tool_decision(spec)
+                payload.update(decision.to_public_dict())
+                payload["enabled"] = decision.effective_enabled
             tools.append(payload)
         return tools
 

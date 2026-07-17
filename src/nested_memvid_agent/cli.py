@@ -27,6 +27,7 @@ from .event_bus import RunEventBus
 from .layers import load_layer_specs
 from .llm.model_catalog import PROVIDER_OPTIONS
 from .mcp_manager import MCPManager
+from .memory_backup import MemoryBackupError, MemoryBackupManager
 from .models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from .orchestrator import build_memory_system
 from .plugin_manager import PluginError, PluginManager
@@ -190,6 +191,23 @@ def main() -> None:
     _add_common_args(memory_compact)
     memory_compact.add_argument("--layer", choices=[layer.value for layer in MemoryLayer], default=MemoryLayer.WORKING.value)
     memory_compact.add_argument("--apply", action="store_true")
+    memory_backup = memory_sub.add_parser("backup")
+    _add_common_args(memory_backup)
+    memory_backup.add_argument("--backup-dir", type=Path, default=Path(".nest/backups/memory"))
+    memory_backup.add_argument("--retain", type=int, default=7)
+    memory_backup_list = memory_sub.add_parser("backup-list")
+    memory_backup_list.add_argument("--memory-dir", type=Path, default=Path(".nest/memory"))
+    memory_backup_list.add_argument("--backup-dir", type=Path, default=Path(".nest/backups/memory"))
+    memory_backup_verify = memory_sub.add_parser("backup-verify")
+    memory_backup_verify.add_argument("backup_id")
+    memory_backup_verify.add_argument("--memory-dir", type=Path, default=Path(".nest/memory"))
+    memory_backup_verify.add_argument("--backup-dir", type=Path, default=Path(".nest/backups/memory"))
+    memory_restore = memory_sub.add_parser("restore")
+    _add_common_args(memory_restore)
+    memory_restore.add_argument("backup_id")
+    memory_restore.add_argument("--backup-dir", type=Path, default=Path(".nest/backups/memory"))
+    memory_restore.add_argument("--retain", type=int, default=7)
+    memory_restore.add_argument("--yes", action="store_true", help="Confirm destructive memory replacement.")
     memory_ledger = memory_sub.add_parser("ledger")
     memory_ledger.add_argument("--state-path", type=Path, default=Path(".nest/state/agent.db"))
     memory_ledger.add_argument("--since", default="30d")
@@ -231,6 +249,11 @@ def main() -> None:
     product_setup = product_sub.add_parser("setup")
     _add_agent_args(product_setup)
     product_setup.add_argument("--json", action="store_true")
+    product_setup.add_argument(
+        "--check",
+        action="store_true",
+        help="Exit nonzero when any required setup check fails.",
+    )
     product_provider_certification = product_sub.add_parser("provider-certification")
     _add_agent_args(product_provider_certification)
     product_provider_certification.add_argument("--json", action="store_true")
@@ -344,6 +367,7 @@ def main() -> None:
     _add_agent_args(server)
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", type=int, default=8765)
+    server.add_argument("--access-log", action=argparse.BooleanOptionalAction, default=True)
 
     channel = sub.add_parser("channel")
     _add_agent_args(channel)
@@ -443,7 +467,7 @@ def main() -> None:
         from .server import create_app
 
         _validate_server_bind(args.host, config)
-        uvicorn.run(create_app(config), host=args.host, port=args.port)
+        uvicorn.run(create_app(config), host=args.host, port=args.port, access_log=args.access_log)
         return
 
     if args.cmd == "channel":
@@ -526,6 +550,15 @@ def main() -> None:
 
     if args.cmd == "product" and args.product_cmd == "support-bundle":
         _print_support_bundle(config, args)
+        return
+
+    if args.cmd == "memory" and args.memory_cmd in {
+        "backup",
+        "backup-list",
+        "backup-verify",
+        "restore",
+    }:
+        _handle_memory_backup_command(config, args)
         return
 
     if args.cmd == "memory" and args.memory_cmd == "ledger":
@@ -784,6 +817,60 @@ def _specs_from_config(config: AgentConfig) -> dict[MemoryLayer, Any] | None:
     return load_layer_specs(layer_config) if layer_config else None
 
 
+def _handle_memory_backup_command(config: AgentConfig, args: argparse.Namespace) -> None:
+    manager = MemoryBackupManager(
+        memory_dir=config.memory_dir,
+        backup_root=Path(args.backup_dir),
+        specs=_specs_from_config(config),
+    )
+    command = str(args.memory_cmd)
+    if command == "backup-list":
+        print(json.dumps(manager.list_backups(), indent=2))
+        return
+    if command == "backup-verify":
+        result = manager.validate(str(args.backup_id))
+        print(json.dumps(result, indent=2))
+        if not result["ok"]:
+            raise SystemExit(1)
+        return
+    if config.backend != "memvid":
+        raise SystemExit("Memory backup and restore require --backend memvid.")
+    active = AgentStateStore(config.state_path).list_nonterminal_runs()
+    if active:
+        raise SystemExit("Refusing memory backup/restore while non-terminal runs exist.")
+    if command == "restore" and not bool(args.yes):
+        raise SystemExit("Memory restore is destructive; rerun with --yes after stopping Kestrel.")
+    if command == "backup":
+        _seal_and_verify_memory(config)
+        print(json.dumps(manager.create(retain=max(1, int(args.retain))), indent=2))
+        return
+    if command == "restore":
+        result = manager.restore(
+            str(args.backup_id),
+            retain=max(2, int(args.retain)),
+            verify_staging=lambda path: _seal_and_verify_memory(replace(config, memory_dir=path)),
+        )
+        print(json.dumps(result, indent=2))
+        return
+    raise SystemExit(f"Unknown memory backup command: {command}")
+
+
+def _seal_and_verify_memory(config: AgentConfig) -> None:
+    memory = build_memory_system(
+        config.backend,
+        config.memory_dir,
+        specs=_specs_from_config(config),
+    )
+    try:
+        memory.seal_all()
+        results = memory.verify_all()
+        failed = [layer.value for layer, ok in results.items() if not ok]
+        if failed:
+            raise MemoryBackupError(f"Memvid verification failed for layers: {', '.join(failed)}")
+    finally:
+        memory.close_all()
+
+
 def _ledger_for_memory_command(args: argparse.Namespace) -> PromotionLedger | None:
     if getattr(args, "cmd", "") != "memory":
         return None
@@ -861,8 +948,11 @@ def _print_product_readiness(args: argparse.Namespace) -> None:
         print(json.dumps(payload, indent=2))
         return
     headline = payload["headline"]
-    print("Product readiness")
-    print(f"Product ready: {'yes' if headline['product_ready'] else 'no'}")
+    print("Full product roadmap")
+    print(
+        "Full hosted/team product roadmap complete: "
+        f"{'yes' if headline['product_ready'] else 'no'}"
+    )
     print(
         f"Categories: {headline['ready_count']} ready, "
         f"{headline['partial_count']} partial, {headline['missing_count']} missing"
@@ -878,17 +968,19 @@ def _print_setup_readiness(config: AgentConfig, args: argparse.Namespace) -> Non
     payload = report.to_dict()
     if args.json:
         print(json.dumps(payload, indent=2))
-        return
-    print("First-run setup readiness")
-    print(f"Ready: {'yes' if payload['ready'] else 'no'}")
-    print(f"Checks: {payload['pass_count']} pass, {payload['warn_count']} warn, {payload['fail_count']} fail")
-    print(f"Next: {payload['next_action']}")
-    print()
-    for check in payload["checks"]:
-        print(f"{check['title']}: {check['status']}")
-        print(f"  Detail: {check['detail']}")
-        if check["status"] != "pass":
-            print(f"  Recovery: {check['recovery']}")
+    else:
+        print("First-run setup readiness")
+        print(f"Ready: {'yes' if payload['ready'] else 'no'}")
+        print(f"Checks: {payload['pass_count']} pass, {payload['warn_count']} warn, {payload['fail_count']} fail")
+        print(f"Next: {payload['next_action']}")
+        print()
+        for check in payload["checks"]:
+            print(f"{check['title']}: {check['status']}")
+            print(f"  Detail: {check['detail']}")
+            if check["status"] != "pass":
+                print(f"  Recovery: {check['recovery']}")
+    if getattr(args, "check", False) and not payload["ready"]:
+        raise SystemExit(1)
 
 
 def _print_provider_certification(config: AgentConfig, args: argparse.Namespace) -> None:
@@ -1248,6 +1340,7 @@ def _doctor_tool_config(config: AgentConfig) -> dict[str, Any]:
         "allow_web": config.allow_web,
         "allow_self_modification": config.allow_self_modification,
         "require_approval_for_high_risk_tools": config.require_approval_for_high_risk_tools,
+        "approval_ttl_seconds": config.approval_ttl_seconds,
         "web_backend": config.web_backend,
         "max_tool_rounds": config.max_tool_rounds,
         "context_budget_chars": config.context_budget_chars,
@@ -1396,7 +1489,7 @@ def _print_status(
 
 
 def _print_approvals(manager: RunManager, *, status: str | None, json_output: bool) -> None:
-    approvals = manager.state.list_approvals(status=status)
+    approvals = manager.list_approvals(status=status)
     if json_output:
         print(json.dumps({"approvals": approvals}, indent=2))
         return

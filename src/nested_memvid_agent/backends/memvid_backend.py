@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -10,12 +11,17 @@ from threading import Lock
 from typing import Any
 
 from ..context_frames import MV2ContextFrame, default_frame_type_for_memory, to_memory_record
+from ..file_lock import lock_exclusive, lock_shared, unlock
 from ..models import EvidenceRef, MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
 from .base import MemoryBackend
 
 _PATH_LOCKS: dict[Path, Lock] = {}
 _PATH_LOCKS_GUARD = Lock()
 _TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+")
+
+
+class MemvidLockError(RuntimeError):
+    """Raised when another live backend owns conflicting access to a layer."""
 
 
 class MemvidBackend(MemoryBackend):
@@ -32,15 +38,21 @@ class MemvidBackend(MemoryBackend):
         enable_vec: bool = False,
         enable_lex: bool = True,
         read_only: bool = False,
+        path_lock_blocking: bool = True,
+        max_file_bytes: int = 1_073_741_824,
         **kwargs: object,
     ) -> None:
         super().__init__(path, layer, **kwargs)
         self.enable_vec = enable_vec
         self.enable_lex = enable_lex
         self.read_only = read_only
+        self.path_lock_blocking = path_lock_blocking
+        self.max_file_bytes = max(1, max_file_bytes)
         self.mem: Any | None = None
         self._path_lock: Lock | None = None
         self._lock_acquired = False
+        self._memory_lock_handle: Any | None = None
+        self._layer_lock_handle: Any | None = None
         self._records: dict[str, MemoryRecord] = {}
         self._inactive_ids: set[str] = set()
         self._index_path = self.path.with_suffix(f"{self.path.suffix}.records.json")
@@ -48,8 +60,12 @@ class MemvidBackend(MemoryBackend):
     def open(self) -> None:
         self._acquire_path_lock()
         try:
+            self._acquire_memory_file_lock()
+            self._acquire_layer_file_lock()
             self._open_unlocked()
         except Exception:
+            self._release_layer_file_lock()
+            self._release_memory_file_lock()
             self._release_path_lock()
             raise
 
@@ -88,6 +104,13 @@ class MemvidBackend(MemoryBackend):
     def put(self, record: MemoryRecord) -> str:
         if self.read_only:
             raise RuntimeError(f"Cannot write read-only Memvid memory: {self.path}")
+        current_size = self.path.stat().st_size if self.path.exists() else 0
+        estimated_write = len(record.title.encode("utf-8")) + len(record.content.encode("utf-8"))
+        if current_size + estimated_write > self.max_file_bytes:
+            raise RuntimeError(
+                f"Memvid layer capacity exceeded for {self.layer.value}: "
+                f"limit={self.max_file_bytes} bytes"
+            )
         mem = self._require_mem()
         if record.layer != self.layer:
             raise ValueError(f"Cannot write {record.layer} record to {self.layer} backend")
@@ -315,6 +338,8 @@ class MemvidBackend(MemoryBackend):
                 try:
                     self._open_unlocked()
                 except Exception:
+                    self._release_layer_file_lock()
+                    self._release_memory_file_lock()
                     self._release_path_lock()
                     raise
         return self.path.exists()
@@ -346,7 +371,67 @@ class MemvidBackend(MemoryBackend):
             if callable(close):
                 close()
         self.mem = None
+        self._release_layer_file_lock()
+        self._release_memory_file_lock()
         self._release_path_lock()
+
+    def _acquire_memory_file_lock(self) -> None:
+        if self._memory_lock_handle is not None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.parent.parent / f".{self.path.parent.name}.kestrel-memory.lock"
+        lock_path.touch(mode=0o600, exist_ok=True)
+        handle = lock_path.open("a+")
+        try:
+            os.chmod(lock_path, 0o600)
+            lock_shared(handle)
+        except Exception:
+            handle.close()
+            raise
+        self._memory_lock_handle = handle
+
+    def _release_memory_file_lock(self) -> None:
+        handle = self._memory_lock_handle
+        if handle is None:
+            return
+        try:
+            unlock(handle)
+        finally:
+            handle.close()
+            self._memory_lock_handle = None
+
+    def _acquire_layer_file_lock(self) -> None:
+        if self._layer_lock_handle is not None:
+            return
+        lock_path = self.path.parent / f".{self.path.name}.kestrel.lock"
+        lock_path.touch(mode=0o600, exist_ok=True)
+        handle = lock_path.open("a+")
+        try:
+            os.chmod(lock_path, 0o600)
+            if self.read_only:
+                lock_shared(handle, blocking=False)
+            else:
+                lock_exclusive(handle, blocking=False)
+        except OSError as exc:
+            handle.close()
+            mode = "read" if self.read_only else "write"
+            raise MemvidLockError(
+                f"Memvid layer is already open for conflicting {mode} access: {self.path}"
+            ) from exc
+        except Exception:
+            handle.close()
+            raise
+        self._layer_lock_handle = handle
+
+    def _release_layer_file_lock(self) -> None:
+        handle = self._layer_lock_handle
+        if handle is None:
+            return
+        try:
+            unlock(handle)
+        finally:
+            handle.close()
+            self._layer_lock_handle = None
 
     def _require_mem(self) -> Any:
         if self.mem is None:
@@ -359,7 +444,9 @@ class MemvidBackend(MemoryBackend):
         resolved = self.path.resolve()
         with _PATH_LOCKS_GUARD:
             lock = _PATH_LOCKS.setdefault(resolved, Lock())
-        lock.acquire()
+        acquired = lock.acquire(blocking=self.path_lock_blocking)
+        if not acquired:
+            raise MemvidLockError(f"Memvid layer is already open in this process: {self.path}")
         self._path_lock = lock
         self._lock_acquired = True
 

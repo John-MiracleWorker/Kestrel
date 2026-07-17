@@ -1,6 +1,6 @@
 # Codex Full Agent Handoff Prompt
 
-Last updated: 2026-05-20
+Last updated: 2026-07-16
 
 You are working inside the Kestrel repository. Kestrel is a local-first, memory-native agent runtime built around Nested Learning-inspired memory layers and Memvid v2 `.mv2` files.
 
@@ -122,7 +122,8 @@ Treat these as implemented unless current verification proves otherwise:
 - `memory.learn`, `memory.consolidate`, and promotion gate metadata.
 - `web.search` and `web.fetch` behind `NEST_AGENT_ALLOW_WEB`, with deterministic mock backend support and public-network fetch checks.
 - Exact-call approval gates for high-risk tools.
-- SQLite state schema version 11, including durable trace spans, persisted run provider, promotion outcome ledger tables, and behavior-delta ledger/activation/outcome tables.
+- SQLite state schema version 15, including durable trace spans, persisted run provider, promotion outcome ledger tables, behavior-delta ledger/activation/outcome tables, fenced run ownership, revisioned tool/MCP-server/skill capability overrides, append-only capability changes, and expiring owner-bound approvals tied to capability revision and policy/spec/parent digest.
+- Settings Capability Center plus `GET /api/capabilities`, revision-checked `PUT /api/capabilities/{kind}/{capability_id}`, and `GET /api/capabilities/history`; configured state never bypasses effective blockers, master flags, parent state, resource-change invalidation, or exact-call approval.
 - Replay-safe terminal run and approval decisions.
 - Managed stdio MCP sessions.
 - Skills with manifest validation, provenance hashes, and local runtimes.

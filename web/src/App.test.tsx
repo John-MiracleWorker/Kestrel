@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import axe from "axe-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import type { Approval, Channel, Run, SecretRef, Session, Skill, TaskGraph, Tool, TraceEvent } from "./types";
+import type { Approval, Capability, Channel, McpServer, Run, SecretRef, Session, Skill, TaskGraph, Tool, TraceEvent } from "./types";
 
 const baseRun: Run = {
   run_id: "run_1",
@@ -61,6 +61,9 @@ let channelsPayload: Channel[];
 let secrets: SecretRef[];
 let toolsPayload: Tool[];
 let skillsPayload: Skill[];
+let mcpServersPayload: McpServer[];
+let capabilitiesPayload: Capability[];
+let capabilityMutationFailure: { status: number; detail: string } | null;
 let onboardingProfile: Record<string, unknown> | null;
 let eventSources: MockEventSource[];
 let eventId: number;
@@ -132,6 +135,48 @@ describe("App", () => {
       }
     ];
     skillsPayload = [];
+    mcpServersPayload = [];
+    capabilitiesPayload = [
+      capabilityFixture({
+        key: "tool:memory.search",
+        id: "memory.search",
+        name: "Memory search",
+        description: "Search nested memory.",
+        default_enabled: true,
+        configured_enabled: true,
+        effective_enabled: true,
+        risk: "low",
+        source: "builtin"
+      }),
+      capabilityFixture({
+        key: "tool:shell.run",
+        id: "shell.run",
+        name: "Shell run",
+        description: "Run an allowlisted shell command.",
+        default_enabled: false,
+        configured_enabled: false,
+        effective_enabled: false,
+        blocked_by: ["allow_shell"],
+        risk: "high",
+        requires_approval: true,
+        source: "builtin",
+        enablement_flag: "allow_shell"
+      }),
+      capabilityFixture({
+        key: "tool:web.search",
+        id: "web.search",
+        name: "Web search",
+        description: "Search outside context.",
+        default_enabled: false,
+        configured_enabled: false,
+        effective_enabled: false,
+        blocked_by: ["allow_web"],
+        risk: "medium",
+        source: "builtin",
+        enablement_flag: "allow_web"
+      })
+    ];
+    capabilityMutationFailure = null;
     onboardingProfile = {
       schema_version: "kestrel_onboarding_profile.v1",
       setup_complete: true,
@@ -1023,13 +1068,13 @@ describe("App", () => {
         memory_dir: "/tmp/memory",
         workspace: "/tmp/kestrel",
         stream: true,
-        require_api_auth: false,
         autonomy_mode: "manual",
         allow_shell: true,
         allow_web: true
       });
       expect(body.allow_file_write).toBe(false);
       expect(body.allow_codex_cli).toBe(false);
+      expect(body).not.toHaveProperty("require_api_auth");
     });
     expect(await screen.findByText("Settings saved and applied to new runs.")).toBeInTheDocument();
   });
@@ -1143,6 +1188,222 @@ describe("App", () => {
     expect(within(grid).getByText("shell.run")).toBeInTheDocument();
     expect(within(grid).getByText("web.search")).toBeInTheDocument();
     expect(within(grid).queryByText("memory.search")).not.toBeInTheDocument();
+  });
+
+  it("persists individual tool capability switches and removes disabled tools from invocation", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    const center = await screen.findByRole("region", { name: "Capabilities" });
+
+    expect(within(center).getAllByText(/Blocked by:/).some((item) => item.parentElement?.textContent?.includes("allow shell"))).toBe(true);
+    fireEvent.click(within(center).getByRole("switch", { name: "Disable Memory search" }));
+
+    await waitFor(() => {
+      const mutation = fetchSpy.mock.calls.find(
+        ([path, init]) => path === "/api/capabilities/tool/memory.search" && init?.method === "PUT"
+      );
+      expect(mutation).toBeDefined();
+      expect(JSON.parse(String(mutation?.[1]?.body ?? "{}"))).toEqual({ enabled: false, expected_revision: 1 });
+    });
+    expect(await screen.findByText(/Memory search disabled for future invocations/i)).toBeInTheDocument();
+
+    fireEvent.click(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("button", { name: "Advanced" }));
+    const toolSelect = await screen.findByLabelText("Tool");
+    expect(within(toolSelect).queryByRole("option", { name: "memory.search" })).not.toBeInTheDocument();
+  });
+
+  it("toggles MCP servers and skills from capabilities and exposes only effective invoke options", async () => {
+    skillsPayload = [
+      { id: "writer", name: "Writing skill", description: "Draft structured prose.", enabled: false }
+    ];
+    mcpServersPayload = [
+      {
+        id: "filesystem",
+        name: "Filesystem MCP",
+        transport: "stdio",
+        command: "filesystem-mcp",
+        enabled: false,
+        tools: [
+          {
+            name: "mcp.filesystem.read_file",
+            remote_name: "read_file",
+            description: "Read an allowed file.",
+            risk: "low",
+            requires_approval: false,
+            source: "mcp",
+            enabled: false
+          }
+        ],
+        status: "configured",
+        session_state: "disconnected"
+      }
+    ];
+    capabilitiesPayload = [
+      ...capabilitiesPayload,
+      capabilityFixture({
+        key: "mcp_server:filesystem",
+        kind: "mcp_server",
+        id: "filesystem",
+        name: "Filesystem MCP",
+        description: "Filesystem MCP server.",
+        configured_enabled: false,
+        effective_enabled: false,
+        risk: "medium",
+        source: "mcp"
+      }),
+      capabilityFixture({
+        key: "tool:mcp.filesystem.read_file",
+        id: "mcp.filesystem.read_file",
+        name: "Read file",
+        description: "Read an allowed file.",
+        configured_enabled: true,
+        effective_enabled: false,
+        risk: "low",
+        source: "mcp",
+        parent_key: "mcp_server:filesystem"
+      }),
+      capabilityFixture({
+        key: "skill:writer",
+        kind: "skill",
+        id: "writer",
+        name: "Writing skill",
+        description: "Draft structured prose.",
+        configured_enabled: false,
+        effective_enabled: false,
+        risk: "low",
+        source: "skill"
+      })
+    ];
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+    expect(within(await screen.findByLabelText("MCP tool")).queryByRole("option", { name: /read_file/ })).not.toBeInTheDocument();
+    expect(within(screen.getByLabelText("Skill")).queryByRole("option", { name: "writer" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    const center = await screen.findByRole("region", { name: "Capabilities" });
+    fireEvent.click(within(center).getByRole("switch", { name: "Enable Filesystem MCP" }));
+    await within(center).findByRole("switch", { name: "Disable Filesystem MCP" });
+    fireEvent.click(within(center).getByRole("switch", { name: "Enable Writing skill" }));
+    await within(center).findByRole("switch", { name: "Disable Writing skill" });
+
+    fireEvent.click(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("button", { name: "Advanced" }));
+    expect(within(await screen.findByLabelText("MCP tool")).getByRole("option", { name: /read_file/ })).toBeInTheDocument();
+    expect(within(screen.getByLabelText("Skill")).getByRole("option", { name: "writer" })).toBeInTheDocument();
+  });
+
+  it("does not overwrite hidden MCP arguments, environment, secrets, or discovered tools on edit", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    mcpServersPayload = [
+      {
+        id: "filesystem",
+        name: "Filesystem MCP",
+        transport: "stdio",
+        command: "filesystem-mcp",
+        enabled: true,
+        tools: [
+          {
+            name: "mcp.filesystem.read_file",
+            remote_name: "read_file",
+            description: "Read an allowed file.",
+            risk: "low",
+            requires_approval: false,
+            source: "mcp"
+          }
+        ],
+        status: "online",
+        session_state: "connected",
+        argument_count: 2,
+        env_keys: ["FILESYSTEM_ROOT"],
+        secret_env_status: { FILESYSTEM_TOKEN: { configured: true } }
+      }
+    ];
+    capabilitiesPayload = [
+      ...capabilitiesPayload,
+      capabilityFixture({
+        key: "mcp_server:filesystem",
+        kind: "mcp_server",
+        id: "filesystem",
+        name: "Filesystem MCP",
+        description: "Filesystem MCP server.",
+        source: "mcp"
+      })
+    ];
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "Filesystem MCP" }));
+    expect(screen.getByText("2 stored arguments are hidden. Edit to replace them.")).toBeInTheDocument();
+    expect(screen.getByText("1 stored environment names are hidden. Edit to replace them.")).toBeInTheDocument();
+    expect(screen.getByText("1 secret bindings are hidden. Edit to replace them.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save Server" }));
+
+    await waitFor(() => {
+      const update = fetchSpy.mock.calls.find(
+        ([path, init]) => path === "/api/mcp/servers/filesystem" && init?.method === "PUT"
+      );
+      expect(update).toBeDefined();
+      const body = JSON.parse(String(update?.[1]?.body ?? "{}"));
+      expect(body).not.toHaveProperty("tools");
+      expect(body).not.toHaveProperty("args");
+      expect(body).not.toHaveProperty("env");
+      expect(body).not.toHaveProperty("secret_env");
+    });
+  });
+
+  it("requires confirmation before enabling a high-risk capability", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const fetchSpy = vi.mocked(fetch);
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    const center = await screen.findByRole("region", { name: "Capabilities" });
+    fireEvent.click(within(center).getByRole("switch", { name: "Enable Shell run" }));
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("high-risk capability"));
+    expect(fetchSpy.mock.calls.some(([path, init]) => path === "/api/capabilities/tool/shell.run" && init?.method === "PUT")).toBe(false);
+  });
+
+  it("reauthorizes a capability after its protected resource changes", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    capabilitiesPayload = capabilitiesPayload.map((capability) =>
+      capability.id === "memory.search"
+        ? { ...capability, effective_enabled: false, blocked_by: ["resource_changed"] }
+        : capability
+    );
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    const center = await screen.findByRole("region", { name: "Capabilities" });
+    fireEvent.click(within(center).getByRole("button", { name: "Reauthorize" }));
+
+    await waitFor(() => {
+      const mutation = fetchSpy.mock.calls.find(
+        ([path, init]) => path === "/api/capabilities/tool/memory.search" && init?.method === "PUT"
+      );
+      expect(JSON.parse(String(mutation?.[1]?.body ?? "{}"))).toEqual({ enabled: true, expected_revision: 1 });
+    });
+    expect(await screen.findByText(/Memory search enabled for future invocations/i)).toBeInTheDocument();
+  });
+
+  it("refreshes authoritative capability state after a mutation conflict", async () => {
+    capabilityMutationFailure = { status: 409, detail: "capability_revision_conflict" };
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    const center = await screen.findByRole("region", { name: "Capabilities" });
+    fireEvent.click(within(center).getByRole("switch", { name: "Disable Memory search" }));
+
+    expect(await screen.findByText("capability_revision_conflict")).toBeInTheDocument();
+    expect(within(center).getByRole("switch", { name: "Disable Memory search" })).toBeChecked();
   });
 
   it("fetches provider model names when the provider changes", async () => {
@@ -1463,6 +1724,54 @@ async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<
     secrets = [secret];
     return jsonResponse(secret);
   }
+  const mcpUpdateMatch = path.match(/^\/api\/mcp\/servers\/([^/]+)$/);
+  if (mcpUpdateMatch && init?.method === "PUT") {
+    const serverId = decodeURIComponent(mcpUpdateMatch[1]);
+    const body = JSON.parse(String(init.body ?? "{}"));
+    const current = mcpServersPayload.find((server) => server.id === serverId);
+    if (!current) return jsonResponse({ detail: "mcp_server_not_found" }, 404);
+    const saved = { ...current, ...body, id: serverId };
+    mcpServersPayload = mcpServersPayload.map((server) => server.id === serverId ? saved : server);
+    return jsonResponse(saved);
+  }
+  const capabilityMatch = path.match(/^\/api\/capabilities\/(tool|mcp_server|skill)\/(.+)$/);
+  if (capabilityMatch && init?.method === "PUT") {
+    if (capabilityMutationFailure) {
+      const failure = capabilityMutationFailure;
+      capabilityMutationFailure = null;
+      return jsonResponse({ detail: failure.detail }, failure.status);
+    }
+    const kind = capabilityMatch[1];
+    const id = decodeURIComponent(capabilityMatch[2]);
+    const body = JSON.parse(String(init.body ?? "{}"));
+    const index = capabilitiesPayload.findIndex((capability) => capability.kind === kind && capability.id === id);
+    if (index < 0) return jsonResponse({ detail: "capability_not_found" }, 404);
+    const current = capabilitiesPayload[index];
+    if (body.expected_revision !== current.revision) {
+      return jsonResponse({ detail: "capability_revision_conflict" }, 409);
+    }
+    const enabled = Boolean(body.enabled);
+    const blockedBy = enabled
+      ? current.blocked_by.filter((blocker) => blocker !== "resource_changed")
+      : current.blocked_by;
+    const capability: Capability = {
+      ...current,
+      configured_enabled: enabled,
+      effective_enabled: enabled && blockedBy.length === 0,
+      blocked_by: blockedBy,
+      revision: current.revision + 1,
+      updated_at: "2026-05-16T00:10:00Z"
+    };
+    capabilitiesPayload = capabilitiesPayload.map((item) => item.key === capability.key ? capability : item);
+    if (capability.kind === "mcp_server") {
+      capabilitiesPayload = capabilitiesPayload.map((item) =>
+        item.parent_key === capability.key
+          ? { ...item, effective_enabled: enabled && item.configured_enabled && item.blocked_by.length === 0, revision: item.revision + 1 }
+          : item
+      );
+    }
+    return jsonResponse({ capability, revoked_approvals: 0, applies_to: "future_invocations" });
+  }
   if (path === "/api/runtime/settings" && init?.method === "PUT") {
     const body = JSON.parse(String(init.body ?? "{}"));
     return jsonResponse({
@@ -1553,7 +1862,8 @@ function payloadFor(path: string): unknown {
   if (path === "/api/approvals?status=pending") return approvals;
   if (path === "/api/approvals") return approvals;
   if (path === "/api/tools") return toolsPayload;
-  if (path === "/api/mcp/servers") return [];
+  if (path === "/api/capabilities") return capabilitySnapshotFixture(capabilitiesPayload);
+  if (path === "/api/mcp/servers") return mcpServersPayload;
   if (path === "/api/skills") return skillsPayload;
   if (path === "/api/plugins") return [];
   if (path === "/api/channels") return channelsPayload;
@@ -1783,6 +2093,36 @@ function apiKeyEnvForProvider(provider: string): string | null {
     kimi: "MOONSHOT_API_KEY"
   };
   return apiKeyEnvs[provider] ?? null;
+}
+
+function capabilityFixture(
+  overrides: Partial<Capability> & Pick<Capability, "key" | "id" | "name">
+): Capability {
+  return {
+    kind: "tool",
+    description: "Test capability.",
+    default_enabled: true,
+    configured_enabled: true,
+    effective_enabled: true,
+    blocked_by: [],
+    revision: 1,
+    risk: "low",
+    requires_approval: false,
+    source: "builtin",
+    ...overrides
+  };
+}
+
+function capabilitySnapshotFixture(items: Capability[]) {
+  return {
+    items,
+    counts: {
+      total: items.length,
+      configured_enabled: items.filter((item) => item.configured_enabled).length,
+      effective_enabled: items.filter((item) => item.effective_enabled).length,
+      blocked: items.filter((item) => item.blocked_by.length > 0).length
+    }
+  };
 }
 
 function personaPayload() {

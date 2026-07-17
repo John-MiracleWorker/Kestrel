@@ -1,18 +1,27 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass, replace
+import os
+import tempfile
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .config import AgentConfig
+from .file_lock import lock_exclusive, unlock
 from .llm.model_catalog import PROVIDER_OPTIONS
 
 PROVIDER_CHOICES = set(PROVIDER_OPTIONS)
 BACKEND_CHOICES = {"memory", "memvid"}
 AUTONOMY_CHOICES = {"background", "manual", "autonomous"}
+RUNTIME_SETTINGS_SCHEMA_VERSION = 1
+
+
+class RuntimeSettingsConflict(RuntimeError):
+    """Raised when a runtime settings compare-and-swap revision is stale."""
 TOOL_PERMISSION_FIELDS = {
     "allow_shell",
     "allow_file_write",
@@ -42,6 +51,9 @@ class RuntimeSettings:
     max_tool_rounds: int
     stream: bool
     require_api_auth: bool
+    schema_version: int = RUNTIME_SETTINGS_SCHEMA_VERSION
+    revision: str | None = None
+    sources: dict[str, str] = field(default_factory=dict)
     base_url: str | None = None
     api_key_env: str | None = None
     autonomy_mode: str = "background"
@@ -54,6 +66,7 @@ class RuntimeSettings:
     allow_executable_skills: bool = False
     allow_web: bool = False
     allow_self_modification: bool = False
+    provider_startup_probe: bool = False
     enable_auto_activate_low_risk_deltas: bool = False
     enable_auto_skill_materialization: bool = False
     enable_auto_consolidation_shadow: bool = False
@@ -85,6 +98,7 @@ class RuntimeSettings:
             allow_executable_skills=config.allow_executable_skills,
             allow_web=config.allow_web,
             allow_self_modification=config.allow_self_modification,
+            provider_startup_probe=config.provider_startup_probe,
             enable_auto_activate_low_risk_deltas=config.enable_auto_activate_low_risk_deltas,
             enable_auto_skill_materialization=config.enable_auto_skill_materialization,
             enable_auto_consolidation_shadow=config.enable_auto_consolidation_shadow,
@@ -117,19 +131,71 @@ class RuntimeSettingsStore:
 
     def load(self, fallback: AgentConfig) -> RuntimeSettings:
         if not self.path.exists():
-            return RuntimeSettings.from_config(fallback)
+            return _finalize_settings(RuntimeSettings.from_config(fallback), source="launch")
         raw = json.loads(self.path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError("runtime settings file must contain a JSON object")
-        return RuntimeSettings.from_mapping(raw, fallback)
+        schema_version = raw.get("schema_version", RUNTIME_SETTINGS_SCHEMA_VERSION)
+        if schema_version != RUNTIME_SETTINGS_SCHEMA_VERSION:
+            raise ValueError(f"unsupported runtime settings schema: {schema_version}")
+        settings = RuntimeSettings.from_mapping(raw, fallback)
+        finalized = _finalize_settings(settings, source="persisted")
+        stored_revision = raw.get("revision")
+        if (
+            stored_revision
+            and stored_revision != finalized.revision
+            and stored_revision != _mapping_revision(raw)
+        ):
+            raise ValueError("runtime settings revision mismatch")
+        return finalized
 
-    def save(self, settings: RuntimeSettings) -> RuntimeSettings:
-        rendered = replace(settings, updated_at=datetime.now(UTC).isoformat())
+    def save(
+        self,
+        settings: RuntimeSettings,
+        *,
+        expected_revision: str | None = None,
+    ) -> RuntimeSettings:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_suffix(f"{self.path.suffix}.tmp")
-        tmp_path.write_text(json.dumps(asdict(rendered), indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        tmp_path.replace(self.path)
-        return rendered
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        lock_path.touch(mode=0o600, exist_ok=True)
+        os.chmod(lock_path, 0o600)
+        with lock_path.open("r+") as lock_handle:
+            lock_exclusive(lock_handle)
+            try:
+                if expected_revision is not None and self.path.exists():
+                    current_raw = json.loads(self.path.read_text(encoding="utf-8"))
+                    if not isinstance(current_raw, dict) or current_raw.get("revision") != expected_revision:
+                        raise RuntimeSettingsConflict("runtime_settings_revision_conflict")
+                rendered = _finalize_settings(
+                    replace(
+                        settings,
+                        schema_version=RUNTIME_SETTINGS_SCHEMA_VERSION,
+                        updated_at=datetime.now(UTC).isoformat(),
+                    ),
+                    source="persisted",
+                )
+                fd, temp_name = tempfile.mkstemp(
+                    prefix=f".{self.path.name}.",
+                    suffix=".tmp",
+                    dir=str(self.path.parent),
+                )
+                temp_path = Path(temp_name)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        json.dump(asdict(rendered), handle, indent=2, sort_keys=True)
+                        handle.write("\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.chmod(temp_path, 0o600)
+                    os.replace(temp_path, self.path)
+                    os.chmod(self.path, 0o600)
+                    _fsync_directory(self.path.parent)
+                except Exception:
+                    temp_path.unlink(missing_ok=True)
+                    raise
+                return rendered
+            finally:
+                unlock(lock_handle)
 
 
 def default_runtime_settings_path(config: AgentConfig) -> Path:
@@ -161,6 +227,7 @@ def apply_runtime_settings(config: AgentConfig, settings: RuntimeSettings) -> Ag
         allow_executable_skills=settings.allow_executable_skills,
         allow_web=settings.allow_web,
         allow_self_modification=settings.allow_self_modification,
+        provider_startup_probe=settings.provider_startup_probe,
         enable_auto_activate_low_risk_deltas=settings.enable_auto_activate_low_risk_deltas,
         enable_auto_skill_materialization=settings.enable_auto_skill_materialization,
         enable_auto_consolidation_shadow=settings.enable_auto_consolidation_shadow,
@@ -169,6 +236,11 @@ def apply_runtime_settings(config: AgentConfig, settings: RuntimeSettings) -> Ag
         # `require_api_auth` is launch-time security policy and must not be
         # overridden by persisted runtime settings.
     )
+
+
+def runtime_settings_snapshot(config: AgentConfig, *, source: str = "run_override") -> RuntimeSettings:
+    """Return a canonical, versioned, non-secret effective settings snapshot."""
+    return _finalize_settings(RuntimeSettings.from_config(config), source=source)
 
 
 def merge_runtime_settings(config: AgentConfig, current: RuntimeSettings, raw: dict[str, Any]) -> RuntimeSettings:
@@ -185,11 +257,36 @@ def merge_runtime_settings(config: AgentConfig, current: RuntimeSettings, raw: d
         "max_tool_rounds",
         "stream",
         "autonomy_mode",
+        "provider_startup_probe",
         *TOOL_PERMISSION_FIELDS,
     }:
         if key in raw:
             values[key] = raw[key]
     return _normalize_settings(RuntimeSettings.from_mapping(values, config))
+
+
+def _finalize_settings(settings: RuntimeSettings, *, source: str) -> RuntimeSettings:
+    normalized = _normalize_settings(settings)
+    source_map = {
+        key: ("launch" if key == "require_api_auth" else source)
+        for key in asdict(normalized)
+        if key not in {"schema_version", "revision", "sources", "updated_at"}
+    }
+    without_revision = replace(
+        normalized,
+        schema_version=RUNTIME_SETTINGS_SCHEMA_VERSION,
+        revision=None,
+        sources=source_map,
+    )
+    canonical = json.dumps(asdict(without_revision), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return replace(without_revision, revision=hashlib.sha256(canonical.encode("utf-8")).hexdigest())
+
+
+def _mapping_revision(raw: dict[str, Any]) -> str:
+    payload = dict(raw)
+    payload["revision"] = None
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _normalize_settings(settings: RuntimeSettings) -> RuntimeSettings:
@@ -228,6 +325,7 @@ def _normalize_settings(settings: RuntimeSettings) -> RuntimeSettings:
         allow_executable_skills=_clean_bool(settings.allow_executable_skills),
         allow_web=_clean_bool(settings.allow_web),
         allow_self_modification=_clean_bool(settings.allow_self_modification),
+        provider_startup_probe=_clean_bool(settings.provider_startup_probe),
         enable_auto_activate_low_risk_deltas=_clean_bool(settings.enable_auto_activate_low_risk_deltas),
         enable_auto_skill_materialization=_clean_bool(settings.enable_auto_skill_materialization),
         enable_auto_consolidation_shadow=_clean_bool(settings.enable_auto_consolidation_shadow),
@@ -281,3 +379,15 @@ def _clean_int_range(value: object, field: str, *, minimum: int, maximum: int) -
     if parsed < minimum or parsed > maximum:
         raise ValueError(f"{field} must be between {minimum} and {maximum}")
     return parsed
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)

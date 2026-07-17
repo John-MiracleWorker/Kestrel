@@ -4,10 +4,22 @@ set -Eeuo pipefail
 DEFAULT_REPO="https://github.com/John-MiracleWorker/Kestrel.git"
 DEFAULT_HOME="${HOME}/.kestrel-agent"
 DEFAULT_EXTRAS="memvid,openai,anthropic,gemini,server,mcp"
+DEFAULT_REQUIREMENTS_URL=""
+DEFAULT_WHEEL_URL=""
+DEFAULT_CHECKSUMS_URL=""
 DEFAULT_PORT="8765"
 DEFAULT_START_SERVER="0"
 DEFAULT_OPEN_BROWSER="0"
 DEFAULT_SERVER_SESSION="kestrel-agent"
+
+RELEASE_TRANSACTION_ACTIVE=0
+RELEASE_VENV_BACKED_UP=0
+RELEASE_VENV_NEW_STARTED=0
+RELEASE_EXISTING_CHECKOUT=0
+RELEASE_ORIGINAL_HEAD=""
+RELEASE_ORIGINAL_BRANCH=""
+RELEASE_VENV_PATH=""
+RELEASE_VENV_PREVIOUS_PATH=""
 
 usage() {
   cat <<'EOF'
@@ -22,6 +34,9 @@ Environment options:
   KESTREL_REF           Git ref to install. Defaults to main.
   KESTREL_PYTHON        Python 3.11+ interpreter path/name to use.
   KESTREL_EXTRAS        Python extras to install. Defaults to memvid,openai,anthropic,gemini,server,mcp.
+  KESTREL_REQUIREMENTS_URL  Hash-locked requirements URL. Release assets set this automatically.
+  KESTREL_WHEEL_URL     Release wheel URL. Release assets set this automatically.
+  KESTREL_CHECKSUMS_URL Release checksum manifest URL. Release assets set this automatically.
   KESTREL_SKIP_WEB      Set to 1/true to skip npm ci and web build.
   KESTREL_SKIP_SMOKE    Set to 1/true to skip doctor/chat smoke checks.
   KESTREL_START_SERVER  Set to 1/true to launch the local server and web UI. Defaults to 0.
@@ -34,6 +49,9 @@ Environment options:
 
 Safe default runtime:
   backend=memvid, provider=mock, model=mock, high-risk tool flags disabled.
+
+Supported installer platforms:
+  macOS and Linux, including Linux inside WSL. Native Windows is unsupported.
 EOF
 }
 
@@ -44,6 +62,120 @@ log() {
 die() {
   printf '[kestrel-install] ERROR: %s\n' "$*" >&2
   exit 1
+}
+
+release_install_exit_trap() {
+  local status="$1"
+  trap - EXIT INT TERM
+  if [[ "$RELEASE_TRANSACTION_ACTIVE" -ne 1 ]]; then
+    exit "$status"
+  fi
+
+  log "Release install failed; restoring the previous checkout and Python environment."
+  if is_true "${KESTREL_DRY_RUN:-}"; then
+    log "DRY RUN: rollback would restore the previous checkout and .venv."
+    exit "$status"
+  fi
+
+  set +e
+  if [[ "$RELEASE_VENV_BACKED_UP" -eq 1 ]] &&
+    [[ -e "$RELEASE_VENV_PREVIOUS_PATH" || -L "$RELEASE_VENV_PREVIOUS_PATH" ]]; then
+    rm -rf -- "$RELEASE_VENV_PATH"
+    if ! mv -- "$RELEASE_VENV_PREVIOUS_PATH" "$RELEASE_VENV_PATH"; then
+      log "WARNING: automatic .venv restore failed; recovery copy remains at ${RELEASE_VENV_PREVIOUS_PATH}."
+    fi
+  elif [[ "$RELEASE_VENV_NEW_STARTED" -eq 1 ]]; then
+    rm -rf -- "$RELEASE_VENV_PATH"
+  elif [[ "$RELEASE_VENV_BACKED_UP" -eq 1 && ! -e "$RELEASE_VENV_PATH" && ! -L "$RELEASE_VENV_PATH" ]]; then
+    log "WARNING: prior .venv backup was not found; inspect ${KESTREL_HOME} before retrying."
+  fi
+  if [[ "$RELEASE_EXISTING_CHECKOUT" -eq 1 && -n "$RELEASE_ORIGINAL_HEAD" ]]; then
+    local restore_ref="$RELEASE_ORIGINAL_HEAD"
+    local checkout_args=(--detach --no-overwrite-ignore "$RELEASE_ORIGINAL_HEAD")
+    if [[ -n "$RELEASE_ORIGINAL_BRANCH" ]]; then
+      restore_ref="$RELEASE_ORIGINAL_BRANCH"
+      checkout_args=(--no-overwrite-ignore "$RELEASE_ORIGINAL_BRANCH")
+    fi
+    if ! git -C "$KESTREL_HOME" checkout "${checkout_args[@]}" >/dev/null 2>&1; then
+      log "WARNING: automatic checkout restore failed; restore commit ${RELEASE_ORIGINAL_HEAD} manually."
+    else
+      log "Restored checkout ${restore_ref}."
+    fi
+  fi
+  exit "$status"
+}
+
+start_release_install_transaction() {
+  RELEASE_TRANSACTION_ACTIVE=1
+  RELEASE_VENV_PATH="${KESTREL_HOME}/.venv"
+  RELEASE_VENV_PREVIOUS_PATH="${KESTREL_HOME}/.venv.release-previous"
+  trap 'release_install_exit_trap "$?"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+prepare_release_venv_replacement() {
+  if [[ -e "$RELEASE_VENV_PREVIOUS_PATH" || -L "$RELEASE_VENV_PREVIOUS_PATH" ]]; then
+    die "A prior release recovery environment already exists: ${RELEASE_VENV_PREVIOUS_PATH}. Restore or remove it before retrying."
+  fi
+  if [[ -e "$RELEASE_VENV_PATH" || -L "$RELEASE_VENV_PATH" ]]; then
+    RELEASE_VENV_BACKED_UP=1
+    if ! run mv -- "$RELEASE_VENV_PATH" "$RELEASE_VENV_PREVIOUS_PATH"; then
+      RELEASE_VENV_BACKED_UP=0
+      die "Unable to preserve the existing Python environment for rollback."
+    fi
+  fi
+  RELEASE_VENV_NEW_STARTED=1
+}
+
+finalize_release_install_transaction() {
+  if [[ "$RELEASE_TRANSACTION_ACTIVE" -ne 1 ]]; then
+    return 0
+  fi
+  RELEASE_TRANSACTION_ACTIVE=0
+  trap - EXIT INT TERM
+  if [[ "$RELEASE_VENV_BACKED_UP" -eq 1 ]]; then
+    if ! run rm -rf -- "$RELEASE_VENV_PREVIOUS_PATH"; then
+      log "WARNING: unable to remove the prior .venv backup: ${RELEASE_VENV_PREVIOUS_PATH}"
+    fi
+  fi
+}
+
+require_supported_platform() {
+  local platform
+  platform="$(uname -s 2>/dev/null || true)"
+  case "$platform" in
+    Darwin | Linux) return 0 ;;
+    *)
+      die "install.sh supports macOS and Linux (including Linux inside WSL); native Windows is unsupported. Open a WSL distro and run the installer there."
+      ;;
+  esac
+}
+
+validate_release_artifact_config() {
+  local configured=0
+  [[ -n "$KESTREL_REQUIREMENTS_URL" ]] && configured=$((configured + 1))
+  [[ -n "$KESTREL_WHEEL_URL" ]] && configured=$((configured + 1))
+  [[ -n "$KESTREL_CHECKSUMS_URL" ]] && configured=$((configured + 1))
+
+  if [[ "$configured" -ne 0 && "$configured" -ne 3 ]]; then
+    die "KESTREL_REQUIREMENTS_URL, KESTREL_WHEEL_URL, and KESTREL_CHECKSUMS_URL must be set together."
+  fi
+  if [[ "$configured" -eq 0 ]]; then
+    return 0
+  fi
+  [[ "$KESTREL_EXTRAS" == "$DEFAULT_EXTRAS" ]] ||
+    die "The verified release artifacts support the default extras exactly: ${DEFAULT_EXTRAS}."
+
+  local url
+  for url in "$KESTREL_REQUIREMENTS_URL" "$KESTREL_WHEEL_URL" "$KESTREL_CHECKSUMS_URL"; do
+    [[ "$url" == https://* ]] || die "Release artifact URLs must use HTTPS: ${url}"
+  done
+  command -v curl >/dev/null 2>&1 || die "curl is required to download verified release artifacts."
+
+  local wheel_name="${KESTREL_WHEEL_URL##*/}"
+  [[ "$wheel_name" == nested_memvid_agent-*.whl ]] ||
+    die "Unexpected Kestrel wheel filename: ${wheel_name}"
 }
 
 is_true() {
@@ -82,6 +214,25 @@ is_nonempty_dir() {
   local dir="$1"
   [[ -d "$dir" ]] || return 1
   [[ -n "$(find "$dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+}
+
+is_kestrel_checkout() {
+  local target="$1"
+  [[ -f "${target}/pyproject.toml" ]] || return 1
+  grep -Eq '^[[:space:]]*name[[:space:]]*=[[:space:]]*"nested-memvid-agent"[[:space:]]*$' \
+    "${target}/pyproject.toml"
+}
+
+require_clean_kestrel_checkout() {
+  local target="$1"
+  local status
+  is_kestrel_checkout "$target" ||
+    die "Refusing to update an unrecognized git checkout: ${target}"
+  if ! status="$(git -C "$target" status --porcelain --untracked-files=all)"; then
+    die "Unable to inspect existing Kestrel checkout: ${target}"
+  fi
+  [[ -z "$status" ]] ||
+    die "Refusing to update a dirty Kestrel checkout: ${target}. Commit, stash, or remove local changes first."
 }
 
 python_is_311_or_newer() {
@@ -140,6 +291,8 @@ print_install_plan() {
   home: ${KESTREL_HOME}
   python: ${PYTHON_BIN}
   extras: .[${KESTREL_EXTRAS}]
+  Python package: ${PYTHON_PACKAGE_LABEL}
+  locked requirements: ${REQUIREMENTS_LABEL}
   memory: .nest/memory
   web build: ${WEB_BUILD_LABEL}
   smoke checks: ${SMOKE_LABEL}
@@ -159,6 +312,7 @@ EOF
 }
 
 ensure_git_target() {
+  local existing_checkout=0
   if [[ -e "$KESTREL_HOME" && ! -d "$KESTREL_HOME" ]]; then
     die "Install target exists and is not a directory: ${KESTREL_HOME}"
   fi
@@ -167,32 +321,88 @@ ensure_git_target() {
   fi
 
   if [[ -d "${KESTREL_HOME}/.git" ]]; then
+    existing_checkout=1
     log "Updating existing Kestrel checkout at ${KESTREL_HOME}"
-    if ! is_true "${KESTREL_DRY_RUN:-}"; then
-      if git -C "$KESTREL_HOME" remote get-url origin >/dev/null 2>&1; then
-        run git -C "$KESTREL_HOME" remote set-url origin "$KESTREL_REPO"
-      else
-        run git -C "$KESTREL_HOME" remote add origin "$KESTREL_REPO"
-      fi
-    else
-      run git -C "$KESTREL_HOME" remote set-url origin "$KESTREL_REPO"
+    require_clean_kestrel_checkout "$KESTREL_HOME"
+    RELEASE_EXISTING_CHECKOUT=1
+    if ! RELEASE_ORIGINAL_HEAD="$(git -C "$KESTREL_HOME" rev-parse --verify HEAD)"; then
+      die "Unable to record the existing Kestrel checkout for rollback: ${KESTREL_HOME}"
     fi
+    RELEASE_ORIGINAL_BRANCH="$(git -C "$KESTREL_HOME" symbolic-ref --quiet --short HEAD || true)"
   else
     run mkdir -p "$(dirname "$KESTREL_HOME")"
     run git clone "$KESTREL_REPO" "$KESTREL_HOME"
   fi
 
-  run git -C "$KESTREL_HOME" fetch origin "$KESTREL_REF"
-  run git -C "$KESTREL_HOME" checkout -f FETCH_HEAD
+  # Fetch the requested source directly so an operator-owned `origin` remote is
+  # never rewritten. A second cleanliness check closes the fetch/checkout gap.
+  run git -C "$KESTREL_HOME" fetch "$KESTREL_REPO" "$KESTREL_REF"
+  if [[ "$existing_checkout" -eq 1 ]] && ! is_true "${KESTREL_DRY_RUN:-}"; then
+    require_clean_kestrel_checkout "$KESTREL_HOME"
+  fi
+  run git -C "$KESTREL_HOME" checkout --detach --no-overwrite-ignore FETCH_HEAD
+}
+
+verify_release_artifact() {
+  local manifest="$1"
+  local artifact="$2"
+  local filename expected actual
+  filename="$(basename "$artifact")"
+  expected="$(awk -v name="$filename" '$2 == name {print $1}' "$manifest")"
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] ||
+    die "Missing or invalid checksum for ${filename} in ${manifest}"
+  if ! actual="$("$PYTHON_BIN" -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$artifact")"; then
+    die "Unable to hash release artifact: ${artifact}"
+  fi
+  [[ "$actual" == "$expected" ]] || die "Checksum mismatch for release artifact: ${filename}"
 }
 
 install_python_deps() {
+  if [[ -z "$KESTREL_WHEEL_URL" ]]; then
+    run "$PYTHON_BIN" -m venv .venv
+    run .venv/bin/python -m pip install --upgrade pip
+    run .venv/bin/python -m pip install -e ".[${KESTREL_EXTRAS}]"
+    run .venv/bin/python -m pip check
+    return 0
+  fi
+
+  local release_dir=".nest/release"
+  local requirements_path="${release_dir}/requirements-release.txt"
+  local checksums_path="${release_dir}/SHA256SUMS"
+  local wheel_name="${KESTREL_WHEEL_URL##*/}"
+  local wheel_path="${release_dir}/${wheel_name}"
+  run mkdir -p "$release_dir"
+  run curl --fail --silent --show-error --location --retry 3 \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    "$KESTREL_REQUIREMENTS_URL" --output "$requirements_path"
+  run curl --fail --silent --show-error --location --retry 3 \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    "$KESTREL_WHEEL_URL" --output "$wheel_path"
+  run curl --fail --silent --show-error --location --retry 3 \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    "$KESTREL_CHECKSUMS_URL" --output "$checksums_path"
+
+  if is_true "${KESTREL_DRY_RUN:-}"; then
+    log "+ verify SHA256SUMS for ${requirements_path} and ${wheel_path}"
+  else
+    verify_release_artifact "$checksums_path" "$requirements_path"
+    verify_release_artifact "$checksums_path" "$wheel_path"
+  fi
+  # Preserve the working environment until every remote artifact has passed
+  # verification, then keep it as a rollback copy until all install smoke
+  # checks complete.
+  prepare_release_venv_replacement
   run "$PYTHON_BIN" -m venv .venv
-  run .venv/bin/python -m pip install --upgrade pip
-  run .venv/bin/python -m pip install -e ".[${KESTREL_EXTRAS}]"
+  run .venv/bin/python -m pip install --require-hashes -r "$requirements_path"
+  run .venv/bin/python -m pip install --no-deps "${wheel_path}[${KESTREL_EXTRAS}]"
+  run .venv/bin/python -m pip check
 }
 
 install_web_deps() {
+  if [[ -n "$KESTREL_WHEEL_URL" ]]; then
+    log "Using the workbench bundled in the verified release wheel."
+    return 0
+  fi
   if is_true "${KESTREL_SKIP_WEB:-}"; then
     log "Skipping web install/build because KESTREL_SKIP_WEB is set."
     return 0
@@ -200,6 +410,16 @@ install_web_deps() {
   command -v npm >/dev/null 2>&1 || die "npm is required for the web workbench. Set KESTREL_SKIP_WEB=1 to skip."
   run npm ci --prefix web
   run npm run build --prefix web
+}
+
+verify_installed_runtime() {
+  run .venv/bin/nest-agent --help
+  run .venv/bin/python -c 'import importlib.util, nested_memvid_agent; required=("fastapi","mcp","memvid_sdk","uvicorn"); missing=[name for name in required if importlib.util.find_spec(name) is None]; assert not missing, f"missing runtime modules: {missing}"; assert nested_memvid_agent.__file__'
+  if [[ -n "$KESTREL_WHEEL_URL" ]]; then
+    run .venv/bin/python -c 'from importlib.resources import files; assert files("nested_memvid_agent").joinpath("web_dist/index.html").is_file(), "bundled workbench is missing"; import anthropic, fastapi, google.genai, mcp, memvid_sdk, openai, uvicorn'
+  elif ! is_true "${KESTREL_SKIP_WEB:-}" && ! is_true "${KESTREL_DRY_RUN:-}"; then
+    [[ -s web/dist/index.html ]] || die "Web workbench build is missing web/dist/index.html"
+  fi
 }
 
 initialize_memory() {
@@ -234,8 +454,7 @@ wait_for_server() {
     return 0
   fi
 
-  local attempt
-  for attempt in $(seq 1 60); do
+  for _ in {1..60}; do
     if server_is_healthy; then
       log "Kestrel server is healthy at $(server_url)"
       return 0
@@ -323,6 +542,7 @@ start_server_detached() {
   log "Server log: ${KESTREL_SERVER_LOG}"
 
   if command -v screen >/dev/null 2>&1; then
+    # shellcheck disable=SC2016  # Inner shell intentionally expands positional parameters.
     run screen -dmS "$KESTREL_SERVER_SESSION" bash -lc 'cd "$1" || exit 1; log_file="$2"; pid_file="$3"; shift 3; "$@" >>"$log_file" 2>&1 & child=$!; printf "%s\n" "$child" >"$pid_file"; wait "$child"' bash "$KESTREL_HOME" "$KESTREL_SERVER_LOG" "$KESTREL_SERVER_PID" "${server_cmd[@]}"
   elif command -v tmux >/dev/null 2>&1; then
     run tmux new-session -d -s "$KESTREL_SERVER_SESSION" "cd $(printf '%q' "$KESTREL_HOME") && $(quote_cmd "${server_cmd[@]}") >>$(printf '%q' "$KESTREL_SERVER_LOG") 2>&1 & child=\$!; printf '%s\\n' \"\$child\" >$(printf '%q' "$KESTREL_SERVER_PID"); wait \"\$child\""
@@ -401,10 +621,15 @@ main() {
     return 0
   fi
 
+  require_supported_platform
+
   KESTREL_HOME="${KESTREL_HOME:-$DEFAULT_HOME}"
   KESTREL_REPO="${KESTREL_REPO:-$DEFAULT_REPO}"
   KESTREL_REF="${KESTREL_REF:-main}"
   KESTREL_EXTRAS="${KESTREL_EXTRAS:-$DEFAULT_EXTRAS}"
+  KESTREL_REQUIREMENTS_URL="${KESTREL_REQUIREMENTS_URL-$DEFAULT_REQUIREMENTS_URL}"
+  KESTREL_WHEEL_URL="${KESTREL_WHEEL_URL-$DEFAULT_WHEEL_URL}"
+  KESTREL_CHECKSUMS_URL="${KESTREL_CHECKSUMS_URL-$DEFAULT_CHECKSUMS_URL}"
   KESTREL_PORT="${KESTREL_PORT:-$DEFAULT_PORT}"
   KESTREL_START_SERVER="${KESTREL_START_SERVER:-$DEFAULT_START_SERVER}"
   if is_true "$KESTREL_START_SERVER"; then
@@ -426,7 +651,11 @@ main() {
   # dependencies from another environment as already installed.
   unset PYTHONPATH
   PYTHON_BIN="$(detect_python)"
-  readonly KESTREL_HOME KESTREL_REPO KESTREL_REF KESTREL_EXTRAS KESTREL_PORT KESTREL_START_SERVER KESTREL_OPEN_BROWSER KESTREL_SERVER_SESSION KESTREL_SERVER_LOG KESTREL_SERVER_PID PYTHON_BIN
+  readonly KESTREL_HOME KESTREL_REPO KESTREL_REF KESTREL_EXTRAS KESTREL_REQUIREMENTS_URL KESTREL_WHEEL_URL KESTREL_CHECKSUMS_URL KESTREL_PORT KESTREL_START_SERVER KESTREL_OPEN_BROWSER KESTREL_SERVER_SESSION KESTREL_SERVER_LOG KESTREL_SERVER_PID PYTHON_BIN
+  validate_release_artifact_config
+  if [[ -n "$KESTREL_WHEEL_URL" ]]; then
+    start_release_install_transaction
+  fi
 
   if is_true "${KESTREL_DRY_RUN:-}"; then
     DRY_RUN_LABEL="yes"
@@ -434,9 +663,17 @@ main() {
   else
     DRY_RUN_LABEL="no"
   fi
-  if is_true "${KESTREL_SKIP_WEB:-}"; then
+  if [[ -n "$KESTREL_WHEEL_URL" ]]; then
+    PYTHON_PACKAGE_LABEL="$KESTREL_WHEEL_URL"
+    REQUIREMENTS_LABEL="$KESTREL_REQUIREMENTS_URL"
+    WEB_BUILD_LABEL="bundled in verified release wheel"
+  elif is_true "${KESTREL_SKIP_WEB:-}"; then
+    PYTHON_PACKAGE_LABEL="editable checkout"
+    REQUIREMENTS_LABEL="live resolver (development/source mode)"
     WEB_BUILD_LABEL="skipped"
   else
+    PYTHON_PACKAGE_LABEL="editable checkout"
+    REQUIREMENTS_LABEL="live resolver (development/source mode)"
     WEB_BUILD_LABEL="npm ci --prefix web && npm run build --prefix web"
   fi
   if is_true "${KESTREL_SKIP_SMOKE:-}"; then
@@ -461,7 +698,7 @@ main() {
     WEB_UI_LABEL="skipped"
     SERVER_COMMAND_LABEL="skipped"
   fi
-  readonly DRY_RUN_LABEL WEB_BUILD_LABEL SMOKE_LABEL SERVER_LABEL BROWSER_LABEL HEALTH_CHECK_LABEL WEB_UI_LABEL SERVER_COMMAND_LABEL
+  readonly DRY_RUN_LABEL PYTHON_PACKAGE_LABEL REQUIREMENTS_LABEL WEB_BUILD_LABEL SMOKE_LABEL SERVER_LABEL BROWSER_LABEL HEALTH_CHECK_LABEL WEB_UI_LABEL SERVER_COMMAND_LABEL
 
   print_runtime_defaults
   print_install_plan
@@ -473,11 +710,13 @@ main() {
 
   install_python_deps
   install_web_deps
+  verify_installed_runtime
   initialize_memory
   run_smoke_checks
   start_server_detached
   open_web_ui
   print_next_steps
+  finalize_release_install_transaction
 }
 
 main "$@"

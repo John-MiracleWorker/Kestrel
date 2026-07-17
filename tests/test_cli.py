@@ -66,6 +66,34 @@ def test_memory_verify_subcommand_reports_layers(tmp_path: Path, monkeypatch: Mo
     assert "policy: ok" in output
 
 
+def test_server_can_disable_access_logging(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("nested_memvid_agent.server.create_app", lambda config: object())
+    monkeypatch.setattr("uvicorn.run", lambda app, **kwargs: captured.update({"app": app, **kwargs}))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "nest-agent",
+            "server",
+            "--backend",
+            "memory",
+            "--memory-dir",
+            str(tmp_path / "memory"),
+            "--state-path",
+            str(tmp_path / "state" / "agent.db"),
+            "--no-access-log",
+        ],
+    )
+
+    main()
+
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 8765
+    assert captured["access_log"] is False
+
+
 def test_product_setup_subcommand_reports_first_run_checks(
     tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object
 ) -> None:
@@ -98,6 +126,43 @@ def test_product_setup_subcommand_reports_first_run_checks(
     payload = json.loads(capsys.readouterr().out)
     assert payload["schema"] == "kestrel.setup_readiness.v1"
     assert any(check["check_id"] == "provider_configuration" for check in payload["checks"])
+
+
+def test_product_setup_check_exits_nonzero_when_required_setup_is_not_ready(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object
+) -> None:
+    _clear_nest_agent_env(monkeypatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "nest-agent",
+            "product",
+            "setup",
+            "--backend",
+            "memory",
+            "--provider",
+            "mock",
+            "--workspace",
+            str(tmp_path / "missing-workspace"),
+            "--memory-dir",
+            str(tmp_path / "missing-memory"),
+            "--state-path",
+            str(tmp_path / "state" / "agent.db"),
+            "--log-dir",
+            str(tmp_path / "logs"),
+            "--json",
+            "--check",
+        ],
+    )
+
+    with raises(SystemExit) as error:
+        main()
+
+    assert error.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is False
+    assert payload["fail_count"] > 0
 
 
 def test_channel_telegram_set_webhook_cli_redacts_secrets(
@@ -686,7 +751,7 @@ def test_doctor_default_memory_dir_is_nest_memory(
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["memory"]["backend"] == "memory"
-    assert payload["memory"]["path"] == ".nest/memory"
+    assert Path(payload["memory"]["path"]) == Path(".nest") / "memory"
 
 
 def test_run_subcommand_reports_structured_turn(tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object) -> None:
@@ -742,7 +807,7 @@ def test_run_subcommand_reports_structured_turn(tmp_path: Path, monkeypatch: Mon
     assert status_payload["status"] == "completed"
 
 
-def test_approval_subcommands_use_persistent_run_state(
+def test_approval_subcommands_fail_closed_for_unbound_persistent_approval(
     tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object
 ) -> None:
     state_path = tmp_path / "state.db"
@@ -807,7 +872,8 @@ def test_approval_subcommands_use_persistent_run_state(
 
     approved_payload = json.loads(capsys.readouterr().out)
     assert approved_payload["approval"]["status"] == "approved"
-    assert approved_payload["run"]["status"] == "completed"
+    assert approved_payload["run"]["status"] == "failed"
+    assert approved_payload["run"]["stop_reason"] == "approval_invalid_before_continuation"
 
 
 def test_deny_subcommand_marks_run_failed(tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object) -> None:
@@ -965,9 +1031,9 @@ def test_product_readiness_subcommand_reports_status(monkeypatch: MonkeyPatch, c
     main()
 
     output = capsys.readouterr().out
-    assert "Product readiness" in output
-    assert "Product ready: no" in output
-    assert "Production auth, users, and workspaces: missing" in output
+    assert "Full product roadmap" in output
+    assert "Full hosted/team product roadmap complete: no" in output
+    assert "Hosted/team auth, users, and workspaces: missing" in output
     assert "Safe autonomous learning: ready" in output
 
 
@@ -977,7 +1043,8 @@ def test_product_readiness_subcommand_can_emit_json(monkeypatch: MonkeyPatch, ca
     main()
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload["schema"] == "kestrel.product_readiness.v1"
+    assert payload["schema"] == "kestrel.product_readiness.v2"
+    assert payload["scope"] == "full_product_including_hosted_team"
     assert payload["headline"]["product_ready"] is False
     assert any(category["category_id"] == "golden_repair_workflow" for category in payload["categories"])
 

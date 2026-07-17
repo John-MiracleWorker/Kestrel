@@ -204,8 +204,8 @@ def run_demo(*, output_dir: Path, backend: str = "memory") -> dict[str, Any]:
     json_path = output_dir / "controlled_self_modification_demo.json"
     report_path = output_dir / "controlled_self_modification_demo.md"
     result["artifacts"] = {"json_path": str(json_path), "report_path": str(report_path)}
-    json_path.write_text(json.dumps(result, indent=2, sort_keys=True))
-    report_path.write_text(_render_markdown(result))
+    json_path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    report_path.write_text(_render_markdown(result), encoding="utf-8")
     return result
 
 
@@ -220,7 +220,7 @@ def main() -> int:
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
-        print(_render_markdown(result))
+        print(_render_markdown(result).replace(" → ", " -> "))
         print(f"\nArtifacts:\n- JSON: {result['artifacts']['json_path']}\n- Report: {result['artifacts']['report_path']}")
     return 0 if result["passed"] else 1
 

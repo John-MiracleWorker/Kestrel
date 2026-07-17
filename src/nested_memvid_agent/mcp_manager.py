@@ -6,6 +6,8 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
+import socket
 import threading
 import time
 from collections.abc import Callable, Coroutine
@@ -17,6 +19,12 @@ from urllib.parse import urlparse
 
 from .runtime_models import ToolCall, ToolExecution, ToolSpec
 from .secret_broker import is_secret_ref
+from .security_boundary import (
+    redact_secrets,
+    redact_text,
+    register_secret_env_names,
+    register_secret_value,
+)
 from .state_store import AgentStateStore
 from .tools.base import AgentTool, ToolContext
 
@@ -59,20 +67,69 @@ class MCPManager:
         self.timeout_seconds = timeout_seconds
         self.allow_network_endpoints = allow_network_endpoints
         self.secret_resolver = secret_resolver
+        self.capability_policy: Any | None = None
         self._lock = threading.RLock()
         self._sessions: dict[str, _MCPSessionWorker] = {}
 
     def add_server(self, payload: dict[str, Any]) -> dict[str, Any]:
-        server = _normalize_server(payload)
-        _validate_server_endpoint(server, allow_network_endpoints=self.allow_network_endpoints)
-        next_row = _server_to_dict(server)
+        raw = dict(payload)
+        server_id = str(raw["id"])
         try:
-            current_row = self.state.get_mcp_server(server.id)
+            current_row = self.state.get_mcp_server(server_id)
         except KeyError:
             current_row = None
-        if current_row is not None and _config_fingerprint(current_row) != _config_fingerprint(next_row):
-            self._close_session(server.id)
+        if current_row is not None:
+            # PUT/PATCH callers only receive redacted public configuration. An
+            # omitted field therefore means preserve, never erase a secret
+            # binding, argument list, or discovered tool manifest.
+            for key in (
+                "name",
+                "transport",
+                "command",
+                "args",
+                "env",
+                "secret_env",
+                "url",
+                "enabled",
+                "tools",
+                "risk_policy",
+                "vetting",
+            ):
+                if key not in raw:
+                    raw[key] = current_row.get(key)
+        server = _normalize_server(raw)
+        _validate_server_endpoint(server, allow_network_endpoints=self.allow_network_endpoints)
+        next_row = _server_to_dict(server)
+        if current_row is not None:
+            if _config_fingerprint(current_row) != _config_fingerprint(next_row):
+                self._close_session(server.id)
+            else:
+                _preserve_matching_connect_approval(next_row, current_row)
+                for key in (
+                    "status",
+                    "error",
+                    "last_synced_at",
+                    "last_seen_at",
+                    "session_state",
+                    "last_call_at",
+                    "last_error_at",
+                    "failure_count",
+                    "last_latency_ms",
+                ):
+                    next_row[key] = current_row.get(key)
         return self.state.upsert_mcp_server(next_row)
+
+    def set_enabled(self, server_id: str, enabled: bool) -> dict[str, Any]:
+        """Persist a server switch and immediately revoke its live session."""
+
+        row = self.state.get_mcp_server(server_id)
+        if not enabled:
+            self._close_session(server_id)
+            row["status"] = "configured"
+            row["session_state"] = "disconnected"
+            row["error"] = None
+        row["enabled"] = bool(enabled)
+        return self.state.upsert_mcp_server(row)
 
     def delete_server(self, server_id: str) -> None:
         self._close_session(server_id)
@@ -85,11 +142,29 @@ class MCPManager:
         for worker in workers:
             worker.close(timeout=self.timeout_seconds)
 
+    def close_disabled_sessions(self) -> list[str]:
+        """Quiesce sessions whose server disappeared or is no longer effective."""
+
+        rows = {str(row["id"]): row for row in self.state.list_mcp_servers()}
+        with self._lock:
+            session_ids = list(self._sessions)
+        closed: list[str] = []
+        for server_id in session_ids:
+            row = rows.get(server_id)
+            if row is not None and self._server_enabled(row):
+                continue
+            self._close_session(server_id)
+            closed.append(server_id)
+        return closed
+
     def list_servers(self) -> list[dict[str, Any]]:
         return self.state.list_mcp_servers()
 
     def connect_server(self, server_id: str) -> dict[str, Any]:
         row = self.state.get_mcp_server(server_id)
+        disabled = self._disabled_result(row)
+        if disabled is not None:
+            return disabled
         server = _server_from_state(row)
         started = time.monotonic()
         try:
@@ -128,9 +203,20 @@ class MCPManager:
 
     def approve_server_connect(self, server_id: str) -> dict[str, Any]:
         row = self.state.get_mcp_server(server_id)
+        if not self._server_enabled(row):
+            raise ValueError("MCP server is disabled.")
+        server = _server_from_state(row)
+        _validate_server_endpoint(
+            server,
+            allow_network_endpoints=self.allow_network_endpoints,
+        )
         _validate_stdio_command_hash(row)
         vetting = dict(row.get("vetting", {}) or {})
         expected_hash = vetting.get("stdio_command_hash")
+        if server.transport == "stdio" and server.command:
+            expected_hash = _stdio_command_hash(server.command, server.args)
+            vetting["stdio_command_hash"] = expected_hash
+            vetting["connect_requires_approval"] = True
         vetting["connect_approved"] = True
         vetting["connect_approved_at"] = _now()
         if isinstance(expected_hash, str) and expected_hash:
@@ -151,12 +237,18 @@ class MCPManager:
         return {"ok": True, "message": "Disconnected.", "server": self.state.upsert_mcp_server(row)}
 
     def restart_server(self, server_id: str) -> dict[str, Any]:
-        self.state.get_mcp_server(server_id)
+        row = self.state.get_mcp_server(server_id)
+        disabled = self._disabled_result(row)
+        if disabled is not None:
+            return disabled
         self._close_session(server_id)
         return self.connect_server(server_id)
 
     def server_health(self, server_id: str) -> dict[str, Any]:
         row = self.state.get_mcp_server(server_id)
+        disabled = self._disabled_result(row)
+        if disabled is not None:
+            return disabled
         server = _server_from_state(row)
         started = time.monotonic()
         try:
@@ -194,6 +286,12 @@ class MCPManager:
 
     def sync_server(self, server_id: str) -> dict[str, Any]:
         server = self.state.get_mcp_server(server_id)
+        if not self._server_enabled(server):
+            self._close_session(server_id)
+            server["status"] = "configured"
+            server["session_state"] = "disconnected"
+            server["error"] = None
+            return self.state.upsert_mcp_server(server)
         started = time.monotonic()
         try:
             _validate_server_endpoint(_server_from_state(server), allow_network_endpoints=self.allow_network_endpoints)
@@ -222,17 +320,36 @@ class MCPManager:
     def test_server(self, server_id: str) -> dict[str, Any]:
         return self.server_health(server_id)
 
-    def tool_adapters(self) -> list[AgentTool]:
+    def tool_adapters(self, *, include_disabled: bool = False) -> list[AgentTool]:
         adapters: list[AgentTool] = []
         for server in self.state.list_mcp_servers():
-            if not server["enabled"]:
+            if not include_disabled and not self._server_enabled(server):
                 continue
             config = _server_from_state(server)
             for tool in server["tools"]:
-                adapters.append(MCPToolAdapter(self, config, tool))
+                adapter = MCPToolAdapter(self, config, _normalize_tool(config, tool))
+                if include_disabled or self.capability_policy is None or self.capability_policy.tool_decision(adapter.spec).effective_enabled:
+                    adapters.append(adapter)
         return adapters
 
-    def call_tool(self, server: MCPServerConfig, tool_name: str, arguments: dict[str, Any]) -> ToolExecution:
+    def call_tool(
+        self, server: MCPServerConfig, tool_name: str, arguments: dict[str, Any]
+    ) -> ToolExecution:
+        """Invoke through the persisted-server approval boundary.
+
+        Keeping this compatibility entry point routed through ``invoke_tool``
+        prevents callers with a hand-built ``MCPServerConfig`` from starting a
+        process that has not received exact connect approval.
+        """
+
+        return self.invoke_tool(server.id, tool_name, arguments)
+
+    def _call_tool_after_connect_approval(
+        self,
+        server: MCPServerConfig,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> ToolExecution:
         call = ToolCall(name=f"mcp.{server.id}.{tool_name}", arguments=arguments)
         started = time.monotonic()
         try:
@@ -244,15 +361,16 @@ class MCPManager:
             return ToolExecution(
                 call=call,
                 success=True,
-                content=result,
+                content=redact_text(result),
                 data={"server_id": server.id, "latency_ms": latency_ms, "session_state": "connected"},
             )
         except Exception as exc:  # noqa: BLE001
             self._close_session(server.id)
+            safe_error = _safe_exception_text(exc)
             return ToolExecution(
                 call=call,
                 success=False,
-                content=f"{type(exc).__name__}: {exc}",
+                content=safe_error,
                 data={"server_id": server.id, "latency_ms": _elapsed_ms(started), "session_state": "error"},
                 error="mcp_tool_failed",
             )
@@ -261,6 +379,42 @@ class MCPManager:
         row = self.state.get_mcp_server(server_id)
         server = _server_from_state(row)
         remote_name = _remote_name_for(row, tool_name)
+        if not self._server_enabled(row):
+            self._close_session(server_id)
+            return ToolExecution(
+                call=ToolCall(name=f"mcp.{server.id}.{remote_name}", arguments=arguments),
+                success=False,
+                content="MCP server is disabled.",
+                data={"server_id": server.id, "session_state": "disconnected"},
+                error="mcp_server_disabled",
+            )
+        if self.capability_policy is not None:
+            normalized = next(
+                (
+                    _normalize_tool(server, tool)
+                    for tool in row.get("tools", [])
+                    if str(tool.get("remote_name") or tool.get("name")) == remote_name
+                ),
+                None,
+            )
+            if normalized is None:
+                return ToolExecution(
+                    call=ToolCall(name=f"mcp.{server.id}.{remote_name}", arguments=arguments),
+                    success=False,
+                    content=f"Unknown MCP tool: {remote_name}",
+                    data={"server_id": server.id},
+                    error="unknown_tool",
+                )
+            spec = MCPToolAdapter(self, server, normalized).spec
+            decision = self.capability_policy.tool_decision(spec)
+            if not decision.effective_enabled:
+                return ToolExecution(
+                    call=ToolCall(name=spec.name, arguments=arguments),
+                    success=False,
+                    content=f"MCP tool is disabled by {', '.join(decision.blocked_by)}.",
+                    data={"server_id": server.id, "session_state": str(row.get("session_state", "disconnected"))},
+                    error="tool_disabled",
+                )
         try:
             _validate_server_endpoint(server, allow_network_endpoints=self.allow_network_endpoints)
             _validate_stdio_command_hash(row)
@@ -275,10 +429,11 @@ class MCPManager:
                 )
         except Exception as exc:  # noqa: BLE001
             self._close_session(server_id)
+            safe_error = _safe_exception_text(exc)
             row["last_error_at"] = _now()
             row["status"] = "error"
             row["session_state"] = "error"
-            row["error"] = f"{type(exc).__name__}: {exc}"
+            row["error"] = safe_error
             row["failure_count"] = int(row.get("failure_count", 0)) + 1
             self.state.upsert_mcp_server(row)
             return ToolExecution(
@@ -288,7 +443,7 @@ class MCPManager:
                 data={"server_id": server.id, "session_state": "error"},
                 error="mcp_tool_failed",
             )
-        execution = self.call_tool(server, remote_name, arguments)
+        execution = self._call_tool_after_connect_approval(server, remote_name, arguments)
         row["last_call_at"] = _now()
         row["last_latency_ms"] = execution.data.get("latency_ms")
         if execution.success:
@@ -314,6 +469,29 @@ class MCPManager:
         row["error"] = "MCP connect approval required."
         row["last_latency_ms"] = latency_ms
         return {"ok": False, "message": "MCP connect approval required.", "server": self.state.upsert_mcp_server(row)}
+
+    def _disabled_result(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        if self._server_enabled(row):
+            return None
+        self._close_session(str(row["id"]))
+        row["status"] = "configured"
+        row["session_state"] = "disconnected"
+        row["error"] = None
+        return {
+            "ok": False,
+            "message": "MCP server is disabled.",
+            "server": self.state.upsert_mcp_server(row),
+        }
+
+    def _server_enabled(self, row: dict[str, Any]) -> bool:
+        if self.capability_policy is None:
+            return bool(row.get("enabled", False))
+        decision = self.capability_policy.parent_decision(
+            "mcp_server",
+            str(row["id"]),
+            entity_enabled=bool(row.get("enabled", False)),
+        )
+        return bool(decision.effective_enabled)
 
     def _discover_tools(self, server: MCPServerConfig, *, prefer_static: bool = False) -> list[dict[str, Any]]:
         if prefer_static or not _has_live_endpoint(server):
@@ -347,7 +525,7 @@ class MCPManager:
     def _mark_error(self, row: dict[str, Any], exc: Exception, *, latency_ms: int) -> dict[str, Any]:
         row["status"] = "error"
         row["session_state"] = "error"
-        row["error"] = f"{type(exc).__name__}: {exc}"
+        row["error"] = _safe_exception_text(exc)
         row["last_error_at"] = _now()
         row["failure_count"] = int(row.get("failure_count", 0)) + 1
         row["last_latency_ms"] = latency_ms
@@ -365,7 +543,10 @@ class MCPToolAdapter(AgentTool):
             description=str(tool.get("description") or f"MCP tool {self.remote_tool_name} from {server.name}"),
             parameters=dict(tool.get("parameters") or {"type": "object", "properties": {}}),
             risk=risk,
-            requires_approval=bool(tool.get("requires_approval", risk in {"medium", "high"})),
+            requires_approval=(
+                risk == "high"
+                or bool(tool.get("requires_approval", risk in {"medium", "high"}))
+            ),
             source="mcp",
             server_id=server.id,
             capabilities=tuple(str(item) for item in tool.get("capabilities", ["mcp"])),
@@ -533,30 +714,44 @@ class _ClientSessionContext:
 
 
 def _normalize_server(payload: dict[str, Any]) -> MCPServerConfig:
+    server_id = _safe_mcp_identifier(str(payload["id"]), field="server id")
     transport = str(payload.get("transport", "stdio"))
     if transport == "http":
         transport = "streamable_http"
     env = {str(k): str(v) for k, v in dict(payload.get("env", {})).items()}
     secret_env = {str(k): str(v) for k, v in dict(payload.get("secret_env", {})).items()}
-    for key in env:
-        if _looks_secret(key):
+    for key, value in env.items():
+        if _looks_secret(key) or _value_looks_secret(value):
             raise ValueError(f"MCP secret-looking environment variable {key} must be configured via secret_env.")
     for target, source in secret_env.items():
         if not _valid_env_name(target) or not (_valid_env_name(source) or is_secret_ref(source)):
             raise ValueError("MCP secret_env keys must be env names and values must be env names or secret:// refs.")
+    args = tuple(str(item) for item in payload.get("args", []))
+    _validate_stdio_args(args)
+    url = None if payload.get("url") is None else str(payload.get("url"))
+    if url is not None:
+        _validate_url_has_no_credential_components(url)
+    sanitized_vetting = _sanitize_mcp_metadata(dict(payload.get("vetting", {}) or {}))
+    vetting = sanitized_vetting if isinstance(sanitized_vetting, dict) else {}
+    for approval_field in (
+        "connect_approved",
+        "connect_approved_at",
+        "connect_approved_command_hash",
+    ):
+        vetting.pop(approval_field, None)
     return MCPServerConfig(
-        id=str(payload["id"]),
-        name=str(payload.get("name") or payload["id"]),
+        id=server_id,
+        name=redact_text(str(payload.get("name") or server_id)),
         transport=transport,
         command=None if payload.get("command") is None else str(payload.get("command")),
-        args=tuple(str(item) for item in payload.get("args", [])),
+        args=args,
         env=env,
         secret_env=secret_env,
-        url=None if payload.get("url") is None else str(payload.get("url")),
+        url=url,
         enabled=bool(payload.get("enabled", True)),
         tools=tuple(dict(item) for item in payload.get("tools", [])),
         risk_policy=_normalize_risk_policy(payload.get("risk_policy", MCP_DEFAULT_RISK_POLICY)),
-        vetting=dict(payload.get("vetting", {}) or {}),
+        vetting=vetting,
     )
 
 
@@ -602,18 +797,64 @@ def _server_from_state(row: dict[str, Any]) -> MCPServerConfig:
 
 
 def _normalize_tool(server: MCPServerConfig, tool: dict[str, Any]) -> dict[str, Any]:
-    remote_name = str(tool.get("remote_name") or tool.get("name"))
+    remote_name = _safe_mcp_identifier(
+        str(tool.get("remote_name") or tool.get("name")),
+        field="tool name",
+    )
     risk, requires_approval = _risk_fields(server, tool)
+    parameters = _sanitize_mcp_metadata(
+        tool.get("parameters")
+        or tool.get("inputSchema")
+        or {"type": "object", "properties": {}}
+    )
+    if not isinstance(parameters, dict):
+        parameters = {"type": "object", "properties": {}}
     return {
         "name": f"mcp.{server.id}.{remote_name}",
         "remote_name": remote_name,
-        "description": str(tool.get("description", "")),
-        "parameters": dict(tool.get("parameters") or tool.get("inputSchema") or {"type": "object", "properties": {}}),
+        "description": redact_text(str(tool.get("description", ""))),
+        "parameters": parameters,
         "risk": risk,
         "requires_approval": requires_approval,
-        "capabilities": list(tool.get("capabilities", ["mcp"])),
+        "capabilities": [
+            redact_text(str(capability))
+            for capability in tool.get("capabilities", ["mcp"])
+        ],
         "produces_validation": bool(tool.get("produces_validation", False)),
     }
+
+
+def _safe_mcp_identifier(value: str, *, field: str) -> str:
+    safe_value = redact_text(value)
+    if safe_value != value:
+        raise ValueError(f"MCP {field} contains credential material.")
+    return value
+
+
+def _sanitize_mcp_metadata(value: Any) -> Any:
+    """Redact both values and attacker-controlled JSON keys from MCP metadata."""
+
+    return _sanitize_mcp_metadata_keys(redact_secrets(value))
+
+
+def _sanitize_mcp_metadata_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        safe: dict[str, Any] = {}
+        for raw_key, item in value.items():
+            key = redact_text(str(raw_key))
+            if key in safe:
+                raise ValueError("MCP metadata keys collide after credential redaction.")
+            safe[key] = _sanitize_mcp_metadata_keys(item)
+        return safe
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_mcp_metadata_keys(item) for item in value]
+    if isinstance(value, str):
+        return redact_text(value)
+    return value
+
+
+def _safe_exception_text(exc: Exception) -> str:
+    return redact_text(f"{type(exc).__name__}: {exc}")
 
 
 def _remote_name_for(row: dict[str, Any], tool_name: str) -> str:
@@ -639,15 +880,27 @@ def _elapsed_ms(started: float) -> int:
 
 
 def _normalize_sdk_tool(server: MCPServerConfig, tool: Any) -> dict[str, Any]:
-    name = str(getattr(tool, "name", "tool"))
-    risk, requires_approval = _risk_fields(server, {})
+    name = _safe_mcp_identifier(str(getattr(tool, "name", "tool")), field="tool name")
+    description = redact_text(str(getattr(tool, "description", "")))
+    risk, _ = _risk_fields(
+        server,
+        {"name": name, "remote_name": name, "description": description},
+    )
+    if risk == "low":
+        risk = "medium"
+    parameters = _sanitize_mcp_metadata(
+        getattr(tool, "inputSchema", None)
+        or {"type": "object", "properties": {}}
+    )
+    if not isinstance(parameters, dict):
+        parameters = {"type": "object", "properties": {}}
     return {
         "name": f"mcp.{server.id}.{name}",
         "remote_name": name,
-        "description": str(getattr(tool, "description", "")),
-        "parameters": dict(getattr(tool, "inputSchema", None) or {"type": "object", "properties": {}}),
+        "description": description,
+        "parameters": parameters,
         "risk": risk,
-        "requires_approval": requires_approval,
+        "requires_approval": True,
         "capabilities": ["mcp"],
         "produces_validation": False,
     }
@@ -657,7 +910,10 @@ def _risk_fields(server: MCPServerConfig, tool: dict[str, Any]) -> tuple[RiskLev
     inferred = _infer_tool_risk(tool)
     if server.risk_policy == MCP_TRUST_MANIFEST_POLICY:
         risk = _max_risk(_risk_level(tool.get("risk", "low")), inferred)
-        return risk, bool(tool.get("requires_approval", risk in {"medium", "high"}))
+        manifest_requires_approval = bool(
+            tool.get("requires_approval", risk in {"medium", "high"})
+        )
+        return risk, risk == "high" or manifest_requires_approval
     risk = _max_risk(_risk_level(tool.get("risk", "medium")), inferred)
     if risk == "low":
         risk = "medium"
@@ -665,15 +921,43 @@ def _risk_fields(server: MCPServerConfig, tool: dict[str, Any]) -> tuple[RiskLev
 
 
 def _infer_tool_risk(tool: dict[str, Any]) -> RiskLevel:
-    name = str(tool.get("remote_name") or tool.get("name") or "").lower()
-    description = str(tool.get("description") or "").lower()
-    haystack = f"{name} {description}"
-    high_markers = (
+    terms = _risk_terms(
+        str(tool.get("remote_name") or tool.get("name") or ""),
+        str(tool.get("description") or ""),
+    )
+    high_markers = {
+        "add",
         "write",
+        "create",
         "delete",
+        "deploy",
+        "destroy",
+        "disable",
+        "enable",
+        "execute",
+        "grant",
+        "insert",
+        "install",
+        "invoke",
+        "modify",
+        "mutate",
         "remove",
+        "replace",
+        "revoke",
+        "rotate",
+        "set",
+        "start",
+        "stop",
+        "restart",
+        "uninstall",
+        "update",
+        "upload",
+        "publish",
+        "post",
         "patch",
         "apply",
+        "broadcast",
+        "charge",
         "commit",
         "push",
         "shell",
@@ -684,13 +968,24 @@ def _infer_tool_risk(tool: dict[str, Any]) -> RiskLevel:
         "secret",
         "token",
         "credential",
-    )
-    if any(marker in haystack for marker in high_markers):
+        "notify",
+        "pay",
+        "purchase",
+        "send",
+        "submit",
+        "transfer",
+    }
+    if terms & high_markers:
         return "high"
-    network_markers = ("http", "request", "fetch", "post", "send", "email", "message")
-    if any(marker in haystack for marker in network_markers):
+    network_markers = {"http", "https", "request", "fetch", "email", "message"}
+    if terms & network_markers:
         return "medium"
     return "low"
+
+
+def _risk_terms(*values: str) -> set[str]:
+    expanded = " ".join(re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", value) for value in values)
+    return {term.lower() for term in re.findall(r"[A-Za-z0-9]+", expanded)}
 
 
 def _max_risk(left: RiskLevel, right: RiskLevel) -> RiskLevel:
@@ -699,6 +994,7 @@ def _max_risk(left: RiskLevel, right: RiskLevel) -> RiskLevel:
 
 
 def _vetting_for_server(server: MCPServerConfig, tools: list[dict[str, Any]]) -> dict[str, Any]:
+    vetting = dict(server.vetting or {})
     secret_refs = dict(server.secret_env or {})
     secrets = sorted(set(secret_refs) | {key for key in (server.env or {}) if _looks_secret(key)})
     network_access = server.transport in {"sse", "streamable_http"} or bool(server.url)
@@ -713,8 +1009,22 @@ def _vetting_for_server(server: MCPServerConfig, tools: list[dict[str, Any]]) ->
         risk_reasons.append("high_risk_tools")
     if server.risk_policy != MCP_TRUST_MANIFEST_POLICY:
         risk_reasons.append("approval_by_default")
+    if server.transport == "stdio" and server.command:
+        command_hash = _stdio_command_hash(server.command, server.args)
+        previous_hash = vetting.get("stdio_command_hash")
+        vetting["stdio_command_hash"] = command_hash
+        vetting["connect_requires_approval"] = True
+        if previous_hash != command_hash:
+            for key in (
+                "connect_approved",
+                "connect_approved_at",
+                "connect_approved_command_hash",
+            ):
+                vetting.pop(key, None)
+        risk_reasons.append("stdio_process")
     recommended_trust = "approval_required" if risk_reasons else "low_risk"
     return {
+        **vetting,
         "server_id": server.id,
         "transport": server.transport,
         "network_access": network_access,
@@ -741,7 +1051,35 @@ def _vetting_for_server(server: MCPServerConfig, tools: list[dict[str, Any]]) ->
 
 def _looks_secret(name: str) -> bool:
     upper = name.upper()
-    return any(marker in upper for marker in ("TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL"))
+    return any(
+        marker in upper
+        for marker in ("AUTH", "TOKEN", "API_KEY", "KEY", "SECRET", "PASSWORD", "CREDENTIAL")
+    )
+
+
+def _value_looks_secret(value: str) -> bool:
+    lowered = value.strip().lower()
+    return lowered.startswith(("bearer ", "basic ", "secret://", "sk-", "ghp_", "github_pat_"))
+
+
+def _validate_stdio_args(args: tuple[str, ...]) -> None:
+    previous_secret_flag = False
+    for argument in args:
+        lowered = argument.strip().lower()
+        if previous_secret_flag:
+            raise ValueError("MCP secrets cannot be embedded in stdio arguments; use secret_env.")
+        secret_flag = _looks_secret(lowered.replace("-", "_"))
+        if secret_flag and "=" in lowered:
+            raise ValueError("MCP secrets cannot be embedded in stdio arguments; use secret_env.")
+        previous_secret_flag = secret_flag and lowered.startswith("-")
+        if _value_looks_secret(argument):
+            raise ValueError("MCP secrets cannot be embedded in stdio arguments; use secret_env.")
+
+
+def _validate_url_has_no_credential_components(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("MCP endpoint URLs cannot contain credentials, queries, or fragments.")
 
 
 def _valid_env_name(name: str) -> bool:
@@ -799,9 +1137,11 @@ def _runtime_env(server: MCPServerConfig, *, secret_resolver: SecretResolver | N
         if is_secret_ref(source) and callable(secret_resolver):
             value = str(secret_resolver(source) or "")
         else:
+            register_secret_env_names({source})
             value = os.getenv(source, "")
         if not value:
             raise ValueError(f"Missing MCP secret environment variable: {source}")
+        register_secret_value(value)
         env[target] = value
     return env
 
@@ -820,10 +1160,73 @@ def _validate_server_endpoint(server: MCPServerConfig, *, allow_network_endpoint
 def _validate_stdio_command(server: MCPServerConfig) -> None:
     if not server.command:
         return
-    command_name = server.command.rsplit("/", 1)[-1].lower()
-    shell_names = {"sh", "bash", "zsh", "fish", "csh", "tcsh", "ksh", "dash", "pwsh", "powershell", "cmd"}
-    if command_name in shell_names:
-        raise ValueError("MCP stdio shell launchers are not allowed.")
+    command = server.command.strip()
+    raw_command_name = re.split(r"[/\\]", command)[-1].lower()
+    command_name = raw_command_name.removesuffix(".exe")
+    if raw_command_name.endswith((".cmd", ".bat")):
+        command_name = raw_command_name.rsplit(".", 1)[0]
+        if command_name not in {"npx", "bunx"}:
+            raise ValueError("MCP stdio batch launchers are not allowed.")
+    if not command or _has_stdio_control_characters(command):
+        raise ValueError("MCP stdio commands must be a single executable path.")
+    proxy_launchers = {
+        "sh",
+        "bash",
+        "zsh",
+        "fish",
+        "csh",
+        "tcsh",
+        "ksh",
+        "dash",
+        "pwsh",
+        "powershell",
+        "cmd",
+        "env",
+        "xargs",
+        "sudo",
+        "doas",
+        "nohup",
+        "setsid",
+        "open",
+        "osascript",
+        "wscript",
+        "cscript",
+        "mshta",
+        "rundll32",
+        "regsvr32",
+    }
+    if command_name in proxy_launchers:
+        raise ValueError("MCP stdio shell and proxy launchers are not allowed.")
+    if any(_has_stdio_control_characters(argument) for argument in server.args):
+        raise ValueError("MCP stdio arguments cannot contain control characters.")
+
+    if re.fullmatch(r"(?:python|pythonw|pypy|py|pyw)(?:\d+(?:\.\d+)*)?", command_name):
+        if not server.args:
+            raise ValueError("MCP stdio Python commands must use `python -m <module>` or a `.py` script.")
+        if server.args[0] == "-m":
+            if len(server.args) < 2 or not _valid_python_module(server.args[1]):
+                raise ValueError("MCP stdio Python module names are invalid.")
+        elif server.args[0].startswith("-") or not server.args[0].lower().endswith(".py"):
+            raise ValueError("MCP stdio Python commands must use `python -m <module>` or a `.py` script.")
+        return
+
+    if command_name in {"node", "nodejs"}:
+        if not server.args or server.args[0].startswith("-") or not server.args[0].lower().endswith((".js", ".cjs", ".mjs")):
+            raise ValueError("MCP stdio Node commands must name a JavaScript module file; eval flags are forbidden.")
+        return
+
+    if command_name in {"npx", "uvx", "bunx"}:
+        if not server.args or not _valid_package_name(server.args[0]):
+            raise ValueError(f"MCP stdio {command_name} commands must name a valid package.")
+        return
+
+    if command_name == "deno":
+        if len(server.args) < 2 or server.args[0] != "run":
+            raise ValueError("MCP stdio Deno commands must use `deno run`; eval mode is forbidden.")
+        return
+
+    if re.fullmatch(r"(?:ruby|perl|php|lua)(?:\d+(?:\.\d+)*)?", command_name):
+        raise ValueError("General-purpose MCP stdio interpreter launchers are not allowed.")
 
 
 def _validate_stdio_command_hash(row: dict[str, Any]) -> None:
@@ -840,16 +1243,21 @@ def _validate_stdio_command_hash(row: dict[str, Any]) -> None:
 
 def _connect_requires_approval(row: dict[str, Any]) -> bool:
     vetting = row.get("vetting")
-    if not isinstance(vetting, dict):
+    metadata = vetting if isinstance(vetting, dict) else {}
+    live_stdio = str(row.get("transport")) == "stdio" and bool(row.get("command"))
+    if not live_stdio and not bool(metadata.get("connect_requires_approval")):
         return False
-    if not bool(vetting.get("connect_requires_approval")):
-        return False
-    if not bool(vetting.get("connect_approved")):
+    if not bool(metadata.get("connect_approved")):
         return True
-    expected = vetting.get("stdio_command_hash")
+    expected = metadata.get("stdio_command_hash")
+    if live_stdio:
+        actual = _stdio_command_hash(row.get("command"), row.get("args", []))
+        if not isinstance(expected, str) or expected != actual:
+            return True
+        return metadata.get("connect_approved_command_hash") != actual
     if not isinstance(expected, str) or not expected:
         return False
-    return vetting.get("connect_approved_command_hash") != expected
+    return metadata.get("connect_approved_command_hash") != expected
 
 
 def _stdio_command_hash(command: object, args: object) -> str:
@@ -858,22 +1266,77 @@ def _stdio_command_hash(command: object, args: object) -> str:
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _preserve_matching_connect_approval(
+    next_row: dict[str, Any],
+    current_row: dict[str, Any],
+) -> None:
+    next_vetting = dict(next_row.get("vetting", {}) or {})
+    current_vetting = dict(current_row.get("vetting", {}) or {})
+    command_hash = next_vetting.get("stdio_command_hash")
+    if (
+        not isinstance(command_hash, str)
+        or current_vetting.get("stdio_command_hash") != command_hash
+        or current_vetting.get("connect_approved_command_hash") != command_hash
+        or not bool(current_vetting.get("connect_approved"))
+    ):
+        return
+    for key in (
+        "connect_approved",
+        "connect_approved_at",
+        "connect_approved_command_hash",
+    ):
+        if key in current_vetting:
+            next_vetting[key] = current_vetting[key]
+    next_row["vetting"] = next_vetting
+
+
+def _valid_python_module(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*", value))
+
+
+def _valid_package_name(value: str) -> bool:
+    return bool(re.fullmatch(r"(@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+", value))
+
+
+def _has_stdio_control_characters(value: str) -> bool:
+    return any(character in value for character in ("\x00", "\r", "\n"))
+
+
 def _validate_network_url(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme != "https":
         raise ValueError("MCP network endpoints must use https URLs.")
     if parsed.username or parsed.password:
         raise ValueError("MCP endpoint URLs cannot include credentials.")
-    if parsed.fragment:
-        raise ValueError("MCP endpoint URLs cannot include fragments.")
+    if parsed.query or parsed.fragment:
+        raise ValueError("MCP endpoint URLs cannot include queries or fragments.")
     host = parsed.hostname or ""
     if not host:
         raise ValueError("MCP endpoint URL must include a host.")
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
-        return
-    if address.is_link_local or address.is_loopback or address.is_private or address.is_reserved or address.is_multicast:
+        try:
+            addresses = {
+                ipaddress.ip_address(sockaddr[0])
+                for _family, _type, _proto, _canonname, sockaddr in socket.getaddrinfo(
+                    host,
+                    parsed.port or 443,
+                    type=socket.SOCK_STREAM,
+                )
+            }
+        except (socket.gaierror, ValueError) as exc:
+            raise ValueError("MCP endpoint hostname could not be resolved safely.") from exc
+    else:
+        addresses = {address}
+    if any(
+        address.is_link_local
+        or address.is_loopback
+        or address.is_private
+        or address.is_reserved
+        or address.is_multicast
+        for address in addresses
+    ):
         raise ValueError("MCP endpoint URL host is not allowed by default.")
 
 

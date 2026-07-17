@@ -5,18 +5,32 @@ Memvid `.mv2` memory, localhost binding, no shell/file-write/policy/Codex high-r
 
 ## One-Shot GitHub Install
 
+The one-shot Bash installer supports macOS and Linux, including Linux inside WSL.
+Native Windows users must open a WSL distro first; Git Bash and the Windows
+`bash.exe` launcher are not supported installer environments. The Python runtime
+is still validated on native Windows; the published universal wheel is built,
+installed, and smoke-tested in the isolated Linux release environment.
+
 For a local Memvid-backed Kestrel install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.0/install.sh | bash
 ```
 
-The installer clones or updates `https://github.com/John-MiracleWorker/Kestrel.git` into `${KESTREL_HOME:-$HOME/.kestrel-agent}`, detects Python 3.11 or newer, creates `.venv`, installs `.[memvid,openai,anthropic,gemini,server,mcp]`, runs `npm ci --prefix web`, builds the web workbench, initializes `.nest/memory` with Memvid `.mv2` layers, verifies memory, and runs doctor plus a deterministic `mock` chat smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. The smoke check proves the CLI path without requiring secrets; it is not the recommended provider for real use.
+The release installer clones or updates `https://github.com/John-MiracleWorker/Kestrel.git` into `${KESTREL_HOME:-$HOME/.kestrel-agent}`, pins the checkout to `v0.3.0`, detects Python 3.11 or newer, creates `.venv`, downloads the universal wheel and hash-locked default dependencies, verifies both against the published `SHA256SUMS`, installs the bundled web workbench, initializes `.nest/memory` with Memvid `.mv2` layers, verifies memory, and runs doctor plus a deterministic `mock` chat smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. The smoke check proves the CLI path without requiring secrets; it is not the recommended provider for real use.
+
+Production installs should use the immutable GitHub release installer above. It pins the source checkout, wheel, dependency manifest, and checksum manifest to the same tag. `main` is a development source, not the published release channel. `v0.3.0` is the latest published release for the supported local/private deployment profile.
+
+The GitHub release also publishes the universal wheel, source distribution,
+version-pinned installer, hash-locked default dependency manifest,
+CycloneDX SBOM, and `SHA256SUMS`. The dependency audit and SBOM are generated
+from the same isolated wheel environment described by `requirements-release.txt`,
+not from the development/test environment.
 
 To install and explicitly launch the localhost workbench in one command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.0/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
 Useful options:
@@ -24,7 +38,7 @@ Useful options:
 ```bash
 KESTREL_DRY_RUN=1 bash install.sh
 KESTREL_HOME="$HOME/dev/kestrel" bash install.sh
-KESTREL_REF=main bash install.sh
+KESTREL_REF=v0.3.0 bash install.sh
 KESTREL_SKIP_WEB=1 bash install.sh
 KESTREL_SKIP_SMOKE=1 bash install.sh
 KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash install.sh
@@ -32,7 +46,7 @@ KESTREL_OPEN_BROWSER=0 KESTREL_PORT=8766 bash install.sh
 KESTREL_SERVER_SESSION=kestrel-agent-dev bash install.sh
 ```
 
-The installer refuses to overwrite a non-git nonempty target directory. It keeps the same safe runtime defaults as the rest of the repo: Memvid backend, localhost server commands, no provider secrets collected, and high-risk shell/file-write/policy/Codex/plugin/git remote mutation flags disabled.
+The installer refuses to overwrite a non-git nonempty target directory or update an existing Kestrel checkout with tracked or untracked changes. Updates fetch the requested source directly, preserve the operator's `origin` remote, and use a non-forced detached checkout that refuses to overwrite ignored files. It keeps the same safe runtime defaults as the rest of the repo: Memvid backend, localhost server commands, no provider secrets collected, and high-risk shell/file-write/policy/Codex/plugin/git remote mutation flags disabled.
 
 An opt-in detached server writes logs to `${KESTREL_HOME:-$HOME/.kestrel-agent}/.nest/server.log`. Stop it with:
 
@@ -160,7 +174,7 @@ require_api_auth=true
 enable_auto_consolidation=false
 ```
 
-The container command binds to `0.0.0.0` inside Docker, so the image requires API auth by default. Set `NEST_AGENT_API_TOKEN` for `docker run` and `docker compose`; startup fails before serving if a non-loopback bind is requested without a configured token.
+The container command binds to `0.0.0.0` inside Docker, so the image requires API auth by default. Set `NEST_AGENT_API_TOKEN` for `docker run` and `docker compose`; startup fails before serving if a non-loopback bind is requested without a configured token. Provider, model, backend, and storage paths come from the `NEST_AGENT_*` environment values instead of being overridden by the image command. The entrypoint initializes only missing Memvid v2 layers before starting the server, and the container health check uses `/api/health/ready` for traffic admission.
 
 When `require_api_auth=true`, the browser shell remains public so operators can load `/`, `/assets/*`, and client-side routes. All `/api/*` routes still require the token. The web app prompts for the token after a 401, stores it in browser local storage, and sends it as `Authorization: Bearer REDACTED` on API requests.
 

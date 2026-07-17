@@ -12,6 +12,7 @@ from .context_frames import MV2ContextFrame, to_memory_record
 from .models import MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
 from .nested_learning import LearningSignal
 from .runtime_models import AgentTurnResult, ToolExecution
+from .security_boundary import redact_secrets, sanitize_memory_record
 
 
 @dataclass(frozen=True)
@@ -104,10 +105,10 @@ class TaskCapsuleWriter:
                 tags=frame.tags,
                 metadata=frame.metadata,
             )
-        return backend.put(to_memory_record(frame))
+        return backend.put(sanitize_memory_record(to_memory_record(frame)))
 
     def put_record(self, record: MemoryRecord) -> str:
-        return self._backend().put(record)
+        return self._backend().put(sanitize_memory_record(record))
 
     def seal(self) -> None:
         self._backend().seal()
@@ -162,6 +163,8 @@ def write_run_capsule(
             "candidate_corrections": list(candidate_corrections),
             "candidate_policy_items": list(candidate_policy_items),
         }
+        safe_payload = redact_secrets(payload)
+        payload = safe_payload if isinstance(safe_payload, dict) else {}
         candidate_frames = _candidate_frames(payload)
         writer.put_frame(
             MV2ContextFrame(

@@ -1,9 +1,18 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from dataclasses import replace
+
+import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.runtime_settings import (
     RuntimeSettings,
+    RuntimeSettingsConflict,
     RuntimeSettingsStore,
     apply_runtime_settings,
 )
@@ -50,6 +59,25 @@ def test_runtime_routes_report_health_and_redacted_config(tmp_path, monkeypatch)
     assert payload["provider"]["api_key_env"] == "KESTREL_TEST_API_KEY"
     assert payload["provider"]["api_key_configured"] is True
     assert "raw-secret-value" not in runtime.text
+
+
+def test_runtime_provider_probe_exposes_explicit_operational_check(tmp_path) -> None:
+    config = AgentConfig(memory_dir=tmp_path / "memory", state_path=tmp_path / "state.db")
+    app = FastAPI()
+    register_runtime_routes(
+        app,
+        active_config=config,
+        state=_FakeState(),
+        http_exception=HTTPException,
+        provider_probe=lambda: {"operational": True, "state": "healthy", "total_successes": 1},
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/runtime/provider/probe")
+
+    assert response.status_code == 200
+    assert response.json()["operational"] is True
+    assert response.json()["state"] == "healthy"
 
 
 def test_runtime_models_route_returns_static_and_dynamic_catalogs(tmp_path) -> None:
@@ -331,3 +359,59 @@ def test_runtime_settings_store_loads_saved_config_on_restart(tmp_path) -> None:
     assert restarted_config.require_api_auth is config.require_api_auth
     assert restarted_config.allow_shell is True
     assert restarted_config.allow_web is True
+
+
+def test_runtime_settings_store_accepts_verified_older_schema_shape(tmp_path) -> None:
+    config = AgentConfig(provider="mock", model="mock", memory_dir=tmp_path / "memory")
+    store = RuntimeSettingsStore(tmp_path / "runtime_settings.json")
+    store.save(RuntimeSettings.from_config(config))
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+    payload.pop("provider_startup_probe")
+    payload["sources"].pop("provider_startup_probe")
+    payload["revision"] = None
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    payload["revision"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    store.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = store.load(config)
+
+    assert loaded.provider_startup_probe is False
+
+
+def test_runtime_settings_save_rejects_stale_revision(tmp_path) -> None:
+    config = AgentConfig(provider="mock", model="mock", memory_dir=tmp_path / "memory")
+    store = RuntimeSettingsStore(tmp_path / "runtime_settings.json")
+    first = store.save(RuntimeSettings.from_config(config))
+    assert first.revision is not None
+    second = store.save(replace(first, model="mock-v2"), expected_revision=first.revision)
+
+    with pytest.raises(RuntimeSettingsConflict, match="revision_conflict"):
+        store.save(replace(first, model="stale-write"), expected_revision=first.revision)
+
+    assert store.load(config).revision == second.revision
+    assert store.load(config).model == "mock-v2"
+
+
+def test_runtime_settings_store_versions_hashes_and_protects_effective_settings(tmp_path) -> None:
+    config = AgentConfig(provider="mock", model="mock", memory_dir=tmp_path / "memory")
+    store = RuntimeSettingsStore(tmp_path / "runtime_settings.json")
+
+    saved = store.save(RuntimeSettings.from_config(config))
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+
+    assert saved.schema_version == 1
+    assert saved.revision is not None and len(saved.revision) == 64
+    assert payload["revision"] == saved.revision
+    assert saved.sources["provider"] == "persisted"
+    assert saved.sources["require_api_auth"] == "launch"
+    if os.name != "nt":
+        assert store.path.stat().st_mode & 0o777 == 0o600
+
+
+def test_runtime_settings_store_rejects_unknown_future_schema(tmp_path) -> None:
+    config = AgentConfig()
+    store = RuntimeSettingsStore(tmp_path / "runtime_settings.json")
+    store.path.write_text('{"schema_version": 999}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported runtime settings schema"):
+        store.load(config)

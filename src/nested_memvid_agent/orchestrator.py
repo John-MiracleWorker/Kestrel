@@ -17,11 +17,18 @@ def build_memory_system(
     *,
     specs: dict[MemoryLayer, LayerSpec] | None = None,
     ledger: PromotionLedger | None = None,
+    max_file_bytes: int = 1_073_741_824,
 ) -> LayeredMemorySystem:
     if backend == "memory":
         return LayeredMemorySystem.from_backend_factory(memory_dir, InMemoryBackend, specs=specs, ledger=ledger)
     if backend == "memvid":
-        return LayeredMemorySystem.from_backend_factory(memory_dir, MemvidBackend, specs=specs, ledger=ledger)
+        return LayeredMemorySystem.from_backend_factory(
+            memory_dir,
+            MemvidBackend,
+            specs=specs,
+            ledger=ledger,
+            max_file_bytes=max_file_bytes,
+        )
     raise ValueError(f"Unknown backend: {backend}")
 
 

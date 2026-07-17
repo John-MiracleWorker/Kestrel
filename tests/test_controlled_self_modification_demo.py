@@ -30,8 +30,8 @@ def test_controlled_self_modification_demo_proves_full_auditable_loop(tmp_path: 
     json_path = Path(result["artifacts"]["json_path"])
     assert report_path.exists()
     assert json_path.exists()
-    payload = json.loads(json_path.read_text())
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["passed"] is True
-    markdown = report_path.read_text()
+    markdown = report_path.read_text(encoding="utf-8")
     assert "capsule → proposal → mutation gate → replay → activation → outcome → rollback" in markdown
     assert result["proposal"]["delta_id"] in markdown

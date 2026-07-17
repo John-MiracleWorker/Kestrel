@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from nested_memvid_agent.backends.memvid_backend import MemvidBackend
 from nested_memvid_agent.cognition import FailureEpisode, LessonCard
 from nested_memvid_agent.layers import LayeredMemorySystem
+from nested_memvid_agent.memory_backup import MemoryBackupManager
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.runtime_models import StrategyProposal, ToolCall, ToolExecution
 
@@ -183,3 +185,30 @@ def test_memvid_backend_exact_record_index_survives_reopen_for_tombstones(tmp_pa
         }
     finally:
         final.close()
+
+
+def test_memvid_backup_restores_and_verifies_when_live_directory_is_missing(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    seed = LayeredMemorySystem.from_backend_factory(memory_dir, MemvidBackend)
+    seed.close_all()
+    manager = MemoryBackupManager(memory_dir=memory_dir, backup_root=tmp_path / "backups")
+    manifest = manager.create()
+    shutil.rmtree(memory_dir)
+
+    def verify_staging(path: Path) -> None:
+        staged = LayeredMemorySystem.from_backend_factory(path, MemvidBackend)
+        try:
+            assert all(staged.verify_all().values())
+        finally:
+            staged.close_all()
+
+    restored = manager.restore(manifest["backup_id"], verify_staging=verify_staging)
+
+    assert restored["safety_backup_id"] is None
+    reopened = LayeredMemorySystem.from_backend_factory(memory_dir, MemvidBackend)
+    try:
+        assert all(reopened.verify_all().values())
+    finally:
+        reopened.close_all()

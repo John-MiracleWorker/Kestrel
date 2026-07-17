@@ -333,10 +333,18 @@ class PluginManager:
         for skill in self.state.list_skills():
             skill_id = str(skill["id"])
             if skill_id.startswith(prefix) and skill_id not in desired_skill_ids:
+                self.state.delete_capability_override("skill", skill_id)
+                self.state.delete_capability_override("tool", f"skill.{skill_id}.run")
                 self.state.delete_skill(skill_id)
         for server in self.state.list_mcp_servers():
             server_id = str(server["id"])
             if server_id.startswith(prefix) and server_id not in desired_mcp_ids:
+                self.state.delete_capability_override("mcp_server", server_id)
+                for tool in server.get("tools", []):
+                    if isinstance(tool, dict) and tool.get("name"):
+                        self.state.delete_capability_override(
+                            "tool", str(tool["name"])
+                        )
                 self.state.delete_mcp_server(server_id)
 
     def _delete_extension_rows(self, plugin_id: str) -> None:
@@ -521,6 +529,12 @@ def _normalize_mcp_server(plugin_id: str, raw: dict[str, Any]) -> dict[str, Any]
         args = [str(item) for item in config.get("args", [])]
         _validate_plugin_stdio_command(command, args)
         vetting = dict(config.get("vetting", {}) or {})
+        for approval_field in (
+            "connect_approved",
+            "connect_approved_at",
+            "connect_approved_command_hash",
+        ):
+            vetting.pop(approval_field, None)
         vetting["stdio_command_hash"] = _stdio_command_hash(command, args)
         vetting["connect_requires_approval"] = True
         vetting["plugin_source"] = plugin_id

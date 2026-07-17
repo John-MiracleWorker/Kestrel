@@ -27,6 +27,7 @@ def test_live_stdio_mcp_discovery_and_invoke(tmp_path: Path) -> None:
             "args": [str(fixture)],
         }
     )
+    manager.approve_server_connect("stdio_fixture")
 
     try:
         connected = manager.connect_server("stdio_fixture")

@@ -121,7 +121,10 @@ export type McpServer = {
   command?: string | null;
   args?: string[];
   env?: Record<string, string>;
+  env_keys?: string[];
   secret_env?: Record<string, string>;
+  secret_env_status?: Record<string, Record<string, unknown>>;
+  argument_count?: number;
   url?: string | null;
   enabled: boolean;
   tools: McpTool[];
@@ -139,6 +142,46 @@ export type McpServer = {
   last_latency_ms?: number | null;
   vetting?: Record<string, unknown>;
   updated_at?: string;
+};
+
+export type CapabilityKind = "tool" | "mcp_server" | "skill";
+
+export type Capability = {
+  key: string;
+  kind: CapabilityKind;
+  id: string;
+  name: string;
+  description: string;
+  default_enabled: boolean;
+  configured_enabled: boolean;
+  effective_enabled: boolean;
+  blocked_by: string[];
+  revision: number;
+  risk: string;
+  requires_approval: boolean;
+  source: string;
+  parent_key?: string | null;
+  enablement_flag?: string | null;
+  status?: string | null;
+  updated_at?: string | null;
+};
+
+export type CapabilityCounts = {
+  total: number;
+  configured_enabled: number;
+  effective_enabled: number;
+  blocked: number;
+};
+
+export type CapabilitySnapshot = {
+  items: Capability[];
+  counts: CapabilityCounts;
+};
+
+export type CapabilityMutationResult = {
+  capability: Capability;
+  revoked_approvals: number;
+  applies_to: "future_invocations";
 };
 
 export type Skill = {

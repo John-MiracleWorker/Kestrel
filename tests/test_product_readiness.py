@@ -7,6 +7,8 @@ from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
 from nested_memvid_agent.config import AgentConfig
+from nested_memvid_agent.llm.factory import provider_health_id
+from nested_memvid_agent.llm.resilience import global_provider_health_registry
 from nested_memvid_agent.product_readiness import (
     ProductReadinessStatus,
     build_product_readiness_report,
@@ -22,7 +24,8 @@ from nested_memvid_agent.setup_readiness import SetupReadinessStatus, build_setu
 def test_product_readiness_report_exposes_all_productization_categories() -> None:
     report = build_product_readiness_report()
 
-    assert report.schema == "kestrel.product_readiness.v1"
+    assert report.schema == "kestrel.product_readiness.v2"
+    assert report.scope == "full_product_including_hosted_team"
     assert report.headline.total_categories == 10
     assert report.headline.ready_count >= 0
     assert report.headline.partial_count > 0
@@ -75,7 +78,8 @@ def test_product_readiness_report_serializes_to_public_dict() -> None:
     report = build_product_readiness_report()
     payload = report.to_dict()
 
-    assert payload["schema"] == "kestrel.product_readiness.v1"
+    assert payload["schema"] == "kestrel.product_readiness.v2"
+    assert payload["scope"] == "full_product_including_hosted_team"
     assert payload["headline"]["product_ready"] is False
     assert payload["categories"][0]["status"] in {"ready", "partial", "missing"}
     assert all(category["next_action"] for category in payload["categories"])
@@ -174,6 +178,36 @@ def test_setup_readiness_requires_openrouter_secret_even_with_default_base_url(t
     checks = {check.check_id: check for check in report.checks}
     assert checks["provider_configuration"].status == SetupReadinessStatus.FAIL
     assert "MISSING_OPENROUTER_TEST_KEY" in checks["provider_configuration"].detail
+
+
+def test_setup_readiness_uses_endpoint_and_credential_scoped_provider_health(
+    tmp_path: Path,
+) -> None:
+    healthy = AgentConfig(
+        provider="openai-compatible",
+        model="shared-model",
+        base_url="https://healthy.example/v1",
+        workspace=tmp_path,
+        memory_dir=tmp_path / "memory",
+    )
+    other_endpoint = AgentConfig(
+        **{**healthy.__dict__, "base_url": "https://unknown.example/v1"}
+    )
+    global_provider_health_registry.reset()
+    global_provider_health_registry.record_success(provider_health_id(healthy))
+    try:
+        healthy_checks = {
+            check.check_id: check for check in build_setup_readiness_report(healthy).checks
+        }
+        other_checks = {
+            check.check_id: check
+            for check in build_setup_readiness_report(other_endpoint).checks
+        }
+    finally:
+        global_provider_health_registry.reset()
+
+    assert healthy_checks["provider_operational"].status == SetupReadinessStatus.PASS
+    assert other_checks["provider_operational"].status == SetupReadinessStatus.WARN
 
 
 def test_product_setup_route_uses_active_config(tmp_path: Path) -> None:

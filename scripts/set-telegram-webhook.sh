@@ -17,6 +17,28 @@ set +a
 : "${TELEGRAM_WEBHOOK_SECRET:?TELEGRAM_WEBHOOK_SECRET is required}"
 : "${PUBLIC_URL:?PUBLIC_URL is required, e.g. https://example.trycloudflare.com}"
 
+case "$PUBLIC_URL" in
+  https://*) ;;
+  *)
+    echo "PUBLIC_URL must use https:// for Telegram webhook ingress." >&2
+    exit 1
+    ;;
+esac
+NEST_AGENT_REQUIRE_API_AUTH="${NEST_AGENT_REQUIRE_API_AUTH:-true}"
+NEST_AGENT_API_AUTH_TOKEN_ENV="${NEST_AGENT_API_AUTH_TOKEN_ENV:-NEST_AGENT_API_TOKEN}"
+case "$NEST_AGENT_REQUIRE_API_AUTH" in
+  1|true|TRUE|yes|YES|on|ON) ;;
+  *)
+    echo "Public Telegram webhook ingress requires NEST_AGENT_REQUIRE_API_AUTH=true." >&2
+    exit 1
+    ;;
+esac
+api_auth_token="$(printenv "$NEST_AGENT_API_AUTH_TOKEN_ENV" 2>/dev/null || true)"
+if [[ -z "$api_auth_token" ]]; then
+  echo "Missing API auth token env: $NEST_AGENT_API_AUTH_TOKEN_ENV" >&2
+  exit 1
+fi
+
 WEBHOOK_URL="${PUBLIC_URL%/}/api/channels/telegram/webhook"
 
 echo "Bot identity:"
@@ -27,7 +49,7 @@ echo "Setting webhook to: ${WEBHOOK_URL}"
 curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
   --data-urlencode "url=${WEBHOOK_URL}" \
   --data-urlencode "secret_token=${TELEGRAM_WEBHOOK_SECRET}" \
-  --data-urlencode "allowed_updates=[\"message\",\"edited_message\"]" \
+  --data-urlencode "allowed_updates=[\"message\",\"edited_message\",\"callback_query\"]" \
   | python3 -m json.tool
 
 echo

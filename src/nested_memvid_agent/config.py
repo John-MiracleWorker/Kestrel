@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,13 @@ class AgentConfig:
     fallback_api_key_env: str | None = None
     timeout_seconds: int = 60
     max_retries: int = 2
+    provider_circuit_failure_threshold: int = 3
+    provider_circuit_cooldown_seconds: float = 30.0
+    provider_startup_probe: bool = False
+    run_lease_ttl_seconds: float = 30.0
+    run_heartbeat_interval_seconds: float = 10.0
+    max_concurrent_runs: int = 4
+    max_queued_runs: int = 100
     temperature: float = 0.2
     codex_sandbox: str = "read-only"
     codex_profile: str | None = None
@@ -27,6 +35,7 @@ class AgentConfig:
     codex_ephemeral: bool = True
     backend: str = "memory"
     memory_dir: Path = Path(".nest/memory")
+    memory_max_layer_bytes: int = 1_073_741_824
     layer_config_path: Path | None = None
     workspace: Path = Path(".")
     max_tool_rounds: int = 6
@@ -51,6 +60,7 @@ class AgentConfig:
     web_max_results: int = 5
     web_max_bytes: int = 200_000
     require_approval_for_high_risk_tools: bool = True
+    approval_ttl_seconds: float = 900.0
     enable_agentic_cycle: bool = True
     enable_autonomous_scheduler: bool = False
     max_scheduler_tasks: int = 3
@@ -85,6 +95,10 @@ class AgentConfig:
     channel_send_timeout_seconds: int = 10
     require_api_auth: bool = False
     api_auth_token_env: str = "NEST_AGENT_API_TOKEN"
+    api_rate_limit_requests: int = 120
+    api_rate_limit_window_seconds: float = 60.0
+    api_rate_limit_max_clients: int = 2048
+    max_request_body_bytes: int = 1_000_000
     tool_timeout_seconds: float = 30.0
     tool_retry_max_attempts: int = 3
     tool_retry_backoff_base_seconds: float = 1.0
@@ -94,6 +108,22 @@ class AgentConfig:
     memory_seal_write_threshold: int = 50
     memory_seal_interval_seconds: float = 10.0
     enabled_tools: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Retain the legacy field for snapshot compatibility, but never permit a
+        # configuration document to disable exact-call approval for tools that
+        # declare it. The registry enforces the same invariant independently.
+        if not self.require_approval_for_high_risk_tools:
+            object.__setattr__(self, "require_approval_for_high_risk_tools", True)
+        if self.approval_ttl_seconds <= 0:
+            raise ValueError("approval_ttl_seconds must be greater than zero")
+        for field_name in ("base_url", "fallback_base_url"):
+            value = getattr(self, field_name)
+            if not value:
+                continue
+            parsed = urlsplit(value)
+            if parsed.username is not None or parsed.password is not None:
+                raise ValueError(f"{field_name} must not embed credentials; use an environment reference")
 
     @classmethod
     def from_env(cls) -> AgentConfig:
@@ -108,6 +138,13 @@ class AgentConfig:
             fallback_api_key_env=_env_str_or_none("NEST_AGENT_FALLBACK_API_KEY_ENV"),
             timeout_seconds=_env_int("NEST_AGENT_TIMEOUT_SECONDS", 60),
             max_retries=_env_int("NEST_AGENT_MAX_RETRIES", 2),
+            provider_circuit_failure_threshold=_env_int("NEST_AGENT_PROVIDER_CIRCUIT_FAILURE_THRESHOLD", 3),
+            provider_circuit_cooldown_seconds=_env_float("NEST_AGENT_PROVIDER_CIRCUIT_COOLDOWN_SECONDS", 30.0),
+            provider_startup_probe=_env_bool("NEST_AGENT_PROVIDER_STARTUP_PROBE"),
+            run_lease_ttl_seconds=_env_float("NEST_AGENT_RUN_LEASE_TTL_SECONDS", 30.0),
+            run_heartbeat_interval_seconds=_env_float("NEST_AGENT_RUN_HEARTBEAT_INTERVAL_SECONDS", 10.0),
+            max_concurrent_runs=_env_int("NEST_AGENT_MAX_CONCURRENT_RUNS", 4),
+            max_queued_runs=_env_int("NEST_AGENT_MAX_QUEUED_RUNS", 100),
             temperature=_env_float("NEST_AGENT_TEMPERATURE", 0.2),
             codex_sandbox=os.getenv("NEST_AGENT_CODEX_SANDBOX", "read-only"),
             codex_profile=_env_str_or_none("NEST_AGENT_CODEX_PROFILE"),
@@ -115,6 +152,7 @@ class AgentConfig:
             codex_ephemeral=not _env_bool("NEST_AGENT_CODEX_PERSIST_SESSION"),
             backend=os.getenv("NEST_AGENT_BACKEND", "memory"),
             memory_dir=Path(os.getenv("NEST_AGENT_MEMORY_DIR", ".nest/memory")),
+            memory_max_layer_bytes=_env_int("NEST_AGENT_MEMORY_MAX_LAYER_BYTES", 1_073_741_824),
             layer_config_path=_env_path_or_none("NEST_AGENT_LAYER_CONFIG"),
             workspace=Path(os.getenv("NEST_AGENT_WORKSPACE", ".")),
             max_tool_rounds=_env_int("NEST_AGENT_MAX_TOOL_ROUNDS", 6),
@@ -129,9 +167,14 @@ class AgentConfig:
             channel_config_path=Path(os.getenv("NEST_AGENT_CHANNEL_CONFIG", ".nest/config/channels.json")),
             enable_channel_delivery=_env_bool("NEST_AGENT_ENABLE_CHANNEL_DELIVERY"),
             channel_send_timeout_seconds=_env_int("NEST_AGENT_CHANNEL_SEND_TIMEOUT_SECONDS", 10),
+            api_rate_limit_requests=_env_int("NEST_AGENT_API_RATE_LIMIT_REQUESTS", 120),
+            api_rate_limit_window_seconds=_env_float("NEST_AGENT_API_RATE_LIMIT_WINDOW_SECONDS", 60.0),
+            api_rate_limit_max_clients=_env_int("NEST_AGENT_API_RATE_LIMIT_MAX_CLIENTS", 2048),
+            max_request_body_bytes=_env_int("NEST_AGENT_MAX_REQUEST_BODY_BYTES", 1_000_000),
             tool_timeout_seconds=_env_float("NEST_AGENT_TOOL_TIMEOUT_SECONDS", 30.0),
             tool_retry_max_attempts=_env_int("NEST_AGENT_TOOL_RETRY_MAX_ATTEMPTS", 3),
             tool_retry_backoff_base_seconds=_env_float("NEST_AGENT_TOOL_RETRY_BACKOFF_BASE_SECONDS", 1.0),
+            approval_ttl_seconds=_env_float("NEST_AGENT_APPROVAL_TTL_SECONDS", 900.0),
             allow_shell=_env_bool("NEST_AGENT_ALLOW_SHELL"),
             allow_file_write=_env_bool("NEST_AGENT_ALLOW_FILE_WRITE"),
             allow_policy_writes=_env_bool("NEST_AGENT_ALLOW_POLICY_WRITES"),
@@ -191,6 +234,10 @@ class AgentConfig:
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any]) -> AgentConfig:
+        allowed = {item.name for item in fields(cls)}
+        unknown = sorted(set(raw) - allowed)
+        if unknown:
+            raise ValueError(f"unsupported agent configuration fields: {', '.join(unknown)}")
         path_fields = {
             "memory_dir",
             "layer_config_path",
@@ -213,6 +260,18 @@ class AgentConfig:
             else:
                 normalized[key] = value
         return cls(**normalized)
+
+    def to_mapping(self) -> dict[str, Any]:
+        rendered: dict[str, Any] = {}
+        for item in fields(self):
+            value = getattr(self, item.name)
+            if isinstance(value, Path):
+                rendered[item.name] = str(value)
+            elif isinstance(value, tuple):
+                rendered[item.name] = list(value)
+            else:
+                rendered[item.name] = value
+        return rendered
 
 
 def _env_bool(name: str) -> bool:

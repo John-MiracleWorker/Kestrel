@@ -2,6 +2,8 @@
 
 Last updated: 2026-05-21
 
+This is the long-horizon full-product roadmap, including hosted/team capabilities. It is not the release gate for the supported single-user, single-node local/private profile; use `docs/PRODUCTION_OPERATIONS.md` and the latest dated readiness review for that decision.
+
 ## Thesis
 
 Kestrel is beyond a demo technically: it has a real local agent runtime, deterministic mock evals, Memvid `.mv2` layered memory, approval gates, repair primitives, task graphs, behavior deltas, and a web control plane.
@@ -142,7 +144,8 @@ Required work:
 
 - Container-grade or equivalent runtime isolation for executable skills/plugins.
 - Dependency management for plugins and skills.
-- Per-tool permission model.
+- Per-tool/MCP-server/skill owner controls for the local single-owner profile. ✅ The Settings Capability Center, revisioned API, effective blockers, and append-only history are implemented.
+- Hosted role-scoped capability administration, distinct actor identity, and tenant-aware audit policy.
 - Filesystem and network scopes.
 - Secret access scopes.
 - Plugin review UX.
@@ -275,6 +278,7 @@ Tasks:
 6. Add patch review UI with validation and rollback state.
 7. Add support bundle export. ✅ `nest-agent product support-bundle` and `POST /api/product/support-bundle` now generate redacted local diagnostic archives.
 8. Add provider certification reporting. ✅ `nest-agent product provider-certification` and `GET /api/product/provider-certification` now expose redacted per-provider status and live-validation commands.
+9. Add durable per-tool, MCP-server, and skill controls. ✅ The Settings Capability Center and revisioned capability API expose configured/effective state, blockers, default-off dynamic capabilities, and change history for the local single-owner profile.
 
 - `examples/golden_repair_demo/` — deterministic fixture repo with one failing test and `expected_fix.patch` for the golden repair journey.
 
@@ -293,7 +297,7 @@ Tasks:
 Tasks:
 
 1. Implement user/session/workspace model.
-2. Add role-scoped permissions.
+2. Extend local owner capability controls into role-scoped permissions with distinct administrator identity, hardened sessions, and actor-attributed audit.
 3. Add sandboxed skill/plugin execution.
 4. Harden plugin/MCP review and enablement.
 5. Add production audit-log export.

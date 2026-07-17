@@ -10,6 +10,7 @@ from ..cognition import RetryPolicy
 from ..diagnosis import classify_failure
 from ..runtime_models import StrategyProposal, ToolCall, ToolExecution, ToolSpec
 from .base import AgentTool, ToolContext
+from .command_tools import _is_allowlisted_command
 from .diagnosis_tools import _recall_failure_lessons, _recall_hit_titles
 from .git_tools import (
     _changed_files_from_status,
@@ -256,7 +257,7 @@ class RepairValidateTool(AgentTool):
                 call, success=False, content="command must be list[str]", error="bad_command"
             )
         command = list(command_raw)
-        if not command or Path(command[0]).name not in self.allowed_first_tokens:
+        if not _is_allowlisted_command(command, self.allowed_first_tokens):
             return self._result(
                 call,
                 success=False,
@@ -274,7 +275,11 @@ class RepairValidateTool(AgentTool):
                     error="not_repair_branch",
                 )
             completed = _run_subprocess(
-                command, context=context, arguments=arguments, default_timeout=120
+                command,
+                context=context,
+                arguments=arguments,
+                default_timeout=120,
+                sanitize_environment=True,
             )
             content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
             diagnosis = (
@@ -344,7 +349,7 @@ class RepairOrchestrateValidateTool(AgentTool):
                 call, success=False, content="command must be list[str]", error="bad_command"
             )
         command = list(command_raw)
-        if not command or Path(command[0]).name not in self.allowed_first_tokens:
+        if not _is_allowlisted_command(command, self.allowed_first_tokens):
             return self._result(
                 call,
                 success=False,
@@ -364,7 +369,11 @@ class RepairOrchestrateValidateTool(AgentTool):
                 )
             status = _git_output(context.workspace, ["git", "status", "--porcelain"])
             completed = _run_subprocess(
-                command, context=context, arguments=arguments, default_timeout=120
+                command,
+                context=context,
+                arguments=arguments,
+                default_timeout=120,
+                sanitize_environment=True,
             )
             validation_content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
             validation = {

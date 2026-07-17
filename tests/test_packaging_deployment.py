@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 import tomllib
 from pathlib import Path
@@ -11,7 +12,7 @@ def test_package_metadata_identifies_kestrel_release() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     project = pyproject["project"]
 
-    assert project["version"] == "0.2.1"
+    assert project["version"] == "0.3.0"
     assert project["description"].startswith("Kestrel:")
     assert project["urls"]["Repository"] == "https://github.com/John-MiracleWorker/Kestrel"
     assert project["urls"]["Issues"] == "https://github.com/John-MiracleWorker/Kestrel/issues"
@@ -32,6 +33,7 @@ def test_package_includes_runtime_prompt_data() -> None:
 
 def test_dockerfile_keeps_safe_runtime_defaults() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    command = next(line for line in dockerfile.splitlines() if line.startswith("CMD ["))
 
     assert "FROM node:22-bookworm-slim AS web-build" in dockerfile
     assert "FROM python:3.11-slim AS runtime" in dockerfile
@@ -50,12 +52,33 @@ def test_dockerfile_keeps_safe_runtime_defaults() -> None:
     assert "NEST_AGENT_REQUIRE_API_AUTH=true" in dockerfile
     assert "NEST_AGENT_API_TOKEN" in dockerfile
     assert "ARG INSTALL_EXTRAS=server,mcp,memvid,openai,anthropic,gemini" in dockerfile
-    assert "--backend\", \"memvid\"" in dockerfile
-    assert "\"--require-api-auth\"" in dockerfile
+    assert 'ENTRYPOINT ["/bin/sh", "/app/scripts/docker-entrypoint.sh"]' in dockerfile
+    assert "/api/health/ready" in dockerfile
+    assert '"--require-api-auth"' in command
+    for env_owned_option in ("--backend", "--memory-dir", "--provider", "--model", "--state-path"):
+        assert env_owned_option not in command
+
+
+def test_docker_entrypoint_initializes_memvid_before_default_server() -> None:
+    entrypoint = ROOT / "scripts" / "docker-entrypoint.sh"
+    script = entrypoint.read_text(encoding="utf-8")
+    syntax = subprocess.run(
+        ["sh", "-n", str(entrypoint)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert syntax.returncode == 0, syntax.stderr
+    assert 'if [ "$#" -ge 2 ] && [ "$1" = "nest-agent" ] && [ "$2" = "server" ]' in script
+    assert "nest-agent init" in script
+    assert 'exec "$@"' in script
 
 
 def test_compose_binds_localhost_and_persists_data_volume() -> None:
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    command = compose.split("    command:\n", maxsplit=1)[1].split("    healthcheck:\n", maxsplit=1)[0]
 
     assert "127.0.0.1:8765:8765" in compose
     assert "INSTALL_EXTRAS: server,mcp,memvid,openai,anthropic,gemini" in compose
@@ -70,6 +93,9 @@ def test_compose_binds_localhost_and_persists_data_volume() -> None:
     assert 'NEST_AGENT_REQUIRE_API_AUTH: "true"' in compose
     assert "NEST_AGENT_API_TOKEN: ${NEST_AGENT_API_TOKEN:?Set NEST_AGENT_API_TOKEN for Kestrel API auth}" in compose
     assert "--require-api-auth" in compose
+    assert "/api/health/ready" in compose
+    for env_owned_option in ("--backend", "--memory-dir", "--provider", "--model", "--state-path"):
+        assert env_owned_option not in command
     assert "env_file:" not in compose
 
 
@@ -89,7 +115,11 @@ def test_deployment_docs_cover_release_and_memory_operations() -> None:
     security = (ROOT / "docs" / "SECURITY.md").read_text(encoding="utf-8")
     checklist = (ROOT / "docs" / "RELEASE_CHECKLIST.md").read_text(encoding="utf-8")
 
-    assert "curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | bash" in deployment
+    assert (
+        "curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/"
+        "v0.3.0/install.sh | bash"
+    ) in deployment
+    assert "/Kestrel/main/install.sh" not in deployment
     assert "KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash" in deployment
     assert "does not start the server" in deployment
     assert "KESTREL_DRY_RUN=1 bash install.sh" in checklist
@@ -113,7 +143,14 @@ def test_one_shot_docs_match_safe_opt_in_server_defaults() -> None:
 
 def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+    default_extras_match = re.search(r'^DEFAULT_EXTRAS="([^"]+)"$', installer, flags=re.MULTILINE)
+    release_extras_match = re.search(r'^\s+RELEASE_EXTRAS: "([^"]+)"$', workflow, flags=re.MULTILINE)
 
+    assert default_extras_match is not None
+    assert release_extras_match is not None
+    assert release_extras_match.group(1) == default_extras_match.group(1)
+    assert not re.search(r"uses:\s+[^\s#]+@v\d+", workflow)
     assert 'tags: ["v*"]' in workflow
     assert "npm audit --audit-level=high" in workflow
     assert "npm run build" in workflow
@@ -124,17 +161,40 @@ def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     assert "curl -fsS http://127.0.0.1:8878/" in workflow
     assert "Verify tag matches package version" in workflow
     assert 'test "$GITHUB_REF_NAME" = "v$VERSION"' in workflow
+    assert "uv lock --check" in workflow
+    assert "uv export --frozen --no-dev --no-emit-local" in workflow
+    assert "--require-hashes" in workflow
+    assert "requirements-release.txt" in workflow
+    assert "python -m pip_audit --path" in workflow
+    assert "cyclonedx-bom==7.3.0" in workflow
+    assert "pip-audit==2.10.1" in workflow
+    assert "cyclonedx-py environment /tmp/kestrel-release-smoke/bin/python" in workflow
+    assert '"nested-memvid-agent"' in workflow
+    assert '"google-genai"' in workflow
     assert "Stage version-pinned installer" in workflow
     assert 'os.environ["GITHUB_REF_NAME"]' in workflow
+    assert 'os.environ["RELEASE_EXTRAS"]' in workflow
+    assert 'DEFAULT_REQUIREMENTS_URL=""' in workflow
+    assert 'DEFAULT_WHEEL_URL=""' in workflow
+    assert 'DEFAULT_CHECKSUMS_URL=""' in workflow
+    assert "{release_base}/install.sh" in workflow
+    assert "${{KESTREL_REF" not in workflow
+    assert "Defaults to {tag}." in workflow
+    assert "Validate staged release installer plan" in workflow
+    assert "verify SHA256SUMS" in workflow
+    assert 'sha256sum install.sh requirements-release.txt "${wheels[@]}"' in workflow
     assert "gh release create \"$GITHUB_REF_NAME\" dist/*" in workflow
     assert "gh release create" in workflow
+    assert 'extra_args+=(--extra "$extra")' in workflow
 
 
 def test_ci_runs_isolated_python_tests_and_web_build() -> None:
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
     assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD: \"1\"" in ci
-    assert "setup-node@v4" in ci
+    assert "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020" in ci
+    assert "go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7" in ci
+    assert "permissions:\n  contents: read" in ci
     assert 'node-version: "22"' in ci
     assert "cache-dependency-path: web/package-lock.json" in ci
     assert "run: npm ci" in ci

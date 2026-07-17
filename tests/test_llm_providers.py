@@ -20,6 +20,7 @@ from nested_memvid_agent.llm.ollama_provider import OllamaNativeProvider
 from nested_memvid_agent.llm.openai_compatible_provider import OpenAICompatibleProvider
 from nested_memvid_agent.llm.openai_provider import OpenAIResponsesProvider
 from nested_memvid_agent.llm.parser import ControlMessageError, parse_agent_response
+from nested_memvid_agent.llm.resilience import ResilientLLMProvider
 from nested_memvid_agent.runtime_models import ChatMessage, LLMOptions, LLMResponse, ToolSpec
 
 
@@ -96,6 +97,38 @@ def test_factory_wraps_configured_fallback_provider() -> None:
     assert provider.capabilities.name == "fallback:mock->mock"
 
 
+def test_factory_never_reuses_the_primary_credential_reference_for_fallback() -> None:
+    requested: list[str] = []
+
+    def resolve(reference: str | None) -> str | None:
+        assert reference is not None
+        requested.append(reference)
+        return f"value-for-{reference}"
+
+    provider = build_llm_provider(
+        AgentConfig(
+            provider="openai",
+            model="primary-model",
+            api_key_env="PRIMARY_API_KEY",
+            fallback_provider="openai",
+            fallback_model="fallback-model",
+        ),
+        secret_resolver=resolve,
+    )
+
+    assert isinstance(provider, FallbackLLMProvider)
+    assert requested == ["PRIMARY_API_KEY", "OPENAI_API_KEY"]
+
+
+@pytest.mark.parametrize("field_name", ["base_url", "fallback_base_url"])
+def test_provider_base_urls_reject_embedded_credentials(field_name: str) -> None:
+    with pytest.raises(ValueError, match="must not embed credentials"):
+        if field_name == "base_url":
+            AgentConfig(base_url="https://embedded-user:embedded-password@example.invalid/v1")
+        else:
+            AgentConfig(fallback_base_url="https://embedded-user:embedded-password@example.invalid/v1")
+
+
 def test_factory_builds_openai_compatible_provider() -> None:
     provider = build_llm_provider(
         AgentConfig(
@@ -105,7 +138,8 @@ def test_factory_builds_openai_compatible_provider() -> None:
         )
     )
 
-    assert isinstance(provider, OpenAICompatibleProvider)
+    assert isinstance(provider, ResilientLLMProvider)
+    assert isinstance(provider.inner, OpenAICompatibleProvider)
 
 
 def test_factory_builds_provider_parity_aliases() -> None:
@@ -121,10 +155,13 @@ def test_factory_builds_provider_parity_aliases() -> None:
     assert deepseek.capabilities.name == "deepseek"
     assert kimi.capabilities.name == "kimi"
     assert ollama.capabilities.name == "ollama"
-    assert isinstance(ollama_cloud, OllamaNativeProvider)
+    assert isinstance(ollama_cloud, ResilientLLMProvider)
+    assert isinstance(ollama_cloud.inner, OllamaNativeProvider)
     assert ollama_cloud.capabilities.name == "ollama-cloud"
-    assert isinstance(anthropic, AnthropicMessagesProvider)
-    assert isinstance(gemini, GeminiProvider)
+    assert isinstance(anthropic, ResilientLLMProvider)
+    assert isinstance(anthropic.inner, AnthropicMessagesProvider)
+    assert isinstance(gemini, ResilientLLMProvider)
+    assert isinstance(gemini.inner, GeminiProvider)
 
 
 def test_model_catalog_returns_static_models_for_mock() -> None:

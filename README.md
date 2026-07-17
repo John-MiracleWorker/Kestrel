@@ -9,24 +9,30 @@
   <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
   <img alt="Memvid v2" src="https://img.shields.io/badge/Memory-Memvid%20v2%20.mv2-6f42c1">
   <img alt="Local first" src="https://img.shields.io/badge/Runtime-local--first-059669">
-  <img alt="Status alpha" src="https://img.shields.io/badge/Status-alpha-f59e0b">
+  <img alt="Status stable local release" src="https://img.shields.io/badge/Status-v0.3.0%20stable-059669">
   <img alt="License Apache-2.0" src="https://img.shields.io/badge/License-Apache--2.0-blue">
 </p>
 
-Kestrel is a memory-native agent runtime for developers who want an AI agent they can run locally, inspect deeply, and improve deliberately. It combines a conversational CLI, a local web workbench, layered Memvid v2 `.mv2` memory, tool approvals, task capsules, behavior-delta learning, managed MCP sessions, provider adapters, and deterministic evals.
+Kestrel is a memory-native agent runtime for developers who want an AI agent they can run locally, inspect deeply, and improve deliberately. It combines a conversational CLI, a local web workbench, layered Memvid v2 `.mv2` memory, centralized capability controls, tool approvals, task capsules, behavior-delta learning, managed MCP sessions, provider adapters, and deterministic evals.
 
 It is not a chatbot wrapper and not just a memory library. Kestrel is built around a stricter product promise:
 
 > Repeated engineering work should make the agent safer and more capable through evidence-backed, auditable, reversible learning.
 
-Kestrel is still an alpha runtime. It is useful for local development, experiments, and hardening work; it is not yet a hosted or production multi-user agent platform.
+Kestrel `v0.3.0` is the stable release for its supported deployment profile: one trusted user, one Kestrel server/worker process, and one local or privately networked node. It is not a hosted/team or multi-tenant Internet service.
 
 ## Start Here
 
-Install the local agent, initialize `.mv2` memory, build the workbench, run a deterministic smoke check, and explicitly open the localhost app:
+The one-shot Bash installer supports macOS and Linux, including Linux inside WSL.
+On native Windows, open a WSL distro before running it; Git Bash and the Windows
+`bash.exe` launcher are not supported installer environments. The Python runtime
+continues to be tested on native Windows; the published universal wheel is built,
+installed, and smoke-tested in the isolated Linux release environment.
+
+Install the latest published release (`v0.3.0`), initialize `.mv2` memory, install the bundled workbench, run a deterministic smoke check, and explicitly open the localhost app:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.0/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
 Omit the two launch variables for an install-only run that starts no server.
@@ -44,8 +50,8 @@ The installer uses `mock` only for deterministic health checks. High-risk tools,
 
 - **Memory with structure:** working, episodic, semantic, procedural, self, and policy memory live in separate Memvid v2 `.mv2` files with different promotion gates.
 - **Learning you can audit:** run-scoped `complete.mv2` capsules, promotion ledgers, validation evidence, behavior deltas, replay, rollback, and activation metrics keep learning inspectable.
-- **Actions you approve:** shell, patching, file writes, tests, commits, plugin installs, MCP tools, Codex CLI delegation, and self-change requests use capability flags plus exact-call approval gates.
-- **A real operator cockpit:** the FastAPI/web workbench exposes runs, traces, approvals, memory/context search, Soul/self views, MCP controls, plugins, skills, channels, scheduler actions, and support diagnostics.
+- **Actions you control:** every built-in or dynamic tool, MCP server, and skill has a durable on/off decision; shell, patching, file writes, tests, commits, plugin installs, MCP tools, Codex CLI delegation, and self-change requests retain their master flags and exact-call approval gates.
+- **A real operator cockpit:** the FastAPI/web workbench exposes runs, traces, approvals, memory/context search, Soul/self views, a Settings Capability Center, MCP controls, plugins, skills, channels, scheduler actions, and support diagnostics.
 - **Deterministic by default:** the mock backend and mock LLM keep tests and golden evals reproducible, while live provider checks stay behind explicit integration flags.
 
 ## Product Surface
@@ -53,7 +59,7 @@ The installer uses `mock` only for deterministic health checks. High-risk tools,
 | Surface | What it gives you today |
 | --- | --- |
 | Conversational agent | `nest-agent chat` with in-memory or Memvid-backed memory, provider selection, tool use, and interactive commands. |
-| Local workbench | Browser UI for background runs, SSE timelines, approvals, tools, memory, behavior deltas, MCP, skills, plugins, channels, scheduler controls, and setup readiness. |
+| Local workbench | Browser UI for background runs, SSE timelines, approvals, per-capability controls, tools, memory, behavior deltas, MCP, skills, plugins, channels, scheduler controls, and setup readiness. |
 | Durable memory | One `.mv2` file per nested layer, MV2 context frames, token-aware packing, lexical-first retrieval, optional vector sidecars, and explicit policy-write constraints. |
 | Controlled learning | Task capsules, promotion gates, validation metadata, behavior-delta proposal/replay/review, low-risk auto-activation behind flags, and rollback paths. |
 | Safe tools | Built-in repo, memory, diagnosis, repair, validation, git, web-context, plugin, skill, MCP, and Codex CLI tools with risk classification and approval boundaries. |
@@ -73,9 +79,11 @@ The installer uses `mock` only for deterministic health checks. High-risk tools,
 
 - `docs/IMPLEMENTATION_STATUS.md` is the detailed truth table for what is working, partial, or not done.
 - `docs/ARCHITECTURE.md` explains the local runtime and memory/control-plane split.
+- `docs/PRODUCTION_OPERATIONS.md` defines health, alerts, backup/restore, upgrade/rollback, failure drills, soak testing, and the release gate.
+- `docs/reviews/2026-07-16-production-readiness.md` records the pre-publication supported-profile verification matrix and external gate inventory; the GitHub release workflow is authoritative for published artifact validation.
 - `docs/MEMORY_OPERATIONS.md` covers `.mv2` backup, restore, verification, and migration.
 - `docs/SECURITY.md` documents local-first safety boundaries, auth, webhook signatures, secrets, and high-risk tools.
-- `docs/PRODUCTIZATION_ROADMAP.md` tracks the path from alpha runtime to dependable product.
+- `docs/PRODUCTIZATION_ROADMAP.md` is the long-horizon hosted/team product roadmap.
 - `docs/DEPLOYMENT.md` covers local installs, Docker, Compose, providers, and runtime checks.
 
 ## Memory Layout
@@ -114,15 +122,17 @@ Important storage rules:
 One-shot local install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.0/install.sh | bash
 ```
 
-The installer clones or updates Kestrel in `${KESTREL_HOME:-$HOME/.kestrel-agent}`, finds Python 3.11 or newer without relying on bare `python`, installs the Memvid/OpenAI/server/MCP extras, builds the web workbench, initializes `.nest/memory/*.mv2`, verifies memory, and runs a deterministic `mock` CLI smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. `mock` is a zero-secret health check, not the intended operating mode. The installer does not ask for secrets or enable high-risk tools.
+The release installer clones or updates Kestrel in `${KESTREL_HOME:-$HOME/.kestrel-agent}`, pins the checkout to `v0.3.0`, finds Python 3.11 or newer without relying on bare `python`, verifies the published wheel and hash-locked dependencies against `SHA256SUMS`, installs the bundled workbench, initializes `.nest/memory/*.mv2`, verifies memory, and runs a deterministic `mock` CLI smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. `mock` is a zero-secret health check, not the intended operating mode. The installer does not ask for secrets or enable high-risk tools.
+
+Production installs should use the immutable GitHub release installer above; it pins the source, wheel, dependency manifest, and checksum manifest to the same tag. `main` is a development source, not the published release channel.
 
 Install and explicitly launch the localhost workbench in one command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.0/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
 Useful installer options:
@@ -241,6 +251,8 @@ nest-agent product provider-certification --backend memory --provider mock --jso
 nest-agent product support-bundle --backend memory --provider mock --output /tmp/kestrel-support.zip --json
 ```
 
+`product readiness` is the static long-horizon roadmap report for the full product, including hosted/team capabilities. It is not an exact-build deployment verdict. Use `product setup --check`, live health checks, and the release gate in `docs/PRODUCTION_OPERATIONS.md` for the supported local/private profile.
+
 Support bundles are redacted diagnostic archives. They include readiness reports, runtime metadata, git status, state-table counts, log file metadata, and a bounded redacted event-log tail; they do not include raw Secret Broker vault contents, raw environment variable values, or `.mv2` memory files.
 
 Provider certification reports are read-only and redacted. They record per-provider readiness, credential/base-url presence, manual host checks, and the validation commands needed before treating live providers as release-certified.
@@ -257,6 +269,8 @@ nest-agent plugins disable <plugin_id> --backend memory
 ```
 
 Plugin review, installation, and updates fetch public GitHub plugin sources, accept `kestrel.plugin.json` plus limited Hermes-style `plugin.yaml`, and materialize plugin-declared skills/MCP servers disabled by default. Review returns provenance, risk, declared dependency, isolation, warning, unsupported-feature, and enable-blocker metadata without installing or executing plugin code. Agent-initiated `plugin.review` and `plugin.install` are high risk: they require `--allow-plugin-install` / `NEST_AGENT_ALLOW_PLUGIN_INSTALL` plus exact-call approval before execution.
+
+Every live MCP stdio command, including a manually configured server, is bound to a command/argument hash and requires explicit connect approval before Kestrel starts the process. Shell/proxy launchers and interpreter eval modes such as `python -c` or `node --eval` are rejected. Tools discovered dynamically from a live server always remain at least medium risk with exact-call approval, even when static manifest metadata is trusted.
 
 ## Memvid Backend
 
@@ -360,7 +374,11 @@ nest-agent server --backend memory --provider mock --host 127.0.0.1 --port 8765
 
 Open `http://127.0.0.1:8765/`.
 
-The workbench exposes runs, live event streams, approvals, tool filters, MCP server health/sync/connect/disconnect/restart, manual MCP invocation, memory/context utilities, skills discovery feedback, subagent/task graph views, and scheduler controls.
+The workbench exposes runs, live event streams, approvals, tool filters, MCP server health/sync/connect/disconnect/restart, manual MCP invocation, memory/context utilities, skills discovery feedback, subagent/task graph views, scheduler controls, and a Capability Center under Settings.
+
+The Capability Center lists every built-in or dynamic tool, MCP server, and skill. Its switch records the owner-desired state; the adjacent effective state and `Blocked by` reasons show whether runtime master flags, launch allowlists, a disabled parent/plugin, or a changed resource still prevent use. New discovered skills and new dynamic MCP/skill tools start off. Every MCP server created through the API is forced off until the owner enables it through the revisioned capability endpoint. Enabling a child tool does not enable its parent, satisfy a master flag, or remove an exact-call approval requirement.
+
+The same control plane is available through `GET /api/capabilities`, revision-checked `PUT /api/capabilities/{kind}/{capability_id}`, and `GET /api/capabilities/history`. A `PUT` body contains `enabled` and `expected_revision`; stale writes return HTTP 409 so clients can reload instead of overwriting a newer owner decision. Changes apply to future invocation attempts. Turning a capability off also denies later attempts from stale registries, revokes affected pending approvals, and closes a disabled MCP server's managed session. It does not promise to terminate an arbitrary built-in subprocess that already crossed the dispatch boundary.
 
 The Soul tab surfaces Kestrel's non-secret self model: identity, memory layers, available tools, skills, plugins, MCP state, validated self-memory capture, and gated web search.
 
@@ -388,7 +406,9 @@ nest-agent channel \
 
 Outbound delivery is disabled by default. To send real replies, configure `.nest/config/channels.json` from `config/channels.example.json`, set the relevant secret environment variable, enable that channel's `send_enabled` or `auto_reply`, and start with `--enable-channel-delivery`.
 
-Telegram can also act as a single-owner admin surface when the Telegram channel includes `settings.admin_enabled=true` plus `settings.owner_user_ids` (or `admin_user_ids`) and Kestrel is started with the run manager/server path. Owner-only admin supports deterministic slash commands and bounded natural-language requests such as "show status" or "increase max tool calls to 12." Write actions return an inline confirmation preview before mutation; raw secrets are never accepted through Telegram and should be entered through the local UI/CLI Secret Broker.
+For a private Telegram agent, set both `settings.allowed_conversation_ids` and `settings.allowed_user_ids` to your numeric Telegram IDs. The polling stack also accepts `TELEGRAM_ALLOWED_CHAT_IDS` and `TELEGRAM_ALLOWED_USER_IDS` as comma-separated fallbacks when those channel settings are omitted. Messages outside either configured allowlist are rejected before a run is created.
+
+Telegram can also act as a single-owner admin surface when the Telegram channel explicitly includes `settings.admin_enabled=true` plus exactly one `settings.owner_user_ids` entry and Kestrel is started with the run manager/server path. `TELEGRAM_ALLOWED_USER_IDS` grants conversation access only and never grants admin ownership. The older `admin_user_ids`/`telegram_owner_ids` setting names remain accepted for configuration compatibility, but still require explicit admin enablement and exactly one owner. Owner-only admin supports deterministic slash commands and bounded natural-language requests such as "show status" or "increase max tool calls to 12." Write actions return an inline confirmation preview before mutation; raw secrets are never accepted through Telegram and should be entered through the local UI/CLI Secret Broker.
 
 The server exposes Telegram setup helpers for webhook deployments:
 
@@ -431,7 +451,7 @@ NEST_AGENT_MAX_ACTIVE_DELTAS_PER_RUN=8
 NEST_AGENT_REQUIRE_API_AUTH=false
 ```
 
-High-risk tools need capability enablement where applicable and exact-call approval before execution. Approval is bound to the requested tool call ID and arguments; changed arguments require a new approval.
+High-risk tools need an enabled per-capability decision, every applicable master flag, and exact-call approval before execution. Capability switches cannot bypass those prerequisites. Approval cannot be disabled by configuration; it is owner-bound, single-use, bound to the requested tool call ID and exact arguments, and expires after 15 minutes by default. It is also bound to the capability revision and a digest of the current tool specification, policy gates, and parent MCP/skill resource. Changed arguments, policy, specification, parent resource, capability revision, or expiry require a new approval.
 
 Secrets stay out of chat. The Secret Broker stores channel/MCP/tool credentials through backend API/UI flows and returns only metadata such as `secret://...` handles, configured state, validation state, timestamps, and fingerprints. No public GET route returns raw secret values; MCP `secret_env` can point to host env names or broker refs, and channel status checks use the same metadata-only boundary.
 
@@ -447,6 +467,7 @@ Core validation:
 python -m compileall -q src tests scripts
 python -m ruff check scripts src tests
 python -m mypy src
+python -m pytest -q tests/test_capability_policy.py tests/test_capability_control_plane.py tests/test_state_store.py
 python -m pytest -q
 python scripts/run_golden_evals.py --backend memory --provider mock
 python scripts/eval_behavior_deltas.py --scenario tests/evals/behavior_deltas/policy_write_requires_approval.json
@@ -485,15 +506,15 @@ Operational docs:
 - `docs/DEPLOYMENT.md` covers local installs, Docker, Compose, providers, and runtime checks.
 - `docs/MEMORY_OPERATIONS.md` covers `.mv2` backup, restore, verification, and migration.
 - `docs/SECURITY.md` documents the local-first posture, API token gate, webhook signatures, and high-risk tool gates.
-- `docs/RELEASE_CHECKLIST.md` lists alpha release validation commands.
+- `docs/RELEASE_CHECKLIST.md` lists release-candidate validation commands.
 
-## Current Gaps
+## Broader and Unsupported Product Gaps
 
-Kestrel is not yet production-complete. The main remaining hardening areas are:
+These capabilities are outside the supported single-user, single-node profile or remain optional-surface hardening work; they do not imply hosted/team support:
 
 - Broader live-provider CI/release coverage beyond the locally validated Ollama Cloud path.
 - Richer provider-specific JSON/context/streaming hardening for every native provider surface.
-- Production-grade auth, user/session isolation, and deployment boundaries.
+- Hosted/team identity, distinct administrator principals, hardened sessions, workspace ownership, role-scoped capability policy, and tenant isolation.
 - Real MCP SSE/streamable HTTP fixtures and soak testing.
 - Container-grade skill isolation and package dependency management.
 - Managed plugin dependency installation and container-grade isolation beyond the current review metadata and enable blockers.

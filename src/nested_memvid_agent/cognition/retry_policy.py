@@ -9,6 +9,7 @@ from .models import RetryDecision, StrategyDiff
 _NON_RETRYABLE_TOOL_ERRORS = {
     "approval_pending",
     "approval_required",
+    "sensitive_tool_arguments_rejected",
     "tool_disabled",
 }
 

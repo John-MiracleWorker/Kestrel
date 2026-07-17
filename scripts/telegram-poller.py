@@ -16,7 +16,15 @@ PORT = os.environ.get("KESTREL_PORT", "8765")
 CHANNEL_ID = os.environ.get("KESTREL_TELEGRAM_CHANNEL_ID", "telegram")
 BASE = f"https://api.telegram.org/bot{TOKEN}"
 INGEST = f"http://127.0.0.1:{PORT}/api/channels/ingest"
+API_AUTH_TOKEN_ENV = os.environ.get("NEST_AGENT_API_AUTH_TOKEN_ENV", "NEST_AGENT_API_TOKEN")
+API_AUTH_TOKEN = os.environ.get(API_AUTH_TOKEN_ENV, "")
 OFFSET_PATH = Path(os.environ.get("KESTREL_TELEGRAM_OFFSET_PATH", str(Path.home() / ".kestrel" / "telegram.offset")))
+HEALTH_PATH = Path(
+    os.environ.get(
+        "KESTREL_TELEGRAM_HEALTH_PATH",
+        str(Path.home() / ".kestrel" / "telegram-poller-health.json"),
+    )
+)
 ALLOWED_UPDATES = ["message", "edited_message", "callback_query"]
 
 running = True
@@ -41,6 +49,8 @@ def post_form(method: str, data: dict[str, object], timeout: int = 35) -> dict[s
 def post_json(url: str, data: dict[str, object], timeout: int = 300) -> dict[str, object]:
     body = json.dumps(data).encode()
     headers = {"Content-Type": "application/json"}
+    if API_AUTH_TOKEN:
+        headers["Authorization"] = f"Bearer {API_AUTH_TOKEN}"
     secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
     if secret:
         headers["X-Telegram-Bot-Api-Secret-Token"] = secret
@@ -51,7 +61,7 @@ def post_json(url: str, data: dict[str, object], timeout: int = 300) -> dict[str
 
 def load_offset() -> int | None:
     try:
-        raw = OFFSET_PATH.read_text().strip()
+        raw = OFFSET_PATH.read_text(encoding="utf-8").strip()
         return int(raw) if raw else None
     except FileNotFoundError:
         return None
@@ -61,12 +71,36 @@ def load_offset() -> int | None:
 
 def save_offset(offset: int) -> None:
     OFFSET_PATH.parent.mkdir(parents=True, exist_ok=True)
-    OFFSET_PATH.write_text(str(offset))
+    OFFSET_PATH.write_text(str(offset), encoding="utf-8")
+
+
+def write_health(status: str, *, error_type: str | None = None) -> None:
+    try:
+        HEALTH_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = HEALTH_PATH.with_suffix(HEALTH_PATH.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "schema": "kestrel.telegram_poller_health.v1",
+                    "status": status,
+                    "updated_at_epoch": time.time(),
+                    "pid": os.getpid(),
+                    "error_type": error_type,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, HEALTH_PATH)
+    except OSError:
+        pass
 
 
 def main() -> int:
     # Polling cannot receive updates while a webhook is active.
     post_form("deleteWebhook", {"drop_pending_updates": "false"}, timeout=20)
+    write_health("ready")
     print("Telegram polling bridge ready", flush=True)
     offset = load_offset()
     backoff = 1.0
@@ -80,11 +114,13 @@ def main() -> int:
                 payload["offset"] = offset
             result = post_form("getUpdates", payload, timeout=40)
             if not result.get("ok"):
+                write_health("error", error_type="telegram_not_ok")
                 print(f"getUpdates returned not ok: {result}", file=sys.stderr, flush=True)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30)
                 continue
             backoff = 1.0
+            write_health("healthy")
             updates = result.get("result", [])
             if not isinstance(updates, list):
                 updates = []
@@ -112,14 +148,17 @@ def main() -> int:
                 offset = update_id + 1
                 save_offset(offset)
         except urllib.error.HTTPError as exc:
+            write_health("error", error_type=f"telegram_http_{exc.code}")
             detail = exc.read().decode(errors="replace")[:500]
             print(f"Telegram HTTPError {exc.code}: {detail}", file=sys.stderr, flush=True)
             time.sleep(backoff)
             backoff = min(backoff * 2, 30)
         except Exception as exc:  # noqa: BLE001
+            write_health("error", error_type=type(exc).__name__)
             print(f"Telegram poller error: {exc}", file=sys.stderr, flush=True)
             time.sleep(backoff)
             backoff = min(backoff * 2, 30)
+    write_health("stopped")
     return 0
 
 

@@ -6,9 +6,9 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from ..mcp_views import mcp_public
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
 from ..secret_broker import build_secret_broker
-from ..server_mcp_routes import mcp_public
 from ..skill_manager import SkillManager
 from ..state_store import AgentStateStore
 from .base import AgentTool, ToolContext
