@@ -14,12 +14,12 @@ installed, and smoke-tested in the isolated Linux release environment.
 For a local Memvid-backed Kestrel install:
 
 ```bash
-curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.0/install.sh | bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.1/install.sh | bash
 ```
 
-The release installer clones or updates `https://github.com/John-MiracleWorker/Kestrel.git` into `${KESTREL_HOME:-$HOME/.kestrel-agent}`, pins the checkout to `v0.3.0`, detects Python 3.11 or newer, creates `.venv`, downloads the universal wheel and hash-locked default dependencies, verifies both against the published `SHA256SUMS`, installs the bundled web workbench, initializes `.nest/memory` with Memvid `.mv2` layers, verifies memory, and runs doctor plus a deterministic `mock` chat smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. The smoke check proves the CLI path without requiring secrets; it is not the recommended provider for real use.
+The release installer clones or updates `https://github.com/John-MiracleWorker/Kestrel.git` into `${KESTREL_HOME:-$HOME/.kestrel-agent}`, pins the checkout to `v0.3.1`, detects Python 3.11 or newer, creates `.venv`, downloads the universal wheel and hash-locked default dependencies, verifies both against the published `SHA256SUMS`, installs the bundled web workbench, initializes `.nest/memory` with Memvid `.mv2` layers, verifies memory, and runs doctor plus a deterministic `mock` chat smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. The smoke check proves the CLI path without requiring secrets; it is not the recommended provider for real use.
 
-Production installs should use the immutable GitHub release installer above. It pins the source checkout, wheel, dependency manifest, and checksum manifest to the same tag. `main` is a development source, not the published release channel. `v0.3.0` is the latest published release for the supported local/private deployment profile.
+Production installs should use the immutable GitHub release installer above. It pins the source checkout, wheel, dependency manifest, and checksum manifest to the same tag. `main` is a development source, not the published release channel. `v0.3.1` is the latest published release for the supported local/private deployment profile.
 
 The GitHub release also publishes the universal wheel, source distribution,
 version-pinned installer, hash-locked default dependency manifest,
@@ -30,7 +30,7 @@ not from the development/test environment.
 To install and explicitly launch the localhost workbench in one command:
 
 ```bash
-curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.0/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.1/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
 Useful options:
@@ -38,7 +38,7 @@ Useful options:
 ```bash
 KESTREL_DRY_RUN=1 bash install.sh
 KESTREL_HOME="$HOME/dev/kestrel" bash install.sh
-KESTREL_REF=v0.3.0 bash install.sh
+KESTREL_REF=v0.3.1 bash install.sh
 KESTREL_SKIP_WEB=1 bash install.sh
 KESTREL_SKIP_SMOKE=1 bash install.sh
 KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash install.sh

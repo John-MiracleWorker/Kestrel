@@ -9,7 +9,7 @@
   <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
   <img alt="Memvid v2" src="https://img.shields.io/badge/Memory-Memvid%20v2%20.mv2-6f42c1">
   <img alt="Local first" src="https://img.shields.io/badge/Runtime-local--first-059669">
-  <img alt="Status stable local release" src="https://img.shields.io/badge/Status-v0.3.0%20stable-059669">
+  <img alt="Status stable local release" src="https://img.shields.io/badge/Status-v0.3.1%20stable-059669">
   <img alt="License Apache-2.0" src="https://img.shields.io/badge/License-Apache--2.0-blue">
 </p>
 
@@ -19,7 +19,7 @@ It is not a chatbot wrapper and not just a memory library. Kestrel is built arou
 
 > Repeated engineering work should make the agent safer and more capable through evidence-backed, auditable, reversible learning.
 
-Kestrel `v0.3.0` is the stable release for its supported deployment profile: one trusted user, one Kestrel server/worker process, and one local or privately networked node. It is not a hosted/team or multi-tenant Internet service.
+Kestrel `v0.3.1` is the stable release for its supported deployment profile: one trusted user, one Kestrel server/worker process, and one local or privately networked node. It is not a hosted/team or multi-tenant Internet service.
 
 ## Start Here
 
@@ -29,10 +29,10 @@ On native Windows, open a WSL distro before running it; Git Bash and the Windows
 continues to be tested on native Windows; the published universal wheel is built,
 installed, and smoke-tested in the isolated Linux release environment.
 
-Install the latest published release (`v0.3.0`), initialize `.mv2` memory, install the bundled workbench, run a deterministic smoke check, and explicitly open the localhost app:
+Install the latest published release (`v0.3.1`), initialize `.mv2` memory, install the bundled workbench, run a deterministic smoke check, and explicitly open the localhost app:
 
 ```bash
-curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.0/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.1/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
 Omit the two launch variables for an install-only run that starts no server.
@@ -122,17 +122,17 @@ Important storage rules:
 One-shot local install:
 
 ```bash
-curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.0/install.sh | bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.1/install.sh | bash
 ```
 
-The release installer clones or updates Kestrel in `${KESTREL_HOME:-$HOME/.kestrel-agent}`, pins the checkout to `v0.3.0`, finds Python 3.11 or newer without relying on bare `python`, verifies the published wheel and hash-locked dependencies against `SHA256SUMS`, installs the bundled workbench, initializes `.nest/memory/*.mv2`, verifies memory, and runs a deterministic `mock` CLI smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. `mock` is a zero-secret health check, not the intended operating mode. The installer does not ask for secrets or enable high-risk tools.
+The release installer clones or updates Kestrel in `${KESTREL_HOME:-$HOME/.kestrel-agent}`, pins the checkout to `v0.3.1`, finds Python 3.11 or newer without relying on bare `python`, verifies the published wheel and hash-locked dependencies against `SHA256SUMS`, installs the bundled workbench, initializes `.nest/memory/*.mv2`, verifies memory, and runs a deterministic `mock` CLI smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. `mock` is a zero-secret health check, not the intended operating mode. The installer does not ask for secrets or enable high-risk tools.
 
 Production installs should use the immutable GitHub release installer above; it pins the source, wheel, dependency manifest, and checksum manifest to the same tag. `main` is a development source, not the published release channel.
 
 Install and explicitly launch the localhost workbench in one command:
 
 ```bash
-curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.0/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.1/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
 Useful installer options:

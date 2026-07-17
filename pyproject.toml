@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nested-memvid-agent"
-version = "0.3.0"
+version = "0.3.1"
 description = "Kestrel: a local-first, memory-native AI engineering agent runtime."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [{ name = "Kestrel Contributors" }]
-dependencies = ["numpy>=1.26,<2.5"]
+dependencies = ["numpy>=1.26,<2.5", "pip>=26.1.2", "setuptools>=83.0.0"]
 
 [project.optional-dependencies]
 runtime = [
