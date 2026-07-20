@@ -12,6 +12,7 @@ from .mock import MockLLMProvider
 from .ollama_provider import OllamaNativeProvider
 from .openai_compatible_provider import OpenAICompatibleProvider
 from .openai_provider import OpenAIResponsesProvider
+from .provider_urls import normalize_ollama_openai_base_url
 from .resilience import ResilientLLMProvider, global_provider_health_registry
 
 SecretResolver = Callable[[str | None], str | None]
@@ -185,7 +186,7 @@ def _build_single_provider(
     if provider == "ollama":
         return OpenAICompatibleProvider(
             model=model,
-            base_url=base_url or "http://localhost:11434/v1",
+            base_url=normalize_ollama_openai_base_url(base_url),
             api_key="ollama",
             timeout_seconds=config.timeout_seconds,
             max_retries=config.max_retries,

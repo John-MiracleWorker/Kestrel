@@ -16,6 +16,7 @@ from pytest import MonkeyPatch
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.orchestrator import build_memory_system
+from nested_memvid_agent.repair_integrity import repair_snapshot
 from nested_memvid_agent.run_manager import RunManager
 from nested_memvid_agent.runtime_models import ToolCall, ToolExecution, ToolSpec
 from nested_memvid_agent.state_store import AgentStateStore
@@ -359,7 +360,9 @@ def test_subprocess_tool_timeout_kills_child_process_and_caps_requested_timeout(
 
 
 def test_memory_search_tool_returns_hits(tmp_path: Path) -> None:
-    memory = build_memory_system("memory", tmp_path / "memory")
+    memory = build_memory_system(
+        "memory", tmp_path / "memory", enforce_stable_write_integrity=False
+    )
     memory.put(
         MemoryRecord(
             layer=MemoryLayer.SEMANTIC,
@@ -531,7 +534,9 @@ def test_plugin_and_mcp_registry_tools_redact_and_count_materialized_state(tmp_p
     )
     context = ToolContext(
         memory=memory,
-        config=AgentConfig(state_path=tmp_path / "state.db", secret_store_path=tmp_path / "secrets.json"),
+        config=AgentConfig(
+            state_path=tmp_path / "state.db", secret_store_path=tmp_path / "secrets.json"
+        ),
         workspace=tmp_path,
     )
 
@@ -548,16 +553,20 @@ def test_plugin_and_mcp_registry_tools_redact_and_count_materialized_state(tmp_p
 
 def test_file_find_stat_git_log_show_and_project_scripts_are_bounded(tmp_path: Path) -> None:
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
-    subprocess.run(["git", "config", "user.email", "kestrel@example.test"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "kestrel@example.test"], cwd=tmp_path, check=True
+    )
     subprocess.run(["git", "config", "user.name", "Kestrel Test"], cwd=tmp_path, check=True)
     (tmp_path / "pyproject.toml").write_text(
-        "[project]\nname = \"demo\"\n[tool.pytest.ini_options]\naddopts = \"-q\"\n",
+        '[project]\nname = "demo"\n[tool.pytest.ini_options]\naddopts = "-q"\n',
         encoding="utf-8",
     )
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "agent.py").write_text("print('kestrel')\n", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True, text=True
+    )
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
     context = ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path)
@@ -565,7 +574,9 @@ def test_file_find_stat_git_log_show_and_project_scripts_are_bounded(tmp_path: P
     found = registry.execute(ToolCall(name="file.find", arguments={"pattern": "*.py"}), context)
     stat = registry.execute(ToolCall(name="file.stat", arguments={"path": "src/agent.py"}), context)
     log = registry.execute(ToolCall(name="git.log", arguments={"max_count": 1}), context)
-    shown = registry.execute(ToolCall(name="git.show", arguments={"rev": "HEAD", "max_chars": 2000}), context)
+    shown = registry.execute(
+        ToolCall(name="git.show", arguments={"rev": "HEAD", "max_chars": 2000}), context
+    )
     scripts = registry.execute(ToolCall(name="project.scripts", arguments={}), context)
 
     assert found.success is True
@@ -1136,7 +1147,7 @@ def test_self_inspect_returns_redacted_runtime_snapshot(
     assert "secret-token" not in json.dumps(result.data)
 
 
-def test_self_remember_writes_validated_self_memory(tmp_path: Path) -> None:
+def test_self_remember_rejects_caller_claimed_confirmation(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
     arguments = {
@@ -1152,17 +1163,13 @@ def test_self_remember_writes_validated_self_memory(tmp_path: Path) -> None:
         ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
     )
 
-    assert result.success
-    hits = memory.retrieve(
+    assert result.success is False
+    assert result.error == "self_memory_rejected"
+    assert not memory.retrieve(
         RetrievalQuery(
             query="implementation over analysis", layers=(MemoryLayer.SELF,), k_per_layer=3
         )
     )
-    assert hits
-    record = hits[0].record
-    assert record.metadata["self_schema"] == "user_workflow_preference"
-    assert record.metadata["validation_status"] == "user_confirmed"
-    assert record.evidence[0].source == "self.remember"
 
 
 def test_self_remember_rejects_low_confidence_self_memory(tmp_path: Path) -> None:
@@ -1375,7 +1382,9 @@ def test_plugin_review_requires_enablement_and_exact_approval(
                 "name": "Review Plugin",
                 "description": "Reviewed through the high-risk plugin tool.",
                 "dependencies": {"python": ["requests>=2"]},
-                "skills": [{"id": "hello", "description": "Say hello.", "instructions": "Return hello."}],
+                "skills": [
+                    {"id": "hello", "description": "Say hello.", "instructions": "Return hello."}
+                ],
             }
         ),
         encoding="utf-8",
@@ -1532,7 +1541,9 @@ def test_diagnosis_classify_identifies_bare_assertion_errors(tmp_path: Path) -> 
 
 
 def test_diagnosis_recall_searches_prior_failure_lessons(tmp_path: Path) -> None:
-    memory = build_memory_system("memory", tmp_path / "memory")
+    memory = build_memory_system(
+        "memory", tmp_path / "memory", enforce_stable_write_integrity=False
+    )
     memory.put(
         MemoryRecord(
             layer=MemoryLayer.PROCEDURAL,
@@ -1575,8 +1586,16 @@ def test_repair_prepare_requires_approval_even_when_file_write_enabled(tmp_path:
 def _init_git_repo(path: Path) -> str:
     subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True, text=True)
     (path / "README.md").write_text("seed\n")
+    # Git-focused tests keep the memory backend inside the synthetic workspace.
+    # Model the runtime-artifact ignores expected in an actual Kestrel workspace
+    # so durable in-memory snapshots do not masquerade as user source changes.
+    (path / ".gitignore").write_text(".nest/\nmemory/\n")
     subprocess.run(
-        ["git", "add", "README.md"], cwd=path, check=True, capture_output=True, text=True
+        ["git", "add", "README.md", ".gitignore"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     subprocess.run(
         [
@@ -1615,6 +1634,26 @@ def _approved_context(
         approved_tool_call_ids=frozenset({call.id}),
         approved_tool_call_arguments={call.id: call.arguments},
     )
+
+
+def _successful_repair_validation_id(
+    registry: ToolRegistry,
+    memory: object,
+    workspace: Path,
+    *,
+    call_id: str,
+) -> str:
+    call = ToolCall(
+        name="repair.validate",
+        arguments={"command": ["python", "-c", "print('repair validation passed')"]},
+        id=call_id,
+    )
+    result = registry.execute(
+        call,
+        _approved_context(memory, workspace, call, allow_shell=True),
+    )
+    assert result.success
+    return str(result.data["validation_id"])
 
 
 def test_repair_prepare_creates_approved_branch_from_clean_repo(tmp_path: Path) -> None:
@@ -1790,7 +1829,14 @@ def test_repair_apply_validate_and_rollback_on_repair_branch(tmp_path: Path) -> 
     assert validated.error == "repair_validation_failed"
     assert validated.data["diagnosis"]["classification"] in {"tool_failure", "unknown_failure"}
 
-    rollback_call = ToolCall(name="repair.rollback", arguments={}, id="repair_rollback")
+    rollback_call = ToolCall(
+        name="repair.rollback",
+        arguments={
+            "validation_id": validated.data["validation_id"],
+            "expected_current_diff_digest": repair_snapshot(tmp_path)["diff_digest"],
+        },
+        id="repair_rollback",
+    )
     rolled_back = registry.execute(
         rollback_call, _approved_context(memory, tmp_path, rollback_call)
     )
@@ -1825,7 +1871,9 @@ def test_repair_orchestrate_validate_recalls_lessons_and_blocks_unchanged_retry(
         capture_output=True,
         text=True,
     )
-    memory = build_memory_system("memory", tmp_path / "memory")
+    memory = build_memory_system(
+        "memory", tmp_path / "memory", enforce_stable_write_integrity=False
+    )
     memory.put(
         MemoryRecord(
             layer=MemoryLayer.PROCEDURAL,
@@ -1863,7 +1911,9 @@ def test_repair_orchestrate_validate_allows_changed_strategy_after_recall(tmp_pa
         capture_output=True,
         text=True,
     )
-    memory = build_memory_system("memory", tmp_path / "memory")
+    memory = build_memory_system(
+        "memory", tmp_path / "memory", enforce_stable_write_integrity=False
+    )
     memory.put(
         MemoryRecord(
             layer=MemoryLayer.PROCEDURAL,
@@ -2200,7 +2250,7 @@ def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_
     review_call = ToolCall(
         name="repair.review",
         arguments={
-            "validation": validation.data["validation"],
+            "validation_id": validation.data["validation"]["validation_id"],
             "summary": "Calculator repair validated by targeted pytest.",
         },
         id="review_e2e",
@@ -2298,15 +2348,15 @@ def test_stale_repair_review_blocks_commit_and_rollback_preserves_artifact(tmp_p
     )
     assert registry.execute(prepare, _approved_context(memory, tmp_path, prepare)).success
     (tmp_path / "calculator.py").write_text("def add(a, b):\n    return a + b\n")
-    validation = {
-        "success": True,
-        "returncode": 0,
-        "command": ["pytest", "-q"],
-        "content": "passed",
-    }
+    validation_id = _successful_repair_validation_id(
+        registry,
+        memory,
+        tmp_path,
+        call_id="validate_stale",
+    )
     review_call = ToolCall(
         name="repair.review",
-        arguments={"validation": validation, "summary": "Calculator fix reviewed."},
+        arguments={"validation_id": validation_id, "summary": "Calculator fix reviewed."},
         id="review_stale",
     )
     review = registry.execute(review_call, _approved_context(memory, tmp_path, review_call))
@@ -2323,7 +2373,11 @@ def test_stale_repair_review_blocks_commit_and_rollback_preserves_artifact(tmp_p
 
     rollback_call = ToolCall(
         name="repair.rollback",
-        arguments={"reason": "stale_repair_review", "review_id": review.data["review_id"]},
+        arguments={
+            "reason": "stale_repair_review",
+            "review_id": review.data["review_id"],
+            "expected_current_diff_digest": repair_snapshot(tmp_path)["diff_digest"],
+        },
         id="rollback_stale",
     )
     rolled_back = registry.execute(
@@ -2362,10 +2416,16 @@ def test_repair_review_creates_commit_gate_after_successful_validation(tmp_path:
     )
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
+    validation_id = _successful_repair_validation_id(
+        registry,
+        memory,
+        tmp_path,
+        call_id="validate_review_gate",
+    )
     call = ToolCall(
         name="repair.review",
         arguments={
-            "validation": {"success": True, "command": ["pytest", "-q"], "content": "passed"},
+            "validation_id": validation_id,
             "summary": "README patch validated with tests.",
         },
         id="review_gate",
@@ -2442,10 +2502,16 @@ def test_git_commit_allows_repair_branch_with_current_reviewer_gate(tmp_path: Pa
     )
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
+    validation_id = _successful_repair_validation_id(
+        registry,
+        memory,
+        tmp_path,
+        call_id="validate_for_commit",
+    )
     review_call = ToolCall(
         name="repair.review",
         arguments={
-            "validation": {"success": True, "command": ["pytest", "-q"]},
+            "validation_id": validation_id,
             "summary": "validated",
         },
         id="review_for_commit",
@@ -2474,9 +2540,36 @@ def test_git_commit_allows_repair_branch_with_current_reviewer_gate(tmp_path: Pa
 def test_git_commit_requires_approval_and_never_pushes(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
+    _init_git_repo(tmp_path)
+    subprocess.run(
+        ["git", "switch", "-c", "topic/exact-commit"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (tmp_path / "README.md").write_text("exact staged candidate\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    expected_tree = subprocess.run(
+        ["git", "write-tree"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
-    call = ToolCall(name="git.commit", arguments={"message": "test commit"}, id="commit1")
+    call = ToolCall(
+        name="git.commit",
+        arguments={"message": "test commit", "expected_tree_sha": expected_tree},
+        id="commit1",
+    )
 
     blocked = registry.execute(
         call,
@@ -2486,15 +2579,13 @@ def test_git_commit_requires_approval_and_never_pushes(
 
     captured: dict[str, object] = {"commands": []}
 
-    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        captured["command"] = command
-        captured["commands"].append(command)  # type: ignore[union-attr]
-        captured["kwargs"] = kwargs
-        if command == ["git", "rev-parse", "HEAD"]:
-            return subprocess.CompletedProcess(command, 0, stdout="abc123\n", stderr="")
-        return subprocess.CompletedProcess(command, 0, stdout="[main abc] test commit", stderr="")
+    real_run = subprocess.run
 
-    monkeypatch.setattr("nested_memvid_agent.tools.git_tools.subprocess.run", fake_run)
+    def recording_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+        captured["commands"].append(command)  # type: ignore[union-attr]
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr("nested_memvid_agent.tools.git_tools.subprocess.run", recording_run)
     approved = registry.execute(
         call,
         ToolContext(
@@ -2502,14 +2593,15 @@ def test_git_commit_requires_approval_and_never_pushes(
             config=AgentConfig(allow_git_commit=True),
             workspace=tmp_path,
             approved_tool_call_ids=frozenset({"commit1"}),
-            approved_tool_call_arguments={"commit1": {"message": "test commit"}},
+            approved_tool_call_arguments={"commit1": call.arguments},
         ),
     )
 
     assert approved.success
     commands = captured["commands"]
     assert isinstance(commands, list)
-    assert ["git", "commit", "-m", "test commit"] in commands
+    assert any("commit-tree" in command for command in commands)
+    assert any("update-ref" in command for command in commands)
     assert all("push" not in command for command in commands)
 
 
@@ -2611,7 +2703,9 @@ def test_git_commit_refuses_protected_branches(tmp_path: Path, monkeypatch: Monk
 
 
 def test_memory_inspect_export_and_import_are_structured_and_gated(tmp_path: Path) -> None:
-    memory = build_memory_system("memory", tmp_path / "memory")
+    memory = build_memory_system(
+        "memory", tmp_path / "memory", enforce_stable_write_integrity=False
+    )
     memory.put(
         MemoryRecord(
             layer=MemoryLayer.SEMANTIC,
@@ -2672,9 +2766,15 @@ def test_memory_inspect_export_and_import_are_structured_and_gated(tmp_path: Pat
         ),
     )
     assert imported.success
-    assert memory.retrieve(
+    assert not memory.retrieve(
         RetrievalQuery(query="Approved import", layers=(MemoryLayer.SEMANTIC,), k_per_layer=3)
     )
+    staged = memory.retrieve(
+        RetrievalQuery(query="Approved import", layers=(MemoryLayer.EPISODIC,), k_per_layer=3)
+    )
+    assert staged
+    assert staged[0].record.metadata["import_requested_layer"] == "semantic"
+    assert staged[0].record.metadata["stable_recall_eligible"] is False
 
 
 def test_memory_import_keeps_policy_writes_separately_gated(tmp_path: Path) -> None:
@@ -2720,7 +2820,7 @@ def test_memory_import_keeps_policy_writes_separately_gated(tmp_path: Path) -> N
     assert result.error == "policy_write_disabled"
 
 
-def test_memory_consolidate_promotes_repeated_procedure(tmp_path: Path) -> None:
+def test_memory_consolidate_rejects_legacy_score_and_repeat_claims(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     memory.put(
         MemoryRecord(
@@ -2746,15 +2846,15 @@ def test_memory_consolidate_promotes_repeated_procedure(tmp_path: Path) -> None:
         ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
     )
     assert result.success
-    assert '"target_layer": "procedural"' in result.content
-    assert memory.retrieve(
+    assert result.data["promoted"] is False
+    assert not memory.retrieve(
         RetrievalQuery(
             query="Repeatable test recipe", layers=(MemoryLayer.PROCEDURAL,), k_per_layer=3
         )
     )
 
 
-def test_memory_learn_routes_validated_signal(tmp_path: Path) -> None:
+def test_memory_learn_rejects_legacy_validation_score(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
     result = registry.execute(
@@ -2773,18 +2873,17 @@ def test_memory_learn_routes_validated_signal(tmp_path: Path) -> None:
     )
 
     assert result.success
-    assert result.data["target_layer"] == "semantic"
-    hits = memory.retrieve(
+    assert result.data["accepted"] is False
+    assert result.data["target_layer"] is None
+    assert result.data["record_id"] is None
+    assert not memory.retrieve(
         RetrievalQuery(
             query=".mv2 file per memory layer", layers=(MemoryLayer.SEMANTIC,), k_per_layer=3
         )
     )
-    assert hits
-    assert hits[0].record.metadata["nested_learning"]["context_flow"]["id"] == "episode_to_semantic"
-    assert hits[0].record.metadata["validation_evidence"]["legacy_raw_score"] is True
 
 
-def test_memory_learn_accepts_structured_validation_evidence(tmp_path: Path) -> None:
+def test_memory_learn_scores_but_rejects_unresolved_structured_evidence(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
     result = registry.execute(
@@ -2808,11 +2907,11 @@ def test_memory_learn_accepts_structured_validation_evidence(tmp_path: Path) -> 
 
     assert result.success
     assert result.data["validation_score"] == 1.0
-    hits = memory.retrieve(
+    assert result.data["accepted"] is False
+    assert result.data["validation_evidence"]["resolved"] is False
+    assert not memory.retrieve(
         RetrievalQuery(query="Structured validation evidence", layers=(MemoryLayer.SEMANTIC,))
     )
-    assert hits
-    assert hits[0].record.metadata["validation_evidence"]["test_refs"] == ["test.run:pytest -q"]
 
 
 def test_memory_learn_blocks_policy_without_config_enablement(tmp_path: Path) -> None:
@@ -2848,8 +2947,68 @@ def test_memory_learn_blocks_policy_without_config_enablement(tmp_path: Path) ->
     )
 
 
-def test_memory_correct_writes_correction_and_hides_superseded_target(tmp_path: Path) -> None:
+def test_policy_promote_requires_durable_receipt_and_staged_source(
+    tmp_path: Path,
+) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    arguments = {
+        "title": "Approval-bound policy",
+        "content": "Policy promotion must retain authenticated approval provenance.",
+        "validation_evidence": {
+            "test_refs": [{"source": "test.run", "locator": "policy-tests"}],
+            "lint_refs": [{"source": "lint.run", "locator": "policy-lint"}],
+            "repair_refs": [{"source": "repair.validate", "locator": "policy-repair"}],
+            "review_refs": [{"source": "repair.review", "locator": "policy-review"}],
+            "task_refs": [{"source": "task", "locator": "only-one-event"}],
+            "human_explicit": True,
+        },
+    }
+    call = ToolCall(name="memory.policy_promote", arguments=arguments, id="policy-receipt")
+    base_context = {
+        "memory": memory,
+        "config": AgentConfig(allow_policy_writes=True),
+        "workspace": tmp_path,
+        "session_id": "policy-test",
+        "run_id": "run-policy-test",
+        "approved_tool_call_ids": frozenset({call.id}),
+        "approved_tool_call_arguments": {call.id: arguments},
+    }
+
+    no_receipt = registry.execute(call, ToolContext(**base_context))
+
+    assert not no_receipt.success
+    assert no_receipt.error == "approval_provenance_required"
+    receipt = {
+        "approval_id": "approval-policy-test",
+        "run_id": "run-policy-test",
+        "tool_call_id": call.id,
+        "tool_name": "memory.policy_promote",
+        "arguments": arguments,
+        "status": "approved",
+        "principal": "owner",
+        "decision": {
+            "approved": True,
+            "arguments": arguments,
+            "principal": "owner",
+        },
+    }
+    single_event = registry.execute(
+        call,
+        ToolContext(**base_context, approval_receipts={call.id: receipt}),
+    )
+
+    assert not single_event.success
+    assert single_event.error == "policy_source_record_required"
+    assert not memory.retrieve(
+        RetrievalQuery(query="authenticated approval provenance", layers=(MemoryLayer.POLICY,))
+    )
+
+
+def test_memory_correct_writes_correction_and_hides_superseded_target(tmp_path: Path) -> None:
+    memory = build_memory_system(
+        "memory", tmp_path / "memory", enforce_stable_write_integrity=False
+    )
     target_id = memory.put(
         MemoryRecord(
             id="fact-alpha",

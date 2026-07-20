@@ -3,6 +3,8 @@
 Kestrel is a local-first agent runtime. The deployment default is intentionally conservative:
 Memvid `.mv2` memory, localhost binding, no shell/file-write/policy/Codex high-risk tools enabled, and no automatic consolidation writes. The `mock` provider appears in smoke checks because it needs no secrets and is deterministic; configure a real provider for normal operation.
 
+`v0.4.0` is the current stable release for the supported local/private deployment profile.
+
 ## One-Shot GitHub Install
 
 The one-shot Bash installer supports macOS and Linux, including Linux inside WSL.
@@ -14,12 +16,17 @@ installed, and smoke-tested in the isolated Linux release environment.
 For a local Memvid-backed Kestrel install:
 
 ```bash
-curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.1/install.sh | bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.0/install.sh | bash
 ```
 
-The release installer clones or updates `https://github.com/John-MiracleWorker/Kestrel.git` into `${KESTREL_HOME:-$HOME/.kestrel-agent}`, pins the checkout to `v0.3.1`, detects Python 3.11 or newer, creates `.venv`, downloads the universal wheel and hash-locked default dependencies, verifies both against the published `SHA256SUMS`, installs the bundled web workbench, initializes `.nest/memory` with Memvid `.mv2` layers, verifies memory, and runs doctor plus a deterministic `mock` chat smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. The smoke check proves the CLI path without requiring secrets; it is not the recommended provider for real use.
+The release installer clones or updates `https://github.com/John-MiracleWorker/Kestrel.git` into `${KESTREL_HOME:-$HOME/.kestrel-agent}`, pins the checkout to `v0.4.0`, detects Python 3.11 or newer, creates `.venv`, downloads the universal wheel and hash-locked default dependencies, verifies both against the published `SHA256SUMS`, installs the bundled web workbench, initializes `.nest/memory` with Memvid `.mv2` layers, verifies memory, and runs doctor plus a deterministic `mock` chat smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. The smoke check proves the CLI path without requiring secrets; it is not the recommended provider for real use.
 
-Production installs should use the immutable GitHub release installer above. It pins the source checkout, wheel, dependency manifest, and checksum manifest to the same tag. `main` is a development source, not the published release channel. `v0.3.1` is the latest published release for the supported local/private deployment profile.
+Production installs should use the immutable GitHub release installer above. It pins the source checkout, wheel, dependency manifest, and checksum manifest to the same `v0.4.0` tag. The moving `main` branch remains a development source, not the published release channel.
+
+The Compose profile runs the image as UID/GID 999 with a read-only root filesystem, all Linux
+capabilities dropped, `no-new-privileges`, and a bounded `noexec,nosuid` temporary filesystem. Only
+the named `/data` volume is persistent and writable. The image also strips SUID bits from unused
+login and mount helpers.
 
 The GitHub release also publishes the universal wheel, source distribution,
 version-pinned installer, hash-locked default dependency manifest,
@@ -30,7 +37,7 @@ not from the development/test environment.
 To install and explicitly launch the localhost workbench in one command:
 
 ```bash
-curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.1/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.0/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
 Useful options:
@@ -38,7 +45,7 @@ Useful options:
 ```bash
 KESTREL_DRY_RUN=1 bash install.sh
 KESTREL_HOME="$HOME/dev/kestrel" bash install.sh
-KESTREL_REF=v0.3.1 bash install.sh
+KESTREL_REF=v0.4.0 bash install.sh
 KESTREL_SKIP_WEB=1 bash install.sh
 KESTREL_SKIP_SMOKE=1 bash install.sh
 KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash install.sh
@@ -135,7 +142,7 @@ Run doctor in the image:
 
 ```bash
 docker run --rm kestrel-agent:local \
-  nest-agent doctor --backend memory --memory-dir /tmp/kestrel-memory --provider mock
+  nest-agent doctor --backend memvid --memory-dir /data/memory --provider mock
 ```
 
 Run the server:
@@ -175,6 +182,8 @@ enable_auto_consolidation=false
 ```
 
 The container command binds to `0.0.0.0` inside Docker, so the image requires API auth by default. Set `NEST_AGENT_API_TOKEN` for `docker run` and `docker compose`; startup fails before serving if a non-loopback bind is requested without a configured token. Provider, model, backend, and storage paths come from the `NEST_AGENT_*` environment values instead of being overridden by the image command. The entrypoint initializes only missing Memvid v2 layers before starting the server, and the container health check uses `/api/health/ready` for traffic admission.
+
+Docker builds validate a real `memvid_sdk` import before producing an image. Every Docker architecture compiles Memvid v2 from its exact hash-verified source distribution in a throwaway build stage; this also avoids an upstream `2.0.160` ARM64 wheel that cannot currently be loaded safely in a standard Python container. A separate build stage uses the same pinned `uv==0.11.16` toolchain as release CI to export the frozen `uv.lock` runtime graph, and the final stage installs that graph with `pip --require-hashes` before installing Kestrel without dependency resolution. The final image contains the resulting native wheel and locked runtime dependencies but none of the Rust or `uv` build toolchain, and image construction fails if the native runtime is not usable.
 
 When `require_api_auth=true`, the browser shell remains public so operators can load `/`, `/assets/*`, and client-side routes. All `/api/*` routes still require the token. The web app prompts for the token after a 401, stores it in browser local storage, and sends it as `Authorization: Bearer REDACTED` on API requests.
 

@@ -26,7 +26,7 @@ def test_product_readiness_report_exposes_all_productization_categories() -> Non
 
     assert report.schema == "kestrel.product_readiness.v2"
     assert report.scope == "full_product_including_hosted_team"
-    assert report.headline.total_categories == 10
+    assert report.headline.total_categories == 11
     assert report.headline.ready_count >= 0
     assert report.headline.partial_count > 0
     assert report.headline.missing_count > 0
@@ -36,6 +36,7 @@ def test_product_readiness_report_exposes_all_productization_categories() -> Non
     assert category_ids == {
         "local_product_stability",
         "golden_repair_workflow",
+        "proactive_personal_routines",
         "safe_autonomous_learning",
         "production_auth_workspaces",
         "sandboxed_extensibility",
@@ -69,9 +70,19 @@ def test_product_readiness_category_payloads_include_evidence_and_next_actions()
     assert not any("default" in item.lower() and "worktree" in item.lower() for item in repair.remaining_work)
     assert not any("coherent" in item.lower() and "worktree" in item.lower() for item in repair.remaining_work)
 
+    routines = report.category("proactive_personal_routines")
+    assert routines.status == ProductReadinessStatus.PARTIAL
+    assert any("fenced" in item.lower() for item in routines.evidence)
+    assert any("delivery" in item.lower() for item in routines.remaining_work)
+
     operations = report.category("operations_release_engineering")
     assert any("support bundle" in item.lower() for item in operations.evidence)
+    assert any("containment" in item.lower() for item in operations.evidence)
     assert not any("support bundle" in item.lower() for item in operations.remaining_work)
+
+    onboarding = report.category("product_ux_onboarding")
+    assert any("first-run setup" in item.lower() for item in onboarding.evidence)
+    assert not any(item.lower().startswith("add first-run onboarding") for item in onboarding.remaining_work)
 
 
 def test_product_readiness_report_serializes_to_public_dict() -> None:
@@ -113,6 +124,37 @@ def test_setup_readiness_reports_first_run_prerequisites(tmp_path: Path) -> None
     assert checks["provider_configuration"].status == SetupReadinessStatus.PASS
     assert checks["memory_storage"].status == SetupReadinessStatus.PASS
     assert checks["api_auth"].status == SetupReadinessStatus.WARN
+    assert checks["proactive_routines"].status == SetupReadinessStatus.PASS
+
+
+def test_setup_readiness_warns_when_proactive_api_owner_gate_is_open(
+    tmp_path: Path,
+) -> None:
+    open_report = build_setup_readiness_report(
+        AgentConfig(
+            workspace=tmp_path,
+            memory_dir=tmp_path / "memory-open",
+            state_path=tmp_path / "state-open" / "agent.db",
+            log_dir=tmp_path / "logs-open",
+            enable_proactive_routines=True,
+            require_api_auth=False,
+        )
+    )
+    gated_report = build_setup_readiness_report(
+        AgentConfig(
+            workspace=tmp_path,
+            memory_dir=tmp_path / "memory-gated",
+            state_path=tmp_path / "state-gated" / "agent.db",
+            log_dir=tmp_path / "logs-gated",
+            enable_proactive_routines=True,
+            require_api_auth=True,
+        )
+    )
+
+    open_checks = {check.check_id: check for check in open_report.checks}
+    gated_checks = {check.check_id: check for check in gated_report.checks}
+    assert open_checks["proactive_routines"].status == SetupReadinessStatus.WARN
+    assert gated_checks["proactive_routines"].status == SetupReadinessStatus.PASS
 
 
 def test_setup_readiness_flags_missing_workspace_and_provider_secret(tmp_path: Path) -> None:

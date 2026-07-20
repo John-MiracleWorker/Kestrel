@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess  # nosec B404
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,20 @@ from .process_tools import (
     _SubprocessToolTimeout,
     _truncate,
 )
-from .validation_helpers import _tool_validation_evidence_payload
+from .validation_helpers import (
+    _authenticated_validation_evidence_payload,
+    _tool_validation_evidence_payload,
+)
+
+
+def _tool_call_from_runtime_arguments(name: str, arguments: dict[str, Any]) -> ToolCall:
+    public_arguments = {
+        key: value for key, value in arguments.items() if not str(key).startswith("_")
+    }
+    call_id = str(arguments.get("_tool_call_id") or "").strip()
+    if call_id:
+        return ToolCall(name=name, arguments=public_arguments, id=call_id)
+    return ToolCall(name=name, arguments=public_arguments)
 
 
 def _remote_mutation_violation(command: list[str]) -> str | None:
@@ -46,7 +60,9 @@ def _is_python_executable_name(name: str) -> bool:
     if name in {"python", "python3"}:
         return True
     suffix = name.removeprefix("python")
-    return bool(suffix) and suffix[0].isdigit() and all(part.isdigit() for part in suffix.split("."))
+    return (
+        bool(suffix) and suffix[0].isdigit() and all(part.isdigit() for part in suffix.split("."))
+    )
 
 
 def _is_allowlisted_command(command: list[str], allowed_first_tokens: set[str]) -> bool:
@@ -345,6 +361,7 @@ class TestRunTool(AgentTool):
             "properties": {
                 "command": {"type": "array", "items": {"type": "string"}},
                 "timeout": {"type": "integer"},
+                "subject_record_id": {"type": "string"},
             },
         },
         risk="high",
@@ -355,7 +372,7 @@ class TestRunTool(AgentTool):
     needs_call_id = True
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
-        call = ToolCall(name=self.spec.name, arguments=arguments)
+        call = _tool_call_from_runtime_arguments(self.spec.name, arguments)
         command_raw = arguments.get("command", ["pytest", "-q"])
         if not isinstance(command_raw, list) or not all(
             isinstance(item, str) for item in command_raw
@@ -381,15 +398,34 @@ class TestRunTool(AgentTool):
                 sanitize_environment=True,
             )
             content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            validation_evidence = _tool_validation_evidence_payload(
+                "test_refs", "test.run", command, content, completed.returncode == 0
+            )
+            if completed.returncode == 0:
+                receipt_id = context.memory.put_runtime_validation_receipt(
+                    tool_name=self.spec.name,
+                    tool_call_id=call.id,
+                    evidence_bucket="test",
+                    command=command,
+                    output_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    session_id=context.session_id,
+                    run_id=context.run_id,
+                    subject_record_id=str(arguments.get("subject_record_id") or "").strip()
+                    or None,
+                )
+                validation_evidence = _authenticated_validation_evidence_payload(
+                    "test_refs",
+                    receipt_id=receipt_id,
+                    quote=content,
+                    source_evidence_chars=len(content),
+                )
             return self._result(
                 call,
                 success=completed.returncode == 0,
                 content=content,
                 data={
                     "returncode": completed.returncode,
-                    "validation_evidence": _tool_validation_evidence_payload(
-                        "test_refs", "test.run", command, content, completed.returncode == 0
-                    ),
+                    "validation_evidence": validation_evidence,
                 },
                 error=None if completed.returncode == 0 else "nonzero_exit",
             )
@@ -411,6 +447,7 @@ class LintRunTool(AgentTool):
             "properties": {
                 "command": {"type": "array", "items": {"type": "string"}},
                 "timeout": {"type": "integer"},
+                "subject_record_id": {"type": "string"},
             },
         },
         risk="high",
@@ -421,7 +458,7 @@ class LintRunTool(AgentTool):
     needs_call_id = True
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
-        call = ToolCall(name=self.spec.name, arguments=arguments)
+        call = _tool_call_from_runtime_arguments(self.spec.name, arguments)
         command_raw = arguments.get("command", ["ruff", "check", "."])
         if not isinstance(command_raw, list) or not all(
             isinstance(item, str) for item in command_raw
@@ -447,15 +484,34 @@ class LintRunTool(AgentTool):
                 sanitize_environment=True,
             )
             content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            validation_evidence = _tool_validation_evidence_payload(
+                "lint_refs", "lint.run", command, content, completed.returncode == 0
+            )
+            if completed.returncode == 0:
+                receipt_id = context.memory.put_runtime_validation_receipt(
+                    tool_name=self.spec.name,
+                    tool_call_id=call.id,
+                    evidence_bucket="lint",
+                    command=command,
+                    output_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    session_id=context.session_id,
+                    run_id=context.run_id,
+                    subject_record_id=str(arguments.get("subject_record_id") or "").strip()
+                    or None,
+                )
+                validation_evidence = _authenticated_validation_evidence_payload(
+                    "lint_refs",
+                    receipt_id=receipt_id,
+                    quote=content,
+                    source_evidence_chars=len(content),
+                )
             return self._result(
                 call,
                 success=completed.returncode == 0,
                 content=content,
                 data={
                     "returncode": completed.returncode,
-                    "validation_evidence": _tool_validation_evidence_payload(
-                        "lint_refs", "lint.run", command, content, completed.returncode == 0
-                    ),
+                    "validation_evidence": validation_evidence,
                 },
                 error=None if completed.returncode == 0 else "nonzero_exit",
             )

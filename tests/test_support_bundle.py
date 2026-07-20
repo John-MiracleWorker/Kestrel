@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -10,7 +11,9 @@ from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
 from nested_memvid_agent.cli import main
+from nested_memvid_agent.cognition.models import FailureEpisode, ProofOfWorkSummary
 from nested_memvid_agent.config import AgentConfig
+from nested_memvid_agent.event_log import AgentEvent, JsonlEventLog
 from nested_memvid_agent.server_product_routes import register_product_routes
 from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.support_bundle import export_support_bundle
@@ -53,12 +56,418 @@ def test_support_bundle_export_writes_redacted_archive(
     assert "<redacted>" in combined_text
     assert runtime["provider"] == "openai"
     assert runtime["api_key_env"] == {"name": "OPENAI_API_KEY", "present": True}
+    assert runtime["learning_flags"]["enable_proactive_routines"] is False
+    assert runtime["learning_flags"]["max_routines_per_tick"] == 3
     assert "secret_store_path" in runtime["paths"]
     assert state_summary["schema_version"] >= 1
     assert state_summary["tables"]["runs"] == 1
     assert state_summary["tables"]["approval_requests"] == 1
     assert state_summary["tables"]["capability_overrides"] == 1
     assert state_summary["tables"]["capability_change_log"] == 1
+    assert state_summary["tables"]["routines"] == 1
+    assert state_summary["tables"]["routine_occurrences"] == 0
+    assert state_summary["routine_summary"] == {
+        "enabled_definitions": 0,
+        "expired_claims": 0,
+        "occurrences_by_status": {
+            "claimed": 0,
+            "completed": 0,
+            "failed": 0,
+            "running": 0,
+            "skipped": 0,
+        },
+        "oldest_nonterminal": None,
+    }
+
+
+def test_support_bundle_reports_prompt_free_routine_aggregates(tmp_path: Path) -> None:
+    config = _support_config(tmp_path)
+    state = AgentStateStore(config.state_path)
+    private_name = "Support-only private routine name 7e3c1a"
+    private_prompt = "ROUTINE_PRIVATE_PROMPT_SENTINEL_7e3c1a"
+
+    running_due = datetime(2021, 1, 1, tzinfo=UTC)
+    running = state.create_routine(
+        routine_id="support-running",
+        name=private_name,
+        prompt=private_prompt,
+        schedule_kind="once",
+        start_at=running_due,
+    )
+    state.update_routine(
+        running.routine_id,
+        expected_revision=running.revision,
+        enabled=True,
+    )
+    running_claim = state.claim_due_routine_occurrences(
+        now=running_due,
+        claim_owner="support-running-owner",
+    ).claimed[0]
+    _current, applied = state.mark_routine_occurrence_running(
+        running_claim.occurrence_id,
+        claim_owner="support-running-owner",
+        claim_generation=running_claim.claim_generation,
+        run_id=running_claim.run_id,
+        now=running_due,
+    )
+    assert applied is True
+
+    claimed_due = datetime(2020, 1, 1, tzinfo=UTC)
+    claimed = state.create_routine(
+        routine_id="support-expired-claimed",
+        name=private_name,
+        prompt=private_prompt,
+        schedule_kind="once",
+        start_at=claimed_due,
+    )
+    state.update_routine(
+        claimed.routine_id,
+        expected_revision=claimed.revision,
+        enabled=True,
+    )
+    expired_claim = state.claim_due_routine_occurrences(
+        now=claimed_due,
+        claim_owner="support-expired-owner",
+    ).claimed[0]
+    assert expired_claim.status == "claimed"
+
+    result = export_support_bundle(config, output_path=tmp_path / "routine-bundle.zip")
+
+    with zipfile.ZipFile(result.bundle_path) as archive:
+        combined_text = "\n".join(
+            archive.read(name).decode("utf-8")
+            for name in sorted(archive.namelist())
+            if name.endswith(".json")
+        )
+        state_summary = json.loads(archive.read("state_summary.json"))
+
+    assert private_name not in combined_text
+    assert private_prompt not in combined_text
+    assert state_summary["routine_summary"] == {
+        "enabled_definitions": 2,
+        "expired_claims": 1,
+        "occurrences_by_status": {
+            "claimed": 1,
+            "completed": 0,
+            "failed": 0,
+            "running": 1,
+            "skipped": 0,
+        },
+        "oldest_nonterminal": {
+            "created_at": claimed_due.isoformat(),
+            "scheduled_for": claimed_due.isoformat(),
+            "status": "claimed",
+            "updated_at": claimed_due.isoformat(),
+        },
+    }
+
+
+def test_support_bundle_event_tail_removes_turn_text_but_keeps_diagnostics(
+    tmp_path: Path,
+) -> None:
+    config = _support_config(tmp_path)
+    user_sentinel = "UNIQUE_USER_TURN_TEXT_4db615"
+    routine_sentinel = "UNIQUE_ROUTINE_TURN_TEXT_8a26c1"
+    content_sentinel = "UNIQUE_NESTED_CONTENT_TEXT_6f89e2"
+    channel_sentinel = "UNIQUE_CHANNEL_TURN_TEXT_2c97f4"
+    event_log = JsonlEventLog(config.log_dir / "events.jsonl")
+    event_log.append(
+        AgentEvent(
+            id="evt_support_user_turn",
+            type="turn.start",
+            created_at="2026-07-19T12:00:00+00:00",
+            payload={
+                "session_id": "support-user-session",
+                "run_id": "run_support_user",
+                "user_message": user_sentinel,
+                "message_length": len(user_sentinel),
+                "turn_origin": "primary_user",
+                "transcript_scope": "primary",
+                "status": "accepted",
+            },
+        )
+    )
+    event_log.append(
+        AgentEvent(
+            id="evt_support_routine_turn",
+            type="turn.start",
+            created_at="2026-07-19T12:01:00+00:00",
+            payload={
+                "session_id": "support-routine-session",
+                "run_id": "run_support_routine",
+                "user_message": routine_sentinel,
+                "turn_origin": "scheduled_routine",
+                "transcript_scope": "internal",
+                "request": {
+                    "prompt": routine_sentinel,
+                    "prompt_tokens": 17,
+                    "result": {"content": content_sentinel, "status": "queued"},
+                },
+            },
+        )
+    )
+    event_log.append(
+        AgentEvent(
+            id="evt_support_channel_turn",
+            type="channel.receive",
+            created_at="2026-07-19T12:02:00+00:00",
+            payload={
+                "channel": "telegram",
+                "channel_id": "support-channel",
+                "conversation_id": "support-conversation",
+                "user_id": "support-user",
+                "message_id": "support-message",
+                "text": channel_sentinel,
+                "metadata": {"status": "received"},
+                "session_id": "support-channel-session",
+            },
+        )
+    )
+    raw_log = event_log.path.read_text(encoding="utf-8")
+    assert user_sentinel in raw_log
+    assert routine_sentinel in raw_log
+    assert content_sentinel in raw_log
+    assert channel_sentinel in raw_log
+
+    result = export_support_bundle(config, output_path=tmp_path / "event-tail-bundle.zip")
+
+    with zipfile.ZipFile(result.bundle_path) as archive:
+        combined_text = "\n".join(
+            archive.read(name).decode("utf-8")
+            for name in sorted(archive.namelist())
+            if name.endswith(".json")
+        )
+        events = json.loads(archive.read("logs/events_tail.json"))
+        manifest = json.loads(archive.read("manifest.json"))
+
+    assert user_sentinel not in combined_text
+    assert routine_sentinel not in combined_text
+    assert content_sentinel not in combined_text
+    assert channel_sentinel not in combined_text
+    assert manifest["redaction"]["logs"] == (
+        "free_form_text_redacted_metadata_allowlist_tail_only"
+    )
+    assert events == [
+        {
+            "created_at": "2026-07-19T12:00:00+00:00",
+            "id": "evt_support_user_turn",
+            "payload": {
+                "message_length": len(user_sentinel),
+                "run_id": "run_support_user",
+                "session_id": "support-user-session",
+                "status": "accepted",
+                "transcript_scope": "primary",
+                "turn_origin": "primary_user",
+                "user_message": "<redacted>",
+            },
+            "type": "turn.start",
+        },
+        {
+            "created_at": "2026-07-19T12:01:00+00:00",
+            "id": "evt_support_routine_turn",
+            "payload": {
+                "request": {
+                    "prompt": "<redacted>",
+                    "prompt_tokens": 17,
+                    "result": {"content": "<redacted>", "status": "queued"},
+                },
+                "run_id": "run_support_routine",
+                "session_id": "support-routine-session",
+                "transcript_scope": "internal",
+                "turn_origin": "scheduled_routine",
+                "user_message": "<redacted>",
+            },
+            "type": "turn.start",
+        },
+        {
+            "created_at": "2026-07-19T12:02:00+00:00",
+            "id": "evt_support_channel_turn",
+            "payload": {
+                "channel": "telegram",
+                "channel_id": "support-channel",
+                "conversation_id": "support-conversation",
+                "message_id": "support-message",
+                "metadata": {"status": "received"},
+                "session_id": "support-channel-session",
+                "text": "<redacted>",
+                "user_id": "support-user",
+            },
+            "type": "channel.receive",
+        },
+    ]
+
+
+def test_support_bundle_event_tail_sanitizes_real_proof_of_work_payload(
+    tmp_path: Path,
+) -> None:
+    config = _support_config(tmp_path)
+    objective_sentinel = "PROOF_OBJECTIVE_SENTINEL_7fdcb1"
+    command_sentinel = "PROOF_COMMAND_SENTINEL_d0cb3e"
+    diagnosis_sentinel = "PROOF_DIAGNOSIS_SENTINEL_ef64a9"
+    strategy_sentinel = "PROOF_STRATEGY_SENTINEL_a724c0"
+    failure = FailureEpisode(
+        failure_id="failure_support_bundle",
+        run_id="run_support_proof",
+        task_id="task_support_proof",
+        tool_name="shell.run",
+        command=command_sentinel,
+        error_text=f"failure output: {diagnosis_sentinel}",
+        category="tool_failure",
+        diagnosis=diagnosis_sentinel,
+        attempted_strategy=strategy_sentinel,
+        similar_lessons_used=("lesson_support_proof",),
+        resolved=False,
+        confidence=0.76,
+        created_at="2026-07-19T12:03:00+00:00",
+    )
+    proof = ProofOfWorkSummary(objective=objective_sentinel)
+    proof.completed_steps.append(f"Ran {command_sentinel}")
+    proof.tools_used.append(
+        {
+            "tool": "shell.run",
+            "tool_call_id": "tool_support_proof",
+            "success": False,
+            "error": diagnosis_sentinel,
+        }
+    )
+    proof.failures.append(failure.to_payload())
+    proof.diagnoses.append(
+        {
+            "classification": "tool_failure",
+            "confidence": 0.72,
+            "retryable": True,
+            "diagnosis": diagnosis_sentinel,
+            "strategy": strategy_sentinel,
+        }
+    )
+    proof.remaining_risks.append(f"risk: {diagnosis_sentinel}")
+    proof.stop_reason = "tool_error"
+    event_log = JsonlEventLog(config.log_dir / "events.jsonl")
+    event_log.append(
+        AgentEvent(
+            id="evt_support_turn_end",
+            type="turn.end",
+            created_at="2026-07-19T12:04:00+00:00",
+            payload={
+                "session_id": "support-proof-session",
+                "run_id": "run_support_proof",
+                "stop_reason": "tool_error",
+                "memory_writes": ["record_support_proof"],
+                "tools": 1,
+                "proof_of_work": proof.to_payload(),
+            },
+        )
+    )
+    raw_log = event_log.path.read_text(encoding="utf-8")
+    for sentinel in (
+        objective_sentinel,
+        command_sentinel,
+        diagnosis_sentinel,
+        strategy_sentinel,
+    ):
+        assert sentinel in raw_log
+
+    result = export_support_bundle(config, output_path=tmp_path / "proof-bundle.zip")
+
+    with zipfile.ZipFile(result.bundle_path) as archive:
+        combined_text = "\n".join(
+            archive.read(name).decode("utf-8")
+            for name in sorted(archive.namelist())
+            if name.endswith(".json")
+        )
+        event = json.loads(archive.read("logs/events_tail.json"))[0]
+
+    for sentinel in (
+        objective_sentinel,
+        command_sentinel,
+        diagnosis_sentinel,
+        strategy_sentinel,
+    ):
+        assert sentinel not in combined_text
+    assert event["id"] == "evt_support_turn_end"
+    assert event["type"] == "turn.end"
+    assert event["created_at"] == "2026-07-19T12:04:00+00:00"
+    assert event["payload"] == {
+        "session_id": "support-proof-session",
+        "run_id": "run_support_proof",
+        "stop_reason": "tool_error",
+        "memory_writes": ["record_support_proof"],
+        "tools": 1,
+        "proof_of_work": {
+            "objective": "<redacted>",
+            "completed_steps": ["<redacted>"],
+            "tools_used": [
+                {
+                    "tool": "shell.run",
+                    "tool_call_id": "tool_support_proof",
+                    "success": False,
+                    "error": "<redacted>",
+                }
+            ],
+            "validation_evidence": [],
+            "failures": [
+                {
+                    "failure_id": "failure_support_bundle",
+                    "run_id": "run_support_proof",
+                    "task_id": "task_support_proof",
+                    "tool_name": "shell.run",
+                    "command": "<redacted>",
+                    "error_text": "<redacted>",
+                    "category": "tool_failure",
+                    "diagnosis": "<redacted>",
+                    "attempted_strategy": "<redacted>",
+                    "similar_lessons_used": ["lesson_support_proof"],
+                    "resolved": False,
+                    "resolution_summary": None,
+                    "validation_evidence": [],
+                    "confidence": 0.76,
+                    "created_at": "2026-07-19T12:03:00+00:00",
+                }
+            ],
+            "diagnoses": [
+                {
+                    "classification": "tool_failure",
+                    "confidence": 0.72,
+                    "retryable": True,
+                    "diagnosis": "<redacted>",
+                    "strategy": "<redacted>",
+                }
+            ],
+            "lessons_applied": [],
+            "lessons_created": [],
+            "remaining_risks": ["<redacted>"],
+            "stop_reason": "tool_error",
+        },
+    }
+
+
+def test_support_bundle_event_tail_preserves_malformed_json_diagnostic(
+    tmp_path: Path,
+) -> None:
+    config = _support_config(tmp_path)
+    event_log = JsonlEventLog(config.log_dir / "events.jsonl")
+    event_log.append(
+        AgentEvent(
+            id="evt_before_malformed",
+            type="diagnostic.test",
+            created_at="2026-07-19T12:05:00+00:00",
+            payload={"status": "ok"},
+        )
+    )
+    with event_log.path.open("a", encoding="utf-8") as handle:
+        handle.write("{malformed-json\n")
+
+    result = export_support_bundle(
+        config,
+        output_path=tmp_path / "malformed-tail-bundle.zip",
+        log_tail=2,
+    )
+
+    with zipfile.ZipFile(result.bundle_path) as archive:
+        events = json.loads(archive.read("logs/events_tail.json"))
+
+    assert events[0]["id"] == "evt_before_malformed"
+    assert events[1] == {"line": 1, "error": "invalid_json: Expecting property name enclosed in double quotes"}
 
 
 def test_product_support_bundle_route_exports_default_bundle(tmp_path: Path) -> None:
@@ -160,6 +569,13 @@ def _seed_state(path: Path) -> None:
         expected_revision=0,
         default_enabled=True,
         updated_by="support-test",
+    )
+    state.create_routine(
+        routine_id="support-routine",
+        name="Support routine",
+        prompt="Inspect local support state",
+        schedule_kind="once",
+        start_at="2030-01-01T00:00:00+00:00",
     )
 
 

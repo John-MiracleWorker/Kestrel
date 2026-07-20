@@ -90,7 +90,7 @@ This is an agent-runtime analogue of Nested Learning. It is not neural weight-le
 3. Validated stable facts can become semantic memory.
 4. Repeated validated workflows can become procedural memory.
 5. Validated identity, capability, workflow preference, and self-change signals can become self memory.
-6. Policy memory remains rare and requires explicit instruction, high validation, repeat evidence, config enablement, and review or equivalent explicit configuration.
+6. Policy memory remains rare and can be activated only through `memory.policy_promote`, with explicit instruction, high validation, repeated evidence, config enablement, exact-call human approval, and durable result attestation.
 7. Promotions carry evidence, provenance, confidence, validation status, context-flow metadata, and optimizer traces.
 
 ## Control Plane
@@ -108,8 +108,9 @@ The SQLite state store tracks operational state:
 - subagent runs
 - promotion ledger and outcome rows
 - behavior-delta ledger, activation rows, and outcome rows
+- revisioned proactive routine definitions and leased occurrence history
 
-Terminal run statuses and approval decisions are replay-safe. State migrations currently initialize schema version 15. Schema v15 adds compare-and-swap `capability_overrides`, append-only `capability_change_log` rows, and capability revision/resource-digest bindings on approval requests.
+Terminal run statuses and approval decisions are replay-safe. State migrations currently initialize schema version 19. Schema v19 adds hashed manual-routine idempotency claims and trigger provenance. Schema v18 adds renewable approval-execution claims, claimant-only result finalization, and durable bindings to the exact scheduler task/subagent continuation. Schema v17 added disabled-by-default routine definitions, revision CAS/tombstones, deterministic scheduled occurrences, lease-generation fencing, and atomic internally scoped run admission. Schema v16 durably binds each run to its serialized turn source, origin, and transcript scope; legacy rows default to primary scope. Schema v15 added compare-and-swap `capability_overrides`, append-only `capability_change_log` rows, and capability revision/resource-digest bindings on approval requests.
 
 ## Capability Resolution
 

@@ -14,6 +14,9 @@ from uuid import uuid4
 from .file_lock import lock_exclusive, unlock
 from .layers import DEFAULT_LAYER_SPECS, LayerSpec
 from .models import MemoryLayer
+from .private_artifacts import harden_private_file
+
+_MEMORY_VALIDATION_KEY_NAME = ".validation-integrity.key"
 
 
 class MemoryBackupError(RuntimeError):
@@ -281,10 +284,22 @@ class MemoryBackupManager:
             if layer_config.stat().st_nlink != 1:
                 raise MemoryBackupError("Memvid layer configuration cannot be hard-linked")
             files.append(layer_config)
+        validation_key = self.memory_dir / _MEMORY_VALIDATION_KEY_NAME
+        try:
+            key_present = harden_private_file(validation_key, missing_ok=True)
+        except (OSError, PermissionError, ValueError) as exc:
+            raise MemoryBackupError(
+                "Memory validation key must be an owner-only, single-link regular file"
+            ) from exc
+        if key_present:
+            files.append(validation_key)
         return sorted(set(files))
 
     def _allowed_manifest_files(self) -> set[str]:
-        allowed = {"memory/layers.json"}
+        allowed = {
+            "memory/layers.json",
+            f"memory/{_MEMORY_VALIDATION_KEY_NAME}",
+        }
         for spec in self.specs.values():
             allowed.add(f"memory/{spec.mv2_file}")
             allowed.add(f"memory/{spec.mv2_file}.records.json")

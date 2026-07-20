@@ -14,8 +14,6 @@ from .operational_metrics import readiness_snapshot
 from .runtime_settings import (
     RuntimeSettingsConflict,
     RuntimeSettingsStore,
-    apply_runtime_settings,
-    merge_runtime_settings,
 )
 
 
@@ -25,10 +23,12 @@ def register_runtime_routes(
     active_config: Any,
     state: Any,
     settings_store: RuntimeSettingsStore | None = None,
+    validate_config_update: Any | None = None,
     on_config_update: Any | None = None,
     secret_broker: Any | None = None,
     http_exception: Any | None = None,
     runs: Any | None = None,
+    routine_loop: Any | None = None,
     provider_probe: Any | None = None,
 ) -> None:
     @app.get("/api/health")  # type: ignore[untyped-decorator]
@@ -46,6 +46,7 @@ def register_runtime_routes(
             config=_active_config(active_config),
             state=state,
             runs=runs,
+            routine_loop=routine_loop,
         )
         if not snapshot["ok"] and http_exception is not None:
             raise http_exception(status_code=503, detail=snapshot)
@@ -122,7 +123,9 @@ def register_runtime_routes(
                 "enable_diagnosis_to_patch": config.enable_diagnosis_to_patch,
                 "require_approval_for_high_risk_tools": config.require_approval_for_high_risk_tools,
                 "enable_agentic_cycle": config.enable_agentic_cycle,
+                "enable_semantic_orchestration": config.enable_semantic_orchestration,
                 "enable_autonomous_scheduler": config.enable_autonomous_scheduler,
+                "enable_proactive_routines": config.enable_proactive_routines,
                 "enable_worker_isolation": config.enable_worker_isolation,
                 "enable_task_capsules": config.enable_task_capsules,
                 "enable_auto_consolidation": config.enable_auto_consolidation,
@@ -140,6 +143,9 @@ def register_runtime_routes(
                 "context_pack_token_budget": config.context_pack_token_budget,
                 "max_scheduler_tasks": config.max_scheduler_tasks,
                 "max_scheduler_cycles": config.max_scheduler_cycles,
+                "routine_poll_interval_seconds": config.routine_poll_interval_seconds,
+                "routine_claim_ttl_seconds": config.routine_claim_ttl_seconds,
+                "max_routines_per_tick": config.max_routines_per_tick,
                 "tool_timeout_seconds": config.tool_timeout_seconds,
                 "approval_ttl_seconds": config.approval_ttl_seconds,
                 "web_timeout_seconds": config.web_timeout_seconds,
@@ -194,43 +200,46 @@ def register_runtime_routes(
     @app.put("/api/runtime/settings")  # type: ignore[untyped-decorator]
     def save_runtime_settings(request: dict[str, Any]) -> dict[str, object]:
         store = _require_settings_store(settings_store, http_exception)
-        config = _active_config(active_config)
+        expected_revision = request.get("expected_revision")
+        if not isinstance(expected_revision, str) or not expected_revision.strip():
+            _raise(http_exception, 400, "expected_revision_is_required")
+        changes = {key: value for key, value in request.items() if key != "expected_revision"}
+
+        def activate(previous_config: AgentConfig, next_config: AgentConfig) -> int:
+            if on_config_update is not None:
+                on_config_update(next_config)
+            return _revoke_disabled_tool_approvals(
+                runs,
+                previous_config=previous_config,
+                next_config=next_config,
+            )
+
         try:
-            current = store.load(config)
-            if "require_api_auth" in request and _request_bool(request["require_api_auth"]) != config.require_api_auth:
+            config = _active_config(active_config)
+            if (
+                "require_api_auth" in changes
+                and _request_bool(changes["require_api_auth"]) != config.require_api_auth
+            ):
                 _raise(http_exception, 400, "require_api_auth_is_launch_controlled")
-            settings = merge_runtime_settings(config, current, request)
-        except ValueError as exc:
-            _raise(http_exception, 400, str(exc))
-        try:
-            saved = store.save(settings, expected_revision=current.revision)
+            update = store.transactional_update(
+                active_config,
+                changes,
+                expected_revision=expected_revision.strip(),
+                validate_config=validate_config_update,
+                activate_config=activate,
+                rollback_config=on_config_update,
+            )
         except RuntimeSettingsConflict as exc:
             _raise(http_exception, 409, str(exc))
-        next_config = apply_runtime_settings(config, saved)
-        if on_config_update is not None:
-            on_config_update(next_config)
-        revoked_approvals = 0
-        if runs is not None:
-            registry = runs.build_registry()
-            specs = getattr(registry, "all_specs", registry.specs)()
-            disabled_flags = {
-                flag
-                for spec in specs
-                if (flag := enablement_flag_for_tool(spec)) is not None
-                and bool(getattr(config, flag, False))
-                and not bool(getattr(next_config, flag, False))
-            }
-            affected = {
-                name
-                for spec in specs
-                if enablement_flag_for_tool(spec) in disabled_flags
-                for name in (spec.name, *spec.aliases)
-            }
-            if affected:
-                revoked_approvals = runs.revoke_pending_approvals_for_tools(
-                    affected,
-                    reason="global_capability_disabled",
-                )
+        except (OSError, ValueError) as exc:
+            _raise(http_exception, 400, str(exc))
+        saved = update.settings
+        next_config = update.config
+        revoked_approvals = (
+            update.activation_result
+            if isinstance(update.activation_result, int)
+            else 0
+        )
         return {
             "settings": saved.to_public_dict(path=store.path, persisted=True),
             "runtime": {
@@ -253,6 +262,7 @@ def register_runtime_routes(
                 "allow_executable_skills": next_config.allow_executable_skills,
                 "allow_web": next_config.allow_web,
                 "allow_self_modification": next_config.allow_self_modification,
+                "enable_semantic_orchestration": next_config.enable_semantic_orchestration,
             },
             "revoked_approvals": revoked_approvals,
         }
@@ -292,3 +302,36 @@ def _request_bool(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _revoke_disabled_tool_approvals(
+    runs: Any | None,
+    *,
+    previous_config: AgentConfig,
+    next_config: AgentConfig,
+) -> int:
+    if runs is None:
+        return 0
+    registry = runs.build_registry()
+    specs = getattr(registry, "all_specs", registry.specs)()
+    disabled_flags = {
+        flag
+        for spec in specs
+        if (flag := enablement_flag_for_tool(spec)) is not None
+        and bool(getattr(previous_config, flag, False))
+        and not bool(getattr(next_config, flag, False))
+    }
+    affected = {
+        name
+        for spec in specs
+        if enablement_flag_for_tool(spec) in disabled_flags
+        for name in (spec.name, *spec.aliases)
+    }
+    if not affected:
+        return 0
+    return int(
+        runs.revoke_pending_approvals_for_tools(
+            affected,
+            reason="global_capability_disabled",
+        )
+    )

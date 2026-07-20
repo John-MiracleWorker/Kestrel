@@ -7,10 +7,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .routine_limits import (
+    validate_routine_claim_ttl,
+    validate_routine_poll_interval,
+    validate_routines_per_tick,
+)
+
 
 @dataclass(frozen=True)
 class AgentConfig:
-    name: str = "Nested MV2 Agent"
+    name: str = "Kestrel"
     provider: str = "mock"
     model: str = "mock"
     base_url: str | None = None
@@ -62,13 +68,19 @@ class AgentConfig:
     require_approval_for_high_risk_tools: bool = True
     approval_ttl_seconds: float = 900.0
     enable_agentic_cycle: bool = True
+    enable_semantic_orchestration: bool = False
     enable_autonomous_scheduler: bool = False
     max_scheduler_tasks: int = 3
     max_scheduler_cycles: int = 5
+    enable_proactive_routines: bool = False
+    routine_poll_interval_seconds: float = 30.0
+    routine_claim_ttl_seconds: float = 120.0
+    max_routines_per_tick: int = 3
     enable_worker_isolation: bool = False
     worker_worktree_dir: Path = Path(".nest/worktrees")
     worker_branch_prefix: str = "kestrel/worker"
     enable_task_capsules: bool = True
+    task_capsule_retention_count: int = 1_000
     enable_auto_consolidation: bool = False
     auto_consolidation_dry_run: bool = True
     enable_auto_compact: bool = False
@@ -117,6 +129,26 @@ class AgentConfig:
             object.__setattr__(self, "require_approval_for_high_risk_tools", True)
         if self.approval_ttl_seconds <= 0:
             raise ValueError("approval_ttl_seconds must be greater than zero")
+        if (
+            isinstance(self.task_capsule_retention_count, bool)
+            or self.task_capsule_retention_count < 1
+        ):
+            raise ValueError("task_capsule_retention_count must be an integer greater than or equal to 1")
+        object.__setattr__(
+            self,
+            "routine_poll_interval_seconds",
+            validate_routine_poll_interval(self.routine_poll_interval_seconds),
+        )
+        object.__setattr__(
+            self,
+            "routine_claim_ttl_seconds",
+            validate_routine_claim_ttl(self.routine_claim_ttl_seconds),
+        )
+        object.__setattr__(
+            self,
+            "max_routines_per_tick",
+            validate_routines_per_tick(self.max_routines_per_tick),
+        )
         for field_name in ("base_url", "fallback_base_url"):
             value = getattr(self, field_name)
             if not value:
@@ -195,14 +227,26 @@ class AgentConfig:
             web_max_results=_env_int("NEST_AGENT_WEB_MAX_RESULTS", 5),
             web_max_bytes=_env_int("NEST_AGENT_WEB_MAX_BYTES", 200_000),
             enable_agentic_cycle=not _env_bool("NEST_AGENT_DISABLE_AGENTIC_CYCLE"),
+            enable_semantic_orchestration=_env_bool("NEST_AGENT_ENABLE_SEMANTIC_ORCHESTRATION"),
             enable_autonomous_scheduler=_env_bool("NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER"),
             max_scheduler_tasks=_env_int("NEST_AGENT_MAX_SCHEDULER_TASKS", 3),
             max_scheduler_cycles=_env_int("NEST_AGENT_MAX_SCHEDULER_CYCLES", 5),
+            enable_proactive_routines=_env_bool("NEST_AGENT_ENABLE_PROACTIVE_ROUTINES"),
+            routine_poll_interval_seconds=_env_float(
+                "NEST_AGENT_ROUTINE_POLL_INTERVAL_SECONDS", 30.0
+            ),
+            routine_claim_ttl_seconds=_env_float(
+                "NEST_AGENT_ROUTINE_CLAIM_TTL_SECONDS", 120.0
+            ),
+            max_routines_per_tick=_env_int("NEST_AGENT_MAX_ROUTINES_PER_TICK", 3),
             enable_worker_isolation=_env_bool("NEST_AGENT_ENABLE_WORKER_ISOLATION"),
             worker_worktree_dir=Path(os.getenv("NEST_AGENT_WORKER_WORKTREE_DIR", ".nest/worktrees")),
             worker_branch_prefix=os.getenv("NEST_AGENT_WORKER_BRANCH_PREFIX", "kestrel/worker"),
             enable_task_capsules=not _env_bool("NEST_AGENT_DISABLE_TASK_CAPSULES")
             and _env_bool_default("NEST_AGENT_ENABLE_TASK_CAPSULES", True),
+            task_capsule_retention_count=_env_int(
+                "NEST_AGENT_TASK_CAPSULE_RETENTION_COUNT", 1_000
+            ),
             enable_auto_consolidation=_env_bool("NEST_AGENT_ENABLE_AUTO_CONSOLIDATION"),
             auto_consolidation_dry_run=_env_bool_default("NEST_AGENT_AUTO_CONSOLIDATION_DRY_RUN", True),
             enable_auto_compact=_env_bool("NEST_AGENT_ENABLE_AUTO_COMPACT"),

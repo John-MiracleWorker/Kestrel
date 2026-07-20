@@ -1,10 +1,10 @@
 # Codex Full Agent Handoff Prompt
 
-Last updated: 2026-07-16
+Last updated: 2026-07-19
 
 You are working inside the Kestrel repository. Kestrel is a local-first, memory-native agent runtime built around Nested Learning-inspired memory layers and Memvid v2 `.mv2` files.
 
-This is not just a RAG layer. The runtime already includes CLI chat, provider adapters, deterministic mock mode, tools, approvals, state, task capsules, controlled behavior deltas, live-learning evals, a FastAPI/web control plane, managed MCP stdio sessions, skills, scheduler slices, and safe repair gates. Your job is to harden the next slice without regressing the current contract.
+This is not just a RAG layer. The runtime already includes CLI chat, provider adapters, deterministic mock mode, tools, approvals, state, task capsules, controlled behavior deltas, live-learning evals, a FastAPI/web control plane, managed MCP stdio sessions, skills, scheduler slices, durable proactive routines, and safe repair gates. Your job is to harden the next slice without regressing the current contract.
 
 ## Read First
 
@@ -90,8 +90,17 @@ npm run build --prefix web
 If the phase touches Memvid or MCP integration, run the matching gated tests:
 
 ```bash
-RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
+RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_memory_system.py tests/integration/test_memvid_context_frames.py
 RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integration.py
+```
+
+If the phase touches executable skills or containment, preload and run the required Docker-backed gate:
+
+```bash
+docker pull 'python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3'
+RUN_EXTENSION_SANDBOX_INTEGRATION=1 \
+KESTREL_EXTENSION_TEST_IMAGE='python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3' \
+python -m pytest -q tests/integration/test_extension_container_integration.py
 ```
 
 If the phase touches live provider wiring, run the gated provider harness with the relevant credentials/endpoints configured:
@@ -122,15 +131,16 @@ Treat these as implemented unless current verification proves otherwise:
 - `memory.learn`, `memory.consolidate`, and promotion gate metadata.
 - `web.search` and `web.fetch` behind `NEST_AGENT_ALLOW_WEB`, with deterministic mock backend support and public-network fetch checks.
 - Exact-call approval gates for high-risk tools.
-- SQLite state schema version 15, including durable trace spans, persisted run provider, promotion outcome ledger tables, behavior-delta ledger/activation/outcome tables, fenced run ownership, revisioned tool/MCP-server/skill capability overrides, append-only capability changes, and expiring owner-bound approvals tied to capability revision and policy/spec/parent digest.
+- SQLite state schema version 19, including durable trace spans, persisted run provider and turn source/origin/scope provenance, promotion outcome ledger tables, behavior-delta ledger/activation/outcome tables, fenced run ownership, revisioned tool/MCP-server/skill capability overrides, append-only capability changes, expiring owner-bound approvals tied to capability revision and policy/spec/parent digest, renewable claimant-only approval execution with exact scheduler task/subagent bindings, plus revisioned proactive routines, leased deterministic occurrences, and hashed manual-run idempotency claims.
 - Settings Capability Center plus `GET /api/capabilities`, revision-checked `PUT /api/capabilities/{kind}/{capability_id}`, and `GET /api/capabilities/history`; configured state never bypasses effective blockers, master flags, parent state, resource-change invalidation, or exact-call approval.
 - Replay-safe terminal run and approval decisions.
 - Managed stdio MCP sessions.
-- Skills with manifest validation, provenance hashes, and local runtimes.
+- Skills with manifest validation, provenance hashes, instruction capsules, and digest-pinned OCI execution; host Python/shell execution fails closed.
 - Alpha plugin registry/CLI with GitHub source fetch, manifest parsing, and materialization of plugin-declared skills/MCP server entries.
 - API token gate and generic HMAC webhook verification.
 - Opt-in autonomous scheduler.
-- Branch-isolated repair primitives, diagnosis-gated validation, `repair.review`, and repair-branch commit gate.
+- Opt-in proactive UTC one-shot/fixed-interval routines with disabled drafts, revision CAS, bounded background polling, atomic internal run admission, normal tool approvals, CLI/API/workbench editing and history, plus idempotent manual run-now. Cron/timezone calendars and connector delivery remain partial.
+- Branch-isolated repair primitives, diagnosis-gated validation, process-signed review artifacts, literal-tree repair commits, approval-bound rollback snapshots, and recovery quarantine.
 - Docker/Compose alpha packaging.
 
 ## Current Partial Areas
@@ -140,14 +150,14 @@ The next useful hardening work should usually target one of these:
 - Credentialed CI/release validation across the full provider matrix; Ollama Cloud + `gpt-oss:120b` has passed local live golden and live-learning E2E validation.
 - Production-grade auth, user/session isolation, and deployment boundaries.
 - MCP SSE/streamable HTTP fixtures and failure-recovery soak tests.
-- Container-grade skill isolation and package dependency management.
-- Managed plugin dependency installation, real container isolation, executable Hermes compatibility, and broader security review beyond the current review metadata and enable blockers.
+- Portable non-Docker container engines, managed skill package dependencies, richer explicit network grants, and containment soak coverage.
+- Managed plugin dependency installation, richer executable Hermes compatibility, and broader security review beyond the current review metadata, OCI skill path, and enable blockers.
 - Stronger consolidation validation loops and broader behavior-delta/operator review UX.
 - Richer self-change execution UX beyond approval-gated proposal capture and the existing repair gates.
 - Fully dynamic planner/executor/reviewer plan rewriting across worker branches.
 - Codex-backed worker fan-out with merge/review handling for isolated worker branches.
 - Production bot identity verification and channel-specific rate-limit handling.
-- Fully autonomous self-improvement with diff review, tests, rollback, and explicit human approval.
+- Fully autonomous patch synthesis and multi-candidate orchestration beyond the existing diff review, test, rollback, and explicit-approval gates.
 
 ## Tool and Approval Rules
 
@@ -256,7 +266,7 @@ Every accepted promotion must carry:
 - promotion/rejection reason
 - context-flow and optimizer-trace metadata when using `NestedLearningKernel`
 
-Do not write policy memory from a single ordinary event. Policy writes require explicit instruction or reviewed rule, high validation, repeat evidence, config enablement, and review or equivalent explicit configuration.
+Do not write policy memory from a single ordinary event. Policy writes require explicit instruction, high validation, repeat evidence, config enablement, and exact-call human approval. System-priority policy recall additionally requires durable approval and result attestation from the dedicated `memory.policy_promote` path.
 
 ## Expected Work Style
 

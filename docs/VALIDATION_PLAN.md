@@ -94,7 +94,7 @@ Every proposed promotion must include:
 - promotion or rejection reason
 - context-flow and optimizer-trace metadata where the Nested Learning kernel is used
 
-Policy promotions require explicit instruction or reviewed rule, repeat evidence, high validation, config enablement, and human review or equivalent explicit configuration.
+Policy promotions require explicit instruction, repeat evidence, high validation, config enablement, exact-call human approval, and durable approval/result attestation through `memory.policy_promote` before they may receive system-priority recall.
 
 ## Context Validation
 

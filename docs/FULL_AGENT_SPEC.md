@@ -1,6 +1,6 @@
 # Full Agent Specification
 
-Last updated: 2026-05-20
+Last updated: 2026-07-19
 
 ## Product Goal
 
@@ -184,7 +184,7 @@ The FastAPI control plane and React/Vite workbench expose:
 
 API auth can be enabled through `NEST_AGENT_REQUIRE_API_AUTH=1` plus a token environment variable.
 
-Plugin installation is an alpha/high-risk surface. The registry, CLI/API review flow, review-first web UX, allow-flag enforcement, exact-call approval, and enable blockers for unmanaged dependencies or required unavailable isolation exist. Managed dependency installation, real container isolation, executable Hermes compatibility, and shared-runtime security review remain hardening work.
+Plugin installation is an alpha/high-risk surface. The registry, CLI/API review flow, review-first web UX, allow-flag enforcement, exact-call approval, enable blockers, and digest-pinned OCI execution with private bounded read snapshots for materialized executable skills exist. Live workspace/write binds fail closed. Quota-bounded staged writeback, managed dependency installation, richer executable Hermes compatibility, portable container engines, explicit network grants, and shared-runtime security review remain hardening work.
 
 ### Channels
 
@@ -212,4 +212,4 @@ RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integ
 RUN_PROVIDER_INTEGRATION=1 python -m pytest -q tests/integration/test_provider_live_integration.py
 ```
 
-The full hosted/team product definition of done requires the remaining gaps in `docs/IMPLEMENTATION_STATUS.md` to close, especially broad credentialed provider CI, hosted identity/isolation, MCP non-stdio transport fixtures, container-grade skill isolation, and Codex-backed distributed worker orchestration. The supported single-user, single-node local/private profile has a narrower exact-byte release gate in `docs/PRODUCTION_OPERATIONS.md`.
+The full hosted/team product definition of done requires the remaining gaps in `docs/IMPLEMENTATION_STATUS.md` to close, especially broad credentialed provider CI, hosted identity/isolation, MCP non-stdio transport fixtures, portable/soak-tested executable-skill containment and dependency management, and Codex-backed distributed worker orchestration. The supported single-user, single-node local/private profile has a narrower exact-byte release gate in `docs/PRODUCTION_OPERATIONS.md`.

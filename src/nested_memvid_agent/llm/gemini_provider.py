@@ -14,7 +14,13 @@ from ..runtime_models import (
     ToolSpec,
 )
 from .base import LLMProvider, ProviderCapabilities, ProviderError
-from .parser import normalize_tool_calls, parse_agent_response
+from .parser import (
+    ControlMessageError,
+    native_tool_arguments,
+    native_tool_name,
+    normalize_tool_calls,
+    parse_agent_response,
+)
 
 
 class GeminiProvider(LLMProvider):
@@ -135,6 +141,8 @@ class GeminiProvider(LLMProvider):
             if response.usage:
                 yield LLMStreamEvent(type="usage", data=response.usage)
             yield LLMStreamEvent(type="message_complete", response=response)
+        except ControlMessageError:
+            raise
         except Exception as exc:  # noqa: BLE001
             yield LLMStreamEvent(
                 type="provider_error",
@@ -144,11 +152,47 @@ class GeminiProvider(LLMProvider):
             raise ProviderError(str(exc), code=type(exc).__name__, retryable=True) from exc
 
 
-def _gemini_contents(messages: list[ChatMessage]) -> str:
-    return "\n\n".join(
-        f"{message.role.upper()}{f' {message.name}' if message.name else ''}:\n{message.content}"
-        for message in messages
-    )
+def _gemini_contents(messages: list[ChatMessage]) -> list[dict[str, Any]]:
+    rendered: list[dict[str, Any]] = []
+
+    def append_parts(role: str, parts: list[dict[str, Any]]) -> None:
+        if rendered and rendered[-1]["role"] == role:
+            rendered[-1]["parts"].extend(parts)
+        else:
+            rendered.append({"role": role, "parts": parts})
+
+    for message in messages:
+        if message.role == "tool":
+            append_parts(
+                "user",
+                [
+                    {
+                        "function_response": {
+                            "name": message.name or "tool",
+                            "response": {"output": message.content},
+                        }
+                    }
+                ],
+            )
+            continue
+        role = "model" if message.role == "assistant" else "user"
+        parts: list[dict[str, Any]] = []
+        if message.content:
+            prefix = "SYSTEM:\n" if message.role == "system" else ""
+            parts.append({"text": f"{prefix}{message.content}"})
+        if message.role == "assistant":
+            parts.extend(
+                {
+                    "function_call": {
+                        "name": call.name,
+                        "args": call.arguments,
+                    }
+                }
+                for call in message.tool_calls
+            )
+        if parts:
+            append_parts(role, parts)
+    return rendered
 
 
 def _gemini_function(tool: ToolSpec) -> dict[str, Any]:
@@ -177,23 +221,78 @@ def _gemini_response_to_llm_response(
 
 
 def _gemini_tool_calls(response: Any) -> list[ToolCall]:
+    raw_calls = _value(response, "function_calls")
+    if raw_calls is not None:
+        if not isinstance(raw_calls, list | tuple):
+            raise ControlMessageError(
+                "gemini.function_calls must be a list",
+                code="invalid_tool_call",
+            )
+        if raw_calls:
+            return [
+                _gemini_tool_call(call, location=f"gemini.function_calls[{index}]")
+                for index, call in enumerate(raw_calls)
+            ]
+
     calls: list[ToolCall] = []
-    raw_calls = getattr(response, "function_calls", None)
-    if raw_calls:
-        for call in raw_calls:
-            name = _value(call, "name")
-            if isinstance(name, str) and name:
-                args = _value(call, "args")
-                calls.append(ToolCall(name=name, arguments=dict(args) if isinstance(args, dict) else {}))
-    for candidate in getattr(response, "candidates", []) or []:
+    raw_candidates = _value(response, "candidates")
+    if raw_candidates is None:
+        return calls
+    if not isinstance(raw_candidates, list | tuple):
+        raise ControlMessageError(
+            "gemini.candidates must be a list",
+            code="invalid_tool_call",
+        )
+    for candidate_index, candidate in enumerate(raw_candidates):
+        candidate_location = f"gemini.candidates[{candidate_index}]"
+        if not _is_native_object(candidate):
+            raise ControlMessageError(
+                f"{candidate_location} must be an object",
+                code="invalid_tool_call",
+            )
         content = _value(candidate, "content")
-        for part in _value(content, "parts") or []:
+        if content is None:
+            continue
+        if not _is_native_object(content):
+            raise ControlMessageError(
+                f"{candidate_location}.content must be an object",
+                code="invalid_tool_call",
+            )
+        raw_parts = _value(content, "parts")
+        if raw_parts is None:
+            continue
+        if not isinstance(raw_parts, list | tuple):
+            raise ControlMessageError(
+                f"{candidate_location}.content.parts must be a list",
+                code="invalid_tool_call",
+            )
+        for part_index, part in enumerate(raw_parts):
+            part_location = f"{candidate_location}.content.parts[{part_index}]"
+            if not _is_native_object(part):
+                raise ControlMessageError(
+                    f"{part_location} must be an object",
+                    code="invalid_tool_call",
+                )
             function_call = _value(part, "function_call")
-            name = _value(function_call, "name")
-            if isinstance(name, str) and name:
-                args = _value(function_call, "args")
-                calls.append(ToolCall(name=name, arguments=dict(args) if isinstance(args, dict) else {}))
+            if function_call is None:
+                continue
+            calls.append(_gemini_tool_call(function_call, location=part_location))
     return calls
+
+
+def _gemini_tool_call(call: Any, *, location: str) -> ToolCall:
+    if not _is_native_object(call):
+        raise ControlMessageError(
+            f"{location}.function_call must be an object",
+            code="invalid_tool_call",
+        )
+    name = native_tool_name(_value(call, "name"), location=location)
+    arguments = native_tool_arguments(
+        _value(call, "args"),
+        tool_name=name,
+        location=location,
+    )
+    return ToolCall(name=name, arguments=arguments)
 
 
 def _usage_dict(response: Any) -> dict[str, Any] | None:
@@ -222,3 +321,10 @@ def _value(item: Any, key: str) -> Any:
     if isinstance(item, dict):
         return item.get(key)
     return getattr(item, key, None)
+
+
+def _is_native_object(value: Any) -> bool:
+    return isinstance(value, dict) or (
+        value is not None
+        and not isinstance(value, str | bytes | list | tuple | bool | int | float)
+    )

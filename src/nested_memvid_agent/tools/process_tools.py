@@ -33,13 +33,18 @@ def _run_subprocess(
     arguments: dict[str, Any],
     default_timeout: int,
     sanitize_environment: bool = False,
+    environment_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     timeout = _effective_timeout(arguments, context, default_timeout)
     call_id = str(arguments.get("_tool_call_id") or "")
+    environment = sanitized_subprocess_environment() if sanitize_environment else None
+    if environment_overrides:
+        environment = dict(os.environ if environment is None else environment)
+        environment.update(environment_overrides)
     process = _start_subprocess(
         command,
         context=context,
-        environment=(sanitized_subprocess_environment() if sanitize_environment else None),
+        environment=environment,
     )
     process_group_id = process.pid if sys.platform != "win32" else None
     if call_id:
@@ -172,9 +177,13 @@ def _kill_process_group(
 
 
 def _terminate_windows_process_tree(process: subprocess.Popen[str]) -> None:
+    taskkill_executable = _windows_taskkill_executable()
+    if taskkill_executable is None:
+        process.kill()
+        return
     try:
         subprocess.run(  # noqa: S603  # nosec B603
-            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            [taskkill_executable, "/PID", str(process.pid), "/T", "/F"],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -182,6 +191,21 @@ def _terminate_windows_process_tree(process: subprocess.Popen[str]) -> None:
         )
     except (FileNotFoundError, subprocess.SubprocessError):
         process.kill()
+
+
+def _windows_taskkill_executable() -> str | None:
+    windows_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
+    if not windows_root:
+        return None
+    try:
+        executable = (
+            Path(windows_root).expanduser() / "System32" / "taskkill.exe"
+        ).resolve(strict=True)
+    except OSError:
+        return None
+    if not executable.is_file() or not executable.is_absolute():
+        return None
+    return str(executable)
 
 
 def _process_output_text(primary: str | bytes | None, fallback: str | bytes | None) -> str:

@@ -110,6 +110,17 @@ class FailureEpisode:
         if self.tool_name:
             title = f"{title} in {self.tool_name}"
         content = json.dumps(self.to_payload(), indent=2)
+        evidence = [
+            EvidenceRef(
+                source=f"agent_runtime://runs/{self.run_id}",
+                locator=self.failure_id,
+                quote=self.error_text[:280],
+            )
+        ]
+        evidence.extend(
+            EvidenceRef(source="validation", locator=validation_ref)
+            for validation_ref in self.validation_evidence
+        )
         return MemoryRecord(
             id=self.failure_id,
             title=title,
@@ -125,15 +136,9 @@ class FailureEpisode:
                 "run_id": self.run_id,
                 "tool_name": self.tool_name,
                 "failure_category": self.category,
-                "validation_status": "unresolved",
+                "validation_status": "resolved" if self.resolved else "unresolved",
             },
-            evidence=[
-                EvidenceRef(
-                    source=f"agent_runtime://runs/{self.run_id}",
-                    locator=self.failure_id,
-                    quote=self.error_text[:280],
-                )
-            ],
+            evidence=evidence,
         )
 
 

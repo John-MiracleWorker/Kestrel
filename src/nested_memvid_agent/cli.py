@@ -5,16 +5,19 @@ import importlib.util
 import ipaddress
 import json
 import platform
+import sqlite3
 import subprocess  # nosec B404
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from time import monotonic, sleep
 from typing import Any
+from uuid import uuid4
 
 from .agent import NestedMV2Agent
+from .agent_backup import AgentBackupManager
 from .app_factory import build_agent
 from .behavior_delta_extractor import BehaviorDeltaExtractor
 from .behavior_delta_ledger import BehaviorDeltaLedger
@@ -24,28 +27,34 @@ from .config import AgentConfig
 from .context_compiler import ContextCompiler
 from .context_packer import ContextPacker, ContextPackRequest
 from .event_bus import RunEventBus
-from .layers import load_layer_specs
+from .layers import DEFAULT_LAYER_SPECS, LayerSpec, load_layer_specs
 from .llm.model_catalog import PROVIDER_OPTIONS
 from .mcp_manager import MCPManager
 from .memory_backup import MemoryBackupError, MemoryBackupManager
 from .models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
+from .nested_learning import direct_memory_write_allowed
 from .orchestrator import build_memory_system
 from .plugin_manager import PluginError, PluginManager
 from .product_readiness import build_product_readiness_report
 from .promotion_ledger import OUTCOME_KINDS, PromotionLedger
 from .provider_certification import build_provider_certification_report
+from .routines import RoutineService
 from .run_manager import RunManager
 from .runtime_models import LLMStreamEvent, ToolCall
+from .runtime_ownership import PrimaryRuntimeOwnership, RuntimeOwnershipError
+from .runtime_settings import default_runtime_settings_path
 from .setup_readiness import build_setup_readiness_report
 from .skill_manager import SkillManager
-from .state_store import AgentStateStore
+from .state_store import AgentStateStore, RoutineConflictError
 from .support_bundle import export_support_bundle
 from .task_capsule import summarize_run_capsule
 from .tools.base import ToolContext
 from .tools.builtin import build_default_tools
 
 
-def _add_common_args(parser: argparse.ArgumentParser, *, default: object = argparse.SUPPRESS) -> None:
+def _add_common_args(
+    parser: argparse.ArgumentParser, *, default: object = argparse.SUPPRESS
+) -> None:
     parser.add_argument("--backend", choices=["memory", "memvid"], default=default)
     parser.add_argument("--memory-dir", type=Path, default=default)
     parser.add_argument("--layer-config", type=Path, default=default)
@@ -70,7 +79,9 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
         default=argparse.SUPPRESS,
     )
     parser.add_argument("--codex-profile", default=argparse.SUPPRESS)
-    parser.add_argument("--codex-skip-git-repo-check", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--codex-skip-git-repo-check", action="store_true", default=argparse.SUPPRESS
+    )
     parser.add_argument("--codex-persist-session", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--workspace", type=Path, default=argparse.SUPPRESS)
     parser.add_argument("--log-dir", type=Path, default=argparse.SUPPRESS)
@@ -97,16 +108,29 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--protected-branches", default=argparse.SUPPRESS)
     parser.add_argument("--allow-memory-import", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--allow-executable-skills", action="store_true", default=argparse.SUPPRESS)
-    parser.add_argument("--allow-mcp-network-endpoints", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--allow-mcp-network-endpoints", action="store_true", default=argparse.SUPPRESS
+    )
     parser.add_argument("--allow-web", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--allow-self-modification", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--web-backend", choices=["direct", "mock"], default=argparse.SUPPRESS)
     parser.add_argument("--web-timeout-seconds", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--web-max-results", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--web-max-bytes", type=int, default=argparse.SUPPRESS)
-    parser.add_argument("--enable-autonomous-scheduler", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--enable-semantic-orchestration", action="store_true", default=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--enable-autonomous-scheduler", action="store_true", default=argparse.SUPPRESS
+    )
     parser.add_argument("--max-scheduler-tasks", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--max-scheduler-cycles", type=int, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--enable-proactive-routines", action="store_true", default=argparse.SUPPRESS
+    )
+    parser.add_argument("--routine-poll-interval-seconds", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--routine-claim-ttl-seconds", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--max-routines-per-tick", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--enable-worker-isolation", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--worker-worktree-dir", type=Path, default=argparse.SUPPRESS)
     parser.add_argument("--worker-branch-prefix", default=argparse.SUPPRESS)
@@ -114,8 +138,12 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-tool-rounds", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--context-budget-chars", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--disable-task-capsules", action="store_true", default=argparse.SUPPRESS)
-    parser.add_argument("--enable-auto-consolidation", action="store_true", default=argparse.SUPPRESS)
-    parser.add_argument("--auto-consolidation-write", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--enable-auto-consolidation", action="store_true", default=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--auto-consolidation-write", action="store_true", default=argparse.SUPPRESS
+    )
     parser.add_argument("--enable-auto-compact", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--auto-compact-apply", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--context-pack-token-budget", type=int, default=argparse.SUPPRESS)
@@ -133,7 +161,9 @@ def main() -> None:
     put = sub.add_parser("put")
     _add_common_args(put)
     put.add_argument("--layer", choices=[layer.value for layer in MemoryLayer], required=True)
-    put.add_argument("--kind", choices=[kind.value for kind in MemoryKind], default=MemoryKind.OBSERVATION.value)
+    put.add_argument(
+        "--kind", choices=[kind.value for kind in MemoryKind], default=MemoryKind.OBSERVATION.value
+    )
     put.add_argument("--title", required=True)
     put.add_argument("--text", required=True)
     put.add_argument("--confidence", type=float, default=0.8)
@@ -150,17 +180,23 @@ def main() -> None:
     _add_common_args(memory_search)
     memory_search.add_argument("query")
     memory_search.add_argument("--k", type=int, default=8)
-    memory_search.add_argument("--mode", choices=["auto", "lex", "vec", "vector", "hybrid"], default="auto")
+    memory_search.add_argument(
+        "--mode", choices=["auto", "lex", "vec", "vector", "hybrid"], default="auto"
+    )
     memory_verify = memory_sub.add_parser("verify")
     _add_common_args(memory_verify)
     memory_doctor = memory_sub.add_parser("doctor")
     _add_common_args(memory_doctor)
-    memory_doctor.add_argument("--repair", action="store_true", help="Allow backend-supported repair instead of dry-run.")
+    memory_doctor.add_argument(
+        "--repair", action="store_true", help="Allow backend-supported repair instead of dry-run."
+    )
     memory_inspect = memory_sub.add_parser("inspect")
     _add_common_args(memory_inspect)
     memory_inspect.add_argument("query")
     memory_inspect.add_argument("--k", type=int, default=8)
-    memory_inspect.add_argument("--mode", choices=["auto", "lex", "vec", "vector", "hybrid"], default="auto")
+    memory_inspect.add_argument(
+        "--mode", choices=["auto", "lex", "vec", "vector", "hybrid"], default="auto"
+    )
     memory_inspect.add_argument("--include-inactive", action="store_true")
     memory_vector = memory_sub.add_parser("vector")
     vector_sub = memory_vector.add_subparsers(dest="vector_cmd", required=True)
@@ -174,7 +210,9 @@ def main() -> None:
     memory_consolidate = memory_sub.add_parser("consolidate")
     _add_common_args(memory_consolidate)
     memory_consolidate.add_argument("query")
-    memory_consolidate.add_argument("--source-layer", choices=[layer.value for layer in MemoryLayer])
+    memory_consolidate.add_argument(
+        "--source-layer", choices=[layer.value for layer in MemoryLayer]
+    )
     memory_consolidate.add_argument("--validation-score", type=float, default=0.7)
     memory_consolidate.add_argument("--repeat-count", type=int, default=1)
     memory_consolidate.add_argument("--explicit-instruction", action="store_true")
@@ -186,13 +224,18 @@ def main() -> None:
     memory_correct.add_argument("--evidence-source", default="cli")
     memory_correct.add_argument("--evidence-locator", default="memory.correct")
     memory_correct.add_argument("--dry-run", action="store_true")
-    memory_correct.add_argument("--allow-memory-import", action="store_true", default=argparse.SUPPRESS)
+    memory_correct.add_argument(
+        "--allow-memory-import", action="store_true", default=argparse.SUPPRESS
+    )
     memory_compact = memory_sub.add_parser("compact")
     _add_common_args(memory_compact)
-    memory_compact.add_argument("--layer", choices=[layer.value for layer in MemoryLayer], default=MemoryLayer.WORKING.value)
+    memory_compact.add_argument(
+        "--layer", choices=[layer.value for layer in MemoryLayer], default=MemoryLayer.WORKING.value
+    )
     memory_compact.add_argument("--apply", action="store_true")
     memory_backup = memory_sub.add_parser("backup")
     _add_common_args(memory_backup)
+    memory_backup.add_argument("--state-path", type=Path, default=argparse.SUPPRESS)
     memory_backup.add_argument("--backup-dir", type=Path, default=Path(".nest/backups/memory"))
     memory_backup.add_argument("--retain", type=int, default=7)
     memory_backup_list = memory_sub.add_parser("backup-list")
@@ -201,13 +244,18 @@ def main() -> None:
     memory_backup_verify = memory_sub.add_parser("backup-verify")
     memory_backup_verify.add_argument("backup_id")
     memory_backup_verify.add_argument("--memory-dir", type=Path, default=Path(".nest/memory"))
-    memory_backup_verify.add_argument("--backup-dir", type=Path, default=Path(".nest/backups/memory"))
+    memory_backup_verify.add_argument(
+        "--backup-dir", type=Path, default=Path(".nest/backups/memory")
+    )
     memory_restore = memory_sub.add_parser("restore")
     _add_common_args(memory_restore)
+    memory_restore.add_argument("--state-path", type=Path, default=argparse.SUPPRESS)
     memory_restore.add_argument("backup_id")
     memory_restore.add_argument("--backup-dir", type=Path, default=Path(".nest/backups/memory"))
     memory_restore.add_argument("--retain", type=int, default=7)
-    memory_restore.add_argument("--yes", action="store_true", help="Confirm destructive memory replacement.")
+    memory_restore.add_argument(
+        "--yes", action="store_true", help="Confirm destructive memory replacement."
+    )
     memory_ledger = memory_sub.add_parser("ledger")
     memory_ledger.add_argument("--state-path", type=Path, default=Path(".nest/state/agent.db"))
     memory_ledger.add_argument("--since", default="30d")
@@ -229,11 +277,12 @@ def main() -> None:
     deltas_ledger.add_argument("--json", action="store_true")
     deltas_skill_preview = deltas_sub.add_parser("skill-preview")
     deltas_skill_preview.add_argument("delta_id")
-    deltas_skill_preview.add_argument("--state-path", type=Path, default=Path(".nest/state/agent.db"))
+    deltas_skill_preview.add_argument(
+        "--state-path", type=Path, default=Path(".nest/state/agent.db")
+    )
     deltas_skill_preview.add_argument("--skills-dir", type=Path, default=Path(".nest/skills"))
     deltas_skill_preview.add_argument("--skill-id")
     deltas_skill_preview.add_argument("--json", action="store_true")
-
 
     learning_cmd = sub.add_parser("learning")
     learning_sub = learning_cmd.add_subparsers(dest="learning_cmd", required=True)
@@ -262,6 +311,33 @@ def main() -> None:
     product_support.add_argument("--output", type=Path)
     product_support.add_argument("--log-tail", type=int, default=100)
     product_support.add_argument("--json", action="store_true")
+
+    backup_cmd = sub.add_parser(
+        "backup",
+        help="Create or restore a coherent agent snapshot (memory, state, capsules, config, skills, plugins).",
+    )
+    backup_sub = backup_cmd.add_subparsers(dest="backup_cmd", required=True)
+    backup_create = backup_sub.add_parser("create")
+    _add_agent_args(backup_create)
+    backup_create.add_argument("--backup-dir", type=Path, default=Path(".nest/backups/agent"))
+    backup_create.add_argument("--retain", type=int, default=7)
+    backup_list = backup_sub.add_parser("list")
+    _add_agent_args(backup_list)
+    backup_list.add_argument("--backup-dir", type=Path, default=Path(".nest/backups/agent"))
+    backup_verify = backup_sub.add_parser("verify")
+    _add_agent_args(backup_verify)
+    backup_verify.add_argument("backup_id")
+    backup_verify.add_argument("--backup-dir", type=Path, default=Path(".nest/backups/agent"))
+    backup_restore = backup_sub.add_parser("restore")
+    _add_agent_args(backup_restore)
+    backup_restore.add_argument("backup_id")
+    backup_restore.add_argument("--backup-dir", type=Path, default=Path(".nest/backups/agent"))
+    backup_restore.add_argument("--retain", type=int, default=7)
+    backup_restore.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm replacement of backed-up runtime components.",
+    )
 
     compile_cmd = sub.add_parser("compile-context")
     _add_common_args(compile_cmd)
@@ -314,18 +390,100 @@ def main() -> None:
     plugins_remove.add_argument("plugin_id")
     plugins_remove.add_argument("--json", action="store_true")
 
-    chat = sub.add_parser("chat")
+    chat = sub.add_parser(
+        "chat",
+        epilog=(
+            "With --message, exit status is 0 for completion, 2 for an operator-action "
+            "block, and 1 for failure or cancellation. Interactive chat reports each "
+            "turn without terminating the session."
+        ),
+    )
     _add_agent_args(chat)
     chat.add_argument("--message", help="Run one chat turn. If omitted, enter interactive mode.")
     chat.add_argument("--session-id", default="cli")
 
-    run_cmd = sub.add_parser("run")
+    run_cmd = sub.add_parser(
+        "run",
+        description="Create one durable run and wait for its terminal outcome.",
+        epilog=(
+            "Exit status: 0 when the run completed; 2 when it is blocked and needs "
+            "operator action; 1 when it failed, was cancelled, or returned an unknown "
+            "state. The run payload is printed before any nonzero exit. Local --no-wait "
+            "is rejected because a terminating CLI cannot own background execution."
+        ),
+    )
     _add_agent_args(run_cmd)
     run_cmd.add_argument("message")
     run_cmd.add_argument("--session-id", default="cli")
     run_cmd.add_argument("--json", action="store_true")
-    run_cmd.add_argument("--no-wait", action="store_true")
+    run_cmd.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Rejected locally; submit asynchronous work through the authenticated server/API.",
+    )
     run_cmd.add_argument("--events", action="store_true")
+
+    routines_cmd = sub.add_parser("routines")
+    routines_sub = routines_cmd.add_subparsers(dest="routines_cmd", required=True)
+    routines_list = routines_sub.add_parser("list")
+    _add_agent_args(routines_list)
+    routines_list.add_argument("--json", action="store_true")
+    routines_create = routines_sub.add_parser("create")
+    _add_agent_args(routines_create)
+    routines_create.add_argument("--id", dest="routine_id")
+    routines_create.add_argument("--name", dest="routine_name", required=True)
+    routines_create.add_argument("--prompt", dest="routine_prompt", required=True)
+    routines_create.add_argument(
+        "--schedule-kind", choices=["once", "interval"], default="interval"
+    )
+    routines_create.add_argument("--start-at")
+    routines_create.add_argument("--interval-seconds", type=int)
+    routines_create.add_argument("--routine-workspace")
+    routines_create.add_argument("--routine-provider")
+    routines_create.add_argument("--routine-model")
+    routines_create.add_argument(
+        "--routine-autonomy",
+        choices=["background", "manual", "autonomous"],
+        default="background",
+    )
+    routines_create.add_argument("--misfire-grace-seconds", type=int, default=60)
+    routines_create.add_argument("--json", action="store_true")
+    routines_show = routines_sub.add_parser("show")
+    _add_agent_args(routines_show)
+    routines_show.add_argument("routine_id")
+    routines_show.add_argument("--json", action="store_true")
+    routines_update = routines_sub.add_parser("update")
+    _add_agent_args(routines_update)
+    routines_update.add_argument("routine_id")
+    routines_update.add_argument("--expected-revision", type=int, required=True)
+    routines_update.add_argument("--name", dest="routine_name")
+    routines_update.add_argument("--prompt", dest="routine_prompt")
+    routines_update.add_argument("--schedule-kind", choices=["once", "interval"])
+    routines_update.add_argument("--start-at")
+    routines_update.add_argument("--interval-seconds", type=int)
+    routines_update.add_argument("--routine-workspace")
+    routines_update.add_argument("--routine-provider")
+    routines_update.add_argument("--routine-model")
+    routines_update.add_argument(
+        "--routine-autonomy",
+        choices=["background", "manual", "autonomous"],
+    )
+    routines_update.add_argument("--misfire-grace-seconds", type=int)
+    routines_update.add_argument("--json", action="store_true")
+    for action in ("enable", "disable", "delete"):
+        routine_mutation = routines_sub.add_parser(action)
+        _add_agent_args(routine_mutation)
+        routine_mutation.add_argument("routine_id")
+        routine_mutation.add_argument("--expected-revision", type=int, required=True)
+        routine_mutation.add_argument("--json", action="store_true")
+    routines_tick = routines_sub.add_parser("tick")
+    _add_agent_args(routines_tick)
+    routines_tick.add_argument("--json", action="store_true")
+    routines_history = routines_sub.add_parser("history")
+    _add_agent_args(routines_history)
+    routines_history.add_argument("routine_id")
+    routines_history.add_argument("--limit", type=int, default=100)
+    routines_history.add_argument("--json", action="store_true")
 
     status_cmd = sub.add_parser("status")
     _add_agent_args(status_cmd)
@@ -341,9 +499,15 @@ def main() -> None:
     approve_cmd = sub.add_parser("approve")
     _add_agent_args(approve_cmd)
     approve_cmd.add_argument("approval_id")
-    approve_cmd.add_argument("--arguments", help="Optional JSON object replacing the originally requested arguments.")
+    approve_cmd.add_argument(
+        "--arguments", help="Optional JSON object replacing the originally requested arguments."
+    )
     approve_cmd.add_argument("--json", action="store_true")
-    approve_cmd.add_argument("--no-wait", action="store_true")
+    approve_cmd.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Rejected locally; resume approvals through the authenticated server/API.",
+    )
 
     deny_cmd = sub.add_parser("deny")
     _add_agent_args(deny_cmd)
@@ -371,52 +535,88 @@ def main() -> None:
 
     channel = sub.add_parser("channel")
     _add_agent_args(channel)
-    channel.add_argument("channel_provider", help="Channel provider: telegram, discord, webhook, or custom.")
+    channel.add_argument(
+        "channel_provider", help="Channel provider: telegram, discord, webhook, or custom."
+    )
     channel.add_argument("--channel-id", help="Configured channel id. Defaults to provider.")
-    channel.add_argument("--send", action="store_true", help="Request outbound delivery after the agent responds.")
+    channel.add_argument(
+        "--send", action="store_true", help="Request outbound delivery after the agent responds."
+    )
     channel.add_argument(
         "--telegram-webhook-action",
         choices=["info", "set", "delete", "test"],
         help="Run Telegram webhook setup/status action instead of ingesting a payload.",
     )
-    channel.add_argument("--webhook-url", help="Public Telegram webhook URL for --telegram-webhook-action set.")
-    channel.add_argument("--test-chat-id", help="Telegram chat id for --telegram-webhook-action test.")
+    channel.add_argument(
+        "--webhook-url", help="Public Telegram webhook URL for --telegram-webhook-action set."
+    )
+    channel.add_argument(
+        "--test-chat-id", help="Telegram chat id for --telegram-webhook-action test."
+    )
     channel.add_argument("--test-text", default="Kestrel Telegram channel test.")
     payload_group = channel.add_mutually_exclusive_group(required=False)
     payload_group.add_argument("--payload", help="Inbound channel payload as JSON.")
-    payload_group.add_argument("--payload-file", type=Path, help="Path to inbound channel payload JSON, or '-' for stdin.")
+    payload_group.add_argument(
+        "--payload-file", type=Path, help="Path to inbound channel payload JSON, or '-' for stdin."
+    )
 
     args = parser.parse_args()
+    if args.cmd == "run" and args.no_wait:
+        raise SystemExit(
+            "Local `run --no-wait` is unsafe because the CLI process cannot own "
+            "background execution after it exits. Submit asynchronous work through "
+            "the authenticated server API at POST /api/runs."
+        )
+    if args.cmd == "approve" and args.no_wait:
+        raise SystemExit(
+            "Local `approve --no-wait` is unsafe because the CLI process cannot own "
+            "approval continuation after it exits. Resume through the authenticated "
+            "server API at POST /api/approvals/{approval_id}/decision."
+        )
     config = _agent_config_from_args(args)
     backend = config.backend
     memory_dir = config.memory_dir
 
     if args.cmd == "chat":
         manager = _build_run_manager(config)
+        exit_code = 0
         try:
             if args.message:
-                if _handle_slash_command_for_manager(manager, config, args.message.strip(), args.session_id):
+                if _handle_slash_command_for_manager(
+                    manager, config, args.message.strip(), args.session_id
+                ):
                     return
-                _run_manager_chat_and_print(manager, args.message, session_id=args.session_id)
-                return
-            print("Nested MV2 Agent chat. Type /exit to quit.")
-            while True:
-                user_message = input("you> ").strip()
-                if user_message in {"/exit", "/quit"}:
-                    return
-                if not user_message:
-                    continue
-                if _handle_slash_command_for_manager(manager, config, user_message, args.session_id):
-                    continue
-                _run_manager_chat_and_print(manager, user_message, session_id=args.session_id, prefix="agent> ")
+                exit_code = _run_manager_chat_and_print(
+                    manager, args.message, session_id=args.session_id
+                )
+            else:
+                print("Kestrel chat. Type /exit to quit.")
+                while True:
+                    user_message = input("you> ").strip()
+                    if user_message in {"/exit", "/quit"}:
+                        break
+                    if not user_message:
+                        continue
+                    if _handle_slash_command_for_manager(
+                        manager, config, user_message, args.session_id
+                    ):
+                        continue
+                    _run_manager_chat_and_print(
+                        manager,
+                        user_message,
+                        session_id=args.session_id,
+                        prefix="agent> ",
+                    )
         finally:
-            manager.mcp.shutdown()
+            _shutdown_run_manager(manager)
+        if exit_code:
+            raise SystemExit(exit_code)
         return
 
     if args.cmd == "run":
         manager = _build_run_manager(config)
         try:
-            _create_run_and_print(
+            exit_code = _create_run_and_print(
                 manager,
                 args.message,
                 session_id=args.session_id,
@@ -425,29 +625,37 @@ def main() -> None:
                 include_events=args.events,
             )
         finally:
-            manager.mcp.shutdown()
+            _shutdown_run_manager(manager)
+        if exit_code:
+            raise SystemExit(exit_code)
+        return
+
+    if args.cmd == "routines":
+        _handle_routines_command(args, config)
         return
 
     if args.cmd == "status":
-        manager = _build_run_manager(config)
+        manager = _build_run_manager(config, read_only_observer=True)
         try:
-            _print_status(manager, run_id=args.run_id, json_output=args.json, include_events=args.events)
+            _print_status(
+                manager, run_id=args.run_id, json_output=args.json, include_events=args.events
+            )
         finally:
-            manager.mcp.shutdown()
+            _shutdown_run_manager(manager)
         return
 
     if args.cmd == "approvals":
-        manager = _build_run_manager(config)
+        manager = _build_run_manager(config, read_only_observer=True)
         try:
             _print_approvals(manager, status=args.status, json_output=args.json)
         finally:
-            manager.mcp.shutdown()
+            _shutdown_run_manager(manager)
         return
 
     if args.cmd in {"approve", "deny"}:
         manager = _build_run_manager(config)
         try:
-            _decide_approval_and_print(
+            exit_code = _decide_approval_and_print(
                 manager,
                 approval_id=args.approval_id,
                 approved=args.cmd == "approve",
@@ -456,7 +664,9 @@ def main() -> None:
                 wait=not getattr(args, "no_wait", False),
             )
         finally:
-            manager.mcp.shutdown()
+            _shutdown_run_manager(manager)
+        if exit_code:
+            raise SystemExit(exit_code)
         return
 
     if args.cmd == "server":
@@ -467,44 +677,65 @@ def main() -> None:
         from .server import create_app
 
         _validate_server_bind(args.host, config)
-        uvicorn.run(create_app(config), host=args.host, port=args.port, access_log=args.access_log)
+        try:
+            app = create_app(config)
+        except RuntimeOwnershipError as exc:
+            raise SystemExit(_runtime_ownership_message()) from exc
+        uvicorn.run(app, host=args.host, port=args.port, access_log=args.access_log)
         return
 
     if args.cmd == "channel":
-            channel_manager = ChannelManager(config)
-            try:
-                if args.telegram_webhook_action:
-                    channel_id = args.channel_id or args.channel_provider
-                    if args.telegram_webhook_action == "info":
-                        webhook_result = channel_manager.telegram_webhook_info(channel_id)
-                    elif args.telegram_webhook_action == "set":
-                        if not args.webhook_url:
-                            raise SystemExit("--webhook-url is required for --telegram-webhook-action set")
-                        webhook_result = channel_manager.telegram_set_webhook(channel_id, url=args.webhook_url)
-                    elif args.telegram_webhook_action == "delete":
-                        webhook_result = channel_manager.telegram_delete_webhook(channel_id)
-                    else:
-                        if not args.test_chat_id:
-                            raise SystemExit("--test-chat-id is required for --telegram-webhook-action test")
-                        webhook_result = channel_manager.telegram_test_message(
-                            channel_id,
-                            chat_id=args.test_chat_id,
-                            text=args.test_text,
-                        )
-                    print(json.dumps(webhook_result, indent=2))
-                    return
-                if args.payload is None and args.payload_file is None:
-                    raise SystemExit("channel payload required: pass --payload/--payload-file or --telegram-webhook-action")
-                process_result = channel_manager.handle_payload(
-                    provider=args.channel_provider,
-                    channel_id=args.channel_id,
-                    payload=_load_channel_payload(args),
-                    send=args.send,
+        channel_run_manager: RunManager | None = None
+        if not args.telegram_webhook_action:
+            if args.payload is None and args.payload_file is None:
+                raise SystemExit(
+                    "channel payload required: pass --payload/--payload-file or --telegram-webhook-action"
                 )
-            except ChannelPayloadError as exc:
-                raise SystemExit(str(exc)) from exc
-            print(json.dumps(process_result.to_public_dict(), indent=2))
-            return
+            channel_run_manager = _build_run_manager(config)
+        channel_manager = ChannelManager(config, run_manager=channel_run_manager)
+        try:
+            if args.telegram_webhook_action:
+                channel_id = args.channel_id or args.channel_provider
+                if args.telegram_webhook_action == "info":
+                    webhook_result = channel_manager.telegram_webhook_info(channel_id)
+                elif args.telegram_webhook_action == "set":
+                    if not args.webhook_url:
+                        raise SystemExit(
+                            "--webhook-url is required for --telegram-webhook-action set"
+                        )
+                    webhook_result = channel_manager.telegram_set_webhook(
+                        channel_id, url=args.webhook_url
+                    )
+                elif args.telegram_webhook_action == "delete":
+                    webhook_result = channel_manager.telegram_delete_webhook(channel_id)
+                else:
+                    if not args.test_chat_id:
+                        raise SystemExit(
+                            "--test-chat-id is required for --telegram-webhook-action test"
+                        )
+                    webhook_result = channel_manager.telegram_test_message(
+                        channel_id,
+                        chat_id=args.test_chat_id,
+                        text=args.test_text,
+                    )
+                print(json.dumps(webhook_result, indent=2))
+                return
+            process_result = channel_manager.handle_payload(
+                provider=args.channel_provider,
+                channel_id=args.channel_id,
+                payload=_load_channel_payload(args),
+                send=args.send,
+            )
+        except ChannelPayloadError as exc:
+            raise SystemExit(str(exc)) from exc
+        finally:
+            try:
+                channel_manager.close()
+            finally:
+                if channel_run_manager is not None:
+                    _shutdown_run_manager(channel_run_manager)
+        print(json.dumps(process_result.to_public_dict(), indent=2))
+        return
 
     if args.cmd == "tools":
         specs = [spec.to_public_dict() for spec in build_default_tools().specs()]
@@ -517,15 +748,21 @@ def main() -> None:
         return
 
     if args.cmd == "plugins":
-        manager = _build_run_manager(config)
+        manager = _build_run_manager(
+            config,
+            read_only_observer=args.plugins_cmd in {"list", "inspect"},
+        )
         try:
             _handle_plugins_command(args, manager, backend=backend, memory_dir=memory_dir)
         finally:
-            manager.mcp.shutdown()
+            _shutdown_run_manager(manager)
         return
 
     if args.cmd == "doctor":
-        print(json.dumps(_doctor_runtime(config), indent=2))
+        report = _doctor_runtime(config)
+        print(json.dumps(report, indent=2))
+        if report.get("ok") is not True:
+            raise SystemExit(1)
         return
 
     if args.cmd == "eval":
@@ -552,6 +789,10 @@ def main() -> None:
         _print_support_bundle(config, args)
         return
 
+    if args.cmd == "backup":
+        _handle_agent_backup_command(config, args)
+        return
+
     if args.cmd == "memory" and args.memory_cmd in {
         "backup",
         "backup-list",
@@ -570,7 +811,9 @@ def main() -> None:
         return
 
     ledger = _ledger_for_memory_command(args)
-    memory = build_memory_system(backend, memory_dir, specs=_specs_from_config(config), ledger=ledger)
+    memory = build_memory_system(
+        backend, memory_dir, specs=_specs_from_config(config), ledger=ledger
+    )
     try:
         if args.cmd == "memory":
             if args.memory_cmd == "vector":
@@ -604,7 +847,11 @@ def main() -> None:
                     if args.memory_cmd == "inspect":
                         memory_payload["metadata"] = hit.record.metadata
                         memory_payload["evidence"] = [
-                            {"source": evidence.source, "locator": evidence.locator, "quote": evidence.quote}
+                            {
+                                "source": evidence.source,
+                                "locator": evidence.locator,
+                                "quote": evidence.quote,
+                            }
                             for evidence in hit.record.evidence
                         ]
                     print(json.dumps(memory_payload, indent=2))
@@ -696,8 +943,14 @@ def main() -> None:
             return
 
         if args.cmd == "put":
+            target_layer = MemoryLayer(args.layer)
+            if not direct_memory_write_allowed(target_layer):
+                raise SystemExit(
+                    f"Direct CLI writes to {target_layer.value} memory are rejected. "
+                    "Use a validated promotion path with durable source evidence."
+                )
             record = MemoryRecord(
-                layer=MemoryLayer(args.layer),
+                layer=target_layer,
                 kind=MemoryKind(args.kind),
                 title=args.title,
                 content=args.text,
@@ -778,9 +1031,14 @@ _CONFIG_ARG_FIELDS = {
     "web_timeout_seconds": "web_timeout_seconds",
     "web_max_results": "web_max_results",
     "web_max_bytes": "web_max_bytes",
+    "enable_semantic_orchestration": "enable_semantic_orchestration",
     "enable_autonomous_scheduler": "enable_autonomous_scheduler",
     "max_scheduler_tasks": "max_scheduler_tasks",
     "max_scheduler_cycles": "max_scheduler_cycles",
+    "enable_proactive_routines": "enable_proactive_routines",
+    "routine_poll_interval_seconds": "routine_poll_interval_seconds",
+    "routine_claim_ttl_seconds": "routine_claim_ttl_seconds",
+    "max_routines_per_tick": "max_routines_per_tick",
     "enable_worker_isolation": "enable_worker_isolation",
     "worker_worktree_dir": "worker_worktree_dir",
     "worker_branch_prefix": "worker_branch_prefix",
@@ -802,7 +1060,9 @@ def _agent_config_from_args(args: argparse.Namespace) -> AgentConfig:
         if hasattr(args, arg_name):
             overrides[field_name] = getattr(args, arg_name)
     if hasattr(args, "protected_branches"):
-        overrides["protected_branches"] = tuple(part.strip() for part in args.protected_branches.split(",") if part.strip())
+        overrides["protected_branches"] = tuple(
+            part.strip() for part in args.protected_branches.split(",") if part.strip()
+        )
     if hasattr(args, "codex_persist_session"):
         overrides["codex_ephemeral"] = False
     if hasattr(args, "disable_task_capsules"):
@@ -818,16 +1078,21 @@ def _specs_from_config(config: AgentConfig) -> dict[MemoryLayer, Any] | None:
 
 
 def _handle_memory_backup_command(config: AgentConfig, args: argparse.Namespace) -> None:
-    manager = MemoryBackupManager(
-        memory_dir=config.memory_dir,
-        backup_root=Path(args.backup_dir),
-        specs=_specs_from_config(config),
-    )
     command = str(args.memory_cmd)
     if command == "backup-list":
+        manager = MemoryBackupManager(
+            memory_dir=config.memory_dir,
+            backup_root=Path(args.backup_dir),
+            specs=_specs_from_config(config),
+        )
         print(json.dumps(manager.list_backups(), indent=2))
         return
     if command == "backup-verify":
+        manager = MemoryBackupManager(
+            memory_dir=config.memory_dir,
+            backup_root=Path(args.backup_dir),
+            specs=_specs_from_config(config),
+        )
         result = manager.validate(str(args.backup_id))
         print(json.dumps(result, indent=2))
         if not result["ok"]:
@@ -835,31 +1100,156 @@ def _handle_memory_backup_command(config: AgentConfig, args: argparse.Namespace)
         return
     if config.backend != "memvid":
         raise SystemExit("Memory backup and restore require --backend memvid.")
-    active = AgentStateStore(config.state_path).list_nonterminal_runs()
-    if active:
-        raise SystemExit("Refusing memory backup/restore while non-terminal runs exist.")
     if command == "restore" and not bool(args.yes):
         raise SystemExit("Memory restore is destructive; rerun with --yes after stopping Kestrel.")
-    if command == "backup":
-        _seal_and_verify_memory(config)
-        print(json.dumps(manager.create(retain=max(1, int(args.retain))), indent=2))
-        return
-    if command == "restore":
-        result = manager.restore(
-            str(args.backup_id),
-            retain=max(2, int(args.retain)),
-            verify_staging=lambda path: _seal_and_verify_memory(replace(config, memory_dir=path)),
+    ownership = PrimaryRuntimeOwnership(config.state_path)
+    try:
+        ownership.acquire()
+    except RuntimeOwnershipError as exc:
+        raise SystemExit(_backup_runtime_ownership_message()) from exc
+    try:
+        manager = MemoryBackupManager(
+            memory_dir=config.memory_dir,
+            backup_root=Path(args.backup_dir),
+            specs=_specs_from_config(config),
         )
+        active = AgentStateStore(config.state_path).list_nonterminal_runs()
+        if active:
+            raise SystemExit("Refusing memory backup/restore while non-terminal runs exist.")
+        if command == "backup":
+            _seal_and_verify_memory(config)
+            print(json.dumps(manager.create(retain=max(1, int(args.retain))), indent=2))
+            return
+        if command == "restore":
+            result = manager.restore(
+                str(args.backup_id),
+                retain=max(2, int(args.retain)),
+                verify_staging=lambda path: _seal_and_verify_memory(
+                    replace(config, memory_dir=path)
+                ),
+            )
+            print(json.dumps(result, indent=2))
+            return
+        raise SystemExit(f"Unknown memory backup command: {command}")
+    finally:
+        ownership.release()
+
+
+def _handle_agent_backup_command(config: AgentConfig, args: argparse.Namespace) -> None:
+    command = str(args.backup_cmd)
+    layer_config_path = config.layer_config_path or (
+        config.memory_dir.parent / "config" / "layers.json"
+    )
+    manager = AgentBackupManager(
+        memory_dir=config.memory_dir,
+        state_path=config.state_path,
+        backup_root=Path(args.backup_dir),
+        runs_dir=config.memory_dir.parent / "runs",
+        skills_dir=config.skills_dir,
+        plugins_dir=config.plugins_dir,
+        mcp_config_path=config.mcp_config_path,
+        channel_config_path=config.channel_config_path,
+        runtime_settings_path=default_runtime_settings_path(config),
+        layer_config_path=layer_config_path,
+        repair_artifact_root=config.workspace / ".nest",
+    )
+    if command == "list":
+        print(json.dumps(manager.list_backups(), indent=2))
+        return
+    if command == "verify":
+        result = manager.validate(str(args.backup_id))
+        print(json.dumps(result, indent=2))
+        if not result["ok"]:
+            raise SystemExit(1)
+        return
+    if config.backend != "memvid":
+        raise SystemExit("Agent backup and restore require --backend memvid.")
+    if command == "restore" and not bool(args.yes):
+        raise SystemExit(
+            "Agent restore replaces memory and control-plane state; rerun with --yes after stopping Kestrel."
+        )
+
+    def preflight() -> None:
+        current_specs = load_layer_specs(layer_config_path) if layer_config_path.is_file() else None
+        manager.specs = current_specs or DEFAULT_LAYER_SPECS
+        try:
+            active = AgentStateStore(config.state_path).list_nonterminal_runs()
+        except Exception:
+            if command != "restore":
+                raise
+            active = []
+        if active:
+            raise SystemExit("Refusing agent backup/restore while non-terminal runs exist.")
+        if command == "create":
+            _seal_and_verify_memory(config, specs=current_specs)
+
+    if command == "create":
+        try:
+            result = manager.create(
+                retain=max(1, int(args.retain)),
+                preflight=preflight,
+            )
+        except RuntimeOwnershipError as exc:
+            raise SystemExit(_backup_runtime_ownership_message()) from exc
         print(json.dumps(result, indent=2))
         return
-    raise SystemExit(f"Unknown memory backup command: {command}")
+    if command == "restore":
+        try:
+            result = manager.restore(
+                str(args.backup_id),
+                retain=max(2, int(args.retain)),
+                preflight=preflight,
+                verify_memory_staging=lambda memory_path, staged_config, layer_files: (
+                    _seal_and_verify_memory(
+                        replace(config, memory_dir=memory_path),
+                        specs=_staged_agent_backup_specs(
+                            memory_path=memory_path,
+                            staged_layer_config=staged_config,
+                            layer_files=layer_files,
+                        ),
+                    )
+                ),
+            )
+        except RuntimeOwnershipError as exc:
+            raise SystemExit(_backup_runtime_ownership_message()) from exc
+        print(json.dumps(result, indent=2))
+        return
+    raise SystemExit(f"Unknown agent backup command: {command}")
 
 
-def _seal_and_verify_memory(config: AgentConfig) -> None:
+def _staged_agent_backup_specs(
+    *,
+    memory_path: Path,
+    staged_layer_config: Path | None,
+    layer_files: dict[MemoryLayer, str],
+) -> dict[MemoryLayer, LayerSpec]:
+    canonical_config = memory_path / "layers.json"
+    if staged_layer_config is not None:
+        specs = load_layer_specs(staged_layer_config)
+    elif canonical_config.is_file():
+        specs = load_layer_specs(canonical_config)
+    else:
+        specs = {
+            layer: replace(DEFAULT_LAYER_SPECS[layer], mv2_file=mv2_file)
+            for layer, mv2_file in layer_files.items()
+        }
+    configured_files = {layer: spec.mv2_file for layer, spec in specs.items()}
+    if configured_files != layer_files:
+        raise MemoryBackupError(
+            "Backed-up layer configuration does not match the backup memory layer map"
+        )
+    return specs
+
+
+def _seal_and_verify_memory(
+    config: AgentConfig,
+    *,
+    specs: dict[MemoryLayer, LayerSpec] | None = None,
+) -> None:
     memory = build_memory_system(
         config.backend,
         config.memory_dir,
-        specs=_specs_from_config(config),
+        specs=specs if specs is not None else _specs_from_config(config),
     )
     try:
         memory.seal_all()
@@ -882,7 +1272,9 @@ def _ledger_for_memory_command(args: argparse.Namespace) -> PromotionLedger | No
 
 def _handle_behavior_deltas_command(args: argparse.Namespace) -> None:
     if args.deltas_cmd == "propose":
-        summary = summarize_run_capsule(runs_dir=args.runs_dir, run_id=args.run_id, backend=args.backend)
+        summary = summarize_run_capsule(
+            runs_dir=args.runs_dir, run_id=args.run_id, backend=args.backend
+        )
         ledger = BehaviorDeltaLedger(AgentStateStore(args.state_path))
         extractor = BehaviorDeltaExtractor(ledger=ledger)
         proposals = extractor.propose_from_signals(
@@ -950,8 +1342,7 @@ def _print_product_readiness(args: argparse.Namespace) -> None:
     headline = payload["headline"]
     print("Full product roadmap")
     print(
-        "Full hosted/team product roadmap complete: "
-        f"{'yes' if headline['product_ready'] else 'no'}"
+        f"Full hosted/team product roadmap complete: {'yes' if headline['product_ready'] else 'no'}"
     )
     print(
         f"Categories: {headline['ready_count']} ready, "
@@ -971,7 +1362,9 @@ def _print_setup_readiness(config: AgentConfig, args: argparse.Namespace) -> Non
     else:
         print("First-run setup readiness")
         print(f"Ready: {'yes' if payload['ready'] else 'no'}")
-        print(f"Checks: {payload['pass_count']} pass, {payload['warn_count']} warn, {payload['fail_count']} fail")
+        print(
+            f"Checks: {payload['pass_count']} pass, {payload['warn_count']} warn, {payload['fail_count']} fail"
+        )
         print(f"Next: {payload['next_action']}")
         print()
         for check in payload["checks"]:
@@ -1026,7 +1419,9 @@ def _print_behavior_delta_skill_preview(args: argparse.Namespace) -> None:
     preview = render_skill_candidate_preview(delta, skill_id=args.skill_id)
     payload = preview.to_payload()
     payload["skills_dir"] = str(args.skills_dir)
-    payload["message"] = "Preview only; no skill files were written and no executable code was generated."
+    payload["message"] = (
+        "Preview only; no skill files were written and no executable code was generated."
+    )
     if args.json:
         print(json.dumps(payload, indent=2))
         return
@@ -1225,7 +1620,10 @@ def _doctor_memory(memory: object, *, dry_run: bool) -> dict[str, Any]:
                 report[layer_name] = doctor(dry_run=dry_run)
             else:
                 verify = getattr(backend, "verify", None)
-                report[layer_name] = {"ok": bool(verify()) if callable(verify) else False, "doctor_available": False}
+                report[layer_name] = {
+                    "ok": bool(verify()) if callable(verify) else False,
+                    "doctor_available": False,
+                }
         except Exception as exc:  # noqa: BLE001 - CLI doctor must report every layer honestly
             report[layer_name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     return report
@@ -1284,10 +1682,23 @@ def _doctor_optional_extras() -> dict[str, Any]:
     return {
         "ok": True,
         "extras": {
-            name: {"available": importlib.util.find_spec(module_name) is not None}
-            for name, module_name in extras.items()
+            name: _doctor_optional_module(module_name) for name, module_name in extras.items()
         },
     }
+
+
+def _doctor_optional_module(module_name: str) -> dict[str, Any]:
+    available = importlib.util.find_spec(module_name) is not None
+    report: dict[str, Any] = {"available": available, "importable": False}
+    if not available:
+        return report
+    try:
+        importlib.import_module(module_name)
+    except Exception as exc:  # noqa: BLE001 - readiness must expose native-loader failures
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        return report
+    report["importable"] = True
+    return report
 
 
 def _doctor_provider(config: AgentConfig) -> dict[str, Any]:
@@ -1378,6 +1789,15 @@ def _doctor_memory_runtime(config: AgentConfig, *, existed_before: bool) -> dict
         report["ok"] = False
         report["error"] = "memvid-sdk is not installed"
         return report
+    if config.backend == "memvid":
+        try:
+            importlib.import_module("memvid_sdk")
+        except Exception as exc:  # noqa: BLE001 - readiness must expose native-loader failures
+            report["ok"] = False
+            report["memvid_importable"] = False
+            report["error"] = f"memvid-sdk import failed: {type(exc).__name__}: {exc}"
+            return report
+        report["memvid_importable"] = True
 
     memory = None
     try:
@@ -1412,13 +1832,226 @@ def _env_has_value(name: str) -> bool:
     return bool(os.getenv(name, "").strip())
 
 
-def _build_run_manager(config: AgentConfig) -> RunManager:
+def _build_run_manager(
+    config: AgentConfig,
+    *,
+    recover_startup_work: bool = True,
+    enforce_single_owner: bool | None = None,
+    read_only_observer: bool = False,
+) -> RunManager:
     state = AgentStateStore(config.state_path)
     events = RunEventBus(state)
     mcp = MCPManager(state, allow_network_endpoints=config.allow_mcp_network_endpoints)
     skills = SkillManager(config.skills_dir, state)
     plugins = PluginManager(config.plugins_dir, state)
-    return RunManager(config=config, state=state, events=events, mcp=mcp, skills=skills, plugins=plugins)
+    try:
+        resolved_recovery = False if read_only_observer else recover_startup_work
+        resolved_owner = (
+            False
+            if read_only_observer
+            else (resolved_recovery if enforce_single_owner is None else enforce_single_owner)
+        )
+        return RunManager(
+            config=config,
+            state=state,
+            events=events,
+            mcp=mcp,
+            skills=skills,
+            plugins=plugins,
+            recover_startup_work=resolved_recovery,
+            enforce_single_owner=resolved_owner,
+            read_only_observer=read_only_observer,
+        )
+    except RuntimeOwnershipError as exc:
+        mcp.shutdown()
+        raise SystemExit(_runtime_ownership_message()) from exc
+
+
+def _runtime_ownership_message() -> str:
+    return (
+        "Another Kestrel runtime already owns this state database. Use its authenticated "
+        "server API, or stop that runtime before starting another CLI worker."
+    )
+
+
+def _backup_runtime_ownership_message() -> str:
+    return (
+        "Another Kestrel runtime already owns this state database. Stop it cleanly "
+        "before creating or restoring a backup."
+    )
+
+
+def _shutdown_run_manager(manager: Any) -> None:
+    """Drain a CLI-owned manager before closing its external sessions."""
+
+    shutdown = getattr(manager, "shutdown", None)
+    stopped = True
+    try:
+        if callable(shutdown):
+            stopped = bool(shutdown(timeout_seconds=5.0))
+    finally:
+        mcp = getattr(manager, "mcp", None)
+        mcp_shutdown = getattr(mcp, "shutdown", None)
+        if callable(mcp_shutdown):
+            mcp_shutdown()
+    if not stopped:
+        raise SystemExit(
+            "Kestrel cancelled the run, but its worker did not stop within the bounded "
+            "shutdown window. The CLI is exiting with a failure instead of abandoning "
+            "background work."
+        )
+
+
+def _handle_routines_command(args: argparse.Namespace, config: AgentConfig) -> None:
+    state = AgentStateStore(config.state_path)
+    manager: RunManager | None = None
+    try:
+        command = str(args.routines_cmd)
+        if command == "list":
+            payload: object = [asdict(item) for item in state.list_routines()]
+        elif command == "create":
+            if args.schedule_kind == "interval" and args.interval_seconds is None:
+                raise SystemExit("--interval-seconds is required for interval routines.")
+            payload = asdict(
+                state.create_routine(
+                    routine_id=args.routine_id or f"routine_{uuid4().hex}",
+                    name=args.routine_name,
+                    prompt=args.routine_prompt,
+                    schedule_kind=args.schedule_kind,
+                    start_at=args.start_at or datetime.now(UTC),
+                    interval_seconds=args.interval_seconds,
+                    enabled=False,
+                    workspace=args.routine_workspace,
+                    provider=args.routine_provider,
+                    model=args.routine_model,
+                    autonomy_mode=args.routine_autonomy,
+                    misfire_grace_seconds=args.misfire_grace_seconds,
+                )
+            )
+        elif command == "show":
+            payload = asdict(state.get_routine(args.routine_id))
+        elif command == "update":
+            fields: dict[str, object] = {}
+            for argument, field_name in (
+                ("routine_name", "name"),
+                ("routine_prompt", "prompt"),
+                ("schedule_kind", "schedule_kind"),
+                ("start_at", "start_at"),
+                ("interval_seconds", "interval_seconds"),
+                ("routine_workspace", "workspace"),
+                ("routine_provider", "provider"),
+                ("routine_model", "model"),
+                ("routine_autonomy", "autonomy_mode"),
+                ("misfire_grace_seconds", "misfire_grace_seconds"),
+            ):
+                value = getattr(args, argument)
+                if value is not None:
+                    fields[field_name] = value
+            if args.schedule_kind == "once":
+                fields["interval_seconds"] = None
+            if not fields:
+                raise SystemExit("Routine update requires at least one changed field.")
+            payload = asdict(
+                state.update_routine(
+                    args.routine_id,
+                    expected_revision=args.expected_revision,
+                    **fields,
+                )
+            )
+        elif command in {"enable", "disable"}:
+            payload = asdict(
+                state.update_routine(
+                    args.routine_id,
+                    expected_revision=args.expected_revision,
+                    enabled=command == "enable",
+                )
+            )
+        elif command == "delete":
+            payload = asdict(
+                state.delete_routine(
+                    args.routine_id,
+                    expected_revision=args.expected_revision,
+                )
+            )
+        elif command == "tick":
+            if not config.enable_proactive_routines:
+                raise SystemExit(
+                    "Proactive routine dispatch is disabled. Pass --enable-proactive-routines or set NEST_AGENT_ENABLE_PROACTIVE_ROUTINES=1."
+                )
+            manager = _build_run_manager(
+                config,
+                recover_startup_work=False,
+                enforce_single_owner=True,
+            )
+            service = RoutineService(
+                manager.state,
+                manager,
+                claim_ttl_seconds=config.routine_claim_ttl_seconds,
+                max_occurrences_per_tick=config.max_routines_per_tick,
+            )
+            recovered_run_ids = manager.recover_queued_scheduled_routine_runs()
+            for recovered_run_id in recovered_run_ids:
+                _wait_for_run(manager, recovered_run_id)
+            result = service.tick()
+            for dispatch in result.dispatches:
+                if dispatch.status == "running":
+                    _wait_for_run(manager, dispatch.run_id)
+            reconciled = tuple(dict.fromkeys((*result.reconciled, *service.reconcile())))
+            payload = {
+                **result.to_payload(),
+                "reconciled": list(reconciled),
+                "recovered_run_ids": list(recovered_run_ids),
+                "occurrences": [
+                    asdict(manager.state.get_routine_occurrence(item.occurrence_id))
+                    for item in result.dispatches
+                ],
+            }
+        elif command == "history":
+            state.get_routine(args.routine_id)
+            payload = [
+                asdict(item)
+                for item in state.list_routine_occurrences(
+                    args.routine_id,
+                    limit=max(1, min(args.limit, 500)),
+                )
+            ]
+        else:
+            raise SystemExit(f"Unsupported routines command: {command}")
+    except RoutineConflictError as exc:
+        raise SystemExit(
+            "Routine revision conflict. Current record: "
+            + json.dumps(asdict(exc.current), sort_keys=True)
+        ) from exc
+    except KeyError as exc:
+        raise SystemExit(str(exc)) from exc
+    except sqlite3.IntegrityError as exc:
+        raise SystemExit(
+            "Routine id already exists, including a tombstoned prior routine."
+        ) from exc
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    finally:
+        if manager is not None:
+            _shutdown_run_manager(manager)
+    _print_routine_payload(payload, json_output=bool(args.json))
+
+
+def _print_routine_payload(payload: object, *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(payload, indent=2))
+        return
+    if isinstance(payload, list):
+        if not payload:
+            print("No routines or occurrences found.")
+            return
+        for item in payload:
+            if isinstance(item, dict):
+                identifier = item.get("routine_id") or item.get("occurrence_id") or "routine"
+                print(f"{identifier}: {item.get('status', item.get('name', ''))}")
+            else:
+                print(item)
+        return
+    print(json.dumps(payload, indent=2))
 
 
 def _create_run_and_print(
@@ -1429,15 +2062,27 @@ def _create_run_and_print(
     json_output: bool,
     wait: bool,
     include_events: bool,
-) -> None:
+) -> int:
     run = manager.create_run(message=message, session_id=session_id)
     if wait:
         _wait_for_run(manager, run.run_id)
     payload = _run_payload(manager, run.run_id, include_events=include_events)
     if json_output:
         print(json.dumps(payload, indent=2))
-        return
-    _print_run_payload(payload)
+    else:
+        _print_run_payload(payload)
+    return _run_exit_code(payload)
+
+
+def _run_exit_code(payload: dict[str, Any]) -> int:
+    """Map the observed run state to the public ``nest-agent run`` contract."""
+
+    status = str(payload.get("status") or "").strip().lower()
+    if status == "completed":
+        return 0
+    if status == "blocked":
+        return 2
+    return 1
 
 
 def _run_manager_chat_and_print(
@@ -1446,7 +2091,7 @@ def _run_manager_chat_and_print(
     *,
     session_id: str,
     prefix: str = "",
-) -> None:
+) -> int:
     run = manager.create_run(message=message, session_id=session_id)
     _wait_for_run(manager, run.run_id)
     payload = _run_payload(manager, run.run_id, include_events=False)
@@ -1457,6 +2102,7 @@ def _run_manager_chat_and_print(
     if payload.get("stop_reason"):
         print(f"stop_reason: {payload['stop_reason']}")
     _print_pending_approvals(payload)
+    return _run_exit_code(payload)
 
 
 def _print_status(
@@ -1511,7 +2157,7 @@ def _decide_approval_and_print(
     arguments_json: str | None,
     json_output: bool,
     wait: bool,
-) -> None:
+) -> int:
     arguments = _json_object_or_none(arguments_json)
     decision = manager.decide_approval(approval_id, approved=approved, arguments=arguments)
     run_payload: dict[str, Any] | None = None
@@ -1524,13 +2170,16 @@ def _decide_approval_and_print(
     payload = {"approval": decision, "run": run_payload}
     if json_output:
         print(json.dumps(payload, indent=2))
-        return
-    print(f"{approval_id}: {'approved' if approved else 'denied'}")
-    if run_payload is not None:
-        print(f"run_id: {run_payload['run_id']}")
-        print(f"status: {run_payload['status']}")
-        if run_payload.get("stop_reason"):
-            print(f"stop_reason: {run_payload['stop_reason']}")
+    else:
+        print(f"{approval_id}: {'approved' if approved else 'denied'}")
+        if run_payload is not None:
+            print(f"run_id: {run_payload['run_id']}")
+            print(f"status: {run_payload['status']}")
+            if run_payload.get("stop_reason"):
+                print(f"stop_reason: {run_payload['stop_reason']}")
+    if approved and run_payload is not None:
+        return _run_exit_code(run_payload)
+    return 0
 
 
 def _run_payload(manager: RunManager, run_id: str, *, include_events: bool) -> dict[str, Any]:
@@ -1556,7 +2205,11 @@ def _print_run_payload(payload: dict[str, Any]) -> None:
 
 
 def _print_pending_approvals(payload: dict[str, Any]) -> None:
-    approvals = [item for item in payload.get("approvals", []) if isinstance(item, dict) and item.get("status") == "pending"]
+    approvals = [
+        item
+        for item in payload.get("approvals", [])
+        if isinstance(item, dict) and item.get("status") == "pending"
+    ]
     if not approvals:
         return
     print("pending_approvals:")
@@ -1588,7 +2241,9 @@ def _handle_plugins_command(
                 enable=args.enable,
                 overwrite=args.overwrite,
             )
-            _write_plugin_audit(manager, backend=backend, memory_dir=memory_dir, action="install", plugin=plugin)
+            _write_plugin_audit(
+                manager, backend=backend, memory_dir=memory_dir, action="install", plugin=plugin
+            )
             _print_plugin(plugin, json_output=args.json)
             return
         if args.plugins_cmd == "inspect":
@@ -1597,18 +2252,24 @@ def _handle_plugins_command(
         if args.plugins_cmd == "enable":
             _require_plugin_install_enabled(manager.config)
             plugin = manager.plugins.set_enabled(args.plugin_id, True)
-            _write_plugin_audit(manager, backend=backend, memory_dir=memory_dir, action="enable", plugin=plugin)
+            _write_plugin_audit(
+                manager, backend=backend, memory_dir=memory_dir, action="enable", plugin=plugin
+            )
             _print_plugin(plugin, json_output=args.json)
             return
         if args.plugins_cmd == "disable":
             plugin = manager.plugins.set_enabled(args.plugin_id, False)
-            _write_plugin_audit(manager, backend=backend, memory_dir=memory_dir, action="disable", plugin=plugin)
+            _write_plugin_audit(
+                manager, backend=backend, memory_dir=memory_dir, action="disable", plugin=plugin
+            )
             _print_plugin(plugin, json_output=args.json)
             return
         if args.plugins_cmd == "update":
             _require_plugin_install_enabled(manager.config)
             plugin = manager.plugins.update(args.plugin_id, ref=args.ref)
-            _write_plugin_audit(manager, backend=backend, memory_dir=memory_dir, action="update", plugin=plugin)
+            _write_plugin_audit(
+                manager, backend=backend, memory_dir=memory_dir, action="update", plugin=plugin
+            )
             _print_plugin(plugin, json_output=args.json)
             return
         if args.plugins_cmd == "remove":
@@ -1652,7 +2313,9 @@ def _print_plugins(plugins: list[dict[str, Any]], *, json_output: bool) -> None:
     for plugin in plugins:
         state = "enabled" if plugin["enabled"] else "not enabled"
         capabilities = ", ".join(str(item) for item in plugin.get("capabilities", [])) or "none"
-        print(f"{plugin['id']} [{state}] {plugin['source_url']} @ {plugin['commit_sha'][:12]} capabilities={capabilities}")
+        print(
+            f"{plugin['id']} [{state}] {plugin['source_url']} @ {plugin['commit_sha'][:12]} capabilities={capabilities}"
+        )
 
 
 def _print_plugin(plugin: dict[str, Any], *, json_output: bool) -> None:
@@ -1665,7 +2328,9 @@ def _print_plugin(plugin: dict[str, Any], *, json_output: bool) -> None:
     print(f"source: {plugin['source_url']}")
     print(f"commit: {plugin['commit_sha']}")
     print(f"format: {plugin['format']}")
-    print(f"capabilities: {', '.join(str(item) for item in plugin.get('capabilities', [])) or 'none'}")
+    print(
+        f"capabilities: {', '.join(str(item) for item in plugin.get('capabilities', [])) or 'none'}"
+    )
     warnings = plugin.get("risk_report", {}).get("warnings", [])
     unsupported = plugin.get("risk_report", {}).get("unsupported_features", [])
     if warnings:
@@ -1687,18 +2352,51 @@ def _print_plugin_review(review: dict[str, Any], *, json_output: bool) -> None:
     print(f"enable blockers: {', '.join(blockers) if blockers else 'none'}")
 
 
+def _cli_run_idle_timeout_seconds(config: Any) -> float:
+    """Bound one no-progress interval without racing provider retry policy.
+
+    ``timeout_seconds`` is a per-attempt provider timeout. A CLI wait that only
+    allows one attempt can cancel a healthy cold-starting local model while its
+    configured retry is already in flight. Each durable run step starts a new
+    interval, so multi-round tool turns remain bounded without multiplying one
+    giant wall-clock deadline up front.
+    """
+
+    timeout_seconds = max(float(getattr(config, "timeout_seconds", 0.0)), 0.0)
+    max_retries = max(int(getattr(config, "max_retries", 0)), 0)
+    provider_calls = 2 if bool(getattr(config, "llm_turn_summaries", False)) else 1
+    return max(
+        (timeout_seconds * (max_retries + 1) * provider_calls) + 15.0,
+        15.0,
+    )
+
+
 def _wait_for_run(manager: RunManager, run_id: str) -> dict[str, Any]:
-    deadline = monotonic() + max(manager.config.timeout_seconds + 15, 15)
+    idle_timeout_seconds = _cli_run_idle_timeout_seconds(manager.config)
+    deadline = monotonic() + idle_timeout_seconds
     terminal = {"completed", "failed", "blocked", "cancelled"}
-    thread = manager._threads.get(run_id)  # CLI wait is in-process; yield to the worker before polling state.
+    last_step_id = 0
+    thread = manager._threads.get(
+        run_id
+    )  # CLI wait is in-process; yield to the worker before polling state.
     while monotonic() < deadline:
         if thread is not None and thread.is_alive():
             thread.join(timeout=0.25)
         run = manager.get_run(run_id)
         if str(run["status"]) in terminal:
             return run
+        state = getattr(manager, "state", None)
+        list_run_steps = getattr(state, "list_run_steps", None)
+        if callable(list_run_steps):
+            steps = list_run_steps(run_id, after_id=last_step_id, limit=200)
+            if steps:
+                last_step_id = max(int(step["id"]) for step in steps)
+                deadline = monotonic() + idle_timeout_seconds
         sleep(0.25)
-    raise SystemExit(f"Run {run_id} did not finish within the CLI wait timeout.")
+    raise SystemExit(
+        f"Run {run_id} made no durable progress within the CLI wait timeout "
+        f"({idle_timeout_seconds:g}s)."
+    )
 
 
 def _json_object_or_none(raw: str | None) -> dict[str, Any] | None:
@@ -1733,7 +2431,9 @@ def _run_eval_command(config: AgentConfig) -> None:
     raise SystemExit(completed.returncode)
 
 
-def _chat_and_print(agent: NestedMV2Agent, user_message: str, *, session_id: str, prefix: str = "") -> None:
+def _chat_and_print(
+    agent: NestedMV2Agent, user_message: str, *, session_id: str, prefix: str = ""
+) -> None:
     streamed = False
     prefix_printed = False
 
@@ -1836,7 +2536,9 @@ def _handle_slash_command(
         for spec in execution.data.get("tools", []):
             if isinstance(spec, dict):
                 approval = "approval required" if spec.get("requires_approval") else "allowed"
-                print(f"{spec.get('name')} [{spec.get('risk')}, {approval}] - {spec.get('description')}")
+                print(
+                    f"{spec.get('name')} [{spec.get('risk')}, {approval}] - {spec.get('description')}"
+                )
         return True
 
     if name == "/web":
@@ -1844,7 +2546,10 @@ def _handle_slash_command(
             print("Usage: /web <query>")
             return True
         execution = agent.tools.execute(
-            ToolCall(name="web.search", arguments={"query": query, "max_results": agent.config.web_max_results}),
+            ToolCall(
+                name="web.search",
+                arguments={"query": query, "max_results": agent.config.web_max_results},
+            ),
             ToolContext(
                 memory=agent.memory,
                 config=agent.config,

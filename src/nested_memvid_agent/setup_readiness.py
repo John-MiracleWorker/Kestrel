@@ -98,6 +98,7 @@ def build_setup_readiness_report(
         ),
         _permission_gate_check(config),
         _repair_isolation_check(config),
+        _proactive_routines_check(config),
         _api_auth_check(config),
     )
     pass_count = sum(1 for check in checks if check.status == SetupReadinessStatus.PASS)
@@ -371,4 +372,30 @@ def _api_auth_check(config: AgentConfig) -> SetupReadinessCheck:
         SetupReadinessStatus.PASS,
         f"API auth is required and `{config.api_auth_token_env}` is present.",
         "No recovery needed.",
+    )
+
+
+def _proactive_routines_check(config: AgentConfig) -> SetupReadinessCheck:
+    if not config.enable_proactive_routines:
+        return SetupReadinessCheck(
+            "proactive_routines",
+            "Proactive routines",
+            SetupReadinessStatus.PASS,
+            "Time-based proactive execution is disabled by default.",
+            "Enable it only after creating and reviewing disabled routine drafts through the local CLI or an authenticated API.",
+        )
+    if not config.require_api_auth:
+        return SetupReadinessCheck(
+            "proactive_routines",
+            "Proactive routines",
+            SetupReadinessStatus.WARN,
+            "Proactive execution is enabled, but API authentication is disabled.",
+            "Keep the server strictly loopback-only or enable API authentication before managing routines through the web API.",
+        )
+    return SetupReadinessCheck(
+        "proactive_routines",
+        "Proactive routines",
+        SetupReadinessStatus.PASS,
+        "Proactive execution is enabled behind authenticated owner controls; individual routines still default disabled.",
+        "Review each routine revision and keep exact-call tool approvals enabled.",
     )

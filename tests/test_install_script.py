@@ -20,6 +20,38 @@ POSIX_SHELL_ONLY = pytest.mark.skipif(
     os.name == "nt",
     reason="installer and operational shell scripts require macOS, Linux, or WSL",
 )
+FIXTURE_PACKAGE_ROOTS = (Path("src/nested_memvid_agent"), Path("web/public"))
+FIXTURE_EXCLUDED_DIRECTORIES = {
+    ".git",
+    ".mypy_cache",
+    ".nest",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "tiuni-fun",
+}
+FIXTURE_SECRET_SUFFIXES = {".key", ".p12", ".pem", ".pfx"}
+
+
+def _fixture_source_allowed(relative: Path) -> bool:
+    if relative.is_absolute() or ".." in relative.parts:
+        return False
+    if any(part in FIXTURE_EXCLUDED_DIRECTORIES for part in relative.parts):
+        return False
+    if relative.name in {".coverage", ".env", ".env.telegram", "local_vault.json"}:
+        return False
+    if relative.name.startswith(".env.") and not relative.name.endswith(".example"):
+        return False
+    return relative.suffix.lower() not in FIXTURE_SECRET_SUFFIXES
+
+
+def _under_fixture_package_root(relative: Path) -> bool:
+    return any(relative == root or root in relative.parents for root in FIXTURE_PACKAGE_ROOTS)
 
 
 def _clean_kestrel_env() -> dict[str, str]:
@@ -30,6 +62,7 @@ def _clean_kestrel_env() -> dict[str, str]:
         and key
         not in {
             "KESTREL_TELEGRAM_RUNTIME",
+            "KESTREL_TELEGRAM_HEALTH_PATH",
             "KESTREL_PRINT_ENV",
             "KESTREL_TELEGRAM_ENV",
             "KESTREL_PORT",
@@ -68,17 +101,60 @@ def _current_tree_git_repo(tmp_path: Path) -> Path:
         capture_output=True,
         check=True,
     ).stdout.split(b"\0")
+    untracked_runtime = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(ROOT),
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "src/nested_memvid_agent",
+            "web/public",
+        ],
+        text=False,
+        capture_output=True,
+        check=True,
+    ).stdout.split(b"\0")
     extra_paths = [Path("install.sh"), Path("tests/test_install_script.py")]
-    for raw in [*tracked, *(str(path).encode() for path in extra_paths)]:
-        if not raw:
-            continue
-        relative = Path(raw.decode())
+    candidate_paths = {
+        Path(raw.decode())
+        for raw in [*tracked, *untracked_runtime, *(str(path).encode() for path in extra_paths)]
+        if raw
+    }
+    selected_paths = {relative for relative in candidate_paths if _fixture_source_allowed(relative)}
+    for relative in selected_paths:
         src = ROOT / relative
         if not src.exists() or src.is_dir():
             continue
         dst = source / relative
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
+
+    intended_package_manifest = {
+        relative
+        for relative in selected_paths
+        if _under_fixture_package_root(relative) and (ROOT / relative).is_file()
+    }
+    copied_package_manifest = {
+        path.relative_to(source)
+        for package_root in FIXTURE_PACKAGE_ROOTS
+        if (source / package_root).is_dir()
+        for path in (source / package_root).rglob("*")
+        if path.is_file()
+    }
+    assert copied_package_manifest == intended_package_manifest, (
+        "installer fixture package manifest mismatch: "
+        f"missing={sorted(intended_package_manifest - copied_package_manifest)!r}, "
+        f"unexpected={sorted(copied_package_manifest - intended_package_manifest)!r}"
+    )
+    copied_files = {
+        path.relative_to(source) for path in source.rglob("*") if path.is_file()
+    }
+    assert not (source / "tiuni-fun").exists()
+    assert all(_fixture_source_allowed(relative) for relative in copied_files)
     subprocess.run(["git", "init", "-q"], cwd=source, check=True)
     subprocess.run(["git", "add", "."], cwd=source, check=True)
     subprocess.run(
@@ -290,6 +366,21 @@ def test_telegram_poller_authenticates_local_control_plane_requests(
     assert captured["authorization"] == "Bearer control-plane-token"
 
 
+def test_telegram_poller_default_health_path_follows_the_instance_state_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "isolated" / "state" / "agent.db"
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:test")
+    monkeypatch.setenv("NEST_AGENT_STATE_PATH", str(state_path))
+    monkeypatch.delenv("KESTREL_TELEGRAM_HEALTH_PATH", raising=False)
+    monkeypatch.setattr("signal.signal", lambda *args: None)
+
+    namespace = runpy.run_path(str(TELEGRAM_POLLER), run_name="telegram_poller_path_test")
+
+    assert namespace["HEALTH_PATH"] == state_path.parent / "telegram-poller-health.json"
+
+
 @POSIX_SHELL_ONLY
 def test_start_telegram_agent_can_use_isolated_memvid_runtime(tmp_path: Path) -> None:
     env_file = tmp_path / ".env.telegram"
@@ -349,6 +440,7 @@ def test_telegram_stack_uses_isolated_runtime_and_bounded_logs() -> None:
     assert '"$LOG_MAX_BYTES" =~ ^[0-9]+$' in text
     assert 'rotate_log "$SERVER_LOG"' in text
     assert 'rotate_log "$POLLER_LOG"' in text
+    assert 'export KESTREL_TELEGRAM_HEALTH_PATH=' in text
 
 
 @POSIX_SHELL_ONLY

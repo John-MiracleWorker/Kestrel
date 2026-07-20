@@ -10,6 +10,7 @@ from typing import Any, Protocol, runtime_checkable
 import numpy as np
 
 from .models import MemoryLayer, MemoryRecord
+from .private_artifacts import harden_private_sqlite_files, prepare_private_sqlite_file
 
 SCHEMA_VERSION = 1
 DEFAULT_LOCAL_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
@@ -121,12 +122,18 @@ class VectorSidecar:
         self._last_error: str | None = None
 
     def open(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        prepare_private_sqlite_file(self.path)
         conn = sqlite3.connect(self.path)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn = conn
-        self._ensure_schema()
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn = conn
+            self._ensure_schema()
+            harden_private_sqlite_files(self.path)
+        except Exception:
+            conn.close()
+            self._conn = None
+            raise
 
     def upsert(self, record: MemoryRecord) -> bool:
         if record.layer != self.layer:
@@ -160,6 +167,7 @@ class VectorSidecar:
             ),
         )
         conn.commit()
+        harden_private_sqlite_files(self.path)
         return True
 
     def tombstone(self, record_id: str) -> None:
@@ -169,6 +177,7 @@ class VectorSidecar:
             (datetime.now(UTC).isoformat(), record_id),
         )
         conn.commit()
+        harden_private_sqlite_files(self.path)
 
     def rebuild(self, records: Iterable[MemoryRecord]) -> VectorSidecarStatus:
         rows = tuple(records)
@@ -183,6 +192,7 @@ class VectorSidecar:
         else:
             conn.execute("DELETE FROM vector_records")
         conn.commit()
+        harden_private_sqlite_files(self.path)
         return self.status(records=rows)
 
     def search(
@@ -254,6 +264,7 @@ class VectorSidecar:
         if self._conn is not None:
             self._conn.close()
         self._conn = None
+        harden_private_sqlite_files(self.path)
 
     def _ensure_schema(self) -> None:
         conn = self._require_conn()
@@ -292,6 +303,7 @@ class VectorSidecar:
             tuple(metadata.items()),
         )
         conn.commit()
+        harden_private_sqlite_files(self.path)
 
     def _embed_record(self, record: MemoryRecord) -> np.ndarray | None:
         try:

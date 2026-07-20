@@ -22,7 +22,12 @@ def _require_memvid_sdk() -> None:
 
 
 def test_memvid_layered_memory_creates_one_mv2_per_layer_and_reopens_existing_files(tmp_path: Path) -> None:
-    memory = LayeredMemorySystem.from_backend_factory(tmp_path / "memory", MemvidBackend)
+    # This test seeds the storage adapter below the promotion-policy boundary.
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path / "memory",
+        MemvidBackend,
+        enforce_stable_write_integrity=False,
+    )
     try:
         assert {path.name for path in (tmp_path / "memory").glob("*.mv2")} == {
             "working.mv2",
@@ -102,6 +107,8 @@ def test_memvid_layered_memory_uses_rebuildable_vector_sidecar(tmp_path: Path) -
         MemvidBackend,
         specs=specs,
         vector_embedder=_ConceptEmbedder(),
+        # This test seeds the storage adapter below the promotion-policy boundary.
+        enforce_stable_write_integrity=False,
     )
     try:
         memory.put(

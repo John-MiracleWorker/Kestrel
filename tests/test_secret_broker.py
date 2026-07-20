@@ -60,6 +60,78 @@ def test_secret_broker_vault_file_is_owner_only(tmp_path: Path) -> None:
     assert mode == 0o600
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows stat modes do not expose NTFS ACLs")
+def test_secret_broker_repairs_existing_vault_before_first_read(tmp_path: Path) -> None:
+    path = tmp_path / "vault.json"
+    path.write_text(
+        json.dumps(
+            {
+                "secrets": {
+                    "token": {
+                        "id": "token",
+                        "name": "TOKEN",
+                        "purpose": "legacy vault",
+                        "value": "legacy-secret",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o644)
+
+    broker = SecretBroker(path)
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert broker.resolve("secret://token") == "legacy-secret"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX link and mode contract")
+@pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
+def test_secret_broker_rejects_vault_alias_without_mutating_target(
+    tmp_path: Path,
+    link_kind: str,
+) -> None:
+    outside = tmp_path / "outside-vault.json"
+    outside.write_text('{"secrets": {"token": {"value": "outside-secret"}}}', encoding="utf-8")
+    os.chmod(outside, 0o644)
+    path = tmp_path / "vault.json"
+    if link_kind == "symlink":
+        path.symlink_to(outside)
+    else:
+        path.hardlink_to(outside)
+
+    with pytest.raises(ValueError, match="symbolic links|hard-linked"):
+        SecretBroker(path)
+
+    assert outside.read_text(encoding="utf-8") == (
+        '{"secrets": {"token": {"value": "outside-secret"}}}'
+    )
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o644
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX link and mode contract")
+@pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
+def test_secret_broker_rejects_lock_alias_without_mutating_target(
+    tmp_path: Path,
+    link_kind: str,
+) -> None:
+    outside = tmp_path / "outside-vault-lock"
+    outside.write_text("outside lock", encoding="utf-8")
+    os.chmod(outside, 0o644)
+    lock_path = tmp_path / ".vault.json.lock"
+    if link_kind == "symlink":
+        lock_path.symlink_to(outside)
+    else:
+        lock_path.hardlink_to(outside)
+
+    with pytest.raises(ValueError, match="symbolic links|hard-linked"):
+        SecretBroker(tmp_path / "vault.json")
+
+    assert outside.read_text(encoding="utf-8") == "outside lock"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o644
+
+
 def test_secret_status_does_not_enumerate_arbitrary_env_vars(tmp_path: Path, monkeypatch: object) -> None:
     monkeypatch.setenv("UNREGISTERED_SECRET_NAME", "super-secret-value")  # type: ignore[attr-defined]
     broker = SecretBroker(tmp_path / "vault.json", allowed_env_names={"REGISTERED_SECRET"})

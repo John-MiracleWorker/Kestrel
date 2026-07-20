@@ -5,6 +5,11 @@ Branch: `fix/runtime-rescue`
 Candidate package: `0.3.0.dev0`
 Latest published release: `v0.2.1`
 
+> **Historical pre-publication snapshot:** This review records the candidate state at the time it
+> was written. Kestrel `v0.3.0` and the bootstrap-security follow-up `v0.3.1` were published later
+> on 2026-07-16. See the [changelog](../../CHANGELOG.md) and current release workflow for the
+> published state; the verdict and evidence below are intentionally preserved as reviewed.
+
 ## Verdict
 
 **Supported local/private deployment: PASS.** The current working tree is a production-grade release candidate for one trusted user, one Kestrel server/worker process, and one local or privately networked node. The conversational CLI, authenticated API, React workbench, Memvid v2 memory, deterministic mock path, approvals, MCP boundary, Telegram controls, recovery, backups, observability, bounded admission, packaging, and operator workflows have all been exercised.

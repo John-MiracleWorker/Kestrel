@@ -104,11 +104,27 @@ def build_product_readiness_report() -> ProductReadinessReport:
                 "Task graph and scheduler records exist with planner/executor/reviewer/recovery nodes.",
                 "Repair/code-modification scheduler tasks now default to git worktree isolation when the workspace supports worktrees, even if general worker isolation is disabled.",
                 "Repair DAG tasks reuse one coherent git worktree for the run instead of creating a separate worktree per scheduler worker.",
+                "A real approved prepare -> patch -> validate -> signed review -> literal-tree commit flow is covered, with deterministic dependency artifact handoff and recoverable approval-bound rollback.",
             ),
             remaining_work=(
-                "Complete patch proposal, validation, review, approval, commit, and optional PR flow in one polished path.",
+                "Add a dedicated candidate-diff preview API and optional remote PR publishing lane without weakening the local exact-call gates.",
             ),
-            next_action="Drive the demo repo fixture through an end-to-end repair workflow test that proves plan -> patch -> validation -> review -> approved commit.",
+            next_action="Polish candidate diff inspection and an explicitly separate optional PR handoff around the now-covered local repair flow.",
+        ),
+        ProductReadinessCategory(
+            category_id="proactive_personal_routines",
+            title="Proactive personal routines",
+            status=ProductReadinessStatus.PARTIAL,
+            evidence=(
+                "Durable UTC one-shot and fixed-interval routines have revisioned owner controls, fenced occurrence leases, deterministic run admission, internal transcript provenance, bounded polling, CLI/API/workbench history, and a hashed-idempotency manual run-now action.",
+                "Routine definitions start disabled, raw registered secrets are rejected, and scheduled runs retain the normal exact-call tool approval boundary.",
+                "The workbench follows selected claimed/running occurrences without overlapping requests and refreshes accepted run-now state through terminal reconciliation.",
+            ),
+            remaining_work=(
+                "Add cron/calendar and named-timezone DST schedules plus explicit result-delivery policies for enabled channels.",
+                "Add connector-specific idempotency keys before claiming replay-safe external delivery; arbitrary side effects remain at-least-once tool concerns.",
+            ),
+            next_action="Add an explicitly configured, connector-idempotent channel delivery step without widening tool approval.",
         ),
         ProductReadinessCategory(
             category_id="safe_autonomous_learning",
@@ -143,13 +159,15 @@ def build_product_readiness_report() -> ProductReadinessReport:
             status=ProductReadinessStatus.PARTIAL,
             evidence=(
                 "Skill discovery, manifest validation, upload/install path, plugin review/install/enable routes, and MCP stdio lifecycle exist.",
-                "Risk classification and approval gates exist for dangerous tools.",
+                "Executable skills fail closed on host runtimes and use an opt-in digest-pinned OCI runner with verified private skill/read-scope snapshots, no live workspace binds, no network/secrets/writes, read-only nonroot execution, resource limits, and no host fallback.",
+                "Risk classification and exact approval gates exist for dangerous tools.",
             ),
             remaining_work=(
-                "Add container-grade or equivalent sandboxing for executable skills and plugins.",
-                "Add managed dependency installation and clearer permission scopes for filesystem, network, and secrets.",
+                "Add quota-bounded staged extension writeback with reviewed no-follow host-side commit semantics.",
+                "Add managed dependency installation, portable non-Docker engines, and narrowly reviewable opt-in network/secret scope grants.",
+                "Apply an equivalent OS-level containment contract to MCP stdio servers and complete production soak testing.",
             ),
-            next_action="Ship a plugin/skill permission review model before expanding executable extension support.",
+            next_action="Extend the default-deny scope model to MCP and dependency installation, then soak the container runner under failure injection.",
         ),
         ProductReadinessCategory(
             category_id="provider_certification",
@@ -171,13 +189,14 @@ def build_product_readiness_report() -> ProductReadinessReport:
             title="Product UX and onboarding",
             status=ProductReadinessStatus.PARTIAL,
             evidence=(
-                "React workbench exposes runs, approvals, memory, skills, plugins, MCP, behavior deltas, settings, and learning dashboard surfaces.",
+                "React workbench exposes runs, approvals, proactive routines, memory, skills, plugins, MCP, behavior deltas, settings, and learning dashboard surfaces.",
                 "A dark command-center/cockpit visual system has been integrated.",
+                "Authenticated first-run setup exposes readiness checks, agent/user naming, bounded persona selection, collaboration preferences, and explicit adaptation consent.",
             ),
             remaining_work=(
-                "Add first-run onboarding, repo connection, provider validation, patch/diff review, rollback flows, empty states, and guided next actions.",
+                "Add guided repository connection and baseline scanning, exact candidate-diff inspection, richer rollback UX, and recovery-oriented empty states.",
             ),
-            next_action="Turn the current cockpit into a guided first-run flow centered on the golden repair journey.",
+            next_action="Extend the existing first-run flow into repository baseline scan and exact candidate-diff review for the golden repair journey.",
         ),
         ProductReadinessCategory(
             category_id="operations_release_engineering",
@@ -187,6 +206,7 @@ def build_product_readiness_report() -> ProductReadinessReport:
                 "Makefile, Dockerfile, Docker Compose, .env example, deployment docs, memory operations docs, and release checklist exist.",
                 "Support bundle export can gather redacted setup/readiness, runtime, git, state, and log-tail metadata from CLI/API.",
                 "Fail-closed upgrade/rollback, checksummed Memvid backup/restore, launchd supervision, health/readiness gates, chaos recovery, and a bounded soak harness exist.",
+                "CI and release validation preload a digest-pinned OCI image and require the real executable-skill containment integration to pass without skips.",
             ),
             remaining_work=(
                 "Run exact candidate bytes through the supported cross-platform CI matrix and independent review.",

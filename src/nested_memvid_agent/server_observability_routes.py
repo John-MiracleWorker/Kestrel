@@ -19,6 +19,7 @@ def register_observability_routes(
     state: Any,
     events: Any,
     runs: Any,
+    routine_loop: Any | None = None,
 ) -> None:
     plain_text_response = import_module("fastapi.responses").PlainTextResponse
 
@@ -68,12 +69,22 @@ def register_observability_routes(
     def metrics() -> dict[str, object]:
         return cast(
             dict[str, object],
-            operational_snapshot(config=config(), state=state, runs=runs),
+            operational_snapshot(
+                config=config(),
+                state=state,
+                runs=runs,
+                routine_loop=routine_loop,
+            ),
         )
 
     @app.get("/metrics")  # type: ignore[untyped-decorator]
     def prometheus_metrics() -> Any:
-        snapshot = operational_snapshot(config=config(), state=state, runs=runs)
+        snapshot = operational_snapshot(
+            config=config(),
+            state=state,
+            runs=runs,
+            routine_loop=routine_loop,
+        )
         return plain_text_response(
             prometheus_snapshot(snapshot),
             media_type="text/plain; version=0.0.4; charset=utf-8",
@@ -84,7 +95,12 @@ def register_observability_routes(
         event_log = JsonlEventLog(config().log_dir / "events.jsonl")
         return {
             "schema": "kestrel.diagnostics.v1",
-            "metrics": operational_snapshot(config=config(), state=state, runs=runs),
+            "metrics": operational_snapshot(
+                config=config(),
+                state=state,
+                runs=runs,
+                routine_loop=routine_loop,
+            ),
             "startup_recovery": getattr(runs, "startup_recovery", {}),
             "logs": [
                 asdict(event)

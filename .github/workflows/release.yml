@@ -8,15 +8,67 @@ permissions:
   contents: write
 
 jobs:
+  cross-platform:
+    name: Cross-platform Python ${{ matrix.python }} on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: macos-latest
+            python: "3.11"
+          - os: macos-latest
+            python: "3.12"
+          - os: windows-latest
+            python: "3.11"
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install exact tag source
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+          python -m pip check
+      - name: Validate exact tag source
+        run: |
+          python -m compileall -q src tests scripts
+          ruff check scripts src tests
+          mypy src
+          pytest -q
+
   validate-and-release:
+    needs: cross-platform
     runs-on: ubuntu-latest
     env:
       PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
       RELEASE_EXTRAS: "memvid,openai,anthropic,gemini,server,mcp"
+      GITLEAKS_IMAGE: "zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Require the tag commit to be on main
+        run: |
+          git fetch --no-tags origin main
+          TAG_COMMIT="$(git rev-parse "$GITHUB_REF^{commit}")"
+          EVENT_COMMIT="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          test "$TAG_COMMIT" = "$EVENT_COMMIT"
+          git merge-base --is-ancestor "$TAG_COMMIT" origin/main
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -29,6 +81,7 @@ jobs:
         run: |
           VERSION="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           test "$GITHUB_REF_NAME" = "v$VERSION"
+          python scripts/check_project_metadata.py
           uv lock --check
       - name: Install Python dependencies
         run: |
@@ -42,12 +95,28 @@ jobs:
           mypy src
           pytest -q
           python scripts/run_golden_evals.py --backend memory --provider mock
+          python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir "${RUNNER_TEMP}/kestrel-memvid-golden"
+          ruff check benchmarks/real_agent_learning_benchmark.py tests/test_real_agent_learning_benchmark.py
+          MYPYPATH=src mypy --strict benchmarks/real_agent_learning_benchmark.py
+          python benchmarks/real_agent_learning_benchmark.py --output "${RUNNER_TEMP}/agent-learning-gate.json"
       - name: Validate security, shell, recovery, and live local integrations
+        env:
+          RUN_EXTENSION_SANDBOX_INTEGRATION: "1"
+          KESTREL_EXTENSION_TEST_IMAGE: "python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3"
         run: |
           shellcheck install.sh scripts/*.sh
           bandit -q -r src -lll -iii
           python -m pip_audit
-          RUN_MEMVID_INTEGRATION=1 RUN_MCP_INTEGRATION=1 pytest -q tests/integration
+          docker pull "$GITLEAKS_IMAGE"
+          docker run --rm -v "$PWD:/repo" -w /repo "$GITLEAKS_IMAGE" \
+            git --redact=100 --no-banner .
+          docker pull "$KESTREL_EXTENSION_TEST_IMAGE"
+          RUN_MEMVID_INTEGRATION=1 RUN_MCP_INTEGRATION=1 pytest -q \
+            tests/integration/test_memvid_backend_integration.py \
+            tests/integration/test_memvid_memory_system.py \
+            tests/integration/test_memvid_context_frames.py \
+            tests/integration/test_mcp_stdio_integration.py \
+            tests/integration/test_extension_container_integration.py
           pytest -q tests/test_chaos_recovery.py tests/test_memory_backup.py tests/test_run_backpressure.py
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -59,17 +128,74 @@ jobs:
         working-directory: web
         run: |
           npm ci
+          npm run licenses:check
           npm audit --audit-level=high
           npm test
           npm run build
       - name: Stage web workbench in Python package
-        run: |
-          rm -rf src/nested_memvid_agent/web_dist
-          mkdir -p src/nested_memvid_agent/web_dist
-          cp -R web/dist/. src/nested_memvid_agent/web_dist/
+        run: python scripts/stage_web_release.py
 
       - name: Build Python release artifacts
         run: python -m build --outdir dist
+      - name: Build and attest release container
+        env:
+          TRIVY_IMAGE: "aquasec/trivy@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f"
+        run: |
+          docker build -t kestrel-agent:release .
+          docker run --rm --entrypoint /bin/sh kestrel-agent:release -c \
+            'set -eu;
+            test "$(id -u)" = 999;
+            test -f /app/LICENSE;
+            test -f /app/web/dist/THIRD_PARTY_NOTICES.txt;
+            test ! -u /usr/bin/mount;
+            test ! -u /usr/bin/umount;
+            test ! -u /usr/bin/su'
+          docker pull "$TRIVY_IMAGE"
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP:/reports" \
+            "$TRIVY_IMAGE" image \
+            --skip-version-check \
+            --scanners vuln \
+            --pkg-types os,library \
+            --format json \
+            --output /reports/kestrel-release-container-trivy.json \
+            kestrel-agent:release
+          python scripts/check_container_vulnerabilities.py \
+            "$RUNNER_TEMP/kestrel-release-container-trivy.json" \
+            --exceptions config/container_vulnerability_exceptions.json
+      - name: Verify packaged licenses and web workbench
+        run: |
+          python - <<'PY'
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          wheels = list(Path("dist").glob("*.whl"))
+          sdists = list(Path("dist").glob("*.tar.gz"))
+          if len(wheels) != 1 or len(sdists) != 1:
+              raise SystemExit(f"unexpected release artifacts: wheels={wheels}, sdists={sdists}")
+          wheel_notice = "nested_memvid_agent/web_dist/THIRD_PARTY_NOTICES.txt"
+          with zipfile.ZipFile(wheels[0]) as archive:
+              wheel_names = set(archive.namelist())
+              if wheel_notice not in wheel_names:
+                  raise SystemExit(f"wheel is missing {wheel_notice}")
+              if not any(name.endswith(".dist-info/licenses/LICENSE") for name in wheel_names):
+                  raise SystemExit("wheel is missing Kestrel's Apache LICENSE")
+              if not any(
+                  name.endswith(".dist-info/licenses/web/public/THIRD_PARTY_NOTICES.txt")
+                  for name in wheel_names
+              ):
+                  raise SystemExit("wheel metadata is missing third-party notices")
+          with tarfile.open(sdists[0], "r:gz") as archive:
+              sdist_names = set(archive.getnames())
+              if any("/tests/" in name for name in sdist_names):
+                  raise SystemExit("sdist contains a partial test bundle")
+              if not any(name.endswith(f"/src/{wheel_notice}") for name in sdist_names):
+                  raise SystemExit(f"sdist is missing src/{wheel_notice}")
+              if not any(name.endswith("/web/public/THIRD_PARTY_NOTICES.txt") for name in sdist_names):
+                  raise SystemExit("sdist is missing source third-party notices")
+          PY
       - name: Stage version-pinned installer
         run: |
           cp install.sh dist/install.sh

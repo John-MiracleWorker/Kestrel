@@ -17,7 +17,7 @@ Last updated: 2026-07-16
    - system prompt
    - compiled nested memory context
    - prior failure lessons when found
-   - available tool specs
+   - provider-specific tool protocol; native schemas stay out-of-band
    - user message
 10. Explicit direct commands such as `/search <query>` can be routed to deterministic tools before the LLM. Otherwise, the LLM provider returns either:
    - final text, or
@@ -51,18 +51,18 @@ nest-agent approvals --backend memory --json
 nest-agent approve <approval_id> --backend memory --json
 ```
 
-The FastAPI server exposes the same state through run, event, approval, scheduler, memory, context, skill, MCP, capability catalog/mutation/history, behavior-delta, plugin, product readiness/setup/provider-certification/support-bundle, and channel routes.
+The FastAPI server exposes the same state through run, event, approval, scheduler, proactive-routine, memory, context, skill, MCP, capability catalog/mutation/history, behavior-delta, plugin, product readiness/setup/provider-certification/support-bundle, and channel routes.
 
 Soul/self routes expose the same non-secret runtime model as the CLI: `/api/self`, `/api/self/remember`, `/api/self/propose-change`, `/api/web/search`, and `/api/web/fetch`.
 
 ## State Store
 
-`AgentStateStore` is SQLite control-plane storage, currently schema version 15.
+`AgentStateStore` is SQLite control-plane storage, currently schema version 19. Run rows retain serialized channel source provenance plus turn origin and transcript scope across queueing, recovery, and approval waits; legacy rows default to primary scope. Schema v19 adds durable hashed manual-routine idempotency claims and trigger provenance. Schema v18 gives approved side effects renewable execution claims and preserves the exact scheduler task/subagent binding until the pair reaches its continuation boundary. Schema v17 added revisioned routine definitions and occurrence rows with deterministic identities, UTC schedule instants, claim owner/generation/expiry fencing, request snapshots, run linkage, and terminal history.
 
 It stores:
 
 - runs and run steps
-- approval requests, decisions, and executed tool results
+- approval requests, decisions, exclusive execution claims, continuation bindings, and executed tool results
 - MCP server records and discovered tools
 - skill records and validation/provenance metadata
 - plugin records and enablement metadata
@@ -75,7 +75,7 @@ It stores:
 
 Run records also persist the provider/model selected for the run so the local operator UI can launch and inspect runs without falling back to process-global provider assumptions.
 
-Terminal run records are replay-safe: completed, failed, and cancelled runs are immutable. Approval records are immutable after they leave `pending`, and approved tool results are recorded back onto the approval record without reopening it.
+Terminal run records are replay-safe: completed, failed, and cancelled runs are immutable. Approval records are immutable after they leave `pending`. Immediately before an approved side effect, the live manager must atomically acquire a durable claim bound to its run lease and, for scheduler work, the exact running task/subagent pair. A heartbeat renews that claim while the tool runs, and only the matching owner and claim ID may finalize the result. The task/subagent binding remains after result persistence until the pair is atomically blocked or terminalized. Startup preserves a demonstrably live claim; an expired/dead claimant is closed as `approval_execution_outcome_unknown`, and stale result-bound continuations are failed closed rather than replayed.
 
 SQLite is not the retrieval memory substrate. Durable retrieval memory remains one Memvid `.mv2` file per nested layer.
 
@@ -112,7 +112,7 @@ Retries of a failed same-action tool call must include a strategy object:
 }
 ```
 
-The envelope and native provider tool calls both pass through strict schema validation against the current `ToolSpec` registry before execution.
+The envelope and native provider tool calls both pass through strict schema validation against the currently advertised, capability-filtered `ToolSpec` set before execution. Native-capable providers receive schemas only through their function-calling interface; Kestrel does not duplicate those full schemas in system text. Provider adapters can advertise a bounded native-tool limit. Kestrel then ranks only the already-active specs for the objective, keeps exact canonical names, retains `tool.registry` for authoritative discovery, and never uses narrowing to grant enablement or bypass execution-time capability and approval checks. Calls outside the advertised subset and malformed calls fail before execution with non-retryable control taxonomy such as `unknown_tool_call`, `missing_tool_arguments`, or `invalid_tool_argument_type`.
 
 ## Trace Spans
 
@@ -133,6 +133,8 @@ High-risk tools require:
 
 Turning a capability off denies later invocations even through a stale registry, revokes affected pending approvals, and closes a disabled MCP server's managed session. It applies at the future-invocation boundary and does not guarantee cancellation of an arbitrary built-in subprocess already past dispatch. Turning on does not rewrite an active run's snapshotted config or bypass a parent, master flag, resource-integrity check, or exact-call approval.
 
+Non-secret runtime settings use a separate content revision. `GET /api/runtime/config` returns the current persisted-settings snapshot; `PUT /api/runtime/settings` requires that snapshot's `expected_revision` and returns HTTP 409 on a stale writer. The store serializes read/merge, candidate-path validation, owner-only atomic persistence, live activation, and revocation of approvals affected by a newly disabled master flag. Activation failure restores both the prior persisted file and live configuration. Telegram's confirmed `max_tool_rounds` admin action uses the same transaction with a bounded conflict retry. API authentication itself is launch-controlled and excluded from persisted overrides.
+
 Examples of high-risk tools:
 
 - `shell.run`
@@ -152,7 +154,7 @@ Examples of high-risk tools:
 - `capsule.apply`
 - `self.propose_change`
 
-`git.commit` never pushes. It refuses protected branches from `NEST_AGENT_PROTECTED_BRANCHES` (`main,master,release/*` by default). On repair branches, it also requires a current `repair.review` artifact tied to successful validation and the current diff hash.
+`git.commit` never pushes. It refuses protected branches from `NEST_AGENT_PROTECTED_BRANCHES` (`main,master,release/*` by default). On repair branches, it requires a process-signed current `repair.review` artifact tied to successful pre/post-stable validation and the current content manifest. Commit construction hashes literal reviewed bytes into a private temporary index, bypasses repository filters/hooks/signing, and compare-and-swaps the branch. On other branches, exact-call approval must include the current staged-tree SHA exposed by `git.status`; a later index change is rejected.
 
 Remote publishing is not part of the default tool lane. `NEST_AGENT_ALLOW_GIT_PUSH=false`, `NEST_AGENT_ALLOW_REMOTE_MUTATION=false`, and `NEST_AGENT_GIT_WRITE_MODE=local_branch` keep self-improvement local by default. The shell tool blocks common remote-mutation escape routes such as `git push`, `git tag`, `git remote set-url`, `gh repo edit`, `gh secret set`, `gh workflow enable`, `rm -rf .git`, and writes to `.git/config` before subprocess execution.
 
@@ -163,6 +165,8 @@ The local-only git lane includes `git.create_local_branch` for approval-gated br
 `web.search` and `web.fetch` are disabled unless `allow_web` is enabled. They are read-only context tools; `web.fetch` rejects private, local, link-local, multicast, reserved, and unspecified addresses and applies timeout/byte limits.
 
 The plugin registry can fetch public GitHub repositories and materialize plugin-declared skills/MCP servers. CLI/API plugin review, install, update, enable, and sync/materialization routes require `NEST_AGENT_ALLOW_PLUGIN_INSTALL=true` or `--allow-plugin-install`. Review returns provenance, dependency, isolation, warning, unsupported-feature, and enable-blocker metadata without installing or executing plugin code. Agent-initiated `plugin.review` and `plugin.install` use the same enablement gate plus exact-call approval, and installed plugins remain disabled unless explicitly enabled. Plugins with unmanaged declared dependencies or required unavailable isolation can be installed disabled but cannot be enabled.
+
+Instruction skills do not execute code. Executable skill manifests fail closed for host `python` and `shell` runtimes; the only executable path is an explicitly enabled, exact-approved, digest-pinned OCI image. Immediately before launch, Kestrel verifies a bounded symlink-free skill-tree snapshot and canonical default-deny workspace scopes. The Docker runner supplies `--pull=never`, `--network=none`, a read-only root filesystem, nonroot identity, dropped capabilities, no-new-privileges, PID/CPU/memory/ulimit/tmpfs bounds, bounded output, hard timeout/process-group cleanup, and no host fallback. The current scope contract grants no secrets and no outbound network.
 
 ## Memory Wiring
 
@@ -203,6 +207,10 @@ The context compiler now uses the MV2 context packer. The packer emits:
 
 Raw expansion happens through `context.expand` when needed rather than dumping full transcripts into every prompt.
 
+Persistent recall is split by trust. General packed memory, failure lessons, display labels, and free-form Soul preferences are JSON-encoded user-role evidence. Only the fixed persona preset selected through the authenticated onboarding route enters the Soul system context. Policy memory enters a system message only after its `memory.policy_promote` attestation matches the durable exact-call owner approval, approved argument digest, and recorded policy record ID; caller-asserted `memory.learn` fields never satisfy this check.
+
+Exact transcript replay is a separate continuity path. Working-memory user and assistant frames carry durable `turn_origin` and `transcript_scope` metadata. Only completed `primary_user`/`primary` and `channel_user`/`channel` pairs replay with native roles; scheduler tasks, subagents, and approval continuations are marked `internal`. Approved tool continuation content is JSON-wrapped as untrusted runtime data before the model sees it.
+
 ## Behavior Delta Wiring
 
 Behavior-delta runtime wiring is default-off via `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS=0`. When enabled, active relevant deltas are compiled into structured runtime instructions, activation rows are logged once per run/delta, and tool-aware preflight passes advisory instructions through the tool context without bypassing capability flags or exact-call approval gates. Proposed/staged low-risk deltas can auto-activate only when `NEST_AGENT_ENABLE_AUTO_ACTIVATE_LOW_RISK_DELTAS=1` and `MutationGate` evidence requirements pass; policy-affecting deltas still require MutationGate approval, exact-call review actions, evidence, validation, and rollback metadata.
@@ -219,7 +227,15 @@ Autonomous-learning rollout flags currently default off:
 
 ## Scheduler and Subagents
 
-Background runs seed a root task and a small deterministic task DAG. The graph runtime records planner metadata on the root task, executes the chat loop through the executor node, gates completion through the reviewer node, and records recovery metadata when approvals or failures block progress. The scheduler can execute approved ready tasks when `enable_autonomous_scheduler` or `NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER` is enabled.
+Background runs seed a root task and a small deterministic task DAG. When `enable_semantic_orchestration` / `NEST_AGENT_ENABLE_SEMANTIC_ORCHESTRATION=1` is explicitly enabled with a non-mock provider that advertises JSON support, the planner makes a bounded structured call that can refine the semantic objective, acceptance criteria, and advisory guidance for existing task IDs. The provider cannot add tasks or alter persisted dependencies, required tools, risk, approval state, or capability gates. Invalid or unavailable structured planning falls back to an explicitly labeled `deterministic_task_graph` plan.
+
+The executor remains one chat/tool turn before any optional scheduler work; Kestrel does not claim that the provider dynamically rewrites the task DAG. The reviewer now records a schema-versioned artifact containing a decision, evaluator, per-criterion status, evidence references, provenance, confidence, and remaining risks. JSON-capable real providers may perform the semantic judgment, but only references to supplied runtime evidence are accepted. Mock mode and invalid/unavailable provider reviews use an explicitly labeled deterministic evidence gate. Approval continuation passes through the same reviewer gate before the run can complete, and unresolved final tool failures fail review. Recovery metadata is recorded when approvals or failures block progress.
+
+The scheduler can execute approved ready tasks when `enable_autonomous_scheduler` or `NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER` is enabled. Task-level acceptance validation no longer marks every criterion satisfied from a single generic pass bit: successful tool calls and proof-of-work validation entries carry evidence IDs, while deterministic mock tool bypasses are persisted as `not_verified_mock` rather than fabricated success.
+
+The root tracking task is reconciled with the terminal run state. For a terminal non-scheduler primary turn, unexecuted child skeleton tasks are marked `skipped` with a durable disposition instead of being left `queued` under a completed root. Scheduler child aggregation merges `child_statuses` into the existing root result so the primary `orchestration_review` artifact is not overwritten.
+
+Semantic orchestration is separate from `enable_agentic_cycle`: the older flag controls failure lessons/proof-of-work behavior inside the chat loop, while `enable_semantic_orchestration` controls extra provider calls around that loop. It defaults off because a normally completed run adds up to two model requests (one plan and one review). Deterministic evidence review remains active without either extra request.
 
 Scheduler bounds:
 
@@ -227,6 +243,27 @@ Scheduler bounds:
 - `max_scheduler_cycles` / `NEST_AGENT_MAX_SCHEDULER_CYCLES`
 
 Ready tasks must be queued or approved, have completed dependencies, and pass retry-strategy gates. Tasks requiring approval remain blocked until explicitly approved.
+
+## Proactive Routine Wiring
+
+Time-based proactive routines are separate from the per-run task scheduler. `RoutineService` claims due definitions from SQLite, while `RoutineLoop` provides an optional non-overlapping polling thread controlled by `enable_proactive_routines` / `NEST_AGENT_ENABLE_PROACTIVE_ROUTINES`. The loop stops and joins before `RunManager` cancels/joins owned work and before channel or MCP resources close.
+
+Routine creation is forced disabled. Owner updates, enable/disable, and tombstone deletion require the current revision; API mutation additionally fails closed unless the global shared-token API-auth gate is configured. The first schedule contract is deliberately small: timezone-aware instants are normalized to UTC, `once` and `interval` are supported, fixed intervals are at least 60 seconds, late intervals skip backlog beyond their grace window, and at most `max_routines_per_tick` occurrences are claimed per tick.
+
+Each occurrence has a deterministic identity over routine ID, routine revision, and scheduled UTC instant. Claim owner, generation, and expiry are revalidated in the same `BEGIN IMMEDIATE` transaction that inserts the deterministic run and moves the occurrence to `running`. Disabling, revising, or deleting before that transaction fences the stale claimant. Expired claims can move to a higher generation; a former owner cannot transition the reclaimed occurrence. A nonterminal occurrence, including a run blocked for exact-call approval, suppresses a new overlapping interval. Routine ticks also expire overdue exact-call approvals and reconcile the linked occurrence, so a headless approval cannot suppress the schedule forever.
+
+Scheduled runs persist `turn_origin=scheduled_routine`, `transcript_scope=internal`, a routine-scoped session ID, and authoritative routine/occurrence provenance in their configuration snapshot. Their initial root/task graph is created in one SQLite transaction. Startup recreates that graph when a process dies after atomic run admission but before graph initialization, then resumes the queued run. The one-shot CLI uses a narrower recovery path that accepts only linked, internally scoped scheduled runs and leaves unrelated queued work untouched. Scheduled runs otherwise use ordinary run capacity, leases, graph execution, capability decisions, exact-call approvals, cancellation, and publication fences. Enabling the routine is not approval for any tool call.
+
+The occurrence/run admission boundary is duplicate-fenced. The owner workbench uses revision-checked definition mutations and selected occurrence history. Its manual `POST /api/routines/{routine_id}/actions/run-now` action requires API auth, proactive-routine enablement, the current routine revision, and a client idempotency UUID. The server stores only a hash of that key, transactionally claims/replays/reclaims it, preserves the schedule, and applies overlap suppression. Kestrel does not claim exactly-once arbitrary tool or external connector side effects after dispatch. Cron, named timezone/DST calendar behavior, and automatic channel delivery are not implemented.
+
+Routine bounds:
+
+- `routine_poll_interval_seconds` / `NEST_AGENT_ROUTINE_POLL_INTERVAL_SECONDS`: 1-3,600 seconds.
+- `routine_claim_ttl_seconds` / `NEST_AGENT_ROUTINE_CLAIM_TTL_SECONDS`: 1-3,600 seconds.
+- `max_routines_per_tick` / `NEST_AGENT_MAX_ROUTINES_PER_TICK`: 1-100 claims.
+- Owner-authored `interval_seconds`: 60-31,536,000 seconds (one year).
+- Owner-authored `misfire_grace_seconds`: 0-604,800 seconds (seven days).
+- Low-level occurrence-history and reconciliation reads are capped at 500 and 1,000 rows respectively.
 
 Subagents are currently in-process planner/worker/reviewer profiles with durable records. When `enable_worker_isolation` or `NEST_AGENT_ENABLE_WORKER_ISOLATION` is enabled, scheduler/subagent execution prepares a git worktree from the run workspace, creates a worker branch using `worker_branch_prefix`, switches the task agent workspace to that worktree, and records the isolation metadata on the task result.
 
@@ -270,6 +307,6 @@ Plugin-provided MCP stdio servers carry `connect_requires_approval` vetting meta
 
 `nest-agent product provider-certification` and `GET /api/product/provider-certification` expose a redacted provider matrix. The report marks deterministic mock coverage as certified, records credential/base-url presence for real providers, identifies host-local manual checks such as `codex-cli`, and returns the live-validation commands needed to turn configured providers into release evidence. It never returns raw API keys.
 
-`nest-agent product support-bundle` and `POST /api/product/support-bundle` write a local zip archive under the requested output path or `.nest/support-bundles/` by default. The archive is diagnostic only: it includes product/setup readiness, runtime metadata with environment-variable presence only, git status, SQLite table counts, log file metadata, and a bounded redacted `events.jsonl` tail. It does not include raw Secret Broker vault contents, raw environment variable values, or `.mv2` memory files.
+`nest-agent product support-bundle` and `POST /api/product/support-bundle` write a local zip archive under the requested output path or `.nest/support-bundles/` by default. The archive is diagnostic only: it includes product/setup readiness, runtime metadata with environment-variable presence only, git status, SQLite table counts, log file metadata, and a bounded `events.jsonl` tail. Event-tail sanitization is default-deny for strings: only explicitly allowlisted operational identifiers, timestamps, statuses, categories, and tool/provider labels survive; prompts, messages, proof objectives, commands, diagnoses, strategies, errors, and other arbitrary nested text become `<redacted>`. The archive does not include raw Secret Broker vault contents, raw environment variable values, or `.mv2` memory files.
 
 SSE and streamable HTTP transports share manager concepts but still need real fixtures and soak testing.

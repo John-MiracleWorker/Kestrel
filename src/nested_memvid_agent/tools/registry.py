@@ -175,6 +175,12 @@ def _run_tool(tool: AgentTool, call: ToolCall, arguments: dict[str, Any], contex
         return results.get(timeout=timeout)
     except Empty:
         _cancel_tool(tool, call.id)
+        if tool.wait_for_completion_on_timeout:
+            # Transactional/high-risk tools must not keep mutating after the
+            # registry has durably reported a terminal timeout. Their own
+            # subprocesses are bounded and cancellable, so wait for the actual
+            # result after requesting cancellation.
+            return results.get()
         return _failure(
             call,
             content=f"Tool {call.name} timed out after {timeout:g} seconds.",
@@ -212,6 +218,7 @@ _ENABLEMENT_BY_TOOL = {
     "git.commit": "allow_git_commit",
     "memory.import": "allow_memory_import",
     "memory.correct": "allow_memory_import",
+    "memory.policy_promote": "allow_policy_writes",
     "web.search": "allow_web",
     "web.fetch": "allow_web",
     "self.propose_change": "allow_self_modification",

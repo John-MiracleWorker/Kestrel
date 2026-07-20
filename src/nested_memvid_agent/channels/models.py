@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from ..runtime_models import AgentTurnResult, TurnSource
-
-_SESSION_SAFE_RE = re.compile(r"[^a-zA-Z0-9_.:-]+")
+from ..runtime_models import AgentTurnResult, TurnSource, durable_channel_session_id
 
 
 @dataclass(frozen=True)
@@ -62,7 +59,11 @@ class ChannelInboundMessage:
 
     @property
     def session_id(self) -> str:
-        return "channel:" + _safe_session_part(self.channel_id) + ":" + _safe_session_part(self.conversation_id)
+        return durable_channel_session_id(
+            channel=self.channel,
+            channel_id=self.channel_id,
+            conversation_id=self.conversation_id,
+        )
 
     def to_turn_source(self) -> TurnSource:
         return TurnSource(
@@ -136,11 +137,6 @@ class ChannelProcessResult:
             "memory_writes": list(self.turn.memory_writes),
             "delivery": self.delivery.to_public_dict(),
         }
-
-
-def _safe_session_part(value: str) -> str:
-    safe = _SESSION_SAFE_RE.sub("_", value.strip())
-    return safe[:120] or "unknown"
 
 
 def _as_bool(value: object, default: bool) -> bool:

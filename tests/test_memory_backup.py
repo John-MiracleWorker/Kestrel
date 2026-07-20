@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -20,6 +21,31 @@ def _seed_memory(memory_dir: Path, suffix: str = "original") -> None:
             f'{{"layer":"{spec.layer.value}","value":"{suffix}"}}',
             encoding="utf-8",
         )
+
+
+def test_backup_restore_preserves_validation_integrity_key(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    backup_root = tmp_path / "backups"
+    _seed_memory(memory_dir)
+    key_path = memory_dir / ".validation-integrity.key"
+    original_key = "ab" * 32
+    key_path.write_text(original_key, encoding="utf-8")
+    key_path.chmod(0o600)
+    manager = MemoryBackupManager(memory_dir=memory_dir, backup_root=backup_root)
+
+    manifest = manager.create()
+    key_path.write_text("cd" * 32, encoding="utf-8")
+    key_path.chmod(0o600)
+    restored = manager.restore(str(manifest["backup_id"]))
+
+    assert restored["restored_files"] == len(manifest["files"])
+    assert key_path.read_text(encoding="utf-8") == original_key
+    assert any(
+        entry["path"] == "memory/.validation-integrity.key"
+        for entry in manifest["files"]
+    )
+    if os.name != "nt":
+        assert key_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_file_fsync_uses_a_writable_descriptor(

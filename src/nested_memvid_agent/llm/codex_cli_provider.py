@@ -95,6 +95,7 @@ class CodexCLIProvider(LLMProvider):
             self.sandbox,
             "--color",
             "never",
+            "--ignore-user-config",
             "--output-last-message",
             str(output_path),
         ]

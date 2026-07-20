@@ -4,11 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nested-memvid-agent"
-version = "0.3.1"
+version = "0.4.0"
 description = "Kestrel: a local-first, memory-native AI engineering agent runtime."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+license-files = ["LICENSE", "web/public/THIRD_PARTY_NOTICES.txt"]
 authors = [{ name = "Kestrel Contributors" }]
 dependencies = ["numpy>=1.26,<2.5", "pip>=26.1.2", "setuptools>=83.0.0"]
 
@@ -37,14 +38,22 @@ nest-agent = "nested_memvid_agent.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/John-MiracleWorker/Kestrel"
+Documentation = "https://github.com/John-MiracleWorker/Kestrel#documentation-map"
 Repository = "https://github.com/John-MiracleWorker/Kestrel"
 Issues = "https://github.com/John-MiracleWorker/Kestrel/issues"
+Changelog = "https://github.com/John-MiracleWorker/Kestrel/blob/main/CHANGELOG.md"
+Security = "https://github.com/John-MiracleWorker/Kestrel/security/policy"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-nested_memvid_agent = ["prompts/*.md", "web_dist/index.html", "web_dist/assets/*"]
+nested_memvid_agent = [
+  "prompts/*.md",
+  "web_dist/index.html",
+  "web_dist/assets/*",
+  "web_dist/THIRD_PARTY_NOTICES.txt",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

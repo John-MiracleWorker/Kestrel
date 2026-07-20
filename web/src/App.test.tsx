@@ -1,9 +1,24 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import axe from "axe-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import type { Approval, Capability, Channel, McpServer, Run, SecretRef, Session, Skill, TaskGraph, Tool, TraceEvent } from "./types";
+import type {
+  Approval,
+  Capability,
+  Channel,
+  McpServer,
+  Routine,
+  RoutineOccurrence,
+  RoutineStatus,
+  Run,
+  SecretRef,
+  Session,
+  Skill,
+  TaskGraph,
+  Tool,
+  TraceEvent
+} from "./types";
 
 const baseRun: Run = {
   run_id: "run_1",
@@ -53,6 +68,46 @@ const pendingApproval: Approval = {
   updated_at: "2026-05-16T00:02:02Z"
 };
 
+const baseRoutine: Routine = {
+  routine_id: "morning-review",
+  name: "Morning review",
+  prompt: "Review my pending local work and summarize the next action.",
+  schedule_kind: "interval",
+  start_at: "2026-05-17T13:00:00Z",
+  interval_seconds: 86400,
+  enabled: true,
+  revision: 3,
+  next_run_at: "2026-05-18T13:00:00Z",
+  workspace: "/tmp/kestrel",
+  provider: "mock",
+  model: "mock",
+  autonomy_mode: "background",
+  misfire_grace_seconds: 300,
+  last_scheduled_at: "2026-05-17T13:00:00Z",
+  deleted_at: null,
+  created_at: "2026-05-16T12:00:00Z",
+  updated_at: "2026-05-17T13:00:00Z"
+};
+
+const baseRoutineOccurrence: RoutineOccurrence = {
+  occurrence_id: "occ_morning_1",
+  routine_id: baseRoutine.routine_id,
+  routine_revision: baseRoutine.revision,
+  scheduled_for: "2026-05-17T13:00:00Z",
+  status: "completed",
+  run_id: "run_routine_1",
+  request: { prompt: baseRoutine.prompt },
+  trigger_kind: "scheduled",
+  requested_at: null,
+  started_at: "2026-05-17T13:00:01Z",
+  finished_at: "2026-05-17T13:00:02Z",
+  skip_reason: null,
+  error: null,
+  result: {},
+  created_at: "2026-05-17T13:00:00Z",
+  updated_at: "2026-05-17T13:00:02Z"
+};
+
 let runs: Run[];
 let sessions: Session[];
 let sessionRuns: Record<string, Run[]>;
@@ -69,6 +124,45 @@ let eventSources: MockEventSource[];
 let eventId: number;
 let traceTimelines: Record<string, TraceEvent[]>;
 let taskGraphs: Record<string, TaskGraph>;
+let routinesPayload: Routine[];
+let routineStatusPayload: RoutineStatus;
+let routineHistories: Record<string, RoutineOccurrence[]>;
+let routineLoadFailure: string | null;
+let routineHistoryFailure: string | null;
+let routineRunNowAmbiguousFailures: number;
+let routineRunNowAccepted: Map<string, RoutineOccurrence>;
+let routineRunNowInitialStatus: string;
+
+function installRoutineHistoryPollTimers() {
+  const nativeSetTimeout = window.setTimeout.bind(window);
+  const nativeClearTimeout = window.clearTimeout.bind(window);
+  type TimerId = NodeJS.Timeout;
+  const pending = new Map<TimerId, () => void>();
+  let nextTimerId = 10_000;
+
+  vi.spyOn(window, "setTimeout").mockImplementation((handler, timeout, ...args) => {
+    if (timeout === 1_500) {
+      const timerId = nextTimerId++ as unknown as TimerId;
+      pending.set(timerId, () => handler());
+      return timerId;
+    }
+    return nativeSetTimeout(handler, timeout, ...args) as unknown as NodeJS.Timeout;
+  });
+  vi.spyOn(window, "clearTimeout").mockImplementation((timerId) => {
+    if (timerId !== undefined && pending.delete(timerId as NodeJS.Timeout)) return;
+    nativeClearTimeout(timerId as NodeJS.Timeout);
+  });
+
+  return {
+    count: () => pending.size,
+    takeNext: () => {
+      const next = pending.entries().next().value as [TimerId, () => void] | undefined;
+      if (!next) throw new Error("No routine history poll is scheduled.");
+      pending.delete(next[0]);
+      return next[1];
+    }
+  };
+}
 
 describe("App", () => {
   beforeEach(() => {
@@ -214,12 +308,33 @@ describe("App", () => {
       ]
     };
     taskGraphs = {};
+    routinesPayload = [baseRoutine];
+    routineStatusPayload = {
+      enabled: true,
+      loop: {
+        running: true,
+        tick_count: 8,
+        last_result: null,
+        last_error: null,
+        tick_in_progress: false,
+        current_tick_age_seconds: null,
+        last_started_at: "2026-05-17T13:00:00Z",
+        last_finished_at: "2026-05-17T13:00:02Z"
+      }
+    };
+    routineHistories = { [baseRoutine.routine_id]: [baseRoutineOccurrence] };
+    routineLoadFailure = null;
+    routineHistoryFailure = null;
+    routineRunNowAmbiguousFailures = 0;
+    routineRunNowAccepted = new Map();
+    routineRunNowInitialStatus = "completed";
     vi.stubGlobal("fetch", vi.fn(fetchMock));
     vi.stubGlobal("EventSource", MockEventSource);
   });
 
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
     sessionStorage.clear();
     localStorage.clear();
@@ -284,6 +399,64 @@ describe("App", () => {
     expect(idlePaths).not.toContain("/api/memory/layers");
   });
 
+  it("pulls incoming runs into the active thread without stealing transcript scroll", async () => {
+    const intervalCallbacks: Array<() => void> = [];
+    vi.spyOn(window, "setInterval").mockImplementation((handler: TimerHandler, timeout?: number) => {
+      if (typeof handler === "function" && timeout === 3500) {
+        intervalCallbacks.push(() => handler());
+      }
+      return 1 as unknown as ReturnType<typeof window.setInterval>;
+    });
+    vi.spyOn(window, "clearInterval").mockImplementation(() => undefined);
+    const fetchSpy = vi.mocked(fetch);
+
+    render(<App />);
+
+    await screen.findAllByText("Run tests");
+    expect(intervalCallbacks).toHaveLength(1);
+    const transcript = screen.getByLabelText("Conversation transcript");
+    let transcriptHeight = 1_200;
+    Object.defineProperty(transcript, "scrollHeight", {
+      configurable: true,
+      get: () => transcriptHeight
+    });
+    Object.defineProperty(transcript, "clientHeight", { configurable: true, get: () => 400 });
+    transcript.scrollTop = 100;
+    fireEvent.scroll(transcript);
+
+    const incomingRun: Run = {
+      ...baseRun,
+      run_id: "run_incoming",
+      message: "Incoming same-thread message",
+      assistant_message: "Incoming response",
+      created_at: "2026-05-16T00:03:00Z",
+      updated_at: "2026-05-16T00:03:01Z"
+    };
+    runs = [incomingRun, ...runs];
+    sessionRuns.session_1 = [...sessionRuns.session_1, incomingRun];
+    sessions = sessions.map((session) =>
+      session.session_id === "session_1"
+        ? {
+            ...session,
+            run_count: 3,
+            status_counts: { completed: 3 },
+            latest_run_id: incomingRun.run_id,
+            latest_status: incomingRun.status,
+            latest_message: incomingRun.message,
+            updated_at: incomingRun.updated_at
+          }
+        : session
+    );
+    transcriptHeight = 1_500;
+    fetchSpy.mockClear();
+
+    intervalCallbacks[0]();
+
+    expect((await screen.findAllByText("Incoming same-thread message")).length).toBeGreaterThan(0);
+    expect(fetchSpy.mock.calls.some(([path]) => path === "/api/sessions/session_1/runs")).toBe(true);
+    expect(transcript.scrollTop).toBe(100);
+  });
+
   it("renders assistant markdown as rich chat prose", async () => {
     runs = [
       {
@@ -333,6 +506,242 @@ describe("App", () => {
     expect(screen.getAllByText("Tools").length).toBeGreaterThan(0);
   });
 
+  it("loads the routine workbench with service status, definitions, history, and accessible owner controls", async () => {
+    const { container } = render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("button", { name: "Routines" }));
+
+    const workbench = await screen.findByRole("region", { name: "Routine Workbench" });
+    expect(within(workbench).getByRole("heading", { name: "Routine Workbench." })).toBeInTheDocument();
+    expect(within(workbench).getByText("running")).toBeInTheDocument();
+    expect(within(workbench).getAllByText("Morning review").length).toBeGreaterThan(0);
+    expect(within(workbench).getByText("Scheduled run")).toBeInTheDocument();
+    expect(within(workbench).getByText("run_routine_1")).toBeInTheDocument();
+    expect(within(workbench).getByRole("button", { name: "Pause Morning review" })).toBeEnabled();
+    expect(within(workbench).getByRole("button", { name: "Edit Morning review" })).toBeEnabled();
+    expect(within(workbench).getByRole("button", { name: "Delete Morning review" })).toBeEnabled();
+    expect(within(workbench).getByRole("button", { name: "Run Morning review now" })).toBeEnabled();
+    fireEvent.click(within(workbench).getByRole("button", { name: "New routine" }));
+    const createForm = within(workbench).getByRole("form", { name: "Create routine" });
+    expect(within(createForm).getByLabelText("Routine name")).toBeRequired();
+    expect(within(createForm).getByLabelText("Prompt")).toBeRequired();
+    expect(within(createForm).getByLabelText(/Start time/)).toBeRequired();
+    expect(within(createForm).getByRole("button", { name: "Save routine" })).toBeEnabled();
+
+    const results = await axe.run(container);
+    expect(results.violations).toEqual([]);
+  });
+
+  it("shows fail-closed disabled and independent endpoint error states", async () => {
+    routineStatusPayload = { enabled: false, loop: null };
+    routineHistoryFailure = "routine_history_unavailable";
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+
+    expect(await screen.findByText("Proactive dispatch is disabled.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run Morning review now" })).toBeDisabled();
+    expect(await screen.findByText("History unavailable: routine_history_unavailable")).toBeInTheDocument();
+    expect(screen.getAllByText("Morning review").length).toBeGreaterThan(0);
+  });
+
+  it("keeps routine definitions visible when the independent status endpoint fails", async () => {
+    routineLoadFailure = "routine_status_unavailable";
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+
+    expect(await screen.findByText("routine_status_unavailable")).toBeInTheDocument();
+    expect(screen.getAllByText("Morning review").length).toBeGreaterThan(0);
+    expect(screen.getByText("Scheduled run")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run Morning review now" })).toBeDisabled();
+  });
+
+  it("dispatches run now with the selected revision and a UUID idempotency key", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Run Morning review now" }));
+
+    await waitFor(() => {
+      const request = fetchSpy.mock.calls.find(
+        ([path, init]) => path === "/api/routines/morning-review/actions/run-now" && init?.method === "POST"
+      );
+      expect(request).toBeDefined();
+      const body = JSON.parse(String(request?.[1]?.body ?? "{}"));
+      expect(body.expected_revision).toBe(3);
+      expect(body.idempotency_key).toMatch(/^[0-9a-f-]{36}$/i);
+    });
+    expect(await screen.findByText("Dispatch accepted")).toBeInTheDocument();
+
+    const runAgain = screen.getByRole("button", { name: "Run Morning review now" });
+    await waitFor(() => expect(runAgain).toBeEnabled());
+    fireEvent.click(runAgain);
+    await waitFor(() => {
+      const requests = fetchSpy.mock.calls.filter(
+        ([path, init]) => path === "/api/routines/morning-review/actions/run-now" && init?.method === "POST"
+      );
+      expect(requests).toHaveLength(2);
+      const first = JSON.parse(String(requests[0][1]?.body ?? "{}"));
+      const second = JSON.parse(String(requests[1][1]?.body ?? "{}"));
+      expect(second.idempotency_key).not.toBe(first.idempotency_key);
+    });
+  });
+
+  it("polls nonterminal routine history without overlap and refreshes the accepted run result", async () => {
+    routineRunNowInitialStatus = "claimed";
+    const timers = installRoutineHistoryPollTimers();
+    const originalFetch = fetchMock;
+    let historyRequestCount = 0;
+    let resolvePoll!: (response: Response) => void;
+    const pendingPoll = new Promise<Response>((resolve) => {
+      resolvePoll = resolve;
+    });
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const raw = typeof input === "string" || input instanceof URL ? input.toString() : input.url;
+      const url = new URL(raw, "http://kestrel.test");
+      if (url.pathname === "/api/routines/morning-review/history") {
+        historyRequestCount += 1;
+        if (historyRequestCount === 3) return pendingPoll;
+      }
+      return originalFetch(input, init);
+    });
+
+    const { container } = render(<App />);
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Run Morning review now" }));
+
+    const acceptedResult = await waitFor(() => {
+      const result = container.querySelector<HTMLElement>(".routine-run-result");
+      expect(result).not.toBeNull();
+      expect(within(result!).getByText("claimed")).toBeInTheDocument();
+      return result!;
+    });
+    await waitFor(() => expect(timers.count()).toBe(1));
+
+    await act(async () => {
+      timers.takeNext()();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(historyRequestCount).toBe(3));
+    expect(timers.count()).toBe(0);
+
+    const claimed = routineHistories[baseRoutine.routine_id][0];
+    const completed: RoutineOccurrence = {
+      ...claimed,
+      status: "completed",
+      finished_at: "2026-05-17T14:00:04Z",
+      updated_at: "2026-05-17T14:00:04Z"
+    };
+    routineHistories[baseRoutine.routine_id] = [
+      completed,
+      ...routineHistories[baseRoutine.routine_id].slice(1)
+    ];
+    await act(async () => {
+      resolvePoll(jsonResponse(routineHistories[baseRoutine.routine_id]));
+      await pendingPoll;
+    });
+
+    await waitFor(() => expect(within(acceptedResult).getByText("completed")).toBeInTheDocument());
+    await waitFor(() => expect(timers.count()).toBe(0));
+    expect(historyRequestCount).toBe(3);
+  });
+
+  it("cancels routine history polling across selection changes and unmount", async () => {
+    const timers = installRoutineHistoryPollTimers();
+    const eveningRoutine: Routine = {
+      ...baseRoutine,
+      routine_id: "evening-review",
+      name: "Evening review",
+      revision: 1
+    };
+    routineHistories = {
+      [baseRoutine.routine_id]: [{ ...baseRoutineOccurrence, status: "running" }],
+      [eveningRoutine.routine_id]: [
+        {
+          ...baseRoutineOccurrence,
+          occurrence_id: "occ_evening_1",
+          routine_id: eveningRoutine.routine_id,
+          routine_revision: eveningRoutine.revision,
+          run_id: "run_evening_1"
+        }
+      ]
+    };
+    routinesPayload = [baseRoutine, eveningRoutine];
+    const fetchSpy = vi.mocked(fetch);
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    await screen.findByText("run_routine_1");
+    await waitFor(() => expect(timers.count()).toBe(1));
+    const staleSelectionPoll = timers.takeNext();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Evening review/ }));
+    await screen.findByText("run_evening_1");
+    const callsAfterSelection = fetchSpy.mock.calls.length;
+    await act(async () => {
+      staleSelectionPoll();
+      await Promise.resolve();
+    });
+    expect(fetchSpy.mock.calls).toHaveLength(callsAfterSelection);
+    expect(timers.count()).toBe(0);
+
+    fireEvent.click(screen.getByRole("button", { name: /^Morning review/ }));
+    await screen.findByText("run_routine_1");
+    await waitFor(() => expect(timers.count()).toBe(1));
+    const staleUnmountPoll = timers.takeNext();
+    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    const callsAfterUnmount = fetchSpy.mock.calls.length;
+    await act(async () => {
+      staleUnmountPoll();
+      await Promise.resolve();
+    });
+    expect(fetchSpy.mock.calls).toHaveLength(callsAfterUnmount);
+    expect(timers.count()).toBe(0);
+  });
+
+  it("reuses the same run-now idempotency key after an ambiguous network result", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    routineRunNowAmbiguousFailures = 1;
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Run Morning review now" }));
+
+    expect(await screen.findByText(/No response was received for Morning review/)).toBeInTheDocument();
+    expect(screen.getByText(/reuse the original idempotency key and revision/i)).toBeInTheDocument();
+    const storageKey = "kestrel.routine.run-now.v1:morning-review";
+    const stored = JSON.parse(String(sessionStorage.getItem(storageKey)));
+    expect(stored.expectedRevision).toBe(3);
+
+    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Retry Morning review now" }));
+
+    await waitFor(() => {
+      const requests = fetchSpy.mock.calls.filter(
+        ([path, init]) => path === "/api/routines/morning-review/actions/run-now" && init?.method === "POST"
+      );
+      expect(requests).toHaveLength(2);
+      const first = JSON.parse(String(requests[0][1]?.body ?? "{}"));
+      const retry = JSON.parse(String(requests[1][1]?.body ?? "{}"));
+      expect(retry).toEqual(first);
+      expect(first.idempotency_key).toBe(stored.idempotencyKey);
+    });
+    expect(await screen.findByText("Recovered dispatch")).toBeInTheDocument();
+    expect(sessionStorage.getItem(storageKey)).toBeNull();
+  });
+
 
   it("renders the Learning Dashboard panel under behavior deltas", async () => {
     render(<App />);
@@ -347,6 +756,13 @@ describe("App", () => {
   });
 
   it("surfaces repair patch review validation and rollback state from the task graph", async () => {
+    const validationId = "repair_validation_aaaaaaaaaaaaaaaaaaaaaaaa";
+    const reviewId = "repair_review_bbbbbbbbbbbbbbbbbbbbbbbb";
+    const repairSnapshot = {
+      branch: "kestrel/worker/run-repair/repair",
+      head_sha: "1111111111111111111111111111111111111111",
+      diff_digest: "deadbeefcafebabedeadbeefcafebabedeadbeefcafebabedeadbeefcafebabe"
+    };
     const repairRun: Run = {
       ...baseRun,
       run_id: "run_repair",
@@ -382,8 +798,12 @@ describe("App", () => {
           risk: "high",
           attempt_count: 1,
           result: {
-            validation: { success: true, command: ["python", "-m", "pytest", "tests/test_calculator.py", "-q"] },
-            next_action: "create_repair_review_before_commit"
+            repair_artifact: {
+              schema_version: 1,
+              tool: "repair.validate",
+              validation_id: validationId,
+              repair_snapshot: repairSnapshot
+            }
           }
         },
         {
@@ -397,10 +817,15 @@ describe("App", () => {
           risk: "medium",
           attempt_count: 1,
           result: {
-            review_id: "review_abc123",
-            diff_hash: "deadbeefcafebabe",
-            changed_files: ["src/calculator.py"],
-            commit_gate: { approval_required_before_commit: true }
+            repair_artifact: {
+              schema_version: 1,
+              tool: "repair.review",
+              validation_id: validationId,
+              review_id: reviewId,
+              repair_snapshot: repairSnapshot,
+              changed_files: ["src/calculator.py"],
+              commit_gate: { commit_allowed: true, approval_required_before_commit: true }
+            }
           }
         },
         {
@@ -431,9 +856,11 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
 
     const panel = await screen.findByLabelText("Repair Patch Review");
-    expect(within(panel).getByText("Validation passed: python -m pytest tests/test_calculator.py -q")).toBeInTheDocument();
-    expect(within(panel).getByText("Review gate: review_abc123 · commit approval required")).toBeInTheDocument();
-    expect(within(panel).getByText("Diff deadbeefcafebabe · src/calculator.py")).toBeInTheDocument();
+    expect(within(panel).getByText(`Validation passed: ${validationId}`)).toBeInTheDocument();
+    expect(within(panel).getByText(`Candidate digest ${repairSnapshot.diff_digest}`)).toBeInTheDocument();
+    expect(within(panel).getByText(`Review gate: ${reviewId} · commit approval required`)).toBeInTheDocument();
+    expect(within(panel).getByText(`Diff ${repairSnapshot.diff_digest} · src/calculator.py`)).toBeInTheDocument();
+    expect(within(panel).getByText(`Candidate ${repairSnapshot.branch} @ ${repairSnapshot.head_sha}`)).toBeInTheDocument();
     expect(within(panel).getByText("Rollback state: ready · rollback_abc123")).toBeInTheDocument();
     expect(within(panel).getByText("Restores src/calculator.py and preserves .nest/repair_rollbacks/rollback_abc123.json")).toBeInTheDocument();
   });
@@ -743,6 +1170,74 @@ describe("App", () => {
     });
   });
 
+  it("clears a queued success notice after the run reaches a terminal state", async () => {
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /new chat/i }));
+    fireEvent.change(screen.getByLabelText("Ask Kestrel"), { target: { value: "Finish this task" } });
+    fireEvent.click(screen.getByRole("button", { name: /send/i }));
+
+    expect(await screen.findByText("Run queued.")).toBeInTheDocument();
+    const created = runs.find((run) => run.run_id === "run_created");
+    expect(created).toBeDefined();
+    const completed = {
+      ...created!,
+      status: "completed",
+      assistant_message: "Task complete",
+      stop_reason: "completed",
+      updated_at: "2026-05-16T00:10:01Z"
+    } satisfies Run;
+    runs = runs.map((run) => run.run_id === completed.run_id ? completed : run);
+    sessionRuns[completed.session_id] = (sessionRuns[completed.session_id] ?? []).map((run) =>
+      run.run_id === completed.run_id ? completed : run
+    );
+
+    await waitFor(() => expect(eventSources.length).toBeGreaterThan(1));
+    eventSources[eventSources.length - 1].emit("run.completed", {});
+
+    await waitFor(() => expect(screen.queryByText("Run queued.")).not.toBeInTheDocument());
+    expect(await screen.findByText("Task complete")).toBeInTheDocument();
+  });
+
+  it("resets the workspace scroll position when navigating between sections", async () => {
+    const { container } = render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    const workspace = container.querySelector<HTMLElement>("main#workspace");
+    expect(workspace).not.toBeNull();
+    workspace!.scrollTop = 420;
+
+    fireEvent.click(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("button", { name: "Routines" }));
+
+    await screen.findByRole("region", { name: "Routine Workbench" });
+    expect(workspace!.scrollTop).toBe(0);
+  });
+
+  it("follows live transcript output unless the user has scrolled away from the bottom", async () => {
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    const transcript = await screen.findByLabelText("Conversation transcript");
+    let transcriptHeight = 1_200;
+    Object.defineProperty(transcript, "scrollHeight", { configurable: true, get: () => transcriptHeight });
+    Object.defineProperty(transcript, "clientHeight", { configurable: true, get: () => 400 });
+    transcript.scrollTop = 800;
+    fireEvent.scroll(transcript);
+
+    const stream = await waitForEventSource();
+    transcriptHeight = 1_500;
+    stream.emit("assistant.token", { content: "More output" });
+    await waitFor(() => expect(transcript.scrollTop).toBe(1_500));
+
+    transcript.scrollTop = 100;
+    fireEvent.scroll(transcript);
+    transcriptHeight = 1_800;
+    stream.emit("assistant.token", { content: "Even more output" });
+    await act(async () => Promise.resolve());
+    expect(transcript.scrollTop).toBe(100);
+  });
+
   it("keeps a new empty thread isolated from the previous active run", async () => {
     render(<App />);
 
@@ -767,7 +1262,7 @@ describe("App", () => {
   it("switches threads and renders active session history in chronological order", async () => {
     render(<App />);
 
-    await screen.findByText("Run tests");
+    await screen.findAllByText("Run tests");
     fireEvent.click(screen.getByRole("button", { name: /run tests/i }));
 
     const transcript = await screen.findByLabelText("Conversation transcript");
@@ -792,7 +1287,7 @@ describe("App", () => {
     approvals = [];
     render(<App />);
 
-    await screen.findByText("Inspect the repo");
+    await screen.findAllByText("Inspect the repo");
     const stream = await waitForEventSource();
     stream.emit("context.compile", { query: "repo" });
     stream.emit("assistant.token", { content: "Streaming answer" });
@@ -820,7 +1315,7 @@ describe("App", () => {
     approvals = [];
     render(<App />);
 
-    await screen.findByText("Inspect the repo");
+    await screen.findAllByText("Inspect the repo");
     const stream = await waitForEventSource();
     stream.emit("context.compile", { query: "repo", context_chars: 1200 });
     stream.emit("tool.started", { tool: "shell.run", tool_call_id: "tool_1" });
@@ -853,7 +1348,7 @@ describe("App", () => {
 
     render(<App />);
 
-    await screen.findByText("Inspect the repo");
+    await screen.findAllByText("Inspect the repo");
     expect(await screen.findByLabelText("Kestrel is responding")).toHaveTextContent("Working");
   });
 
@@ -1060,6 +1555,7 @@ describe("App", () => {
       expect(saveCall).toBeDefined();
       const body = JSON.parse(String(saveCall?.[1]?.body ?? "{}"));
       expect(body).toMatchObject({
+        expected_revision: "runtime-revision-1",
         provider: "codex-cli",
         model: "gpt-5.4",
         temperature: 0.7,
@@ -1651,6 +2147,103 @@ async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<
     ];
     return jsonResponse(run);
   }
+  if (path === "/api/routines/status" && routineLoadFailure) {
+    return jsonResponse({ detail: routineLoadFailure }, 503);
+  }
+  const routineHistoryMatch = path.match(/^\/api\/routines\/([^/]+)\/history\?limit=50$/);
+  if (routineHistoryMatch) {
+    if (routineHistoryFailure) return jsonResponse({ detail: routineHistoryFailure }, 503);
+    return jsonResponse(routineHistories[decodeURIComponent(routineHistoryMatch[1])] ?? []);
+  }
+  const routineRunNowMatch = path.match(/^\/api\/routines\/([^/]+)\/actions\/run-now$/);
+  if (routineRunNowMatch && init?.method === "POST") {
+    const routineId = decodeURIComponent(routineRunNowMatch[1]);
+    const body = JSON.parse(String(init.body ?? "{}"));
+    const requestKey = `${routineId}:${String(body.idempotency_key)}`;
+    const existing = routineRunNowAccepted.get(requestKey);
+    const occurrence: RoutineOccurrence = existing ?? {
+      ...baseRoutineOccurrence,
+      occurrence_id: `occ_manual_${routineId}_${routineRunNowAccepted.size + 1}`,
+      routine_id: routineId,
+      routine_revision: body.expected_revision,
+      scheduled_for: "2026-05-17T14:00:00Z",
+      run_id: `run_manual_${routineId}_${routineRunNowAccepted.size + 1}`,
+      status: routineRunNowInitialStatus,
+      trigger_kind: "manual",
+      requested_at: "2026-05-17T14:00:00Z",
+      created_at: "2026-05-17T14:00:00Z",
+      updated_at: "2026-05-17T14:00:02Z"
+    };
+    if (!existing) {
+      routineRunNowAccepted.set(requestKey, occurrence);
+      routineHistories[routineId] = [occurrence, ...(routineHistories[routineId] ?? [])];
+    }
+    if (routineRunNowAmbiguousFailures > 0) {
+      routineRunNowAmbiguousFailures -= 1;
+      throw new TypeError("Failed to fetch");
+    }
+    return jsonResponse({
+      requested_at: occurrence.requested_at,
+      claim_owner: "routine-test-owner",
+      idempotent_replay: Boolean(existing),
+      occurrence,
+      dispatch: existing ? null : {
+        occurrence_id: occurrence.occurrence_id,
+        routine_id: routineId,
+        run_id: occurrence.run_id,
+        status: occurrence.status,
+        error: null
+      }
+    });
+  }
+  if (path === "/api/routines" && init?.method === "POST") {
+    const body = JSON.parse(String(init.body ?? "{}"));
+    const routine: Routine = {
+      ...baseRoutine,
+      ...body,
+      routine_id: "routine_created",
+      enabled: false,
+      revision: 1,
+      next_run_at: body.start_at,
+      created_at: "2026-05-17T14:00:00Z",
+      updated_at: "2026-05-17T14:00:00Z"
+    };
+    routinesPayload = [routine, ...routinesPayload];
+    routineHistories[routine.routine_id] = [];
+    return jsonResponse(routine);
+  }
+  const routineEnabledMatch = path.match(/^\/api\/routines\/([^/]+)\/enabled$/);
+  if (routineEnabledMatch && init?.method === "PUT") {
+    const routineId = decodeURIComponent(routineEnabledMatch[1]);
+    const body = JSON.parse(String(init.body ?? "{}"));
+    const current = routinesPayload.find((routine) => routine.routine_id === routineId);
+    if (!current) return jsonResponse({ detail: "routine_not_found" }, 404);
+    if (body.expected_revision !== current.revision) return jsonResponse({ detail: "routine_revision_conflict" }, 409);
+    const saved = { ...current, enabled: body.enabled, revision: current.revision + 1 };
+    routinesPayload = routinesPayload.map((routine) => routine.routine_id === routineId ? saved : routine);
+    return jsonResponse(saved);
+  }
+  const routineMutationMatch = path.match(/^\/api\/routines\/([^/?]+)(?:\?expected_revision=(\d+))?$/);
+  if (routineMutationMatch && init?.method === "PUT") {
+    const routineId = decodeURIComponent(routineMutationMatch[1]);
+    const body = JSON.parse(String(init.body ?? "{}"));
+    const current = routinesPayload.find((routine) => routine.routine_id === routineId);
+    if (!current) return jsonResponse({ detail: "routine_not_found" }, 404);
+    if (body.expected_revision !== current.revision) return jsonResponse({ detail: "routine_revision_conflict" }, 409);
+    const { expected_revision: _expectedRevision, ...changes } = body;
+    const saved = { ...current, ...changes, revision: current.revision + 1 };
+    routinesPayload = routinesPayload.map((routine) => routine.routine_id === routineId ? saved : routine);
+    return jsonResponse(saved);
+  }
+  if (routineMutationMatch && init?.method === "DELETE") {
+    const routineId = decodeURIComponent(routineMutationMatch[1]);
+    const expectedRevision = Number(routineMutationMatch[2]);
+    const current = routinesPayload.find((routine) => routine.routine_id === routineId);
+    if (!current) return jsonResponse({ detail: "routine_not_found" }, 404);
+    if (expectedRevision !== current.revision) return jsonResponse({ detail: "routine_revision_conflict" }, 409);
+    routinesPayload = routinesPayload.filter((routine) => routine.routine_id !== routineId);
+    return jsonResponse({ ...current, deleted_at: "2026-05-17T14:00:00Z", revision: current.revision + 1 });
+  }
   if (path.match(/^\/api\/approvals\/approval_1\/decision$/) && init?.method === "POST") {
     approvals = [];
     return jsonResponse({ ...pendingApproval, status: "approved", decision: JSON.parse(String(init.body ?? "{}")) });
@@ -1774,14 +2367,16 @@ async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<
   }
   if (path === "/api/runtime/settings" && init?.method === "PUT") {
     const body = JSON.parse(String(init.body ?? "{}"));
+    const { expected_revision: _expectedRevision, ...changes } = body;
     return jsonResponse({
       settings: {
-        ...body,
+        ...changes,
+        revision: "runtime-revision-2",
         updated_at: "2026-05-16T00:10:00Z",
         path: ".nest/config/runtime_settings.json",
         persisted: true
       },
-      runtime: body
+      runtime: changes
     });
   }
   const telegramWebhookMatch = path.match(/^\/api\/channels\/([^/]+)\/telegram\/(webhook-info|set-webhook|delete-webhook|test-message)$/);
@@ -1856,6 +2451,8 @@ async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<
 
 function payloadFor(path: string): unknown {
   if (path === "/api/runs") return runs;
+  if (path === "/api/routines/status") return routineStatusPayload;
+  if (path === "/api/routines") return routinesPayload;
   if (path === "/api/sessions") return sessions;
   const sessionMatch = path.match(/^\/api\/sessions\/([^/]+)\/runs$/);
   if (sessionMatch) return sessionRuns[decodeURIComponent(sessionMatch[1])] ?? [];
@@ -1991,7 +2588,7 @@ function payloadFor(path: string): unknown {
   }
   if (path === "/api/runtime/config") {
     return {
-      name: "Nested MV2 Agent",
+      name: "Kestrel",
       version: "0.1.0",
       schema_version: 9,
       provider: { name: "mock", model: "mock", api_key_env: null, api_key_configured: false },
@@ -2014,6 +2611,7 @@ function payloadFor(path: string): unknown {
           stream: false,
           require_api_auth: false,
           autonomy_mode: "background",
+          revision: "runtime-revision-1",
           persisted: false
         }
       },

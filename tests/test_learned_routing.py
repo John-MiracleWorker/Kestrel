@@ -24,7 +24,12 @@ from nested_memvid_agent.learned_routing import (
     routing_example_from_decision,
 )
 from nested_memvid_agent.models import EvidenceRef, MemoryKind, MemoryLayer
-from nested_memvid_agent.nested_learning import LearningSignal, NestedLearningKernel
+from nested_memvid_agent.nested_learning import (
+    LearningSignal,
+    NestedLearningKernel,
+    ValidationEvidence,
+    resolve_validation_evidence,
+)
 from nested_memvid_agent.state_store import AgentStateStore
 
 
@@ -43,7 +48,20 @@ def test_shadow_router_records_counterfactual_without_changing_rule_decision() -
         content="The workbench provider selector is easier to discover when shown inline.",
         kind=MemoryKind.FACT,
         source_layer=MemoryLayer.EPISODIC,
-        validation_score=0.82,
+        validation_score=None,
+        validation_evidence=resolve_validation_evidence(
+            ValidationEvidence(
+                task_refs=(
+                    EvidenceRef(
+                        source="operator_confirmation",
+                        locator="shadow-router-confirmed-fact",
+                    ),
+                ),
+                human_explicit=True,
+            ),
+            status="human_confirmed",
+            artifact_ids=("shadow-router-confirmed-fact",),
+        ),
         repeat_count=1,
     )
     kernel = NestedLearningKernel(router=router)

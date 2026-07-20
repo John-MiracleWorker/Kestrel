@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
+from nested_memvid_agent.config import AgentConfig
+
 ROOT = Path(__file__).resolve().parents[1]
+EXTENSION_TEST_IMAGE = (
+    "python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3"
+)
 
 
 def test_package_metadata_identifies_kestrel_release() -> None:
@@ -14,7 +20,7 @@ def test_package_metadata_identifies_kestrel_release() -> None:
     project = pyproject["project"]
     locked_versions = {package["name"]: package["version"] for package in lock["package"]}
 
-    assert project["version"] == "0.3.1"
+    assert project["version"] == "0.4.0"
     assert "pip>=26.1.2" in project["dependencies"]
     assert "setuptools>=83.0.0" in project["dependencies"]
     assert locked_versions["pip"] == "26.1.2"
@@ -22,6 +28,50 @@ def test_package_metadata_identifies_kestrel_release() -> None:
     assert project["description"].startswith("Kestrel:")
     assert project["urls"]["Repository"] == "https://github.com/John-MiracleWorker/Kestrel"
     assert project["urls"]["Issues"] == "https://github.com/John-MiracleWorker/Kestrel/issues"
+
+
+def test_python_and_web_release_metadata_stay_aligned() -> None:
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "check_project_metadata.py")],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "nested-memvid-agent 0.4.0 release" in result.stdout
+    assert "published release v0.4.0" in result.stdout
+    assert "kestrel-web 0.4.0" in result.stdout
+
+
+def test_default_user_facing_branding_is_kestrel() -> None:
+    web_index = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    example_config = (ROOT / "config" / "agent.example.json").read_text(encoding="utf-8")
+
+    assert AgentConfig().name == "Kestrel"
+    assert "<title>Kestrel</title>" in web_index
+    assert '"name": "Kestrel"' in example_config
+
+
+def test_community_policy_links_enabled_private_vulnerability_reporting() -> None:
+    security = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
+    issue_config = (ROOT / ".github" / "ISSUE_TEMPLATE" / "config.yml").read_text(
+        encoding="utf-8"
+    )
+    bug_template = (ROOT / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml").read_text(
+        encoding="utf-8"
+    )
+    governance = (ROOT / "GOVERNANCE.md").read_text(encoding="utf-8")
+
+    private_reporting_url = (
+        "https://github.com/John-MiracleWorker/Kestrel/security/advisories/new"
+    )
+    assert private_reporting_url in security
+    assert private_reporting_url in issue_config
+    assert "private reporting channel linked in SECURITY.md" in bug_template
+    assert "private process in SECURITY.md" not in bug_template
+    assert "No separate project-lead appointment is currently recorded" in governance
 
 
 def test_package_includes_runtime_prompt_data() -> None:
@@ -33,18 +83,67 @@ def test_package_includes_runtime_prompt_data() -> None:
     assert "prompts/*.md" in package_data["nested_memvid_agent"]
     assert "web_dist/index.html" in package_data["nested_memvid_agent"]
     assert "web_dist/assets/*" in package_data["nested_memvid_agent"]
+    assert "web_dist/THIRD_PARTY_NOTICES.txt" in package_data["nested_memvid_agent"]
+    assert "web/public/THIRD_PARTY_NOTICES.txt" in pyproject["project"]["license-files"]
     assert any(str(dep).startswith("bandit>=") for dep in dev_deps)
     assert any(str(dep).startswith("build>=") for dep in dev_deps)
+
+
+def test_sdist_manifest_excludes_partial_tests_and_local_evidence() -> None:
+    manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+
+    assert "prune tests" in manifest
+    assert "prune benchmark_results" in manifest
+    assert "prune tiuni-fun" in manifest
+    assert "exclude .env*" in manifest
 
 
 def test_dockerfile_keeps_safe_runtime_defaults() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     command = next(line for line in dockerfile.splitlines() if line.startswith("CMD ["))
 
-    assert "FROM node:22-bookworm-slim AS web-build" in dockerfile
-    assert "FROM python:3.11-slim AS runtime" in dockerfile
+    assert (
+        "FROM node:22-bookworm-slim@sha256:"
+        "6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 "
+        "AS web-build" in dockerfile
+    )
+    assert (
+        "FROM rust:1.89-bookworm@sha256:"
+        "948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff "
+        "AS memvid-wheels" in dockerfile
+    )
+    pinned_python = (
+        "python:3.11-slim-trixie@sha256:"
+        "db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93"
+    )
+    assert f"FROM {pinned_python} AS dependency-lock" in dockerfile
+    assert f"FROM {pinned_python} AS runtime" in dockerfile
+    assert "MEMVID_SDK_VERSION=2.0.160" in dockerfile
+    assert "MEMVID_SDK_SDIST_SHA256=8eab5aec9a30eb459f553ed091038b6916d02a2f33569b32a7aee1b556820243" in dockerfile
+    assert "UV_VERSION=0.11.16" in dockerfile
+    assert "COPY pyproject.toml uv.lock ./" in dockerfile
+    assert "COPY pyproject.toml README.md LICENSE ./" in dockerfile
+    assert (
+        "COPY web/public/THIRD_PARTY_NOTICES.txt "
+        "./web/public/THIRD_PARTY_NOTICES.txt" in dockerfile
+    )
+    assert "uv export" in dockerfile
+    assert "--frozen" in dockerfile
+    assert "--no-emit-local" in dockerfile
+    assert "requirements-runtime.txt" in dockerfile
+    assert "--require-hashes" in dockerfile
+    assert "--no-binary memvid-sdk" in dockerfile
+    assert "sha256sum -c -" in dockerfile
+    assert "import memvid_sdk; assert callable(memvid_sdk.create)" in dockerfile
+    assert "test -f /app/LICENSE" in dockerfile
+    assert "chmod a-s /usr/bin/mount /usr/bin/umount /usr/bin/su" in dockerfile
+    assert "test ! -u /usr/bin/mount" in dockerfile
+    assert "test ! -u /usr/bin/umount" in dockerfile
+    assert "test ! -u /usr/bin/su" in dockerfile
+    assert ".dist-info/licenses/LICENSE" in dockerfile
+    assert ".dist-info/licenses/web/public/THIRD_PARTY_NOTICES.txt" in dockerfile
     assert "npm run build" in dockerfile
-    assert "pip install -e \".[${INSTALL_EXTRAS}]\"" in dockerfile
+    assert "pip install --no-deps --no-build-isolation -e \".[${INSTALL_EXTRAS}]\"" in dockerfile
     assert "USER kestrel" in dockerfile
     assert "HEALTHCHECK" in dockerfile
     assert "NEST_AGENT_BACKEND=memvid" in dockerfile
@@ -63,6 +162,18 @@ def test_dockerfile_keeps_safe_runtime_defaults() -> None:
     assert '"--require-api-auth"' in command
     for env_owned_option in ("--backend", "--memory-dir", "--provider", "--model", "--state-path"):
         assert env_owned_option not in command
+
+
+def test_docker_build_context_excludes_local_secrets_and_unrelated_trees() -> None:
+    patterns = {
+        line.strip()
+        for line in (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+    assert ".env*" in patterns
+    assert ".env" not in patterns
+    assert "tiuni-fun" in patterns
 
 
 def test_docker_entrypoint_initializes_memvid_before_default_server() -> None:
@@ -89,6 +200,11 @@ def test_compose_binds_localhost_and_persists_data_volume() -> None:
     assert "127.0.0.1:8765:8765" in compose
     assert "INSTALL_EXTRAS: server,mcp,memvid,openai,anthropic,gemini" in compose
     assert "kestrel-data:/data" in compose
+    assert 'user: "999:999"' in compose
+    assert "read_only: true" in compose
+    assert "cap_drop:\n      - ALL" in compose
+    assert "security_opt:\n      - no-new-privileges:true" in compose
+    assert "/tmp:rw,noexec,nosuid,size=64m" in compose
     assert "NEST_AGENT_BACKEND: memvid" in compose
     assert 'NEST_AGENT_ALLOW_SHELL: "false"' in compose
     assert 'NEST_AGENT_ALLOW_FILE_WRITE: "false"' in compose
@@ -108,11 +224,20 @@ def test_compose_binds_localhost_and_persists_data_volume() -> None:
 def test_makefile_exposes_packaging_validation_targets() -> None:
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
 
-    for target in ["install-dev:", "validate:", "doctor:", "chat-smoke:", "docker-build:", "docker-doctor:"]:
+    for target in [
+        "install-dev:",
+        "validate:",
+        "doctor:",
+        "chat-smoke:",
+        "release-build:",
+        "docker-build:",
+        "docker-doctor:",
+    ]:
         assert target in makefile
     assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 $(PYTHON) -m pytest -q" in makefile
     assert "scripts/run_golden_evals.py --backend memory --provider mock" in makefile
     assert "docker run --rm $(DOCKER_IMAGE) nest-agent doctor" in makefile
+    assert "--backend memvid --memory-dir /data/memory" in makefile
 
 
 def test_deployment_docs_cover_release_and_memory_operations() -> None:
@@ -123,8 +248,10 @@ def test_deployment_docs_cover_release_and_memory_operations() -> None:
 
     assert (
         "curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/"
-        "v0.3.1/install.sh | bash"
+        "v0.4.0/install.sh | bash"
     ) in deployment
+    assert "`v0.4.0` is the current stable release" in deployment
+    assert "releases/download/v0.4.0/install.sh" in deployment
     assert "/Kestrel/main/install.sh" not in deployment
     assert "KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash" in deployment
     assert "does not start the server" in deployment
@@ -136,6 +263,8 @@ def test_deployment_docs_cover_release_and_memory_operations() -> None:
     assert "Never call `create(path)` on an existing `.mv2` file." in memory_ops
     assert "NEST_AGENT_ALLOW_SHELL=false" in security
     assert "RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid" in checklist
+    assert "Every Docker architecture" in deployment
+    assert "hash-verified source distribution" in deployment
 
 
 def test_one_shot_docs_match_safe_opt_in_server_defaults() -> None:
@@ -159,14 +288,25 @@ def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     assert not re.search(r"uses:\s+[^\s#]+@v\d+", workflow)
     assert 'tags: ["v*"]' in workflow
     assert "npm audit --audit-level=high" in workflow
+    assert "npm run licenses:check" in workflow
     assert "npm run build" in workflow
     assert "Stage web workbench in Python package" in workflow
-    assert "src/nested_memvid_agent/web_dist" in workflow
+    assert "python scripts/stage_web_release.py" in workflow
     assert "python -m build" in workflow
+    assert "Build and attest release container" in workflow
+    assert "check_container_vulnerabilities.py" in workflow
+    assert "container_vulnerability_exceptions.json" in workflow
+    assert 'raise SystemExit("sdist contains a partial test bundle")' in workflow
     assert "release wheel smoke" in workflow
     assert "curl -fsS http://127.0.0.1:8878/" in workflow
     assert "Verify tag matches package version" in workflow
     assert 'test "$GITHUB_REF_NAME" = "v$VERSION"' in workflow
+    assert "python scripts/check_project_metadata.py" in workflow
+    assert "scripts/run_golden_evals.py --backend memvid --provider mock" in workflow
+    assert 'RUN_EXTENSION_SANDBOX_INTEGRATION: "1"' in workflow
+    assert f'KESTREL_EXTENSION_TEST_IMAGE: "{EXTENSION_TEST_IMAGE}"' in workflow
+    assert 'docker pull "$KESTREL_EXTENSION_TEST_IMAGE"' in workflow
+    assert "tests/integration/test_extension_container_integration.py" in workflow
     assert "uv lock --check" in workflow
     assert "uv export --frozen --no-dev --no-emit-local" in workflow
     assert "--require-hashes" in workflow
@@ -205,9 +345,48 @@ def test_ci_runs_isolated_python_tests_and_web_build() -> None:
     assert "cache-dependency-path: web/package-lock.json" in ci
     assert "run: npm ci" in ci
     assert "run: npm audit --audit-level=high" in ci
+    assert "run: npm run licenses:check" in ci
     assert "run: npm test" in ci
     assert "run: npm run build" in ci
+    assert "codeql:" in ci
+    assert "name: CodeQL" in ci
+    assert "github/codeql-action/init@b7351df727350dca84cb9d725d57dcf5bc82ba26" in ci
+    assert "github/codeql-action/analyze@b7351df727350dca84cb9d725d57dcf5bc82ba26" in ci
+    assert "security-events: write" in ci
+    assert "foundational-integrations:" in ci
+    assert 'RUN_MEMVID_INTEGRATION: "1"' in ci
+    assert 'RUN_MCP_INTEGRATION: "1"' in ci
+    assert "tests/integration/test_memvid_memory_system.py" in ci
+    assert "tests/integration/test_mcp_stdio_integration.py" in ci
+    assert "extension-sandbox:" in ci
+    assert 'RUN_EXTENSION_SANDBOX_INTEGRATION: "1"' in ci
+    assert f'KESTREL_EXTENSION_TEST_IMAGE: "{EXTENSION_TEST_IMAGE}"' in ci
+    assert 'docker pull "$KESTREL_EXTENSION_TEST_IMAGE"' in ci
+    assert "tests/integration/test_extension_container_integration.py" in ci
+    assert "--backend memvid" in ci
+    assert '"${RUNNER_TEMP}/kestrel-memvid-golden"' in ci
+    assert "- foundational-integrations" in ci
+    assert "- extension-sandbox" in ci
+    assert "- codeql" in ci
+    assert "run: python scripts/check_project_metadata.py" in ci
     assert "run: docker build -t kestrel-agent:ci ." in ci
+    assert "Verify container privilege and license controls" in ci
+    assert "check_container_vulnerabilities.py" in ci
+    assert "cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f" in ci
+
+
+def test_generated_web_third_party_notices_are_present_and_complete() -> None:
+    package_json = (ROOT / "web" / "package.json").read_text(encoding="utf-8")
+    notice = (ROOT / "web" / "public" / "THIRD_PARTY_NOTICES.txt").read_text(
+        encoding="utf-8"
+    )
+
+    assert '"licenses:check"' in package_json
+    assert "Production packages: 106" in notice
+    assert "lucide-react@0.561.0" in notice
+    assert "The MIT License (MIT) (for portions derived from Feather)" in notice
+    assert "@ungap/structured-clone@1.3.1" in notice
+    assert "Copyright (c) 2021, Andrea Giammarchi, @WebReflection" in notice
 
 
 def test_runtime_artifacts_are_not_tracked() -> None:

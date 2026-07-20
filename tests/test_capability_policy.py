@@ -204,7 +204,7 @@ def test_schema_15_migrates_approval_capability_binding_and_adds_policy_tables(
 
     state = AgentStateStore(path)
 
-    assert state.schema_version() == SCHEMA_VERSION == 15
+    assert state.schema_version() == SCHEMA_VERSION == 19
     approval = state.get_approval("approval_old")
     assert approval["capability_revision"] == 0
     assert approval["resource_digest"] == ""

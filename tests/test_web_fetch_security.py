@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from nested_memvid_agent import net_safety
 from nested_memvid_agent.tools import web_tools
 
 
@@ -35,7 +36,7 @@ class _FakeOpener:
 
     def open(self, _request: object, timeout: int) -> _FakeResponse:
         del timeout
-        web_tools.socket.getaddrinfo("example.com", 443)
+        net_safety.socket.getaddrinfo("example.com", 443)
         return self._response
 
 
@@ -59,15 +60,15 @@ def test_fetch_pins_dns_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
         calls.append(host)
         return [
             (
-                web_tools.socket.AF_INET,
-                web_tools.socket.SOCK_STREAM,
-                web_tools.socket.IPPROTO_TCP,
+                net_safety.socket.AF_INET,
+                net_safety.socket.SOCK_STREAM,
+                net_safety.socket.IPPROTO_TCP,
                 "",
                 ("93.184.216.34", int(port or 443)),
             )
         ]
 
-    monkeypatch.setattr(web_tools.socket, "getaddrinfo", tracking_getaddrinfo)
+    monkeypatch.setattr(net_safety.socket, "getaddrinfo", tracking_getaddrinfo)
 
     text, final_url = web_tools._fetch_public_text("https://example.com", timeout=2, max_bytes=1024)
 

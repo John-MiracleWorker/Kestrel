@@ -1,0 +1,7 @@
+# The sdist is an install/build artifact. The repository and exact-tag CI are
+# the authoritative test bundle; do not ship a partial, non-runnable subset.
+prune tests
+prune benchmark_results
+prune tiuni-fun
+exclude .env*
+global-exclude __pycache__ *.py[cod] .DS_Store

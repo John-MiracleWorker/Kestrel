@@ -1,8 +1,8 @@
 # Testing Guide
 
-Last updated: 2026-05-20
+Last updated: 2026-07-19
 
-Kestrel's fast test path is deterministic: it uses `InMemoryBackend` plus the mock LLM provider. Memvid, MCP, provider, and platform integrations stay behind explicit environment flags.
+Kestrel's fast test path is deterministic: it uses `InMemoryBackend` plus the mock LLM provider. Memvid, MCP, provider, executable-skill container, and platform integrations stay behind explicit environment flags.
 
 ## Setup
 
@@ -22,10 +22,50 @@ Run these for normal development:
 python -m compileall -q src tests scripts
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 python scripts/run_golden_evals.py --backend memory --provider mock
+python benchmarks/real_agent_learning_benchmark.py --output benchmark_results/agent_learning_gate.json
 PYTHONPATH=src python -m nested_memvid_agent.cli chat --backend memory --provider mock --message "hello"
 ```
 
 `python -m pytest -q` is preferred over a global `pytest` binary so subprocess fixtures use the active interpreter. CI also sets `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` so local editor or environment plugins cannot leak into deterministic mock-backed tests.
+
+The agent learning gate is not a seeded retrieval fixture. Its first task causes a deterministic
+tool failure and validated changed-strategy resolution through `NestedMV2Agent`; the runtime must
+persist provenance-linked `FailureEpisode` and `LessonCard` records. Its second task must retrieve
+that exact lesson as untrusted user-role evidence and improve from control failure to treatment
+success. Any missing evidence, validation metadata, exact-call approval, transfer, or expected
+outcome exits nonzero. Real-provider learning remains a separate optional evaluation below.
+
+The proactive-routine slice has a smaller deterministic safety gate for scheduler changes:
+
+```bash
+python -m pytest -q \
+  tests/test_state_store.py \
+  tests/test_routines.py \
+  tests/test_routine_loop.py \
+  tests/test_server_routine_routes.py \
+  tests/test_operational_metrics.py \
+  tests/test_server_runtime_routes.py \
+  tests/test_support_bundle.py
+python -m pytest -q \
+  tests/test_cli.py::test_routines_cli_creates_enables_ticks_and_reports_history \
+  tests/test_cli.py::test_routines_cli_tick_does_not_resume_unrelated_queued_run \
+  tests/test_cli.py::test_routines_cli_tick_selectively_recovers_admitted_routine_crash_window
+```
+
+These cases cover schema migration, disabled drafts, revision conflicts, raw-secret rejection, minimum intervals, concurrent claims, misfires, overlap, lease-generation fencing, disable/revise/delete races, atomic internally scoped run admission and task-graph initialization, crash-window recovery, persisted provenance, headless approval expiry, owner API auth, scoped CLI dispatch/history, bounded lifecycle shutdown races, readiness/metrics loop health, private SQLite modes/symlink defenses, and prompt-free routine aggregates in support bundles.
+
+Repair and executable-skill containment have focused adversarial gates:
+
+```bash
+python -m pytest -q tests/test_repair_integrity.py tests/test_worker_isolation.py
+python -m pytest -q tests/test_extension_policy.py tests/test_extension_runner.py tests/test_skill_containment.py
+docker pull 'python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3'
+RUN_EXTENSION_SANDBOX_INTEGRATION=1 \
+KESTREL_EXTENSION_TEST_IMAGE='python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3' \
+python -m pytest -q tests/integration/test_extension_container_integration.py
+```
+
+The repair cases cover signed/tamper-evident receipts, redacted validation output, pre/post validation drift, Git-root and `.nest` symlink refusal, literal-byte commits with clean filters disabled, index/HEAD compare-and-swap gates, approval-bound rollback snapshots, and recovery quarantine. The Docker integration verifies the same no-network/read-only/nonroot/resource-bounded runner used by executable skills, including private read snapshots and timeout orphan cleanup, and is a required CI/release gate. Local runs remain explicitly enabled because they require a Docker daemon and the exact pre-pulled digest-pinned image. Once `RUN_EXTENSION_SANDBOX_INTEGRATION=1` is set, a missing Docker executable or invalid image setting fails instead of skipping.
 
 ## Lint, Types, and Web
 
@@ -36,9 +76,10 @@ npm run test --prefix web
 npm run build --prefix web
 ```
 
-`npm run test --prefix web` currently runs the TypeScript build in no-pretty mode. `npm run build --prefix web` runs TypeScript plus the Vite production build.
+`npm run test --prefix web` runs the TypeScript build in no-pretty mode and the Vitest jsdom suite. `npm run build --prefix web` runs TypeScript plus the Vite production build.
 
-CI runs the web app in its own Node 22 job with `npm ci`, `npm test`, and `npm run build`, then runs a Docker build smoke job after Python and web checks pass.
+CI runs the web app in its own Node 22 job with `npm ci`, `npm test`, and `npm run build`.
+A credential-free foundation job runs the Memvid v2 and stdio MCP fixtures, and a separate Docker-backed job preloads the pinned Python image and runs the executable-skill containment integration on every pull request and supported branch push. The Docker build starts only after Python, web, foundation, and containment jobs pass.
 
 ## Installer Validation
 
@@ -57,20 +98,23 @@ The local-clone installer smoke is optional because it installs dependencies int
 RUN_MEMVID_INTEGRATION=1 RUN_INSTALLER_INTEGRATION=1 python -m pytest -q tests/test_install_script.py::test_install_from_local_repo_smoke_with_memvid
 ```
 
-## Optional Memvid Integration
+## Foundational Memvid Integration
 
-The Memvid tests require `memvid-sdk` from the `memvid` extra and are skipped unless `RUN_MEMVID_INTEGRATION=1` is set:
+The Memvid tests require `memvid-sdk` from the `memvid` extra and are skipped unless
+`RUN_MEMVID_INTEGRATION=1` is set. They require no provider credentials and run in the dedicated CI
+foundation job:
 
 ```bash
-RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_context_frames.py
+RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_memory_system.py tests/integration/test_memvid_context_frames.py
 RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
 ```
 
 The tests create temporary `.mv2` files, write records, seal, verify, close, reopen, search, round-trip context-frame metadata, validate the Soul/self layer, and read run-scoped `complete.mv2` capsules.
 
-## Optional MCP Integration
+## Foundational MCP Integration
 
-Live stdio MCP coverage is gated by `RUN_MCP_INTEGRATION=1`:
+The local stdio MCP fixture is gated by `RUN_MCP_INTEGRATION=1`. It uses a bundled fixture process,
+requires no network endpoint or credential, and runs in the dedicated CI foundation job:
 
 ```bash
 RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integration.py
@@ -86,7 +130,7 @@ Live provider coverage is gated by `RUN_PROVIDER_INTEGRATION=1`:
 RUN_PROVIDER_INTEGRATION=1 python -m pytest -q tests/integration/test_provider_live_integration.py
 ```
 
-Each provider case also requires its own credentials or endpoint variables. The harness covers OpenAI, Anthropic, Gemini, OpenAI-compatible endpoints, Ollama, Ollama Cloud, OpenRouter, and Codex CLI, and skips cases whose required environment is missing. Ollama Cloud + `gpt-oss:120b` has been locally validated against both memory and Memvid live learning/golden eval paths.
+Each provider case also requires its own credentials or endpoint variables. The harness covers OpenAI, Anthropic, Gemini, OpenAI-compatible endpoints, Ollama, Ollama Cloud, OpenRouter, and Codex CLI, and skips cases whose required environment is missing. In addition to text generation and streaming, every provider that advertises native tools must return one exact, schema-valid `certification.echo` call; the fixture never executes that call. Ollama Cloud + `gpt-oss:120b` has been locally validated against both memory and Memvid live learning/golden eval paths.
 
 ## Live Learning E2E Eval
 
@@ -193,7 +237,10 @@ Each Memvid golden case should use its own memory/log directory to avoid `.mv2` 
 
 ## Release Validation
 
-Use `docs/RELEASE_CHECKLIST.md` before tagging or publishing an alpha build. The checklist includes compile, lint, typecheck, unit tests, golden evals, web build/test, optional Memvid/MCP integration, and packaging/Docker smoke checks.
+Use `docs/RELEASE_CHECKLIST.md` before tagging or publishing a build. The checklist includes
+compile, metadata alignment, lint, typecheck, unit tests, golden evals, the deterministic
+end-to-end agent learning gate, web build/test, required
+credential-free Memvid/MCP integration, executable-skill OCI containment, and packaging/Docker smoke checks.
 
 ## Failure Handling
 

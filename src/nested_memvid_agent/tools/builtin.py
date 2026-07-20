@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -12,22 +13,40 @@ from ..context_frames import (
     estimate_tokens,
     from_memory_record,
     make_correction_frame,
+    to_memory_record,
 )
 from ..context_packer import ContextPacker, ContextPackRequest
-from ..models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
+from ..models import EvidenceRef, MemoryHit, MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from ..nested_learning import (
+    STABLE_MEMORY_LAYERS,
     LearningSignal,
     NestedLearningKernel,
+    ValidationEvidence,
     compute_validation_score,
+    resolve_validation_evidence,
 )
 from ..plugin_manager import PluginManager
+from ..policy_provenance import (
+    POLICY_PROMOTION_TOOL,
+    policy_approval_metadata,
+    public_tool_arguments,
+)
 from ..promotion_ledger import OUTCOME_KINDS, PromotionLedger
+from ..repair_integrity import load_review_receipt, load_validation_receipt
 from ..retention import RetentionCompactor
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
 from ..secret_broker import SecretBroker, build_secret_broker, is_secret_ref
+from ..self_profile import (
+    SELF_PROFILE_SCHEMA,
+    TRUSTED_ONBOARDING_LOCATOR,
+    TRUSTED_ONBOARDING_ORIGIN,
+    TRUSTED_ONBOARDING_PROVENANCE_SCHEMA,
+    TRUSTED_ONBOARDING_SOURCE,
+    trusted_onboarding_record_ids,
+)
 from ..skill_validation import validate_skill_manifest
 from ..state_store import AgentStateStore
-from ..task_capsule import summarize_run_capsule
+from ..task_capsule import capsule_signal_staging_record, summarize_run_capsule
 from .base import AgentTool, ToolContext
 from .command_tools import (
     CodexExecTool,
@@ -94,6 +113,7 @@ class MemorySearchTool(AgentTool):
                 "layers": {"type": "array", "items": {"type": "string"}},
                 "k": {"type": "integer", "minimum": 1, "maximum": 20},
                 "include_inactive": {"type": "boolean"},
+                "include_retrieval_artifacts": {"type": "boolean"},
             },
             "required": ["query"],
         },
@@ -125,6 +145,9 @@ class MemorySearchTool(AgentTool):
                 layers=layers,
                 k_per_layer=k,
                 include_inactive=bool(arguments.get("include_inactive", False)),
+                include_retrieval_artifacts=bool(
+                    arguments.get("include_retrieval_artifacts", False)
+                ),
             )
         )
         rows = []
@@ -401,6 +424,7 @@ class CapsuleSummarizeTool(AgentTool):
                 run_id=run_id,
                 backend=context.config.backend,
             )
+            summary = _resolve_capsule_summary_evidence(summary, context=context)
             kernel = NestedLearningKernel()
             decisions = []
             for signal in summary.learning_signals:
@@ -465,6 +489,7 @@ class CapsuleApplyTool(AgentTool):
                 run_id=run_id,
                 backend=context.config.backend,
             )
+            summary = _resolve_capsule_summary_evidence(summary, context=context)
             plan = _capsule_apply_plan(summary, context=context, include_policy=include_policy)
             if dry_run:
                 payload = {
@@ -501,6 +526,23 @@ class CapsuleApplyTool(AgentTool):
                 if not isinstance(signal_index, int):
                     continue
                 signal = summary.learning_signals[signal_index]
+                if item.get("write_mode") == "unvalidated_episodic_staging":
+                    staged_record = capsule_signal_staging_record(signal)
+                    if staged_record is None:
+                        continue
+                    if _memory_has_content_hash(
+                        context,
+                        MemoryLayer.EPISODIC,
+                        staged_record.content_hash,
+                    ):
+                        item["skipped"] = "duplicate_content_hash"
+                        item["will_write"] = False
+                        continue
+                    item["record_id"] = context.memory.put(staged_record)
+                    item["actual_layer"] = MemoryLayer.EPISODIC.value
+                    item["validation_status"] = "unresolved"
+                    wrote = True
+                    continue
                 decision = NestedLearningKernel().decide(signal)
                 if decision.target_layer is None:
                     continue
@@ -509,7 +551,13 @@ class CapsuleApplyTool(AgentTool):
                     item["skipped"] = "duplicate_content_hash"
                     item["will_write"] = False
                     continue
-                item["record_id"] = context.memory.put(record)
+                source_ids = _stable_signal_source_record_ids(signal)
+                item["record_id"] = context.memory.put_validated(
+                    record,
+                    authority="nested_learning",
+                    source_record_ids=source_ids,
+                    validation_evidence=signal.validation_evidence,
+                )
                 wrote = True
             if wrote:
                 context.memory.seal_all()
@@ -691,9 +739,15 @@ class MemoryLedgerTool(AgentTool):
             since = _datetime_arg(arguments.get("since"))
             target_layer = _layer_arg(arguments.get("target_layer"))
             outcome = _outcome_arg(arguments.get("outcome"))
-            ledger = context.memory.ledger or PromotionLedger(AgentStateStore(context.config.state_path))
-            payload = ledger.summarize(since=since, target_layer=target_layer, outcome=outcome).to_payload()
-            return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
+            ledger = context.memory.ledger or PromotionLedger(
+                AgentStateStore(context.config.state_path)
+            )
+            payload = ledger.summarize(
+                since=since, target_layer=target_layer, outcome=outcome
+            ).to_payload()
+            return self._result(
+                call, success=True, content=json.dumps(payload, indent=2), data=payload
+            )
         except Exception as exc:  # noqa: BLE001 - tool boundary returns structured diagnostics
             return self._result(call, success=False, content=str(exc), error="memory_ledger_failed")
 
@@ -707,6 +761,7 @@ class MemoryConsolidateTool(AgentTool):
             "properties": {
                 "query": {"type": "string"},
                 "source_layer": {"type": "string"},
+                "source_record_id": {"type": "string"},
                 "validation_evidence": {"type": "object"},
                 "validation_score": {"type": "number", "minimum": 0, "maximum": 1},
                 "repeat_count": {"type": "integer", "minimum": 1},
@@ -737,6 +792,12 @@ class MemoryConsolidateTool(AgentTool):
                     error="candidate_not_found",
                 )
             validation_evidence = _validation_evidence_arg(arguments)
+            if validation_evidence is not None:
+                validation_evidence, _, _ = _resolve_runtime_validation_evidence(
+                    validation_evidence,
+                    context=context,
+                    expected_subject_record_id=hits[0].record.id,
+                )
             validation_score = (
                 compute_validation_score(validation_evidence)
                 if validation_evidence is not None
@@ -747,6 +808,7 @@ class MemoryConsolidateTool(AgentTool):
             candidate = Consolidator().propose(
                 hits[0].record,
                 validation_score=validation_score,
+                validation_evidence=validation_evidence,
                 repeat_count=repeat_count,
                 explicit_instruction=explicit_instruction,
             )
@@ -764,9 +826,35 @@ class MemoryConsolidateTool(AgentTool):
                     content="Policy promotion is disabled by default.",
                     error="policy_write_disabled",
                 )
+            if candidate.target_layer == MemoryLayer.POLICY:
+                return self._result(
+                    call,
+                    success=False,
+                    content=(
+                        "Policy promotion requires the dedicated exact-call approval path. "
+                        "Use memory.policy_promote with structured repeated evidence."
+                    ),
+                    error="policy_approval_required",
+                )
             promoted = Consolidator().promote(candidate)
+            promoted.metadata.update(
+                {
+                    "session_id": context.session_id,
+                    "run_id": context.run_id,
+                }
+            )
             dry_run = bool(arguments.get("dry_run", False))
-            record_id = None if dry_run else context.memory.put(promoted)
+            source_ids = tuple(str(item) for item in promoted.metadata.get("source_record_ids", []))
+            record_id = (
+                None
+                if dry_run
+                else context.memory.put_validated(
+                    promoted,
+                    authority="nested_learning",
+                    source_record_ids=source_ids,
+                    validation_evidence=candidate.signal.validation_evidence,
+                )
+            )
             if record_id is not None:
                 context.memory.seal_all()
             payload = {
@@ -805,6 +893,7 @@ class MemoryLearnTool(AgentTool):
                 "content": {"type": "string"},
                 "kind": {"type": "string"},
                 "source_layer": {"type": "string"},
+                "source_record_id": {"type": "string"},
                 "target_layer": {"type": "string"},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "importance": {"type": "number", "minimum": 0, "maximum": 1},
@@ -834,9 +923,39 @@ class MemoryLearnTool(AgentTool):
             )
         try:
             source_layer = _layer_arg(arguments.get("source_layer")) or MemoryLayer.WORKING
+            source_record_id = str(arguments.get("source_record_id") or "").strip()
+            source_record = (
+                context.memory.get_record(None, source_record_id, include_inactive=False)
+                if source_record_id
+                else None
+            )
             target_layer = _layer_arg(arguments.get("target_layer"))
             kind = MemoryKind(str(arguments.get("kind", MemoryKind.OBSERVATION.value)))
             validation_evidence = _validation_evidence_arg(arguments)
+            if validation_evidence is not None:
+                validation_evidence, _, _ = _resolve_runtime_validation_evidence(
+                    validation_evidence,
+                    context=context,
+                    expected_subject_record_id=source_record_id or None,
+                )
+            if target_layer == MemoryLayer.POLICY and not context.config.allow_policy_writes:
+                return self._result(
+                    call,
+                    success=False,
+                    content="Policy promotion is disabled by default.",
+                    data={"policy_write_enabled": False},
+                    error="policy_write_disabled",
+                )
+            if target_layer == MemoryLayer.POLICY:
+                return self._result(
+                    call,
+                    success=False,
+                    content=(
+                        "Policy promotion requires the dedicated exact-call approval path. "
+                        "Use memory.policy_promote with structured repeated evidence."
+                    ),
+                    error="policy_approval_required",
+                )
             signal = LearningSignal(
                 title=title,
                 content=content,
@@ -858,11 +977,21 @@ class MemoryLearnTool(AgentTool):
             kernel = NestedLearningKernel()
             decision = kernel.decide(signal)
             if not decision.accepted:
+                payload = {
+                    **decision.to_payload(),
+                    "dry_run": bool(arguments.get("dry_run", False)),
+                    "record_id": None,
+                    "validation_score": signal.computed_validation_score,
+                    "validation_evidence": _validation_evidence_payload_for_output(
+                        validation_evidence,
+                        signal.computed_validation_score,
+                    ),
+                }
                 return self._result(
                     call,
                     success=True,
-                    content=json.dumps(decision.to_payload(), indent=2),
-                    data=decision.to_payload(),
+                    content=json.dumps(payload, indent=2),
+                    data=payload,
                 )
             if (
                 decision.target_layer == MemoryLayer.POLICY
@@ -877,9 +1006,58 @@ class MemoryLearnTool(AgentTool):
                     data=payload,
                     error="policy_write_disabled",
                 )
+            if decision.target_layer == MemoryLayer.POLICY:
+                return self._result(
+                    call,
+                    success=False,
+                    content=(
+                        "Policy promotion requires the dedicated exact-call approval path. "
+                        "Use memory.policy_promote with structured repeated evidence."
+                    ),
+                    data=decision.to_payload(),
+                    error="policy_approval_required",
+                )
+            if decision.target_layer in STABLE_MEMORY_LAYERS and (
+                source_record is None
+                or source_record.layer != source_layer
+                or source_record.title != title
+                or source_record.content != content
+                or source_record.kind != kind
+            ):
+                return self._result(
+                    call,
+                    success=False,
+                    content=(
+                        "Stable learning requires an active source_record_id whose layer, "
+                        "title, content, and kind exactly match the proposed claim."
+                    ),
+                    data=decision.to_payload(),
+                    error="stable_learning_source_mismatch",
+                )
             record = kernel.to_memory_record(signal, decision)
             dry_run = bool(arguments.get("dry_run", False))
-            record_id = None if dry_run else context.memory.put(record)
+            source_ids = tuple(
+                dict.fromkeys(
+                    (
+                        *((source_record.id,) if source_record is not None else ()),
+                        *_stable_signal_source_record_ids(signal),
+                    )
+                )
+            )
+            if source_record is not None:
+                record.evidence.append(
+                    EvidenceRef(source="memory_record", locator=source_record.id)
+                )
+            record_id = (
+                None
+                if dry_run
+                else context.memory.put_validated(
+                    record,
+                    authority="nested_learning",
+                    source_record_ids=source_ids,
+                    validation_evidence=signal.validation_evidence,
+                )
+            )
             if record_id is not None:
                 context.memory.seal_all()
             payload = {
@@ -899,6 +1077,305 @@ class MemoryLearnTool(AgentTool):
             return self._result(call, success=False, content=str(exc), error="memory_learn_failed")
 
 
+class MemoryPolicyPromoteTool(AgentTool):
+    """The sole built-in path that can create system-trusted policy memory."""
+
+    needs_call_id = True
+    spec = ToolSpec(
+        name=POLICY_PROMOTION_TOOL,
+        description=(
+            "Stage or promote a policy candidate. Promotion requires owner approval of "
+            "this exact call plus claim-bound receipts from at least five distinct "
+            "validation tasks."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "content": {"type": "string"},
+                "stage_proposal": {"type": "boolean"},
+                "source_record_id": {"type": "string"},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "importance": {"type": "number", "minimum": 0, "maximum": 1},
+                "validation_evidence": {"type": "object"},
+                "dry_run": {"type": "boolean"},
+            },
+            "required": ["title", "content"],
+        },
+        risk="high",
+        requires_approval=True,
+        capabilities=("nested-learning", "continuum-memory", "policy-write"),
+    )
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+        public_arguments = public_tool_arguments(arguments)
+        call_id = str(arguments.get("_tool_call_id") or "")
+        call = ToolCall(name=self.spec.name, arguments=public_arguments, id=call_id)
+        title = str(public_arguments.get("title", "")).strip()
+        content = str(public_arguments.get("content", "")).strip()
+        if not title:
+            return self._result(call, success=False, content="Missing title", error="missing_title")
+        if not content:
+            return self._result(
+                call, success=False, content="Missing content", error="missing_content"
+            )
+        if not context.config.allow_policy_writes:
+            return self._result(
+                call,
+                success=False,
+                content="Policy promotion is disabled by default.",
+                error="policy_write_disabled",
+            )
+        receipt = (
+            context.approval_receipts.get(call_id)
+            if context.approval_receipts is not None
+            else None
+        )
+        approval = (
+            policy_approval_metadata(
+                receipt,
+                call_id=call_id,
+                arguments=public_arguments,
+                run_id=context.run_id,
+            )
+            if isinstance(receipt, dict)
+            else None
+        )
+        if approval is None:
+            return self._result(
+                call,
+                success=False,
+                content="A durable owner approval receipt for this exact call is required.",
+                error="approval_provenance_required",
+            )
+        dry_run = bool(public_arguments.get("dry_run", False))
+        source_record_id = str(public_arguments.get("source_record_id") or "").strip()
+        stage_proposal = bool(public_arguments.get("stage_proposal", False))
+        if stage_proposal:
+            if source_record_id or public_arguments.get("validation_evidence") is not None:
+                return self._result(
+                    call,
+                    success=False,
+                    content=(
+                        "Policy proposal staging cannot include source_record_id or validation "
+                        "evidence. Stage first, then validate that exact proposal."
+                    ),
+                    error="policy_proposal_arguments_invalid",
+                )
+            proposal_id = None
+            if not dry_run:
+                proposal_id = context.memory.put(
+                    MemoryRecord(
+                        title=title,
+                        content=content,
+                        layer=MemoryLayer.EPISODIC,
+                        kind=MemoryKind.POLICY,
+                        confidence=max(float(public_arguments.get("confidence", 0.95)), 0.5),
+                        importance=float(public_arguments.get("importance", 0.95)),
+                        metadata={
+                            "frame_type": "trace_stub",
+                            "validation_status": "policy_promotion_candidate",
+                            "policy_promotion_candidate": True,
+                            "proposal_approval_id": approval["approval_id"],
+                            "session_id": context.session_id,
+                            "run_id": context.run_id,
+                        },
+                        evidence=[
+                            EvidenceRef(
+                                source=POLICY_PROMOTION_TOOL,
+                                locator=approval["approval_id"],
+                            )
+                        ],
+                    )
+                )
+                context.memory.seal_all()
+            payload = {
+                "staged": True,
+                "promoted": False,
+                "dry_run": dry_run,
+                "proposal_id": proposal_id,
+                "next_action": (
+                    "Run test.run, lint.run, repair.validate, and repair.review with "
+                    "subject_record_id set to proposal_id, then submit a separately approved "
+                    "memory.policy_promote call using those memory_record receipts."
+                ),
+            }
+            return self._result(
+                call,
+                success=True,
+                content=json.dumps(payload, indent=2),
+                data=payload,
+            )
+        if not source_record_id:
+            return self._result(
+                call,
+                success=False,
+                content=(
+                    "Policy promotion requires source_record_id for a proposal staged by an "
+                    "earlier approved call. Use stage_proposal=true first."
+                ),
+                error="policy_source_record_required",
+            )
+        proposal = context.memory.get_record(
+            MemoryLayer.EPISODIC,
+            source_record_id,
+            include_inactive=False,
+        )
+        if (
+            proposal is None
+            or proposal.kind != MemoryKind.POLICY
+            or proposal.title != title
+            or proposal.content != content
+            or proposal.metadata.get("policy_promotion_candidate") is not True
+            or proposal.metadata.get("validation_status") != "policy_promotion_candidate"
+            or not str(proposal.metadata.get("proposal_approval_id") or "").strip()
+            or str(proposal.metadata.get("session_id") or "") != context.session_id
+            or proposal.metadata.get("run_id") != context.run_id
+        ):
+            return self._result(
+                call,
+                success=False,
+                content=(
+                    "source_record_id must name the active, exact policy proposal staged in "
+                    "this session and run."
+                ),
+                error="policy_source_record_mismatch",
+            )
+        validation_evidence = _validation_evidence_arg(
+            public_arguments,
+            trust_human_explicit=True,
+        )
+        policy_spec = context.memory.specs[MemoryLayer.POLICY]
+        if validation_evidence is None or not validation_evidence.human_explicit:
+            return self._result(
+                call,
+                success=False,
+                content="Policy promotion requires structured, human-explicit validation evidence.",
+                error="policy_evidence_invalid",
+            )
+        distinct_tasks = {
+            (ref.source.strip(), ref.locator.strip())
+            for ref in validation_evidence.task_refs
+            if ref.source.strip() and ref.locator.strip()
+        }
+        if len(distinct_tasks) < policy_spec.min_repeat_count_for_promotion:
+            return self._result(
+                call,
+                success=False,
+                content=(
+                    "Policy promotion requires at least "
+                    f"{policy_spec.min_repeat_count_for_promotion} distinct task evidence refs; "
+                    f"received {len(distinct_tasks)}."
+                ),
+                error="policy_repeat_evidence_insufficient",
+            )
+        (
+            resolved_evidence,
+            source_record_ids,
+            resolved_artifact_bindings,
+            unresolved_refs,
+        ) = _resolve_policy_evidence(
+            validation_evidence,
+            context=context,
+            subject_record_id=source_record_id,
+        )
+        if unresolved_refs:
+            return self._result(
+                call,
+                success=False,
+                content=(
+                    "Policy evidence must resolve to claim-bound, current-run validation "
+                    "receipts from the correct tool class. Unresolved refs: "
+                    + ", ".join(unresolved_refs)
+                ),
+                data={"unresolved_evidence_refs": unresolved_refs},
+                error="policy_evidence_unresolved",
+            )
+        validation_evidence = resolved_evidence
+        score = compute_validation_score(validation_evidence)
+        if score < policy_spec.promotion_threshold:
+            return self._result(
+                call,
+                success=False,
+                content=(
+                    f"Policy validation score {score:.2f} is below "
+                    f"{policy_spec.promotion_threshold:.2f}."
+                ),
+                error="policy_evidence_invalid",
+            )
+        try:
+            signal = LearningSignal(
+                title=title,
+                content=content,
+                kind=MemoryKind.POLICY,
+                source_layer=MemoryLayer.PROCEDURAL,
+                confidence=float(public_arguments.get("confidence", 0.95)),
+                importance=float(public_arguments.get("importance", 0.95)),
+                validation_score=None,
+                validation_evidence=validation_evidence,
+                repeat_count=len(distinct_tasks),
+                explicit_instruction=True,
+                source=POLICY_PROMOTION_TOOL,
+                locator=approval["approval_id"],
+                metadata={
+                    "session_id": context.session_id,
+                    "run_id": context.run_id,
+                    "approval_provenance": approval,
+                    "resolved_artifact_bindings": resolved_artifact_bindings,
+                },
+                requested_target_layer=MemoryLayer.POLICY,
+            )
+            kernel = NestedLearningKernel(specs=context.memory.specs)
+            decision = kernel.decide(signal, action="promote")
+            if not decision.accepted or decision.target_layer != MemoryLayer.POLICY:
+                return self._result(
+                    call,
+                    success=False,
+                    content=decision.reason,
+                    data=decision.to_payload(),
+                    error="policy_memory_rejected",
+                )
+            record = kernel.to_memory_record(signal, decision)
+            source_record_ids = tuple(
+                dict.fromkeys((source_record_id, *source_record_ids))
+            )
+            record.evidence.append(
+                EvidenceRef(source="memory_record", locator=source_record_id)
+            )
+            record_id = (
+                None
+                if dry_run
+                else context.memory.put_validated(
+                    record,
+                    authority="nested_learning",
+                    source_record_ids=source_record_ids,
+                    validation_evidence=validation_evidence,
+                )
+            )
+            if record_id is not None:
+                context.memory.seal_all()
+            promotion_payload: dict[str, Any] = {
+                **decision.to_payload(),
+                "dry_run": dry_run,
+                "record_id": record_id,
+                "record_content_hash": record.content_hash,
+                "validation_score": score,
+                "repeat_count": len(distinct_tasks),
+                "approval_id": approval["approval_id"],
+                "validation_evidence": validation_evidence.to_metadata(),
+            }
+            return self._result(
+                call,
+                success=True,
+                content=json.dumps(promotion_payload, indent=2),
+                data=promotion_payload,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._result(
+                call, success=False, content=str(exc), error="policy_promote_failed"
+            )
+
+
 class MemoryInspectTool(AgentTool):
     spec = ToolSpec(
         name="memory.inspect",
@@ -910,6 +1387,7 @@ class MemoryInspectTool(AgentTool):
                 "layers": {"type": "array", "items": {"type": "string"}},
                 "k": {"type": "integer", "minimum": 1, "maximum": 50},
                 "include_inactive": {"type": "boolean"},
+                "include_retrieval_artifacts": {"type": "boolean"},
             },
             "required": ["query"],
         },
@@ -927,6 +1405,9 @@ class MemoryInspectTool(AgentTool):
                 layers=layers,
                 k_per_layer=int(arguments.get("k", 8)),
                 include_inactive=bool(arguments.get("include_inactive", False)),
+                include_retrieval_artifacts=bool(
+                    arguments.get("include_retrieval_artifacts", False)
+                ),
             )
         )
         rows = [_memory_hit_payload(hit) for hit in hits]
@@ -990,7 +1471,19 @@ class MemoryCorrectTool(AgentTool):
         )
         record_id = None
         if not dry_run:
-            record_id = context.memory.put_frame(frame)
+            correction_record = to_memory_record(frame)
+            correction_record.evidence.append(
+                EvidenceRef(source="memory_record", locator=target.id)
+            )
+            record_id = (
+                context.memory.put_validated(
+                    correction_record,
+                    authority="approved_correction",
+                    source_record_ids=(target.id,),
+                )
+                if target.layer in STABLE_MEMORY_LAYERS
+                else context.memory.put(correction_record)
+            )
             context.memory.tombstone(
                 target.layer, target.id, reason="corrected", superseded_by=str(record_id)
             )
@@ -1097,7 +1590,7 @@ class MemoryImportTool(AgentTool):
                 call, success=False, content="Every record must be an object", error="bad_records"
             )
         try:
-            records = [_memory_record_from_payload(item) for item in raw_records]
+            records = [_memory_record_from_payload(item, imported=True) for item in raw_records]
         except Exception as exc:  # noqa: BLE001 - import payload validation boundary
             return self._result(call, success=False, content=str(exc), error="bad_records")
         if (
@@ -1110,6 +1603,10 @@ class MemoryImportTool(AgentTool):
                 content="Policy memory import is disabled by default.",
                 error="policy_write_disabled",
             )
+        staged_layers = [
+            record.layer.value for record in records if record.layer in STABLE_MEMORY_LAYERS
+        ]
+        records = [_stage_untrusted_import(record) for record in records]
         dry_run = bool(arguments.get("dry_run", False))
         ids: list[str] = []
         if not dry_run:
@@ -1121,7 +1618,14 @@ class MemoryImportTool(AgentTool):
                 return self._result(
                     call, success=False, content=str(exc), error="memory_import_failed"
                 )
-        payload = {"dry_run": dry_run, "imported": len(records), "record_ids": ids}
+        payload = {
+            "dry_run": dry_run,
+            "imported": len(records),
+            "record_ids": ids,
+            "staged_stable_records": len(staged_layers),
+            "requested_stable_layers": staged_layers,
+            "stable_import_status": "untrusted_episodic_staging",
+        }
         return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
 
 
@@ -1294,9 +1798,7 @@ class PluginReviewTool(AgentTool):
                 call, success=True, content=json.dumps(review, indent=2), data=review
             )
         except Exception as exc:  # noqa: BLE001 - plugin review boundary reports structured failure
-            return self._result(
-                call, success=False, content=str(exc), error="plugin_review_failed"
-            )
+            return self._result(call, success=False, content=str(exc), error="plugin_review_failed")
 
 
 class SelfInspectTool(AgentTool):
@@ -1348,10 +1850,27 @@ class SelfReflectTool(AgentTool):
             RetrievalQuery(query=query, layers=(MemoryLayer.SELF,), k_per_layer=k)
         )
         rows = [_memory_hit_payload(hit) for hit in hits[:k]]
+        all_self_hits = [
+            MemoryHit(
+                record=record,
+                score=1.0,
+                source_backend="trusted_self_scan",
+                frame_id=str(record.metadata.get("frame_id") or record.id),
+            )
+            for record in context.memory.iter_records(MemoryLayer.SELF)
+        ]
+        trusted_ids = trusted_onboarding_record_ids(
+            all_self_hits,
+            spec=context.memory.specs[MemoryLayer.SELF],
+        )
+        trusted_onboarding_rows = [
+            _memory_hit_payload(hit) for hit in all_self_hits if hit.record.id in trusted_ids
+        ]
         payload = {
             "identity": _self_identity(),
             "query": query,
             "self_memory_hits": rows,
+            "trusted_onboarding_hits": trusted_onboarding_rows,
             "reflection": _self_reflection_text(rows),
         }
         return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
@@ -1409,6 +1928,72 @@ class SelfRememberTool(AgentTool):
         importance = float(arguments.get("importance", 0.72))
         source = str(arguments.get("source") or "self.remember")
         locator = str(arguments.get("locator") or context.run_id or context.session_id)
+        trusted_onboarding = (
+            context.trusted_request_origin == TRUSTED_ONBOARDING_ORIGIN
+            and schema == SELF_PROFILE_SCHEMA
+            and validation_status == "user_confirmed"
+            and source == TRUSTED_ONBOARDING_SOURCE
+            and locator == TRUSTED_ONBOARDING_LOCATOR
+        )
+        source_record_ids: tuple[str, ...] = ()
+        validation_evidence: ValidationEvidence | None = None
+        candidate_id: str | None = None
+        if trusted_onboarding:
+            candidate_id = context.memory.put(
+                MemoryRecord(
+                    title=title,
+                    content=content,
+                    layer=MemoryLayer.EPISODIC,
+                    kind=MemoryKind.FACT,
+                    confidence=max(confidence, 0.5),
+                    importance=importance,
+                    metadata={
+                        "frame_type": "section_summary",
+                        "validation_status": "onboarding_candidate",
+                        "self_schema": schema,
+                        "trusted_request_origin": TRUSTED_ONBOARDING_ORIGIN,
+                    },
+                    evidence=[
+                        EvidenceRef(
+                            source=TRUSTED_ONBOARDING_ORIGIN,
+                            locator=context.run_id or context.session_id,
+                        )
+                    ],
+                )
+            )
+            receipt_id = context.memory.put_runtime_validation_receipt(
+                tool_name=TRUSTED_ONBOARDING_SOURCE,
+                tool_call_id=context.run_id or context.session_id,
+                evidence_bucket="human",
+                command=(
+                    TRUSTED_ONBOARDING_PROVENANCE_SCHEMA,
+                    TRUSTED_ONBOARDING_ORIGIN,
+                    locator,
+                ),
+                output_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                session_id=context.session_id,
+                run_id=context.run_id,
+                subject_record_id=candidate_id,
+            )
+            onboarding_receipt = context.memory.get_record(MemoryLayer.EPISODIC, receipt_id)
+            if onboarding_receipt is None:
+                raise RuntimeError("Authenticated onboarding receipt was not persisted.")
+            onboarding_receipt.metadata.update(
+                {
+                    "authenticated_onboarding_receipt": True,
+                    "trusted_request_origin": TRUSTED_ONBOARDING_ORIGIN,
+                }
+            )
+            context.memory.upsert(onboarding_receipt)
+            source_record_ids = (candidate_id, receipt_id)
+            validation_evidence = resolve_validation_evidence(
+                ValidationEvidence(
+                    task_refs=(EvidenceRef(source="memory_record", locator=receipt_id),),
+                    human_explicit=True,
+                ),
+                status="human_confirmed",
+                artifact_ids=(receipt_id,),
+            )
         signal = LearningSignal(
             title=title,
             content=content,
@@ -1416,10 +2001,10 @@ class SelfRememberTool(AgentTool):
             source_layer=MemoryLayer.EPISODIC,
             confidence=confidence,
             importance=importance,
-            validation_score=confidence,
+            validation_score=None if validation_evidence is not None else confidence,
+            validation_evidence=validation_evidence,
             repeat_count=1,
-            explicit_instruction=validation_status
-            in {"user_confirmed", "operator_confirmed", "explicit_request"},
+            explicit_instruction=trusted_onboarding,
             source=source,
             locator=locator,
             tags={"self_schema": schema},
@@ -1451,8 +2036,25 @@ class SelfRememberTool(AgentTool):
                 "frame_type": "self_model",
             }
         )
+        if trusted_onboarding:
+            if candidate_id is None:
+                raise RuntimeError("Trusted onboarding candidate was not persisted.")
+            record.metadata["onboarding_provenance"] = {
+                "schema": TRUSTED_ONBOARDING_PROVENANCE_SCHEMA,
+                "origin": TRUSTED_ONBOARDING_ORIGIN,
+                "source": TRUSTED_ONBOARDING_SOURCE,
+                "locator": TRUSTED_ONBOARDING_LOCATOR,
+            }
+            record.evidence.append(
+                EvidenceRef(source="memory_record", locator=candidate_id)
+            )
         try:
-            record_id = context.memory.put(record)
+            record_id = context.memory.put_validated(
+                record,
+                authority="nested_learning",
+                source_record_ids=source_record_ids,
+                validation_evidence=validation_evidence,
+            )
             context.memory.seal_all()
         except Exception as exc:  # noqa: BLE001 - tool boundary
             return self._result(
@@ -1504,29 +2106,45 @@ class SelfProposeChangeTool(AgentTool):
             "approval_required_before_execution": True,
             "push_or_merge_allowed": False,
         }
-        remember = SelfRememberTool().run(
-            {
-                "title": "Self-change request",
-                "content": json.dumps(payload, indent=2),
-                "schema": "self_change_request",
+        proposal = MemoryRecord(
+            title="Self-change request",
+            content=json.dumps(payload, indent=2),
+            layer=MemoryLayer.EPISODIC,
+            kind=MemoryKind.EVENT,
+            confidence=0.86,
+            importance=0.85,
+            metadata={
+                "frame_type": "trace_stub",
+                "self_schema": "self_change_request",
                 "validation_status": "operator_requested",
-                "confidence": 0.86,
-                "source": "self.propose_change",
-                "locator": call.id,
+                "approval_gated": True,
+                "session_id": context.session_id,
+                "run_id": context.run_id,
             },
-            context,
+            evidence=[EvidenceRef(source="self.propose_change", locator=call.id)],
         )
+        try:
+            record_id = context.memory.put(proposal)
+            context.memory.seal_all()
+        except Exception as exc:  # noqa: BLE001 - tool boundary
+            return self._result(
+                call,
+                success=False,
+                content=str(exc),
+                data=payload,
+                error="self_change_proposal_failed",
+            )
         data = {
             **payload,
-            "memory_record_id": remember.data.get("record_id"),
-            "memory_error": remember.error,
+            "memory_record_id": record_id,
+            "memory_layer": MemoryLayer.EPISODIC.value,
+            "memory_error": None,
         }
         return self._result(
             call,
-            success=remember.success,
+            success=True,
             content=json.dumps(data, indent=2),
             data=data,
-            error=remember.error,
         )
 
 
@@ -1592,6 +2210,7 @@ def build_default_tools(enabled_names: tuple[str, ...] | None = None) -> ToolReg
     register(MemvidStatsTool())
     register(MemoryLedgerTool())
     register(MemoryLearnTool())
+    register(MemoryPolicyPromoteTool())
     register(MemoryConsolidateTool())
     register(MemoryCorrectTool())
     register(MemoryCompactTool())
@@ -1761,7 +2380,50 @@ def _memory_record_payload(record: MemoryRecord) -> dict[str, object]:
     }
 
 
-def _memory_record_from_payload(item: dict[str, Any]) -> MemoryRecord:
+_RUNTIME_TRANSCRIPT_AUTHORITY_FIELDS = frozenset(
+    {
+        "channel",
+        "channel_id",
+        "channel_message_id",
+        "channel_metadata",
+        "channel_user_id",
+        "conversation_id",
+        "frame_id",
+        "frame_type",
+        "runtime_source_uri",
+        "session_id",
+        "source_span",
+        "source_uri",
+        "transcript_scope",
+        "turn_origin",
+        "authenticated_onboarding_receipt",
+        "cognition_schema",
+        "nested_learning",
+        "onboarding_provenance",
+        "promotion_evidence_receipt",
+        "promotion_id",
+        "promotion_status",
+        "stable_write_envelope",
+        "validation_evidence",
+        "validation_method",
+        "validation_status",
+    }
+)
+
+
+def _memory_record_from_payload(item: dict[str, Any], *, imported: bool = False) -> MemoryRecord:
+    metadata = dict(item.get("metadata", {})) if isinstance(item.get("metadata"), dict) else {}
+    if imported:
+        metadata = {
+            key: value
+            for key, value in metadata.items()
+            if key not in _RUNTIME_TRANSCRIPT_AUTHORITY_FIELDS
+        }
+        # Imports are always untrusted memory data, even when an operator approves the
+        # exact call. Approval authorizes the write; it does not authenticate runtime
+        # transcript provenance supplied by the payload.
+        metadata["memory_imported"] = True
+        metadata["import_trust"] = "untrusted_data"
     record = MemoryRecord(
         layer=MemoryLayer(str(item.get("layer", MemoryLayer.WORKING.value))),
         kind=MemoryKind(str(item.get("kind", MemoryKind.OBSERVATION.value))),
@@ -1770,12 +2432,37 @@ def _memory_record_from_payload(item: dict[str, Any]) -> MemoryRecord:
         confidence=float(item.get("confidence", 0.8)),
         importance=float(item.get("importance", 0.5)),
         tags=dict(item.get("tags", {})) if isinstance(item.get("tags"), dict) else {},
-        metadata=dict(item.get("metadata", {})) if isinstance(item.get("metadata"), dict) else {},
+        metadata=metadata,
     )
     record_id = str(item.get("id") or "").strip()
     if record_id:
         record.id = record_id
     return record
+
+
+def _stage_untrusted_import(record: MemoryRecord) -> MemoryRecord:
+    if record.layer not in STABLE_MEMORY_LAYERS:
+        return record
+    requested_layer = record.layer
+    return replace(
+        record,
+        layer=MemoryLayer.EPISODIC,
+        kind=MemoryKind.EVENT,
+        metadata={
+            **record.metadata,
+            "import_requested_layer": requested_layer.value,
+            "validation_status": "untrusted_import_staged",
+            "stable_recall_eligible": False,
+        },
+        evidence=[
+            *record.evidence,
+            EvidenceRef(
+                source="memory.import",
+                locator=record.id,
+                quote=f"Requested {requested_layer.value} record staged as untrusted episodic data.",
+            ),
+        ],
+    )
 
 
 def _layer_arg(value: object) -> MemoryLayer | None:
@@ -1843,6 +2530,284 @@ def _find_memory_by_id(context: ToolContext, lookup_id: str) -> Any | None:
     return None
 
 
+def _stable_signal_source_record_ids(signal: LearningSignal) -> tuple[str, ...]:
+    evidence = signal.validation_evidence
+    if evidence is None:
+        return ()
+    return tuple(
+        dict.fromkeys(
+            ref.locator.strip()
+            for ref in evidence.all_refs()
+            if ref.source.strip() == "memory_record" and ref.locator.strip()
+        )
+    )
+
+
+def _resolve_runtime_validation_evidence(
+    evidence: ValidationEvidence,
+    *,
+    context: ToolContext,
+    expected_subject_record_id: str | None,
+) -> tuple[ValidationEvidence, tuple[str, ...], list[str]]:
+    """Resolve current-run receipts bound to one exact durable claim candidate."""
+
+    unresolved: list[str] = []
+    artifact_ids: list[str] = []
+    expected_subject_id = (expected_subject_record_id or "").strip()
+    for bucket, refs in (
+        ("test", evidence.test_refs),
+        ("lint", evidence.lint_refs),
+        ("repair", evidence.repair_refs),
+        ("review", evidence.review_refs),
+        (None, evidence.task_refs),
+    ):
+        for ref in refs:
+            source = ref.source.strip()
+            locator = ref.locator.strip()
+            label = f"{source}:{locator}"
+            if source != "memory_record" or not locator:
+                unresolved.append(label)
+                continue
+            record = context.memory.get_record(None, locator, include_inactive=False)
+            if record is None or not context.memory.is_authenticated_validation_receipt(
+                record,
+                evidence_bucket=bucket,
+                require_subject_binding=True,
+            ):
+                unresolved.append(label)
+                continue
+            binding = context.memory.validation_receipt_subject(record)
+            if binding is None or binding[0] != expected_subject_id:
+                unresolved.append(label)
+                continue
+            receipt_session_id = binding[2]
+            receipt_run_id = binding[3]
+            if (
+                (context.run_id is not None and receipt_run_id != context.run_id)
+                or (
+                    context.run_id is None
+                    and (receipt_run_id is not None or receipt_session_id != context.session_id)
+                )
+            ):
+                unresolved.append(label)
+                continue
+            artifact_ids.append(record.id)
+    if unresolved or not artifact_ids:
+        return evidence, (), sorted(set(unresolved or ["no_authenticated_runtime_receipts"]))
+    runtime_evidence = replace(evidence, human_explicit=False)
+    resolved = resolve_validation_evidence(
+        runtime_evidence,
+        status="runtime_validated",
+        artifact_ids=tuple(dict.fromkeys(artifact_ids)),
+    )
+    return resolved, tuple(dict.fromkeys(artifact_ids)), []
+
+
+def _resolve_capsule_summary_evidence(summary: Any, *, context: ToolContext) -> Any:
+    signals: list[LearningSignal] = []
+    for signal in summary.learning_signals:
+        evidence = signal.validation_evidence
+        if evidence is None:
+            signals.append(signal)
+            continue
+        expected_subject_id = str(
+            (signal.metadata or {}).get("source_record_id") or ""
+        ).strip()
+        resolved, _, _ = _resolve_runtime_validation_evidence(
+            evidence,
+            context=context,
+            expected_subject_record_id=expected_subject_id or None,
+        )
+        signals.append(
+            replace(
+                signal,
+                validation_evidence=resolved,
+                validation_score=None,
+            )
+        )
+    return replace(summary, learning_signals=tuple(signals))
+
+
+def _resolve_policy_evidence(
+    evidence: ValidationEvidence,
+    *,
+    context: ToolContext,
+    subject_record_id: str | None = None,
+) -> tuple[
+    ValidationEvidence,
+    tuple[str, ...],
+    dict[str, dict[str, str]],
+    list[str],
+]:
+    unresolved: list[str] = []
+    artifact_ids: list[str] = []
+    source_record_ids: list[str] = []
+    artifact_bindings: dict[str, dict[str, str]] = {}
+    resolved_refs: dict[str, list[EvidenceRef]] = {
+        "test": [],
+        "lint": [],
+        "repair": [],
+        "review": [],
+        "task": [],
+    }
+    for bucket, refs in (
+        ("test", evidence.test_refs),
+        ("lint", evidence.lint_refs),
+        ("repair", evidence.repair_refs),
+        ("review", evidence.review_refs),
+        ("task", evidence.task_refs),
+    ):
+        for ref in refs:
+            source = ref.source.strip()
+            locator = ref.locator.strip()
+            label = f"{source}:{locator}"
+            if not source or not locator:
+                unresolved.append(label)
+                continue
+            if source != "memory_record":
+                # Raw signed repair artifacts prove that a tool ran, but they do
+                # not bind that run to this exact policy claim.  Only the
+                # runtime's HMAC receipt can supply claim/run/bucket binding.
+                unresolved.append(label)
+                continue
+            record = context.memory.get_record(None, locator, include_inactive=False)
+            if record is None or not _record_is_resolved_promotion_evidence(
+                record,
+                context=context,
+                expected_subject_record_id=subject_record_id,
+                expected_evidence_bucket=bucket,
+            ):
+                unresolved.append(label)
+                continue
+            payload = record.metadata.get("validation_receipt_payload")
+            if not isinstance(payload, dict):
+                unresolved.append(label)
+                continue
+            source_record_ids.append(record.id)
+            artifact_ids.append(record.id)
+            resolved_refs[bucket].append(ref)
+            artifact_bindings[record.id] = {
+                "source": str(record.metadata.get("signed_artifact_source") or ""),
+                "locator": str(record.metadata.get("signed_artifact_locator") or ""),
+                "evidence_bucket": str(payload.get("evidence_bucket") or ""),
+            }
+    if unresolved:
+        return evidence, (), {}, sorted(set(unresolved))
+    resolved_payload = ValidationEvidence(
+        test_refs=tuple(resolved_refs["test"]),
+        lint_refs=tuple(resolved_refs["lint"]),
+        repair_refs=tuple(resolved_refs["repair"]),
+        review_refs=tuple(resolved_refs["review"]),
+        task_refs=tuple(resolved_refs["task"]),
+        human_explicit=evidence.human_explicit,
+        source_evidence_chars=evidence.source_evidence_chars,
+    )
+    resolved = resolve_validation_evidence(
+        resolved_payload,
+        status="operator_approved",
+        artifact_ids=tuple(dict.fromkeys(artifact_ids)),
+    )
+    return resolved, tuple(dict.fromkeys(source_record_ids)), artifact_bindings, []
+
+
+def _record_is_resolved_promotion_evidence(
+    record: MemoryRecord,
+    *,
+    context: ToolContext,
+    expected_subject_record_id: str | None,
+    expected_evidence_bucket: str,
+) -> bool:
+    if not record.evidence:
+        return False
+    metadata = record.metadata
+    source = str(metadata.get("signed_artifact_source") or "").strip()
+    locator = str(metadata.get("signed_artifact_locator") or "").strip()
+    if context.memory.is_authenticated_validation_receipt(
+        record,
+        require_subject_binding=True,
+    ):
+        binding = context.memory.validation_receipt_subject(record)
+        expected_subject_id = (expected_subject_record_id or "").strip()
+        payload = record.metadata.get("validation_receipt_payload")
+        if not isinstance(payload, dict):
+            return False
+        receipt_bucket = str(payload.get("evidence_bucket") or "")
+        tool_name = str(payload.get("tool_name") or "")
+        if expected_evidence_bucket != "task" and receipt_bucket != expected_evidence_bucket:
+            return False
+        allowed_tools = {
+            "test": frozenset({"test.run"}),
+            "lint": frozenset({"lint.run"}),
+            "repair": frozenset({"repair.validate", "repair.orchestrate_validate"}),
+            "review": frozenset({"repair.review"}),
+        }
+        if receipt_bucket not in allowed_tools or tool_name not in allowed_tools[receipt_bucket]:
+            return False
+        artifact_pair_valid = bool(source) == bool(locator)
+        if receipt_bucket == "repair":
+            artifact_pair_valid = (
+                source == "repair.validate"
+                and bool(locator)
+                and _signed_promotion_artifact_is_valid(
+                    source,
+                    locator,
+                    workspace=context.workspace,
+                )
+            )
+        elif receipt_bucket == "review":
+            artifact_pair_valid = (
+                source == "repair.review"
+                and bool(locator)
+                and _signed_promotion_artifact_is_valid(
+                    source,
+                    locator,
+                    workspace=context.workspace,
+                )
+            )
+        elif source or locator:
+            artifact_pair_valid = False
+        return bool(
+            binding is not None
+            and binding[0] == expected_subject_id
+            and (
+                (context.run_id is not None and binding[3] == context.run_id)
+                or (
+                    context.run_id is None
+                    and binding[3] is None
+                    and binding[2] == context.session_id
+                )
+            )
+            and artifact_pair_valid
+        )
+    # Legacy unsigned memory receipts were not bound to the promoted claim and
+    # therefore remain audit-only.  They cannot authorize a policy write.
+    return False
+
+
+def _signed_promotion_artifact_is_valid(
+    source: str,
+    locator: str,
+    *,
+    workspace: Any,
+) -> bool:
+    try:
+        if source == "repair.validate":
+            return load_validation_receipt(workspace, locator).get("success") is True
+        if source == "repair.review":
+            receipt = load_review_receipt(workspace, locator)
+            validation = receipt.get("validation")
+            commit_gate = receipt.get("commit_gate")
+            return bool(
+                isinstance(validation, dict)
+                and validation.get("success") is True
+                and isinstance(commit_gate, dict)
+                and commit_gate.get("commit_allowed") is True
+            )
+    except (FileNotFoundError, ValueError):
+        return False
+    return False
+
+
 def _related_frames(
     context: ToolContext,
     frame: Any,
@@ -1900,21 +2865,40 @@ def _capsule_apply_plan(
         )
         payload["will_write"] = False
         if not decision.accepted or decision.target_layer is None:
-            payload["blocked"] = (
-                "policy_requires_explicit_instruction"
-                if signal.requested_target_layer == MemoryLayer.POLICY
-                and not signal.explicit_instruction
-                else "nested_learning_rejected"
-            )
-        elif decision.target_layer == MemoryLayer.POLICY:
-            if not include_policy:
-                payload["blocked"] = "policy_excluded_from_capsule_apply"
-            elif not context.config.allow_policy_writes:
-                payload["blocked"] = "policy_write_disabled"
-            elif not signal.explicit_instruction:
-                payload["blocked"] = "policy_requires_explicit_instruction"
+            staged_record = capsule_signal_staging_record(signal)
+            if staged_record is not None:
+                if _memory_has_content_hash(
+                    context,
+                    MemoryLayer.EPISODIC,
+                    staged_record.content_hash,
+                ):
+                    payload["blocked"] = "duplicate_content_hash"
+                else:
+                    payload.update(
+                        {
+                            "will_write": True,
+                            "write_mode": "unvalidated_episodic_staging",
+                            "actual_layer": MemoryLayer.EPISODIC.value,
+                            "requested_stable_layer": staged_record.metadata[
+                                "requested_stable_layer"
+                            ],
+                            "validation_status": "unresolved",
+                            "stable_promotion_blocked": "authenticated_validation_required",
+                        }
+                    )
             else:
-                payload["will_write"] = True
+                payload["blocked"] = (
+                    "policy_requires_explicit_instruction"
+                    if signal.requested_target_layer == MemoryLayer.POLICY
+                    and not signal.explicit_instruction
+                    else "nested_learning_rejected"
+                )
+        elif decision.target_layer == MemoryLayer.POLICY:
+            payload["blocked"] = (
+                "policy_excluded_from_capsule_apply"
+                if not include_policy
+                else "policy_requires_dedicated_exact_call_approval"
+            )
         else:
             record = kernel.to_memory_record(signal, decision)
             if _memory_has_content_hash(context, decision.target_layer, record.content_hash):

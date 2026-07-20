@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Iterator
 from importlib import import_module
@@ -15,7 +14,13 @@ from ..runtime_models import (
     ToolSpec,
 )
 from .base import LLMProvider, ProviderCapabilities, ProviderError
-from .parser import normalize_tool_calls, parse_agent_response
+from .parser import (
+    ControlMessageError,
+    native_tool_arguments,
+    native_tool_name,
+    normalize_tool_calls,
+    parse_agent_response,
+)
 
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -43,6 +48,11 @@ class OpenAICompatibleProvider(LLMProvider):
 
     @property
     def capabilities(self) -> ProviderCapabilities:
+        constrained_local_provider = self.provider_name in {
+            "lm-studio",
+            "ollama",
+            "openai-compatible",
+        }
         return ProviderCapabilities(
             name=self.provider_name,
             supports_native_tools=True,
@@ -50,6 +60,7 @@ class OpenAICompatibleProvider(LLMProvider):
             supports_json_mode=True,
             supports_system_messages=True,
             token_usage_available=True,
+            native_tool_limit=12 if constrained_local_provider else None,
         )
 
     def generate(
@@ -123,6 +134,8 @@ class OpenAICompatibleProvider(LLMProvider):
                     content_parts.append(str(token))
                     yield LLMStreamEvent(type="token", content=str(token))
                 _accumulate_delta_tool_calls(tool_buffers, getattr(delta, "tool_calls", None))
+        except ControlMessageError:
+            raise
         except Exception as exc:  # noqa: BLE001
             yield LLMStreamEvent(
                 type="provider_error",
@@ -167,9 +180,9 @@ class OpenAICompatibleProvider(LLMProvider):
 def _to_chat_completion_dict(message: ChatMessage) -> dict[str, Any]:
     payload = message.to_openai_dict()
     if payload["role"] == "tool":
-        payload["role"] = "user"
-        payload["content"] = f"Tool result from {message.name or 'tool'}:\n{message.content}"
-        payload.pop("tool_call_id", None)
+        # Chat Completions requires a native assistant tool_calls item followed
+        # by a tool result carrying the same tool_call_id.  The agent runtime
+        # now preserves that pair in provider-neutral ChatMessage fields.
         payload.pop("name", None)
     return payload
 
@@ -220,69 +233,134 @@ def _chat_completion_tool_calls(response: Any) -> list[ToolCall]:
     if choice is None:
         return []
     message = getattr(choice, "message", None)
-    raw_calls = getattr(message, "tool_calls", None)
+    raw_calls = _item_value(message, "tool_calls")
     calls: list[ToolCall] = []
-    if not raw_calls:
+    if raw_calls is None:
         return calls
-    for item in raw_calls:
-        function = getattr(item, "function", None)
-        name = getattr(function, "name", None)
-        if not isinstance(name, str) or not name:
-            continue
+    if not isinstance(raw_calls, list | tuple):
+        raise ControlMessageError(
+            "chat.completions.tool_calls must be a list",
+            code="invalid_tool_call",
+        )
+    for index, item in enumerate(raw_calls):
+        location = f"chat.completions.tool_calls[{index}]"
+        function = _native_function_block(item, location=location)
+        name = native_tool_name(_item_value(function, "name"), location=location)
+        arguments = native_tool_arguments(
+            _item_value(function, "arguments"),
+            tool_name=name,
+            location=location,
+        )
         calls.append(
             ToolCall(
                 name=name,
-                arguments=_arguments_dict(getattr(function, "arguments", None)),
-                id=str(getattr(item, "id", "") or f"tool_{name}"),
+                arguments=arguments,
+                id=str(_item_value(item, "id") or f"tool_{name}"),
             )
         )
     return calls
 
 
 def _accumulate_delta_tool_calls(buffers: dict[int, dict[str, str]], raw_calls: Any) -> None:
-    if not raw_calls:
+    if raw_calls is None:
         return
-    for item in raw_calls:
-        index = int(getattr(item, "index", 0) or 0)
+    if not isinstance(raw_calls, list | tuple):
+        raise ControlMessageError(
+            "chat.completions.delta.tool_calls must be a list",
+            code="invalid_tool_call",
+        )
+    for position, item in enumerate(raw_calls):
+        location = f"chat.completions.delta.tool_calls[{position}]"
+        if not _is_native_object(item):
+            raise ControlMessageError(f"{location} must be an object", code="invalid_tool_call")
+        raw_index = _item_value(item, "index")
+        if raw_index is None:
+            index = 0
+        elif isinstance(raw_index, int) and not isinstance(raw_index, bool) and raw_index >= 0:
+            index = raw_index
+        else:
+            raise ControlMessageError(
+                f"{location}.index must be a non-negative integer",
+                code="invalid_tool_call",
+            )
         buffer = buffers.setdefault(index, {"id": "", "name": "", "arguments": ""})
-        item_id = getattr(item, "id", None)
-        if item_id:
-            buffer["id"] = str(item_id)
-        function = getattr(item, "function", None)
-        name = getattr(function, "name", None)
-        if name:
-            buffer["name"] += str(name)
-        arguments = getattr(function, "arguments", None)
-        if arguments:
-            buffer["arguments"] += str(arguments)
+        item_id = _item_value(item, "id")
+        if item_id is not None:
+            if not isinstance(item_id, str):
+                raise ControlMessageError(
+                    f"{location}.id must be a string",
+                    code="invalid_tool_call",
+                )
+            buffer["id"] = item_id
+        function = _item_value(item, "function")
+        if function is None:
+            continue
+        if not _is_native_object(function):
+            raise ControlMessageError(
+                f"{location}.function must be an object",
+                code="invalid_tool_call",
+            )
+        name = _item_value(function, "name")
+        if name is not None:
+            if not isinstance(name, str):
+                raise ControlMessageError(
+                    f"{location} tool name fragments must be strings",
+                    code="invalid_tool_name",
+                )
+            buffer["name"] += name
+        arguments = _item_value(function, "arguments")
+        if arguments is not None:
+            if not isinstance(arguments, str):
+                raise ControlMessageError(
+                    f"{location} argument fragments must be strings",
+                    code="invalid_tool_arguments",
+                )
+            buffer["arguments"] += arguments
 
 
 def _buffered_tool_calls(buffers: dict[int, dict[str, str]]) -> list[ToolCall]:
     calls: list[ToolCall] = []
-    for item in buffers.values():
-        if not item["name"]:
-            continue
+    for index, item in sorted(buffers.items()):
+        location = f"chat.completions.delta.tool_calls[{index}]"
+        name = native_tool_name(item["name"], location=location)
+        arguments = native_tool_arguments(
+            item["arguments"],
+            tool_name=name,
+            location=location,
+        )
         calls.append(
             ToolCall(
-                name=item["name"],
-                arguments=_arguments_dict(item["arguments"]),
-                id=item["id"] or f"tool_{item['name']}",
+                name=name,
+                arguments=arguments,
+                id=item["id"] or f"tool_{name}",
             )
         )
     return calls
 
 
-def _arguments_dict(raw: Any) -> dict[str, Any]:
-    if isinstance(raw, dict):
-        return dict(raw)
-    if isinstance(raw, str) and raw.strip():
-        try:
-            loaded = os.linesep.join(raw.splitlines())
-            parsed = json.loads(loaded)
-        except Exception:  # noqa: BLE001 - invalid provider argument JSON becomes empty at parse stage
-            return {}
-        return dict(parsed) if isinstance(parsed, dict) else {}
-    return {}
+def _native_function_block(item: Any, *, location: str) -> Any:
+    if not _is_native_object(item):
+        raise ControlMessageError(f"{location} must be an object", code="invalid_tool_call")
+    function = _item_value(item, "function")
+    if not _is_native_object(function):
+        raise ControlMessageError(
+            f"{location}.function must be an object",
+            code="invalid_tool_call",
+        )
+    return function
+
+
+def _is_native_object(value: Any) -> bool:
+    return isinstance(value, dict) or (
+        value is not None
+        and not isinstance(value, str | bytes | list | tuple | bool | int | float)
+    )
+
+
+def _item_value(item: Any, key: str) -> Any:
+    if isinstance(item, dict):
+        return item.get(key)
+    return getattr(item, key, None)
 
 
 def _usage_dict(response: Any) -> dict[str, Any] | None:

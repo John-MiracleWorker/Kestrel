@@ -14,7 +14,13 @@ from ..runtime_models import (
     ToolSpec,
 )
 from .base import LLMProvider, ProviderCapabilities, ProviderError
-from .parser import normalize_tool_calls, parse_agent_response
+from .parser import (
+    ControlMessageError,
+    native_tool_arguments,
+    native_tool_name,
+    normalize_tool_calls,
+    parse_agent_response,
+)
 
 
 class AnthropicMessagesProvider(LLMProvider):
@@ -75,6 +81,8 @@ class AnthropicMessagesProvider(LLMProvider):
                 temperature=active_options.temperature,
                 max_tokens=self.max_tokens,
             )
+        except ControlMessageError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise ProviderError(str(exc), code=type(exc).__name__, retryable=True) from exc
         return _anthropic_response_to_llm_response(response, tools=tools)
@@ -128,6 +136,8 @@ class AnthropicMessagesProvider(LLMProvider):
             if response.usage:
                 yield LLMStreamEvent(type="usage", data=response.usage)
             yield LLMStreamEvent(type="message_complete", response=response)
+        except ControlMessageError:
+            raise
         except Exception as exc:  # noqa: BLE001
             yield LLMStreamEvent(
                 type="provider_error",
@@ -150,11 +160,32 @@ def _anthropic_messages(messages: list[ChatMessage]) -> list[dict[str, Any]]:
             rendered.append(
                 {
                     "role": "user",
-                    "content": f"Tool result from {message.name or 'tool'}:\n{message.content}",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": message.tool_call_id or "missing_tool_call_id",
+                            "content": message.content,
+                        }
+                    ],
                 }
             )
             continue
         role = "assistant" if message.role == "assistant" else "user"
+        if message.role == "assistant" and message.tool_calls:
+            content: list[dict[str, Any]] = []
+            if message.content:
+                content.append({"type": "text", "text": message.content})
+            content.extend(
+                {
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": call.arguments,
+                }
+                for call in message.tool_calls
+            )
+            rendered.append({"role": role, "content": content})
+            continue
         rendered.append({"role": role, "content": message.content})
     return rendered
 
@@ -170,23 +201,39 @@ def _anthropic_response_to_llm_response(
 ) -> LLMResponse:
     text_parts: list[str] = []
     native_calls: list[ToolCall] = []
-    for block in getattr(response, "content", []) or []:
+    raw_content = _value(response, "content")
+    if raw_content is None:
+        content: list[Any] | tuple[Any, ...] = []
+    elif isinstance(raw_content, list | tuple):
+        content = raw_content
+    else:
+        raise ControlMessageError(
+            "anthropic.content must be a list",
+            code="invalid_tool_call",
+        )
+    for index, block in enumerate(content):
+        location = f"anthropic.content[{index}]"
+        if not _is_native_object(block):
+            raise ControlMessageError(f"{location} must be an object", code="invalid_tool_call")
         block_type = _value(block, "type")
         if block_type == "text":
             text = _value(block, "text")
             if text is not None:
                 text_parts.append(str(text))
         elif block_type == "tool_use":
-            name = _value(block, "name")
-            if isinstance(name, str) and name:
-                raw_input = _value(block, "input")
-                native_calls.append(
-                    ToolCall(
-                        name=name,
-                        arguments=dict(raw_input) if isinstance(raw_input, dict) else {},
-                        id=str(_value(block, "id") or f"tool_{name}"),
-                    )
+            name = native_tool_name(_value(block, "name"), location=location)
+            arguments = native_tool_arguments(
+                _value(block, "input"),
+                tool_name=name,
+                location=location,
+            )
+            native_calls.append(
+                ToolCall(
+                    name=name,
+                    arguments=arguments,
+                    id=str(_value(block, "id") or f"tool_{name}"),
                 )
+            )
     text = "\n".join(text_parts)
     parsed = parse_agent_response(text, tools=tools, strict=True)
     return LLMResponse(
@@ -233,3 +280,10 @@ def _value(item: Any, key: str) -> Any:
     if isinstance(item, dict):
         return item.get(key)
     return getattr(item, key, None)
+
+
+def _is_native_object(value: Any) -> bool:
+    return isinstance(value, dict) or (
+        value is not None
+        and not isinstance(value, str | bytes | list | tuple | bool | int | float)
+    )

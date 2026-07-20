@@ -4,24 +4,36 @@ import hashlib
 import json
 import math
 import os
-import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock, RLock
 from typing import Any
 
 from .config import AgentConfig
 from .file_lock import lock_exclusive, unlock
 from .llm.model_catalog import PROVIDER_OPTIONS
+from .private_artifacts import (
+    harden_private_file,
+    open_private_file_descriptor,
+    read_private_text,
+    write_private_text,
+)
 
 PROVIDER_CHOICES = set(PROVIDER_OPTIONS)
 BACKEND_CHOICES = {"memory", "memvid"}
 AUTONOMY_CHOICES = {"background", "manual", "autonomous"}
 RUNTIME_SETTINGS_SCHEMA_VERSION = 1
+_SETTINGS_THREAD_LOCKS: dict[Path, RLock] = {}
+_SETTINGS_THREAD_LOCKS_GUARD = Lock()
 
 
 class RuntimeSettingsConflict(RuntimeError):
     """Raised when a runtime settings compare-and-swap revision is stale."""
+
+
 TOOL_PERMISSION_FIELDS = {
     "allow_shell",
     "allow_file_write",
@@ -67,6 +79,7 @@ class RuntimeSettings:
     allow_web: bool = False
     allow_self_modification: bool = False
     provider_startup_probe: bool = False
+    enable_semantic_orchestration: bool = False
     enable_auto_activate_low_risk_deltas: bool = False
     enable_auto_skill_materialization: bool = False
     enable_auto_consolidation_shadow: bool = False
@@ -99,6 +112,7 @@ class RuntimeSettings:
             allow_web=config.allow_web,
             allow_self_modification=config.allow_self_modification,
             provider_startup_probe=config.provider_startup_probe,
+            enable_semantic_orchestration=config.enable_semantic_orchestration,
             enable_auto_activate_low_risk_deltas=config.enable_auto_activate_low_risk_deltas,
             enable_auto_skill_materialization=config.enable_auto_skill_materialization,
             enable_auto_consolidation_shadow=config.enable_auto_consolidation_shadow,
@@ -122,23 +136,113 @@ class RuntimeSettings:
         return payload
 
 
+@dataclass(frozen=True)
+class RuntimeSettingsUpdateResult:
+    settings: RuntimeSettings
+    previous_config: AgentConfig
+    config: AgentConfig
+    activation_result: object | None = None
+
+
 class RuntimeSettingsStore:
     def __init__(self, path: Path) -> None:
-        self.path = path
+        self.path = Path(path)
+        self._thread_lock = _settings_thread_lock(self.path)
 
     def exists(self) -> bool:
-        return self.path.exists()
+        with self._thread_lock:
+            return harden_private_file(self.path, missing_ok=True)
 
     def load(self, fallback: AgentConfig) -> RuntimeSettings:
-        if not self.path.exists():
+        with self._thread_lock, self._settings_lock(exclusive=True):
+            return self._load_unlocked(fallback, migrate=True)
+
+    def save(
+        self,
+        settings: RuntimeSettings,
+        *,
+        expected_revision: str | None = None,
+    ) -> RuntimeSettings:
+        with self._thread_lock, self._settings_lock(exclusive=True):
+            current_raw = self._read_raw_unlocked()
+            if (
+                expected_revision is not None
+                and current_raw is not None
+                and current_raw.get("revision") != expected_revision
+            ):
+                raise RuntimeSettingsConflict("runtime_settings_revision_conflict")
+            rendered = _persisted_settings(settings)
+            self._write_unlocked(rendered)
+            return rendered
+
+    def transactional_update(
+        self,
+        fallback: AgentConfig | Callable[[], AgentConfig],
+        changes: dict[str, Any],
+        *,
+        expected_revision: str | None,
+        validate_config: Callable[[AgentConfig], None] | None = None,
+        activate_config: Callable[[AgentConfig, AgentConfig], object | None] | None = None,
+        rollback_config: Callable[[AgentConfig], None] | None = None,
+    ) -> RuntimeSettingsUpdateResult:
+        """Serialize merge, validation, persistence, and live activation."""
+
+        with self._thread_lock, self._settings_lock(exclusive=True):
+            previous_config = fallback() if callable(fallback) else fallback
+            had_persisted_settings = harden_private_file(self.path, missing_ok=True)
+            current = self._load_unlocked(previous_config, migrate=True)
+            if expected_revision is not None and current.revision != expected_revision:
+                raise RuntimeSettingsConflict("runtime_settings_revision_conflict")
+            merged = merge_runtime_settings(previous_config, current, changes)
+            candidate_config = apply_runtime_settings(previous_config, merged)
+            if validate_config is not None:
+                validate_config(candidate_config)
+            saved = _persisted_settings(merged)
+            next_config = apply_runtime_settings(previous_config, saved)
+            activation_started = False
+            try:
+                self._write_unlocked(saved)
+                activation_started = True
+                activation_result = (
+                    activate_config(previous_config, next_config)
+                    if activate_config is not None
+                    else None
+                )
+            except BaseException:
+                rollback_error: BaseException | None = None
+                if activation_started and rollback_config is not None:
+                    try:
+                        rollback_config(previous_config)
+                    except BaseException as exc:  # noqa: BLE001 - persistence rollback must still run
+                        rollback_error = exc
+                try:
+                    if had_persisted_settings:
+                        self._write_unlocked(current)
+                    else:
+                        self._remove_unlocked()
+                except BaseException as exc:
+                    raise RuntimeError("runtime_settings_persistence_rollback_failed") from exc
+                if rollback_error is not None:
+                    raise RuntimeError("runtime_settings_activation_rollback_failed") from rollback_error
+                raise
+            return RuntimeSettingsUpdateResult(
+                settings=saved,
+                previous_config=previous_config,
+                config=next_config,
+                activation_result=activation_result,
+            )
+
+    def _load_unlocked(self, fallback: AgentConfig, *, migrate: bool) -> RuntimeSettings:
+        raw = self._read_raw_unlocked()
+        if raw is None:
             return _finalize_settings(RuntimeSettings.from_config(fallback), source="launch")
-        raw = json.loads(self.path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raise ValueError("runtime settings file must contain a JSON object")
         schema_version = raw.get("schema_version", RUNTIME_SETTINGS_SCHEMA_VERSION)
         if schema_version != RUNTIME_SETTINGS_SCHEMA_VERSION:
             raise ValueError(f"unsupported runtime settings schema: {schema_version}")
         settings = RuntimeSettings.from_mapping(raw, fallback)
+        # This policy is controlled only by launch configuration, even when an
+        # older persisted file contains a different historical value.
+        settings = replace(settings, require_api_auth=fallback.require_api_auth)
         finalized = _finalize_settings(settings, source="persisted")
         stored_revision = raw.get("revision")
         if (
@@ -147,53 +251,41 @@ class RuntimeSettingsStore:
             and stored_revision != _mapping_revision(raw)
         ):
             raise ValueError("runtime settings revision mismatch")
+        if migrate and stored_revision != finalized.revision:
+            self._write_unlocked(finalized)
         return finalized
 
-    def save(
-        self,
-        settings: RuntimeSettings,
-        *,
-        expected_revision: str | None = None,
-    ) -> RuntimeSettings:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def _read_raw_unlocked(self) -> dict[str, Any] | None:
+        raw_text = read_private_text(self.path, missing_ok=True)
+        if raw_text is None:
+            return None
+        raw = json.loads(raw_text)
+        if not isinstance(raw, dict):
+            raise ValueError("runtime settings file must contain a JSON object")
+        return raw
+
+    def _write_unlocked(self, settings: RuntimeSettings) -> None:
+        rendered = json.dumps(asdict(settings), indent=2, sort_keys=True)
+        write_private_text(self.path, f"{rendered}\n")
+
+    def _remove_unlocked(self) -> None:
+        if not harden_private_file(self.path, missing_ok=True):
+            return
+        self.path.unlink()
+
+    @contextmanager
+    def _settings_lock(self, *, exclusive: bool) -> Iterator[None]:
         lock_path = self.path.with_name(f".{self.path.name}.lock")
-        lock_path.touch(mode=0o600, exist_ok=True)
-        os.chmod(lock_path, 0o600)
-        with lock_path.open("r+") as lock_handle:
-            lock_exclusive(lock_handle)
+        descriptor = open_private_file_descriptor(lock_path)
+        with os.fdopen(descriptor, "r+", encoding="utf-8") as lock_handle:
+            if exclusive:
+                lock_exclusive(lock_handle)
+            else:
+                # Settings reads currently use exclusive locking so accepted
+                # legacy shapes can be migrated atomically.
+                raise ValueError("shared runtime settings locks are unsupported")
             try:
-                if expected_revision is not None and self.path.exists():
-                    current_raw = json.loads(self.path.read_text(encoding="utf-8"))
-                    if not isinstance(current_raw, dict) or current_raw.get("revision") != expected_revision:
-                        raise RuntimeSettingsConflict("runtime_settings_revision_conflict")
-                rendered = _finalize_settings(
-                    replace(
-                        settings,
-                        schema_version=RUNTIME_SETTINGS_SCHEMA_VERSION,
-                        updated_at=datetime.now(UTC).isoformat(),
-                    ),
-                    source="persisted",
-                )
-                fd, temp_name = tempfile.mkstemp(
-                    prefix=f".{self.path.name}.",
-                    suffix=".tmp",
-                    dir=str(self.path.parent),
-                )
-                temp_path = Path(temp_name)
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                        json.dump(asdict(rendered), handle, indent=2, sort_keys=True)
-                        handle.write("\n")
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    os.chmod(temp_path, 0o600)
-                    os.replace(temp_path, self.path)
-                    os.chmod(self.path, 0o600)
-                    _fsync_directory(self.path.parent)
-                except Exception:
-                    temp_path.unlink(missing_ok=True)
-                    raise
-                return rendered
+                yield
             finally:
                 unlock(lock_handle)
 
@@ -228,6 +320,7 @@ def apply_runtime_settings(config: AgentConfig, settings: RuntimeSettings) -> Ag
         allow_web=settings.allow_web,
         allow_self_modification=settings.allow_self_modification,
         provider_startup_probe=settings.provider_startup_probe,
+        enable_semantic_orchestration=settings.enable_semantic_orchestration,
         enable_auto_activate_low_risk_deltas=settings.enable_auto_activate_low_risk_deltas,
         enable_auto_skill_materialization=settings.enable_auto_skill_materialization,
         enable_auto_consolidation_shadow=settings.enable_auto_consolidation_shadow,
@@ -258,6 +351,7 @@ def merge_runtime_settings(config: AgentConfig, current: RuntimeSettings, raw: d
         "stream",
         "autonomy_mode",
         "provider_startup_probe",
+        "enable_semantic_orchestration",
         *TOOL_PERMISSION_FIELDS,
     }:
         if key in raw:
@@ -287,6 +381,23 @@ def _mapping_revision(raw: dict[str, Any]) -> str:
     payload["revision"] = None
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _persisted_settings(settings: RuntimeSettings) -> RuntimeSettings:
+    return _finalize_settings(
+        replace(
+            settings,
+            schema_version=RUNTIME_SETTINGS_SCHEMA_VERSION,
+            updated_at=datetime.now(UTC).isoformat(),
+        ),
+        source="persisted",
+    )
+
+
+def _settings_thread_lock(path: Path) -> RLock:
+    key = Path(os.path.abspath(os.fspath(path)))
+    with _SETTINGS_THREAD_LOCKS_GUARD:
+        return _SETTINGS_THREAD_LOCKS.setdefault(key, RLock())
 
 
 def _normalize_settings(settings: RuntimeSettings) -> RuntimeSettings:
@@ -326,6 +437,7 @@ def _normalize_settings(settings: RuntimeSettings) -> RuntimeSettings:
         allow_web=_clean_bool(settings.allow_web),
         allow_self_modification=_clean_bool(settings.allow_self_modification),
         provider_startup_probe=_clean_bool(settings.provider_startup_probe),
+        enable_semantic_orchestration=_clean_bool(settings.enable_semantic_orchestration),
         enable_auto_activate_low_risk_deltas=_clean_bool(settings.enable_auto_activate_low_risk_deltas),
         enable_auto_skill_materialization=_clean_bool(settings.enable_auto_skill_materialization),
         enable_auto_consolidation_shadow=_clean_bool(settings.enable_auto_consolidation_shadow),
@@ -379,15 +491,3 @@ def _clean_int_range(value: object, field: str, *, minimum: int, maximum: int) -
     if parsed < minimum or parsed > maximum:
         raise ValueError(f"{field} must be between {minimum} and {maximum}")
     return parsed
-
-
-def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)

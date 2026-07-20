@@ -19,10 +19,11 @@ INGEST = f"http://127.0.0.1:{PORT}/api/channels/ingest"
 API_AUTH_TOKEN_ENV = os.environ.get("NEST_AGENT_API_AUTH_TOKEN_ENV", "NEST_AGENT_API_TOKEN")
 API_AUTH_TOKEN = os.environ.get(API_AUTH_TOKEN_ENV, "")
 OFFSET_PATH = Path(os.environ.get("KESTREL_TELEGRAM_OFFSET_PATH", str(Path.home() / ".kestrel" / "telegram.offset")))
+STATE_PATH = Path(os.environ.get("NEST_AGENT_STATE_PATH", ".nest/state/agent.db"))
 HEALTH_PATH = Path(
     os.environ.get(
         "KESTREL_TELEGRAM_HEALTH_PATH",
-        str(Path.home() / ".kestrel" / "telegram-poller-health.json"),
+        str(STATE_PATH.parent / "telegram-poller-health.json"),
     )
 )
 ALLOWED_UPDATES = ["message", "edited_message", "callback_query"]

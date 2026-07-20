@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import os
 import platform
+import shutil
 import sqlite3
-import subprocess
+import subprocess  # nosec B404 - fixed Git argv, no shell, bounded timeout
 import zipfile
 from contextlib import closing
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import AgentConfig
-from .event_log import redact_secrets
+from .event_log import read_bounded_jsonl_tail, redact_secrets
 from .product_readiness import build_product_readiness_report
 from .setup_readiness import build_setup_readiness_report
 
@@ -34,6 +35,71 @@ _STATE_TABLES = (
     "behavior_delta_ledger",
     "behavior_delta_activations",
     "behavior_delta_outcomes",
+    "routines",
+    "routine_occurrences",
+)
+_ROUTINE_OCCURRENCE_STATUSES = (
+    "claimed",
+    "running",
+    "completed",
+    "failed",
+    "skipped",
+)
+_EVENT_SAFE_TEXT_FIELDS = frozenset(
+    {
+        "backend",
+        "blocked_reason",
+        "category",
+        "channel",
+        "classification",
+        "code",
+        "decision",
+        "event_type",
+        "finish_reason",
+        "frame_type",
+        "from",
+        "id",
+        "kind",
+        "layer",
+        "method",
+        "model",
+        "provider",
+        "risk",
+        "role",
+        "schedule_kind",
+        "source",
+        "status",
+        "stop_reason",
+        "to",
+        "tool",
+        "tool_name",
+        "transcript_scope",
+        "turn_origin",
+        "type",
+        "validation_status",
+    }
+)
+_EVENT_SAFE_TEXT_FIELD_SUFFIXES = (
+    "_at",
+    "_category",
+    "_code",
+    "_id",
+    "_ids",
+    "_kind",
+    "_layer",
+    "_origin",
+    "_role",
+    "_scope",
+    "_status",
+    "_type",
+)
+_EVENT_SAFE_TEXT_LIST_FIELDS = frozenset(
+    {
+        "active_behavior_deltas",
+        "memory_writes",
+        "similar_lessons",
+        "similar_lessons_used",
+    }
 )
 
 
@@ -79,7 +145,7 @@ def export_support_bundle(
         "redaction": {
             "raw_secret_values": "excluded",
             "environment_variables": "presence_only",
-            "logs": "pattern_redacted_tail_only",
+            "logs": "free_form_text_redacted_metadata_allowlist_tail_only",
         },
         "limits": {"log_tail": _bounded_log_tail(log_tail)},
         "entries": list(entries),
@@ -153,7 +219,12 @@ def _runtime_payload(config: AgentConfig) -> dict[str, Any]:
         },
         "learning_flags": {
             "enable_agentic_cycle": config.enable_agentic_cycle,
+            "enable_semantic_orchestration": config.enable_semantic_orchestration,
             "enable_autonomous_scheduler": config.enable_autonomous_scheduler,
+            "enable_proactive_routines": config.enable_proactive_routines,
+            "routine_poll_interval_seconds": config.routine_poll_interval_seconds,
+            "routine_claim_ttl_seconds": config.routine_claim_ttl_seconds,
+            "max_routines_per_tick": config.max_routines_per_tick,
             "enable_worker_isolation": config.enable_worker_isolation,
             "enable_task_capsules": config.enable_task_capsules,
             "enable_auto_consolidation": config.enable_auto_consolidation,
@@ -196,9 +267,18 @@ def _git_payload(workspace: Path) -> dict[str, Any]:
 
 
 def _run_git(workspace: Path, *args: str) -> dict[str, Any]:
+    git_path = shutil.which("git")
+    if git_path is None:
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "Git executable is unavailable.",
+        }
+    git_executable = str(Path(git_path).expanduser().resolve())
     try:
-        completed = subprocess.run(
-            ["git", *args],
+        # shutil.which resolves the trusted executable; args are fixed internal probes.
+        completed = subprocess.run(  # nosec B603
+            [git_executable, *args],
             cwd=workspace,
             check=False,
             capture_output=True,
@@ -222,18 +302,21 @@ def _state_summary(path: Path) -> dict[str, Any]:
             "exists": False,
             "schema_version": 0,
             "tables": {name: 0 for name in _STATE_TABLES},
+            "routine_summary": _empty_routine_summary(),
         }
     try:
         with closing(sqlite3.connect(resolved.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
             conn.row_factory = sqlite3.Row
             schema_version = _schema_version(conn)
             tables = {name: _table_count(conn, name) for name in _STATE_TABLES}
+            routine_summary = _routine_summary(conn)
     except sqlite3.Error as exc:
         return {
             "path": str(resolved),
             "exists": True,
             "schema_version": 0,
             "tables": {name: 0 for name in _STATE_TABLES},
+            "routine_summary": _empty_routine_summary(),
             "error": str(exc),
         }
     return {
@@ -241,7 +324,66 @@ def _state_summary(path: Path) -> dict[str, Any]:
         "exists": True,
         "schema_version": schema_version,
         "tables": tables,
+        "routine_summary": routine_summary,
     }
+
+
+def _empty_routine_summary() -> dict[str, Any]:
+    return {
+        "enabled_definitions": 0,
+        "occurrences_by_status": {status: 0 for status in _ROUTINE_OCCURRENCE_STATUSES},
+        "expired_claims": 0,
+        "oldest_nonterminal": None,
+    }
+
+
+def _routine_summary(conn: sqlite3.Connection) -> dict[str, Any]:
+    summary = _empty_routine_summary()
+    if _table_exists(conn, "routines"):
+        enabled = conn.execute(
+            "SELECT COUNT(*) AS count FROM routines WHERE enabled = 1 AND deleted_at IS NULL"
+        ).fetchone()
+        summary["enabled_definitions"] = int(enabled["count"]) if enabled is not None else 0
+    if not _table_exists(conn, "routine_occurrences"):
+        return summary
+
+    status_counts = summary["occurrences_by_status"]
+    rows = conn.execute(
+        "SELECT status, COUNT(*) AS count FROM routine_occurrences GROUP BY status"
+    ).fetchall()
+    for row in rows:
+        status = str(row["status"])
+        if status in status_counts:
+            status_counts[status] = int(row["count"])
+
+    now = datetime.now(UTC).isoformat()
+    expired = conn.execute(
+        """
+        SELECT COUNT(*) AS count FROM routine_occurrences
+        WHERE status = 'claimed' AND claim_expires_at IS NOT NULL
+          AND julianday(claim_expires_at) <= julianday(?)
+        """,
+        (now,),
+    ).fetchone()
+    summary["expired_claims"] = int(expired["count"]) if expired is not None else 0
+
+    oldest = conn.execute(
+        """
+        SELECT status, scheduled_for, created_at, updated_at
+        FROM routine_occurrences
+        WHERE status IN ('claimed', 'running')
+        ORDER BY scheduled_for ASC, occurrence_id ASC
+        LIMIT 1
+        """
+    ).fetchone()
+    if oldest is not None:
+        summary["oldest_nonterminal"] = {
+            "status": str(oldest["status"]),
+            "scheduled_for": str(oldest["scheduled_for"]),
+            "created_at": str(oldest["created_at"]),
+            "updated_at": str(oldest["updated_at"]),
+        }
+    return summary
 
 
 def _schema_version(conn: sqlite3.Connection) -> int:
@@ -272,7 +414,7 @@ def _event_tail(path: Path, *, limit: int) -> list[dict[str, Any]]:
     bounded = _bounded_log_tail(limit)
     if bounded <= 0 or not _safe_log_file(path, path.parent):
         return []
-    lines = path.read_text(encoding="utf-8").splitlines()[-bounded:]
+    lines = read_bounded_jsonl_tail(path, limit=bounded)
     events: list[dict[str, Any]] = []
     for index, line in enumerate(lines):
         try:
@@ -281,8 +423,32 @@ def _event_tail(path: Path, *, limit: int) -> list[dict[str, Any]]:
             events.append({"line": index, "error": f"invalid_json: {exc.msg}"})
             continue
         if isinstance(parsed, dict):
-            events.append(parsed)
+            events.append(_sanitize_event_value(parsed))
     return events
+
+
+def _sanitize_event_value(value: Any, *, field_name: str | None = None) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_event_value(item, field_name=str(key))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_event_value(item, field_name=field_name) for item in value]
+    if isinstance(value, str):
+        return value if _is_safe_event_text_field(field_name) else "<redacted>"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return "<redacted>"
+
+
+def _is_safe_event_text_field(field_name: str | None) -> bool:
+    if field_name is None:
+        return False
+    normalized = field_name.strip().lower().replace("-", "_")
+    if normalized in _EVENT_SAFE_TEXT_FIELDS or normalized in _EVENT_SAFE_TEXT_LIST_FIELDS:
+        return True
+    return any(normalized.endswith(suffix) for suffix in _EVENT_SAFE_TEXT_FIELD_SUFFIXES)
 
 
 def _log_files(log_dir: Path) -> list[dict[str, Any]]:

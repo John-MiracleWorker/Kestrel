@@ -5,7 +5,6 @@ import json
 import os
 import re
 import secrets
-import stat
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -16,6 +15,12 @@ from threading import Lock, RLock
 from typing import IO, Any, Protocol, cast
 
 from .file_lock import lock_exclusive, lock_shared, unlock
+from .private_artifacts import (
+    ensure_private_directory,
+    harden_private_file,
+    open_private_file_descriptor,
+    read_private_text,
+)
 from .security_boundary import register_secret_env_names, register_secret_value
 from .state_store import utc_now
 
@@ -46,8 +51,11 @@ class SecretBroker:
     """
 
     def __init__(self, vault_path: Path, *, allowed_env_names: set[str] | None = None) -> None:
-        self.vault_path = vault_path
+        self.vault_path = Path(vault_path)
         self.allowed_env_names = {name.strip() for name in (allowed_env_names or set()) if name.strip()}
+        ensure_private_directory(self.vault_path.parent)
+        with self._vault_lock(exclusive=False):
+            harden_private_file(self.vault_path, missing_ok=True)
         register_secret_env_names(self.allowed_env_names)
 
     def register_allowed_env_names(self, names: set[str]) -> None:
@@ -201,11 +209,10 @@ class SecretBroker:
             return self._read_unlocked()
 
     def _read_unlocked(self) -> dict[str, Any]:
-        if not self.vault_path.exists():
+        raw_text = read_private_text(self.vault_path, missing_ok=True)
+        if raw_text is None:
             return {"secrets": {}}
-        if not stat.S_ISREG(self.vault_path.lstat().st_mode):
-            raise ValueError("Secret vault path must be a regular file and cannot be a symlink.")
-        raw = json.loads(self.vault_path.read_text(encoding="utf-8"))
+        raw = json.loads(raw_text)
         return raw if isinstance(raw, dict) else {"secrets": {}}
 
     def _write(self, data: dict[str, Any]) -> None:
@@ -213,7 +220,8 @@ class SecretBroker:
             self._write_unlocked(data)
 
     def _write_unlocked(self, data: dict[str, Any]) -> None:
-        self.vault_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        ensure_private_directory(self.vault_path.parent)
+        harden_private_file(self.vault_path, missing_ok=True)
         fd, temp_name = tempfile.mkstemp(
             prefix=f".{self.vault_path.name}.",
             suffix=".tmp",
@@ -228,7 +236,7 @@ class SecretBroker:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_path, self.vault_path)
-            os.chmod(self.vault_path, 0o600)
+            harden_private_file(self.vault_path)
             _fsync_directory(self.vault_path.parent)
         except BaseException:
             try:
@@ -240,16 +248,9 @@ class SecretBroker:
 
     @contextmanager
     def _vault_lock(self, *, exclusive: bool) -> Iterator[None]:
-        self.vault_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        ensure_private_directory(self.vault_path.parent)
         lock_path = self.vault_path.with_name(f".{self.vault_path.name}.lock")
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        if lock_path.is_symlink():
-            raise ValueError("Secret vault lock path cannot be a symlink.")
-        fd = os.open(lock_path, flags, 0o600)
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            os.close(fd)
-            raise ValueError("Secret vault lock path must be a regular file.")
-        _chmod_owner_only(fd, lock_path)
+        fd = open_private_file_descriptor(lock_path)
         thread_lock = _thread_lock_for(self.vault_path)
         with thread_lock, os.fdopen(fd, "r+", encoding="utf-8") as lock_handle:
             _lock_handle(lock_handle, exclusive=exclusive)

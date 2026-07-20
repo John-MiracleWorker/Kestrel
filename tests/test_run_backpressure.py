@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, Event, Lock
+from threading import Event, Lock
 from time import monotonic, sleep
 
 import pytest
@@ -86,10 +86,10 @@ def test_admission_setup_failure_releases_capacity_and_terminally_reconciles_run
         skills=SkillManager(config.skills_dir, state),
     )
 
-    def fail_task_creation(**_fields):
+    def fail_task_graph_creation(**_fields):
         raise RuntimeError("injected setup failure")
 
-    monkeypatch.setattr(state, "create_task_node", fail_task_creation)
+    monkeypatch.setattr(state, "create_task_graph_once", fail_task_graph_creation)
     with pytest.raises(RuntimeError, match="injected setup failure"):
         manager.create_run(message="must fail closed", autonomy_mode="manual")
 
@@ -147,7 +147,7 @@ def test_cancelled_run_cancels_descendants_and_rejects_new_work(tmp_path) -> Non
         manager.create_subagent(run_id=run.run_id, profile="worker", goal="too late")
 
 
-def test_concurrent_scheduler_steps_claim_each_task_exactly_once(tmp_path, monkeypatch) -> None:
+def test_concurrent_scheduler_steps_claim_each_task_exactly_once(tmp_path) -> None:
     manager = _manager(tmp_path)
     run = manager.state.create_run(
         run_id="run_scheduler_claim_race",
@@ -166,21 +166,17 @@ def test_concurrent_scheduler_steps_claim_each_task_exactly_once(tmp_path, monke
         status="queued",
         approved=True,
     )
-    original_claim = manager.state.claim_task_node
-    claim_barrier = Barrier(2)
-
-    def synchronized_claim(task_id, **kwargs):
-        claim_barrier.wait(timeout=3)
-        return original_claim(task_id, **kwargs)
-
-    monkeypatch.setattr(manager.state, "claim_task_node", synchronized_claim)
     chat_calls: list[str] = []
     chat_lock = Lock()
+    chat_started = Event()
+    release_chat = Event()
 
     class FakeAgent:
         def chat(self, message, **_kwargs):
             with chat_lock:
                 chat_calls.append(message)
+            chat_started.set()
+            assert release_chat.wait(timeout=3)
             return AgentTurnResult(
                 session_id="session",
                 user_message=message,
@@ -197,7 +193,14 @@ def test_concurrent_scheduler_steps_claim_each_task_exactly_once(tmp_path, monke
     manager._build_agent = lambda _config: FakeAgent()  # type: ignore[method-assign]
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(manager.run_scheduler_step, run.run_id, max_tasks=1) for _ in range(2)]
+        first = pool.submit(manager.run_scheduler_step, run.run_id, max_tasks=1)
+        assert chat_started.wait(timeout=3)
+        second = pool.submit(manager.run_scheduler_step, run.run_id, max_tasks=1)
+        sleep(0.05)
+        assert not second.done()
+        assert manager.state.get_task_node(task.task_id).status == "running"
+        release_chat.set()
+        futures = [first, second]
         results = [future.result(timeout=5) for future in futures]
 
     assert len(chat_calls) == 1

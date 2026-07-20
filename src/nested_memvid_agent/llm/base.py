@@ -23,6 +23,7 @@ class ProviderCapabilities:
     supports_system_messages: bool = True
     max_context_tokens: int | None = None
     token_usage_available: bool = False
+    native_tool_limit: int | None = None
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -33,6 +34,7 @@ class ProviderCapabilities:
             "supports_system_messages": self.supports_system_messages,
             "max_context_tokens": self.max_context_tokens,
             "token_usage_available": self.token_usage_available,
+            "native_tool_limit": self.native_tool_limit,
         }
 
 
@@ -64,6 +66,11 @@ class LLMProvider(ABC):
         yield LLMStreamEvent(type="message_complete", response=response)
 
 
+def _combined_native_tool_limit(primary: int | None, secondary: int | None) -> int | None:
+    limits = [limit for limit in (primary, secondary) if limit is not None]
+    return min(limits) if limits else None
+
+
 class FallbackLLMProvider(LLMProvider):
     """Try a secondary provider only for retryable primary provider failures."""
 
@@ -87,6 +94,10 @@ class FallbackLLMProvider(LLMProvider):
             if primary.max_context_tokens is not None or secondary.max_context_tokens is not None
             else None,
             token_usage_available=primary.token_usage_available and secondary.token_usage_available,
+            native_tool_limit=_combined_native_tool_limit(
+                primary.native_tool_limit,
+                secondary.native_tool_limit,
+            ),
         )
 
     def generate(

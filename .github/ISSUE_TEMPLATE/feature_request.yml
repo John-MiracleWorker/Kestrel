@@ -1,0 +1,55 @@
+name: Feature request
+description: Propose an improvement to Kestrel.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem before prescribing an implementation. Large changes to memory, trust boundaries, persistent formats, or the supported deployment profile should include alternatives and a rollback story.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues, pull requests, and the product roadmap.
+          required: true
+        - label: This request does not contain secrets or private data.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is difficult today, for whom, and why does it matter?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the observable user or operator outcome.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: Include interface sketches, commands, or data flow when useful.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety, memory, and compatibility impact
+      description: Address `.mv2` invariants, approvals, secrets, persistence, migrations, and rollback when relevant.
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Contribution interest
+      options:
+        - I can implement this
+        - I can help test or document this
+        - I am proposing only
+    validations:
+      required: true

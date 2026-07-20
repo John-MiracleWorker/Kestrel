@@ -22,6 +22,13 @@ Run just agent benchmarks with the deterministic mock provider:
 python benchmarks/agent_benchmark.py --provider mock --output benchmark_results/agent.json
 ```
 
+Run the deterministic end-to-end learning release gate:
+
+```bash
+python benchmarks/real_agent_learning_benchmark.py \
+  --output benchmark_results/agent_learning_gate.json
+```
+
 Run agent benchmarks with a real provider:
 
 ```bash
@@ -70,6 +77,20 @@ With `--provider mock`, the benchmark uses pre-programmed mock responses so it r
 **Real-provider mode**
 With a real LLM provider, the benchmark becomes a true capability evaluation. The mock responses are discarded and the agent's actual reasoning and tool selection are measured.
 
+### Agent Learning Gate (`real_agent_learning_benchmark.py`)
+
+This is a deterministic production-path gate, despite the historical filename. It does not seed an
+oracle lesson. Task 1 runs through the normal agentic failure cycle: a mock validation tool fails,
+the runtime persists a `FailureEpisode`, a changed strategy produces a successful validation, and
+the runtime persists a `LessonCard` linked to both failure and validation evidence. Task 2 must
+retrieve that exact lesson as untrusted evidence, apply it, and improve from a fresh-memory control
+failure to treatment success. High-risk mock file/test calls still require exact operator approval.
+
+The command exits nonzero if the evidence/provenance/validation chain, retrieval transfer, expected
+outcomes, or approval checks do not match. Use `scripts/run_live_learning_eval.py` for optional
+real-provider learning evaluation; this deterministic release gate intentionally accepts only the
+mock provider.
+
 ## Interpreting Results
 
 A healthy Kestrel installation should show:
@@ -97,6 +118,7 @@ benchmarks/
   baseline_rag.py            # Pure-Python TF-IDF RAG baseline
   memory_benchmark.py        # Head-to-head memory retrieval benchmark
   agent_benchmark.py         # End-to-end agent task benchmark
+  real_agent_learning_benchmark.py # Production-path learning release gate
   run_all.py                 # Orchestrator
   datasets/
     memory_corpus.py         # Synthetic memory corpora and queries

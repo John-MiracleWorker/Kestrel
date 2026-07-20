@@ -14,12 +14,19 @@ from .capability_policy import parent_resource_digest
 from .channels import ChannelManager
 from .config import AgentConfig
 from .event_bus import RunEventBus
+from .layers import (
+    load_layer_specs,
+    prepare_private_memory_artifacts,
+    prepare_private_runs_root,
+)
 from .llm.model_catalog import DEFAULT_API_KEY_ENVS
 from .mcp_manager import MCPManager
 from .models import MemoryLayer, RetrievalQuery
 from .orchestrator import build_memory_system
 from .plugin_manager import PluginError, PluginManager
 from .promotion_ledger import PromotionLedger
+from .routine_loop import RoutineLoop
+from .routines import RoutineService
 from .run_manager import RunCapacityError, RunManager
 from .runtime_settings import (
     RuntimeSettingsStore,
@@ -30,6 +37,7 @@ from .secret_broker import build_secret_broker
 from .self_profile import (
     SELF_PROFILE_QUERY,
     SELF_PROFILE_SCHEMA,
+    TRUSTED_ONBOARDING_ORIGIN,
     build_onboarding_profile,
     onboarding_record_content,
     onboarding_record_title,
@@ -76,7 +84,26 @@ from .state_store import AgentStateStore, CapabilityConflictError
 
 
 def create_app(config: AgentConfig | None = None) -> Any:
-    """Create the local web/API app for the full Nested MV2 Agent."""
+    """Create the local Kestrel web/API app."""
+
+    construction_cleanup: list[Callable[[], None]] = []
+    try:
+        return _create_app(config, construction_cleanup=construction_cleanup)
+    except BaseException:
+        for cleanup in reversed(construction_cleanup):
+            try:
+                cleanup()
+            except Exception:
+                pass
+        raise
+
+
+def _create_app(
+    config: AgentConfig | None,
+    *,
+    construction_cleanup: list[Callable[[], None]],
+) -> Any:
+    """Assemble an app while exposing acquired resources to the factory guard."""
 
     try:
         fastapi_module = import_module("fastapi")
@@ -115,6 +142,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         )
         from .server_observability_routes import register_observability_routes
         from .server_product_routes import register_product_routes
+        from .server_routine_routes import register_routine_routes
         from .server_runtime_routes import register_runtime_routes
         from .server_secret_routes import register_secret_routes
         from .server_tool_routes import register_tool_routes, tool_invoke_response
@@ -134,6 +162,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
     base_config = config or AgentConfig.from_env()
     runtime_settings_store = RuntimeSettingsStore(default_runtime_settings_path(base_config))
     active_config = apply_runtime_settings(base_config, runtime_settings_store.load(base_config))
+    _prepare_private_runtime_artifacts(active_config)
     secret_broker = build_secret_broker(
         active_config.secret_store_path, backend=active_config.secret_backend
     )
@@ -154,8 +183,32 @@ def create_app(config: AgentConfig | None = None) -> Any:
         skills=skills,
         plugins=plugins,
         secret_resolver=secret_broker.resolve,
+        enforce_single_owner=True,
+        auto_start=False,
     )
+
+    def abort_runtime_construction() -> None:
+        try:
+            runs.shutdown(timeout_seconds=5.0)
+        finally:
+            mcp.shutdown()
+
+    construction_cleanup.append(abort_runtime_construction)
     channels = ChannelManager(active_config, secret_resolver=secret_broker.resolve, run_manager=runs)
+    routine_service = RoutineService(
+        state,
+        runs,
+        claim_ttl_seconds=active_config.routine_claim_ttl_seconds,
+        max_occurrences_per_tick=active_config.max_routines_per_tick,
+    )
+    routine_loop = (
+        RoutineLoop(
+            routine_service,
+            interval_seconds=active_config.routine_poll_interval_seconds,
+        )
+        if active_config.enable_proactive_routines
+        else None
+    )
     secret_broker.register_allowed_env_names(
         _known_secret_env_names(channels.list_channels(), mcp.list_servers())
         | _provider_secret_env_names(active_config)
@@ -233,21 +286,50 @@ def create_app(config: AgentConfig | None = None) -> Any:
     @asynccontextmanager
     async def lifespan(app_instance: Any) -> Any:
         del app_instance
-        if active_config.provider_startup_probe:
-            Thread(
-                target=_probe_provider_health,
-                kwargs={"config": active_config, "secret_resolver": secret_broker.resolve},
-                name="kestrel-provider-startup-probe",
-                daemon=True,
-            ).start()
         try:
+            runs.start()
+            if routine_loop is not None:
+                routine_loop.start()
+            if active_config.provider_startup_probe:
+                Thread(
+                    target=_probe_provider_health,
+                    kwargs={"config": active_config, "secret_resolver": secret_broker.resolve},
+                    name="kestrel-provider-startup-probe",
+                    daemon=True,
+                ).start()
             yield
         finally:
-            channels.close()
-            mcp.shutdown()
+            shutdown_incomplete = False
+            try:
+                loop_stopped = (
+                    routine_loop is None
+                    or routine_loop.close(timeout_seconds=5.0)
+                )
+                if routine_loop is not None and not loop_stopped:
+                    loop_stopped = routine_loop.close(timeout_seconds=1.0)
+                shutdown_incomplete = not loop_stopped
+            except Exception:  # noqa: BLE001 - finish all dependency cleanup before reporting
+                shutdown_incomplete = True
+            try:
+                runs_stopped = runs.shutdown(timeout_seconds=5.0)
+                if not runs_stopped:
+                    runs_stopped = runs.shutdown(timeout_seconds=1.0)
+                shutdown_incomplete = shutdown_incomplete or not runs_stopped
+            except Exception:  # noqa: BLE001 - finish all dependency cleanup before reporting
+                shutdown_incomplete = True
+            try:
+                channels.close()
+            except Exception:  # noqa: BLE001 - MCP cleanup must still run
+                shutdown_incomplete = True
+            try:
+                mcp.shutdown()
+            except Exception:  # noqa: BLE001 - report a fixed, non-secret lifecycle error
+                shutdown_incomplete = True
+            if shutdown_incomplete:
+                raise RuntimeError("runtime_shutdown_incomplete") from None
 
     app = FastAPI(
-        title="Nested MV2 Agent",
+        title="Kestrel",
         lifespan=lifespan,
     )
     app.add_middleware(
@@ -340,14 +422,24 @@ def create_app(config: AgentConfig | None = None) -> Any:
         active_config=lambda: active_config,
         state=state,
         settings_store=runtime_settings_store,
+        validate_config_update=_prepare_private_runtime_artifacts,
         on_config_update=update_active_config,
         secret_broker=secret_broker,
         http_exception=HTTPException,
         runs=runs,
+        routine_loop=routine_loop,
         provider_probe=lambda: _probe_provider_health(
             config=active_config,
             secret_resolver=secret_broker.resolve,
         ),
+    )
+    register_routine_routes(
+        app,
+        active_config=lambda: active_config,
+        state=state,
+        service=routine_service,
+        loop=routine_loop,
+        http_exception=HTTPException,
     )
 
     register_secret_routes(
@@ -462,6 +554,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         state=state,
         events=events,
         runs=runs,
+        routine_loop=routine_loop,
     )
     register_behavior_delta_routes(app, http_exception=HTTPException, ledger=BehaviorDeltaLedger(state))
 
@@ -501,7 +594,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         )
         rows = []
         if execution.success and isinstance(execution.data, dict):
-            raw_rows = execution.data.get("self_memory_hits")
+            raw_rows = execution.data.get("trusted_onboarding_hits")
             rows = raw_rows if isinstance(raw_rows, list) else []
         state_payload = onboarding_state_from_reflection(rows)
         state_payload["reflection"] = execution.data.get("reflection") if isinstance(execution.data, dict) else None
@@ -523,6 +616,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 "locator": "api://self/onboarding",
             },
             session_id="api",
+            trusted_request_origin=TRUSTED_ONBOARDING_ORIGIN,
         )
         return {
             "success": execution.success,
@@ -1063,7 +1157,14 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 raise HTTPException(status_code=404, detail="not_found")
             return FileResponse(web_dist / "index.html")
 
+    construction_cleanup.clear()
     return app
+
+
+def _prepare_private_runtime_artifacts(config: AgentConfig) -> None:
+    specs = load_layer_specs(config.layer_config_path) if config.layer_config_path else None
+    prepare_private_memory_artifacts(config.memory_dir, specs=specs)
+    prepare_private_runs_root(config.memory_dir.parent / "runs")
 
 
 def _resolve_web_dist() -> Path | None:

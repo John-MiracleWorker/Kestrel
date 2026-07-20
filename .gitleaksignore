@@ -1,0 +1,19 @@
+# Intentional synthetic values used to prove redaction boundaries. Fingerprint-scoped
+# ignores keep any other secret-shaped value in the same test files detectable.
+tests/test_learning_architecture_eval.py:generic-api-key:52
+tests/test_learning_architecture_eval.py:generic-api-key:74
+tests/test_routine_loop.py:generic-api-key:168
+tests/test_security_boundary.py:generic-api-key:134
+tests/test_server_routine_routes.py:generic-api-key:499
+tests/test_task_capsule.py:generic-api-key:116
+# Same synthetic capsule-redaction fixture in its committed pre-refactor location.
+ae2bb227c10818a90e81ffd7c8473cca065af8ec:tests/test_task_capsule.py:generic-api-key:108
+# Historical fingerprints for the same intentional redaction-boundary fixtures.
+ae2bb227c10818a90e81ffd7c8473cca065af8ec:tests/test_security_boundary.py:generic-api-key:134
+0777de1287426f072b339bdc064540f382cf3368:tests/test_learning_architecture_eval.py:generic-api-key:52
+0777de1287426f072b339bdc064540f382cf3368:tests/test_learning_architecture_eval.py:generic-api-key:74
+# Deterministic post-rewrite fingerprints for the same historical synthetic fixtures.
+4082624696a3420f263faa83bf63f1f4b66550a1:tests/test_task_capsule.py:generic-api-key:108
+4082624696a3420f263faa83bf63f1f4b66550a1:tests/test_security_boundary.py:generic-api-key:134
+bd646c1352dd95768614b488f0caf1e883395cfc:tests/test_learning_architecture_eval.py:generic-api-key:52
+bd646c1352dd95768614b488f0caf1e883395cfc:tests/test_learning_architecture_eval.py:generic-api-key:74

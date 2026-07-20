@@ -9,7 +9,11 @@ from nested_memvid_agent.validation import GoldenQuestion, RetrievalValidator
 
 
 def test_retrieval_validator_passes_expected_terms(tmp_path: Path) -> None:
-    memory = LayeredMemorySystem.from_backend_factory(tmp_path, InMemoryBackend)
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path,
+        InMemoryBackend,
+        enforce_stable_write_integrity=False,
+    )
     memory.put(
         MemoryRecord(
             title="Memvid model",

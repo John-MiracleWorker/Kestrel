@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a vulnerability privately
+    url: https://github.com/John-MiracleWorker/Kestrel/security/advisories/new
+    about: Send suspected vulnerabilities through GitHub's confidential reporting channel.
+  - name: Contribution guide
+    url: https://github.com/John-MiracleWorker/Kestrel/blob/main/CONTRIBUTING.md
+    about: Read setup, architecture invariants, and validation requirements before contributing.

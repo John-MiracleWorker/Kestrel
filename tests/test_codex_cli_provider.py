@@ -45,6 +45,7 @@ def test_codex_cli_provider_reads_output_last_message(tmp_path: Path, monkeypatc
     assert command[:2] == ["codex", "exec"]
     assert ["--cd", str(tmp_path.resolve())] == command[2:4]
     assert ["--sandbox", "read-only"] == command[4:6]
+    assert "--ignore-user-config" in command
     assert ["--model", "gpt-test"] == command[command.index("--model") : command.index("--model") + 2]
     assert "--ephemeral" in command
     assert command[-1] == "-"
