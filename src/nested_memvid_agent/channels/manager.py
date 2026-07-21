@@ -287,7 +287,11 @@ class ChannelManager:
     ) -> ChannelProcessResult:
         if self.run_manager is None:
             raise ChannelPayloadError("Run manager is required for channel approval prompts.")
-        run = self.run_manager.create_run(message=inbound.text, session_id=inbound.session_id)
+        run = self.run_manager.create_run(
+            message=inbound.text,
+            session_id=inbound.session_id,
+            source=inbound.to_turn_source(),
+        )
         run_id = str(getattr(run, "run_id", "") or "")
         self._start_run_progress_watcher(
             channel,
@@ -750,19 +754,40 @@ class ChannelManager:
     def _apply_max_tool_rounds(self, value: int) -> None:
         next_config = replace(self.config, max_tool_rounds=value)
         if self._runtime_settings_store is not None:
-            from ..runtime_settings import apply_runtime_settings, merge_runtime_settings
+            from ..runtime_settings import RuntimeSettingsConflict
 
-            current = self._runtime_settings_store.load(self.config)
-            saved = self._runtime_settings_store.save(
-                merge_runtime_settings(self.config, current, {"max_tool_rounds": value})
-            )
-            next_config = apply_runtime_settings(self.config, saved)
+            def activate(_previous: AgentConfig, candidate: AgentConfig) -> None:
+                self._activate_runtime_config(candidate)
+
+            conflict: RuntimeSettingsConflict | None = None
+            for _attempt in range(3):
+                current = self._runtime_settings_store.load(self.config)
+                try:
+                    self._runtime_settings_store.transactional_update(
+                        lambda: self.config,
+                        {"max_tool_rounds": value},
+                        expected_revision=current.revision,
+                        activate_config=activate,
+                        rollback_config=self._activate_runtime_config,
+                    )
+                except RuntimeSettingsConflict as exc:
+                    conflict = exc
+                    continue
+                break
+            else:
+                raise conflict or RuntimeSettingsConflict(
+                    "runtime_settings_revision_conflict"
+                )
+        else:
+            self._activate_runtime_config(next_config)
+
+    def _activate_runtime_config(self, next_config: AgentConfig) -> None:
         if self._config_update_handler is not None:
             self._config_update_handler(next_config)
-        else:
-            self.config = next_config
-            if self.run_manager is not None and hasattr(self.run_manager, "config"):
-                self.run_manager.config = next_config
+            return
+        self.config = next_config
+        if self.run_manager is not None and hasattr(self.run_manager, "config"):
+            self.run_manager.config = next_config
 
     def _telegram_admin_result(
         self,
@@ -998,9 +1023,10 @@ class ChannelManager:
     def close(self) -> None:
         with self._agent_lock:
             agent = self._agent
-            self._agent = None
-        if agent is not None:
-            agent.close()
+            if agent is not None:
+                agent.close()
+                if self._agent is agent:
+                    self._agent = None
 
     def _agent_for_hot_path(self) -> NestedMV2Agent:
         if self._agent is None:

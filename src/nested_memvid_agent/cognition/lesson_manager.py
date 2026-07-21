@@ -8,7 +8,7 @@ from typing import Any
 
 from ..diagnosis import FailureClassification
 from ..layers import LayeredMemorySystem
-from ..models import MemoryLayer, RetrievalQuery
+from ..models import EvidenceRef, MemoryLayer, RetrievalQuery
 from ..runtime_models import StrategyProposal, ToolExecution
 from .models import FailureEpisode, LessonCard
 
@@ -36,7 +36,9 @@ class LessonManager:
         failure_text: str,
         k: int = 5,
     ) -> list[dict[str, Any]]:
-        return self._retrieve_lessons_semantic(query=f"{classification.category} {failure_text}", k=k, include_episodic=True)
+        return self._retrieve_lessons_semantic(
+            query=f"{classification.category} {failure_text}", k=k, include_episodic=True
+        )
 
     def record_failure(
         self,
@@ -53,7 +55,9 @@ class LessonManager:
             category=classification.category,
             diagnosis=str(classification.playbook.get("name", classification.category)),
             attempted_strategy=attempted_strategy,
-            similar_lessons_used=tuple(str(hit.get("id") or hit.get("title") or "") for hit in recall_hits if hit),
+            similar_lessons_used=tuple(
+                str(hit.get("id") or hit.get("title") or "") for hit in recall_hits if hit
+            ),
         )
         return episode, self.memory.put(episode.to_memory_record())
 
@@ -64,7 +68,20 @@ class LessonManager:
         validation: ToolExecution,
         strategy: StrategyProposal,
     ) -> tuple[LessonCard, str]:
-        lesson = LessonCard.from_resolution(failure=failure, validation=validation, strategy=strategy)
+        resolved_failure = replace(
+            failure,
+            resolved=True,
+            resolution_summary=strategy.changed_strategy.strip(),
+            validation_evidence=tuple(
+                dict.fromkeys((*failure.validation_evidence, validation.call.id))
+            ),
+        )
+        self.memory.upsert(resolved_failure.to_memory_record())
+        lesson = LessonCard.from_resolution(
+            failure=resolved_failure,
+            validation=validation,
+            strategy=strategy,
+        )
         existing = self.find_existing_lesson(
             category=lesson.failure_category,
             corrected_strategy=lesson.corrected_strategy,
@@ -86,8 +103,45 @@ class LessonManager:
                 confidence=max(existing.confidence, lesson.confidence),
                 updated_at=datetime.now(UTC).isoformat(),
             )
-            return lesson, self.memory.upsert(lesson.to_memory_record())
-        return lesson, self.memory.upsert(lesson.to_memory_record())
+            existing_record = self.memory.get_record(MemoryLayer.PROCEDURAL, existing.id)
+            existing_envelope = (
+                existing_record.metadata.get("stable_write_envelope")
+                if existing_record is not None
+                else None
+            )
+            prior_source_ids = (
+                existing_envelope.get("source_record_ids", [])
+                if isinstance(existing_envelope, dict)
+                else []
+            )
+            source_ids = tuple(
+                dict.fromkeys(
+                    [
+                        *(str(item) for item in prior_source_ids if str(item).strip()),
+                        resolved_failure.failure_id,
+                    ]
+                )
+            )
+            lesson_record = lesson.to_memory_record()
+            lesson_record.evidence.extend(
+                EvidenceRef(source="memory_record", locator=source_id)
+                for source_id in source_ids
+                if not any(ref.locator == source_id for ref in lesson_record.evidence)
+            )
+            return lesson, self.memory.upsert_validated(
+                lesson_record,
+                authority="lesson_resolution",
+                source_record_ids=source_ids,
+            )
+        lesson_record = lesson.to_memory_record()
+        lesson_record.evidence.append(
+            EvidenceRef(source="memory_record", locator=resolved_failure.failure_id)
+        )
+        return lesson, self.memory.upsert_validated(
+            lesson_record,
+            authority="lesson_resolution",
+            source_record_ids=(resolved_failure.failure_id,),
+        )
 
     def find_existing_lesson(
         self,
@@ -98,7 +152,11 @@ class LessonManager:
     ) -> LessonCard | None:
         best: tuple[float, LessonCard] | None = None
         candidates = self._retrieve_lessons_semantic(
-            query=_lesson_query(category=category, corrected_strategy=corrected_strategy, failure_signature=failure_signature),
+            query=_lesson_query(
+                category=category,
+                corrected_strategy=corrected_strategy,
+                failure_signature=failure_signature,
+            ),
             k=10,
             include_episodic=False,
         )
@@ -140,7 +198,11 @@ class LessonManager:
         k: int,
         include_episodic: bool = False,
     ) -> list[dict[str, Any]]:
-        layers = (MemoryLayer.PROCEDURAL, MemoryLayer.EPISODIC) if include_episodic else (MemoryLayer.PROCEDURAL,)
+        layers = (
+            (MemoryLayer.PROCEDURAL, MemoryLayer.EPISODIC)
+            if include_episodic
+            else (MemoryLayer.PROCEDURAL,)
+        )
         hits = self.memory.retrieve(
             RetrievalQuery(
                 query=query,
@@ -193,7 +255,12 @@ class LessonManager:
             schema = str(hit.record.metadata.get("cognition_schema", ""))
             if schema and schema not in {"lesson_card.v1", "failure_episode.v1"}:
                 continue
-            if not schema and hit.record.kind.value not in {"failure", "procedure", "summary", "event"}:
+            if not schema and hit.record.kind.value not in {
+                "failure",
+                "procedure",
+                "summary",
+                "event",
+            }:
                 continue
             rows.append(
                 {

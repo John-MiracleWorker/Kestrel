@@ -47,7 +47,11 @@ nest-agent memory compact --layer episodic --apply --backend memvid --memory-dir
 
 TTL compaction only targets working and episodic layers by default. Stable layers are skipped except for correction-driven tombstones. Automatic compaction is off unless `NEST_AGENT_ENABLE_AUTO_COMPACT=1`; it still runs dry-run unless `NEST_AGENT_AUTO_COMPACT_APPLY=1`.
 
+New working and episodic records receive the configured layer TTL when callers do not provide an earlier explicit expiry. Expired records leave normal retrieval immediately but remain available to inactive/audit retrieval until compaction tombstones them. Each compaction pass processes at most 1,000 oldest candidates and caps its deterministic summary at 12,000 characters; reports expose processed and deferred counts so a backlog is visible and can be drained over repeated passes.
+
 Compaction records `never_retrieved` promotion outcomes for promoted records that are summarized away before any `last_retrieved_at` write-back. Normal retrieval updates `last_retrieved_at` at most once per hour per hit, so this is a coarse operator signal rather than a complete retrieval log.
+
+Results from `memory.search`, `memory.inspect`, `memory.export`, `memory.ledger`, `memory.conflicts`, `context.pack`, and `context.expand` are derived from memory rather than new evidence. Kestrel therefore stores only a hash/size/provenance trace for those tool results, excludes the traces from normal retrieval and context-child expansion, and omits copied payloads from turn summaries. Explicit retrieval with `include_retrieval_artifacts=true` keeps the trace/transcript path auditable. Other tool-result memory is capped at 64,000 characters with a content digest; the run result/capsule remains the full execution record.
 
 ## Promotion Ledger
 
@@ -86,6 +90,10 @@ Hybrid retrieval rank-fuses exact `.mv2` lexical hits with local vector-sidecar 
 
 Local embeddings require the optional `sentence-transformers` dependency, plus `vector.embedding_provider: "local"` and a `vector.index_path` in the layer config. Sidecars are SQLite files stored beside the `.mv2` layers, contain embeddings keyed by `.mv2` record ID and content hash, and do not store raw memory text.
 
+Every `mv2_file` must be a unique, direct filename ending in `.mv2`. Every enabled local `vector.index_path` must likewise be a unique direct filename that does not conflict with a layer container, exact-record artifact, Memvid lock, or another vector database and its WAL/SHM/journal files. Collision checks use Unicode normalization and case folding so a config that is unsafe on default macOS or Windows filesystems is rejected on every host. Absolute paths, directory components, traversal, and duplicate names are rejected before any file is opened or permission is changed.
+
+The deterministic `memory` backend coordinates same-path instances with a shared per-path state/version lock, refreshes stale search indexes before queries, and serializes snapshot seals with an owner-only OS lock. Separate processes merge distinct record IDs under that lock before atomic snapshot replacement, preventing concurrent test/mock runs from silently dropping each other's records.
+
 Inspect and rebuild sidecars with:
 
 ```bash
@@ -97,11 +105,49 @@ Procedural lesson recall asks for hybrid retrieval when local vector settings ar
 
 ## Backup
 
-Stop the server or pause writes first, then copy the complete runtime directory:
+Stop Kestrel first, then create a coherent agent backup:
 
 ```bash
-tar -czf kestrel-backup-$(date +%Y%m%d-%H%M%S).tgz .nest/memory .nest/state .nest/logs .nest/config
+nest-agent backup create \
+  --backend memvid \
+  --memory-dir .nest/memory \
+  --state-path .nest/state/agent.db \
+  --backup-dir .nest/backups/agent
 ```
+
+Backup and restore mutations acquire the primary-runtime ownership lock before
+reading live state and retain it through verification and cleanup. A live server
+therefore causes a deterministic refusal before a snapshot, safety backup, or
+restore staging path is written. For the memory-only commands, pass the active
+`--state-path` whenever it is not the default so the same interlock protects the
+correct runtime.
+
+The agent backup takes a SQLite-consistent control-plane snapshot and checksums
+the six authoritative memory layers together with task capsules, runtime
+configuration, installed skills, and installed plugins. Existing exact-record
+JSON caches may be included to speed a restore, but schema-v2 caches are
+disposable and are rebuilt from digest-verified `.mv2` events on open. It deliberately
+excludes raw Secret Broker values, operational logs, and disposable worker
+worktrees. Back up secrets separately through an encrypted/keychain-appropriate
+process; do not weaken the Secret Broker boundary by copying its raw JSON vault
+into an ordinary archive.
+
+List and verify snapshots before relying on them:
+
+```bash
+nest-agent backup list --backup-dir .nest/backups/agent
+nest-agent backup verify BACKUP_ID --backup-dir .nest/backups/agent
+```
+
+Create and restore responses include `maintenance_warnings`. A
+`retention_prune_failed` warning means the requested backup or restore was already committed and
+fsynced, but cleanup of older snapshots did not finish. Treat the committed outcome as successful,
+inspect the warning, list/verify the retained backups, and retry retention maintenance separately;
+do not repeat a restore on the assumption that it rolled back.
+
+`nest-agent memory backup` remains available for a memory-only snapshot. Use it
+only when intentionally excluding run history, ledgers, task capsules, runtime
+settings, skills, and plugins.
 
 For Docker Compose:
 
@@ -114,15 +160,36 @@ docker compose up -d
 
 ## Restore
 
-Restore the full memory directory and state database together when possible:
+Stop Kestrel, verify the selected snapshot, then restore it explicitly:
 
 ```bash
-tar -xzf kestrel-backup.tgz
-nest-agent memory verify --backend memvid --memory-dir .nest/memory
+nest-agent backup verify BACKUP_ID --backup-dir .nest/backups/agent
+nest-agent backup restore BACKUP_ID \
+  --yes \
+  --backend memvid \
+  --memory-dir .nest/memory \
+  --state-path .nest/state/agent.db \
+  --backup-dir .nest/backups/agent
 nest-agent doctor --backend memvid --memory-dir .nest/memory
 ```
 
-If only `.mv2` files are restored, run a fresh `doctor` and expect run history/state views to be incomplete.
+Restore stages and validates every component before replacement, creates a
+pre-restore safety snapshot, and attempts to roll all changed components back if
+a later component swap fails. If rollback itself fails, the command reports the
+safety-backup ID and preserves unreinstated rollback artifacts for operator
+recovery. If the snapshot used an external layer configuration, restore installs
+it at `.nest/config/layers.json` by default; pass `--layer-config` only to choose
+another target. The target may be absent on a clean host. When an older or custom
+layout stored the active `layers.json` inside the memory directory, a default
+clean-host restore also materializes that checksummed file at the external target
+so custom `.mv2` filenames remain usable. Secret Broker values are preserved
+from the live installation rather than restored from the snapshot.
+
+If only schema-v2 `.mv2` files are restored with `nest-agent memory restore`,
+Kestrel rebuilds exact-record caches on open. Run a fresh `doctor` and expect run
+history, learning ledgers, capsules, configuration, and extension views to be
+incomplete. Preserve a legacy version-one records cache until its first writable
+open completes the canonical-envelope migration.
 
 ## Migration
 
@@ -134,7 +201,9 @@ cp .nest/memory/*.mv2 /new/kestrel/memory/
 nest-agent memory verify --backend memvid --memory-dir /new/kestrel/memory
 ```
 
-Never call `create(path)` on an existing `.mv2` file. The backend must use existing files through the safe open/use path.
+Copy the matching `.mv2.records.json` too only when the source is a legacy,
+not-yet-migrated container. Never call `create(path)` on an existing `.mv2` file.
+The backend must use existing files through the safe open/use path.
 
 ## Retention Notes
 
@@ -146,11 +215,14 @@ Working memory can be compacted or promoted through the nested learning pipeline
 
 Stable layers must use paths that preserve validation, provenance, confidence, and approval metadata:
 
-- Use `memory.learn` for validated semantic/procedural promotion.
+- Use `memory.learn` for validated semantic/procedural promotion. It cannot write policy memory.
+- Use approval-gated `memory.policy_promote` for policy promotion. First call it with `stage_proposal=true` to create the exact episodic proposal. Run `test.run`, `lint.run`, `repair.validate` (or `repair.orchestrate_validate`), and `repair.review` with that proposal ID as `subject_record_id`; collect at least five distinct authenticated receipt IDs in `task_refs`. A separately approved promotion call must name the proposal as `source_record_id`. Raw repair artifact locators are audit evidence only and cannot be rematerialized to authorize a later policy claim.
 - Use `self.remember` for validated Soul/self memory.
 - Use `memory.correct` to correct existing stable records without overwriting history.
 - Use approval-gated `memory.import` or an admin path for migrations and bulk restoration.
 
-Policy writes are stricter than other stable writes. They remain disabled unless `allow_policy_writes` is explicitly enabled, and even then direct `memory.write` does not write policy records; use the nested-learning or admin path so policy evidence, repeat count, explicit instruction, and approval gates stay intact.
+Policy writes are stricter than other stable writes. They remain disabled unless `allow_policy_writes` is explicitly enabled, and even then direct `memory.write`, `memory.learn`, and `memory.consolidate` do not write policy records. Both proposal staging and final `memory.policy_promote` execution require owner approval for their exact arguments. Final evidence receipts are HMAC-authenticated, bound to the proposal and current run, and checked against their declared objective bucket; repair/review receipts additionally retain signed disk-artifact backing. The final approval attestation is cross-checked against durable control-plane state before the record can receive system-role priority. Imported or legacy policy-shaped records remain untrusted recall data unless that check succeeds.
+
+Soul onboarding has a matching prompt-trust boundary. Only the internal onboarding route can add authenticated onboarding provenance. Only its fixed persona preset may affect system-role voice; display names, working style, goals, interests, and communication notes are bounded JSON at user-role priority. A caller cannot obtain system priority by passing `user_confirmed` or forged onboarding source strings to `self.remember`.
 
 Near-miss promotions use `promotion_status: provisional`. Provisional records are visible to retrieval, have half retention, and cannot be promoted further until later full-threshold evidence confirms them.

@@ -20,8 +20,14 @@ from nested_memvid_agent.llm.ollama_provider import OllamaNativeProvider
 from nested_memvid_agent.llm.openai_compatible_provider import OpenAICompatibleProvider
 from nested_memvid_agent.llm.openai_provider import OpenAIResponsesProvider
 from nested_memvid_agent.llm.parser import ControlMessageError, parse_agent_response
-from nested_memvid_agent.llm.resilience import ResilientLLMProvider
-from nested_memvid_agent.runtime_models import ChatMessage, LLMOptions, LLMResponse, ToolSpec
+from nested_memvid_agent.llm.resilience import ResilientLLMProvider, classify_provider_error
+from nested_memvid_agent.runtime_models import (
+    ChatMessage,
+    LLMOptions,
+    LLMResponse,
+    ToolCall,
+    ToolSpec,
+)
 
 
 class RecordingProvider(LLMProvider):
@@ -52,6 +58,7 @@ def test_provider_capabilities_have_serializable_metadata() -> None:
         supports_system_messages=True,
         max_context_tokens=8192,
         token_usage_available=True,
+        native_tool_limit=12,
     )
 
     assert caps.to_payload() == {
@@ -62,6 +69,7 @@ def test_provider_capabilities_have_serializable_metadata() -> None:
         "supports_system_messages": True,
         "max_context_tokens": 8192,
         "token_usage_available": True,
+        "native_tool_limit": 12,
     }
 
 
@@ -164,6 +172,56 @@ def test_factory_builds_provider_parity_aliases() -> None:
     assert isinstance(gemini.inner, GeminiProvider)
 
 
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        ("http://127.0.0.1:11434", "http://127.0.0.1:11434/v1"),
+        ("http://127.0.0.1:11434/", "http://127.0.0.1:11434/v1"),
+        ("http://[::1]:11434", "http://[::1]:11434/v1"),
+        ("http://127.0.0.1:11434/v1", "http://127.0.0.1:11434/v1"),
+        ("https://proxy.example/ollama/v1", "https://proxy.example/ollama/v1"),
+    ],
+)
+def test_factory_normalizes_host_only_ollama_base_url(configured: str, expected: str) -> None:
+    provider = build_llm_provider(
+        AgentConfig(provider="ollama", model="qwen3:4b", base_url=configured)
+    )
+
+    assert isinstance(provider, ResilientLLMProvider)
+    assert isinstance(provider.inner, OpenAICompatibleProvider)
+    assert provider.inner.base_url == expected
+
+
+def test_provider_404_is_non_retryable_configuration_failure() -> None:
+    error = classify_provider_error(ProviderError("404 page not found", code="NotFoundError", retryable=True))
+
+    assert error.code == "invalid_request"
+    assert error.retryable is False
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "file:///tmp/provider.sock",
+        "ftp://provider.example/v1",
+        "localhost:1234/v1",
+    ],
+)
+def test_model_catalog_rejects_non_http_provider_base_urls(base_url: str) -> None:
+    catalog = model_catalog_for_provider(
+        AgentConfig(
+            provider="openai-compatible",
+            model="local-model",
+            base_url=base_url,
+        ),
+        "openai-compatible",
+    )
+
+    assert catalog.ok is False
+    assert catalog.source == "fallback"
+    assert "http:// or https://" in str(catalog.error)
+
+
 def test_model_catalog_returns_static_models_for_mock() -> None:
     catalog = model_catalog_for_provider(AgentConfig(), "mock")
 
@@ -193,6 +251,30 @@ def test_model_catalog_fetches_openai_compatible_models(monkeypatch: pytest.Monk
     assert catalog.ok is True
     assert catalog.models == ("local-a", "local-b")
     assert calls["url"] == "http://127.0.0.1:1234/v1/models"
+
+
+def test_model_catalog_normalizes_host_only_ollama_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, Any] = {}
+
+    def fake_fetch_json(url: str, **kwargs: Any) -> Any:
+        calls["url"] = url
+        calls["kwargs"] = kwargs
+        return {"models": [{"name": "qwen3:4b"}]}
+
+    monkeypatch.setattr("nested_memvid_agent.llm.model_catalog._fetch_json", fake_fetch_json)
+    catalog = model_catalog_for_provider(
+        AgentConfig(
+            provider="ollama",
+            model="qwen3:4b",
+            base_url="http://127.0.0.1:11434",
+        ),
+        "ollama",
+    )
+
+    assert catalog.ok is True
+    assert catalog.models == ("qwen3:4b",)
+    assert catalog.base_url == "http://127.0.0.1:11434/v1"
+    assert calls["url"] == "http://127.0.0.1:11434/v1/models"
 
 
 def test_model_catalog_fetches_deepseek_models(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -415,6 +497,85 @@ def test_openai_compatible_provider_normalizes_native_tool_calls(monkeypatch: py
     assert response.usage == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
 
 
+def test_openai_compatible_provider_preserves_native_tool_call_result_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, Any] = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs: Any) -> Any:
+            calls["request"] = kwargs
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content="done", tool_calls=[]),
+                    )
+                ]
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.llm.openai_compatible_provider.import_module",
+        lambda name: SimpleNamespace(OpenAI=FakeOpenAI),
+    )
+    provider = OpenAICompatibleProvider(
+        model="local-model",
+        base_url="http://127.0.0.1:1234/v1",
+        api_key="local-key",
+    )
+    call = ToolCall(
+        name="memory.search",
+        arguments={"query": "continuity", "k": 1},
+        id="call_continuity",
+    )
+
+    response = provider.generate(
+        [
+            ChatMessage(role="user", content="search"),
+            ChatMessage(role="assistant", content="", tool_calls=(call,)),
+            ChatMessage(
+                role="tool",
+                content='{"count":1}',
+                name="memory.search",
+                tool_call_id=call.id,
+            ),
+        ],
+        tools=[
+            ToolSpec(
+                name="memory.search",
+                description="Search",
+                parameters={"type": "object", "properties": {}},
+            )
+        ],
+    )
+
+    assert response.content == "done"
+    assert calls["request"]["messages"][-2] == {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_continuity",
+                "type": "function",
+                "function": {
+                    "name": "memory.search",
+                    "arguments": '{"k":1,"query":"continuity"}',
+                },
+            }
+        ],
+    }
+    assert calls["request"]["messages"][-1] == {
+        "role": "tool",
+        "content": '{"count":1}',
+        "tool_call_id": "call_continuity",
+    }
+
+
 def test_ollama_native_provider_uses_chat_api(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: dict[str, Any] = {}
 
@@ -465,6 +626,86 @@ def test_ollama_native_provider_uses_chat_api(monkeypatch: pytest.MonkeyPatch) -
     assert response.usage == {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "file:///tmp/ollama.sock",
+        "ftp://ollama.example/api",
+        "ollama.example/api",
+        "https://user:password@ollama.example/api",
+    ],
+)
+def test_ollama_native_provider_rejects_unsafe_base_urls(base_url: str) -> None:
+    with pytest.raises(ValueError, match="Provider URL"):
+        OllamaNativeProvider(model="cloud-model", base_url=base_url)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://localhost:11434/api",
+        "http://127.0.0.1:11434/api",
+        "http://[::1]:11434/api",
+    ],
+)
+def test_ollama_native_provider_accepts_local_http_base_urls(base_url: str) -> None:
+    provider = OllamaNativeProvider(model="local-model", base_url=base_url)
+
+    assert provider.base_url == base_url
+
+
+def test_ollama_native_provider_preserves_native_tool_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, Any] = {}
+
+    def fake_post_json(url: str, payload: dict[str, Any], **kwargs: Any) -> Any:
+        del url, kwargs
+        calls["payload"] = payload
+        return {"message": {"role": "assistant", "content": "done"}}
+
+    monkeypatch.setattr("nested_memvid_agent.llm.ollama_provider._post_json", fake_post_json)
+    provider = OllamaNativeProvider(model="cloud-model", api_key="cloud-key")
+    call = ToolCall(name="memory.search", arguments={"query": "needle"}, id="ollama-pair")
+
+    response = provider.generate(
+        [
+            ChatMessage(role="user", content="search"),
+            ChatMessage(role="assistant", content="", tool_calls=(call,)),
+            ChatMessage(
+                role="tool",
+                content='{"count":1}',
+                name="memory.search",
+                tool_call_id=call.id,
+            ),
+        ],
+        tools=[],
+    )
+
+    assert response.content == "done"
+    assert calls["payload"]["messages"][-2:] == [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "ollama-pair",
+                    "type": "function",
+                    "function": {
+                        "name": "memory.search",
+                        "arguments": {"query": "needle"},
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": '{"count":1}',
+            "tool_name": "memory.search",
+        },
+    ]
+
+
 def test_anthropic_provider_normalizes_tool_use(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeMessages:
         def create(self, **kwargs: Any) -> Any:
@@ -504,6 +745,71 @@ def test_anthropic_provider_normalizes_tool_use(monkeypatch: pytest.MonkeyPatch)
     assert response.tool_calls[0].id == "toolu_123"
     assert response.tool_calls[0].arguments == {"query": "anthropic"}
     assert response.finish_reason == "tool_use"
+
+
+def test_anthropic_provider_preserves_native_tool_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, Any] = {}
+
+    class FakeMessages:
+        def create(self, **kwargs: Any) -> Any:
+            calls["request"] = kwargs
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="done")],
+                stop_reason="end_turn",
+            )
+
+    class FakeAnthropic:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+            self.messages = FakeMessages()
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.llm.anthropic_provider.import_module",
+        lambda name: SimpleNamespace(Anthropic=FakeAnthropic),
+    )
+    provider = AnthropicMessagesProvider(model="claude-test", api_key="test-key")
+    call = ToolCall(name="memory.search", arguments={"query": "needle"}, id="toolu_pair")
+
+    response = provider.generate(
+        [
+            ChatMessage(role="user", content="search"),
+            ChatMessage(role="assistant", content="", tool_calls=(call,)),
+            ChatMessage(
+                role="tool",
+                content='{"count":1}',
+                name="memory.search",
+                tool_call_id=call.id,
+            ),
+        ],
+        tools=[],
+    )
+
+    assert response.content == "done"
+    assert calls["request"]["messages"][-2:] == [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_pair",
+                    "name": "memory.search",
+                    "input": {"query": "needle"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_pair",
+                    "content": '{"count":1}',
+                }
+            ],
+        },
+    ]
 
 
 def test_anthropic_provider_streams_tokens_and_final_tool_use(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -604,6 +910,73 @@ def test_gemini_provider_normalizes_function_calls(monkeypatch: pytest.MonkeyPat
     assert response.tool_calls[0].name == "memory.search"
     assert response.tool_calls[0].arguments == {"query": "gemini"}
     assert response.usage == {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
+
+
+def test_gemini_provider_preserves_native_tool_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, Any] = {}
+
+    class FakeModels:
+        def generate_content(self, **kwargs: Any) -> Any:
+            calls["request"] = kwargs
+            return SimpleNamespace(
+                text="done",
+                function_calls=[],
+                candidates=[SimpleNamespace(finish_reason="STOP")],
+            )
+
+    class FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+            self.models = FakeModels()
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.llm.gemini_provider.import_module",
+        lambda name: SimpleNamespace(Client=FakeClient),
+    )
+    provider = GeminiProvider(model="gemini-test", api_key="test-key")
+    call = ToolCall(name="memory.search", arguments={"query": "needle"}, id="gemini-pair")
+
+    response = provider.generate(
+        [
+            ChatMessage(role="user", content="search"),
+            ChatMessage(role="assistant", content="", tool_calls=(call,)),
+            ChatMessage(
+                role="tool",
+                content='{"count":1}',
+                name="memory.search",
+                tool_call_id=call.id,
+            ),
+        ],
+        tools=[],
+    )
+
+    assert response.content == "done"
+    assert calls["request"]["contents"][-2:] == [
+        {
+            "role": "model",
+            "parts": [
+                {
+                    "function_call": {
+                        "name": "memory.search",
+                        "args": {"query": "needle"},
+                    }
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "parts": [
+                {
+                    "function_response": {
+                        "name": "memory.search",
+                        "response": {"output": '{"count":1}'},
+                    }
+                }
+            ],
+        },
+    ]
 
 
 def test_gemini_provider_streams_tokens_and_function_calls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -712,6 +1085,58 @@ def test_openai_responses_provider_normalizes_native_tool_calls(monkeypatch: pyt
     assert response.finish_reason == "completed"
     assert calls["request"]["tools"][0]["type"] == "function"
     assert calls["request"]["tools"][0]["name"] == "memory.search"
+
+
+def test_openai_responses_provider_preserves_native_tool_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, Any] = {}
+
+    class FakeResponses:
+        def create(self, **kwargs: Any) -> Any:
+            calls["request"] = kwargs
+            return SimpleNamespace(output_text="done", output=[], status="completed")
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+            self.responses = FakeResponses()
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.llm.openai_provider.import_module",
+        lambda name: SimpleNamespace(OpenAI=FakeOpenAI),
+    )
+    provider = OpenAIResponsesProvider(model="gpt-test", api_key="test-key")
+    call = ToolCall(name="memory.search", arguments={"query": "needle"}, id="call_response_pair")
+
+    response = provider.generate(
+        [
+            ChatMessage(role="user", content="search"),
+            ChatMessage(role="assistant", content="", tool_calls=(call,)),
+            ChatMessage(
+                role="tool",
+                content='{"count":1}',
+                name="memory.search",
+                tool_call_id=call.id,
+            ),
+        ],
+        tools=[],
+    )
+
+    assert response.content == "done"
+    assert calls["request"]["input"][-2:] == [
+        {
+            "type": "function_call",
+            "call_id": "call_response_pair",
+            "name": "memory.search",
+            "arguments": '{"query":"needle"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_response_pair",
+            "output": '{"count":1}',
+        },
+    ]
 
 
 def test_openai_responses_provider_keeps_json_envelope_fallback(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,12 +1,13 @@
+import os
 import sys
+
 sys.path.insert(0, "src")
 
-import os
-os.environ.setdefault("OLLAMA_API_KEY", os.getenv("OLLAMA_API_KEY", ""))
+from nested_memvid_agent.config import AgentConfig  # noqa: E402
+from nested_memvid_agent.llm.factory import build_llm_provider  # noqa: E402
+from nested_memvid_agent.runtime_models import ChatMessage  # noqa: E402
 
-from nested_memvid_agent.config import AgentConfig
-from nested_memvid_agent.llm.factory import build_llm_provider
-from nested_memvid_agent.runtime_models import ChatMessage
+os.environ.setdefault("OLLAMA_API_KEY", os.getenv("OLLAMA_API_KEY", ""))
 
 config = AgentConfig(
     provider="ollama-cloud",

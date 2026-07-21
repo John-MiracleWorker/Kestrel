@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+import json
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from difflib import SequenceMatcher
+from hashlib import sha256
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -11,6 +13,34 @@ from .layers import DEFAULT_LAYER_SPECS, LayerSpec
 from .models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord
 
 LearningAction = Literal["reject", "write", "promote", "promote_provisional"]
+ValidationStatus = Literal[
+    "unresolved",
+    "runtime_validated",
+    "human_confirmed",
+    "operator_approved",
+]
+
+STABLE_MEMORY_LAYERS = frozenset(
+    {
+        MemoryLayer.SEMANTIC,
+        MemoryLayer.PROCEDURAL,
+        MemoryLayer.SELF,
+        MemoryLayer.POLICY,
+    }
+)
+DIRECT_WRITE_LAYERS = frozenset({MemoryLayer.WORKING, MemoryLayer.EPISODIC})
+_RESOLVED_VALIDATION_STATUSES = frozenset(
+    {"runtime_validated", "human_confirmed", "operator_approved"}
+)
+_EVIDENCE_RESOLUTION_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class _EvidenceResolution:
+    status: ValidationStatus
+    artifact_ids: tuple[str, ...]
+    evidence_digest: str
+    token: object = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -56,7 +86,9 @@ class OptimizerTrace:
             "surprise": round(self.surprise, 4),
             "validation_score": round(self.validation_score, 4),
             "repeat_count": self.repeat_count,
-            "compression_ratio": None if self.compression_ratio is None else round(self.compression_ratio, 4),
+            "compression_ratio": None
+            if self.compression_ratio is None
+            else round(self.compression_ratio, 4),
             "confidence_delta": round(self.confidence_delta, 4),
             "confidence_delta_kind": self.confidence_delta_kind,
             "effective_confidence": round(self.effective_confidence, 4),
@@ -75,6 +107,12 @@ class ValidationEvidence:
     human_explicit: bool = False
     legacy_raw_score: bool = False
     source_evidence_chars: int | None = None
+    validation_status: ValidationStatus = "unresolved"
+    _resolution: _EvidenceResolution | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def to_metadata(self) -> dict[str, object]:
         return {
@@ -86,14 +124,35 @@ class ValidationEvidence:
             "human_explicit": self.human_explicit,
             "legacy_raw_score": self.legacy_raw_score,
             "source_evidence_chars": self.source_evidence_chars,
+            "validation_status": self.validation_status,
+            "resolved": validation_evidence_is_resolved(self),
+            "repeat_observation_count": validation_repeat_count(self),
+            "resolution_artifact_ids": list(self._resolution.artifact_ids)
+            if validation_evidence_is_resolved(self) and self._resolution is not None
+            else [],
+            "resolution_digest": self._resolution.evidence_digest
+            if validation_evidence_is_resolved(self) and self._resolution is not None
+            else None,
             "computed_score": compute_validation_score(self),
         }
 
     def all_refs(self) -> tuple[EvidenceRef, ...]:
-        return self.test_refs + self.lint_refs + self.repair_refs + self.review_refs + self.task_refs
+        return (
+            self.test_refs + self.lint_refs + self.repair_refs + self.review_refs + self.task_refs
+        )
 
 
 def compute_validation_score(evidence: ValidationEvidence) -> float:
+    if (
+        evidence.validation_status == "human_confirmed"
+        and evidence.human_explicit
+        and evidence.task_refs
+        and validation_evidence_is_resolved(evidence)
+    ):
+        # A trusted caller resolved a direct user/operator confirmation.  The
+        # public JSON parser never grants this status from caller-controlled
+        # strings, so it is safe to treat as a fully validated preference/fact.
+        return 1.0
     objective_buckets = (
         evidence.test_refs,
         evidence.lint_refs,
@@ -103,6 +162,106 @@ def compute_validation_score(evidence: ValidationEvidence) -> float:
     objective_score = sum(1 for refs in objective_buckets if refs) / len(objective_buckets)
     human_bonus = 0.05 if evidence.human_explicit and objective_score > 0 else 0.0
     return round(min(objective_score + human_bonus, 1.0), 4)
+
+
+def validation_evidence_is_resolved(evidence: ValidationEvidence | None) -> bool:
+    """Return whether structured evidence was resolved by a trusted runtime path.
+
+    Merely supplying plausible ``source``/``locator`` strings is deliberately
+    insufficient.  Public parsers leave evidence unresolved; trusted runtime
+    code must resolve it after checking the underlying artifact or approval.
+    """
+
+    if evidence is None or evidence.legacy_raw_score:
+        return False
+    resolution = evidence._resolution
+    if (
+        resolution is None
+        or resolution.token is not _EVIDENCE_RESOLUTION_TOKEN
+        or resolution.status != evidence.validation_status
+        or resolution.status not in _RESOLVED_VALIDATION_STATUSES
+        or resolution.evidence_digest != _validation_evidence_digest(evidence)
+    ):
+        return False
+    refs = evidence.all_refs()
+    locators = {ref.locator.strip() for ref in refs if ref.locator.strip()}
+    return (
+        bool(refs)
+        and bool(resolution.artifact_ids)
+        and set(resolution.artifact_ids).issubset(locators)
+        and all(ref.source.strip() and ref.locator.strip() for ref in refs)
+    )
+
+
+def resolve_validation_evidence(
+    evidence: ValidationEvidence,
+    *,
+    status: ValidationStatus,
+    artifact_ids: tuple[str, ...],
+) -> ValidationEvidence:
+    """Bind already-verified runtime artifacts to structured evidence.
+
+    Callers must first authenticate every supplied artifact against durable
+    runtime state.  The returned capability cannot be reconstructed through
+    JSON/dataclass status fields alone and is invalidated if any evidence ref
+    changes afterward.
+    """
+
+    normalized_ids = tuple(
+        dict.fromkeys(str(item).strip() for item in artifact_ids if str(item).strip())
+    )
+    if status not in _RESOLVED_VALIDATION_STATUSES or not normalized_ids:
+        raise ValueError("Resolved validation evidence requires trusted artifact IDs.")
+    refs = evidence.all_refs()
+    locators = {ref.locator.strip() for ref in refs if ref.locator.strip()}
+    if not set(normalized_ids).issubset(locators):
+        raise ValueError("Resolved artifact IDs must be present in validation evidence refs.")
+    prepared = replace(evidence, validation_status=status, _resolution=None)
+    return replace(
+        prepared,
+        _resolution=_EvidenceResolution(
+            status=status,
+            artifact_ids=normalized_ids,
+            evidence_digest=_validation_evidence_digest(prepared),
+            token=_EVIDENCE_RESOLUTION_TOKEN,
+        ),
+    )
+
+
+def validation_repeat_count(evidence: ValidationEvidence | None) -> int:
+    """Count independently identified task observations supporting a promotion."""
+
+    if evidence is None or not validation_evidence_is_resolved(evidence):
+        return 0
+    return len(
+        {
+            (ref.source.strip(), ref.locator.strip())
+            for ref in evidence.task_refs
+            if ref.source.strip() and ref.locator.strip()
+        }
+    )
+
+
+def direct_memory_write_allowed(layer: MemoryLayer) -> bool:
+    """Public/manual direct writes are limited to volatile/audit layers."""
+
+    return layer in DIRECT_WRITE_LAYERS
+
+
+def _validation_evidence_digest(evidence: ValidationEvidence) -> str:
+    payload = {
+        "test_refs": _ref_labels(evidence.test_refs),
+        "lint_refs": _ref_labels(evidence.lint_refs),
+        "repair_refs": _ref_labels(evidence.repair_refs),
+        "review_refs": _ref_labels(evidence.review_refs),
+        "task_refs": _ref_labels(evidence.task_refs),
+        "human_explicit": evidence.human_explicit,
+        "legacy_raw_score": evidence.legacy_raw_score,
+        "source_evidence_chars": evidence.source_evidence_chars,
+        "validation_status": evidence.validation_status,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + sha256(encoded.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -154,7 +313,10 @@ class LearningDecision:
 
     @property
     def accepted(self) -> bool:
-        return self.action in {"write", "promote", "promote_provisional"} and self.target_layer is not None
+        return (
+            self.action in {"write", "promote", "promote_provisional"}
+            and self.target_layer is not None
+        )
 
     def to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -252,7 +414,9 @@ class NestedLearningKernel:
         self.memory = memory
         self.router = router
 
-    def decide(self, signal: LearningSignal, *, action: LearningAction = "write") -> LearningDecision:
+    def decide(
+        self, signal: LearningSignal, *, action: LearningAction = "write"
+    ) -> LearningDecision:
         target_layer, reason = self._target(signal)
         decision_action = "promote_provisional" if _is_provisional_reason(reason) else action
         requested_or_target = signal.requested_target_layer or target_layer
@@ -278,7 +442,10 @@ class NestedLearningKernel:
             target_kind=_target_kind(signal.kind, target_layer),
             reason=reason,
             confidence=trace.effective_confidence,
-            importance=max(signal.importance, 0.65 if target_layer != MemoryLayer.WORKING else signal.importance),
+            importance=max(
+                signal.importance,
+                0.65 if target_layer != MemoryLayer.WORKING else signal.importance,
+            ),
             flow=flow,
             optimizer_trace=trace,
             promotion_requirements=requirements,
@@ -289,7 +456,8 @@ class NestedLearningKernel:
         self,
         record: MemoryRecord,
         *,
-        validation_score: float,
+        validation_score: float | None,
+        validation_evidence: ValidationEvidence | None = None,
         repeat_count: int = 1,
         explicit_instruction: bool = False,
     ) -> LearningDecision:
@@ -300,8 +468,8 @@ class NestedLearningKernel:
             source_layer=record.layer,
             confidence=record.confidence,
             importance=record.importance,
-            validation_score=validation_score,
-            validation_evidence=ValidationEvidence(legacy_raw_score=True) if validation_score is None else None,
+            validation_score=None if validation_evidence is not None else validation_score,
+            validation_evidence=validation_evidence,
             repeat_count=repeat_count,
             explicit_instruction=explicit_instruction,
             source="consolidator",
@@ -325,7 +493,9 @@ class NestedLearningKernel:
             promotion_status = "provisional"
             confidence = max(target_spec.min_write_confidence, decision.confidence * 0.8)
             expires_at = now + timedelta(days=max(target_spec.retention_days * 0.5, 0.0))
-        evidence = [EvidenceRef(source=signal.source, locator=signal.locator, quote=decision.reason)]
+        evidence = [
+            EvidenceRef(source=signal.source, locator=signal.locator, quote=decision.reason)
+        ]
         if signal.validation_evidence is not None:
             evidence.extend(signal.validation_evidence.all_refs())
             validation_evidence_metadata = signal.validation_evidence.to_metadata()
@@ -352,7 +522,7 @@ class NestedLearningKernel:
             "validation_method": "nested_learning_kernel",
             "validation_score": signal.computed_validation_score,
             "validation_evidence": validation_evidence_metadata,
-            "repeat_count": signal.repeat_count,
+            "repeat_count": _effective_repeat_count(signal, target_layer),
             "explicit_instruction": signal.explicit_instruction,
             "source_layer": signal.source_layer.value,
             "promotion_id": uuid4().hex,
@@ -383,64 +553,117 @@ class NestedLearningKernel:
             and str((signal.metadata or {}).get("promotion_status", "")) == "provisional"
         ):
             return None, "Cannot promote from provisional record; await confirmation evidence."
-        if signal.source_layer == MemoryLayer.WORKING and score < _provisional_threshold(episodic_spec):
+        if signal.source_layer == MemoryLayer.WORKING and score < _provisional_threshold(
+            episodic_spec
+        ):
             return None, "Rejected: below provisional gate."
 
         if signal.requested_target_layer is not None:
+            integrity_rejection = _stable_integrity_rejection(signal, signal.requested_target_layer)
+            if integrity_rejection is not None:
+                return None, integrity_rejection
             allowed, reason = self._requested_target_allowed(signal, signal.requested_target_layer)
             return (signal.requested_target_layer, reason) if allowed else (None, reason)
 
         if signal.source_layer == MemoryLayer.WORKING:
             if score >= episodic_spec.promotion_threshold:
-                return MemoryLayer.EPISODIC, "Working context survived validation and became an episodic event."
-            if score >= _provisional_threshold(episodic_spec) and signal.repeat_count >= episodic_spec.min_repeat_count_for_promotion:
-                return MemoryLayer.EPISODIC, "Provisional: working context nearly cleared the episodic gate."
+                return (
+                    MemoryLayer.EPISODIC,
+                    "Working context survived validation and became an episodic event.",
+                )
+            if (
+                score >= _provisional_threshold(episodic_spec)
+                and signal.repeat_count >= episodic_spec.min_repeat_count_for_promotion
+            ):
+                return (
+                    MemoryLayer.EPISODIC,
+                    "Provisional: working context nearly cleared the episodic gate.",
+                )
             return None, "Rejected: below provisional gate."
 
         if signal.source_layer == MemoryLayer.EPISODIC:
-            if signal.kind == MemoryKind.FACT and str((signal.metadata or {}).get("self_schema", "")).strip():
+            integrity_rejection = _stable_integrity_rejection(signal, MemoryLayer.SEMANTIC)
+            if integrity_rejection is not None:
+                return None, integrity_rejection
+            if (
+                signal.kind == MemoryKind.FACT
+                and str((signal.metadata or {}).get("self_schema", "")).strip()
+            ):
                 self_spec = self.specs[MemoryLayer.SELF]
                 if score >= self_spec.promotion_threshold:
                     return MemoryLayer.SELF, "Validated self-model signal became self memory."
-                if score >= _provisional_threshold(self_spec) and signal.repeat_count >= self_spec.min_repeat_count_for_promotion:
-                    return MemoryLayer.SELF, "Provisional: self-model signal nearly cleared the self-memory gate."
+                if (
+                    score >= _provisional_threshold(self_spec)
+                    and signal.repeat_count >= self_spec.min_repeat_count_for_promotion
+                ):
+                    return (
+                        MemoryLayer.SELF,
+                        "Provisional: self-model signal nearly cleared the self-memory gate.",
+                    )
             procedural_spec = self.specs[MemoryLayer.PROCEDURAL]
             if (
                 signal.kind in {MemoryKind.FAILURE, MemoryKind.PROCEDURE}
                 and signal.repeat_count >= procedural_spec.min_repeat_count_for_promotion
                 and score >= procedural_spec.promotion_threshold
             ):
-                return MemoryLayer.PROCEDURAL, "Repeated validated outcome became a reusable procedure."
+                return (
+                    MemoryLayer.PROCEDURAL,
+                    "Repeated validated outcome became a reusable procedure.",
+                )
             if (
                 signal.kind in {MemoryKind.FAILURE, MemoryKind.PROCEDURE}
                 and signal.repeat_count >= procedural_spec.min_repeat_count_for_promotion
                 and score >= _provisional_threshold(procedural_spec)
             ):
-                return MemoryLayer.PROCEDURAL, "Provisional: repeated outcome nearly cleared the procedural gate."
+                return (
+                    MemoryLayer.PROCEDURAL,
+                    "Provisional: repeated outcome nearly cleared the procedural gate.",
+                )
             semantic_spec = self.specs[MemoryLayer.SEMANTIC]
             if score >= semantic_spec.promotion_threshold:
                 return MemoryLayer.SEMANTIC, "Validated episode became stable semantic memory."
-            if score >= _provisional_threshold(semantic_spec) and signal.repeat_count >= semantic_spec.min_repeat_count_for_promotion:
-                return MemoryLayer.SEMANTIC, "Provisional: episode nearly cleared the semantic gate."
+            if (
+                score >= _provisional_threshold(semantic_spec)
+                and signal.repeat_count >= semantic_spec.min_repeat_count_for_promotion
+            ):
+                return (
+                    MemoryLayer.SEMANTIC,
+                    "Provisional: episode nearly cleared the semantic gate.",
+                )
             return None, "Rejected: episodic signal did not clear semantic/procedural gates."
 
         if signal.source_layer == MemoryLayer.PROCEDURAL:
+            integrity_rejection = _stable_integrity_rejection(signal, MemoryLayer.POLICY)
+            if integrity_rejection is not None:
+                return None, integrity_rejection
             policy_spec = self.specs[MemoryLayer.POLICY]
             if (
                 score >= policy_spec.promotion_threshold
                 and signal.repeat_count >= policy_spec.min_repeat_count_for_promotion
                 and signal.explicit_instruction
             ):
-                return MemoryLayer.POLICY, "Explicit repeated procedure cleared the policy-candidate gate."
+                return (
+                    MemoryLayer.POLICY,
+                    "Explicit repeated procedure cleared the policy-candidate gate.",
+                )
             if (
                 score >= _provisional_threshold(policy_spec)
                 and signal.repeat_count >= policy_spec.min_repeat_count_for_promotion
                 and signal.explicit_instruction
             ):
-                return MemoryLayer.POLICY, "Provisional: explicit repeated procedure nearly cleared the policy-candidate gate."
-            return None, "Rejected: policy promotion requires explicit instruction, high validation, and repeated evidence."
+                return (
+                    MemoryLayer.POLICY,
+                    "Provisional: explicit repeated procedure nearly cleared the policy-candidate gate.",
+                )
+            return (
+                None,
+                "Rejected: policy promotion requires explicit instruction, high validation, and repeated evidence.",
+            )
 
         if signal.source_layer == MemoryLayer.SEMANTIC:
+            integrity_rejection = _stable_integrity_rejection(signal, MemoryLayer.PROCEDURAL)
+            if integrity_rejection is not None:
+                return None, integrity_rejection
             procedural_spec = self.specs[MemoryLayer.PROCEDURAL]
             if (
                 signal.kind == MemoryKind.PROCEDURE
@@ -453,26 +676,37 @@ class NestedLearningKernel:
                 and signal.repeat_count >= procedural_spec.min_repeat_count_for_promotion
                 and score >= _provisional_threshold(procedural_spec)
             ):
-                return MemoryLayer.PROCEDURAL, "Provisional: semantic procedure nearly cleared repeated-use gate."
-            return None, "Rejected: semantic memory is already stable and needs correction, not promotion."
+                return (
+                    MemoryLayer.PROCEDURAL,
+                    "Provisional: semantic procedure nearly cleared repeated-use gate.",
+                )
+            return (
+                None,
+                "Rejected: semantic memory is already stable and needs correction, not promotion.",
+            )
 
         if signal.source_layer == MemoryLayer.SELF:
-            return None, "Rejected: self memory is already part of the self-model and needs correction, not promotion."
+            return (
+                None,
+                "Rejected: self memory is already part of the self-model and needs correction, not promotion.",
+            )
 
         return None, "Rejected: policy memory cannot self-promote."
 
-    def _requested_target_allowed(self, signal: LearningSignal, target: MemoryLayer) -> tuple[bool, str]:
+    def _requested_target_allowed(
+        self, signal: LearningSignal, target: MemoryLayer
+    ) -> tuple[bool, str]:
         spec = self.specs[target]
         score = signal.computed_validation_score
-        repeat_ok = signal.repeat_count >= spec.min_repeat_count_for_promotion
+        effective_repeat_count = _effective_repeat_count(signal, target)
+        repeat_ok = effective_repeat_count >= spec.min_repeat_count_for_promotion
         if target == MemoryLayer.POLICY:
-            ok = (
-                signal.explicit_instruction
-                and score >= spec.promotion_threshold
-                and repeat_ok
-            )
+            ok = signal.explicit_instruction and score >= spec.promotion_threshold and repeat_ok
             if ok:
-                return True, "Explicit repeated signal requested policy memory and cleared the policy gate."
+                return (
+                    True,
+                    "Explicit repeated signal requested policy memory and cleared the policy gate.",
+                )
             if signal.explicit_instruction and repeat_ok and score >= _provisional_threshold(spec):
                 return True, "Provisional: requested policy memory nearly cleared the policy gate."
             return (
@@ -485,7 +719,10 @@ class NestedLearningKernel:
             if ok:
                 return True, "Requested procedural memory cleared repeated validation gate."
             if repeat_ok and score >= _provisional_threshold(spec):
-                return True, "Provisional: requested procedural memory nearly cleared repeated validation gate."
+                return (
+                    True,
+                    "Provisional: requested procedural memory nearly cleared repeated validation gate.",
+                )
             return (
                 False,
                 "Rejected: procedural writes require "
@@ -501,16 +738,25 @@ class NestedLearningKernel:
             if ok:
                 return True, f"Requested {target.value} memory cleared validation gate."
             if repeat_ok and score >= _provisional_threshold(spec):
-                return True, f"Provisional: requested {target.value} memory nearly cleared validation gate."
-            return False, f"Rejected: {target.value} writes require validation >= {spec.promotion_threshold:.2f}."
+                return (
+                    True,
+                    f"Provisional: requested {target.value} memory nearly cleared validation gate.",
+                )
+            return (
+                False,
+                f"Rejected: {target.value} writes require validation >= {spec.promotion_threshold:.2f}.",
+            )
         return True, "Requested working memory write accepted."
 
-    def _promotion_requirements(self, signal: LearningSignal, target: MemoryLayer | None) -> dict[str, object]:
+    def _promotion_requirements(
+        self, signal: LearningSignal, target: MemoryLayer | None
+    ) -> dict[str, object]:
         payload: dict[str, object] = {
             "target_layer": None if target is None else target.value,
             "observed_validation_score": signal.computed_validation_score,
             "observed_validation_evidence": _validation_evidence_metadata(signal),
-            "observed_repeat_count": signal.repeat_count,
+            "observed_repeat_count": _effective_repeat_count(signal, target),
+            "claimed_repeat_count": signal.repeat_count,
             "observed_explicit_instruction": signal.explicit_instruction,
         }
         if target is not None:
@@ -527,26 +773,33 @@ class NestedLearningKernel:
             payload.update(
                 {
                     "min_validation_score": self.specs[MemoryLayer.EPISODIC].promotion_threshold,
-                    "provisional_validation_score": _provisional_threshold(self.specs[MemoryLayer.EPISODIC]),
+                    "provisional_validation_score": _provisional_threshold(
+                        self.specs[MemoryLayer.EPISODIC]
+                    ),
                     "min_repeat_count": 1,
                     "requires_explicit_instruction": False,
                 }
             )
         return payload
 
-    def _optimizer_trace(self, signal: LearningSignal, target: MemoryLayer | None) -> OptimizerTrace:
+    def _optimizer_trace(
+        self, signal: LearningSignal, target: MemoryLayer | None
+    ) -> OptimizerTrace:
         score = signal.computed_validation_score
+        effective_repeat_count = _effective_repeat_count(signal, target)
         source_chars = signal.effective_source_evidence_chars
-        compression_ratio = (len(signal.content) / source_chars) if source_chars and source_chars > 0 else None
+        compression_ratio = (
+            (len(signal.content) / source_chars) if source_chars and source_chars > 0 else None
+        )
         surprise = self._surprise(signal, target)
-        repeat_bonus = min(max(signal.repeat_count - 1, 0) * 0.03, 0.12)
+        repeat_bonus = min(max(effective_repeat_count - 1, 0) * 0.03, 0.12)
         target_bonus = 0.0 if target is None else 0.02 * _layer_level(target)
         confidence_delta = min(score - signal.confidence + repeat_bonus + target_bonus, 0.25)
         effective = max(0.0, min(0.99, signal.confidence + max(confidence_delta, 0.0)))
         return OptimizerTrace(
             surprise=surprise,
             validation_score=score,
-            repeat_count=signal.repeat_count,
+            repeat_count=effective_repeat_count,
             compression_ratio=compression_ratio,
             confidence_delta=max(confidence_delta, 0.0),
             effective_confidence=effective,
@@ -558,16 +811,26 @@ class NestedLearningKernel:
         try:
             from .models import RetrievalQuery
 
-            hits = self.memory.retrieve(RetrievalQuery(query=f"{signal.title} {signal.content}", layers=(target,), k_per_layer=3))
+            hits = self.memory.retrieve(
+                RetrievalQuery(
+                    query=f"{signal.title} {signal.content}", layers=(target,), k_per_layer=3
+                )
+            )
         except Exception:
             return max(0.0, min(1.0, 1.0 - signal.confidence))
         if not hits:
             return 1.0
-        similarity = max(SequenceMatcher(None, signal.content, hit.record.content).ratio() for hit in hits)
-        conflict_bonus = 0.15 if any(hit.record.metadata.get("conflict_group_id") for hit in hits) else 0.0
+        similarity = max(
+            SequenceMatcher(None, signal.content, hit.record.content).ratio() for hit in hits
+        )
+        conflict_bonus = (
+            0.15 if any(hit.record.metadata.get("conflict_group_id") for hit in hits) else 0.0
+        )
         return max(0.0, min(1.0, (1.0 - similarity) + conflict_bonus))
 
-    def _with_learned_routing(self, signal: LearningSignal, decision: LearningDecision) -> LearningDecision:
+    def _with_learned_routing(
+        self, signal: LearningSignal, decision: LearningDecision
+    ) -> LearningDecision:
         if self.router is None:
             return decision
         try:
@@ -614,8 +877,45 @@ def _validation_evidence_metadata(signal: LearningSignal) -> dict[str, object]:
         "human_explicit": signal.explicit_instruction,
         "legacy_raw_score": True,
         "source_evidence_chars": signal.source_evidence_chars,
+        "validation_status": "unresolved",
+        "resolved": False,
+        "repeat_observation_count": 0,
         "computed_score": signal.computed_validation_score,
     }
+
+
+def _stable_integrity_rejection(
+    signal: LearningSignal,
+    target: MemoryLayer,
+) -> str | None:
+    if target not in STABLE_MEMORY_LAYERS:
+        return None
+    evidence = signal.validation_evidence
+    if evidence is None or evidence.legacy_raw_score:
+        return (
+            f"Rejected: {target.value} memory requires structured validation evidence; "
+            "legacy raw validation_score and repeat_count claims cannot promote stable memory."
+        )
+    if not validation_evidence_is_resolved(evidence):
+        return (
+            f"Rejected: {target.value} memory requires resolved validation evidence tied "
+            "to a trusted runtime artifact or explicit operator confirmation."
+        )
+    return None
+
+
+def _effective_repeat_count(
+    signal: LearningSignal,
+    target: MemoryLayer | None,
+) -> int:
+    if target not in STABLE_MEMORY_LAYERS:
+        return signal.repeat_count
+    observed = validation_repeat_count(signal.validation_evidence)
+    if target in {MemoryLayer.SEMANTIC, MemoryLayer.SELF}:
+        return (
+            max(1, observed) if validation_evidence_is_resolved(signal.validation_evidence) else 0
+        )
+    return observed
 
 
 def _ref_labels(refs: tuple[EvidenceRef, ...]) -> list[str]:

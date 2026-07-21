@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from concurrent.futures import Future
 from datetime import UTC, datetime
 from importlib import import_module
 from pathlib import Path
@@ -19,22 +20,28 @@ from .process_liveness import process_is_alive
 _PROCESS_STARTED = monotonic()
 _MEMORY_HEALTH_LOCK = Lock()
 _MEMORY_HEALTH_CACHE: dict[str, tuple[tuple[int, int, int, int], float, bool, str | None]] = {}
+_STATE_HEALTH_LOCK = Lock()
+_STATE_HEALTH_INFLIGHT: dict[str, Future[dict[str, object]]] = {}
+_STATE_HEALTH_INFLIGHT_LIMIT = 64
 
 
-def operational_snapshot(*, config: Any, state: Any, runs: Any) -> dict[str, Any]:
+def operational_snapshot(
+    *,
+    config: Any,
+    state: Any,
+    runs: Any,
+    routine_loop: Any | None = None,
+) -> dict[str, Any]:
     statuses = state.run_status_counts() if hasattr(state, "run_status_counts") else {}
     worker_statuses = state.subagent_status_counts() if hasattr(state, "subagent_status_counts") else {}
     capacity = runs.capacity_snapshot() if hasattr(runs, "capacity_snapshot") else {}
     counters = runs.operational_counters() if hasattr(runs, "operational_counters") else {}
     provider_id = provider_health_id(config)
     provider = global_provider_health_registry.snapshot(provider_id)
-    poller = _telegram_poller_health()
+    poller = _telegram_poller_health(config)
+    routines = _routine_loop_health(config, routine_loop)
     memory = _memory_storage(config)
-    state_health = (
-        state.health_snapshot()
-        if hasattr(state, "health_snapshot")
-        else {"ok": False, "integrity": "unavailable", "writable": False}
-    )
+    state_health = _state_health_snapshot(state)
     alerts: list[dict[str, str]] = []
     if provider["state"] in {"open", "half_open", "degraded"}:
         alerts.append({"code": "provider_degraded", "severity": "error", "provider": provider_id})
@@ -46,6 +53,8 @@ def operational_snapshot(*, config: Any, state: Any, runs: Any) -> dict[str, Any
         alerts.append({"code": "failed_workers_present", "severity": "warning"})
     if poller["status"] in {"error", "stale"}:
         alerts.append({"code": "telegram_poller_unhealthy", "severity": "error"})
+    if routines["status"] in {"error", "stale", "stopped", "unavailable"}:
+        alerts.append({"code": "proactive_routine_loop_unhealthy", "severity": "error"})
     if memory["max_utilization"] >= 0.9:
         alerts.append({"code": "memory_capacity_high", "severity": "warning"})
     payload = {
@@ -57,12 +66,56 @@ def operational_snapshot(*, config: Any, state: Any, runs: Any) -> dict[str, Any
         "workers": {"by_status": worker_statuses},
         "provider": provider,
         "telegram_poller": poller,
+        "proactive_routines": routines,
         "memory": memory,
         "state": state_health,
-        "state_schema_version": state.schema_version() if hasattr(state, "schema_version") else None,
+        "state_schema_version": (
+            state_health.get("schema_version")
+            if "schema_version" in state_health
+            else state.schema_version()
+            if hasattr(state, "schema_version")
+            else None
+        ),
         "alerts": alerts,
     }
     return cast(dict[str, Any], redact_secrets(payload))
+
+
+def _routine_loop_health(config: Any, routine_loop: Any | None) -> dict[str, Any]:
+    if not bool(getattr(config, "enable_proactive_routines", False)):
+        return {"status": "disabled", "enabled": False}
+    if routine_loop is None or not hasattr(routine_loop, "status"):
+        return {"status": "unavailable", "enabled": True}
+    status = routine_loop.status()
+    payload = status.to_dict() if hasattr(status, "to_dict") else dict(status)
+    running = bool(payload.get("running"))
+    last_error = payload.get("last_error")
+    tick_in_progress = bool(payload.get("tick_in_progress"))
+    tick_age = float(payload.get("current_tick_age_seconds") or 0.0)
+    stale_after = max(
+        float(getattr(config, "routine_poll_interval_seconds", 30.0)) * 2,
+        float(getattr(config, "routine_claim_ttl_seconds", 120.0)),
+    )
+    if last_error:
+        health = "error"
+    elif not running:
+        health = "stopped"
+    elif tick_in_progress and tick_age > stale_after:
+        health = "stale"
+    else:
+        health = "healthy"
+    return {
+        "status": health,
+        "enabled": True,
+        "running": running,
+        "tick_count": int(payload.get("tick_count", 0)),
+        "last_error": last_error,
+        "tick_in_progress": tick_in_progress,
+        "current_tick_age_seconds": tick_age if tick_in_progress else None,
+        "stale_after_seconds": stale_after,
+        "last_started_at": payload.get("last_started_at"),
+        "last_finished_at": payload.get("last_finished_at"),
+    }
 
 
 def _memory_storage(config: Any) -> dict[str, Any]:
@@ -151,13 +204,8 @@ def _check_memvid_layer(path: Path, layer: Any, *, cache_seconds: float = 30.0) 
     return result
 
 
-def _telegram_poller_health() -> dict[str, Any]:
-    path = Path(
-        os.environ.get(
-            "KESTREL_TELEGRAM_HEALTH_PATH",
-            str(Path.home() / ".kestrel" / "telegram-poller-health.json"),
-        )
-    )
+def _telegram_poller_health(config: Any) -> dict[str, Any]:
+    path = _telegram_poller_health_path(config)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         updated = float(raw.get("updated_at_epoch", 0.0))
@@ -177,8 +225,65 @@ def _telegram_poller_health() -> dict[str, Any]:
         return {"status": "error", "error_type": "invalid_health_file"}
 
 
-def readiness_snapshot(*, config: Any, state: Any, runs: Any) -> dict[str, Any]:
-    metrics = operational_snapshot(config=config, state=state, runs=runs)
+def _telegram_poller_health_path(config: Any) -> Path:
+    explicit = os.environ.get("KESTREL_TELEGRAM_HEALTH_PATH", "").strip()
+    if explicit:
+        return Path(explicit)
+    state_path = Path(getattr(config, "state_path", Path(".nest/state/agent.db")))
+    return state_path.parent / "telegram-poller-health.json"
+
+
+def _state_health_snapshot(state: Any) -> dict[str, object]:
+    if not hasattr(state, "health_snapshot"):
+        return {"ok": False, "integrity": "unavailable", "writable": False}
+
+    key = _state_health_key(state)
+    leader = False
+    with _STATE_HEALTH_LOCK:
+        future = _STATE_HEALTH_INFLIGHT.get(key)
+        if future is None and len(_STATE_HEALTH_INFLIGHT) < _STATE_HEALTH_INFLIGHT_LIMIT:
+            future = Future()
+            _STATE_HEALTH_INFLIGHT[key] = future
+            leader = True
+
+    if future is None:
+        return cast(dict[str, object], state.health_snapshot())
+    if not leader:
+        return dict(future.result())
+
+    try:
+        snapshot = cast(dict[str, object], state.health_snapshot())
+        future.set_result(dict(snapshot))
+        return snapshot
+    except BaseException as exc:
+        future.set_exception(exc)
+        raise
+    finally:
+        with _STATE_HEALTH_LOCK:
+            if _STATE_HEALTH_INFLIGHT.get(key) is future:
+                del _STATE_HEALTH_INFLIGHT[key]
+
+
+def _state_health_key(state: Any) -> str:
+    path = getattr(state, "path", None)
+    if path is not None:
+        return f"path:{Path(path).absolute()}"
+    return f"object:{type(state).__module__}.{type(state).__qualname__}:{id(state)}"
+
+
+def readiness_snapshot(
+    *,
+    config: Any,
+    state: Any,
+    runs: Any,
+    routine_loop: Any | None = None,
+) -> dict[str, Any]:
+    metrics = operational_snapshot(
+        config=config,
+        state=state,
+        runs=runs,
+        routine_loop=routine_loop,
+    )
     provider_state = str(metrics["provider"]["state"])
     nonterminal = state.list_nonterminal_runs() if hasattr(state, "list_nonterminal_runs") else []
     orphaned = [
@@ -205,6 +310,13 @@ def readiness_snapshot(*, config: Any, state: Any, runs: Any) -> dict[str, Any]:
         reasons.append("memory_capacity_exhausted")
     if _telegram_is_required(config) and metrics["telegram_poller"].get("status") != "healthy":
         reasons.append("telegram_poller_unhealthy")
+    if metrics["proactive_routines"].get("status") in {
+        "error",
+        "stale",
+        "stopped",
+        "unavailable",
+    }:
+        reasons.append("proactive_routine_loop_unhealthy")
     if orphaned:
         reasons.append("orphaned_running_runs")
     return {
@@ -216,6 +328,7 @@ def readiness_snapshot(*, config: Any, state: Any, runs: Any) -> dict[str, Any]:
         "state": state_health,
         "memory": memory,
         "telegram_poller": metrics["telegram_poller"],
+        "proactive_routines": metrics["proactive_routines"],
         "state_schema_version": metrics["state_schema_version"],
     }
 
@@ -262,10 +375,12 @@ def prometheus_snapshot(snapshot: dict[str, Any]) -> str:
         ]
     )
     poller = _metric_mapping(snapshot.get("telegram_poller"))
+    routines = _metric_mapping(snapshot.get("proactive_routines"))
     lines.extend(
         [
             f"kestrel_telegram_poller_healthy {1 if poller.get('status') == 'healthy' else 0}",
             f"kestrel_telegram_poller_age_seconds {_metric_number(poller.get('age_seconds'))}",
+            f"kestrel_proactive_routine_loop_healthy {1 if routines.get('status') in {'healthy', 'disabled'} else 0}",
         ]
     )
     return "\n".join(lines) + "\n"

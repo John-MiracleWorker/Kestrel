@@ -1,3 +1,6 @@
+import pytest
+from pydantic import ValidationError
+
 from nested_memvid_agent.server_models import (
     CreateRunRequest,
     SecretStoreRequest,
@@ -27,3 +30,8 @@ def test_server_request_models_preserve_defaults_and_aliases() -> None:
     )
     assert self_memory.schema_ == "identity_summary"
     assert _model_payload(self_memory)["schema"] == "identity_summary"
+
+
+def test_create_run_request_rejects_unknown_fields() -> None:
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        CreateRunRequest(message="hello", client_extension="not-supported")

@@ -32,7 +32,15 @@ class ContextCompiler:
         self.config = config or ContextCompilerConfig()
         self.packer = ContextPacker(memory)
 
-    def compile(self, objective: str, query: str | None = None) -> CompiledContext:
+    def compile(
+        self,
+        objective: str,
+        query: str | None = None,
+        *,
+        excluded_record_ids: frozenset[str] = frozenset(),
+        include_objective: bool = True,
+        include_telemetry: bool = True,
+    ) -> CompiledContext:
         packed = self.packer.pack(
             ContextPackRequest(
                 objective=objective,
@@ -40,8 +48,10 @@ class ContextCompiler:
                 token_budget=max(self.config.context_pack_token_budget, 1),
                 allowed_layers=tuple(MemoryLayer),
                 expand_raw=self.config.expand_raw,
-                include_telemetry=True,
+                include_objective=include_objective,
+                include_telemetry=include_telemetry,
                 k_per_layer=self.config.max_hits_per_layer,
+                excluded_record_ids=excluded_record_ids,
             )
         )
         selected = list(packed.hits)

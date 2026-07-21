@@ -5,6 +5,10 @@ Branch: `fix/runtime-rescue`
 Scope: production-grade, single-user, single-node, local/self-hosted deployment
 Published recommendation: `v0.2.1` remains the only published/recommended release
 
+> **Historical pre-publication snapshot:** This review predates the `v0.3.0` and `v0.3.1`
+> releases published on 2026-07-16. See the [changelog](../../CHANGELOG.md) for the current release
+> history; the findings below remain unchanged as evidence of the state reviewed on 2026-07-14.
+
 ## Verdict
 
 **Local deployment acceptance: PASS.** The current working tree satisfies the production-parity plan for the declared single-user, single-node topology on the verified macOS host. Durable ownership, startup recovery, cancellation, bounded admission, immutable effective configuration, provider resilience, API/channel controls, operational telemetry, Memvid recovery, packaging, launchd, Codex CLI, and Telegram paths were exercised with real outputs.

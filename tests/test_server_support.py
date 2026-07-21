@@ -53,7 +53,8 @@ def test_server_support_normalizes_request_helpers() -> None:
     assert bounded_limit(0, default=20, maximum=100) == 20
     assert bounded_limit(200, default=20, maximum=100) == 100
     assert hostname_from_header("127.0.0.1:8765") == "127.0.0.1"
-    assert hostname_from_url("http://localhost:8765/path") == "localhost"
+    assert hostname_from_url("http://localhost:8765") == "localhost"
+    assert hostname_from_url("http://localhost:8765/path") == ""
     assert host_is_trusted("coming-emacs-experienced-dome.trycloudflare.com", ["*.trycloudflare.com"])
     assert not host_is_trusted("trycloudflare.com", ["*.trycloudflare.com"])
     assert not host_is_trusted("evil.example", ["*.trycloudflare.com"])

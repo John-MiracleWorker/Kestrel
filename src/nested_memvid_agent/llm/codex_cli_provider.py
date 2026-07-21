@@ -8,6 +8,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from ..runtime_models import ChatMessage, LLMOptions, LLMResponse, ToolSpec
+from ..tools.process_tools import (
+    WorkspaceSecretIsolationError,
+    assert_arbitrary_subprocess_safe,
+)
 from .base import LLMProvider, ProviderCapabilities, ProviderError
 from .parser import parse_agent_response
 
@@ -29,6 +33,8 @@ class CodexCLIProvider(LLMProvider):
         profile: str | None = None,
         skip_git_repo_check: bool = False,
         ephemeral: bool = True,
+        secret_store_path: Path = Path(".nest/secrets/local_vault.json"),
+        secret_backend: str = "json",
     ) -> None:
         self.model = None if model in {None, "", "mock"} else model
         self.workspace = workspace
@@ -36,6 +42,8 @@ class CodexCLIProvider(LLMProvider):
         self.profile = profile
         self.skip_git_repo_check = skip_git_repo_check
         self.ephemeral = ephemeral
+        self.secret_store_path = secret_store_path
+        self.secret_backend = secret_backend
 
     @property
     def capabilities(self) -> ProviderCapabilities:
@@ -56,6 +64,14 @@ class CodexCLIProvider(LLMProvider):
     ) -> LLMResponse:
         active_options = options or LLMOptions()
         prompt = _format_prompt(messages, tools)
+        try:
+            assert_arbitrary_subprocess_safe(
+                workspace=self.workspace,
+                secret_store_path=self.secret_store_path,
+                secret_backend=self.secret_backend,
+            )
+        except WorkspaceSecretIsolationError as exc:
+            raise ProviderError(str(exc), code=exc.code) from exc
         with TemporaryDirectory(prefix="kestrel-codex-") as tmpdir:
             output_path = Path(tmpdir) / "last-message.txt"
             command = self._command(output_path)
@@ -95,6 +111,7 @@ class CodexCLIProvider(LLMProvider):
             self.sandbox,
             "--color",
             "never",
+            "--ignore-user-config",
             "--output-last-message",
             str(output_path),
         ]

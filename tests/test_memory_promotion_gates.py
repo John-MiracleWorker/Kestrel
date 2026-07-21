@@ -5,15 +5,31 @@ from pathlib import Path
 from nested_memvid_agent.backends.in_memory import InMemoryBackend
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS, LayeredMemorySystem, LayerSpec
-from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
-from nested_memvid_agent.nested_learning import LearningSignal, NestedLearningKernel
+from nested_memvid_agent.models import (
+    EvidenceRef,
+    MemoryKind,
+    MemoryLayer,
+    MemoryRecord,
+    RetrievalQuery,
+)
+from nested_memvid_agent.nested_learning import (
+    LearningSignal,
+    NestedLearningKernel,
+    ValidationEvidence,
+    ValidationStatus,
+    resolve_validation_evidence,
+)
 from nested_memvid_agent.runtime_models import ToolCall
 from nested_memvid_agent.tools.base import ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
 
 
 def test_write_thresholds_accept_working_but_reject_low_confidence_stable_layers(tmp_path: Path) -> None:
-    memory = LayeredMemorySystem.from_backend_factory(tmp_path / "memory", InMemoryBackend)
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path / "memory",
+        InMemoryBackend,
+        enforce_stable_write_integrity=False,
+    )
 
     working_id = memory.put(
         MemoryRecord(
@@ -71,7 +87,8 @@ def test_procedural_gate_requires_repeated_validated_success(tmp_path: Path) -> 
         content="sentinel_procedural_repeat_gate_1a8b recipe from one success.",
         kind=MemoryKind.PROCEDURE,
         source_layer=MemoryLayer.EPISODIC,
-        validation_score=0.95,
+        validation_score=None,
+        validation_evidence=_resolved_validation_evidence(task_count=1),
         repeat_count=1,
         requested_target_layer=MemoryLayer.PROCEDURAL,
     )
@@ -80,8 +97,9 @@ def test_procedural_gate_requires_repeated_validated_success(tmp_path: Path) -> 
         content="sentinel_procedural_repeat_gate_1a8b recipe from repeated success.",
         kind=MemoryKind.PROCEDURE,
         source_layer=MemoryLayer.EPISODIC,
-        validation_score=0.95,
-        repeat_count=2,
+        validation_score=None,
+        validation_evidence=_resolved_validation_evidence(task_count=2),
+        repeat_count=999,
         requested_target_layer=MemoryLayer.PROCEDURAL,
     )
 
@@ -109,7 +127,12 @@ def test_self_memory_requires_self_appropriate_validated_signal() -> None:
         content="The user explicitly prefers implementation after a plan is accepted.",
         kind=MemoryKind.FACT,
         source_layer=MemoryLayer.EPISODIC,
-        validation_score=0.88,
+        validation_score=None,
+        validation_evidence=_resolved_validation_evidence(
+            task_count=1,
+            human_explicit=True,
+            status="human_confirmed",
+        ),
         repeat_count=1,
         explicit_instruction=True,
         requested_target_layer=MemoryLayer.SELF,
@@ -124,7 +147,7 @@ def test_self_memory_requires_self_appropriate_validated_signal() -> None:
     assert validated_decision.accepted
     assert record.layer == MemoryLayer.SELF
     assert record.metadata["source_layer"] == MemoryLayer.EPISODIC.value
-    assert record.metadata["validation_score"] == 0.88
+    assert record.metadata["validation_score"] == 1.0
 
 
 def test_policy_promotion_matrix_and_tool_config_gate(tmp_path: Path) -> None:
@@ -189,25 +212,30 @@ def test_policy_promotion_matrix_and_tool_config_gate(tmp_path: Path) -> None:
 
     assert disabled.success is False
     assert disabled.error == "policy_write_disabled"
-    assert enabled.success is True
-    assert enabled.data["target_layer"] == "policy"
+    assert enabled.success is False
+    assert enabled.error == "policy_approval_required"
     hits = memory.retrieve(RetrievalQuery(query="sentinel_policy_approved_path_31ee", layers=(MemoryLayer.POLICY,)))
-    assert len(hits) == 1
-    assert hits[0].record.metadata["explicit_instruction"] is True
+    assert hits == []
 
 
 def test_provisional_records_are_visible_but_cannot_promote_further_and_confirm_without_duplicate(tmp_path: Path) -> None:
     custom = dict(DEFAULT_LAYER_SPECS)
     semantic = custom[MemoryLayer.SEMANTIC]
     custom[MemoryLayer.SEMANTIC] = LayerSpec(**{**semantic.__dict__, "provisional_threshold": 0.64})
-    memory = LayeredMemorySystem.from_backend_factory(tmp_path / "memory", InMemoryBackend, specs=custom)
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path / "memory",
+        InMemoryBackend,
+        specs=custom,
+        enforce_stable_write_integrity=False,
+    )
     kernel = NestedLearningKernel(specs=custom, memory=memory)
     provisional = LearningSignal(
         title="Provisional fact slot",
         content="sentinel_provisional_slot_22aa starts as provisional.",
         kind=MemoryKind.FACT,
         source_layer=MemoryLayer.EPISODIC,
-        validation_score=0.66,
+        validation_score=None,
+        validation_evidence=_resolved_validation_evidence(bucket_count=3),
         repeat_count=1,
     )
     confirmed = LearningSignal(
@@ -215,11 +243,15 @@ def test_provisional_records_are_visible_but_cannot_promote_further_and_confirm_
         content="sentinel_provisional_slot_22aa starts as provisional.",
         kind=MemoryKind.FACT,
         source_layer=MemoryLayer.EPISODIC,
-        validation_score=0.9,
+        validation_score=None,
+        validation_evidence=_resolved_validation_evidence(bucket_count=4),
         repeat_count=1,
     )
 
-    provisional_record = kernel.to_memory_record(provisional, kernel.decide(provisional))
+    provisional_record = _with_unsafe_test_envelope(
+        kernel.to_memory_record(provisional, kernel.decide(provisional)),
+        "provisional-source",
+    )
     provisional_id = memory.put(provisional_record)
     blocked = kernel.decide(
         LearningSignal(
@@ -232,7 +264,12 @@ def test_provisional_records_are_visible_but_cannot_promote_further_and_confirm_
             metadata={"promotion_status": "provisional"},
         )
     )
-    confirmed_id = memory.put(kernel.to_memory_record(confirmed, kernel.decide(confirmed)))
+    confirmed_id = memory.put(
+        _with_unsafe_test_envelope(
+            kernel.to_memory_record(confirmed, kernel.decide(confirmed)),
+            "confirmed-source",
+        )
+    )
 
     hits = memory.retrieve(RetrievalQuery(query="sentinel_provisional_slot_22aa", layers=(MemoryLayer.SEMANTIC,)))
     records = list(memory.iter_records(MemoryLayer.SEMANTIC))
@@ -241,3 +278,48 @@ def test_provisional_records_are_visible_but_cannot_promote_further_and_confirm_
     assert confirmed_id == provisional_id
     assert len(records) == 1
     assert records[0].metadata["promotion_status"] == "confirmed"
+
+
+def _resolved_validation_evidence(
+    *,
+    bucket_count: int = 4,
+    task_count: int = 1,
+    human_explicit: bool = False,
+    status: ValidationStatus = "runtime_validated",
+) -> ValidationEvidence:
+    bucket_refs = tuple(
+        EvidenceRef(source="memory_record", locator=f"receipt-bucket-{index}")
+        for index in range(bucket_count)
+    )
+    task_refs = tuple(
+        EvidenceRef(source="memory_record", locator=f"receipt-task-{index}")
+        for index in range(task_count)
+    )
+    buckets = [(), (), (), ()]
+    for index, ref in enumerate(bucket_refs):
+        buckets[index] = (ref,)
+    evidence = ValidationEvidence(
+        test_refs=buckets[0],
+        lint_refs=buckets[1],
+        repair_refs=buckets[2],
+        review_refs=buckets[3],
+        task_refs=task_refs,
+        human_explicit=human_explicit,
+    )
+    return resolve_validation_evidence(
+        evidence,
+        status=status,
+        artifact_ids=tuple(ref.locator for ref in (*bucket_refs, *task_refs)),
+    )
+
+
+def _with_unsafe_test_envelope(record: MemoryRecord, source_id: str) -> MemoryRecord:
+    record.metadata["stable_write_envelope"] = {
+        "version": 1,
+        "authority": "nested_learning",
+        "target_layer": record.layer.value,
+        "source_record_ids": [source_id],
+        "evidence_resolved": True,
+    }
+    record.evidence.append(EvidenceRef(source="memory_record", locator=source_id))
+    return record

@@ -8,7 +8,7 @@ import pytest
 
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.llm.factory import build_llm_provider
-from nested_memvid_agent.runtime_models import ChatMessage, LLMOptions
+from nested_memvid_agent.runtime_models import ChatMessage, LLMOptions, ToolSpec
 
 pytestmark = pytest.mark.skipif(
     os.getenv("RUN_PROVIDER_INTEGRATION") != "1",
@@ -56,6 +56,50 @@ def test_live_provider_stream_smoke(provider_case: ProviderCase) -> None:
     assert events
     assert events[-1].type in {"message_complete", "provider_error"}
     assert events[-1].type == "message_complete"
+
+
+def test_live_provider_native_tool_call_certification(provider_case: ProviderCase) -> None:
+    if not provider_case.available:
+        pytest.skip(provider_case.reason)
+    provider = build_llm_provider(provider_case.config)
+    if not provider.capabilities.supports_native_tools:
+        pytest.skip(f"{provider_case.name} does not advertise native tools")
+    certification_tool = ToolSpec(
+        name="certification.echo",
+        description="Return the provided text unchanged for provider tool-call certification.",
+        parameters={
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+    )
+
+    response = provider.generate(
+        [
+            ChatMessage(
+                role="system",
+                content=(
+                    "Use the provider-native function-calling interface. Do not emit a JSON "
+                    "tool envelope in assistant text."
+                ),
+            ),
+            ChatMessage(
+                role="user",
+                content="Call certification.echo exactly once with text set to kestrel.",
+            ),
+        ],
+        tools=[certification_tool],
+        options=LLMOptions(
+            timeout_seconds=provider_case.config.timeout_seconds,
+            max_retries=0,
+            temperature=0.0,
+        ),
+    )
+
+    assert len(response.tool_calls) == 1
+    assert response.tool_calls[0].name == "certification.echo"
+    assert response.tool_calls[0].arguments == {"text": "kestrel"}
 
 
 def _provider_cases() -> list[ProviderCase]:

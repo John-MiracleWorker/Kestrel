@@ -185,8 +185,35 @@ def test_packer_expands_child_raw_frame_from_summary_link(tmp_path: Path) -> Non
     assert expanded.items[0].reason == "expanded_child_frames"
 
 
+def test_packer_excludes_the_current_turn_frame_from_recalled_hits(tmp_path: Path) -> None:
+    memory = _memory(tmp_path)
+    _put(
+        memory,
+        "Current turn duplicate",
+        "current-turn-duplicate-91af should not be recalled alongside the live user message.",
+        MemoryLayer.WORKING,
+        frame_type="raw_chunk",
+        metadata={"frame_id": "turn_current_user"},
+    )
+
+    packed = ContextPacker(memory).pack(
+        ContextPackRequest(
+            objective="current-turn-duplicate-91af",
+            query="current-turn-duplicate-91af",
+            excluded_record_ids=frozenset({"turn_current_user"}),
+        )
+    )
+
+    assert packed.hits == ()
+    assert packed.telemetry["excluded"] == 1
+
+
 def _memory(tmp_path: Path) -> LayeredMemorySystem:
-    return LayeredMemorySystem.from_backend_factory(tmp_path, InMemoryBackend)
+    return LayeredMemorySystem.from_backend_factory(
+        tmp_path,
+        InMemoryBackend,
+        enforce_stable_write_integrity=False,
+    )
 
 
 def _put(

@@ -10,8 +10,13 @@ from nested_memvid_agent.context_compiler import ContextCompiler, ContextCompile
 from nested_memvid_agent.context_packer import ContextPacker, ContextPackRequest
 from nested_memvid_agent.layers import LayeredMemorySystem
 from nested_memvid_agent.llm.mock import MockLLMProvider
-from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
-from nested_memvid_agent.nested_learning import LearningSignal, NestedLearningKernel
+from nested_memvid_agent.models import (
+    EvidenceRef,
+    MemoryKind,
+    MemoryLayer,
+    MemoryRecord,
+    RetrievalQuery,
+)
 from nested_memvid_agent.promotion_ledger import PromotionLedger
 from nested_memvid_agent.runtime_models import LLMResponse, ToolCall, ToolExecution, ToolSpec
 from nested_memvid_agent.state_store import AgentStateStore
@@ -23,7 +28,12 @@ from nested_memvid_agent.tools.registry import ToolRegistry
 def test_memory_correct_tombstones_target_and_records_ledger_outcomes(tmp_path: Path) -> None:
     state = AgentStateStore(tmp_path / "state.db")
     ledger = PromotionLedger(state)
-    memory = LayeredMemorySystem.from_backend_factory(tmp_path / "memory", InMemoryBackend, ledger=ledger)
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path / "memory",
+        InMemoryBackend,
+        ledger=ledger,
+        enforce_stable_write_integrity=False,
+    )
     target_id = memory.put(
         _promoted_record(
             promotion_id="promotion-corrected",
@@ -92,20 +102,63 @@ def test_agent_to_promotion_to_later_context_flow_keeps_policy_untouched(tmp_pat
     )
 
     result = agent.chat("Please process sentinel_cross_layer_flow_58bc.", session_id="session-cross", run_id="run-cross")
-    kernel = NestedLearningKernel(memory=memory)
-    signal = LearningSignal(
-        title="Cross-layer promoted fact",
-        content="sentinel_cross_layer_flow_58bc is a validated durable fact for later context.",
-        kind=MemoryKind.FACT,
-        source_layer=MemoryLayer.EPISODIC,
-        validation_score=0.82,
-        repeat_count=1,
-        source="test.agent_cross_layer",
-        locator=result.run_id,
+    promoted_title = "Cross-layer promoted fact"
+    promoted_content = (
+        "sentinel_cross_layer_flow_58bc is a validated durable fact for later context."
     )
-    decision = kernel.decide(signal)
-    promoted = kernel.to_memory_record(signal, decision)
-    promoted_id = memory.put(promoted)
+    candidate_id = memory.put(
+        MemoryRecord(
+            title=promoted_title,
+            content=promoted_content,
+            kind=MemoryKind.FACT,
+            layer=MemoryLayer.EPISODIC,
+            confidence=0.9,
+            evidence=[EvidenceRef(source="agent_run", locator=result.run_id)],
+        )
+    )
+    receipt_ids = {
+        bucket: memory.put_runtime_validation_receipt(
+            tool_name=f"{bucket}.validator",
+            tool_call_id=f"cross-layer-{bucket}",
+            evidence_bucket=bucket,
+            command=(bucket, "cross-layer"),
+            output_sha256=f"{index:064x}",
+            session_id="session-cross",
+            run_id="run-cross",
+            subject_record_id=candidate_id,
+        )
+        for index, bucket in enumerate(("test", "lint", "repair", "review"), start=1)
+    }
+    validation_evidence = {
+        f"{bucket}_refs": [{"source": "memory_record", "locator": receipt_id}]
+        for bucket, receipt_id in receipt_ids.items()
+    }
+    validation_evidence["task_refs"] = [
+        {"source": "memory_record", "locator": receipt_ids["test"]}
+    ]
+    promotion = build_default_tools().execute(
+        ToolCall(
+            name="memory.learn",
+            arguments={
+                "title": promoted_title,
+                "content": promoted_content,
+                "kind": "fact",
+                "source_layer": "episodic",
+                "source_record_id": candidate_id,
+                "confidence": 0.95,
+                "validation_evidence": validation_evidence,
+            },
+        ),
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(memory_dir=tmp_path / "memory"),
+            workspace=tmp_path,
+            session_id="session-cross",
+            run_id="run-cross",
+        ),
+    )
+    assert promotion.success
+    promoted_id = str(promotion.data["record_id"])
 
     compiled = ContextCompiler(
         memory,
@@ -130,7 +183,7 @@ def test_agent_to_promotion_to_later_context_flow_keeps_policy_untouched(tmp_pat
     stored = memory.get_record(MemoryLayer.SEMANTIC, promoted_id)
     assert stored is not None
     assert stored.metadata["source_layer"] == "episodic"
-    assert stored.metadata["validation_score"] == 0.82
+    assert stored.metadata["validation_score"] == 1.0
     assert stored.metadata["repeat_count"] == 1
     assert stored.metadata["promotion_status"] == "confirmed"
     assert stored.metadata["promotion_id"]
@@ -142,7 +195,12 @@ def test_memory_ledger_tool_reports_outcomes_without_mutating_thresholds(tmp_pat
     state_path = tmp_path / "state.db"
     state = AgentStateStore(state_path)
     ledger = PromotionLedger(state)
-    memory = LayeredMemorySystem.from_backend_factory(tmp_path / "memory", InMemoryBackend, ledger=ledger)
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path / "memory",
+        InMemoryBackend,
+        ledger=ledger,
+        enforce_stable_write_integrity=False,
+    )
     original_threshold = memory.specs[MemoryLayer.SEMANTIC].promotion_threshold
     record_id = memory.put(
         _promoted_record(

@@ -2,15 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import subprocess  # nosec B404
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .extension_policy import (
+    ExtensionPolicyError,
+    ExtensionScopes,
+    extension_tree_digest,
+    parse_extension_scopes,
+)
+from .extension_runner import (
+    OCI_TOOL_TIMEOUT_MARGIN_SECONDS,
+    ContainerExecutionRequest,
+    OCIContainerRunner,
+)
 from .models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord
 from .runtime_models import ToolCall, ToolExecution, ToolSpec
+from .security_boundary import redact_secrets, redact_text
 from .skill_validation import validate_skill_manifest
 from .state_store import AgentStateStore
 from .tools.base import AgentTool, ToolContext
@@ -30,9 +39,16 @@ class SkillCapsule:
 class SkillManager:
     """Discovers nested-learning skill capsules and exposes them as tools."""
 
-    def __init__(self, root: Path, state: AgentStateStore) -> None:
+    def __init__(
+        self,
+        root: Path,
+        state: AgentStateStore,
+        *,
+        container_runner: OCIContainerRunner | None = None,
+    ) -> None:
         self.root = root
         self.state = state
+        self.container_runner = container_runner or OCIContainerRunner()
         self.validation_errors: list[dict[str, Any]] = []
         self.capability_policy: Any | None = None
         self.root.mkdir(parents=True, exist_ok=True)
@@ -65,9 +81,21 @@ class SkillManager:
             if validation["errors"]:
                 self.validation_errors.append({"path": str(skill_dir), **validation})
                 continue
+            try:
+                tree_digest = extension_tree_digest(skill_dir)
+            except (OSError, ExtensionPolicyError) as exc:
+                self.validation_errors.append(
+                    {"path": str(skill_dir), "errors": [str(exc)], "warnings": validation["warnings"]}
+                )
+                continue
             manifest = dict(manifest)
             manifest["validation"] = validation
-            manifest["provenance"] = _skill_provenance(skill_dir, manifest_text, instructions)
+            manifest["provenance"] = _skill_provenance(
+                skill_dir,
+                manifest_text,
+                instructions,
+                tree_sha256=tree_digest,
+            )
             capsule = SkillCapsule(
                 id=str(manifest.get("id", skill_dir.name)),
                 name=str(manifest.get("name", skill_dir.name)),
@@ -129,6 +157,37 @@ class SkillManager:
     def set_enabled(self, skill_id: str, enabled: bool) -> dict[str, Any]:
         return self.state.set_skill_enabled(skill_id, enabled)
 
+    def retry_container_cleanup(self, *, timeout_seconds: float) -> bool:
+        """Retry retained OCI cleanup without dropping the owning runner."""
+
+        retry = getattr(self.container_runner, "retry_cleanup", None)
+        if not callable(retry):
+            return True
+        return bool(retry(timeout_seconds=timeout_seconds))
+
+    @property
+    def pending_container_cleanup_count(self) -> int:
+        """Return retained OCI resources that still need exact-name cleanup."""
+
+        pending = getattr(self.container_runner, "pending_cleanup_count", 0)
+        return max(0, int(pending))
+
+    def container_cleanup_status(self) -> tuple[dict[str, object], ...]:
+        """Expose non-secret cleanup identities for operator reconciliation."""
+
+        status = getattr(self.container_runner, "pending_cleanups", None)
+        if not callable(status):
+            return ()
+        return tuple(status())
+
+    def shutdown(self, *, timeout_seconds: float) -> bool:
+        """Fail closed while any skill/validation OCI cleanup is unverified."""
+
+        shutdown = getattr(self.container_runner, "shutdown", None)
+        if callable(shutdown):
+            return bool(shutdown(timeout_seconds=timeout_seconds))
+        return self.retry_container_cleanup(timeout_seconds=timeout_seconds)
+
     def install_skill(
         self,
         *,
@@ -162,20 +221,23 @@ class SkillManager:
         (skill_dir / "skill.json").write_text(manifest_text + "\n", encoding="utf-8")
         (skill_dir / "SKILL.md").write_text(instructions, encoding="utf-8")
         self.discover()
+        stored = self.state.get_skill(skill_id)
         return {
             "installed": True,
             "dry_run": False,
             "skill_id": skill_id,
             "path": str(skill_dir),
             "validation": validation,
-            "provenance": _skill_provenance(skill_dir, manifest_text, instructions),
+            "provenance": dict(stored.get("manifest", {})).get("provenance", {}),
         }
 
     def tool_adapters(self, *, include_disabled: bool = False) -> list[AgentTool]:
         adapters: list[AgentTool] = []
         for skill in self.state.list_skills():
             adapter = SkillToolAdapter(
-                _capsule_from_state(skill), capability_policy=self.capability_policy
+                _capsule_from_state(skill),
+                capability_policy=self.capability_policy,
+                container_runner=self.container_runner,
             )
             parent_enabled = bool(skill["enabled"])
             if self.capability_policy is not None:
@@ -194,9 +256,18 @@ class SkillManager:
 
 
 class SkillToolAdapter(AgentTool):
-    def __init__(self, capsule: SkillCapsule, *, capability_policy: Any | None = None) -> None:
+    wait_for_completion_on_timeout = True
+
+    def __init__(
+        self,
+        capsule: SkillCapsule,
+        *,
+        capability_policy: Any | None = None,
+        container_runner: OCIContainerRunner | None = None,
+    ) -> None:
         self.capsule = capsule
         self.capability_policy = capability_policy
+        self.container_runner = container_runner or OCIContainerRunner()
         risk = str(capsule.manifest.get("risk", "medium"))
         runtime = capsule.manifest.get("runtime", {"type": "instruction"})
         runtime_type = str(runtime.get("type", "instruction")) if isinstance(runtime, dict) else "instruction"
@@ -206,6 +277,16 @@ class SkillToolAdapter(AgentTool):
             capabilities.append("executable-skill")
         if executable_runtime:
             capabilities.append(f"runtime:{runtime_type}")
+            try:
+                scopes = parse_extension_scopes(capsule.manifest.get("scopes", {}))
+            except ExtensionPolicyError:
+                capabilities.append("extension-scopes-invalid")
+            else:
+                capabilities.extend(_scope_capabilities(scopes))
+            if runtime_type in {"python", "shell"}:
+                capabilities.append("host-runtime-disabled")
+            else:
+                capabilities.append("container-isolated")
         self.spec = ToolSpec(
             name=f"skill.{capsule.id}.run",
             description=capsule.description or f"Run skill capsule {capsule.name}.",
@@ -256,17 +337,34 @@ class SkillToolAdapter(AgentTool):
                 content="Executable skill runtimes are disabled by default.",
                 error="tool_disabled",
             )
+        container_timeout_budget: float | None = None
+        if runtime_type == "container":
+            container_timeout_budget = _container_timeout_budget(context.config.tool_timeout_seconds)
+            if container_timeout_budget is None:
+                return self._result(
+                    call,
+                    success=False,
+                    content="Tool timeout is too small to start and reliably clean up a container.",
+                    error="extension_timeout_budget_too_small",
+                )
         try:
+            scopes = parse_extension_scopes(self.capsule.manifest.get("scopes", {}))
             runtime_result = _run_skill_runtime(
                 self.capsule,
                 arguments=arguments,
                 runtime=runtime if isinstance(runtime, dict) else {"type": "instruction"},
                 task=task,
+                workspace=context.workspace,
+                scopes=scopes,
+                container_runner=self.container_runner,
+                execution_timeout_seconds=container_timeout_budget,
             )
-        except Exception as exc:  # noqa: BLE001 - skill boundary returns structured failure
+        except (ExtensionPolicyError, OSError, ValueError) as exc:
             return self._result(call, success=False, content=f"{type(exc).__name__}: {exc}", error="skill_runtime_failed")
 
-        content = runtime_result["content"]
+        safe_runtime_result = redact_secrets(runtime_result)
+        runtime_result = safe_runtime_result if isinstance(safe_runtime_result, dict) else runtime_result
+        content = redact_text(str(runtime_result["content"]))
         record = MemoryRecord(
             layer=MemoryLayer.EPISODIC,
             kind=MemoryKind.EVENT,
@@ -295,6 +393,10 @@ def _run_skill_runtime(
     arguments: dict[str, Any],
     runtime: dict[str, Any],
     task: str,
+    workspace: Path,
+    scopes: ExtensionScopes,
+    container_runner: OCIContainerRunner,
+    execution_timeout_seconds: float | None,
 ) -> dict[str, Any]:
     runtime_type = str(runtime.get("type", "instruction"))
     payload = {
@@ -314,52 +416,76 @@ def _run_skill_runtime(
             f"Instructions:\n{capsule.instructions.strip()}\n"
         )
         return {"success": True, "content": content, "data": {"runtime": "instruction"}}
-    if runtime_type == "python":
-        entrypoint = str(runtime.get("entrypoint", "skill.py"))
-        script = _safe_skill_path(capsule.path, entrypoint)
-        if not script.exists() or not script.is_file():
-            return {
-                "success": False,
-                "content": f"Python skill entrypoint does not exist: {entrypoint}",
-                "data": {"runtime": "python", "entrypoint": entrypoint},
-                "error": "missing_entrypoint",
-            }
-        return _run_skill_process(
-            capsule,
-            command=[sys.executable, str(script)],
-            payload=payload,
-            runtime_type="python",
-            timeout_seconds=_runtime_timeout(runtime),
-        )
-    if runtime_type == "shell":
-        command = runtime.get("command")
-        if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
-            return {
-                "success": False,
-                "content": "Shell skill runtime requires command as list[str].",
-                "data": {"runtime": "shell"},
-                "error": "bad_skill_command",
-            }
-        if not command:
-            return {
-                "success": False,
-                "content": "Shell skill runtime command cannot be empty.",
-                "data": {"runtime": "shell"},
-                "error": "bad_skill_command",
-            }
-        return _run_skill_process(
-            capsule,
-            command=list(command),
-            payload=payload,
-            runtime_type="shell",
-            timeout_seconds=_runtime_timeout(runtime),
-        )
-    if runtime_type == "container":
+    if runtime_type in {"python", "shell"}:
         return {
             "success": False,
-            "content": "Container skill runtime is not available in this local sandbox yet.",
-            "data": {"runtime": "container"},
-            "error": "container_runtime_unavailable",
+            "content": (
+                f"Host {runtime_type} skill execution is disabled. "
+                "Use a digest-pinned container runtime with explicit scopes."
+            ),
+            "data": {
+                "runtime": runtime_type,
+                "containment": "required",
+                "scopes": scopes.to_payload(),
+            },
+            "error": "extension_sandbox_required",
+        }
+    if runtime_type == "container":
+        provenance = capsule.manifest.get("provenance", {})
+        expected_tree_digest = (
+            str(provenance.get("tree_sha256", "")) if isinstance(provenance, dict) else ""
+        )
+        if not expected_tree_digest.startswith("sha256:"):
+            return {
+                "success": False,
+                "content": "Executable skill integrity metadata is unavailable; rediscover the skill.",
+                "data": {"runtime": "container", "scopes": scopes.to_payload()},
+                "error": "extension_integrity_unavailable",
+            }
+        image = str(runtime.get("image", ""))
+        raw_command = runtime.get("command")
+        command = tuple(str(item) for item in raw_command) if isinstance(raw_command, list) else ()
+        result = container_runner.run(
+            ContainerExecutionRequest(
+                extension_id=capsule.id,
+                source_dir=capsule.path,
+                expected_tree_digest=expected_tree_digest,
+                workspace=workspace,
+                scopes=scopes,
+                image=image,
+                command=command,
+                stdin=json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+                timeout_seconds=min(
+                    _runtime_timeout(runtime),
+                    execution_timeout_seconds or _runtime_timeout(runtime),
+                ),
+            )
+        )
+        content = (
+            f"Skill: {capsule.name}\n"
+            "Runtime: container\n"
+            f"Image: {image}\n"
+            f"Exit code: {result.returncode}\n\n"
+            f"STDOUT:\n{result.stdout}\n\n"
+            f"STDERR:\n{result.stderr}"
+        )
+        if result.content and not result.success:
+            content = f"{result.content}\n\n{content}"
+        return {
+            "success": result.success,
+            "content": content,
+            "data": {
+                "runtime": "container",
+                "containment": "oci",
+                "image": image,
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "tree_digest": result.tree_digest,
+                "scope_digest": result.scope_digest,
+                "scopes": scopes.to_payload(),
+            },
+            "error": result.error,
         }
     return {
         "success": False,
@@ -369,48 +495,15 @@ def _run_skill_runtime(
     }
 
 
-def _run_skill_process(
-    capsule: SkillCapsule,
-    *,
-    command: list[str],
-    payload: dict[str, Any],
-    runtime_type: str,
-    timeout_seconds: int,
-) -> dict[str, Any]:
-    completed = subprocess.run(  # noqa: S603 - list argv, skill cwd, timeout, no shell  # nosec B603
-        command,
-        cwd=capsule.path,
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        timeout=timeout_seconds,
-        check=False,
-        env={"PATH": os.defpath, "PYTHONNOUSERSITE": "1", "NEST_SKILL_SANDBOX": "1"},
-    )
-    stdout = completed.stdout.strip()
-    stderr = completed.stderr.strip()
-    content = (
-        f"Skill: {capsule.name}\n"
-        f"Runtime: {runtime_type}\n"
-        f"Exit code: {completed.returncode}\n\n"
-        f"STDOUT:\n{stdout}\n\n"
-        f"STDERR:\n{stderr}"
-    )
-    return {
-        "success": completed.returncode == 0,
-        "content": content,
-        "data": {
-            "runtime": runtime_type,
-            "returncode": completed.returncode,
-            "stdout": stdout[:4000],
-            "stderr": stderr[:4000],
-        },
-        "error": None if completed.returncode == 0 else "skill_nonzero_exit",
-    }
+def _runtime_timeout(runtime: dict[str, Any]) -> float:
+    return max(1.0, min(float(runtime.get("timeout", 10)), 120.0))
 
 
-def _runtime_timeout(runtime: dict[str, Any]) -> int:
-    return max(1, min(int(runtime.get("timeout", 10)), 120))
+def _container_timeout_budget(tool_timeout_seconds: float) -> float | None:
+    timeout = max(float(tool_timeout_seconds), 0.001)
+    if timeout <= OCI_TOOL_TIMEOUT_MARGIN_SECONDS:
+        return None
+    return timeout - OCI_TOOL_TIMEOUT_MARGIN_SECONDS
 
 
 def _safe_skill_id(skill_id: str) -> bool:
@@ -425,20 +518,30 @@ def _safe_skill_dir(root: Path, skill_id: str) -> Path:
     return target
 
 
-def _safe_skill_path(root: Path, relative: str) -> Path:
-    target = (root / relative).resolve()
-    root_resolved = root.resolve()
-    if target != root_resolved and root_resolved not in target.parents:
-        raise ValueError(f"Skill path escapes skill root: {relative}")
-    return target
-
-
-def _skill_provenance(skill_dir: Path, manifest_text: str, instructions: str) -> dict[str, Any]:
-    return {
+def _skill_provenance(
+    skill_dir: Path,
+    manifest_text: str,
+    instructions: str,
+    *,
+    tree_sha256: str | None = None,
+) -> dict[str, Any]:
+    payload = {
         "path": str(skill_dir),
         "manifest_sha256": hashlib.sha256(manifest_text.encode("utf-8")).hexdigest(),
         "instructions_sha256": hashlib.sha256(instructions.encode("utf-8")).hexdigest(),
     }
+    if tree_sha256:
+        payload["tree_sha256"] = tree_sha256
+    return payload
+
+
+def _scope_capabilities(scopes: ExtensionScopes) -> list[str]:
+    capabilities = [f"extension-scope:{scopes.digest()}", "network:none", "secrets:none"]
+    capabilities.extend(
+        f"filesystem:{scope.root}:{scope.path}:{scope.access}"
+        for scope in scopes.filesystem
+    )
+    return capabilities
 
 
 def _capsule_to_state(capsule: SkillCapsule) -> dict[str, Any]:

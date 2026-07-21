@@ -1,11 +1,11 @@
 import sys
+
 sys.path.insert(0, "src")
 
-import os
-from nested_memvid_agent.config import AgentConfig
-from nested_memvid_agent.llm.factory import build_llm_provider
-from nested_memvid_agent.runtime_models import ChatMessage
-from nested_memvid_agent.tools.builtin import build_default_tools
+from nested_memvid_agent.config import AgentConfig  # noqa: E402
+from nested_memvid_agent.llm.factory import build_llm_provider  # noqa: E402
+from nested_memvid_agent.runtime_models import ChatMessage  # noqa: E402
+from nested_memvid_agent.tools.builtin import build_default_tools  # noqa: E402
 
 config = AgentConfig(
     provider="openai-compatible",

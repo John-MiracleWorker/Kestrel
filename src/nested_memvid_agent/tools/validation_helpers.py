@@ -4,6 +4,7 @@ from typing import Any
 
 from ..models import EvidenceRef
 from ..nested_learning import ValidationEvidence
+from ..security_boundary import redact_secrets, redact_text
 
 
 def _tool_validation_evidence_payload(
@@ -13,21 +14,53 @@ def _tool_validation_evidence_payload(
     content: str,
     success: bool,
 ) -> dict[str, object]:
+    safe_content = redact_text(content)
+    safe_command = redact_secrets(command)
+    locator = (
+        " ".join(str(item) for item in safe_command)
+        if isinstance(safe_command, list)
+        else "<redacted>"
+    )
     if not success:
-        return {"source_evidence_chars": len(content)}
+        return {"source_evidence_chars": len(safe_content)}
     return {
         bucket: [
             {
-                "source": source,
-                "locator": " ".join(command),
-                "quote": content[:240],
+                "source": redact_text(source),
+                "locator": locator,
+                "quote": safe_content[:240],
             }
         ],
-        "source_evidence_chars": len(content),
+        "source_evidence_chars": len(safe_content),
     }
 
 
-def _validation_evidence_arg(arguments: dict[str, Any]) -> ValidationEvidence | None:
+def _authenticated_validation_evidence_payload(
+    bucket: str,
+    *,
+    receipt_id: str,
+    quote: str,
+    source_evidence_chars: int,
+) -> dict[str, object]:
+    if bucket not in {"test_refs", "lint_refs", "repair_refs", "review_refs"}:
+        raise ValueError(f"Unknown validation evidence bucket: {bucket}")
+    ref = {
+        "source": "memory_record",
+        "locator": receipt_id,
+        "quote": quote[:240],
+    }
+    return {
+        bucket: [ref],
+        "task_refs": [ref],
+        "source_evidence_chars": source_evidence_chars,
+    }
+
+
+def _validation_evidence_arg(
+    arguments: dict[str, Any],
+    *,
+    trust_human_explicit: bool = False,
+) -> ValidationEvidence | None:
     raw = arguments.get("validation_evidence")
     if not isinstance(raw, dict):
         return None
@@ -38,7 +71,8 @@ def _validation_evidence_arg(arguments: dict[str, Any]) -> ValidationEvidence | 
         review_refs=tuple(_evidence_refs_arg(raw.get("review_refs"))),
         task_refs=tuple(_evidence_refs_arg(raw.get("task_refs"))),
         human_explicit=bool(
-            raw.get("human_explicit", arguments.get("explicit_instruction", False))
+            trust_human_explicit
+            and raw.get("human_explicit", arguments.get("explicit_instruction", False))
         ),
         source_evidence_chars=_optional_int(raw.get("source_evidence_chars")),
     )

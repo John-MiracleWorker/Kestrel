@@ -3,6 +3,7 @@ import {
   Bell,
   Bot,
   Brain,
+  CalendarClock,
   Check,
   ClipboardCheck,
   Database,
@@ -15,7 +16,10 @@ import {
   LineChart,
   MessageCircle,
   PanelRightOpen,
+  Pencil,
+  Play,
   PlugZap,
+  Plus,
   RefreshCw,
   Route,
   Search,
@@ -27,13 +31,14 @@ import {
   Square,
   TerminalSquare,
   TestTube2,
+  Trash2,
   Wrench,
   X
 } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { ApiAuthError, deleteJson, getJson, getLearningDashboard, postJson, putJson, queryString, subscribeJsonEvents } from "./api";
+import { ApiAuthError, ApiResponseError, deleteJson, getJson, getLearningDashboard, postJson, putJson, queryString, subscribeJsonEvents } from "./api";
 import { getApiToken, setApiToken } from "./auth";
 import { EmptyState, Field, InlineMeta, JsonBlock, Panel, StatusBadge } from "./components";
 import {
@@ -70,6 +75,10 @@ import type {
   ProviderModelCatalog,
   Run,
   RunTrace,
+  Routine,
+  RoutineOccurrence,
+  RoutineRunNowResult,
+  RoutineStatus,
   RuntimeConfig,
   SelfState,
   SelfOnboardingSaveResult,
@@ -94,6 +103,10 @@ type ProviderOption = {
   apiKeyEnv?: string;
   requiresKey?: boolean;
 };
+
+type AppSection = "chat" | "routines" | "advanced" | "settings";
+
+const RUN_EVENT_REFRESH_DEBOUNCE_MS = 250;
 
 const providerOptions: ProviderOption[] = [
   { value: "lm-studio", label: "LM Studio", group: "Local", baseUrl: "http://localhost:1234/v1" },
@@ -273,7 +286,10 @@ const runEventTypes = [
   "memory.write",
   "capsule.completed",
   "capsule.failed",
+  "capsule.retention",
+  "capsule.retention_failed",
   "memory.compact",
+  "memory.compact_failed",
   "behavior_delta.preflight",
   "retry.blocked",
   "lesson.preflight",
@@ -351,6 +367,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [authPromptOpen, setAuthPromptOpen] = useState(false);
+  const [apiReady, setApiReady] = useState(false);
   const [apiTokenDraft, setApiTokenDraft] = useState(() => getApiToken());
   const [runtime, setRuntime] = useState<Record<string, unknown> | null>(null);
   const [runtimeSettingsResult, setRuntimeSettingsResult] = useState<Record<string, unknown> | null>(null);
@@ -392,12 +409,17 @@ export function App() {
   const [localThreads, setLocalThreads] = useState<ThreadSummary[]>([]);
   const activeRunIdRef = useRef<string | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
-  const activeSectionRef = useRef<"chat" | "advanced" | "settings">("chat");
+  const activeSectionRef = useRef<AppSection>("chat");
+  const threadRunsRef = useRef<Run[]>([]);
+  const topbarRef = useRef<HTMLElement | null>(null);
+  const conversationRef = useRef<HTMLElement | null>(null);
+  const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const followTranscriptRef = useRef(true);
   const idleRefreshInFlightRef = useRef(false);
   const memoryBackendHydratedRef = useRef(false);
   const setupDraftHydratedRef = useRef(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [activeSection, setActiveSection] = useState<"chat" | "advanced" | "settings">("chat");
+  const [activeSection, setActiveSection] = useState<AppSection>("chat");
 
   const [message, setMessage] = useState("");
   const [sessionId, setSessionId] = useState("");
@@ -663,7 +685,9 @@ export function App() {
     Boolean(pluginReview) && pluginReviewSource === pluginSourceValue && pluginReviewRef === pluginRefValue;
   const pluginEnableBlockers = reviewedCurrentPlugin ? pluginReview?.enable_blockers ?? [] : [];
 
-  function routeToSection(section: "chat" | "advanced" | "settings") {
+  function routeToSection(section: AppSection) {
+    setNotice(null);
+    setError(null);
     setActiveSection(section);
     if (!HASH_ROUTING_ENABLED) return;
     const hash = `#${section}`;
@@ -680,6 +704,7 @@ export function App() {
   }
 
   function selectSessionId(sessionId: string | null) {
+    followTranscriptRef.current = true;
     activeSessionIdRef.current = sessionId;
     setActiveSessionId(sessionId);
   }
@@ -753,6 +778,47 @@ export function App() {
   }, [activeSection]);
 
   useEffect(() => {
+    threadRunsRef.current = threadRuns;
+  }, [threadRuns]);
+
+  useEffect(() => {
+    const topbar = topbarRef.current;
+    if (!topbar) return;
+    const syncTopbarHeight = () => {
+      const height = Math.ceil(topbar.getBoundingClientRect().height);
+      if (height > 0) {
+        document.documentElement.style.setProperty("--kestrel-topbar-height", `${height}px`);
+      }
+    };
+    syncTopbarHeight();
+    window.addEventListener("resize", syncTopbarHeight);
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(syncTopbarHeight);
+    observer?.observe(topbar);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", syncTopbarHeight);
+      document.documentElement.style.removeProperty("--kestrel-topbar-height");
+    };
+  }, []);
+
+  useEffect(() => {
+    if (conversationRef.current) conversationRef.current.scrollTop = 0;
+  }, [activeSection]);
+
+  useEffect(() => {
+    if (notice !== "Run queued." || !activeRun) return;
+    if (activeRun.status !== "queued" && activeRun.status !== "running") {
+      setNotice(null);
+    }
+  }, [notice, activeRun?.status]);
+
+  useEffect(() => {
+    const transcript = transcriptRef.current;
+    if (!transcript || !followTranscriptRef.current) return;
+    transcript.scrollTop = transcript.scrollHeight;
+  }, [activeSessionId, sortedThreadRuns.length, activeRun?.status, activeRunEvents.length, streamedAssistant]);
+
+  useEffect(() => {
     if (!onboardingState) return;
     if (onboardingState.profile && !setupDraftHydratedRef.current) {
       setSetupDraft(setupDraftFromProfile(onboardingState.profile));
@@ -764,14 +830,28 @@ export function App() {
   }, [onboardingState, setupDismissed]);
 
   useEffect(() => {
-    refreshAll().catch(reportError);
-    const timer = window.setInterval(() => refreshIdleSummary().catch(reportError), 3500);
-    return () => window.clearInterval(timer);
+    let cancelled = false;
+    getJson<Record<string, unknown>>("/api/health")
+      .then(() => {
+        if (!cancelled) setApiReady(true);
+      })
+      .catch(reportError);
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
+    if (!apiReady) return;
+    refreshAll().catch(reportError);
+    const timer = window.setInterval(() => refreshIdleSummary().catch(reportError), 3500);
+    return () => window.clearInterval(timer);
+  }, [apiReady]);
+
+  useEffect(() => {
+    if (!apiReady) return;
     void refreshProviderModels(provider);
-  }, [provider]);
+  }, [provider, apiReady]);
 
   useEffect(() => {
     if (!HASH_ROUTING_ENABLED) return;
@@ -794,17 +874,35 @@ export function App() {
 
   useEffect(() => {
     if (!activeRun?.run_id) return;
+    const runId = activeRun.run_id;
+    const sessionId = activeRun.session_id;
+    let refreshTimer: number | null = null;
+    let closed = false;
     setEvents([]);
-    refreshRunDetails(activeRun.run_id).catch(reportError);
+    refreshRunDetails(runId).catch(reportError);
+    const scheduleAuthoritativeRefresh = () => {
+      if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+      refreshTimer = window.setTimeout(() => {
+        refreshTimer = null;
+        if (closed) return;
+        void Promise.all([
+          refreshChatSummary(sessionId),
+          refreshRunDetails(runId)
+        ]).catch(reportError);
+      }, RUN_EVENT_REFRESH_DEBOUNCE_MS);
+    };
     const appendEvent = (parsed: TraceEvent) => {
       setEvents((rows) => [...rows.slice(-120), parsed]);
       if (parsed.type !== "assistant.token") {
-        refreshChatSummary().catch(reportError);
-        refreshRunDetails(activeRun.run_id).catch(reportError);
-        refreshThreadRuns(activeRun.session_id).catch(reportError);
+        scheduleAuthoritativeRefresh();
       }
     };
-    return subscribeJsonEvents<TraceEvent>(`/api/runs/${activeRun.run_id}/events`, runEventTypes, appendEvent, reportError);
+    const unsubscribe = subscribeJsonEvents<TraceEvent>(`/api/runs/${runId}/events`, runEventTypes, appendEvent, reportError);
+    return () => {
+      closed = true;
+      if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+      unsubscribe();
+    };
   }, [activeRun?.run_id]);
 
   function applyRunSessionSelection(runList: Run[], sessionList: Session[], pendingApprovalList: Approval[]) {
@@ -824,7 +922,7 @@ export function App() {
     }
   }
 
-  async function refreshChatSummary() {
+  async function refreshChatSummary(forceThreadSessionId?: string) {
     const [runList, sessionList, pendingApprovalList] = await Promise.all([
       getJson<Run[]>("/api/runs"),
       getJson<Session[]>("/api/sessions"),
@@ -834,6 +932,11 @@ export function App() {
     setSessions(sessionList);
     setApprovals(pendingApprovalList);
     applyRunSessionSelection(runList, sessionList, pendingApprovalList);
+    if (forceThreadSessionId && activeSessionIdRef.current === forceThreadSessionId) {
+      await refreshThreadRuns(forceThreadSessionId);
+    } else {
+      await refreshSelectedThreadIfChanged(sessionList);
+    }
   }
 
   async function refreshSummary() {
@@ -869,6 +972,22 @@ export function App() {
       memoryBackendHydratedRef.current = true;
     }
     applyRunSessionSelection(runList, sessionList, pendingApprovalList);
+    await refreshSelectedThreadIfChanged(sessionList);
+  }
+
+  async function refreshSelectedThreadIfChanged(sessionList: Session[]) {
+    const selectedSessionId = activeSessionIdRef.current;
+    if (!selectedSessionId) return;
+    const summary = sessionList.find((session) => session.session_id === selectedSessionId);
+    if (!summary) return;
+    const knownRuns = threadRunsRef.current;
+    const knownLatest = knownRuns[knownRuns.length - 1];
+    const changed =
+      summary.run_count !== knownRuns.length ||
+      summary.latest_run_id !== knownLatest?.run_id ||
+      summary.latest_status !== knownLatest?.status ||
+      summary.updated_at !== knownLatest?.updated_at;
+    if (changed) await refreshThreadRuns(selectedSessionId);
   }
 
   async function refreshIdleSummary() {
@@ -954,6 +1073,7 @@ export function App() {
   async function refreshThreadRuns(sessionId: string) {
     const runList = await getJson<Run[]>(`/api/sessions/${encodeURIComponent(sessionId)}/runs`);
     if (activeSessionIdRef.current === sessionId) {
+      threadRunsRef.current = runList;
       setThreadRuns(runList);
       if (!activeRunIdRef.current && runList.length > 0) {
         selectRunId(runList[runList.length - 1].run_id);
@@ -988,6 +1108,7 @@ export function App() {
 
   function reportError(value: unknown) {
     if (value instanceof ApiAuthError) {
+      setApiReady(false);
       setAuthPromptOpen(true);
       setApiTokenDraft(getApiToken());
       setError(null);
@@ -1001,7 +1122,16 @@ export function App() {
     setApiToken(apiTokenDraft);
     setAuthPromptOpen(false);
     setError(null);
-    await refreshAll().catch(reportError);
+    try {
+      await getJson<Record<string, unknown>>("/api/health");
+      if (apiReady) {
+        await refreshAll();
+      } else {
+        setApiReady(true);
+      }
+    } catch (value) {
+      reportError(value);
+    }
   }
 
   async function saveRuntimeSettings() {
@@ -1009,6 +1139,7 @@ export function App() {
     const savedSettings = runtimeSettingsFrom(currentRuntime);
     await guarded(async () => {
       const result = await putJson<Record<string, unknown>>("/api/runtime/settings", {
+        expected_revision: String(savedSettings.revision ?? ""),
         provider,
         model: model.trim() || "mock",
         base_url: baseUrl.trim() || null,
@@ -1057,7 +1188,8 @@ export function App() {
   async function submitRun(event: FormEvent) {
     event.preventDefault();
     await guarded(async () => {
-      if (!message.trim()) return;
+      if (!message.trim() || !runtime) return;
+      followTranscriptRef.current = true;
       const targetSessionId = sessionId.trim() || activeSessionIdRef.current || createThreadId();
       const payload: Record<string, unknown> = {
         message,
@@ -1098,6 +1230,7 @@ export function App() {
     const now = new Date().toISOString();
     selectSessionId(threadId);
     selectRunId(null);
+    threadRunsRef.current = [];
     setThreadRuns([]);
     setEvents([]);
     setRunTrace(null);
@@ -1702,14 +1835,24 @@ export function App() {
   const personaPresets = onboardingState?.personas?.length ? onboardingState.personas : defaultPersonaPresets;
   const agentDisplayName = String(onboardingProfile?.agent_name || selfState?.identity?.name || "Kestrel");
   const userDisplayName = String(onboardingProfile?.preferred_name || onboardingProfile?.user_name || "");
-  const simpleStatus = simpleChatStatus(activeRun, pendingApprovalCount, setupReadiness);
+  const simpleStatus = authPromptOpen
+    ? {
+        label: "Locked",
+        detail: "Enter the local API token before using this Kestrel."
+      }
+    : !apiReady || !runtime
+      ? {
+          label: "Connecting",
+          detail: "Loading the authoritative Kestrel runtime configuration."
+        }
+    : simpleChatStatus(activeRun, pendingApprovalCount, setupReadiness);
   const chatIntro = userDisplayName
     ? `Ready when you are, ${userDisplayName}.`
     : "Ready when you are.";
 
   return (
     <>
-      <header className="topbar">
+      <header className="topbar" ref={topbarRef}>
         <div className="topbar-inner">
           <a className="brand" href="#workspace">
             <span className="brand-mark" aria-hidden="true">
@@ -1722,6 +1865,7 @@ export function App() {
           </a>
           <nav className="primary-nav" aria-label="Primary">
             <button type="button" className={activeSection === "chat" ? "active" : ""} onClick={() => routeToSection("chat")}>Chat</button>
+            <button type="button" className={activeSection === "routines" ? "active" : ""} onClick={() => routeToSection("routines")}>Routines</button>
             <button type="button" className={activeSection === "settings" ? "active" : ""} onClick={() => routeToSection("settings")}>Settings</button>
             <button type="button" className={activeSection === "advanced" ? "active" : ""} onClick={() => routeToSection("advanced")}>Advanced</button>
           </nav>
@@ -1754,6 +1898,30 @@ export function App() {
             </Panel>
           </section>
         </main>
+      ) : !apiReady || !runtime ? (
+        <main className="conversation" id="workspace">
+          <section className="settings-grid" aria-label="Kestrel connection status">
+            <Panel title={`Connecting to ${agentDisplayName}`} icon={<Activity size={19} />}>
+              <p>{error || "Loading the authoritative runtime configuration before enabling the workbench."}</p>
+              {error && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setError(null);
+                    getJson<Record<string, unknown>>("/api/health")
+                      .then(() => {
+                        setApiReady(true);
+                        return refreshAll();
+                      })
+                      .catch(reportError);
+                  }}
+                >
+                  <RefreshCw size={15} /> Retry
+                </button>
+              )}
+            </Panel>
+          </section>
+        </main>
       ) : (
       <div className={`chat-shell ${inspectorOpen ? "" : "no-inspector"}`} data-active-section={activeSection}>
       <a className="skip-link" href="#workspace">Skip to workspace</a>
@@ -1768,7 +1936,7 @@ export function App() {
           <Search size={14} />
           <input type="text" placeholder="Search threads..." />
         </div>
-        <div className="thread-list" aria-label="Conversation threads">
+        <div className="thread-list" role="region" aria-label="Conversation threads">
           {threadSummaries.map((thread) => (
             <button
               type="button"
@@ -1787,7 +1955,7 @@ export function App() {
         </div>
       </aside>
 
-      <main className="conversation" id="workspace">
+      <main className="conversation" id="workspace" ref={conversationRef}>
         {activeSection === "chat" && (
           <>
         <header className="conv-head simple-conv-head" data-section="chat">
@@ -1824,7 +1992,18 @@ export function App() {
 
         <section className={`conversation-layout ${inspectorOpen ? "with-inspector" : ""}`} data-section="chat">
           <div className="transcript-inner">
-            <div className="transcript" aria-label="Conversation transcript">
+            <div
+              className="transcript"
+              role="region"
+              aria-label="Conversation transcript"
+              tabIndex={0}
+              ref={transcriptRef}
+              onScroll={(event) => {
+                const transcript = event.currentTarget;
+                const distanceFromBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight;
+                followTranscriptRef.current = distanceFromBottom < 96;
+              }}
+            >
               {sortedThreadRuns.length === 0 ? (
                 <div className="empty-state">
                   <MessageCircle size={28} />
@@ -1884,6 +2063,12 @@ export function App() {
         </section>
 
           </>
+        )}
+        {activeSection === "routines" && (
+          <RoutineWorkbench onAuthRequired={() => {
+            setAuthPromptOpen(true);
+            setApiTokenDraft(getApiToken());
+          }} />
         )}
         {activeSection === "advanced" && (
           <section id="advanced" className="shell page-shell advanced-page" data-section="advanced" aria-label="Advanced Operator Console">
@@ -3510,6 +3695,723 @@ export function App() {
   );
 }
 
+type RoutineDraft = {
+  name: string;
+  prompt: string;
+  schedule_kind: "once" | "interval";
+  start_at_local: string;
+  interval_seconds: string;
+  workspace: string;
+  provider: string;
+  model: string;
+  autonomy_mode: string;
+  misfire_grace_seconds: string;
+};
+
+type RoutineRunNowRequestRecord = {
+  idempotencyKey: string;
+  expectedRevision: number;
+};
+
+const ROUTINE_RUN_NOW_STORAGE_PREFIX = "kestrel.routine.run-now.v1:";
+const ROUTINE_HISTORY_POLL_INTERVAL_MS = 1_500;
+const ROUTINE_HISTORY_MAX_POLLS = 400;
+const ROUTINE_NONTERMINAL_STATUSES = new Set(["claimed", "running"]);
+const ROUTINE_RUN_NOW_DEFINITIVE_REJECTION_STATUSES = new Set([400, 401, 403, 404, 409, 422]);
+
+type RoutineHistoryRequest = {
+  routineId: string;
+  controller: AbortController;
+  promise: Promise<void>;
+};
+
+function RoutineWorkbench({ onAuthRequired }: { onAuthRequired: () => void }) {
+  const [status, setStatus] = useState<RoutineStatus | null>(null);
+  const [routines, setRoutines] = useState<Routine[]>([]);
+  const [selectedRoutineId, setSelectedRoutineId] = useState<string | null>(null);
+  const selectedRoutineIdRef = useRef<string | null>(null);
+  const [history, setHistory] = useState<RoutineOccurrence[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [editorMode, setEditorMode] = useState<"create" | "edit" | null>(null);
+  const [draft, setDraft] = useState<RoutineDraft>(() => emptyRoutineDraft());
+  const [mutationPending, setMutationPending] = useState(false);
+  const [runNowPendingId, setRunNowPendingId] = useState<string | null>(null);
+  const [uncertainRoutineIds, setUncertainRoutineIds] = useState<Set<string>>(() => new Set());
+  const [runNowResult, setRunNowResult] = useState<RoutineRunNowResult | null>(null);
+  const runNowRequestRef = useRef(new Map<string, RoutineRunNowRequestRecord>());
+  const historyRequestRef = useRef<RoutineHistoryRequest | null>(null);
+
+  const selectedRoutine = routines.find((routine) => routine.routine_id === selectedRoutineId) ?? null;
+  const selectedHistoryHasNonterminalOccurrence = history.some((occurrence) =>
+    ROUTINE_NONTERMINAL_STATUSES.has(occurrence.status)
+  );
+  const localTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "local time";
+
+  function selectRoutineId(routineId: string | null) {
+    if (selectedRoutineIdRef.current !== routineId) {
+      historyRequestRef.current?.controller.abort();
+      historyRequestRef.current = null;
+      setHistory([]);
+      setHistoryError(null);
+      setHistoryLoading(false);
+    }
+    selectedRoutineIdRef.current = routineId;
+    setSelectedRoutineId(routineId);
+  }
+
+  const handleError = useCallback((value: unknown, fallback: string) => {
+    if (value instanceof ApiAuthError) {
+      onAuthRequired();
+      return "Kestrel API authentication is required for routine owner actions.";
+    }
+    return value instanceof Error ? value.message : fallback;
+  }, [onAuthRequired]);
+
+  const refreshHistory = useCallback(async (routineId: string, options: { showLoading?: boolean } = {}) => {
+    const existingRequest = historyRequestRef.current;
+    if (existingRequest?.routineId === routineId) {
+      return existingRequest.promise;
+    }
+
+    existingRequest?.controller.abort();
+    const controller = new AbortController();
+    const request: RoutineHistoryRequest = {
+      routineId,
+      controller,
+      promise: Promise.resolve()
+    };
+    historyRequestRef.current = request;
+
+    if (options.showLoading !== false) setHistoryLoading(true);
+    setHistoryError(null);
+    request.promise = (async () => {
+      try {
+        const rows = await getJson<RoutineOccurrence[]>(
+          `/api/routines/${encodeURIComponent(routineId)}/history${queryString({ limit: 50 })}`,
+          { signal: controller.signal }
+        );
+        if (controller.signal.aborted || selectedRoutineIdRef.current !== routineId) return;
+        setHistory(rows);
+        setRunNowResult((current) => {
+          if (!current || current.occurrence.routine_id !== routineId) return current;
+          const occurrence = rows.find(
+            (row) => row.occurrence_id === current.occurrence.occurrence_id
+          );
+          if (!occurrence) return current;
+          return {
+            ...current,
+            occurrence,
+            dispatch: current.dispatch
+              ? {
+                  ...current.dispatch,
+                  status: occurrence.status,
+                  error: occurrence.error
+                }
+              : null
+          };
+        });
+      } catch (value) {
+        if (controller.signal.aborted || selectedRoutineIdRef.current !== routineId) return;
+        setHistory([]);
+        setHistoryError(handleError(value, "Routine history is unavailable."));
+      } finally {
+        if (historyRequestRef.current === request) historyRequestRef.current = null;
+        if (!controller.signal.aborted && selectedRoutineIdRef.current === routineId) {
+          setHistoryLoading(false);
+        }
+      }
+    })();
+    return request.promise;
+  }, [handleError]);
+
+  async function refreshWorkbench(preferredRoutineId = selectedRoutineIdRef.current) {
+    setLoading(true);
+    setLoadError(null);
+    const [statusResult, routinesResult] = await Promise.allSettled([
+      getJson<RoutineStatus>("/api/routines/status"),
+      getJson<Routine[]>("/api/routines")
+    ]);
+
+    if (statusResult.status === "fulfilled") {
+      setStatus(statusResult.value);
+    } else {
+      setStatus(null);
+      setLoadError(handleError(statusResult.reason, "Routine status is unavailable."));
+    }
+
+    if (routinesResult.status === "fulfilled") {
+      const nextRoutines = routinesResult.value;
+      setRoutines(nextRoutines);
+      const recoveredUncertain = new Set<string>();
+      nextRoutines.forEach((routine) => {
+        const recovered = runNowRequestRef.current.get(routine.routine_id) ?? readStoredRunNowRequest(routine.routine_id);
+        if (!recovered) return;
+        runNowRequestRef.current.set(routine.routine_id, recovered);
+        recoveredUncertain.add(routine.routine_id);
+      });
+      setUncertainRoutineIds(recoveredUncertain);
+      const nextSelection =
+        nextRoutines.find((routine) => routine.routine_id === preferredRoutineId)?.routine_id ??
+        nextRoutines[0]?.routine_id ??
+        null;
+      selectRoutineId(nextSelection);
+      if (nextSelection) {
+        await refreshHistory(nextSelection);
+      } else {
+        setHistory([]);
+        setHistoryError(null);
+      }
+    } else {
+      setRoutines([]);
+      selectRoutineId(null);
+      setHistory([]);
+      const message = handleError(routinesResult.reason, "Routine definitions are unavailable.");
+      setLoadError((current) => current ? `${current} ${message}` : message);
+    }
+    setLoading(false);
+  }
+
+  useEffect(() => {
+    void refreshWorkbench();
+  }, []);
+
+  useEffect(() => () => {
+    selectedRoutineIdRef.current = null;
+    historyRequestRef.current?.controller.abort();
+    historyRequestRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    if (!selectedRoutineId || !selectedHistoryHasNonterminalOccurrence) return;
+
+    let cancelled = false;
+    let pollCount = 0;
+    let timeoutId: number | null = null;
+
+    const poll = async () => {
+      if (cancelled) return;
+      pollCount += 1;
+      await refreshHistory(selectedRoutineId, { showLoading: false });
+      if (!cancelled && pollCount < ROUTINE_HISTORY_MAX_POLLS) schedulePoll();
+    };
+    const schedulePoll = () => {
+      timeoutId = window.setTimeout(() => {
+        timeoutId = null;
+        void poll();
+      }, ROUTINE_HISTORY_POLL_INTERVAL_MS);
+    };
+
+    schedulePoll();
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+    };
+  }, [refreshHistory, selectedHistoryHasNonterminalOccurrence, selectedRoutineId]);
+
+  async function chooseRoutine(routine: Routine) {
+    selectRoutineId(routine.routine_id);
+    setRunNowResult(null);
+    await refreshHistory(routine.routine_id);
+  }
+
+  function openCreateEditor() {
+    setDraft(emptyRoutineDraft());
+    setEditorMode("create");
+    setActionError(null);
+  }
+
+  function openEditEditor(routine: Routine) {
+    setDraft(routineDraftFrom(routine));
+    selectRoutineId(routine.routine_id);
+    setEditorMode("edit");
+    setActionError(null);
+  }
+
+  async function submitRoutine(event: FormEvent) {
+    event.preventDefault();
+    setActionError(null);
+    setNotice(null);
+    setMutationPending(true);
+    try {
+      const payload = routinePayload(draft);
+      const saved = editorMode === "edit" && selectedRoutine
+        ? await putJson<Routine>(`/api/routines/${encodeURIComponent(selectedRoutine.routine_id)}`, {
+            expected_revision: selectedRoutine.revision,
+            ...payload
+          })
+        : await postJson<Routine>("/api/routines", payload);
+      setEditorMode(null);
+      setNotice(editorMode === "edit" ? `${saved.name} updated.` : `${saved.name} created disabled; review it before enabling.`);
+      await refreshWorkbench(saved.routine_id);
+    } catch (value) {
+      setActionError(handleError(value, "Routine could not be saved."));
+    } finally {
+      setMutationPending(false);
+    }
+  }
+
+  async function toggleRoutine(routine: Routine) {
+    setActionError(null);
+    setNotice(null);
+    setMutationPending(true);
+    try {
+      const saved = await putJson<Routine>(`/api/routines/${encodeURIComponent(routine.routine_id)}/enabled`, {
+        expected_revision: routine.revision,
+        enabled: !routine.enabled
+      });
+      setNotice(`${saved.name} ${saved.enabled ? "enabled" : "paused"}.`);
+      await refreshWorkbench(saved.routine_id);
+    } catch (value) {
+      setActionError(handleError(value, "Routine state could not be changed."));
+    } finally {
+      setMutationPending(false);
+    }
+  }
+
+  async function deleteRoutine(routine: Routine) {
+    if (!window.confirm(`Delete ${routine.name}? Its occurrence history remains in the local audit store.`)) return;
+    setActionError(null);
+    setNotice(null);
+    setMutationPending(true);
+    try {
+      await deleteJson<Routine>(
+        `/api/routines/${encodeURIComponent(routine.routine_id)}${queryString({ expected_revision: routine.revision })}`
+      );
+      forgetRunNowRequest(runNowRequestRef.current, routine.routine_id);
+      setUncertainRoutineIds((current) => withoutSetValue(current, routine.routine_id));
+      setNotice(`${routine.name} deleted.`);
+      await refreshWorkbench(null);
+    } catch (value) {
+      setActionError(handleError(value, "Routine could not be deleted."));
+    } finally {
+      setMutationPending(false);
+    }
+  }
+
+  async function runRoutineNow(routine: Routine) {
+    let request = runNowRequestRef.current.get(routine.routine_id) ?? readStoredRunNowRequest(routine.routine_id);
+    if (!request) {
+      request = {
+        idempotencyKey: crypto.randomUUID(),
+        expectedRevision: routine.revision
+      };
+      runNowRequestRef.current.set(routine.routine_id, request);
+      storeRunNowRequest(routine.routine_id, request);
+    }
+
+    setRunNowPendingId(routine.routine_id);
+    setActionError(null);
+    setNotice(null);
+    try {
+      const result = await postJson<RoutineRunNowResult>(
+        `/api/routines/${encodeURIComponent(routine.routine_id)}/actions/run-now`,
+        {
+          expected_revision: request.expectedRevision,
+          idempotency_key: request.idempotencyKey
+        }
+      );
+      forgetRunNowRequest(runNowRequestRef.current, routine.routine_id);
+      setUncertainRoutineIds((current) => withoutSetValue(current, routine.routine_id));
+      setRunNowResult(result);
+      setNotice(
+        result.idempotent_replay
+          ? `${routine.name} request recovered without creating a duplicate run.`
+          : `${routine.name} dispatched.`
+      );
+      await refreshHistory(routine.routine_id);
+    } catch (value) {
+      if (
+        value instanceof ApiResponseError
+        && ROUTINE_RUN_NOW_DEFINITIVE_REJECTION_STATUSES.has(value.status)
+      ) {
+        forgetRunNowRequest(runNowRequestRef.current, routine.routine_id);
+        setUncertainRoutineIds((current) => withoutSetValue(current, routine.routine_id));
+        setActionError(handleError(value, "Routine dispatch was rejected."));
+      } else {
+        setUncertainRoutineIds((current) => new Set(current).add(routine.routine_id));
+        const reason = value instanceof ApiResponseError
+          ? `The server returned ${value.status} before confirming the outcome for ${routine.name}.`
+          : `No response was received for ${routine.name}.`;
+        setActionError(`${reason} Retry run now to safely reuse the same request key.`);
+      }
+    } finally {
+      setRunNowPendingId(null);
+    }
+  }
+
+  const enabledCount = routines.filter((routine) => routine.enabled).length;
+  const selectedIsUncertain = selectedRoutine ? uncertainRoutineIds.has(selectedRoutine.routine_id) : false;
+
+  return (
+    <section id="routines" className="shell page-shell routines-page" data-section="routines" aria-label="Routine Workbench">
+      <header className="page-head">
+        <div>
+          <p className="page-eyebrow">Personal automation</p>
+          <h1 className="page-title">Routine Workbench<em>.</em></h1>
+          <p className="page-subtitle">
+            Schedule durable local turns, inspect their audit history, and dispatch one routine now without duplicate retries.
+          </p>
+        </div>
+        <div className="page-actions">
+          <button className="btn subtle" type="button" onClick={() => void refreshWorkbench()} disabled={loading}>
+            <RefreshCw size={15} /> Refresh
+          </button>
+          <button className="btn primary" type="button" onClick={openCreateEditor}>
+            <Plus size={15} /> New routine
+          </button>
+        </div>
+      </header>
+
+      <div className="announcer page-notice" aria-live="polite">{notice}</div>
+      {loadError && <ActionError message={loadError} onDismiss={() => setLoadError(null)} />}
+      {actionError && <ActionError message={actionError} onDismiss={() => setActionError(null)} />}
+
+      <section className="routine-status-grid" aria-label="Routine service status">
+        <Metric label="Definitions" value={routines.length} />
+        <Metric label="Enabled" value={enabledCount} />
+        <Metric label="Dispatcher" value={status?.enabled ? "enabled" : "disabled"} />
+        <Metric label="Loop" value={status?.loop?.running ? "running" : status?.loop ? "stopped" : "unavailable"} />
+      </section>
+
+      {status && !status.enabled && (
+        <section className="routine-disabled-callout" role="status">
+          <ShieldCheck size={18} />
+          <div>
+            <strong>Proactive dispatch is disabled.</strong>
+            <p>Definitions remain editable, but scheduled and manual runs stay fail-closed until proactive routines are enabled at launch.</p>
+          </div>
+        </section>
+      )}
+      {status?.loop?.last_error && (
+        <section className="routine-disabled-callout danger" role="alert">
+          <div>
+            <strong>The routine loop reported an error.</strong>
+            <p>{status.loop.last_error}</p>
+          </div>
+        </section>
+      )}
+
+      <div className="routine-workbench-grid">
+        <Panel
+          id="routine-definitions"
+          title="Routines"
+          icon={<CalendarClock size={19} />}
+          actions={<StatusBadge value={loading ? "loading" : `${routines.length} total`} />}
+        >
+          <div className="routine-list">
+            {routines.map((routine) => (
+              <article
+                className={`routine-card ${routine.routine_id === selectedRoutineId ? "selected" : ""}`}
+                key={routine.routine_id}
+              >
+                <button type="button" className="routine-select" onClick={() => void chooseRoutine(routine)}>
+                  <span>
+                    <strong>{routine.name}</strong>
+                    <small>{routineScheduleLabel(routine)}</small>
+                  </span>
+                  <StatusBadge value={routine.enabled ? "enabled" : "paused"} />
+                </button>
+                <div className="routine-card-actions">
+                  <button
+                    type="button"
+                    aria-label={`${routine.enabled ? "Pause" : "Enable"} ${routine.name}`}
+                    onClick={() => void toggleRoutine(routine)}
+                    disabled={mutationPending || uncertainRoutineIds.has(routine.routine_id)}
+                  >
+                    {routine.enabled ? "Pause" : "Enable"}
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`Edit ${routine.name}`}
+                    onClick={() => openEditEditor(routine)}
+                    disabled={mutationPending || uncertainRoutineIds.has(routine.routine_id)}
+                  >
+                    <Pencil size={14} /> Edit
+                  </button>
+                  <button
+                    type="button"
+                    className="btn danger"
+                    aria-label={`Delete ${routine.name}`}
+                    onClick={() => void deleteRoutine(routine)}
+                    disabled={mutationPending || uncertainRoutineIds.has(routine.routine_id)}
+                  >
+                    <Trash2 size={14} /> Delete
+                  </button>
+                </div>
+              </article>
+            ))}
+            {!loading && routines.length === 0 && <EmptyState>No routines yet. Create one to start with a disabled, reviewable definition.</EmptyState>}
+          </div>
+        </Panel>
+
+        <Panel
+          id="routine-detail"
+          title={selectedRoutine?.name ?? "Routine detail"}
+          icon={<Play size={19} />}
+          actions={selectedRoutine ? <StatusBadge value={`revision ${selectedRoutine.revision}`} /> : undefined}
+        >
+          {selectedRoutine ? (
+            <div className="routine-detail">
+              <p>{selectedRoutine.prompt}</p>
+              <dl className="routine-facts">
+                <div><dt>Schedule</dt><dd>{routineScheduleLabel(selectedRoutine)}</dd></div>
+                <div><dt>Next run</dt><dd>{formatRoutineDate(selectedRoutine.next_run_at)}</dd></div>
+                <div><dt>Workspace</dt><dd>{selectedRoutine.workspace || "Configured default"}</dd></div>
+                <div><dt>Provider</dt><dd>{[selectedRoutine.provider, selectedRoutine.model].filter(Boolean).join(" / ") || "Configured default"}</dd></div>
+                <div><dt>Autonomy</dt><dd>{selectedRoutine.autonomy_mode}</dd></div>
+                <div><dt>Timezone</dt><dd>{localTimeZone} display · UTC storage</dd></div>
+              </dl>
+              <button
+                type="button"
+                className="btn primary routine-run-now"
+                aria-label={`${selectedIsUncertain ? "Retry" : "Run"} ${selectedRoutine.name} now`}
+                disabled={!status?.enabled || !selectedRoutine.enabled || runNowPendingId !== null}
+                onClick={() => void runRoutineNow(selectedRoutine)}
+              >
+                <Play size={14} />
+                {runNowPendingId === selectedRoutine.routine_id
+                  ? "Dispatching…"
+                  : selectedIsUncertain
+                    ? "Retry run now safely"
+                    : "Run now"}
+              </button>
+              {!selectedRoutine.enabled && <p className="muted">Enable this definition before running it.</p>}
+              {selectedIsUncertain && (
+                <p className="routine-retry-note" role="status">
+                  Retry will reuse the original idempotency key and revision until the server gives a definite response.
+                </p>
+              )}
+              {runNowResult?.occurrence.routine_id === selectedRoutine.routine_id && (
+                <div className="routine-run-result" aria-live="polite">
+                  <strong>{runNowResult.idempotent_replay ? "Recovered dispatch" : "Dispatch accepted"}</strong>
+                  <InlineMeta items={[runNowResult.occurrence.run_id, runNowResult.occurrence.status, runNowResult.occurrence.trigger_kind]} />
+                </div>
+              )}
+              <section className="routine-history" aria-labelledby="routine-history-title">
+                <div className="routine-history-head">
+                  <h3 id="routine-history-title">Run history</h3>
+                  <StatusBadge value={historyLoading ? "loading" : `${history.length} records`} />
+                </div>
+                {historyError && <p className="danger-text">History unavailable: {historyError}</p>}
+                <div className="list compact-list">
+                  {history.map((occurrence) => (
+                    <article className="data-row" key={occurrence.occurrence_id}>
+                      <div className="run-title">
+                        <strong>{occurrence.trigger_kind === "manual" ? "Manual run" : "Scheduled run"}</strong>
+                        <StatusBadge value={occurrence.status} />
+                      </div>
+                      <InlineMeta items={[occurrence.run_id, formatRoutineDate(occurrence.requested_at ?? occurrence.scheduled_for)]} />
+                      {(occurrence.error || occurrence.skip_reason) && <p className="danger-text">{occurrence.error || occurrence.skip_reason}</p>}
+                    </article>
+                  ))}
+                  {!historyLoading && !historyError && history.length === 0 && <EmptyState>No occurrences recorded for this routine.</EmptyState>}
+                </div>
+              </section>
+            </div>
+          ) : (
+            <EmptyState>Select a routine to inspect its schedule and run history.</EmptyState>
+          )}
+        </Panel>
+      </div>
+
+      {editorMode && (
+        <Panel
+          id="routine-editor"
+          title={editorMode === "edit" ? `Edit ${selectedRoutine?.name ?? "routine"}` : "Create routine"}
+          icon={editorMode === "edit" ? <Pencil size={19} /> : <Plus size={19} />}
+        >
+          <form className="routine-editor-form" aria-label={editorMode === "edit" ? "Edit routine" : "Create routine"} onSubmit={submitRoutine}>
+            <Field label="Routine name">
+              <input required maxLength={200} value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} />
+            </Field>
+            <Field label="Prompt">
+              <textarea required maxLength={20_000} rows={5} value={draft.prompt} onChange={(event) => setDraft((current) => ({ ...current, prompt: event.target.value }))} />
+            </Field>
+            <div className="field-row">
+              <Field label="Schedule">
+                <select value={draft.schedule_kind} onChange={(event) => setDraft((current) => ({ ...current, schedule_kind: event.target.value as "once" | "interval" }))}>
+                  <option value="once">Once</option>
+                  <option value="interval">Fixed interval</option>
+                </select>
+              </Field>
+              <Field label={`Start time (${localTimeZone})`} hint="Stored as UTC after submission.">
+                <input type="datetime-local" required value={draft.start_at_local} onChange={(event) => setDraft((current) => ({ ...current, start_at_local: event.target.value }))} />
+              </Field>
+              {draft.schedule_kind === "interval" && (
+                <Field label="Interval seconds" hint="Minimum 60 seconds.">
+                  <input type="number" required min="60" max="31536000" step="1" value={draft.interval_seconds} onChange={(event) => setDraft((current) => ({ ...current, interval_seconds: event.target.value }))} />
+                </Field>
+              )}
+              <Field label="Misfire grace seconds">
+                <input type="number" required min="0" max="604800" step="1" value={draft.misfire_grace_seconds} onChange={(event) => setDraft((current) => ({ ...current, misfire_grace_seconds: event.target.value }))} />
+              </Field>
+            </div>
+            <div className="field-row">
+              <Field label="Workspace" hint="Blank uses the configured default.">
+                <input maxLength={4096} value={draft.workspace} onChange={(event) => setDraft((current) => ({ ...current, workspace: event.target.value }))} />
+              </Field>
+              <Field label="Provider" hint="Blank uses the configured default.">
+                <input maxLength={256} value={draft.provider} onChange={(event) => setDraft((current) => ({ ...current, provider: event.target.value }))} />
+              </Field>
+              <Field label="Model" hint="Blank uses the configured default.">
+                <input maxLength={256} value={draft.model} onChange={(event) => setDraft((current) => ({ ...current, model: event.target.value }))} />
+              </Field>
+              <Field label="Autonomy">
+                <select value={draft.autonomy_mode} onChange={(event) => setDraft((current) => ({ ...current, autonomy_mode: event.target.value }))}>
+                  <option value="background">Safe Auto</option>
+                  <option value="manual">Manual</option>
+                  <option value="autonomous">Autopilot</option>
+                </select>
+              </Field>
+            </div>
+            <div className="page-actions">
+              <button className="btn primary" type="submit" disabled={mutationPending}>{mutationPending ? "Saving…" : "Save routine"}</button>
+              <button className="btn subtle" type="button" onClick={() => setEditorMode(null)} disabled={mutationPending}>Cancel</button>
+            </div>
+          </form>
+        </Panel>
+      )}
+    </section>
+  );
+}
+
+function emptyRoutineDraft(): RoutineDraft {
+  const start = new Date(Date.now() + 60 * 60 * 1000);
+  start.setSeconds(0, 0);
+  return {
+    name: "",
+    prompt: "",
+    schedule_kind: "once",
+    start_at_local: localDateTimeInput(start),
+    interval_seconds: "3600",
+    workspace: "",
+    provider: "",
+    model: "",
+    autonomy_mode: "background",
+    misfire_grace_seconds: "60"
+  };
+}
+
+function routineDraftFrom(routine: Routine): RoutineDraft {
+  return {
+    name: routine.name,
+    prompt: routine.prompt,
+    schedule_kind: routine.schedule_kind,
+    start_at_local: localDateTimeInput(new Date(routine.start_at)),
+    interval_seconds: String(routine.interval_seconds ?? 3600),
+    workspace: routine.workspace ?? "",
+    provider: routine.provider ?? "",
+    model: routine.model ?? "",
+    autonomy_mode: routine.autonomy_mode,
+    misfire_grace_seconds: String(routine.misfire_grace_seconds)
+  };
+}
+
+function routinePayload(draft: RoutineDraft): Record<string, unknown> {
+  const start = new Date(draft.start_at_local);
+  if (Number.isNaN(start.valueOf())) throw new Error("Start time must be a valid local date and time.");
+  const intervalSeconds = Number(draft.interval_seconds);
+  const misfireGraceSeconds = Number(draft.misfire_grace_seconds);
+  if (
+    draft.schedule_kind === "interval" &&
+    (!Number.isInteger(intervalSeconds) || intervalSeconds < 60 || intervalSeconds > 31_536_000)
+  ) {
+    throw new Error("Interval seconds must be an integer between 60 and 31536000.");
+  }
+  if (!Number.isInteger(misfireGraceSeconds) || misfireGraceSeconds < 0 || misfireGraceSeconds > 604_800) {
+    throw new Error("Misfire grace seconds must be an integer between 0 and 604800.");
+  }
+  return {
+    name: draft.name.trim(),
+    prompt: draft.prompt.trim(),
+    schedule_kind: draft.schedule_kind,
+    start_at: start.toISOString(),
+    interval_seconds: draft.schedule_kind === "interval" ? intervalSeconds : null,
+    workspace: draft.workspace.trim() || null,
+    provider: draft.provider.trim() || null,
+    model: draft.model.trim() || null,
+    autonomy_mode: draft.autonomy_mode,
+    misfire_grace_seconds: misfireGraceSeconds
+  };
+}
+
+function localDateTimeInput(date: Date): string {
+  const offset = date.getTimezoneOffset() * 60_000;
+  return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+}
+
+function routineScheduleLabel(routine: Routine): string {
+  if (routine.schedule_kind === "interval") {
+    return `Every ${formatDuration(routine.interval_seconds ?? 0)} from ${formatRoutineDate(routine.start_at)}`;
+  }
+  return `Once at ${formatRoutineDate(routine.start_at)}`;
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds > 0 && seconds % 86_400 === 0) return `${seconds / 86_400}d`;
+  if (seconds > 0 && seconds % 3_600 === 0) return `${seconds / 3_600}h`;
+  if (seconds > 0 && seconds % 60 === 0) return `${seconds / 60}m`;
+  return `${seconds}s`;
+}
+
+function formatRoutineDate(value: string | null | undefined): string {
+  if (!value) return "Not scheduled";
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
+}
+
+function storeRunNowRequest(routineId: string, request: RoutineRunNowRequestRecord) {
+  try {
+    sessionStorage.setItem(`${ROUTINE_RUN_NOW_STORAGE_PREFIX}${encodeURIComponent(routineId)}`, JSON.stringify(request));
+  } catch {
+    // The in-memory request map still preserves retry safety when browser storage is unavailable.
+  }
+}
+
+function readStoredRunNowRequest(routineId: string): RoutineRunNowRequestRecord | null {
+  const key = `${ROUTINE_RUN_NOW_STORAGE_PREFIX}${encodeURIComponent(routineId)}`;
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<RoutineRunNowRequestRecord>;
+    if (
+      typeof parsed.idempotencyKey !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed.idempotencyKey) ||
+      !Number.isInteger(parsed.expectedRevision) ||
+      Number(parsed.expectedRevision) < 1
+    ) {
+      sessionStorage.removeItem(key);
+      return null;
+    }
+    return {
+      idempotencyKey: parsed.idempotencyKey,
+      expectedRevision: Number(parsed.expectedRevision)
+    };
+  } catch {
+    return null;
+  }
+}
+
+function forgetRunNowRequest(requests: Map<string, RoutineRunNowRequestRecord>, routineId: string) {
+  requests.delete(routineId);
+  try {
+    sessionStorage.removeItem(`${ROUTINE_RUN_NOW_STORAGE_PREFIX}${encodeURIComponent(routineId)}`);
+  } catch {
+    // The request is already removed from the active in-memory retry boundary.
+  }
+}
+
+function withoutSetValue(values: Set<string>, value: string): Set<string> {
+  const next = new Set(values);
+  next.delete(value);
+  return next;
+}
+
 function SetupWizard({
   draft,
   personas,
@@ -3702,15 +4604,35 @@ function RepairPatchReview({
   const rollbackTask = repairTasks.find((task) => taskUsesTool(task, "repair.rollback"));
 
   const validationResult = validationTask?.result ?? null;
+  const validationArtifact = readRecord(validationResult?.repair_artifact);
   const validation = readRecord(validationResult?.validation);
-  const validationSuccess = validation?.success === true;
+  const validationSnapshot = readRecord(validationArtifact?.repair_snapshot);
+  const validationId = String(validationArtifact?.validation_id ?? validation?.validation_id ?? "pending");
+  const explicitValidationSuccess = validation?.success;
+  const validationSuccess = explicitValidationSuccess === true || (
+    explicitValidationSuccess === undefined
+    && validationTask?.status === "completed"
+    && ["repair.validate", "repair.orchestrate_validate"].includes(String(validationArtifact?.tool ?? ""))
+    && validationId !== "pending"
+  );
+  const validationFailed = explicitValidationSuccess === false;
+  const validationLabel = validationSuccess
+    ? "Validation passed"
+    : validationFailed
+      ? "Validation failed"
+      : "Validation pending";
   const validationCommand = formatCommand(validation?.command);
+  const validationEvidence = validationCommand || (validationId !== "pending" ? validationId : validationTask?.title ?? "pending");
 
   const reviewResult = reviewTask?.result ?? null;
-  const reviewId = String(reviewResult?.review_id ?? "pending");
-  const diffHash = String(reviewResult?.diff_hash ?? "pending");
-  const changedFiles = asStringArray(reviewResult?.changed_files);
-  const commitGate = readRecord(reviewResult?.commit_gate);
+  const reviewArtifact = readRecord(reviewResult?.repair_artifact);
+  const reviewSnapshot = readRecord(reviewArtifact?.repair_snapshot);
+  const reviewId = String(reviewArtifact?.review_id ?? reviewResult?.review_id ?? "pending");
+  const diffHash = String(reviewSnapshot?.diff_digest ?? reviewResult?.diff_hash ?? "pending");
+  const reviewBranch = String(reviewSnapshot?.branch ?? "pending");
+  const reviewHead = String(reviewSnapshot?.head_sha ?? "pending");
+  const changedFiles = asStringArray(reviewArtifact?.changed_files ?? reviewResult?.changed_files);
+  const commitGate = readRecord(reviewArtifact?.commit_gate ?? reviewResult?.commit_gate);
   const commitApprovalRequired = commitGate?.approval_required_before_commit === true;
 
   const rollbackResult = rollbackTask?.result ?? null;
@@ -3727,7 +4649,8 @@ function RepairPatchReview({
   const prepareRollback = () => {
     onPrepareTool("repair.rollback", {
       reason: `Rollback reviewed repair ${reviewId}`,
-      review_id: reviewId
+      review_id: reviewId,
+      expected_current_diff_digest: diffHash
     });
   };
 
@@ -3741,9 +4664,10 @@ function RepairPatchReview({
       <div className="list compact-list">
         {validationTask && (
           <div className="data-row">
-            <strong>{validationSuccess ? "Validation passed" : "Validation pending"}</strong>
+            <strong>{validationLabel}</strong>
             <InlineMeta items={[validationTask.status, validationTask.risk, validationTask.scheduler_reason]} />
-            <p>{`${validationSuccess ? "Validation passed" : "Validation state"}: ${validationCommand || validationTask.title}`}</p>
+            <p>{`${validationSuccess || validationFailed ? validationLabel : "Validation state"}: ${validationEvidence}`}</p>
+            {Boolean(validationSnapshot?.diff_digest) && <p>{`Candidate digest ${String(validationSnapshot?.diff_digest)}`}</p>}
           </div>
         )}
         {reviewTask && (
@@ -3752,6 +4676,7 @@ function RepairPatchReview({
             <InlineMeta items={[reviewTask.status, reviewTask.profile, commitApprovalRequired ? "exact-call commit approval" : "commit gate pending"]} />
             <p>{`Review gate: ${reviewId} · ${commitApprovalRequired ? "commit approval required" : "commit gate pending"}`}</p>
             <p>{`Diff ${diffHash} · ${changedFiles.length ? changedFiles.join(", ") : "no changed files recorded"}`}</p>
+            {reviewBranch !== "pending" && <p>{`Candidate ${reviewBranch} @ ${reviewHead}`}</p>}
             <button type="button" className="btn subtle" disabled={!hasReviewArtifact} onClick={prepareCommit}>
               Prepare exact-call git.commit request
             </button>
@@ -3863,7 +4788,7 @@ function LiveRunActivity({ run, events }: { run: Run; events: TraceEvent[] }) {
   const isRunning = run.status === "queued" || run.status === "running";
   if (items.length === 0 && !isRunning) return null;
   return (
-    <div className="activity" aria-label="Live run activity" aria-live="polite">
+    <div className="activity" role="status" aria-label="Live run activity" aria-live="polite">
       <div className="act-heading">
         <Brain size={15} />
         <strong>Thinking</strong>
@@ -4166,9 +5091,11 @@ function createThreadId(): string {
   return `thread_${crypto.randomUUID()}`;
 }
 
-function sectionFromHash(hash: string): "chat" | "advanced" | "settings" | null {
+function sectionFromHash(hash: string): AppSection | null {
   const normalized = hash.replace(/^#/, "").toLowerCase();
-  return normalized === "chat" || normalized === "advanced" || normalized === "settings" ? normalized : null;
+  return normalized === "chat" || normalized === "routines" || normalized === "advanced" || normalized === "settings"
+    ? normalized
+    : null;
 }
 
 function scrollToElement(id: string) {

@@ -10,7 +10,11 @@ from nested_memvid_agent.retention import RetentionCompactor
 
 
 def test_retention_compactor_dry_run_skips_stable_layers(tmp_path: Path) -> None:
-    memory = LayeredMemorySystem.from_backend_factory(tmp_path, InMemoryBackend)
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path,
+        InMemoryBackend,
+        enforce_stable_write_integrity=False,
+    )
     memory.put(
         MemoryRecord(
             id="stable-fact",

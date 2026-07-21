@@ -11,6 +11,7 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from ..config import AgentConfig
+from .provider_urls import normalize_ollama_openai_base_url, validate_provider_http_url
 
 PROVIDER_OPTIONS: tuple[str, ...] = (
     "mock",
@@ -231,7 +232,7 @@ def _fetch_provider_models(
         )
         return _catalog(provider, _model_ids(payload), fallback, "provider", base_url, api_key_env, secret_resolver=secret_resolver)
     if provider == "ollama":
-        base_url = _base_url_for_provider(config, provider) or DEFAULT_BASE_URLS[provider]
+        base_url = normalize_ollama_openai_base_url(_base_url_for_provider(config, provider))
         payload = _fetch_json(
             _join_url(base_url, "models"),
             timeout_seconds=_catalog_timeout(config),
@@ -327,12 +328,14 @@ def _fetch_json(
     headers: dict[str, str] | None = None,
     use_bearer: bool = True,
 ) -> Any:
+    safe_url = validate_provider_http_url(url)
     request_headers = {"Accept": "application/json", **(headers or {})}
     if api_key and use_bearer:
         request_headers["Authorization"] = f"Bearer {api_key}"
-    request = Request(url, headers=request_headers)
+    request = Request(safe_url, headers=request_headers)
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310 - URLs are fixed provider endpoints or user-configured provider bases
+        # The URL is restricted to HTTP(S) with a host immediately above.
+        with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310
             body = response.read().decode("utf-8")
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -380,7 +383,8 @@ def _unique(values: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def _join_url(base_url: str, suffix: str) -> str:
-    return urljoin(f"{base_url.rstrip('/')}/", suffix)
+    safe_base_url = validate_provider_http_url(base_url)
+    return validate_provider_http_url(urljoin(f"{safe_base_url.rstrip('/')}/", suffix))
 
 
 def _catalog_timeout(config: AgentConfig) -> float:

@@ -272,6 +272,7 @@ def test_plugin_mcp_stdio_command_is_allowlisted_and_hashed(tmp_path: Path) -> N
 
     good_repo = tmp_path / "good-repo"
     good_repo.mkdir()
+    (good_repo / "server.js").write_text("// reviewed\n", encoding="utf-8")
     _write_manifest(
         good_repo,
         {
@@ -282,8 +283,8 @@ def test_plugin_mcp_stdio_command_is_allowlisted_and_hashed(tmp_path: Path) -> N
                 {
                     "id": "node",
                     "transport": "stdio",
-                    "command": "npx",
-                    "args": ["@modelcontextprotocol/server-filesystem", "."],
+                    "command": "node",
+                    "args": ["server.js"],
                     "tools": [{"name": "read", "description": "Read", "risk": "low"}],
                 }
             ],
@@ -301,6 +302,7 @@ def test_plugin_mcp_stdio_command_is_allowlisted_and_hashed(tmp_path: Path) -> N
 def test_mcp_connect_refuses_plugin_command_hash_mismatch(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
+    (repo / "server.js").write_text("// reviewed\n", encoding="utf-8")
     _write_manifest(
         repo,
         {
@@ -311,8 +313,8 @@ def test_mcp_connect_refuses_plugin_command_hash_mismatch(tmp_path: Path) -> Non
                 {
                     "id": "node",
                     "transport": "stdio",
-                    "command": "npx",
-                    "args": ["@modelcontextprotocol/server-filesystem", "."],
+                    "command": "node",
+                    "args": ["server.js"],
                     "tools": [{"name": "read", "description": "Read", "risk": "low"}],
                 }
             ],
@@ -321,7 +323,9 @@ def test_mcp_connect_refuses_plugin_command_hash_mismatch(tmp_path: Path) -> Non
     state = AgentStateStore(tmp_path / "state.db")
     PluginManager(tmp_path / "plugins", state, fetcher=FakeFetcher(repo)).install("owner/tamper", enable=True)
     row = state.get_mcp_server("plugin.tamper.node")
-    row["args"] = ["@modelcontextprotocol/server-filesystem", "/tmp"]
+    replacement = tmp_path / "replacement.js"
+    replacement.write_text("// replacement\n", encoding="utf-8")
+    row["args"] = [str(replacement)]
     state.upsert_mcp_server(row)
 
     result = MCPManager(state).connect_server("plugin.tamper.node")
@@ -333,6 +337,7 @@ def test_mcp_connect_refuses_plugin_command_hash_mismatch(tmp_path: Path) -> Non
 def test_mcp_plugin_connect_requires_explicit_approval(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
+    (repo / "server.js").write_text("// reviewed\n", encoding="utf-8")
     _write_manifest(
         repo,
         {
@@ -343,8 +348,8 @@ def test_mcp_plugin_connect_requires_explicit_approval(tmp_path: Path) -> None:
                 {
                     "id": "node",
                     "transport": "stdio",
-                    "command": "npx",
-                    "args": ["@modelcontextprotocol/server-filesystem", "."],
+                    "command": "node",
+                    "args": ["server.js"],
                     "tools": [{"name": "read", "description": "Read", "risk": "low"}],
                 }
             ],
@@ -370,12 +375,12 @@ def test_mcp_plugin_connect_requires_explicit_approval(tmp_path: Path) -> None:
 
 
 def test_mcp_plugin_cannot_preseed_its_own_connect_approval(tmp_path: Path) -> None:
-    args = ["@modelcontextprotocol/server-filesystem", "."]
+    args = ["server.js"]
     command_hash = (
         "sha256:"
         + hashlib.sha256(
             json.dumps(
-                {"command": "npx", "args": args},
+                {"command": "node", "args": args},
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode("utf-8")
@@ -383,6 +388,7 @@ def test_mcp_plugin_cannot_preseed_its_own_connect_approval(tmp_path: Path) -> N
     )
     repo = tmp_path / "repo"
     repo.mkdir()
+    (repo / "server.js").write_text("// reviewed\n", encoding="utf-8")
     _write_manifest(
         repo,
         {
@@ -393,7 +399,7 @@ def test_mcp_plugin_cannot_preseed_its_own_connect_approval(tmp_path: Path) -> N
                 {
                     "id": "node",
                     "transport": "stdio",
-                    "command": "npx",
+                    "command": "node",
                     "args": args,
                     "tools": [{"name": "read", "description": "Read"}],
                     "vetting": {

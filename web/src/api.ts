@@ -1,16 +1,25 @@
 import { apiAuthHeaders, getApiToken } from "./auth";
 
-export class ApiAuthError extends Error {
-  readonly status = 401;
+export class ApiResponseError extends Error {
+  constructor(
+    message: string,
+    readonly status: number
+  ) {
+    super(message);
+    this.name = "ApiResponseError";
+  }
+}
+
+export class ApiAuthError extends ApiResponseError {
 
   constructor(message = "Kestrel API token required.") {
-    super(message);
+    super(message, 401);
     this.name = "ApiAuthError";
   }
 }
 
-export async function getJson<T>(path: string): Promise<T> {
-  const response = await fetch(path, { headers: apiAuthHeaders() });
+export async function getJson<T>(path: string, options: { signal?: AbortSignal } = {}): Promise<T> {
+  const response = await fetch(path, { headers: apiAuthHeaders(), signal: options.signal });
   return parseResponse<T>(response);
 }
 
@@ -44,13 +53,7 @@ async function parseResponse<T>(response: Response): Promise<T> {
     if (response.status === 401) {
       throw new ApiAuthError(errorMessage(payload, text, response.statusText));
     }
-    if (response.status === 403) {
-      throw new Error(errorMessage(payload, text, response.statusText));
-    }
-    if (response.status === 503) {
-      throw new Error(errorMessage(payload, text, response.statusText));
-    }
-    throw new Error(errorMessage(payload, text, response.statusText));
+    throw new ApiResponseError(errorMessage(payload, text, response.statusText), response.status);
   }
   return payload as T;
 }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from _fixtures import SemanticInMemoryBackend
@@ -58,6 +59,57 @@ def test_lesson_manager_deduplicates_similar_lessons_and_updates_counts(tmp_path
     assert "validation-2" in second.evidence_refs
     assert len(hits) == 1
     assert hits[0].record.metadata["repeat_count"] == 4
+
+
+def test_lesson_manager_marks_failure_resolved_with_validation_provenance(
+    tmp_path: Path,
+) -> None:
+    memory = LayeredMemorySystem.from_backend_factory(tmp_path, InMemoryBackend)
+    manager = LessonManager(memory)
+    failure = FailureEpisode(
+        failure_id="failure-resolution",
+        run_id="run-resolution",
+        task_id=None,
+        tool_name="test.run",
+        command="pytest -q",
+        error_text="AssertionError: expected fixed",
+        category="test_failure",
+        diagnosis="Test failure playbook",
+        attempted_strategy="Run without fixing the candidate.",
+    )
+    memory.put(failure.to_memory_record())
+    validation = ToolExecution(
+        call=ToolCall(
+            name="test.run",
+            arguments={"command": ["pytest", "tests/test_one.py", "-q"]},
+            id="validation-resolution",
+        ),
+        success=True,
+        content="1 passed",
+    )
+
+    manager.write_lesson_from_resolution(
+        failure=failure,
+        validation=validation,
+        strategy=StrategyProposal(
+            changed_strategy="Fix the focused candidate before validating the focused test."
+        ),
+    )
+
+    record = next(
+        item
+        for item in memory.iter_records(MemoryLayer.EPISODIC)
+        if item.id == failure.failure_id
+    )
+    payload = json.loads(record.content)
+    assert payload["resolved"] is True
+    assert payload["resolution_summary"].startswith("Fix the focused candidate")
+    assert payload["validation_evidence"] == ["validation-resolution"]
+    assert record.metadata["validation_status"] == "resolved"
+    assert [(item.source, item.locator) for item in record.evidence][-1] == (
+        "validation",
+        "validation-resolution",
+    )
 
 
 def test_lesson_manager_merges_semantic_equivalent_failure_wording(tmp_path: Path) -> None:

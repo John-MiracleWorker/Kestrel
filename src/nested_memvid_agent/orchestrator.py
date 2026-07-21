@@ -10,6 +10,8 @@ from .layers import LayeredMemorySystem, LayerSpec
 from .models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord
 from .promotion_ledger import PromotionLedger
 
+_DIRECT_OBSERVATION_LAYERS = frozenset({MemoryLayer.WORKING, MemoryLayer.EPISODIC})
+
 
 def build_memory_system(
     backend: str,
@@ -18,9 +20,16 @@ def build_memory_system(
     specs: dict[MemoryLayer, LayerSpec] | None = None,
     ledger: PromotionLedger | None = None,
     max_file_bytes: int = 1_073_741_824,
+    enforce_stable_write_integrity: bool = True,
 ) -> LayeredMemorySystem:
     if backend == "memory":
-        return LayeredMemorySystem.from_backend_factory(memory_dir, InMemoryBackend, specs=specs, ledger=ledger)
+        return LayeredMemorySystem.from_backend_factory(
+            memory_dir,
+            InMemoryBackend,
+            specs=specs,
+            ledger=ledger,
+            enforce_stable_write_integrity=enforce_stable_write_integrity,
+        )
     if backend == "memvid":
         return LayeredMemorySystem.from_backend_factory(
             memory_dir,
@@ -28,6 +37,7 @@ def build_memory_system(
             specs=specs,
             ledger=ledger,
             max_file_bytes=max_file_bytes,
+            enforce_stable_write_integrity=enforce_stable_write_integrity,
         )
     raise ValueError(f"Unknown backend: {backend}")
 
@@ -52,6 +62,11 @@ class NestedMemoryAgentRuntime:
         confidence: float = 0.5,
         source: str = "runtime",
     ) -> str:
+        if layer not in _DIRECT_OBSERVATION_LAYERS:
+            raise ValueError(
+                f"Direct runtime observations cannot write {layer.value} memory; "
+                "stable layers require a resolved promotion envelope."
+            )
         record = MemoryRecord(
             title=title,
             content=text,

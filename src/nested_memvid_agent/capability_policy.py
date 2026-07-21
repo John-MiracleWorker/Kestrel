@@ -261,6 +261,13 @@ def parent_resource_digest(
                 "tools",
             )
         }
+        if str(row.get("transport")) == "stdio" and row.get("command"):
+            # Import locally to keep the policy layer independent at module
+            # import time while sharing the launch identity used by approval
+            # and process creation.
+            from .mcp_manager import stdio_launch_resource
+
+            payload["launch_resource"] = stdio_launch_resource(row)
     elif kind == "skill":
         row = state.get_skill(capability_id)
         payload = {

@@ -1,11 +1,48 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+from .routine_limits import (
+    MAX_ROUTINE_INTERVAL_SECONDS,
+    MAX_ROUTINE_MISFIRE_GRACE_SECONDS,
+    MIN_ROUTINE_INTERVAL_SECONDS,
+    MIN_ROUTINE_MISFIRE_GRACE_SECONDS,
+)
+
+_StrictRoutineRevision = Annotated[int, Field(strict=True, ge=1)]
+_StrictRoutineEnabled = Annotated[bool, Field(strict=True)]
+_StrictRoutineInterval = Annotated[
+    int,
+    Field(
+        strict=True,
+        ge=MIN_ROUTINE_INTERVAL_SECONDS,
+        le=MAX_ROUTINE_INTERVAL_SECONDS,
+    ),
+]
+_StrictRoutineMisfireGrace = Annotated[
+    int,
+    Field(
+        strict=True,
+        ge=MIN_ROUTINE_MISFIRE_GRACE_SECONDS,
+        le=MAX_ROUTINE_MISFIRE_GRACE_SECONDS,
+    ),
+]
+_RoutineIdempotencyKey = Annotated[
+    str,
+    Field(
+        strict=True,
+        min_length=16,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    ),
+]
 
 
 class CreateRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     message: str
     session_id: str | None = None
     workspace: str | None = None
@@ -91,6 +128,46 @@ class SchedulerStepRequest(BaseModel):
 class SchedulerRunRequest(BaseModel):
     max_tasks: int | None = None
     max_cycles: int | None = None
+
+
+class RoutineCreateRequest(BaseModel):
+    routine_id: str | None = None
+    name: str
+    prompt: str
+    schedule_kind: str = "interval"
+    start_at: str
+    interval_seconds: _StrictRoutineInterval | None = None
+    workspace: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    autonomy_mode: str = "background"
+    misfire_grace_seconds: _StrictRoutineMisfireGrace = 60
+
+
+class RoutineUpdateRequest(BaseModel):
+    expected_revision: _StrictRoutineRevision
+    name: str | None = None
+    prompt: str | None = None
+    schedule_kind: str | None = None
+    start_at: str | None = None
+    interval_seconds: _StrictRoutineInterval | None = None
+    workspace: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    autonomy_mode: str | None = None
+    misfire_grace_seconds: _StrictRoutineMisfireGrace | None = None
+
+
+class RoutineToggleRequest(BaseModel):
+    enabled: _StrictRoutineEnabled
+    expected_revision: _StrictRoutineRevision
+
+
+class RoutineRunNowRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: _StrictRoutineRevision
+    idempotency_key: _RoutineIdempotencyKey
 
 
 class MemorySearchRequest(BaseModel):

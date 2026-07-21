@@ -1,19 +1,32 @@
 """Dense vector RAG baseline using sentence-transformers + cosine similarity."""
 from __future__ import annotations
 
-import numpy as np
-from sentence_transformers import SentenceTransformer
+from typing import Any
 
-from .base import RetrievalResult
+from .base import OptionalDependencyUnavailable, RetrievalResult
 
 
 class VectorRAG:
     """Flat dense vector RAG with all-MiniLM-L6-v2 embeddings."""
 
+    BACKEND_NAME = "VectorRAG (sentence-transformers)"
+
     def __init__(self, model_name: str = "all-MiniLM-L6-v2") -> None:
-        self.model = SentenceTransformer(model_name)
-        self.docs: list[dict] = []
-        self.embeddings: list[np.ndarray] = []
+        try:
+            import numpy as np
+            from sentence_transformers import SentenceTransformer
+
+            model = SentenceTransformer(model_name)
+        except ImportError as exc:
+            raise OptionalDependencyUnavailable(
+                self.BACKEND_NAME,
+                missing_dependency=getattr(exc, "name", None) or "sentence-transformers",
+                install_hint="python -m pip install numpy sentence-transformers",
+            ) from exc
+        self._np = np
+        self.model = model
+        self.docs: list[dict[str, str | None]] = []
+        self.embeddings: list[Any] = []
 
     def name(self) -> str:
         return f"VectorRAG ({self.model.get_sentence_embedding_dimension()}d)"
@@ -27,9 +40,9 @@ class VectorRAG:
         if not self.embeddings:
             return []
         q_emb = self.model.encode(query, normalize_embeddings=True)
-        embeddings = np.array(self.embeddings)
+        embeddings = self._np.array(self.embeddings)
         scores = embeddings @ q_emb  # cosine similarity (already normalized)
-        top_k = np.argsort(scores)[::-1][:k]
+        top_k = self._np.argsort(scores)[::-1][:k]
         results = []
         for idx in top_k:
             doc = self.docs[idx]

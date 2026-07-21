@@ -14,11 +14,12 @@ Failure modes tested:
 Usage:
     python benchmarks/error_recovery_benchmark.py --provider mock --output results/error_recovery.json
 """
+
 from __future__ import annotations
 
 import argparse
 import json
-import os
+import re
 import sys
 import tempfile
 import time
@@ -27,19 +28,23 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from nested_memvid_agent.app_factory import build_agent
+from nested_memvid_agent.cognition.retry_policy import RetryPolicy
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.llm.mock import MockLLMProvider
-from nested_memvid_agent.models import MemoryLayer, RetrievalQuery
-from nested_memvid_agent.runtime_models import LLMResponse, ToolCall, ToolExecution, ToolSpec, StrategyProposal
+from nested_memvid_agent.runtime_models import (
+    LLMResponse,
+    StrategyProposal,
+    ToolCall,
+    ToolExecution,
+)
 from nested_memvid_agent.tools.base import AgentTool, ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
 from nested_memvid_agent.tools.registry import ToolRegistry
 
-
 # ---------------------------------------------------------------------------
 # Fault-injecting tool wrapper
 # ---------------------------------------------------------------------------
+
 
 class FaultInjector:
     """Wraps a ToolRegistry to inject failures on specific call patterns."""
@@ -48,7 +53,9 @@ class FaultInjector:
         self._registry = registry
         self._rules: list[dict[str, Any]] = []
         self._call_counts: dict[str, int] = {}
+        self._requested_calls: list[ToolCall] = []
         self._executions: list[ToolExecution] = []
+        self._injected_executions: list[ToolExecution] = []
 
     def add_rule(self, rule: dict[str, Any]) -> None:
         """Add a fault injection rule.
@@ -74,12 +81,15 @@ class FaultInjector:
         return wrapped
 
     def should_inject(self, call: ToolCall) -> dict[str, Any] | None:
+        self._requested_calls.append(call)
         key = call.name
         self._call_counts[key] = self._call_counts.get(key, 0) + 1
         count = self._call_counts[key]
 
         # Also check canonical name if this is an alias
-        canonical = self._registry._aliases.get(call.name) if hasattr(self._registry, '_aliases') else None
+        canonical = (
+            self._registry._aliases.get(call.name) if hasattr(self._registry, "_aliases") else None
+        )
         names_to_check = {key}
         if canonical:
             names_to_check.add(canonical)
@@ -97,8 +107,22 @@ class FaultInjector:
                 return rule
         return None
 
-    def record(self, execution: ToolExecution) -> None:
+    def record(self, execution: ToolExecution, *, injected: bool = False) -> None:
         self._executions.append(execution)
+        if injected:
+            self._injected_executions.append(execution)
+
+    @property
+    def executions(self) -> tuple[ToolExecution, ...]:
+        return tuple(self._executions)
+
+    @property
+    def requested_calls(self) -> tuple[ToolCall, ...]:
+        return tuple(self._requested_calls)
+
+    @property
+    def injected_executions(self) -> tuple[ToolExecution, ...]:
+        return tuple(self._injected_executions)
 
 
 class _FaultInjectedTool(AgentTool):
@@ -134,7 +158,7 @@ class FaultInjectingRegistry(ToolRegistry):
                 error=rule["error"],
                 data=rule.get("data") or {},
             )
-            self._injector.record(execution)
+            self._injector.record(execution, injected=True)
             return execution
         execution = super().execute(call, context)
         self._injector.record(execution)
@@ -145,9 +169,61 @@ class FaultInjectingRegistry(ToolRegistry):
 # Task definitions
 # ---------------------------------------------------------------------------
 
-def _task_transient_file_read(agent: Any, workspace: Path, injector: FaultInjector) -> dict[str, Any]:
+
+def _tool_attempts(injector: FaultInjector, name: str) -> list[ToolExecution]:
+    return [
+        execution
+        for execution in injector.executions
+        if execution.call.name == name
+        or injector._registry.canonical_name(execution.call.name) == name
+    ]
+
+
+def _requested_tool_calls(injector: FaultInjector, name: str) -> list[ToolCall]:
+    return [
+        call
+        for call in injector.requested_calls
+        if call.name == name or injector._registry.canonical_name(call.name) == name
+    ]
+
+
+def _injected_failures(
+    injector: FaultInjector,
+    *,
+    name: str,
+    error: str,
+) -> list[ToolExecution]:
+    return [
+        execution
+        for execution in injector.injected_executions
+        if execution.call.name == name and not execution.success and execution.error == error
+    ]
+
+
+def _read_succeeded(
+    execution: ToolExecution,
+    *,
+    expected_path: Path,
+) -> bool:
+    return bool(
+        execution.success
+        and execution.call.arguments.get("path") == str(expected_path)
+        and execution.data.get("path") == str(expected_path.resolve())
+    )
+
+
+def _task_transient_file_read(
+    agent: Any, workspace: Path, injector: FaultInjector
+) -> dict[str, Any]:
     """Tool fails first time, agent should retry or find another way."""
-    injector.add_rule({"tool": "file.read", "call_index": 1, "error": "transient_error", "message": "Connection reset"})
+    injector.add_rule(
+        {
+            "tool": "file.read",
+            "call_index": 1,
+            "error": "transient_error",
+            "message": "Connection reset",
+        }
+    )
     answer_file = workspace / "answer.txt"
     answer_file.write_text("The secret code is 42.")
 
@@ -160,13 +236,38 @@ def _task_transient_file_read(agent: Any, workspace: Path, injector: FaultInject
             "tc2": {"path": str(answer_file)},
         },
     )
-    success = "42" in turn.assistant_message
+    attempts = _tool_attempts(injector, "file.read")
+    injected = _injected_failures(
+        injector,
+        name="file.read",
+        error="transient_error",
+    )
+    injected = [
+        execution
+        for execution in injected
+        if execution.call.arguments == {"path": str(answer_file)}
+    ]
+    successful_reads = [
+        execution
+        for execution in attempts
+        if _read_succeeded(execution, expected_path=answer_file) and "42" in execution.content
+    ]
+    recovered_after_injection = bool(
+        injected
+        and successful_reads
+        and attempts.index(injected[0]) < attempts.index(successful_reads[-1])
+    )
+    semantic_answer = re.search(r"\b42\b", turn.assistant_message) is not None
+    success = recovered_after_injection and semantic_answer
     return {
         "task": "transient_file_read",
         "success": success,
         "turns": 1,
-        "tool_calls": [te.call.name for te in turn.tool_executions],
-        "errors_seen": [te.error for te in turn.tool_executions if not te.success],
+        "tool_calls": [execution.call.name for execution in attempts],
+        "errors_seen": [execution.error for execution in attempts if not execution.success],
+        "injected_errors": [execution.error for execution in injected],
+        "recovered_after_injection": recovered_after_injection,
+        "semantic_answer": semantic_answer,
         "final_answer": turn.assistant_message[:200],
     }
 
@@ -174,7 +275,14 @@ def _task_transient_file_read(agent: Any, workspace: Path, injector: FaultInject
 def _task_file_not_found(agent: Any, workspace: Path, injector: FaultInjector) -> dict[str, Any]:
     """File doesn't exist. Agent should report it rather than loop forever."""
     missing = workspace / "missing.txt"
-    injector.add_rule({"tool": "file.read", "call_index": 1, "error": "not_found", "message": f"File not found: {missing}"})
+    injector.add_rule(
+        {
+            "tool": "file.read",
+            "call_index": 1,
+            "error": "not_found",
+            "message": f"File not found: {missing}",
+        }
+    )
 
     turn = agent.chat(
         f"Read {missing} and tell me its contents.",
@@ -182,22 +290,42 @@ def _task_file_not_found(agent: Any, workspace: Path, injector: FaultInjector) -
         approved_tool_call_ids=frozenset({"tc1"}),
         approved_tool_call_arguments={"tc1": {"path": str(missing)}},
     )
-    # Success if agent acknowledges the file is missing without crashing
+    attempts = _tool_attempts(injector, "file.read")
+    injected = _injected_failures(injector, name="file.read", error="not_found")
+    exact_injected_call = any(
+        execution.call.arguments == {"path": str(missing)} for execution in injected
+    )
+    # Success requires the injected failure itself plus an accurate explanation.
     content = turn.assistant_message.lower()
-    success = "not found" in content or "missing" in content or "doesn't exist" in content or "does not exist" in content
+    semantic_answer = any(
+        phrase in content for phrase in ("not found", "missing", "doesn't exist", "does not exist")
+    )
+    success = exact_injected_call and semantic_answer
     return {
         "task": "file_not_found",
         "success": success,
         "turns": 1,
-        "tool_calls": [te.call.name for te in turn.tool_executions],
-        "errors_seen": [te.error for te in turn.tool_executions if not te.success],
+        "tool_calls": [execution.call.name for execution in attempts],
+        "errors_seen": [execution.error for execution in attempts if not execution.success],
+        "injected_errors": [execution.error for execution in injected],
+        "exact_injected_call": exact_injected_call,
+        "semantic_answer": semantic_answer,
         "final_answer": turn.assistant_message[:200],
     }
 
 
-def _task_empty_search_results(agent: Any, workspace: Path, injector: FaultInjector) -> dict[str, Any]:
+def _task_empty_search_results(
+    agent: Any, workspace: Path, injector: FaultInjector
+) -> dict[str, Any]:
     """Search returns nothing. Agent should handle gracefully."""
-    injector.add_rule({"tool": "repo.search", "call_index": 1, "error": "empty_results", "message": "No matches found."})
+    injector.add_rule(
+        {
+            "tool": "repo.search",
+            "call_index": 1,
+            "error": "empty_results",
+            "message": "No matches found.",
+        }
+    )
     (workspace / "fruits.txt").write_text("apple\nbanana\n")
 
     turn = agent.chat(
@@ -206,19 +334,37 @@ def _task_empty_search_results(agent: Any, workspace: Path, injector: FaultInjec
         approved_tool_call_ids=frozenset({"tc1"}),
         approved_tool_call_arguments={"tc1": {"query": "zebra", "path": str(workspace)}},
     )
+    attempts = _tool_attempts(injector, "repo.search")
+    injected = _injected_failures(
+        injector,
+        name="repo.search",
+        error="empty_results",
+    )
+    exact_injected_call = any(
+        execution.call.arguments == {"query": "zebra", "path": str(workspace)}
+        for execution in injected
+    )
     content = turn.assistant_message.lower()
-    success = "no matches" in content or "not found" in content or "nothing" in content or "empty" in content
+    semantic_answer = any(
+        phrase in content for phrase in ("no matches", "not found", "nothing", "empty")
+    )
+    success = exact_injected_call and semantic_answer
     return {
         "task": "empty_search_results",
         "success": success,
         "turns": 1,
-        "tool_calls": [te.call.name for te in turn.tool_executions],
-        "errors_seen": [te.error for te in turn.tool_executions if not te.success],
+        "tool_calls": [execution.call.name for execution in attempts],
+        "errors_seen": [execution.error for execution in attempts if not execution.success],
+        "injected_errors": [execution.error for execution in injected],
+        "exact_injected_call": exact_injected_call,
+        "semantic_answer": semantic_answer,
         "final_answer": turn.assistant_message[:200],
     }
 
 
-def _task_malformed_tool_name(agent: Any, workspace: Path, injector: FaultInjector) -> dict[str, Any]:
+def _task_malformed_tool_name(
+    agent: Any, workspace: Path, injector: FaultInjector
+) -> dict[str, Any]:
     """LLM hallucinates a tool name. Registry should resolve alias or fail cleanly."""
     answer_file = workspace / "answer.txt"
     answer_file.write_text("The secret code is 42.")
@@ -230,22 +376,38 @@ def _task_malformed_tool_name(agent: Any, workspace: Path, injector: FaultInject
         approved_tool_call_ids=frozenset({"tc1"}),
         approved_tool_call_arguments={"tc1": {"path": str(answer_file)}},
     )
-    # We test that the registry resolved the alias and the tool succeeded
-    file_read_calls = [te for te in turn.tool_executions if te.call.name in ("file.read", "read")]
-    success = len(file_read_calls) > 0 and file_read_calls[0].success
+    # Prove that the alias resolved to the exact canonical read and that the
+    # answer reflects the observed tool result.
+    attempts = _tool_attempts(injector, "file.read")
+    exact_read = any(
+        _read_succeeded(execution, expected_path=answer_file) and "42" in execution.content
+        for execution in attempts
+    )
+    semantic_answer = re.search(r"\b42\b", turn.assistant_message) is not None
+    success = exact_read and semantic_answer
     return {
         "task": "malformed_tool_name",
         "success": success,
         "turns": 1,
-        "tool_calls": [te.call.name for te in turn.tool_executions],
-        "errors_seen": [te.error for te in turn.tool_executions if not te.success],
+        "tool_calls": [execution.call.name for execution in attempts],
+        "errors_seen": [execution.error for execution in attempts if not execution.success],
+        "injected_errors": [],
+        "expected_tool_succeeded": exact_read,
+        "semantic_answer": semantic_answer,
         "final_answer": turn.assistant_message[:200],
     }
 
 
 def _task_strategy_retry(agent: Any, workspace: Path, injector: FaultInjector) -> dict[str, Any]:
     """Tool fails first time; LLM provides changed strategy and retry succeeds."""
-    injector.add_rule({"tool": "file.read", "call_index": 1, "error": "transient_error", "message": "Connection reset"})
+    injector.add_rule(
+        {
+            "tool": "file.read",
+            "call_index": 1,
+            "error": "transient_error",
+            "message": "Connection reset",
+        }
+    )
     answer_file = workspace / "answer.txt"
     answer_file.write_text("The secret code is 42.")
 
@@ -258,24 +420,63 @@ def _task_strategy_retry(agent: Any, workspace: Path, injector: FaultInjector) -
             "tc2": {"path": str(answer_file)},
         },
     )
-    success = "42" in turn.assistant_message
-    file_read_calls = [te for te in turn.tool_executions if te.call.name == "file.read"]
-    # Did the retry policy ALLOW the second call (because strategy was meaningful)?
-    retry_allowed = len(file_read_calls) >= 2 and file_read_calls[1].success
+    attempts = _tool_attempts(injector, "file.read")
+    injected = _injected_failures(
+        injector,
+        name="file.read",
+        error="transient_error",
+    )
+    injected = [
+        execution
+        for execution in injected
+        if execution.call.arguments == {"path": str(answer_file)}
+    ]
+    successful_reads = [
+        execution
+        for execution in attempts
+        if _read_succeeded(execution, expected_path=answer_file) and "42" in execution.content
+    ]
+    requested_reads = _requested_tool_calls(injector, "file.read")
+    retry_decision = (
+        RetryPolicy().assess_call(requested_reads[1], [injected[0]])
+        if injected and successful_reads and len(requested_reads) >= 2
+        else None
+    )
+    retry_allowed = bool(retry_decision is not None and retry_decision.retry_allowed)
+    recovered_after_injection = bool(
+        injected
+        and successful_reads
+        and attempts.index(injected[0]) < attempts.index(successful_reads[0])
+    )
+    semantic_answer = re.search(r"\b42\b", turn.assistant_message) is not None
+    success = recovered_after_injection and retry_allowed and semantic_answer
     return {
         "task": "strategy_retry",
         "success": success,
         "retry_allowed": retry_allowed,
         "turns": 1,
-        "tool_calls": [te.call.name for te in turn.tool_executions],
-        "errors_seen": [te.error for te in turn.tool_executions if not te.success],
+        "tool_calls": [execution.call.name for execution in attempts],
+        "errors_seen": [execution.error for execution in attempts if not execution.success],
+        "injected_errors": [execution.error for execution in injected],
+        "retry_decision": retry_decision.to_payload() if retry_decision is not None else None,
+        "recovered_after_injection": recovered_after_injection,
+        "semantic_answer": semantic_answer,
         "final_answer": turn.assistant_message[:200],
     }
 
 
-def _task_max_retries_exceeded(agent: Any, workspace: Path, injector: FaultInjector) -> dict[str, Any]:
+def _task_max_retries_exceeded(
+    agent: Any, workspace: Path, injector: FaultInjector
+) -> dict[str, Any]:
     """Tool fails every time. Agent should stop trying and report failure."""
-    injector.add_rule({"tool": "file.read", "error": "transient_error", "message": "Persistent failure", "recover_after": 10})
+    injector.add_rule(
+        {
+            "tool": "file.read",
+            "error": "transient_error",
+            "message": "Persistent failure",
+            "recover_after": 10,
+        }
+    )
     answer_file = workspace / "answer.txt"
     answer_file.write_text("The secret code is 42.")
 
@@ -291,16 +492,39 @@ def _task_max_retries_exceeded(agent: Any, workspace: Path, injector: FaultInjec
             "tc5": {"path": str(answer_file)},
         },
     )
-    # Success = agent didn't crash, and it eventually stopped
-    file_read_count = len([te for te in turn.tool_executions if te.call.name == "file.read"])
-    success = file_read_count <= agent.config.max_tool_rounds
+    attempts = _tool_attempts(injector, "file.read")
+    injected = _injected_failures(
+        injector,
+        name="file.read",
+        error="transient_error",
+    )
+    injected = [
+        execution
+        for execution in injected
+        if execution.call.arguments == {"path": str(answer_file)}
+    ]
+    file_read_count = len(attempts)
+    nonzero_bounded_failures = bool(
+        0 < file_read_count <= agent.config.max_tool_rounds
+        and len(injected) == file_read_count
+        and all(not execution.success for execution in attempts)
+    )
+    content = turn.assistant_message.lower()
+    terminal_failure_reported = any(
+        phrase in content for phrase in ("unable", "could not", "couldn't", "failed", "failure")
+    )
+    success = nonzero_bounded_failures and terminal_failure_reported
     return {
         "task": "max_retries_exceeded",
         "success": success,
         "turns": 1,
-        "tool_calls": [te.call.name for te in turn.tool_executions],
-        "errors_seen": [te.error for te in turn.tool_executions if not te.success],
+        "tool_calls": [execution.call.name for execution in attempts],
+        "errors_seen": [execution.error for execution in attempts if not execution.success],
+        "injected_errors": [execution.error for execution in injected],
         "file_read_attempts": file_read_count,
+        "max_tool_rounds": agent.config.max_tool_rounds,
+        "nonzero_bounded_failures": nonzero_bounded_failures,
+        "terminal_failure_reported": terminal_failure_reported,
         "final_answer": turn.assistant_message[:200],
     }
 
@@ -309,77 +533,146 @@ def _task_max_retries_exceeded(agent: Any, workspace: Path, injector: FaultInjec
 # Mock response programming
 # ---------------------------------------------------------------------------
 
-def _mock_for_task(task_name: str) -> MockLLMProvider:
+
+def _mock_for_task(task_name: str, workspace: Path) -> MockLLMProvider:
+    answer_file = workspace / "answer.txt"
+    missing_file = workspace / "missing.txt"
     if task_name == "transient_file_read":
-        return MockLLMProvider([
-            LLMResponse(
-                content="I'll read that file.",
-                tool_calls=(ToolCall(name="file.read", arguments={"path": "answer.txt"}, id="tc1"),),
-            ),
-            LLMResponse(
-                content="Let me try again.",
-                tool_calls=(ToolCall(name="file.read", arguments={"path": "answer.txt"}, id="tc2"),),
-            ),
-            LLMResponse(content="The secret code is 42."),
-        ])
-    if task_name == "file_not_found":
-        return MockLLMProvider([
-            LLMResponse(
-                content="I'll read that file.",
-                tool_calls=(ToolCall(name="file.read", arguments={"path": "missing.txt"}, id="tc1"),),
-            ),
-            LLMResponse(content="The file missing.txt does not exist."),
-        ])
-    if task_name == "empty_search_results":
-        return MockLLMProvider([
-            LLMResponse(
-                content="I'll search for that.",
-                tool_calls=(ToolCall(name="repo.search", arguments={"query": "zebra", "path": "."}, id="tc1"),),
-            ),
-            LLMResponse(content="No matches were found for 'zebra'."),
-        ])
-    if task_name == "malformed_tool_name":
-        return MockLLMProvider([
-            LLMResponse(
-                content="I'll read that file.",
-                tool_calls=(ToolCall(name="read", arguments={"path": "answer.txt"}, id="tc1"),),
-            ),
-            LLMResponse(content="The secret code is 42."),
-        ])
-    if task_name == "strategy_retry":
-        return MockLLMProvider([
-            LLMResponse(
-                content="I'll read that file.",
-                tool_calls=(ToolCall(name="file.read", arguments={"path": "answer.txt"}, id="tc1"),),
-            ),
-            LLMResponse(
-                content="The previous read failed due to a connection reset. I will retry with the same path but expect the filesystem to be stable now.",
-                tool_calls=(
-                    ToolCall(
-                        name="file.read",
-                        arguments={"path": "answer.txt"},
-                        id="tc2",
-                        strategy=StrategyProposal(
-                            changed_strategy="Retry the file read assuming the transient connection issue has cleared.",
-                            why_different="The first failure was a connection reset, which is typically transient.",
-                            expected_signal="File contents returned successfully.",
-                            fallback_if_fails="Report the file as unreadable.",
+        return MockLLMProvider(
+            [
+                LLMResponse(
+                    content="I'll read that file.",
+                    tool_calls=(
+                        ToolCall(
+                            name="file.read",
+                            arguments={"path": str(answer_file)},
+                            id="tc1",
                         ),
                     ),
                 ),
-            ),
-            LLMResponse(content="The secret code is 42."),
-        ])
+                LLMResponse(
+                    content="Let me try again.",
+                    tool_calls=(
+                        ToolCall(
+                            name="file.read",
+                            arguments={"path": str(answer_file), "max_chars": 1_000},
+                            id="tc2",
+                        ),
+                    ),
+                ),
+                LLMResponse(content="The secret code is 42."),
+            ]
+        )
+    if task_name == "file_not_found":
+        return MockLLMProvider(
+            [
+                LLMResponse(
+                    content="I'll read that file.",
+                    tool_calls=(
+                        ToolCall(
+                            name="file.read",
+                            arguments={"path": str(missing_file)},
+                            id="tc1",
+                        ),
+                    ),
+                ),
+                LLMResponse(content="The file missing.txt does not exist."),
+            ]
+        )
+    if task_name == "empty_search_results":
+        return MockLLMProvider(
+            [
+                LLMResponse(
+                    content="I'll search for that.",
+                    tool_calls=(
+                        ToolCall(
+                            name="repo.search",
+                            arguments={"query": "zebra", "path": str(workspace)},
+                            id="tc1",
+                        ),
+                    ),
+                ),
+                LLMResponse(content="No matches were found for 'zebra'."),
+            ]
+        )
+    if task_name == "malformed_tool_name":
+        return MockLLMProvider(
+            [
+                LLMResponse(
+                    content="I'll read that file.",
+                    tool_calls=(
+                        ToolCall(
+                            name="read",
+                            arguments={"path": str(answer_file)},
+                            id="tc1",
+                        ),
+                    ),
+                ),
+                LLMResponse(content="The secret code is 42."),
+            ]
+        )
+    if task_name == "strategy_retry":
+        return MockLLMProvider(
+            [
+                LLMResponse(
+                    content="I'll read that file.",
+                    tool_calls=(
+                        ToolCall(
+                            name="file.read",
+                            arguments={"path": str(answer_file)},
+                            id="tc1",
+                        ),
+                    ),
+                ),
+                LLMResponse(
+                    content="The previous read failed due to a connection reset. I will retry with the same path but expect the filesystem to be stable now.",
+                    tool_calls=(
+                        ToolCall(
+                            name="file.read",
+                            arguments={"path": str(answer_file)},
+                            id="tc2",
+                            strategy=StrategyProposal(
+                                changed_strategy="Retry the file read assuming the transient connection issue has cleared.",
+                                why_different="The first failure was a connection reset, which is typically transient.",
+                                expected_signal="File contents returned successfully.",
+                                fallback_if_fails="Report the file as unreadable.",
+                            ),
+                        ),
+                    ),
+                ),
+                LLMResponse(content="The secret code is 42."),
+            ]
+        )
     if task_name == "max_retries_exceeded":
         responses = []
         for i in range(5):
+            strategy = None
+            if i > 0:
+                strategy = StrategyProposal(
+                    changed_strategy=(
+                        f"Attempt bounded diagnostic read number {i + 1} after checking "
+                        "the persistent failure evidence."
+                    ),
+                    why_different="This attempt follows a newly observed bounded failure.",
+                    expected_signal="The exact file contents are returned.",
+                    fallback_if_fails="Stop at the configured tool-round boundary.",
+                )
             responses.append(
                 LLMResponse(
-                    content=f"Attempt {i+1}...",
-                    tool_calls=(ToolCall(name="file.read", arguments={"path": "answer.txt"}, id=f"tc{i+1}"),),
+                    content=f"Attempt {i + 1}...",
+                    tool_calls=(
+                        ToolCall(
+                            name="file.read",
+                            arguments={"path": str(answer_file)},
+                            id=f"tc{i + 1}",
+                            strategy=strategy,
+                        ),
+                    ),
                 )
             )
-        responses.append(LLMResponse(content="I was unable to read the file after multiple attempts."))
+        responses.append(
+            LLMResponse(content="I was unable to read the file after multiple attempts.")
+        )
         return MockLLMProvider(responses)
     return MockLLMProvider([LLMResponse(content="I don't know.")])
 
@@ -387,6 +680,7 @@ def _mock_for_task(task_name: str) -> MockLLMProvider:
 # ---------------------------------------------------------------------------
 # Benchmark harness
 # ---------------------------------------------------------------------------
+
 
 def run_error_recovery_benchmark(
     *,
@@ -405,7 +699,7 @@ def run_error_recovery_benchmark(
         "strategy_retry": _task_strategy_retry,
         "max_retries_exceeded": _task_max_retries_exceeded,
     }
-    active_tasks = tasks or list(task_fns.keys())
+    active_tasks = list(task_fns) if tasks is None else list(tasks)
 
     results = []
     total_time = 0.0
@@ -425,6 +719,13 @@ def run_error_recovery_benchmark(
                 memory_dir=memory_dir,
                 workspace=workspace,
                 log_dir=Path(tmpdir) / "logs",
+                state_path=Path(tmpdir) / "state" / "agent.db",
+                secret_store_path=Path(tmpdir) / "secrets" / "local_vault.json",
+                skills_dir=Path(tmpdir) / "skills",
+                plugins_dir=Path(tmpdir) / "plugins",
+                mcp_config_path=Path(tmpdir) / "config" / "mcp_servers.json",
+                channel_config_path=Path(tmpdir) / "config" / "channels.json",
+                worker_worktree_dir=Path(tmpdir) / "worktrees",
                 allow_web=False,
                 allow_shell=False,
                 max_tool_rounds=5,
@@ -432,12 +733,10 @@ def run_error_recovery_benchmark(
 
             from nested_memvid_agent.agent import AgentDependencies, NestedMV2Agent
             from nested_memvid_agent.backends.in_memory import InMemoryBackend
-            from nested_memvid_agent.layers import LayeredMemorySystem
-            from nested_memvid_agent.state_store import AgentStateStore
             from nested_memvid_agent.event_log import JsonlEventLog
+            from nested_memvid_agent.layers import LayeredMemorySystem
             from nested_memvid_agent.llm.factory import build_llm_provider
 
-            state = AgentStateStore(config.state_path)
             memory = LayeredMemorySystem.from_backend_factory(memory_dir, InMemoryBackend)
             base_tools = build_default_tools()
             event_log = JsonlEventLog(config.log_dir / "events.jsonl")
@@ -449,10 +748,17 @@ def run_error_recovery_benchmark(
                 if tool is not None:
                     raw_tools.register(tool)
 
-            # For real providers, wrap with transparent retry layer so transient
-            # failures are retried automatically before the LLM sees them.
-            if provider != "mock" and config.tool_retry_max_attempts > 0:
+            # Real-provider transient recovery exercises the transparent retry
+            # layer. Strategy and maximum-round tasks must expose each failure
+            # to the model so their explicit retry-policy evidence is possible.
+            use_transparent_retry = (
+                provider != "mock"
+                and config.tool_retry_max_attempts > 0
+                and task_name not in {"strategy_retry", "max_retries_exceeded"}
+            )
+            if use_transparent_retry:
                 from nested_memvid_agent.tools.registry import RetryingRegistry
+
                 tools = RetryingRegistry(
                     raw_tools,
                     max_attempts=config.tool_retry_max_attempts,
@@ -462,7 +768,7 @@ def run_error_recovery_benchmark(
                 tools = raw_tools
 
             if provider == "mock":
-                llm = _mock_for_task(task_name)
+                llm = _mock_for_task(task_name, workspace)
             else:
                 llm = build_llm_provider(config)
 
@@ -491,16 +797,24 @@ def run_error_recovery_benchmark(
             results.append(result)
 
     success_count = sum(1 for r in results if r.get("success"))
-    total_errors = sum(len(r.get("errors_seen", [])) for r in results)
+    total_errors = sum(len(r.get("injected_errors", [])) for r in results)
     total_attempts = sum(len(r.get("tool_calls", [])) for r in results)
+    passed = bool(results) and success_count == len(results)
 
     return {
         "schema": "kestrel.error_recovery_benchmark.v1",
-        "config": {"provider": provider, "model": model, "backend": backend, "tasks": active_tasks},
+        "config": {
+            "provider": provider,
+            "model": model,
+            "backend": "in_memory",
+            "requested_backend": backend,
+            "tasks": active_tasks,
+        },
         "summary": {
             "total_tasks": len(results),
             "success_count": success_count,
             "success_rate": round(success_count / len(results), 2) if results else 0.0,
+            "passed": passed,
             "total_errors_injected": total_errors,
             "total_tool_attempts": total_attempts,
             "avg_tools_per_task": round(total_attempts / len(results), 2) if results else 0.0,
@@ -534,7 +848,17 @@ def main() -> int:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(result, indent=2))
         print(f"\nWrote results to {args.output}", file=sys.stderr)
-    return 0
+    summary = result.get("summary", {})
+    total_tasks = int(summary.get("total_tasks", 0))
+    success_count = int(summary.get("success_count", 0))
+    rows = result.get("results", [])
+    passed = bool(
+        rows
+        and len(rows) == total_tasks
+        and success_count == total_tasks
+        and all(bool(row.get("success")) for row in rows)
+    )
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":

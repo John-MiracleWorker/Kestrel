@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from scripts.eval_behavior_deltas import (
     evaluate_behavior_delta_agent_scenario,
@@ -13,7 +14,9 @@ from scripts.eval_behavior_deltas import (
 
 
 def test_policy_replay_passes_with_delta_and_baseline_scores_lower() -> None:
-    scenario = load_scenario(Path("tests/evals/behavior_deltas/policy_write_requires_approval.json"))
+    scenario = load_scenario(
+        Path("tests/evals/behavior_deltas/policy_write_requires_approval.json")
+    )
 
     result = evaluate_behavior_delta_scenario(scenario)
 
@@ -53,8 +56,14 @@ def test_policy_replay_fails_when_active_delta_triggers_gate_violation(tmp_path:
                         },
                     }
                 ],
-                "expected_behavior": ["require approval-gate tests", "avoid direct policy memory write"],
-                "failure_conditions": ["writes policy memory directly", "bypasses exact-call approval"],
+                "expected_behavior": [
+                    "require approval-gate tests",
+                    "avoid direct policy memory write",
+                ],
+                "failure_conditions": [
+                    "writes policy memory directly",
+                    "bypasses exact-call approval",
+                ],
             }
         )
     )
@@ -62,11 +71,16 @@ def test_policy_replay_fails_when_active_delta_triggers_gate_violation(tmp_path:
     result = evaluate_behavior_delta_scenario(load_scenario(scenario_path))
 
     assert result.passed is False
-    assert set(result.gate_violations) == {"writes policy memory directly", "bypasses exact-call approval"}
+    assert set(result.gate_violations) == {
+        "writes policy memory directly",
+        "bypasses exact-call approval",
+    }
 
 
 def test_mv2_replay_blocks_vector_db_replacement() -> None:
-    scenario = load_scenario(Path("tests/evals/behavior_deltas/mv2_canonical_memory_constraint.json"))
+    scenario = load_scenario(
+        Path("tests/evals/behavior_deltas/mv2_canonical_memory_constraint.json")
+    )
 
     result = evaluate_behavior_delta_scenario(scenario)
 
@@ -78,7 +92,9 @@ def test_mv2_replay_blocks_vector_db_replacement() -> None:
 
 
 def test_repeated_retry_replay_requires_changed_strategy() -> None:
-    scenario = load_scenario(Path("tests/evals/behavior_deltas/repeated_validation_retry_requires_changed_strategy.json"))
+    scenario = load_scenario(
+        Path("tests/evals/behavior_deltas/repeated_validation_retry_requires_changed_strategy.json")
+    )
 
     result = evaluate_behavior_delta_scenario(scenario)
 
@@ -89,7 +105,9 @@ def test_repeated_retry_replay_requires_changed_strategy() -> None:
 
 
 def test_agent_replay_runs_full_agent_turn_and_logs_behavior_delta_activation() -> None:
-    scenario = load_scenario(Path("tests/evals/behavior_deltas/policy_write_requires_approval.json"))
+    scenario = load_scenario(
+        Path("tests/evals/behavior_deltas/policy_write_requires_approval.json")
+    )
 
     result = evaluate_behavior_delta_agent_scenario(scenario)
 
@@ -102,6 +120,42 @@ def test_agent_replay_runs_full_agent_turn_and_logs_behavior_delta_activation() 
     assert "require approval-gate tests" in result.agent_context_prompt
     assert result.activation_count == 1
     assert result.context_compile_events == 1
+    assert result.agent_policy_write_count == 0
+
+
+def test_agent_replay_rejects_context_text_without_runtime_activation_evidence(
+    monkeypatch,
+) -> None:
+    scenario = load_scenario(
+        Path("tests/evals/behavior_deltas/policy_write_requires_approval.json")
+    )
+    compiled_fixture = evaluate_behavior_delta_scenario(scenario).compiled_text
+
+    class FakeAgent:
+        event_log = SimpleNamespace(tail=lambda *, limit: ())
+        memory = SimpleNamespace(iter_records=lambda *, layer, include_inactive: ())
+
+        def chat(self, message, *, session_id, run_id):  # noqa: ANN001
+            del message, session_id, run_id
+            return SimpleNamespace(
+                context_prompt=compiled_fixture,
+                stop_reason="complete",
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "scripts.eval_behavior_deltas.build_agent",
+        lambda config, *, state: FakeAgent(),
+    )
+
+    result = evaluate_behavior_delta_agent_scenario(scenario)
+
+    assert result.delta_score > result.baseline_score
+    assert result.activation_count == 0
+    assert result.context_compile_events == 0
+    assert result.passed is False
 
 
 def test_replay_cli_agent_mode_runs_full_agent_turn() -> None:

@@ -1,11 +1,13 @@
 {
-  "name": "nested-mv2-agent-web",
-  "version": "0.2.1",
+  "name": "kestrel-web",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc -b && vite build",
+    "licenses:generate": "node ../scripts/generate-web-third-party-notices.mjs",
+    "licenses:check": "node ../scripts/generate-web-third-party-notices.mjs --check",
     "test": "NODE_ENV=test tsc -b --pretty false && NODE_ENV=test vitest run --environment jsdom",
     "test:typecheck": "tsc -b --pretty false"
   },

@@ -7,7 +7,7 @@
 __pycache__
 *.egg-info
 *.pyc
-.env
+.env*
 .nest
 memory
 logs
@@ -16,3 +16,4 @@ web/dist
 web/node_modules
 dist
 build
+tiuni-fun

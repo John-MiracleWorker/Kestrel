@@ -29,8 +29,10 @@ class ContextPackRequest:
     token_budget: int = 6000
     allowed_layers: tuple[MemoryLayer, ...] = PACK_LAYER_ORDER
     expand_raw: bool = False
+    include_objective: bool = True
     include_telemetry: bool = True
     k_per_layer: int = 8
+    excluded_record_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -78,7 +80,7 @@ class ContextPacker:
             raise ValueError("ContextPackRequest.query cannot be empty")
 
         layers = request.allowed_layers or PACK_LAYER_ORDER
-        hits = self.memory.retrieve(
+        retrieved_hits = self.memory.retrieve(
             RetrievalQuery(
                 query=query,
                 layers=tuple(layers),
@@ -86,6 +88,12 @@ class ContextPacker:
                 objective=request.objective,
             )
         )
+        hits = [
+            hit
+            for hit in retrieved_hits
+            if hit.record.id not in request.excluded_record_ids
+            and _frame_for(hit).id not in request.excluded_record_ids
+        ]
         ordered = sorted(hits, key=self._rank_key, reverse=True)
         conflict_warnings = _detect_conflicts(ordered)
         selected = self._select_items(ordered, request)
@@ -95,8 +103,9 @@ class ContextPacker:
             prompt = _truncate_to_tokens(prompt, max(request.token_budget - 16, 1))
             token_estimate = estimate_tokens(prompt, request.model_hint)
         telemetry: dict[str, object] = {
-            "retrieved": len(hits),
+            "retrieved": len(retrieved_hits),
             "selected": len(selected),
+            "excluded": len(retrieved_hits) - len(hits),
             "budget_tokens": request.token_budget,
             "estimated_tokens": token_estimate,
             "layers": sorted({item.frame.layer.value for item in selected}),
@@ -120,7 +129,13 @@ class ContextPacker:
     def _select_items(self, hits: list[MemoryHit], request: ContextPackRequest) -> list[PackedContextItem]:
         selected: list[PackedContextItem] = []
         seen_hashes: set[str] = set()
-        used_tokens = estimate_tokens(_prompt_scaffold(request.objective), request.model_hint)
+        used_tokens = estimate_tokens(
+            _prompt_scaffold(
+                request.objective,
+                include_objective=request.include_objective,
+            ),
+            request.model_hint,
+        )
         has_summary = any(_frame_for(hit).frame_type in SUMMARY_FRAME_TYPES for hit in hits)
         needs_exact = _needs_exact_evidence(request.objective, request.query or "")
 
@@ -183,15 +198,10 @@ class ContextPacker:
         for item in items:
             by_layer[item.frame.layer].append(item)
 
-        lines = [
-            "# MV2 PSEUDO-CONTEXT PACK",
-            "",
-            "## Current Objective",
-            request.objective.strip(),
-            "",
-            "## Hard Policy Constraints",
-            "POLICY MEMORY",
-        ]
+        lines = ["# MV2 PSEUDO-CONTEXT PACK"]
+        if request.include_objective:
+            lines.extend(["", "## Current Objective", request.objective.strip()])
+        lines.extend(["", "## Hard Policy Constraints", "POLICY MEMORY"])
         lines.extend(_section_lines(by_layer.get(MemoryLayer.POLICY, []), empty="No matching policy memory retrieved."))
         lines.extend(["", "## Soul / Self Model", "SELF MEMORY"])
         lines.extend(_section_lines(by_layer.get(MemoryLayer.SELF, []), empty="No matching self memory retrieved."))
@@ -242,6 +252,8 @@ class ContextPacker:
             record = self._find_record_by_id(child_id)
             if record is None:
                 continue
+            if _is_retrieval_artifact(record):
+                continue
             child_frame = from_memory_record(record)
             if child_frame.frame_type not in RAW_FRAME_TYPES | CORRECTION_FRAME_TYPES:
                 continue
@@ -262,6 +274,23 @@ class ContextPacker:
 def _frame_for(hit: MemoryHit) -> MV2ContextFrame:
     frame_type = str(hit.record.metadata.get("frame_type") or ("correction" if hit.record.kind.value == "correction" else "raw_chunk"))
     return from_memory_record(hit.record, frame_type=frame_type)
+
+
+def _is_retrieval_artifact(record: MemoryRecord) -> bool:
+    if record.metadata.get("retrieval_artifact") is True:
+        return True
+    source_uri = str(record.metadata.get("source_uri") or "")
+    return source_uri.startswith(
+        (
+            "tool://context.expand/",
+            "tool://context.pack/",
+            "tool://memory.conflicts/",
+            "tool://memory.export/",
+            "tool://memory.inspect/",
+            "tool://memory.ledger/",
+            "tool://memory.search/",
+        )
+    )
 
 
 def _section_lines(items: list[PackedContextItem], *, empty: str) -> list[str]:
@@ -293,7 +322,9 @@ def _provenance_suffix(frame: MV2ContextFrame) -> str:
     return "" if not parts else ", " + ", ".join(parts)
 
 
-def _prompt_scaffold(objective: str) -> str:
+def _prompt_scaffold(objective: str, *, include_objective: bool = True) -> str:
+    if not include_objective:
+        return "# MV2 PSEUDO-CONTEXT PACK\n## Next-step Instruction\n"
     return f"# MV2 PSEUDO-CONTEXT PACK\n## Current Objective\n{objective}\n## Next-step Instruction\n"
 
 

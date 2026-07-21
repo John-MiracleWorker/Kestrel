@@ -63,7 +63,12 @@ def test_promotion_ledger_allows_multiple_outcomes(tmp_path: Path) -> None:
 
 def test_conflict_metadata_records_contradicted_outcome(tmp_path: Path) -> None:
     ledger = PromotionLedger(AgentStateStore(tmp_path / "state.db"))
-    memory = LayeredMemorySystem.from_backend_factory(tmp_path / "memory", InMemoryBackend, ledger=ledger)
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path / "memory",
+        InMemoryBackend,
+        ledger=ledger,
+        enforce_stable_write_integrity=False,
+    )
     promoted = _promoted_record(
         promotion_id="promotion-contradicted",
         title="Provider setting",
@@ -87,7 +92,12 @@ def test_conflict_metadata_records_contradicted_outcome(tmp_path: Path) -> None:
 
 def test_tombstoning_promoted_record_records_tombstoned_outcome(tmp_path: Path) -> None:
     ledger = PromotionLedger(AgentStateStore(tmp_path / "state.db"))
-    memory = LayeredMemorySystem.from_backend_factory(tmp_path / "memory", InMemoryBackend, ledger=ledger)
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path / "memory",
+        InMemoryBackend,
+        ledger=ledger,
+        enforce_stable_write_integrity=False,
+    )
     promoted = _promoted_record(promotion_id="promotion-tombstoned")
     record_id = memory.put(promoted)
 

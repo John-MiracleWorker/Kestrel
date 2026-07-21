@@ -1,14 +1,15 @@
 [build-system]
-requires = ["setuptools>=83.0.0"]
+requires = ["setuptools==83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "nested-memvid-agent"
-version = "0.3.1"
+version = "0.4.0"
 description = "Kestrel: a local-first, memory-native AI engineering agent runtime."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
+license-files = ["LICENSE", "web/public/THIRD_PARTY_NOTICES.txt"]
 authors = [{ name = "Kestrel Contributors" }]
 dependencies = ["numpy>=1.26,<2.5", "pip>=26.1.2", "setuptools>=83.0.0"]
 
@@ -29,7 +30,11 @@ anthropic = ["anthropic>=0.39"]
 gemini = ["google-genai>=0.3"]
 server = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.31", "starlette>=1.3.1"]
 mcp = ["mcp>=1.0", "cryptography>=48.0.1", "httplib2>=0.32.0"]
-dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.10", "bandit>=1.7", "build>=1.2", "fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27", "pygments>=2.20.0"]
+keyring = ["keyring>=25.6.0"]
+dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.10", "bandit>=1.7", "build==1.5.0", "fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27", "pygments>=2.20.0"]
+
+[dependency-groups]
+release = ["cyclonedx-bom==7.3.0", "pip-audit==2.10.1", "twine==6.2.0"]
 
 [project.scripts]
 nested-memvid = "nested_memvid_agent.cli:main"
@@ -37,14 +42,22 @@ nest-agent = "nested_memvid_agent.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/John-MiracleWorker/Kestrel"
+Documentation = "https://github.com/John-MiracleWorker/Kestrel#documentation-map"
 Repository = "https://github.com/John-MiracleWorker/Kestrel"
 Issues = "https://github.com/John-MiracleWorker/Kestrel/issues"
+Changelog = "https://github.com/John-MiracleWorker/Kestrel/blob/main/CHANGELOG.md"
+Security = "https://github.com/John-MiracleWorker/Kestrel/security/policy"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-nested_memvid_agent = ["prompts/*.md", "web_dist/index.html", "web_dist/assets/*"]
+nested_memvid_agent = [
+  "prompts/*.md",
+  "web_dist/index.html",
+  "web_dist/assets/*",
+  "web_dist/THIRD_PARTY_NOTICES.txt",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

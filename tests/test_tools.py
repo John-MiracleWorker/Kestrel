@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import sleep
@@ -13,17 +15,500 @@ from typing import Any, Literal, cast
 import pytest
 from pytest import MonkeyPatch
 
+import nested_memvid_agent.tools.command_tools as command_tools
+import nested_memvid_agent.tools.process_tools as process_tools
+import nested_memvid_agent.tools.repair_tools as repair_tools
 from nested_memvid_agent.config import AgentConfig
+from nested_memvid_agent.extension_runner import (
+    ContainerExecutionRequest,
+    ContainerExecutionResult,
+)
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.orchestrator import build_memory_system
+from nested_memvid_agent.repair_integrity import repair_snapshot
 from nested_memvid_agent.run_manager import RunManager
 from nested_memvid_agent.runtime_models import ToolCall, ToolExecution, ToolSpec
+from nested_memvid_agent.secret_broker import SecretBroker
 from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.tools.base import AgentTool, ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
-from nested_memvid_agent.tools.command_tools import _is_python_executable_name
-from nested_memvid_agent.tools.process_tools import _run_subprocess, _SubprocessToolTimeout
+from nested_memvid_agent.tools.command_tools import CodexExecTool, _is_python_executable_name
+from nested_memvid_agent.tools.process_tools import (
+    _run_subprocess,
+    _SubprocessToolOutcomeIndeterminate,
+    _SubprocessToolTimeout,
+    cancel_subprocesses_for_run,
+)
 from nested_memvid_agent.tools.registry import RetryingRegistry, ToolRegistry
+from nested_memvid_agent.validation_runner import (
+    IsolatedValidationResult,
+)
+from nested_memvid_agent.validation_runner import (
+    run_isolated_validation as run_real_isolated_validation,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_repair_validation_stub(monkeypatch: MonkeyPatch) -> None:
+    """Keep repair unit tests deterministic; real OCI coverage is integration-only."""
+
+    class LocalUnitRunner:
+        def run(self, request: ContainerExecutionRequest) -> ContainerExecutionResult:
+            normalized = list(request.command)
+            if normalized and Path(normalized[0]).name.casefold().startswith("python"):
+                normalized[0] = sys.executable
+            # Windows needs its native runtime and writable temporary-directory
+            # variables even in this credential-free unit runner. Without
+            # them, pytest falls back to the read-only candidate snapshot and
+            # exits before collecting the seeded regression.
+            environment = {"PATH": os.defpath}
+            for name in (
+                "COMSPEC",
+                "PATHEXT",
+                "SYSTEMROOT",
+                "TEMP",
+                "TMP",
+                "TMPDIR",
+                "WINDIR",
+            ):
+                if value := os.environ.get(name):
+                    environment[name] = value
+            completed = subprocess.run(  # noqa: S603  # nosec B603
+                normalized,
+                cwd=request.source_dir,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=request.timeout_seconds,
+                check=False,
+            )
+            return ContainerExecutionResult(
+                success=completed.returncode == 0,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                returncode=completed.returncode,
+                content="Container execution completed.",
+                error=None if completed.returncode == 0 else "container_nonzero_exit",
+                tree_digest=request.expected_tree_digest,
+                scope_digest=request.scopes.digest(),
+            )
+
+    def run_stub(
+        *,
+        workspace: Path,
+        image: str | None,
+        command: list[str],
+        timeout_seconds: float,
+        expected_repair_snapshot: dict[str, Any] | None = None,
+        runner: object | None = None,
+    ) -> IsolatedValidationResult:
+        del image, runner
+        return run_real_isolated_validation(
+            workspace=workspace,
+            image="example.invalid/kestrel-validation@sha256:" + "a" * 64,
+            command=command,
+            timeout_seconds=timeout_seconds,
+            expected_repair_snapshot=expected_repair_snapshot,
+            runner=LocalUnitRunner(),
+        )
+
+    monkeypatch.setattr(process_tools, "run_isolated_validation", run_stub)
+
+
+def test_windows_process_tree_uses_absolute_system_taskkill(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    windows_root = tmp_path / "Windows"
+    taskkill = windows_root / "System32" / "taskkill.exe"
+    taskkill.parent.mkdir(parents=True)
+    taskkill.write_text("", encoding="utf-8")
+    monkeypatch.setenv("SystemRoot", str(windows_root))
+    monkeypatch.delenv("WINDIR", raising=False)
+    commands: list[list[str]] = []
+
+    class FakeProcess:
+        pid = 4242
+        killed = False
+
+        def poll(self) -> int | None:
+            return None
+
+        def kill(self) -> None:
+            self.killed = True
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    process = FakeProcess()
+    monkeypatch.setattr(process_tools.subprocess, "run", fake_run)
+
+    verified = process_tools._terminate_windows_process_tree(  # noqa: SLF001
+        cast(Any, process)
+    )
+
+    assert commands == [[str(taskkill.resolve()), "/PID", "4242", "/T", "/F"]]
+    assert Path(commands[0][0]).is_absolute()
+    assert process.killed is False
+    assert verified is True
+
+
+def test_windows_process_tree_falls_back_when_system_taskkill_is_unavailable(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SystemRoot", raising=False)
+    monkeypatch.delenv("WINDIR", raising=False)
+
+    class FakeProcess:
+        pid = 4242
+        killed = False
+
+        def poll(self) -> int | None:
+            return None
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = FakeProcess()
+    verified = process_tools._terminate_windows_process_tree(  # noqa: SLF001
+        cast(Any, process)
+    )
+
+    assert process.killed is True
+    assert verified is False
+
+
+def test_windows_process_tree_rejects_nonzero_taskkill_as_verified(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    windows_root = tmp_path / "Windows"
+    taskkill = windows_root / "System32" / "taskkill.exe"
+    taskkill.parent.mkdir(parents=True)
+    taskkill.write_text("", encoding="utf-8")
+    monkeypatch.setenv("SystemRoot", str(windows_root))
+
+    class FakeProcess:
+        pid = 4242
+        killed = False
+
+        def poll(self) -> int | None:
+            return None
+
+        def kill(self) -> None:
+            self.killed = True
+
+    monkeypatch.setattr(
+        process_tools.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 128),
+    )
+    process = FakeProcess()
+
+    verified = process_tools._terminate_windows_process_tree(  # noqa: SLF001
+        cast(Any, process)
+    )
+
+    assert verified is False
+    assert process.killed is True
+
+
+def test_windows_taskkill_cannot_verify_descendants_after_leader_exit(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    windows_root = tmp_path / "Windows"
+    taskkill = windows_root / "System32" / "taskkill.exe"
+    taskkill.parent.mkdir(parents=True)
+    taskkill.write_text("", encoding="utf-8")
+    monkeypatch.setenv("SystemRoot", str(windows_root))
+
+    class DeadLeader:
+        pid = 4242
+        killed = False
+
+        def poll(self) -> int | None:
+            return 0
+
+        def kill(self) -> None:
+            self.killed = True
+
+    monkeypatch.setattr(
+        process_tools.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0),
+    )
+
+    verified = process_tools._terminate_windows_process_tree(  # noqa: SLF001
+        cast(Any, DeadLeader())
+    )
+
+    assert verified is False
+
+
+def test_windows_popen_is_suspended_until_job_assignment(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    observed: dict[str, Any] = {}
+    memory = build_memory_system("memory", tmp_path / "memory")
+
+    def fake_popen(command: list[str], **kwargs: Any) -> object:
+        observed["command"] = command
+        observed.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(process_tools.sys, "platform", "win32")
+    monkeypatch.setattr(process_tools.subprocess, "Popen", fake_popen)
+
+    process_tools._start_subprocess(  # noqa: SLF001
+        ["example.exe"],
+        context=ToolContext(
+            memory=memory,
+            config=AgentConfig(),
+            workspace=tmp_path,
+        ),
+    )
+
+    assert int(observed["creationflags"]) & 0x00000004
+    assert int(observed["creationflags"]) & 0x00000200
+
+
+def test_subprocess_binary_stdin_preserves_exact_bytes(tmp_path: Path) -> None:
+    payload = b"first line\nsecond line\n"
+    completed = _run_subprocess(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write(sys.stdin.buffer.read().hex())",
+        ],
+        context=ToolContext(
+            memory=build_memory_system("memory", tmp_path / "memory"),
+            config=AgentConfig(),
+            workspace=tmp_path,
+        ),
+        arguments={},
+        default_timeout=5,
+        input_bytes=payload,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == payload.hex()
+    assert completed.stderr == ""
+
+
+def test_subprocess_rejects_ambiguous_text_and_binary_stdin(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="either text or bytes"):
+        _run_subprocess(
+            [sys.executable, "-c", "pass"],
+            context=ToolContext(
+                memory=build_memory_system("memory", tmp_path / "memory"),
+                config=AgentConfig(),
+                workspace=tmp_path,
+            ),
+            arguments={},
+            default_timeout=5,
+            input_text="text",
+            input_bytes=b"bytes",
+        )
+
+
+@pytest.mark.parametrize("mode", ["success", "timeout", "cancel"])
+def test_windows_unverified_job_cleanup_is_indeterminate(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    mode: str,
+) -> None:
+    events: list[str] = []
+    memory = build_memory_system("memory", tmp_path / "memory")
+
+    class FakeJob:
+        def assign(self, process_id: int) -> bool:
+            events.append(f"assign:{process_id}")
+            return True
+
+        def resume(self, process_id: int) -> bool:
+            events.append(f"resume:{process_id}")
+            return True
+
+        def terminate_and_wait(self, *, timeout_seconds: float = 2.0) -> bool:
+            del timeout_seconds
+            events.append("terminate")
+            return False
+
+        def close(self) -> bool:
+            events.append("close")
+            return True
+
+    class FakeProcess:
+        pid = 4242
+        returncode = 0
+
+        def communicate(self, *args: object, **kwargs: object) -> tuple[str, str]:
+            del args, kwargs
+            events.append("communicate")
+            if mode == "timeout":
+                raise subprocess.TimeoutExpired(["example.exe"], 0.1)
+            if mode == "cancel":
+                process_tools._cancel_running_subprocess("windows-job-test")  # noqa: SLF001
+            return "", ""
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            events.append("kill")
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return self.returncode
+
+    monkeypatch.setattr(process_tools.sys, "platform", "win32")
+    monkeypatch.setattr(process_tools, "_create_windows_process_job", FakeJob)
+    monkeypatch.setattr(
+        process_tools,
+        "_start_subprocess",
+        lambda *args, **kwargs: cast(Any, FakeProcess()),
+    )
+    context = ToolContext(
+        memory=memory,
+        config=AgentConfig(tool_timeout_seconds=0.1),
+        workspace=tmp_path,
+        run_id="run-windows-job",
+    )
+
+    with pytest.raises(_SubprocessToolOutcomeIndeterminate):
+        _run_subprocess(
+            ["example.exe"],
+            context=context,
+            arguments={"_tool_execution_id": "windows-job-test"},
+            default_timeout=1,
+        )
+
+    assert events[:2] == ["assign:4242", "resume:4242"]
+    assert "terminate" in events
+    assert events[-1] == "close"
+
+
+def test_windows_job_quiesces_detached_descendants_after_dead_leader(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    memory = build_memory_system("memory", tmp_path / "memory")
+
+    class FakeJob:
+        def assign(self, process_id: int) -> bool:
+            events.append("assign")
+            return process_id == 4242
+
+        def resume(self, process_id: int) -> bool:
+            events.append("resume")
+            return process_id == 4242
+
+        def terminate_and_wait(self, *, timeout_seconds: float = 2.0) -> bool:
+            del timeout_seconds
+            events.append("job-tree-quiesced")
+            return True
+
+        def close(self) -> bool:
+            events.append("close")
+            return True
+
+    class DeadLeaderWithDetachedChild:
+        pid = 4242
+        returncode = 0
+
+        def communicate(self, *args: object, **kwargs: object) -> tuple[str, str]:
+            del args, kwargs
+            events.append("leader-exited")
+            return "ok", ""
+
+        def poll(self) -> int | None:
+            return 0
+
+    monkeypatch.setattr(process_tools.sys, "platform", "win32")
+    monkeypatch.setattr(process_tools, "_create_windows_process_job", FakeJob)
+    monkeypatch.setattr(
+        process_tools,
+        "_start_subprocess",
+        lambda *args, **kwargs: cast(Any, DeadLeaderWithDetachedChild()),
+    )
+
+    completed = _run_subprocess(
+        ["example.exe"],
+        context=ToolContext(
+            memory=memory,
+            config=AgentConfig(tool_timeout_seconds=1),
+            workspace=tmp_path,
+        ),
+        arguments={},
+        default_timeout=1,
+    )
+
+    assert completed.returncode == 0
+    assert events == [
+        "assign",
+        "resume",
+        "leader-exited",
+        "job-tree-quiesced",
+        "close",
+    ]
+
+
+def test_windows_unverified_job_handle_close_is_indeterminate(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+
+    class FakeJob:
+        def assign(self, process_id: int) -> bool:
+            return process_id == 4242
+
+        def resume(self, process_id: int) -> bool:
+            return process_id == 4242
+
+        def terminate_and_wait(self, *, timeout_seconds: float = 2.0) -> bool:
+            del timeout_seconds
+            return True
+
+        def close(self) -> bool:
+            return False
+
+    class FakeProcess:
+        pid = 4242
+        returncode = 0
+
+        def communicate(self, *args: object, **kwargs: object) -> tuple[str, str]:
+            del args, kwargs
+            return "ok", ""
+
+        def poll(self) -> int | None:
+            return 0
+
+    monkeypatch.setattr(process_tools.sys, "platform", "win32")
+    monkeypatch.setattr(process_tools, "_create_windows_process_job", FakeJob)
+    monkeypatch.setattr(
+        process_tools,
+        "_start_subprocess",
+        lambda *args, **kwargs: cast(Any, FakeProcess()),
+    )
+
+    with pytest.raises(
+        _SubprocessToolOutcomeIndeterminate,
+        match="could not close the kill-on-close Job Object",
+    ):
+        _run_subprocess(
+            ["example.exe"],
+            context=ToolContext(
+                memory=memory,
+                config=AgentConfig(tool_timeout_seconds=1),
+                workspace=tmp_path,
+            ),
+            arguments={},
+            default_timeout=1,
+        )
 
 
 class SlowTool(AgentTool):
@@ -40,6 +525,18 @@ class SlowTool(AgentTool):
             success=True,
             content="finished",
         )
+
+
+class SystemExitTool(AgentTool):
+    spec = ToolSpec(
+        name="system-exit.tool",
+        description="Raises a BaseException at the tool boundary.",
+        parameters={"type": "object", "properties": {}},
+    )
+
+    def run(self, arguments: dict[str, object], context: ToolContext) -> ToolExecution:
+        del arguments, context
+        raise SystemExit(17)
 
 
 class FlakyRetryTool(AgentTool):
@@ -148,6 +645,90 @@ def test_transparent_retries_never_repeat_high_risk_or_approved_tools(tmp_path: 
     assert mutating.calls == 1
 
 
+def test_transparent_retry_never_repeats_indeterminate_mcp_outcome(tmp_path: Path) -> None:
+    class IndeterminateMCPTool(AgentTool):
+        spec = ToolSpec(
+            name="mcp.test.commit",
+            description="Models a remote operation with unknown timeout outcome.",
+            parameters={"type": "object", "properties": {}},
+        )
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
+            del context
+            self.calls += 1
+            return ToolExecution(
+                call=ToolCall(name=self.spec.name, arguments=arguments),
+                success=False,
+                content="Remote outcome is indeterminate.",
+                data={"outcome_indeterminate": True, "retryable": False},
+                error="mcp_tool_outcome_indeterminate",
+            )
+
+    memory = build_memory_system("memory", tmp_path / "memory")
+    tool = IndeterminateMCPTool()
+    inner = ToolRegistry()
+    inner.register(tool)
+    registry = RetryingRegistry(inner, max_attempts=3, backoff_base_seconds=0)
+
+    result = registry.execute(
+        ToolCall(name=tool.spec.name, arguments={}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.error == "mcp_tool_outcome_indeterminate"
+    assert tool.calls == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    ["extension_cleanup_pending", "extension_cleanup_unverified"],
+)
+def test_transparent_retry_never_repeats_unverified_oci_cleanup(
+    tmp_path: Path,
+    error: str,
+) -> None:
+    class CleanupFailureTool(AgentTool):
+        spec = ToolSpec(
+            name="test.oci-cleanup",
+            description="Models a retained OCI cleanup identity.",
+            parameters={"type": "object", "properties": {}},
+        )
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(
+            self,
+            arguments: dict[str, Any],
+            context: ToolContext,
+        ) -> ToolExecution:
+            del context
+            self.calls += 1
+            return ToolExecution(
+                call=ToolCall(name=self.spec.name, arguments=arguments),
+                success=False,
+                content="OCI cleanup requires operator reconciliation.",
+                error=error,
+            )
+
+    memory = build_memory_system("memory", tmp_path / "memory")
+    tool = CleanupFailureTool()
+    inner = ToolRegistry()
+    inner.register(tool)
+    registry = RetryingRegistry(inner, max_attempts=3, backoff_base_seconds=0)
+
+    result = registry.execute(
+        ToolCall(name=tool.spec.name, arguments={}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.error == error
+    assert tool.calls == 1
+
+
 def test_file_write_is_atomic_and_rejects_secret_or_symlink_targets(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools(("file.write",))
@@ -226,6 +807,29 @@ def test_repo_search_does_not_follow_workspace_file_symlinks(tmp_path: Path) -> 
     assert result.data == {"matches": []}
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Creating symlinks may require privileges on Windows")
+def test_workspace_enumeration_skips_symlink_loops(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools(("file.list", "file.find", "repo.map"))
+    context = ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path)
+    (tmp_path / "safe.txt").write_text("safe", encoding="utf-8")
+    (tmp_path / "loop").symlink_to("loop")
+
+    results = (
+        registry.execute(ToolCall(name="file.list", arguments={}), context),
+        registry.execute(
+            ToolCall(name="file.find", arguments={"pattern": "*"}),
+            context,
+        ),
+        registry.execute(ToolCall(name="repo.map", arguments={}), context),
+    )
+
+    assert all(result.success for result in results)
+    payload = json.dumps([result.data for result in results])
+    assert "safe.txt" in payload
+    assert "loop" not in payload
+
+
 def test_run_manager_registry_honors_enabled_tools_config(tmp_path: Path) -> None:
     class _Events:
         pass
@@ -265,7 +869,7 @@ def test_run_manager_registry_honors_enabled_tools_config(tmp_path: Path) -> Non
     assert names == ["memory.search", "file.read"]
 
 
-def test_tool_registry_times_out_slow_tools(tmp_path: Path) -> None:
+def test_tool_registry_reports_actual_quiesced_outcome_after_deadline(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = ToolRegistry()
     registry.register(SlowTool())
@@ -276,9 +880,112 @@ def test_tool_registry_times_out_slow_tools(tmp_path: Path) -> None:
         ToolContext(memory=memory, config=config, workspace=tmp_path),
     )
 
+    assert result.success is True
+    assert result.error is None
+    assert result.data["tool_deadline_exceeded"] is True
+
+
+def test_tool_registry_system_exit_always_signals_worker_completion(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    registry.register(SystemExitTool())
+
+    result = registry.execute(
+        ToolCall(name="system-exit.tool", arguments={}),
+        ToolContext(
+            memory=build_memory_system("memory", tmp_path / "memory"),
+            config=AgentConfig(tool_timeout_seconds=0.05),
+            workspace=tmp_path,
+        ),
+    )
+
     assert result.success is False
-    assert result.error == "tool_timeout"
-    assert "timed out" in result.content
+    assert result.error == "tool_execution_failed"
+    assert "SystemExit" in result.content
+
+
+def test_low_risk_memory_timeout_quiesces_before_memory_close(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    class SlowRetrievalMemory:
+        closed = False
+
+        def retrieve(self, _query: RetrievalQuery) -> list[object]:
+            for layer in ("working", "episodic", "semantic"):
+                sleep(0.04)
+                assert self.closed is False
+                calls.append(layer)
+            # Model retrieval metadata write-back as part of the same owned
+            # operation: it too must settle before registry terminality.
+            calls.append("retrieval_metadata_upsert")
+            return []
+
+        def close_all(self) -> None:
+            self.closed = True
+            calls.append("closed")
+
+    memory = SlowRetrievalMemory()
+    registry = build_default_tools(("memory.search",))
+    result = registry.execute(
+        ToolCall(name="memory.search", arguments={"query": "slow"}),
+        ToolContext(
+            memory=cast(Any, memory),
+            config=AgentConfig(tool_timeout_seconds=0.01),
+            workspace=tmp_path,
+        ),
+    )
+    memory.close_all()
+
+    assert result.success is True
+    assert result.data["tool_deadline_exceeded"] is True
+    assert calls == [
+        "working",
+        "episodic",
+        "semantic",
+        "retrieval_metadata_upsert",
+        "closed",
+    ]
+
+
+def test_high_risk_file_write_never_mutates_after_terminal_result(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    import nested_memvid_agent.tools.workspace_tools as workspace_tools
+
+    original_write = workspace_tools._atomic_workspace_write
+    write_started = False
+
+    def delayed_write(workspace: Path, path: Path, text: str) -> None:
+        nonlocal write_started
+        write_started = True
+        sleep(0.1)
+        original_write(workspace, path, text)
+
+    monkeypatch.setattr(workspace_tools, "_atomic_workspace_write", delayed_write)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    call = ToolCall(
+        name="file.write",
+        arguments={"path": "delayed.txt", "content": "durable"},
+        id="delayed-file-write",
+    )
+
+    result = build_default_tools(("file.write",)).execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_file_write=True, tool_timeout_seconds=0.01),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({call.id}),
+            approved_tool_call_arguments={call.id: call.arguments},
+        ),
+    )
+
+    assert write_started is True
+    assert result.success is True
+    assert (tmp_path / "delayed.txt").read_text(encoding="utf-8") == "durable"
+    snapshot = (tmp_path / "delayed.txt").stat().st_mtime_ns
+    sleep(0.05)
+    assert (tmp_path / "delayed.txt").stat().st_mtime_ns == snapshot
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
@@ -322,8 +1029,188 @@ def test_subprocess_timeout_kills_term_ignoring_descendants(tmp_path: Path) -> N
         pytest.fail(f"TERM-ignoring descendant survived tool timeout in state {process_state}")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
+def test_subprocess_success_quiesces_redirected_background_descendants(tmp_path: Path) -> None:
+    child_pid_path = tmp_path / "success-child.pid"
+    late_marker = tmp_path / "late-success-mutation.txt"
+    child_code = (
+        "import pathlib,signal,time;"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        "time.sleep(0.8);"
+        f"pathlib.Path({str(late_marker)!r}).write_text('late')"
+    )
+    parent_code = (
+        "import pathlib,subprocess,sys;"
+        f"child=subprocess.Popen([sys.executable,'-c',{child_code!r}],"
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
+        f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid))"
+    )
+    context = ToolContext(
+        memory=build_memory_system("memory", tmp_path / "memory"),
+        config=AgentConfig(tool_timeout_seconds=2),
+        workspace=tmp_path,
+    )
+
+    completed = _run_subprocess(
+        [sys.executable, "-c", parent_code],
+        context=context,
+        arguments={"_tool_call_id": "normal-exit-tree"},
+        default_timeout=2,
+    )
+
+    assert completed.returncode == 0
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+    _assert_pid_gone_or_zombie(child_pid)
+    sleep(1.0)
+    assert late_marker.exists() is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
+def test_subprocess_communicate_failure_still_quiesces_process_group(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    late_marker = tmp_path / "communicate-failure-late.txt"
+    code = (
+        f"import pathlib,time;time.sleep(0.8);pathlib.Path({str(late_marker)!r}).write_text('late')"
+    )
+
+    class CommunicateFailureProxy:
+        def __init__(self, process: subprocess.Popen[str]) -> None:
+            self._process = process
+            self.pid = process.pid
+
+        def communicate(self, *args: object, **kwargs: object) -> tuple[str, str]:
+            del args, kwargs
+            raise OSError("injected communicate failure")
+
+        def poll(self) -> int | None:
+            return self._process.poll()
+
+        def terminate(self) -> None:
+            self._process.terminate()
+
+        def kill(self) -> None:
+            self._process.kill()
+
+        def wait(self, *args: object, **kwargs: object) -> int:
+            return self._process.wait(*args, **kwargs)
+
+    def failing_start(
+        command: list[str],
+        *,
+        context: ToolContext,
+        environment: dict[str, str] | None = None,
+        pipe_stdin: bool = False,
+    ) -> Any:
+        del context, pipe_stdin
+        process = subprocess.Popen(
+            command,
+            cwd=tmp_path,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        return CommunicateFailureProxy(process)
+
+    monkeypatch.setattr(process_tools, "_start_subprocess", failing_start)
+    context = ToolContext(
+        memory=build_memory_system("memory", tmp_path / "memory"),
+        config=AgentConfig(tool_timeout_seconds=2),
+        workspace=tmp_path,
+    )
+
+    with pytest.raises(OSError, match="injected communicate failure"):
+        _run_subprocess(
+            [sys.executable, "-c", code],
+            context=context,
+            arguments={"_tool_execution_id": "communicate-failure"},
+            default_timeout=2,
+        )
+
+    sleep(1.0)
+    assert late_marker.exists() is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
+def test_same_public_call_id_across_runs_keeps_process_tracking_isolated(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools(("test.run",))
+
+    def host_supervised_run(command: list[str], **kwargs: Any) -> Any:
+        kwargs["require_container_isolation"] = False
+        return _run_subprocess(command, **kwargs)
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.tools.command_tools._run_subprocess",
+        host_supervised_run,
+    )
+
+    def invocation(run_id: str) -> tuple[ToolCall, ToolContext, Path]:
+        pid_path = tmp_path / f"{run_id}.pid"
+        code = (
+            "import os,pathlib,signal,time;"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+            f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()));"
+            "time.sleep(30)"
+        )
+        call = ToolCall(
+            name="test.run",
+            arguments={"command": [sys.executable, "-c", code]},
+            id="call_1",
+        )
+        context = ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_shell=True, tool_timeout_seconds=10),
+            workspace=tmp_path,
+            run_id=run_id,
+            approved_tool_call_ids=frozenset({call.id}),
+            approved_tool_call_arguments={call.id: call.arguments},
+        )
+        return call, context, pid_path
+
+    call_a, context_a, pid_a_path = invocation("run-a")
+    call_b, context_b, pid_b_path = invocation("run-b")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_a = pool.submit(registry.execute, call_a, context_a)
+        future_b = pool.submit(registry.execute, call_b, context_b)
+        for _ in range(200):
+            if pid_a_path.is_file() and pid_b_path.is_file():
+                break
+            sleep(0.01)
+        assert pid_a_path.is_file() and pid_b_path.is_file()
+        pid_a = int(pid_a_path.read_text(encoding="utf-8"))
+        pid_b = int(pid_b_path.read_text(encoding="utf-8"))
+
+        assert cancel_subprocesses_for_run("run-a") == 1
+        result_a = future_a.result(timeout=3)
+        _assert_pid_gone_or_zombie(pid_a)
+        status_b = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid_b)],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        assert status_b.returncode == 0
+        assert status_b.stdout.strip() and not status_b.stdout.strip().startswith("Z")
+
+        assert cancel_subprocesses_for_run("run-b") == 1
+        result_b = future_b.result(timeout=3)
+
+    assert result_a.success is False
+    assert result_b.success is False
+    _assert_pid_gone_or_zombie(pid_b)
+
+
 def test_subprocess_tool_timeout_kills_child_process_and_caps_requested_timeout(
     tmp_path: Path,
+    monkeypatch: MonkeyPatch,
 ) -> None:
     script = tmp_path / "sleep_then_write.py"
     marker = tmp_path / "should_not_exist.txt"
@@ -335,6 +1222,15 @@ def test_subprocess_tool_timeout_kills_child_process_and_caps_requested_timeout(
     )
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
+
+    def host_supervised_run(command: list[str], **kwargs: Any) -> Any:
+        kwargs["require_container_isolation"] = False
+        return _run_subprocess(command, **kwargs)
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.tools.command_tools._run_subprocess",
+        host_supervised_run,
+    )
     call = ToolCall(
         name="test.run",
         arguments={"command": [sys.executable, str(script)], "timeout": 30},
@@ -359,7 +1255,9 @@ def test_subprocess_tool_timeout_kills_child_process_and_caps_requested_timeout(
 
 
 def test_memory_search_tool_returns_hits(tmp_path: Path) -> None:
-    memory = build_memory_system("memory", tmp_path / "memory")
+    memory = build_memory_system(
+        "memory", tmp_path / "memory", enforce_stable_write_integrity=False
+    )
     memory.put(
         MemoryRecord(
             layer=MemoryLayer.SEMANTIC,
@@ -376,6 +1274,37 @@ def test_memory_search_tool_returns_hits(tmp_path: Path) -> None:
     )
     assert result.success
     assert "Needle fact" in result.content
+
+
+def test_low_risk_memvid_doctor_never_runs_mutating_repairs(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    calls: list[bool] = []
+
+    def doctor(*, dry_run: bool) -> dict[str, bool]:
+        calls.append(dry_run)
+        return {"ok": True}
+
+    for backend in memory.backends.values():
+        monkeypatch.setattr(backend, "doctor", doctor, raising=False)
+    registry = build_default_tools(("memvid.doctor",))
+    context = ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path)
+
+    rejected = registry.execute(
+        ToolCall(name="memvid.doctor", arguments={"dry_run": False}),
+        context,
+    )
+    checked = registry.execute(
+        ToolCall(name="memvid.doctor", arguments={}),
+        context,
+    )
+
+    assert rejected.success is False
+    assert rejected.error == "mutating_doctor_disabled"
+    assert checked.success is True
+    assert calls == [True] * len(memory.backends)
 
 
 def test_memory_search_invalid_layer_returns_structured_failure(tmp_path: Path) -> None:
@@ -531,7 +1460,9 @@ def test_plugin_and_mcp_registry_tools_redact_and_count_materialized_state(tmp_p
     )
     context = ToolContext(
         memory=memory,
-        config=AgentConfig(state_path=tmp_path / "state.db", secret_store_path=tmp_path / "secrets.json"),
+        config=AgentConfig(
+            state_path=tmp_path / "state.db", secret_store_path=tmp_path / "secrets.json"
+        ),
         workspace=tmp_path,
     )
 
@@ -548,16 +1479,20 @@ def test_plugin_and_mcp_registry_tools_redact_and_count_materialized_state(tmp_p
 
 def test_file_find_stat_git_log_show_and_project_scripts_are_bounded(tmp_path: Path) -> None:
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
-    subprocess.run(["git", "config", "user.email", "kestrel@example.test"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "kestrel@example.test"], cwd=tmp_path, check=True
+    )
     subprocess.run(["git", "config", "user.name", "Kestrel Test"], cwd=tmp_path, check=True)
     (tmp_path / "pyproject.toml").write_text(
-        "[project]\nname = \"demo\"\n[tool.pytest.ini_options]\naddopts = \"-q\"\n",
+        '[project]\nname = "demo"\n[tool.pytest.ini_options]\naddopts = "-q"\n',
         encoding="utf-8",
     )
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "agent.py").write_text("print('kestrel')\n", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True, text=True
+    )
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
     context = ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path)
@@ -565,7 +1500,9 @@ def test_file_find_stat_git_log_show_and_project_scripts_are_bounded(tmp_path: P
     found = registry.execute(ToolCall(name="file.find", arguments={"pattern": "*.py"}), context)
     stat = registry.execute(ToolCall(name="file.stat", arguments={"path": "src/agent.py"}), context)
     log = registry.execute(ToolCall(name="git.log", arguments={"max_count": 1}), context)
-    shown = registry.execute(ToolCall(name="git.show", arguments={"rev": "HEAD", "max_chars": 2000}), context)
+    shown = registry.execute(
+        ToolCall(name="git.show", arguments={"rev": "HEAD", "max_chars": 2000}), context
+    )
     scripts = registry.execute(ToolCall(name="project.scripts", arguments={}), context)
 
     assert found.success is True
@@ -707,6 +1644,124 @@ def test_file_read_rejects_secret_store_path(tmp_path: Path) -> None:
     assert not result.success
     assert result.error == "file_read_failed"
     assert "not allowed" in result.content.lower()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="hard-link identity semantics differ on Windows"
+)
+def test_workspace_tools_hide_custom_secret_store_and_inode_aliases(tmp_path: Path) -> None:
+    raw_secret = "opaque-custom-vault-sentinel-7e18b9"
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    vault_path = config_dir / "runtime-vault.json"
+    vault_path.write_text(
+        json.dumps(
+            {
+                "secrets": {
+                    "provider": {
+                        "id": "provider",
+                        "name": "provider",
+                        "value": raw_secret,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    vault_path.chmod(0o600)
+    # Simulate a restart: the broker sees the pre-existing file but never resolves
+    # or registers its raw value with the process-wide redactor.
+    SecretBroker(vault_path)
+    temporary_path = config_dir / ".runtime-vault.json.interrupted.tmp"
+    temporary_path.write_text(raw_secret, encoding="utf-8")
+    temporary_path.chmod(0o600)
+    alias_path = tmp_path / "innocent-notes.json"
+    os.link(vault_path, alias_path)
+    (config_dir / "safe.txt").write_text("safe content", encoding="utf-8")
+
+    memory = build_memory_system("memory", tmp_path / "memory")
+    config = AgentConfig(
+        workspace=tmp_path,
+        secret_store_path=vault_path,
+        allow_file_write=True,
+    )
+    read_paths = (
+        "config/runtime-vault.json",
+        "config/.runtime-vault.json.lock",
+        "config/.runtime-vault.json.interrupted.tmp",
+        "innocent-notes.json",
+    )
+    write_calls = (
+        ToolCall(
+            name="file.write",
+            arguments={"path": "config/runtime-vault.json", "content": "replacement"},
+            id="write-vault",
+        ),
+        ToolCall(
+            name="file.write",
+            arguments={"path": "innocent-notes.json", "content": "replacement"},
+            id="write-alias",
+        ),
+    )
+    context = ToolContext(
+        memory=memory,
+        config=config,
+        workspace=tmp_path,
+        approved_tool_call_ids=frozenset(call.id for call in write_calls),
+        approved_tool_call_arguments={call.id: dict(call.arguments) for call in write_calls},
+    )
+    registry = build_default_tools()
+
+    direct_results = [
+        registry.execute(ToolCall(name="file.read", arguments={"path": path}), context)
+        for path in read_paths
+    ]
+    stat_results = [
+        registry.execute(
+            ToolCall(name="file.stat", arguments={"path": path, "hash": True}),
+            context,
+        )
+        for path in ("config/runtime-vault.json", "innocent-notes.json")
+    ]
+    write_results = [registry.execute(call, context) for call in write_calls]
+    search = registry.execute(
+        ToolCall(name="repo.search", arguments={"query": raw_secret}),
+        context,
+    )
+    listed = registry.execute(
+        ToolCall(name="file.list", arguments={"path": "config"}),
+        context,
+    )
+    found = registry.execute(
+        ToolCall(name="file.find", arguments={"path": ".", "pattern": "*", "type": "file"}),
+        context,
+    )
+    mapped = registry.execute(
+        ToolCall(name="repo.map", arguments={"path": ".", "max_depth": 3}),
+        context,
+    )
+
+    assert all(not result.success for result in (*direct_results, *stat_results, *write_results))
+    assert all(
+        raw_secret not in result.content
+        for result in (*direct_results, *stat_results, *write_results)
+    )
+    assert search.success is True
+    assert search.data["matches"] == []
+    visible_payload = json.dumps(
+        {
+            "list": listed.data,
+            "find": found.data,
+            "map": mapped.data,
+            "search": search.data,
+        }
+    )
+    assert "safe.txt" in visible_payload
+    assert "runtime-vault" not in visible_payload
+    assert "innocent-notes.json" not in visible_payload
+    assert raw_secret not in visible_payload
+    assert vault_path.read_text(encoding="utf-8").find(raw_secret) >= 0
+    assert alias_path.read_text(encoding="utf-8").find(raw_secret) >= 0
 
 
 @pytest.mark.parametrize(
@@ -889,6 +1944,81 @@ def test_shell_run_python_escape_is_not_allowlisted(
 
     assert result.error == "command_not_allowlisted"
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "executable",
+    ("./echo", "/tmp/echo", "nested/ls", "..\\cat"),
+)
+def test_shell_run_rejects_caller_selected_allowlist_executables(
+    tmp_path: Path,
+    executable: str,
+) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    call = ToolCall(
+        name="shell.run",
+        arguments={"command": [executable, "must-not-run"]},
+        id="caller-selected-utility",
+    )
+
+    result = build_default_tools().execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_shell=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({call.id}),
+            approved_tool_call_arguments={call.id: call.arguments},
+        ),
+    )
+
+    assert result.success is False
+    assert result.error == "command_not_allowlisted"
+
+
+def test_shell_run_uses_bounded_utility_instead_of_path_executable(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    marker = tmp_path / "path-executable-ran"
+    fake_echo = tmp_path / "echo"
+    fake_echo.write_text(
+        f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\n",
+        encoding="utf-8",
+    )
+    fake_echo.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.defpath}")
+
+    def forbidden_launch(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("bounded shell utilities must not launch a host process")
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.tools.process_tools._start_subprocess",
+        forbidden_launch,
+    )
+    memory = build_memory_system("memory", tmp_path / "memory")
+    call = ToolCall(
+        name="shell.run",
+        arguments={"command": ["echo", "safe"]},
+        id="bounded-echo",
+    )
+
+    result = build_default_tools().execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_shell=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({call.id}),
+            approved_tool_call_arguments={call.id: call.arguments},
+        ),
+    )
+
+    assert result.success is True
+    assert result.data["execution_mode"] == "bounded_utility"
+    assert "safe" in result.content
+    assert marker.exists() is False
 
 
 @pytest.mark.parametrize(
@@ -1136,7 +2266,7 @@ def test_self_inspect_returns_redacted_runtime_snapshot(
     assert "secret-token" not in json.dumps(result.data)
 
 
-def test_self_remember_writes_validated_self_memory(tmp_path: Path) -> None:
+def test_self_remember_rejects_caller_claimed_confirmation(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
     arguments = {
@@ -1152,17 +2282,13 @@ def test_self_remember_writes_validated_self_memory(tmp_path: Path) -> None:
         ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
     )
 
-    assert result.success
-    hits = memory.retrieve(
+    assert result.success is False
+    assert result.error == "self_memory_rejected"
+    assert not memory.retrieve(
         RetrievalQuery(
             query="implementation over analysis", layers=(MemoryLayer.SELF,), k_per_layer=3
         )
     )
-    assert hits
-    record = hits[0].record
-    assert record.metadata["self_schema"] == "user_workflow_preference"
-    assert record.metadata["validation_status"] == "user_confirmed"
-    assert record.evidence[0].source == "self.remember"
 
 
 def test_self_remember_rejects_low_confidence_self_memory(tmp_path: Path) -> None:
@@ -1375,7 +2501,9 @@ def test_plugin_review_requires_enablement_and_exact_approval(
                 "name": "Review Plugin",
                 "description": "Reviewed through the high-risk plugin tool.",
                 "dependencies": {"python": ["requests>=2"]},
-                "skills": [{"id": "hello", "description": "Say hello.", "instructions": "Return hello."}],
+                "skills": [
+                    {"id": "hello", "description": "Say hello.", "instructions": "Return hello."}
+                ],
             }
         ),
         encoding="utf-8",
@@ -1455,6 +2583,8 @@ def test_approved_exact_tool_call_runs_once_and_changed_args_do_not_run(tmp_path
     )
     assert approved.success
     assert "hi" in approved.content
+    assert approved.call == call
+    assert all(not key.startswith("_") for key in approved.call.arguments)
 
     changed = registry.execute(
         ToolCall(name="shell.run", arguments={"command": ["echo", "bye"]}, id="shell_exact"),
@@ -1532,7 +2662,9 @@ def test_diagnosis_classify_identifies_bare_assertion_errors(tmp_path: Path) -> 
 
 
 def test_diagnosis_recall_searches_prior_failure_lessons(tmp_path: Path) -> None:
-    memory = build_memory_system("memory", tmp_path / "memory")
+    memory = build_memory_system(
+        "memory", tmp_path / "memory", enforce_stable_write_integrity=False
+    )
     memory.put(
         MemoryRecord(
             layer=MemoryLayer.PROCEDURAL,
@@ -1574,9 +2706,41 @@ def test_repair_prepare_requires_approval_even_when_file_write_enabled(tmp_path:
 
 def _init_git_repo(path: Path) -> str:
     subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True, text=True)
-    (path / "README.md").write_text("seed\n")
     subprocess.run(
-        ["git", "add", "README.md"], cwd=path, check=True, capture_output=True, text=True
+        ["git", "config", "user.name", "Kestrel Test"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "kestrel-test@example.invalid"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "core.autocrlf", "false"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    # Git patches in these fixtures use LF bytes. Keep the committed target
+    # byte-identical on Windows so tests exercise patch transport rather than
+    # platform newline conversion in Path.write_text().
+    (path / "README.md").write_bytes(b"seed\n")
+    # Git-focused tests keep the memory backend inside the synthetic workspace.
+    # Model the runtime-artifact ignores expected in an actual Kestrel workspace
+    # so durable in-memory snapshots do not masquerade as user source changes.
+    (path / ".gitignore").write_text(".nest/\nmemory/\n")
+    subprocess.run(
+        ["git", "add", "README.md", ".gitignore"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     subprocess.run(
         [
@@ -1615,6 +2779,26 @@ def _approved_context(
         approved_tool_call_ids=frozenset({call.id}),
         approved_tool_call_arguments={call.id: call.arguments},
     )
+
+
+def _successful_repair_validation_id(
+    registry: ToolRegistry,
+    memory: object,
+    workspace: Path,
+    *,
+    call_id: str,
+) -> str:
+    call = ToolCall(
+        name="repair.validate",
+        arguments={"command": ["python", "-c", "print('repair validation passed')"]},
+        id=call_id,
+    )
+    result = registry.execute(
+        call,
+        _approved_context(memory, workspace, call, allow_shell=True),
+    )
+    assert result.success
+    return str(result.data["validation_id"])
 
 
 def test_repair_prepare_creates_approved_branch_from_clean_repo(tmp_path: Path) -> None:
@@ -1757,6 +2941,76 @@ def test_repair_apply_patch_refuses_non_repair_branch(tmp_path: Path) -> None:
     assert (tmp_path / "README.md").read_text() == "seed\n"
 
 
+def test_repair_apply_patch_preserves_exact_utf8_bytes(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _init_git_repo(tmp_path)
+    subprocess.run(
+        ["git", "switch", "-c", "codex/repair-exact-bytes"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert (tmp_path / "README.md").read_bytes() == b"seed\n"
+    patch_text = "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-seed\n+patched β\n"
+    observed_inputs: list[object] = []
+    real_run = subprocess.run
+
+    def capture_git_apply(command: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(command, list) and "apply" in command:
+            observed_inputs.append(kwargs.get("input"))
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(repair_tools.subprocess, "run", capture_git_apply)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(
+        name="repair.apply_patch",
+        arguments={"patch": patch_text},
+        id="repair_apply_exact_bytes",
+    )
+
+    result = registry.execute(call, _approved_context(memory, tmp_path, call))
+
+    assert result.success, result.content
+    assert observed_inputs == [patch_text.encode("utf-8")]
+    assert (tmp_path / "README.md").read_bytes() == "patched β\n".encode()
+
+
+def test_patch_apply_preserves_exact_utf8_bytes(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _init_git_repo(tmp_path)
+    assert (tmp_path / "README.md").read_bytes() == b"seed\n"
+    patch_text = "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-seed\n+patched β\n"
+    observed_inputs: list[object] = []
+    real_run_subprocess = process_tools._run_subprocess  # noqa: SLF001
+
+    def capture_run_subprocess(command: list[str], **kwargs: Any) -> Any:
+        if command == ["git", "apply", "--whitespace=nowarn"]:
+            observed_inputs.append(kwargs.get("input_bytes"))
+            assert "input_text" not in kwargs
+        return real_run_subprocess(command, **kwargs)
+
+    monkeypatch.setattr(command_tools, "_run_subprocess", capture_run_subprocess)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(
+        name="patch.apply",
+        arguments={"patch": patch_text},
+        id="patch_apply_exact_bytes",
+    )
+
+    result = registry.execute(call, _approved_context(memory, tmp_path, call))
+
+    assert result.success, result.content
+    assert observed_inputs == [patch_text.encode("utf-8")]
+    assert (tmp_path / "README.md").read_bytes() == "patched β\n".encode()
+
+
 def test_repair_apply_validate_and_rollback_on_repair_branch(tmp_path: Path) -> None:
     _init_git_repo(tmp_path)
     subprocess.run(
@@ -1790,7 +3044,14 @@ def test_repair_apply_validate_and_rollback_on_repair_branch(tmp_path: Path) -> 
     assert validated.error == "repair_validation_failed"
     assert validated.data["diagnosis"]["classification"] in {"tool_failure", "unknown_failure"}
 
-    rollback_call = ToolCall(name="repair.rollback", arguments={}, id="repair_rollback")
+    rollback_call = ToolCall(
+        name="repair.rollback",
+        arguments={
+            "validation_id": validated.data["validation_id"],
+            "expected_current_diff_digest": repair_snapshot(tmp_path)["diff_digest"],
+        },
+        id="repair_rollback",
+    )
     rolled_back = registry.execute(
         rollback_call, _approved_context(memory, tmp_path, rollback_call)
     )
@@ -1825,7 +3086,9 @@ def test_repair_orchestrate_validate_recalls_lessons_and_blocks_unchanged_retry(
         capture_output=True,
         text=True,
     )
-    memory = build_memory_system("memory", tmp_path / "memory")
+    memory = build_memory_system(
+        "memory", tmp_path / "memory", enforce_stable_write_integrity=False
+    )
     memory.put(
         MemoryRecord(
             layer=MemoryLayer.PROCEDURAL,
@@ -1863,7 +3126,9 @@ def test_repair_orchestrate_validate_allows_changed_strategy_after_recall(tmp_pa
         capture_output=True,
         text=True,
     )
-    memory = build_memory_system("memory", tmp_path / "memory")
+    memory = build_memory_system(
+        "memory", tmp_path / "memory", enforce_stable_write_integrity=False
+    )
     memory.put(
         MemoryRecord(
             layer=MemoryLayer.PROCEDURAL,
@@ -1946,6 +3211,31 @@ def test_codex_exec_requires_approval_by_default(tmp_path: Path) -> None:
     assert result.error == "tool_disabled"
 
 
+def test_codex_workspace_write_is_never_run_as_uncontained_host_process(
+    tmp_path: Path,
+) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    call = ToolCall(
+        name="codex.exec",
+        arguments={"prompt": "edit a file", "sandbox": "workspace-write"},
+        id="codex-workspace-write",
+    )
+
+    result = build_default_tools(("codex.exec",)).execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_codex_cli=True),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({call.id}),
+            approved_tool_call_arguments={call.id: call.arguments},
+        ),
+    )
+
+    assert result.success is False
+    assert result.error == "codex_workspace_write_uncontained"
+
+
 def test_codex_exec_runs_when_enabled(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
@@ -1956,7 +3246,7 @@ def test_codex_exec_runs_when_enabled(tmp_path: Path, monkeypatch: MonkeyPatch) 
         captured["kwargs"] = kwargs
         return subprocess.CompletedProcess(command, 0, stdout="codex done", stderr="")
 
-    monkeypatch.setattr("nested_memvid_agent.tools.command_tools.subprocess.run", fake_run)
+    monkeypatch.setattr("nested_memvid_agent.tools.command_tools._run_subprocess", fake_run)
 
     result = registry.execute(
         ToolCall(
@@ -1964,7 +3254,7 @@ def test_codex_exec_runs_when_enabled(tmp_path: Path, monkeypatch: MonkeyPatch) 
             arguments={
                 "prompt": "summarize this repo",
                 "model": "gpt-test",
-                "sandbox": "workspace-write",
+                "sandbox": "read-only",
                 "timeout": 45,
             },
             id="codex1",
@@ -1978,7 +3268,7 @@ def test_codex_exec_runs_when_enabled(tmp_path: Path, monkeypatch: MonkeyPatch) 
                 "codex1": {
                     "prompt": "summarize this repo",
                     "model": "gpt-test",
-                    "sandbox": "workspace-write",
+                    "sandbox": "read-only",
                     "timeout": 45,
                 }
             },
@@ -1990,10 +3280,195 @@ def test_codex_exec_runs_when_enabled(tmp_path: Path, monkeypatch: MonkeyPatch) 
     command = captured["command"]
     assert isinstance(command, list)
     assert command[:2] == ["codex", "exec"]
-    assert ["--cd", str(tmp_path.resolve())] == command[2:4]
-    assert ["--sandbox", "workspace-write"] == command[4:6]
+    assert ["--cd", "/extension"] == command[2:4]
+    assert ["--sandbox", "read-only"] == command[4:6]
     assert "--ephemeral" in command
     assert command[-1] == "summarize this repo"
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["sanitize_environment"] is True
+    assert kwargs["require_container_isolation"] is True
+    assert kwargs["default_timeout"] == 45
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
+def test_codex_exec_timeout_kills_term_ignoring_descendants(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    child_pid_path = tmp_path / "codex-child.pid"
+    executable = tmp_path / "codex"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "trap '' TERM\n"
+        "(trap '' TERM; sleep 30) &\n"
+        f"echo $! > {child_pid_path}\n"
+        "sleep 30\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    def host_supervised_run(command: list[str], **kwargs: Any) -> Any:
+        kwargs["require_container_isolation"] = False
+        return _run_subprocess(command, **kwargs)
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.tools.command_tools._run_subprocess",
+        host_supervised_run,
+    )
+    context = ToolContext(
+        memory=build_memory_system("memory", tmp_path / "memory"),
+        config=AgentConfig(allow_codex_cli=True, tool_timeout_seconds=1.0),
+        workspace=tmp_path,
+        run_id="run-codex-timeout",
+    )
+
+    result = CodexExecTool().run(
+        {
+            "prompt": "bounded timeout",
+            "timeout": 30,
+            "_tool_call_id": "codex-timeout-tree",
+        },
+        context,
+    )
+
+    assert result.success is False
+    assert result.error == "codex_timeout"
+    child_pid = int(child_pid_path.read_text(encoding="utf-8").strip())
+    _assert_pid_gone_or_zombie(child_pid)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
+def test_codex_exec_cancel_kills_term_ignoring_descendants(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    child_pid_path = tmp_path / "codex-cancel-child.pid"
+    executable = tmp_path / "codex"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "trap '' TERM\n"
+        "(trap '' TERM; sleep 30) &\n"
+        f"echo $! > {child_pid_path}\n"
+        "sleep 30\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    def host_supervised_run(command: list[str], **kwargs: Any) -> Any:
+        kwargs["require_container_isolation"] = False
+        return _run_subprocess(command, **kwargs)
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.tools.command_tools._run_subprocess",
+        host_supervised_run,
+    )
+    tool = CodexExecTool()
+    context = ToolContext(
+        memory=build_memory_system("memory", tmp_path / "memory"),
+        config=AgentConfig(allow_codex_cli=True, tool_timeout_seconds=30),
+        workspace=tmp_path,
+        run_id="run-codex-cancel",
+    )
+    arguments = {
+        "prompt": "bounded cancellation",
+        "timeout": 30,
+        "_tool_call_id": "codex-cancel-tree",
+    }
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(tool.run, arguments, context)
+        for _ in range(100):
+            if child_pid_path.is_file():
+                break
+            sleep(0.01)
+        assert child_pid_path.is_file()
+        tool.cancel("codex-cancel-tree")
+        result = future.result(timeout=3.0)
+
+    assert result.success is False
+    child_pid = int(child_pid_path.read_text(encoding="utf-8").strip())
+    _assert_pid_gone_or_zombie(child_pid)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
+def test_patch_apply_timeout_cannot_mutate_after_terminal_result(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    child_pid_path = tmp_path / "patch-child.pid"
+    late_marker = tmp_path / "late-patch-mutation.txt"
+    executable = tmp_path / "git"
+    child_code = (
+        "import pathlib,signal,time;"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        "time.sleep(1.0);"
+        f"pathlib.Path({str(late_marker)!r}).write_text('late')"
+    )
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import pathlib, signal, subprocess, sys, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"child_code = {child_code!r}\n"
+        "child = subprocess.Popen([sys.executable, '-c', child_code])\n"
+        f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid))\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    memory = build_memory_system("memory", tmp_path / "memory")
+    call = ToolCall(
+        name="patch.apply",
+        arguments={
+            "patch": (
+                "diff --git a/safe.txt b/safe.txt\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/safe.txt\n"
+                "@@ -0,0 +1 @@\n"
+                "+safe\n"
+            )
+        },
+        id="patch-timeout-tree",
+    )
+
+    result = build_default_tools().execute(
+        call,
+        ToolContext(
+            memory=memory,
+            config=AgentConfig(allow_file_write=True, tool_timeout_seconds=0.4),
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({call.id}),
+            approved_tool_call_arguments={call.id: call.arguments},
+        ),
+    )
+
+    assert result.success is False
+    assert result.error == "tool_timeout"
+    assert child_pid_path.is_file()
+    child_pid = int(child_pid_path.read_text(encoding="utf-8").strip())
+    _assert_pid_gone_or_zombie(child_pid)
+    sleep(1.2)
+    assert late_marker.exists() is False
+    assert (tmp_path / "safe.txt").exists() is False
+
+
+def _assert_pid_gone_or_zombie(pid: int) -> None:
+    for _ in range(40):
+        status = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        process_state = status.stdout.strip()
+        if status.returncode != 0 or not process_state or process_state.startswith("Z"):
+            return
+        sleep(0.05)
+    pytest.fail(f"Codex descendant survived in state {process_state}")
 
 
 def test_repo_search_stays_in_workspace(tmp_path: Path) -> None:
@@ -2042,6 +3517,7 @@ def test_file_write_still_blocks_path_escape_when_enabled(tmp_path: Path) -> Non
 
 
 def test_lint_run_uses_shell_enablement_and_allowlist(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
 
@@ -2072,12 +3548,55 @@ def test_lint_run_uses_shell_enablement_and_allowlist(tmp_path: Path) -> None:
     assert "exit_code=0" in allowed.content
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "command", "config"),
+    (
+        (
+            "test.run",
+            [sys.executable, "-c", "print('no host fallback')"],
+            AgentConfig(allow_shell=True),
+        ),
+        (
+            "lint.run",
+            [sys.executable, "-m", "compileall", "-q", "."],
+            AgentConfig(allow_shell=True),
+        ),
+        ("codex.exec", None, AgentConfig(allow_codex_cli=True)),
+    ),
+)
+def test_arbitrary_code_tools_require_digest_pinned_container_by_default(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    tool_name: str,
+    command: list[str] | None,
+    config: AgentConfig,
+) -> None:
+    monkeypatch.setattr(process_tools, "run_isolated_validation", run_real_isolated_validation)
+    arguments = {"prompt": "inspect only"} if command is None else {"command": command}
+    call = ToolCall(name=tool_name, arguments=arguments, id=f"contained-{tool_name}")
+
+    result = build_default_tools((tool_name,)).execute(
+        call,
+        ToolContext(
+            memory=build_memory_system("memory", tmp_path / f"memory-{tool_name}"),
+            config=config,
+            workspace=tmp_path,
+            approved_tool_call_ids=frozenset({call.id}),
+            approved_tool_call_arguments={call.id: call.arguments},
+        ),
+    )
+
+    assert result.success is False
+    assert result.error == "validation_container_required"
+
+
 @pytest.mark.parametrize("tool_name", ["test.run", "lint.run"])
 def test_validation_subprocesses_do_not_inherit_credentials(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
     tool_name: str,
 ) -> None:
+    _init_git_repo(tmp_path)
     monkeypatch.setenv("OPENAI_API_KEY", "opaque-provider-secret-12345")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:telegram-secret-material-value")
     monkeypatch.setenv("NEST_AGENT_API_TOKEN", "opaque-server-secret-12345")
@@ -2109,7 +3628,7 @@ def test_validation_subprocesses_do_not_inherit_credentials(
     )
 
     assert result.success is True
-    assert '"SAFE_VALIDATION_FLAG": "present"' in result.content
+    assert '"SAFE_VALIDATION_FLAG": null' in result.content
     assert '"OPENAI_API_KEY": null' in result.content
     assert '"TELEGRAM_BOT_TOKEN": null' in result.content
     assert '"NEST_AGENT_API_TOKEN": null' in result.content
@@ -2118,9 +3637,9 @@ def test_validation_subprocesses_do_not_inherit_credentials(
 
 def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_path: Path) -> None:
     _init_git_repo(tmp_path)
-    (tmp_path / "calculator.py").write_text("def add(a, b):\n    return a - b\n")
-    (tmp_path / "test_calculator.py").write_text(
-        "from calculator import add\n\ndef test_adds_numbers():\n    assert add(2, 3) == 5\n"
+    (tmp_path / "calculator.py").write_bytes(b"def add(a, b):\n    return a - b\n")
+    (tmp_path / "test_calculator.py").write_bytes(
+        b"from calculator import add\n\ndef test_adds_numbers():\n    assert add(2, 3) == 5\n"
     )
     subprocess.run(
         ["git", "add", "calculator.py", "test_calculator.py"],
@@ -2200,7 +3719,7 @@ def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_
     review_call = ToolCall(
         name="repair.review",
         arguments={
-            "validation": validation.data["validation"],
+            "validation_id": validation.data["validation"]["validation_id"],
             "summary": "Calculator repair validated by targeted pytest.",
         },
         id="review_e2e",
@@ -2298,15 +3817,15 @@ def test_stale_repair_review_blocks_commit_and_rollback_preserves_artifact(tmp_p
     )
     assert registry.execute(prepare, _approved_context(memory, tmp_path, prepare)).success
     (tmp_path / "calculator.py").write_text("def add(a, b):\n    return a + b\n")
-    validation = {
-        "success": True,
-        "returncode": 0,
-        "command": ["pytest", "-q"],
-        "content": "passed",
-    }
+    validation_id = _successful_repair_validation_id(
+        registry,
+        memory,
+        tmp_path,
+        call_id="validate_stale",
+    )
     review_call = ToolCall(
         name="repair.review",
-        arguments={"validation": validation, "summary": "Calculator fix reviewed."},
+        arguments={"validation_id": validation_id, "summary": "Calculator fix reviewed."},
         id="review_stale",
     )
     review = registry.execute(review_call, _approved_context(memory, tmp_path, review_call))
@@ -2323,7 +3842,11 @@ def test_stale_repair_review_blocks_commit_and_rollback_preserves_artifact(tmp_p
 
     rollback_call = ToolCall(
         name="repair.rollback",
-        arguments={"reason": "stale_repair_review", "review_id": review.data["review_id"]},
+        arguments={
+            "reason": "stale_repair_review",
+            "review_id": review.data["review_id"],
+            "expected_current_diff_digest": repair_snapshot(tmp_path)["diff_digest"],
+        },
         id="rollback_stale",
     )
     rolled_back = registry.execute(
@@ -2362,10 +3885,16 @@ def test_repair_review_creates_commit_gate_after_successful_validation(tmp_path:
     )
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
+    validation_id = _successful_repair_validation_id(
+        registry,
+        memory,
+        tmp_path,
+        call_id="validate_review_gate",
+    )
     call = ToolCall(
         name="repair.review",
         arguments={
-            "validation": {"success": True, "command": ["pytest", "-q"], "content": "passed"},
+            "validation_id": validation_id,
             "summary": "README patch validated with tests.",
         },
         id="review_gate",
@@ -2442,10 +3971,16 @@ def test_git_commit_allows_repair_branch_with_current_reviewer_gate(tmp_path: Pa
     )
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
+    validation_id = _successful_repair_validation_id(
+        registry,
+        memory,
+        tmp_path,
+        call_id="validate_for_commit",
+    )
     review_call = ToolCall(
         name="repair.review",
         arguments={
-            "validation": {"success": True, "command": ["pytest", "-q"]},
+            "validation_id": validation_id,
             "summary": "validated",
         },
         id="review_for_commit",
@@ -2474,9 +4009,55 @@ def test_git_commit_allows_repair_branch_with_current_reviewer_gate(tmp_path: Pa
 def test_git_commit_requires_approval_and_never_pushes(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
+    _init_git_repo(tmp_path)
+    subprocess.run(
+        ["git", "switch", "-c", "topic/exact-commit"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (tmp_path / "README.md").write_text("exact staged candidate\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    expected_tree = subprocess.run(
+        ["git", "write-tree"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
-    call = ToolCall(name="git.commit", arguments={"message": "test commit"}, id="commit1")
+    status = registry.execute(
+        ToolCall(name="git.status", arguments={}, id="commit_preview_status"),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+    assert status.success
+    preview = cast(dict[str, str], status.data["commit_preview"])
+    assert preview == {
+        "expected_branch": "topic/exact-commit",
+        "expected_head_sha": status.data["head_sha"],
+        "expected_tree_sha": expected_tree,
+    }
+    commit_spec = registry.spec_for("git.commit")
+    assert commit_spec is not None
+    assert {"expected_branch", "expected_head_sha", "expected_tree_sha"} <= set(
+        commit_spec.parameters["properties"]
+    )
+    assert {
+        "required": ["expected_branch", "expected_head_sha", "expected_tree_sha"]
+    } in commit_spec.parameters["anyOf"]
+    call = ToolCall(
+        name="git.commit",
+        arguments={"message": "test commit", **preview},
+        id="commit1",
+    )
 
     blocked = registry.execute(
         call,
@@ -2486,15 +4067,13 @@ def test_git_commit_requires_approval_and_never_pushes(
 
     captured: dict[str, object] = {"commands": []}
 
-    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        captured["command"] = command
-        captured["commands"].append(command)  # type: ignore[union-attr]
-        captured["kwargs"] = kwargs
-        if command == ["git", "rev-parse", "HEAD"]:
-            return subprocess.CompletedProcess(command, 0, stdout="abc123\n", stderr="")
-        return subprocess.CompletedProcess(command, 0, stdout="[main abc] test commit", stderr="")
+    real_run = subprocess.run
 
-    monkeypatch.setattr("nested_memvid_agent.tools.git_tools.subprocess.run", fake_run)
+    def recording_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+        captured["commands"].append(command)  # type: ignore[union-attr]
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr("nested_memvid_agent.tools.git_tools.subprocess.run", recording_run)
     approved = registry.execute(
         call,
         ToolContext(
@@ -2502,14 +4081,15 @@ def test_git_commit_requires_approval_and_never_pushes(
             config=AgentConfig(allow_git_commit=True),
             workspace=tmp_path,
             approved_tool_call_ids=frozenset({"commit1"}),
-            approved_tool_call_arguments={"commit1": {"message": "test commit"}},
+            approved_tool_call_arguments={"commit1": call.arguments},
         ),
     )
 
     assert approved.success
     commands = captured["commands"]
     assert isinstance(commands, list)
-    assert ["git", "commit", "-m", "test commit"] in commands
+    assert any("commit-tree" in command for command in commands)
+    assert any("update-ref" in command for command in commands)
     assert all("push" not in command for command in commands)
 
 
@@ -2539,18 +4119,22 @@ def test_git_create_local_branch_is_local_only_and_approval_gated(
 
     calls: list[list[str]] = []
 
-    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    def fake_output(workspace: Path, command: list[str]) -> str:
+        del workspace
+        calls.append(command)
+        return "feature"
+
+    def fake_supervised(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         del kwargs
         calls.append(command)
-        if command == ["git", "branch", "--show-current"]:
-            return subprocess.CompletedProcess(command, 0, stdout="feature\n", stderr="")
         return subprocess.CompletedProcess(command, 0, stdout="Switched to a new branch", stderr="")
 
-    monkeypatch.setattr("nested_memvid_agent.tools.git_tools.subprocess.run", fake_run)
+    monkeypatch.setattr("nested_memvid_agent.tools.git_tools._git_output", fake_output)
+    monkeypatch.setattr("nested_memvid_agent.tools.git_tools._run_subprocess", fake_supervised)
     result = registry.execute(call, _approved_context(memory, tmp_path, call))
 
     assert result.success
-    assert ["git", "switch", "-c", "kestrel/self-improve/test"] in calls
+    assert any(command[-3:] == ["switch", "-c", "kestrel/self-improve/test"] for command in calls)
     assert all("push" not in command for command in calls)
 
 
@@ -2566,12 +4150,34 @@ def test_git_export_patch_writes_local_improvement_patch(
         id="export_patch",
     )
 
-    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[Any]:
         del kwargs
-        assert command == ["git", "diff"]
+        if "config" in command and "--get-regexp" in command:
+            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
+        if command[-7:] == [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--ignore-cr-at-eol",
+            "--numstat",
+            "-z",
+        ]:
+            return subprocess.CompletedProcess(command, 0, stdout=b"1\t0\ta.txt\0", stderr=b"")
+        raise AssertionError(f"unexpected direct Git command: {command}")
+
+    def fake_supervised(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        assert command[-4:] == [
+            "diff",
+            "--ignore-cr-at-eol",
+            "--no-ext-diff",
+            "--no-textconv",
+        ]
         return subprocess.CompletedProcess(command, 0, stdout=patch_text, stderr="")
 
     monkeypatch.setattr("nested_memvid_agent.tools.git_tools.subprocess.run", fake_run)
+    monkeypatch.setattr("nested_memvid_agent.tools.git_tools._run_subprocess", fake_supervised)
     result = registry.execute(call, _approved_context(memory, tmp_path, call))
 
     assert result.success
@@ -2590,7 +4196,7 @@ def test_git_commit_refuses_protected_branches(tmp_path: Path, monkeypatch: Monk
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         del kwargs
         calls.append(command)
-        if command == ["git", "branch", "--show-current"]:
+        if command[-2:] == ["branch", "--show-current"]:
             return subprocess.CompletedProcess(command, 0, stdout="main\n", stderr="")
         return subprocess.CompletedProcess(command, 0, stdout="should not commit", stderr="")
 
@@ -2607,11 +4213,40 @@ def test_git_commit_refuses_protected_branches(tmp_path: Path, monkeypatch: Monk
     )
 
     assert result.error == "protected_branch"
-    assert ["git", "commit", "-m", "test commit"] not in calls
+    assert not any(command[-3:] == ["commit", "-m", "test commit"] for command in calls)
+
+
+def test_git_commit_requires_branch_and_head_preview_for_nonrepair_call(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(
+        name="git.commit",
+        arguments={"message": "incomplete preview", "expected_tree_sha": "a" * 40},
+        id="commit_incomplete_preview",
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="topic/incomplete\n", stderr="")
+
+    monkeypatch.setattr("nested_memvid_agent.tools.git_tools.subprocess.run", fake_run)
+
+    result = registry.execute(call, _approved_context(memory, tmp_path, call))
+
+    assert result.error == "commit_preview_required"
+    assert "expected_branch, expected_head_sha" in result.content
+    operational_calls = [command for command in calls if "--get-regexp" not in command]
+    assert len(operational_calls) == 1
+    assert operational_calls[0][-2:] == ["branch", "--show-current"]
 
 
 def test_memory_inspect_export_and_import_are_structured_and_gated(tmp_path: Path) -> None:
-    memory = build_memory_system("memory", tmp_path / "memory")
+    memory = build_memory_system(
+        "memory", tmp_path / "memory", enforce_stable_write_integrity=False
+    )
     memory.put(
         MemoryRecord(
             layer=MemoryLayer.SEMANTIC,
@@ -2637,7 +4272,12 @@ def test_memory_inspect_export_and_import_are_structured_and_gated(tmp_path: Pat
         ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
     )
     assert exported.success
-    assert json.loads(exported.content)[0]["title"] == "Structured export fact"
+    export_payload = json.loads(exported.content)
+    assert export_payload["records"][0]["title"] == "Structured export fact"
+    assert export_payload["total"] == 1
+    assert export_payload["truncated"] is False
+    assert export_payload["complete_export"] is True
+    assert export_payload["records"][0]["created_at"]
 
     import_call = ToolCall(
         name="memory.import",
@@ -2672,9 +4312,15 @@ def test_memory_inspect_export_and_import_are_structured_and_gated(tmp_path: Pat
         ),
     )
     assert imported.success
-    assert memory.retrieve(
+    assert not memory.retrieve(
         RetrievalQuery(query="Approved import", layers=(MemoryLayer.SEMANTIC,), k_per_layer=3)
     )
+    staged = memory.retrieve(
+        RetrievalQuery(query="Approved import", layers=(MemoryLayer.EPISODIC,), k_per_layer=3)
+    )
+    assert staged
+    assert staged[0].record.metadata["import_requested_layer"] == "semantic"
+    assert staged[0].record.metadata["stable_recall_eligible"] is False
 
 
 def test_memory_import_keeps_policy_writes_separately_gated(tmp_path: Path) -> None:
@@ -2720,7 +4366,7 @@ def test_memory_import_keeps_policy_writes_separately_gated(tmp_path: Path) -> N
     assert result.error == "policy_write_disabled"
 
 
-def test_memory_consolidate_promotes_repeated_procedure(tmp_path: Path) -> None:
+def test_memory_consolidate_rejects_legacy_score_and_repeat_claims(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     memory.put(
         MemoryRecord(
@@ -2746,15 +4392,15 @@ def test_memory_consolidate_promotes_repeated_procedure(tmp_path: Path) -> None:
         ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
     )
     assert result.success
-    assert '"target_layer": "procedural"' in result.content
-    assert memory.retrieve(
+    assert result.data["promoted"] is False
+    assert not memory.retrieve(
         RetrievalQuery(
             query="Repeatable test recipe", layers=(MemoryLayer.PROCEDURAL,), k_per_layer=3
         )
     )
 
 
-def test_memory_learn_routes_validated_signal(tmp_path: Path) -> None:
+def test_memory_learn_rejects_legacy_validation_score(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
     result = registry.execute(
@@ -2773,18 +4419,17 @@ def test_memory_learn_routes_validated_signal(tmp_path: Path) -> None:
     )
 
     assert result.success
-    assert result.data["target_layer"] == "semantic"
-    hits = memory.retrieve(
+    assert result.data["accepted"] is False
+    assert result.data["target_layer"] is None
+    assert result.data["record_id"] is None
+    assert not memory.retrieve(
         RetrievalQuery(
             query=".mv2 file per memory layer", layers=(MemoryLayer.SEMANTIC,), k_per_layer=3
         )
     )
-    assert hits
-    assert hits[0].record.metadata["nested_learning"]["context_flow"]["id"] == "episode_to_semantic"
-    assert hits[0].record.metadata["validation_evidence"]["legacy_raw_score"] is True
 
 
-def test_memory_learn_accepts_structured_validation_evidence(tmp_path: Path) -> None:
+def test_memory_learn_scores_but_rejects_unresolved_structured_evidence(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
     result = registry.execute(
@@ -2808,11 +4453,11 @@ def test_memory_learn_accepts_structured_validation_evidence(tmp_path: Path) -> 
 
     assert result.success
     assert result.data["validation_score"] == 1.0
-    hits = memory.retrieve(
+    assert result.data["accepted"] is False
+    assert result.data["validation_evidence"]["resolved"] is False
+    assert not memory.retrieve(
         RetrievalQuery(query="Structured validation evidence", layers=(MemoryLayer.SEMANTIC,))
     )
-    assert hits
-    assert hits[0].record.metadata["validation_evidence"]["test_refs"] == ["test.run:pytest -q"]
 
 
 def test_memory_learn_blocks_policy_without_config_enablement(tmp_path: Path) -> None:
@@ -2848,8 +4493,68 @@ def test_memory_learn_blocks_policy_without_config_enablement(tmp_path: Path) ->
     )
 
 
-def test_memory_correct_writes_correction_and_hides_superseded_target(tmp_path: Path) -> None:
+def test_policy_promote_requires_durable_receipt_and_staged_source(
+    tmp_path: Path,
+) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    arguments = {
+        "title": "Approval-bound policy",
+        "content": "Policy promotion must retain authenticated approval provenance.",
+        "validation_evidence": {
+            "test_refs": [{"source": "test.run", "locator": "policy-tests"}],
+            "lint_refs": [{"source": "lint.run", "locator": "policy-lint"}],
+            "repair_refs": [{"source": "repair.validate", "locator": "policy-repair"}],
+            "review_refs": [{"source": "repair.review", "locator": "policy-review"}],
+            "task_refs": [{"source": "task", "locator": "only-one-event"}],
+            "human_explicit": True,
+        },
+    }
+    call = ToolCall(name="memory.policy_promote", arguments=arguments, id="policy-receipt")
+    base_context = {
+        "memory": memory,
+        "config": AgentConfig(allow_policy_writes=True),
+        "workspace": tmp_path,
+        "session_id": "policy-test",
+        "run_id": "run-policy-test",
+        "approved_tool_call_ids": frozenset({call.id}),
+        "approved_tool_call_arguments": {call.id: arguments},
+    }
+
+    no_receipt = registry.execute(call, ToolContext(**base_context))
+
+    assert not no_receipt.success
+    assert no_receipt.error == "approval_provenance_required"
+    receipt = {
+        "approval_id": "approval-policy-test",
+        "run_id": "run-policy-test",
+        "tool_call_id": call.id,
+        "tool_name": "memory.policy_promote",
+        "arguments": arguments,
+        "status": "approved",
+        "principal": "owner",
+        "decision": {
+            "approved": True,
+            "arguments": arguments,
+            "principal": "owner",
+        },
+    }
+    single_event = registry.execute(
+        call,
+        ToolContext(**base_context, approval_receipts={call.id: receipt}),
+    )
+
+    assert not single_event.success
+    assert single_event.error == "policy_source_record_required"
+    assert not memory.retrieve(
+        RetrievalQuery(query="authenticated approval provenance", layers=(MemoryLayer.POLICY,))
+    )
+
+
+def test_memory_correct_writes_correction_and_hides_superseded_target(tmp_path: Path) -> None:
+    memory = build_memory_system(
+        "memory", tmp_path / "memory", enforce_stable_write_integrity=False
+    )
     target_id = memory.put(
         MemoryRecord(
             id="fact-alpha",

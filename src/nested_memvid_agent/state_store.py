@@ -1,20 +1,43 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
-from collections.abc import Iterator
+import stat
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from math import isfinite
 from pathlib import Path
 from threading import RLock
 from time import sleep
 from typing import Any
 
-SCHEMA_VERSION = 15
+from .file_lock import lock_exclusive, unlock
+from .platform_primitives import chmod_descriptor
+from .private_artifacts import open_private_file_descriptor
+from .routine_limits import (
+    MAX_ROUTINE_INTERVAL_SECONDS,
+    MAX_ROUTINE_MISFIRE_GRACE_SECONDS,
+    MIN_ROUTINE_INTERVAL_SECONDS,
+    MIN_ROUTINE_MISFIRE_GRACE_SECONDS,
+    validate_routine_claim_ttl,
+    validate_routine_history_limit,
+    validate_routine_interval,
+    validate_routine_misfire_grace,
+    validate_routine_reconciliation_limit,
+    validate_routines_per_tick,
+)
+from .security_boundary import redact_text
+
+SCHEMA_VERSION = 19
 DEFAULT_APPROVAL_TTL_SECONDS = 900.0
 CAPABILITY_KINDS = frozenset({"tool", "mcp_server", "skill"})
+_STATE_DIRECTORY_MODE = 0o700
+_SQLITE_FILE_MODE = 0o600
+_SQLITE_PRIVATE_SUFFIXES = ("", "-wal", "-shm", "-journal")
 _TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 _ABORTED_RUN_STATUSES = {"failed", "cancelled"}
 _SCHEMA_MIGRATION_LOCK = RLock()
@@ -38,6 +61,30 @@ class CapabilityConflictError(RuntimeError):
     def __init__(self, current: dict[str, Any]) -> None:
         self.current = current
         super().__init__("capability_revision_conflict")
+
+
+class RoutineConflictError(RuntimeError):
+    """Raised when a routine compare-and-swap revision is stale."""
+
+    def __init__(self, current: RoutineRecord) -> None:
+        self.current = current
+        super().__init__("routine_revision_conflict")
+
+
+class RoutineRunNowConflictError(RuntimeError):
+    """Raised when an owner-requested routine trigger cannot be admitted."""
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        current: RoutineRecord | None = None,
+        occurrence: RoutineOccurrenceRecord | None = None,
+    ) -> None:
+        self.code = code
+        self.current = current
+        self.occurrence = occurrence
+        super().__init__(code)
 
 
 def utc_now() -> str:
@@ -66,6 +113,9 @@ class RunRecord:
     recovery_reason: str = ""
     config_revision: str | None = None
     config_snapshot: dict[str, Any] = field(default_factory=dict)
+    turn_source: dict[str, Any] | None = None
+    turn_origin: str = "primary_user"
+    transcript_scope: str = "primary"
     created_at: str = ""
     updated_at: str = ""
 
@@ -123,16 +173,83 @@ class TraceSpanRecord:
     ended_at: str | None = None
 
 
+@dataclass(frozen=True)
+class RoutineRecord:
+    routine_id: str
+    name: str
+    prompt: str
+    schedule_kind: str
+    start_at: str
+    interval_seconds: int | None
+    enabled: bool
+    revision: int
+    next_run_at: str | None
+    workspace: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    autonomy_mode: str = "background"
+    misfire_grace_seconds: int = 60
+    last_scheduled_at: str | None = None
+    deleted_at: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class RoutineOccurrenceRecord:
+    occurrence_id: str
+    routine_id: str
+    routine_revision: int
+    scheduled_for: str
+    status: str
+    run_id: str
+    request: dict[str, Any] = field(default_factory=dict)
+    trigger_kind: str = "scheduled"
+    trigger_key_digest: str | None = None
+    requested_at: str | None = None
+    claim_owner: str | None = None
+    claim_generation: int = 1
+    claim_expires_at: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    skip_reason: str | None = None
+    error: str | None = None
+    result: dict[str, Any] = field(default_factory=dict)
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class RoutineClaimBatch:
+    claimed: tuple[RoutineOccurrenceRecord, ...] = ()
+    skipped: tuple[RoutineOccurrenceRecord, ...] = ()
+
+
+@dataclass(frozen=True)
+class RoutineManualClaim:
+    occurrence: RoutineOccurrenceRecord
+    dispatch: bool
+    created: bool
+
+
 class AgentStateStore:
     """SQLite control-plane state for runs, approvals, capabilities, and extensions."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        routine_admission_clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._routine_admission_clock = routine_admission_clock or (lambda: datetime.now(UTC))
         self._lock = RLock()
         with _SCHEMA_MIGRATION_LOCK:
-            self._migrate_schema()
-            self._enable_wal_mode()
+            with _state_initialization_lock(self.path):
+                _prepare_private_sqlite_storage(self.path)
+                self._migrate_schema()
+                self._enable_wal_mode()
+                _harden_private_sqlite_files(self.path)
 
     def create_run(
         self,
@@ -145,6 +262,9 @@ class AgentStateStore:
         provider: str = "mock",
         config_revision: str | None = None,
         config_snapshot: dict[str, Any] | None = None,
+        turn_source: dict[str, Any] | None = None,
+        turn_origin: str = "primary_user",
+        transcript_scope: str = "primary",
         max_nonterminal_runs: int | None = None,
     ) -> RunRecord:
         now = utc_now()
@@ -162,8 +282,9 @@ class AgentStateStore:
                 INSERT INTO runs (
                     run_id, status, message, session_id, workspace, provider, model,
                     assistant_message, context_chars, tool_count, stop_reason, error,
-                    config_revision, config_snapshot_json, created_at, updated_at
-                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, '', 0, 0, '', NULL, ?, ?, ?, ?)
+                    config_revision, config_snapshot_json, turn_source_json,
+                    turn_origin, transcript_scope, created_at, updated_at
+                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, '', 0, 0, '', NULL, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -174,11 +295,156 @@ class AgentStateStore:
                     model,
                     config_revision,
                     _encode(config_snapshot or {}),
+                    _encode(turn_source) if turn_source is not None else None,
+                    turn_origin,
+                    transcript_scope,
                     now,
                     now,
                 ),
             )
         return self.get_run(run_id)
+
+    def create_run_for_routine_occurrence(
+        self,
+        *,
+        occurrence_id: str,
+        claim_owner: str,
+        claim_generation: int,
+        dispatch_at: datetime,
+        run_id: str,
+        message: str,
+        session_id: str,
+        workspace: str,
+        model: str,
+        provider: str,
+        config_revision: str,
+        config_snapshot: dict[str, Any],
+        max_nonterminal_runs: int | None = None,
+    ) -> tuple[RunRecord, bool]:
+        """Atomically fence a routine claim, persist its run, and mark it running."""
+
+        instant = _lease_instant(dispatch_at)
+        owner = claim_owner.strip()
+        if not owner:
+            raise ValueError("routine claim owner is required")
+        if isinstance(claim_generation, bool) or claim_generation <= 0:
+            raise ValueError("routine claim generation must be positive")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            admission_instant = _lease_instant(self._routine_admission_clock())
+            occurrence_row = conn.execute(
+                """
+                SELECT o.*, r.enabled AS routine_enabled,
+                    r.revision AS current_revision, r.deleted_at AS routine_deleted_at
+                FROM routine_occurrences AS o
+                JOIN routines AS r ON r.routine_id = o.routine_id
+                WHERE o.occurrence_id = ?
+                """,
+                (occurrence_id,),
+            ).fetchone()
+            if occurrence_row is None:
+                raise KeyError(f"Unknown routine occurrence: {occurrence_id}")
+            occurrence = _routine_occurrence_from_row(occurrence_row)
+            expected_run_id = routine_run_id(
+                occurrence.routine_id,
+                occurrence.occurrence_id,
+            )
+            if occurrence.run_id != expected_run_id or run_id != expected_run_id:
+                raise ValueError("routine occurrence run identity mismatch")
+            if occurrence_row["routine_deleted_at"] is not None:
+                raise ValueError("routine deleted before dispatch")
+            if not bool(occurrence_row["routine_enabled"]):
+                raise ValueError("routine disabled before dispatch")
+            if int(occurrence_row["current_revision"]) != occurrence.routine_revision:
+                raise ValueError("routine changed before dispatch")
+            routine_provenance = {
+                "routine_id": occurrence.routine_id,
+                "occurrence_id": occurrence.occurrence_id,
+                "routine_revision": occurrence.routine_revision,
+                "scheduled_for": occurrence.scheduled_for,
+                "claim_generation": occurrence.claim_generation,
+            }
+            if occurrence.trigger_kind == "manual":
+                routine_provenance.update(
+                    {
+                        "trigger_kind": "manual",
+                        "trigger_key_digest": occurrence.trigger_key_digest,
+                        "requested_at": occurrence.requested_at,
+                    }
+                )
+            existing_row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if existing_row is not None:
+                existing = _run_from_row(existing_row)
+                if (
+                    existing.message != message
+                    or existing.session_id != session_id
+                    or existing.turn_source is not None
+                    or existing.turn_origin != "scheduled_routine"
+                    or existing.transcript_scope != "internal"
+                    or existing.config_snapshot.get("routine_provenance") != routine_provenance
+                ):
+                    raise ValueError("scheduled_routine_run_identity_conflict")
+                if occurrence.status not in {"running", "completed", "failed"}:
+                    raise ValueError("scheduled routine run has invalid occurrence state")
+                return existing, False
+            if occurrence.status != "claimed":
+                raise ValueError("routine occurrence is not claimed")
+            if occurrence.claim_owner != owner or occurrence.claim_generation != claim_generation:
+                raise ValueError("routine occurrence claim fence lost")
+            expiry = _parse_timestamp(occurrence.claim_expires_at)
+            if expiry is None or expiry <= admission_instant:
+                raise ValueError("routine occurrence claim expired")
+            if max_nonterminal_runs is not None:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM runs
+                    WHERE status IN ('queued', 'running', 'blocked')
+                    """
+                ).fetchone()
+                count = int(row["count"]) if row is not None else 0
+                if count >= max(1, max_nonterminal_runs):
+                    raise StateCapacityError("durable_run_capacity_exhausted")
+            now = instant.isoformat()
+            persisted_config_snapshot = dict(config_snapshot)
+            persisted_config_snapshot["routine_provenance"] = routine_provenance
+            conn.execute(
+                """
+                INSERT INTO runs (
+                    run_id, status, message, session_id, workspace, provider, model,
+                    assistant_message, context_chars, tool_count, stop_reason, error,
+                    config_revision, config_snapshot_json, turn_source_json,
+                    turn_origin, transcript_scope, created_at, updated_at
+                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, '', 0, 0, '', NULL, ?, ?, NULL,
+                    'scheduled_routine', 'internal', ?, ?)
+                """,
+                (
+                    run_id,
+                    message,
+                    session_id,
+                    workspace,
+                    provider,
+                    model,
+                    config_revision,
+                    _encode(persisted_config_snapshot),
+                    now,
+                    now,
+                ),
+            )
+            cursor = conn.execute(
+                """
+                UPDATE routine_occurrences SET status = 'running', started_at = ?,
+                    claim_expires_at = NULL, error = NULL, updated_at = ?
+                WHERE occurrence_id = ? AND status = 'claimed'
+                    AND claim_owner = ? AND claim_generation = ?
+                """,
+                (now, now, occurrence_id, owner, claim_generation),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("routine occurrence claim fence lost")
+            run_row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if run_row is None:
+                raise RuntimeError("scheduled routine run insert did not persist")
+            return _run_from_row(run_row), True
 
     def update_run(self, run_id: str, **fields: object) -> RunRecord:
         if not fields:
@@ -190,6 +456,34 @@ class AgentStateStore:
         with self._connect() as conn:
             conn.execute(f"UPDATE runs SET {assignments} WHERE run_id = ?", values)  # nosec
         return self.get_run(run_id)
+
+    def record_cancelled_run_durability_failure(
+        self,
+        run_id: str,
+        *,
+        error: str,
+        recovery_reason: str,
+    ) -> tuple[RunRecord, bool]:
+        """Annotate an immutable cancelled run when its final close was not durable."""
+
+        if not error.strip():
+            raise ValueError("cancelled run durability error is required")
+        if not recovery_reason.strip():
+            raise ValueError("cancelled run durability recovery reason is required")
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE runs SET error = ?, recovery_reason = ?, updated_at = ?
+                WHERE run_id = ? AND status = 'cancelled'
+                """,
+                (error, recovery_reason, now, run_id),
+            )
+            row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown run: {run_id}")
+            return _run_from_row(row), cursor.rowcount == 1
 
     def transition_run(
         self,
@@ -282,7 +576,12 @@ class AgentStateStore:
             if current.status in _TERMINAL_RUN_STATUSES or current.status == "blocked":
                 return None
             current_expiry = _parse_timestamp(current.lease_expires_at)
-            if current.lease_owner and current.lease_owner != owner and current_expiry and current_expiry > instant:
+            if (
+                current.lease_owner
+                and current.lease_owner != owner
+                and current_expiry
+                and current_expiry > instant
+            ):
                 return None
             generation = current.lease_generation
             if current.lease_owner != owner or current_expiry is None or current_expiry <= instant:
@@ -292,9 +591,285 @@ class AgentStateStore:
                 UPDATE runs SET lease_owner = ?, lease_generation = ?, lease_expires_at = ?,
                     heartbeat_at = ?, updated_at = ? WHERE run_id = ?
                 """,
-                (owner, generation, expires_at.isoformat(), instant.isoformat(), instant.isoformat(), run_id),
+                (
+                    owner,
+                    generation,
+                    expires_at.isoformat(),
+                    instant.isoformat(),
+                    instant.isoformat(),
+                    run_id,
+                ),
             )
         return self.get_run(run_id)
+
+    def claim_run_for_startup_recovery(
+        self,
+        run_id: str,
+        *,
+        expected_status: str,
+        expected_lease_owner: str | None,
+        expected_lease_generation: int,
+        expected_lease_expires_at: str | None,
+        owner: str,
+        ttl_seconds: float,
+        allow_unexpired_observed_lease: bool = False,
+        now: datetime | None = None,
+    ) -> RunRecord | None:
+        """Claim an exact stale run snapshot before startup mutates its state."""
+
+        normalized_owner = owner.strip()
+        if not normalized_owner:
+            raise ValueError("startup recovery owner is required")
+        instant = _lease_instant(now)
+        expires_at = instant + timedelta(seconds=_positive_ttl(ttl_seconds))
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown run: {run_id}")
+            current = _run_from_row(row)
+            if current.status in _TERMINAL_RUN_STATUSES:
+                return None
+            if (
+                current.status != expected_status
+                or current.lease_owner != expected_lease_owner
+                or current.lease_generation != expected_lease_generation
+                or current.lease_expires_at != expected_lease_expires_at
+            ):
+                return None
+            current_expiry = _parse_timestamp(current.lease_expires_at)
+            if (
+                current.lease_owner
+                and current_expiry is not None
+                and current_expiry > instant
+                and not allow_unexpired_observed_lease
+            ):
+                return None
+            generation = current.lease_generation + 1
+            cursor = conn.execute(
+                """
+                UPDATE runs SET lease_owner = ?, lease_generation = ?, lease_expires_at = ?,
+                    heartbeat_at = ?, updated_at = ?
+                WHERE run_id = ? AND status = ? AND lease_generation = ?
+                    AND lease_owner IS ? AND lease_expires_at IS ?
+                """,
+                (
+                    normalized_owner,
+                    generation,
+                    expires_at.isoformat(),
+                    instant.isoformat(),
+                    instant.isoformat(),
+                    run_id,
+                    expected_status,
+                    expected_lease_generation,
+                    expected_lease_owner,
+                    expected_lease_expires_at,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            updated = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if updated is None:
+                raise RuntimeError("startup recovery run claim did not persist")
+            return _run_from_row(updated)
+
+    def recover_pending_approval_wait(
+        self,
+        run_id: str,
+        approval_id: str,
+        *,
+        recovery_owner: str,
+        recovery_generation: int,
+        task_id: str | None = None,
+        subagent_id: str | None = None,
+        worker_owner: str | None = None,
+        worker_claim_id: str | None = None,
+    ) -> tuple[RunRecord, TaskNodeRecord | None, SubagentRunRecord | None, bool]:
+        """Atomically restore a pending approval waiter and block its claimed run."""
+
+        if (task_id is None) != (subagent_id is None):
+            raise ValueError("pending approval task and subagent bindings must be paired")
+        if task_id is not None and (
+            not str(worker_owner or "").strip() or not str(worker_claim_id or "").strip()
+        ):
+            raise ValueError("pending approval worker identity is required")
+        now = datetime.now(UTC)
+        now_text = now.isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run_row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if run_row is None:
+                raise KeyError(f"Unknown run: {run_id}")
+            current_run = _run_from_row(run_row)
+            if not _run_execution_lease_matches(
+                run_row,
+                owner=recovery_owner,
+                generation=recovery_generation,
+                instant=now,
+                allowed_statuses={"queued", "running", "blocked"},
+            ):
+                return current_run, None, None, False
+            approval_row = conn.execute(
+                "SELECT * FROM approval_requests WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval_row is None:
+                return current_run, None, None, False
+            approval = _approval_from_row(approval_row)
+            if approval["run_id"] != run_id or approval["status"] != "pending":
+                return current_run, None, None, False
+
+            current_task: TaskNodeRecord | None = None
+            current_subagent: SubagentRunRecord | None = None
+            if task_id is not None and subagent_id is not None:
+                task_row = conn.execute(
+                    "SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)
+                ).fetchone()
+                subagent_row = conn.execute(
+                    "SELECT * FROM subagent_runs WHERE subagent_id = ?", (subagent_id,)
+                ).fetchone()
+                if task_row is None or subagent_row is None:
+                    return current_run, None, None, False
+                current_task = _task_from_row(task_row)
+                current_subagent = _subagent_from_row(subagent_row)
+                task_result = dict(current_task.result or {})
+                continuation = task_result.get("approval_continuation")
+                pair_status = (current_task.status, current_subagent.status)
+                if (
+                    current_task.run_id != run_id
+                    or current_subagent.run_id != run_id
+                    or current_subagent.task_id != task_id
+                    or pair_status not in {("running", "running"), ("blocked", "blocked")}
+                    or (
+                        pair_status == ("running", "running")
+                        and (
+                            task_result.get("worker_owner") != worker_owner
+                            or task_result.get("worker_claim_id") != worker_claim_id
+                        )
+                    )
+                    or not isinstance(continuation, dict)
+                    or continuation.get("approval_id") != approval_id
+                    or continuation.get("tool_call_id") != approval.get("tool_call_id")
+                    or continuation.get("task_id") != task_id
+                    or continuation.get("subagent_id") != subagent_id
+                    or continuation.get("worker_owner") != worker_owner
+                    or continuation.get("worker_claim_id") != worker_claim_id
+                ):
+                    return current_run, current_task, current_subagent, False
+                if pair_status == ("running", "running"):
+                    task_cursor = conn.execute(
+                        """
+                        UPDATE task_nodes SET status = 'blocked', updated_at = ?
+                        WHERE task_id = ? AND run_id = ? AND status = 'running'
+                        """,
+                        (now_text, task_id, run_id),
+                    )
+                    subagent_cursor = conn.execute(
+                        """
+                        UPDATE subagent_runs SET status = 'blocked', result = ?, updated_at = ?
+                        WHERE subagent_id = ? AND run_id = ? AND task_id = ?
+                            AND status = 'running'
+                        """,
+                        ("Approval required.", now_text, subagent_id, run_id, task_id),
+                    )
+                    if task_cursor.rowcount != 1 or subagent_cursor.rowcount != 1:
+                        conn.rollback()
+                        return current_run, current_task, current_subagent, False
+
+            run_cursor = conn.execute(
+                """
+                UPDATE runs SET status = 'blocked', stop_reason = 'approval_required',
+                    recovery_reason = 'preserved_pending_approval', lease_owner = NULL,
+                    lease_expires_at = NULL, heartbeat_at = NULL, updated_at = ?
+                WHERE run_id = ? AND lease_owner = ? AND lease_generation = ?
+                    AND lease_expires_at > ?
+                    AND status IN ('queued', 'running', 'blocked')
+                """,
+                (
+                    now_text,
+                    run_id,
+                    recovery_owner,
+                    recovery_generation,
+                    now_text,
+                ),
+            )
+            if run_cursor.rowcount != 1:
+                conn.rollback()
+                return current_run, current_task, current_subagent, False
+            updated_run_row = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if updated_run_row is None:
+                raise RuntimeError("pending approval run recovery did not persist")
+            if task_id is not None and subagent_id is not None:
+                updated_task_row = conn.execute(
+                    "SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)
+                ).fetchone()
+                updated_subagent_row = conn.execute(
+                    "SELECT * FROM subagent_runs WHERE subagent_id = ?", (subagent_id,)
+                ).fetchone()
+                if updated_task_row is None or updated_subagent_row is None:
+                    raise RuntimeError("pending approval pair recovery did not persist")
+                current_task = _task_from_row(updated_task_row)
+                current_subagent = _subagent_from_row(updated_subagent_row)
+            return _run_from_row(updated_run_row), current_task, current_subagent, True
+
+    def claim_blocked_run_for_approval(
+        self,
+        run_id: str,
+        *,
+        owner: str,
+        ttl_seconds: float,
+        now: datetime | None = None,
+    ) -> RunRecord | None:
+        """Atomically publish an approval handoff and its new execution lease."""
+
+        normalized_owner = owner.strip()
+        if not normalized_owner:
+            raise ValueError("lease owner is required")
+        instant = _lease_instant(now)
+        expires_at = instant + timedelta(seconds=_positive_ttl(ttl_seconds))
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown run: {run_id}")
+            current = _run_from_row(row)
+            if current.status not in {"blocked", "queued"}:
+                return None
+            current_expiry = _parse_timestamp(current.lease_expires_at)
+            if current.lease_owner and current_expiry and current_expiry > instant:
+                return None
+            generation = current.lease_generation + 1
+            cursor = conn.execute(
+                """
+                UPDATE runs
+                SET status = 'running', stop_reason = 'scheduler_approval_handoff',
+                    lease_owner = ?, lease_generation = ?, lease_expires_at = ?,
+                    heartbeat_at = ?, updated_at = ?
+                WHERE run_id = ? AND status IN ('blocked', 'queued')
+                """,
+                (
+                    normalized_owner,
+                    generation,
+                    expires_at.isoformat(),
+                    instant.isoformat(),
+                    instant.isoformat(),
+                    run_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            updated = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if updated is None:
+                raise RuntimeError("approval run handoff did not persist")
+            return _run_from_row(updated)
 
     def renew_run_lease(
         self,
@@ -315,7 +890,15 @@ class AgentStateStore:
                   AND lease_expires_at > ?
                   AND status NOT IN ('completed', 'failed', 'cancelled', 'blocked')
                 """,
-                (expires_at.isoformat(), instant.isoformat(), instant.isoformat(), run_id, owner, generation, instant.isoformat()),
+                (
+                    expires_at.isoformat(),
+                    instant.isoformat(),
+                    instant.isoformat(),
+                    run_id,
+                    owner,
+                    generation,
+                    instant.isoformat(),
+                ),
             )
             if cursor.rowcount != 1:
                 return None
@@ -387,6 +970,830 @@ class AgentStateStore:
             ).fetchall()
         return [_run_from_row(row) for row in rows]
 
+    def create_routine(
+        self,
+        *,
+        routine_id: str,
+        name: str,
+        prompt: str,
+        schedule_kind: str,
+        start_at: datetime | str,
+        interval_seconds: int | None = None,
+        enabled: bool = False,
+        workspace: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        autonomy_mode: str = "background",
+        misfire_grace_seconds: int = 60,
+    ) -> RoutineRecord:
+        if enabled is not False:
+            raise ValueError("routines must be created disabled")
+        normalized = _normalize_routine_fields(
+            routine_id=routine_id,
+            name=name,
+            prompt=prompt,
+            schedule_kind=schedule_kind,
+            start_at=start_at,
+            interval_seconds=interval_seconds,
+            enabled=enabled,
+            workspace=workspace,
+            provider=provider,
+            model=model,
+            autonomy_mode=autonomy_mode,
+            misfire_grace_seconds=misfire_grace_seconds,
+        )
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO routines (
+                    routine_id, name, prompt, schedule_kind, start_at,
+                    interval_seconds, enabled, revision, next_run_at, workspace,
+                    provider, model, autonomy_mode, misfire_grace_seconds,
+                    last_scheduled_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    normalized["routine_id"],
+                    normalized["name"],
+                    normalized["prompt"],
+                    normalized["schedule_kind"],
+                    normalized["start_at"],
+                    normalized["interval_seconds"],
+                    1 if normalized["enabled"] is True else 0,
+                    normalized["start_at"],
+                    normalized["workspace"],
+                    normalized["provider"],
+                    normalized["model"],
+                    normalized["autonomy_mode"],
+                    normalized["misfire_grace_seconds"],
+                    now,
+                    now,
+                ),
+            )
+        return self.get_routine(str(normalized["routine_id"]))
+
+    def get_routine(self, routine_id: str) -> RoutineRecord:
+        normalized_id = _routine_identifier(routine_id)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM routines WHERE routine_id = ?", (normalized_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown routine: {normalized_id}")
+        return _routine_from_row(row)
+
+    def list_routines(self) -> list[RoutineRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM routines WHERE deleted_at IS NULL
+                ORDER BY created_at ASC, routine_id ASC
+                """
+            ).fetchall()
+        return [_routine_from_row(row) for row in rows]
+
+    def update_routine(
+        self,
+        routine_id: str,
+        *,
+        expected_revision: int,
+        **fields: object,
+    ) -> RoutineRecord:
+        normalized_id = _routine_identifier(routine_id)
+        expected_revision = _positive_routine_revision(
+            expected_revision,
+            field_name="expected_revision",
+        )
+        allowed = {
+            "name",
+            "prompt",
+            "schedule_kind",
+            "start_at",
+            "interval_seconds",
+            "enabled",
+            "workspace",
+            "provider",
+            "model",
+            "autonomy_mode",
+            "misfire_grace_seconds",
+        }
+        unknown = sorted(set(fields) - allowed)
+        if unknown:
+            raise ValueError(f"unsupported routine fields: {', '.join(unknown)}")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM routines WHERE routine_id = ?", (normalized_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown routine: {normalized_id}")
+            current = _routine_from_row(row)
+            if current.deleted_at is not None:
+                raise ValueError("routine_deleted")
+            if current.revision != expected_revision:
+                raise RoutineConflictError(current)
+            if not fields:
+                return current
+            merged: dict[str, object] = {
+                "routine_id": current.routine_id,
+                "name": current.name,
+                "prompt": current.prompt,
+                "schedule_kind": current.schedule_kind,
+                "start_at": current.start_at,
+                "interval_seconds": current.interval_seconds,
+                "enabled": current.enabled,
+                "workspace": current.workspace,
+                "provider": current.provider,
+                "model": current.model,
+                "autonomy_mode": current.autonomy_mode,
+                "misfire_grace_seconds": current.misfire_grace_seconds,
+            }
+            merged.update(fields)
+            normalized = _normalize_routine_fields(**merged)
+            schedule_changed = bool({"schedule_kind", "start_at", "interval_seconds"} & set(fields))
+            claimed_once = conn.execute(
+                """
+                SELECT scheduled_for FROM routine_occurrences
+                WHERE routine_id = ? AND routine_revision = ?
+                  AND status = 'claimed'
+                ORDER BY scheduled_for ASC LIMIT 1
+                """,
+                (normalized_id, current.revision),
+            ).fetchone()
+            next_run_at = str(normalized["start_at"]) if schedule_changed else current.next_run_at
+            if (
+                not schedule_changed
+                and normalized["schedule_kind"] == "once"
+                and normalized["enabled"] is True
+                and claimed_once is not None
+            ):
+                # A due one-shot has already cleared next_run_at. If an owner
+                # revision fences that still-claimed occurrence, carry its UTC
+                # slot into the new revision so the one-shot is not lost.
+                next_run_at = str(claimed_once["scheduled_for"])
+            now = utc_now()
+            cursor = conn.execute(
+                """
+                UPDATE routines SET name = ?, prompt = ?, schedule_kind = ?,
+                    start_at = ?, interval_seconds = ?, enabled = ?, revision = ?,
+                    next_run_at = ?, workspace = ?, provider = ?, model = ?,
+                    autonomy_mode = ?, misfire_grace_seconds = ?, updated_at = ?
+                WHERE routine_id = ? AND revision = ?
+                """,
+                (
+                    normalized["name"],
+                    normalized["prompt"],
+                    normalized["schedule_kind"],
+                    normalized["start_at"],
+                    normalized["interval_seconds"],
+                    1 if normalized["enabled"] is True else 0,
+                    current.revision + 1,
+                    next_run_at,
+                    normalized["workspace"],
+                    normalized["provider"],
+                    normalized["model"],
+                    normalized["autonomy_mode"],
+                    normalized["misfire_grace_seconds"],
+                    now,
+                    normalized_id,
+                    expected_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                latest = conn.execute(
+                    "SELECT * FROM routines WHERE routine_id = ?", (normalized_id,)
+                ).fetchone()
+                if latest is None:
+                    raise KeyError(f"Unknown routine: {normalized_id}")
+                raise RoutineConflictError(_routine_from_row(latest))
+            updated = conn.execute(
+                "SELECT * FROM routines WHERE routine_id = ?", (normalized_id,)
+            ).fetchone()
+            if updated is None:
+                raise KeyError(f"Unknown routine: {normalized_id}")
+            _skip_claimed_occurrences_for_routine(
+                conn,
+                normalized_id,
+                instant=_require_timestamp(now, "updated_at"),
+                reason=(
+                    "routine_disabled_before_dispatch"
+                    if not bool(normalized["enabled"])
+                    else "routine_changed_before_dispatch"
+                ),
+            )
+            return _routine_from_row(updated)
+
+    def delete_routine(
+        self,
+        routine_id: str,
+        *,
+        expected_revision: int,
+    ) -> RoutineRecord:
+        normalized_id = _routine_identifier(routine_id)
+        expected_revision = _positive_routine_revision(
+            expected_revision,
+            field_name="expected_revision",
+        )
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM routines WHERE routine_id = ?", (normalized_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown routine: {normalized_id}")
+            current = _routine_from_row(row)
+            if current.revision != expected_revision:
+                raise RoutineConflictError(current)
+            if current.deleted_at is not None:
+                return current
+            cursor = conn.execute(
+                """
+                UPDATE routines SET enabled = 0, revision = ?, next_run_at = NULL,
+                    deleted_at = ?, updated_at = ?
+                WHERE routine_id = ? AND revision = ? AND deleted_at IS NULL
+                """,
+                (
+                    current.revision + 1,
+                    now,
+                    now,
+                    normalized_id,
+                    expected_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                latest = conn.execute(
+                    "SELECT * FROM routines WHERE routine_id = ?", (normalized_id,)
+                ).fetchone()
+                if latest is None:
+                    raise KeyError(f"Unknown routine: {normalized_id}")
+                raise RoutineConflictError(_routine_from_row(latest))
+            _skip_claimed_occurrences_for_routine(
+                conn,
+                normalized_id,
+                instant=_require_timestamp(now, "deleted_at"),
+                reason="routine_deleted_before_dispatch",
+            )
+            deleted = conn.execute(
+                "SELECT * FROM routines WHERE routine_id = ?", (normalized_id,)
+            ).fetchone()
+            if deleted is None:
+                raise KeyError(f"Unknown routine: {normalized_id}")
+            return _routine_from_row(deleted)
+
+    def claim_manual_routine_occurrence(
+        self,
+        routine_id: str,
+        *,
+        expected_revision: int,
+        idempotency_key: str,
+        now: datetime,
+        claim_owner: str,
+        lease_ttl_seconds: float = 30.0,
+    ) -> RoutineManualClaim:
+        """Create or recover one idempotent owner-requested routine occurrence.
+
+        The idempotency key is hashed before persistence. Replays return the
+        original occurrence, while only a caller holding its live claim may
+        dispatch it. This path never advances the definition's schedule.
+        """
+
+        normalized_id = _routine_identifier(routine_id)
+        revision = _positive_routine_revision(
+            expected_revision,
+            field_name="expected_revision",
+        )
+        owner = claim_owner.strip()
+        if not owner:
+            raise ValueError("routine claim owner is required")
+        instant = _lease_instant(now)
+        claim_ttl = validate_routine_claim_ttl(
+            lease_ttl_seconds,
+            field_name="routine claim lease_ttl_seconds",
+        )
+        expires_at = instant + timedelta(seconds=claim_ttl)
+        key_digest = _routine_trigger_key_digest(idempotency_key)
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing_row = conn.execute(
+                """
+                SELECT * FROM routine_occurrences
+                WHERE routine_id = ? AND trigger_kind = 'manual'
+                  AND trigger_key_digest = ?
+                """,
+                (normalized_id, key_digest),
+            ).fetchone()
+            if existing_row is not None:
+                existing = _routine_occurrence_from_row(existing_row)
+                if existing.routine_revision != revision:
+                    current_row = conn.execute(
+                        "SELECT * FROM routines WHERE routine_id = ?",
+                        (normalized_id,),
+                    ).fetchone()
+                    raise RoutineRunNowConflictError(
+                        "routine_idempotency_key_reused",
+                        current=(
+                            _routine_from_row(current_row)
+                            if current_row is not None
+                            else None
+                        ),
+                        occurrence=existing,
+                    )
+                if existing.status != "claimed":
+                    return RoutineManualClaim(existing, dispatch=False, created=False)
+
+                routine_row = conn.execute(
+                    "SELECT * FROM routines WHERE routine_id = ?",
+                    (normalized_id,),
+                ).fetchone()
+                if routine_row is None:
+                    _skip_occurrence_row(
+                        conn,
+                        existing.occurrence_id,
+                        instant=instant,
+                        reason="routine_missing_before_dispatch",
+                    )
+                    return RoutineManualClaim(
+                        _require_occurrence_row(conn, existing.occurrence_id),
+                        dispatch=False,
+                        created=False,
+                    )
+                routine = _routine_from_row(routine_row)
+                invalid_reason = _routine_dispatch_invalid_reason(
+                    routine,
+                    occurrence_revision=existing.routine_revision,
+                )
+                if invalid_reason is not None:
+                    _skip_occurrence_row(
+                        conn,
+                        existing.occurrence_id,
+                        instant=instant,
+                        reason=invalid_reason,
+                    )
+                    return RoutineManualClaim(
+                        _require_occurrence_row(conn, existing.occurrence_id),
+                        dispatch=False,
+                        created=False,
+                    )
+
+                claim_expiry = _parse_timestamp(existing.claim_expires_at)
+                if claim_expiry is not None and claim_expiry > instant:
+                    return RoutineManualClaim(
+                        existing,
+                        dispatch=existing.claim_owner == owner,
+                        created=False,
+                    )
+                cursor = conn.execute(
+                    """
+                    UPDATE routine_occurrences SET claim_owner = ?,
+                        claim_generation = claim_generation + 1,
+                        claim_expires_at = ?, error = NULL, updated_at = ?
+                    WHERE occurrence_id = ? AND status = 'claimed'
+                      AND (claim_expires_at IS NULL OR claim_expires_at <= ?)
+                    """,
+                    (
+                        owner,
+                        expires_at.isoformat(),
+                        instant.isoformat(),
+                        existing.occurrence_id,
+                        instant.isoformat(),
+                    ),
+                )
+                current = _require_occurrence_row(conn, existing.occurrence_id)
+                return RoutineManualClaim(
+                    current,
+                    dispatch=cursor.rowcount == 1,
+                    created=False,
+                )
+
+            routine_row = conn.execute(
+                "SELECT * FROM routines WHERE routine_id = ?",
+                (normalized_id,),
+            ).fetchone()
+            if routine_row is None:
+                raise KeyError(f"Unknown routine: {normalized_id}")
+            routine = _routine_from_row(routine_row)
+            if routine.revision != revision:
+                raise RoutineConflictError(routine)
+            if routine.deleted_at is not None:
+                raise RoutineRunNowConflictError("routine_deleted", current=routine)
+            if not routine.enabled:
+                raise RoutineRunNowConflictError("routine_disabled", current=routine)
+
+            scheduled_for = _manual_occurrence_identity_instant(
+                conn,
+                routine_id=normalized_id,
+                routine_revision=revision,
+                requested_at=instant,
+                trigger_key_digest=key_digest,
+            )
+            occurrence_id = routine_manual_occurrence_id(normalized_id, key_digest)
+            run_id = routine_run_id(normalized_id, occurrence_id)
+            request = {
+                **_routine_request_snapshot(routine),
+                "trigger_kind": "manual",
+                "trigger_key_digest": key_digest,
+                "requested_at": instant.isoformat(),
+            }
+            active = conn.execute(
+                """
+                SELECT 1 FROM routine_occurrences
+                WHERE routine_id = ? AND status IN ('claimed', 'running')
+                LIMIT 1
+                """,
+                (normalized_id,),
+            ).fetchone()
+            skip_reason = "overlap_active" if active is not None else None
+            result = {
+                "trigger_kind": "manual",
+                "requested_at": instant.isoformat(),
+            }
+            conn.execute(
+                """
+                INSERT INTO routine_occurrences (
+                    occurrence_id, routine_id, routine_revision,
+                    scheduled_for, status, run_id, request_json,
+                    trigger_kind, trigger_key_digest, requested_at,
+                    claim_owner, claim_generation, claim_expires_at,
+                    started_at, finished_at,
+                    skip_reason, error, result_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, 1, ?, NULL, ?, ?, NULL, ?, ?, ?)
+                """,
+                (
+                    occurrence_id,
+                    normalized_id,
+                    revision,
+                    scheduled_for.isoformat(),
+                    "skipped" if skip_reason else "claimed",
+                    run_id,
+                    _encode(request),
+                    key_digest,
+                    instant.isoformat(),
+                    None if skip_reason else owner,
+                    None if skip_reason else expires_at.isoformat(),
+                    instant.isoformat() if skip_reason else None,
+                    skip_reason,
+                    _encode(result),
+                    instant.isoformat(),
+                    instant.isoformat(),
+                ),
+            )
+            occurrence = _require_occurrence_row(conn, occurrence_id)
+            return RoutineManualClaim(
+                occurrence,
+                dispatch=skip_reason is None,
+                created=True,
+            )
+
+    def claim_due_routine_occurrences(
+        self,
+        *,
+        now: datetime,
+        claim_owner: str,
+        lease_ttl_seconds: float = 30.0,
+        limit: int = 10,
+    ) -> RoutineClaimBatch:
+        instant = _lease_instant(now)
+        owner = claim_owner.strip()
+        if not owner:
+            raise ValueError("routine claim owner is required")
+        limit = validate_routines_per_tick(limit, field_name="routine claim limit")
+        claim_ttl = validate_routine_claim_ttl(
+            lease_ttl_seconds,
+            field_name="routine claim lease_ttl_seconds",
+        )
+        expires_at = instant + timedelta(seconds=claim_ttl)
+        claimed: list[RoutineOccurrenceRecord] = []
+        skipped: list[RoutineOccurrenceRecord] = []
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            stale_rows = conn.execute(
+                """
+                SELECT o.*, r.enabled AS routine_enabled,
+                    r.revision AS current_revision, r.deleted_at AS routine_deleted_at
+                FROM routine_occurrences AS o
+                JOIN routines AS r ON r.routine_id = o.routine_id
+                WHERE o.status = 'claimed' AND o.claim_expires_at <= ?
+                ORDER BY o.scheduled_for ASC, o.occurrence_id ASC
+                LIMIT ?
+                """,
+                (instant.isoformat(), limit),
+            ).fetchall()
+            for row in stale_rows:
+                occurrence = _routine_occurrence_from_row(row)
+                if row["routine_deleted_at"] is not None:
+                    _skip_occurrence_row(
+                        conn,
+                        occurrence.occurrence_id,
+                        instant=instant,
+                        reason="routine_deleted_before_dispatch",
+                    )
+                    skipped.append(_require_occurrence_row(conn, occurrence.occurrence_id))
+                    continue
+                if not bool(row["routine_enabled"]):
+                    _skip_occurrence_row(
+                        conn,
+                        occurrence.occurrence_id,
+                        instant=instant,
+                        reason="routine_disabled_before_dispatch",
+                    )
+                    skipped.append(_require_occurrence_row(conn, occurrence.occurrence_id))
+                    continue
+                if int(row["current_revision"]) != occurrence.routine_revision:
+                    _skip_occurrence_row(
+                        conn,
+                        occurrence.occurrence_id,
+                        instant=instant,
+                        reason="routine_changed_before_dispatch",
+                    )
+                    skipped.append(_require_occurrence_row(conn, occurrence.occurrence_id))
+                    continue
+                conn.execute(
+                    """
+                    UPDATE routine_occurrences SET claim_owner = ?,
+                        claim_generation = claim_generation + 1,
+                        claim_expires_at = ?, error = NULL, updated_at = ?
+                    WHERE occurrence_id = ? AND status = 'claimed'
+                    """,
+                    (
+                        owner,
+                        expires_at.isoformat(),
+                        instant.isoformat(),
+                        occurrence.occurrence_id,
+                    ),
+                )
+                claimed.append(_require_occurrence_row(conn, occurrence.occurrence_id))
+            remaining = max(0, limit - len(claimed))
+            if remaining == 0:
+                return RoutineClaimBatch(tuple(claimed), tuple(skipped))
+            due_rows = conn.execute(
+                """
+                SELECT * FROM routines
+                WHERE enabled = 1 AND deleted_at IS NULL
+                  AND next_run_at IS NOT NULL AND next_run_at <= ?
+                ORDER BY next_run_at ASC, routine_id ASC
+                LIMIT ?
+                """,
+                (instant.isoformat(), remaining),
+            ).fetchall()
+            for row in due_rows:
+                routine = _routine_from_row(row)
+                scheduled = _require_timestamp(routine.next_run_at, "next_run_at")
+                occurrence_id = routine_occurrence_id(
+                    routine.routine_id,
+                    routine.revision,
+                    scheduled.isoformat(),
+                )
+                run_id = routine_run_id(routine.routine_id, occurrence_id)
+                request = _routine_request_snapshot(routine)
+                active = conn.execute(
+                    """
+                    SELECT 1 FROM routine_occurrences
+                    WHERE routine_id = ? AND status IN ('claimed', 'running')
+                    LIMIT 1
+                    """,
+                    (routine.routine_id,),
+                ).fetchone()
+                lateness = max(0.0, (instant - scheduled).total_seconds())
+                skip_reason: str | None = None
+                if active is not None:
+                    skip_reason = "overlap_active"
+                elif lateness > routine.misfire_grace_seconds:
+                    skip_reason = "misfire_grace_exceeded"
+                next_run_at, missed_intervals = _next_routine_run_at(
+                    routine, scheduled=scheduled, now=instant
+                )
+                result = {
+                    "lateness_seconds": lateness,
+                    "missed_intervals": missed_intervals,
+                }
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO routine_occurrences (
+                            occurrence_id, routine_id, routine_revision,
+                            scheduled_for, status, run_id, request_json,
+                            claim_owner, claim_generation, claim_expires_at,
+                            started_at, finished_at,
+                            skip_reason, error, result_json, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, ?, ?, NULL, ?, ?, ?)
+                        """,
+                        (
+                            occurrence_id,
+                            routine.routine_id,
+                            routine.revision,
+                            scheduled.isoformat(),
+                            "skipped" if skip_reason else "claimed",
+                            run_id,
+                            _encode(request),
+                            None if skip_reason else owner,
+                            None if skip_reason else expires_at.isoformat(),
+                            instant.isoformat() if skip_reason else None,
+                            skip_reason,
+                            _encode(result),
+                            instant.isoformat(),
+                            instant.isoformat(),
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    pass
+                conn.execute(
+                    """
+                    UPDATE routines SET next_run_at = ?, last_scheduled_at = ?,
+                        updated_at = ? WHERE routine_id = ? AND revision = ?
+                    """,
+                    (
+                        next_run_at,
+                        scheduled.isoformat(),
+                        instant.isoformat(),
+                        routine.routine_id,
+                        routine.revision,
+                    ),
+                )
+                occurrence = _require_occurrence_row(conn, occurrence_id)
+                if occurrence.status == "claimed":
+                    claimed.append(occurrence)
+                elif occurrence.status == "skipped":
+                    skipped.append(occurrence)
+        return RoutineClaimBatch(tuple(claimed), tuple(skipped))
+
+    def get_routine_occurrence(self, occurrence_id: str) -> RoutineOccurrenceRecord:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM routine_occurrences WHERE occurrence_id = ?",
+                (occurrence_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown routine occurrence: {occurrence_id}")
+        return _routine_occurrence_from_row(row)
+
+    def list_routine_occurrences(
+        self,
+        routine_id: str | None = None,
+        *,
+        statuses: tuple[str, ...] | None = None,
+        limit: int = 100,
+    ) -> list[RoutineOccurrenceRecord]:
+        limit = validate_routine_history_limit(limit)
+        predicates: list[str] = []
+        values: list[object] = []
+        if routine_id is not None:
+            predicates.append("routine_id = ?")
+            values.append(_routine_identifier(routine_id))
+        if statuses:
+            normalized_statuses = tuple(_routine_occurrence_status(item) for item in statuses)
+            predicates.append("status IN (" + ", ".join("?" for _ in normalized_statuses) + ")")
+            values.extend(normalized_statuses)
+        where = f"WHERE {' AND '.join(predicates)}" if predicates else ""
+        values.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(  # nosec - predicates are fixed strings above
+                f"SELECT * FROM routine_occurrences {where} "
+                "ORDER BY scheduled_for DESC, occurrence_id DESC LIMIT ?",
+                values,
+            ).fetchall()
+        return [_routine_occurrence_from_row(row) for row in rows]
+
+    def list_reconcilable_routine_occurrences(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[RoutineOccurrenceRecord]:
+        """Return running occurrences whose linked run is terminal or missing.
+
+        Filtering in SQLite prevents newer blocked/running runs from starving
+        older terminal reconciliation behind a bounded in-memory scan.
+        """
+
+        limit = validate_routine_reconciliation_limit(limit)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT o.* FROM routine_occurrences AS o
+                LEFT JOIN runs AS r ON r.run_id = o.run_id
+                WHERE o.status = 'running'
+                  AND (r.run_id IS NULL OR r.status IN ('completed', 'failed', 'cancelled'))
+                ORDER BY o.scheduled_for ASC, o.occurrence_id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [_routine_occurrence_from_row(row) for row in rows]
+
+    def mark_routine_occurrence_running(
+        self,
+        occurrence_id: str,
+        *,
+        claim_owner: str,
+        claim_generation: int,
+        run_id: str,
+        now: datetime | None = None,
+    ) -> tuple[RoutineOccurrenceRecord, bool]:
+        instant = _lease_instant(now)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE routine_occurrences SET status = 'running', started_at = ?,
+                    claim_expires_at = NULL, error = NULL, updated_at = ?
+                WHERE occurrence_id = ? AND status = 'claimed'
+                  AND claim_owner = ? AND claim_generation = ?
+                  AND run_id = ? AND claim_expires_at > ?
+                """,
+                (
+                    instant.isoformat(),
+                    instant.isoformat(),
+                    occurrence_id,
+                    claim_owner,
+                    claim_generation,
+                    run_id,
+                    instant.isoformat(),
+                ),
+            )
+        return self.get_routine_occurrence(occurrence_id), cursor.rowcount == 1
+
+    def finish_routine_occurrence(
+        self,
+        occurrence_id: str,
+        *,
+        run_id: str,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+        now: datetime | None = None,
+    ) -> tuple[RoutineOccurrenceRecord, bool]:
+        normalized_status = _routine_terminal_occurrence_status(status)
+        instant = _lease_instant(now)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE routine_occurrences SET status = ?, finished_at = ?,
+                    claim_owner = NULL, claim_expires_at = NULL, result_json = ?,
+                    error = ?, updated_at = ?
+                WHERE occurrence_id = ? AND run_id = ?
+                  AND status = 'running'
+                """,
+                (
+                    normalized_status,
+                    instant.isoformat(),
+                    _encode(result or {}),
+                    error,
+                    instant.isoformat(),
+                    occurrence_id,
+                    run_id,
+                ),
+            )
+        return self.get_routine_occurrence(occurrence_id), cursor.rowcount == 1
+
+    def skip_routine_occurrence(
+        self,
+        occurrence_id: str,
+        *,
+        reason: str,
+        now: datetime | None = None,
+    ) -> tuple[RoutineOccurrenceRecord, bool]:
+        instant = _lease_instant(now)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE routine_occurrences SET status = 'skipped', skip_reason = ?,
+                    claim_owner = NULL, claim_expires_at = NULL, finished_at = ?,
+                    updated_at = ? WHERE occurrence_id = ? AND status = 'claimed'
+                """,
+                (reason, instant.isoformat(), instant.isoformat(), occurrence_id),
+            )
+        return self.get_routine_occurrence(occurrence_id), cursor.rowcount == 1
+
+    def release_routine_occurrence_claim(
+        self,
+        occurrence_id: str,
+        *,
+        claim_owner: str,
+        claim_generation: int,
+        error: str,
+        now: datetime | None = None,
+    ) -> bool:
+        instant = _lease_instant(now)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE routine_occurrences SET claim_expires_at = ?, error = ?,
+                    updated_at = ? WHERE occurrence_id = ? AND status = 'claimed'
+                    AND claim_owner = ?
+                    AND claim_generation = ?
+                """,
+                (
+                    instant.isoformat(),
+                    error,
+                    instant.isoformat(),
+                    occurrence_id,
+                    claim_owner,
+                    claim_generation,
+                ),
+            )
+        return cursor.rowcount == 1
+
     def list_sessions(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -428,7 +1835,9 @@ class AgentStateStore:
             )
             return int(cursor.lastrowid or 0)
 
-    def list_run_steps(self, run_id: str, after_id: int = 0, limit: int = 200) -> list[dict[str, Any]]:
+    def list_run_steps(
+        self, run_id: str, after_id: int = 0, limit: int = 200
+    ) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -492,6 +1901,7 @@ class AgentStateStore:
         principal: str = "owner",
         capability_revision: int = 0,
         resource_digest: str = "",
+        scheduler_continuation: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Create one live approval per run.
 
@@ -501,9 +1911,10 @@ class AgentStateStore:
         """
 
         now = utc_now()
-        expiry = expires_at or (
-            datetime.now(UTC) + timedelta(seconds=DEFAULT_APPROVAL_TTL_SECONDS)
-        ).isoformat()
+        expiry = (
+            expires_at
+            or (datetime.now(UTC) + timedelta(seconds=DEFAULT_APPROVAL_TTL_SECONDS)).isoformat()
+        )
         if _parse_timestamp(expiry) is None:
             raise ValueError("Approval expiration must be an ISO-8601 timestamp")
         normalized_principal = principal.strip()
@@ -577,6 +1988,15 @@ class AgentStateStore:
                             str(duplicate["approval_id"]),
                         ),
                     )
+                if scheduler_continuation is not None:
+                    _bind_scheduler_approval_continuation(
+                        conn,
+                        run_id=run_id,
+                        approval_id=str(current["approval_id"]),
+                        tool_call_id=tool_call_id,
+                        continuation=scheduler_continuation,
+                        now=now,
+                    )
                 return current, False
             conn.execute(
                 """
@@ -607,6 +2027,15 @@ class AgentStateStore:
             ).fetchone()
             if created is None:
                 raise KeyError(f"Unknown approval: {approval_id}")
+            if scheduler_continuation is not None:
+                _bind_scheduler_approval_continuation(
+                    conn,
+                    run_id=run_id,
+                    approval_id=approval_id,
+                    tool_call_id=tool_call_id,
+                    continuation=scheduler_continuation,
+                    now=now,
+                )
             return _approval_from_row(created), True
 
     def get_approval(self, approval_id: str, *, expire: bool = True) -> dict[str, Any]:
@@ -647,19 +2076,34 @@ class AgentStateStore:
         """Atomically expire pending exact-call approvals whose deadline passed."""
 
         now = utc_now()
+        due_predicate = (
+            "status = 'pending' AND (expires_at IS NULL "
+            "OR julianday(expires_at) IS NULL "
+            "OR julianday(expires_at) <= julianday(?))"
+        )
+        params: tuple[object, ...] = (now,)
+        if approval_id is not None:
+            due_predicate += " AND approval_id = ?"
+            params = (now, approval_id)
+
+        # Approval reads are part of the scheduler's ordinary observation
+        # path. Avoid taking a reserved writer slot unless the same sampled
+        # instant proves that reconciliation is actually due. WAL readers can
+        # complete this probe while an unrelated writer is active.
+        with self._connect() as conn:
+            due = conn.execute(
+                f"SELECT 1 FROM approval_requests WHERE {due_predicate} LIMIT 1",
+                params,
+            ).fetchone()
+        if due is None:
+            return []
+
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            sql = (
-                "SELECT approval_id FROM approval_requests "
-                "WHERE status = 'pending' AND (expires_at IS NULL "
-                "OR julianday(expires_at) IS NULL "
-                "OR julianday(expires_at) <= julianday(?))"
-            )
-            params: list[object] = [now]
-            if approval_id is not None:
-                sql += " AND approval_id = ?"
-                params.append(approval_id)
-            rows = conn.execute(sql, tuple(params)).fetchall()
+            rows = conn.execute(
+                f"SELECT approval_id FROM approval_requests WHERE {due_predicate}",
+                params,
+            ).fetchall()
             identifiers = [str(row["approval_id"]) for row in rows]
             if not identifiers:
                 return []
@@ -773,98 +2217,421 @@ class AgentStateStore:
 
     def record_approval_result(self, approval_id: str, result: dict[str, Any]) -> dict[str, Any]:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             current = conn.execute(
-                "SELECT status, result_json FROM approval_requests WHERE approval_id = ?",
+                "SELECT * FROM approval_requests WHERE approval_id = ?",
                 (approval_id,),
             ).fetchone()
             if current is None:
                 raise KeyError(f"Unknown approval: {approval_id}")
             if str(current["status"]) == "pending":
-                return self.get_approval(approval_id)
+                return _approval_from_row(current)
             if current["result_json"] is not None:
-                return self.get_approval(approval_id)
+                return _approval_from_row(current)
+            if current["execution_claim_id"] is not None:
+                return _approval_from_row(current)
             conn.execute(
                 """
                 UPDATE approval_requests
                 SET result_json = ?, updated_at = ?
-                WHERE approval_id = ?
+                WHERE approval_id = ? AND result_json IS NULL
+                    AND execution_claim_id IS NULL
                 """,
                 (json.dumps(result), utc_now(), approval_id),
             )
         return self.get_approval(approval_id)
 
+    def claim_approval_execution(
+        self,
+        approval_id: str,
+        *,
+        run_id: str,
+        tool_call_id: str,
+        owner: str,
+        claim_id: str,
+        ttl_seconds: float,
+        task_id: str | None = None,
+        subagent_id: str | None = None,
+        run_lease_owner: str | None = None,
+        run_lease_generation: int | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically fence one approved exact-call side effect."""
+
+        normalized_owner = owner.strip()
+        normalized_claim_id = claim_id.strip()
+        if not normalized_owner or not normalized_claim_id:
+            raise ValueError("approval execution owner and claim id are required")
+        if (task_id is None) != (subagent_id is None):
+            raise ValueError("approval execution task and subagent bindings must be paired")
+        if (run_lease_owner is None) != (run_lease_generation is None):
+            raise ValueError("run lease owner and generation must be provided together")
+        if run_lease_owner is not None and run_lease_owner != normalized_owner:
+            raise ValueError("approval execution owner must hold the run lease")
+        instant = datetime.now(UTC)
+        now = instant.isoformat()
+        expires_at = (instant + timedelta(seconds=_positive_ttl(ttl_seconds))).isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run_row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if run_row is None:
+                raise KeyError(f"Unknown run: {run_id}")
+            if run_lease_owner is not None and run_lease_generation is not None:
+                if not _run_execution_lease_matches(
+                    run_row,
+                    owner=run_lease_owner,
+                    generation=run_lease_generation,
+                    instant=instant,
+                ):
+                    current = conn.execute(
+                        "SELECT * FROM approval_requests WHERE approval_id = ?",
+                        (approval_id,),
+                    ).fetchone()
+                    if current is None:
+                        raise KeyError(f"Unknown approval: {approval_id}")
+                    return _approval_from_row(current), False
+            elif str(run_row["status"]) != "completed" or task_id is not None:
+                current = conn.execute(
+                    "SELECT * FROM approval_requests WHERE approval_id = ?",
+                    (approval_id,),
+                ).fetchone()
+                if current is None:
+                    raise KeyError(f"Unknown approval: {approval_id}")
+                return _approval_from_row(current), False
+            else:
+                bound_task = conn.execute(
+                    """
+                    SELECT 1 FROM task_nodes
+                    WHERE run_id = ?
+                      AND json_extract(result_json, '$.approval_continuation.approval_id') = ?
+                    LIMIT 1
+                    """,
+                    (run_id, approval_id),
+                ).fetchone()
+                if bound_task is not None:
+                    current = conn.execute(
+                        "SELECT * FROM approval_requests WHERE approval_id = ?",
+                        (approval_id,),
+                    ).fetchone()
+                    if current is None:
+                        raise KeyError(f"Unknown approval: {approval_id}")
+                    return _approval_from_row(current), False
+            current = conn.execute(
+                "SELECT * FROM approval_requests WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Unknown approval: {approval_id}")
+            decision = _json_or_none(current["decision_json"])
+            if (
+                str(current["status"]) != "approved"
+                or not isinstance(decision, dict)
+                or decision.get("approved") is not True
+                or str(current["run_id"]) != run_id
+                or str(current["tool_call_id"]) != tool_call_id
+                or current["result_json"] is not None
+                or current["execution_claim_id"] is not None
+            ):
+                return _approval_from_row(current), False
+            if task_id is not None and subagent_id is not None:
+                task_row = conn.execute(
+                    "SELECT * FROM task_nodes WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                subagent_row = conn.execute(
+                    "SELECT * FROM subagent_runs WHERE subagent_id = ?",
+                    (subagent_id,),
+                ).fetchone()
+                if task_row is None or subagent_row is None:
+                    return _approval_from_row(current), False
+                task = _task_from_row(task_row)
+                subagent = _subagent_from_row(subagent_row)
+                task_result = task.result or {}
+                continuation = task_result.get("approval_continuation")
+                if (
+                    task.run_id != run_id
+                    or task.status != "running"
+                    or task_result.get("worker_owner") != normalized_owner
+                    or task_result.get("worker_claim_id") != subagent_id
+                    or not isinstance(continuation, dict)
+                    or continuation.get("approval_id") != approval_id
+                    or continuation.get("task_id") != task_id
+                    or continuation.get("subagent_id") != subagent_id
+                    or subagent.run_id != run_id
+                    or subagent.task_id != task_id
+                    or subagent.status != "running"
+                ):
+                    return _approval_from_row(current), False
+            cursor = conn.execute(
+                """
+                UPDATE approval_requests
+                SET execution_claim_owner = ?, execution_claim_id = ?,
+                    execution_claim_started_at = ?, execution_claim_expires_at = ?,
+                    execution_claim_task_id = ?, execution_claim_subagent_id = ?,
+                    updated_at = ?
+                WHERE approval_id = ? AND status = 'approved'
+                    AND result_json IS NULL AND execution_claim_id IS NULL
+                """,
+                (
+                    normalized_owner,
+                    normalized_claim_id,
+                    now,
+                    expires_at,
+                    task_id,
+                    subagent_id,
+                    now,
+                    approval_id,
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM approval_requests WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            if updated is None:
+                raise KeyError(f"Unknown approval: {approval_id}")
+            return _approval_from_row(updated), cursor.rowcount == 1
+
+    def renew_approval_execution_claim(
+        self,
+        approval_id: str,
+        *,
+        owner: str,
+        claim_id: str,
+        ttl_seconds: float,
+    ) -> bool:
+        """Heartbeat one in-flight approved side-effect claim."""
+
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(seconds=_positive_ttl(ttl_seconds))
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE approval_requests
+                SET execution_claim_expires_at = ?, updated_at = ?
+                WHERE approval_id = ? AND status = 'approved'
+                    AND result_json IS NULL
+                    AND execution_claim_owner = ? AND execution_claim_id = ?
+                """,
+                (
+                    expires_at.isoformat(),
+                    now.isoformat(),
+                    approval_id,
+                    owner,
+                    claim_id,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def record_claimed_approval_result(
+        self,
+        approval_id: str,
+        *,
+        owner: str,
+        claim_id: str,
+        result: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Finalize an approval result only for its durable execution claimant."""
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT * FROM approval_requests WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Unknown approval: {approval_id}")
+            if current["result_json"] is not None:
+                return _approval_from_row(current), False
+            if (
+                str(_row_get(current, "execution_claim_owner", "")) != owner
+                or str(_row_get(current, "execution_claim_id", "")) != claim_id
+            ):
+                return _approval_from_row(current), False
+            cursor = conn.execute(
+                """
+                UPDATE approval_requests
+                SET result_json = ?, execution_claim_owner = NULL,
+                    execution_claim_id = NULL, execution_claim_started_at = NULL,
+                    execution_claim_expires_at = NULL,
+                    updated_at = ?
+                WHERE approval_id = ? AND result_json IS NULL
+                    AND execution_claim_owner = ? AND execution_claim_id = ?
+                """,
+                (json.dumps(result), utc_now(), approval_id, owner, claim_id),
+            )
+            updated = conn.execute(
+                "SELECT * FROM approval_requests WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            if updated is None:
+                raise KeyError(f"Unknown approval: {approval_id}")
+            return _approval_from_row(updated), cursor.rowcount == 1
+
+    def fail_approval_execution_claim(
+        self,
+        approval_id: str,
+        *,
+        owner: str,
+        claim_id: str,
+        expected_expires_at: str | None,
+        result: dict[str, Any],
+        reason: str,
+    ) -> tuple[
+        dict[str, Any],
+        TaskNodeRecord | None,
+        SubagentRunRecord | None,
+        bool,
+    ]:
+        """Atomically close an interrupted claim and its exact scheduler pair."""
+
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            approval_row = conn.execute(
+                "SELECT * FROM approval_requests WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval_row is None:
+                raise KeyError(f"Unknown approval: {approval_id}")
+            current_approval = _approval_from_row(approval_row)
+            if (
+                current_approval["status"] != "approved"
+                or current_approval["result"] is not None
+                or current_approval.get("execution_claim_owner") != owner
+                or current_approval.get("execution_claim_id") != claim_id
+                or current_approval.get("execution_claim_expires_at") != expected_expires_at
+            ):
+                return current_approval, None, None, False
+
+            raw_task_id = current_approval.get("execution_claim_task_id")
+            raw_subagent_id = current_approval.get("execution_claim_subagent_id")
+            task_id = raw_task_id if isinstance(raw_task_id, str) else None
+            subagent_id = raw_subagent_id if isinstance(raw_subagent_id, str) else None
+            updated_task: TaskNodeRecord | None = None
+            updated_subagent: SubagentRunRecord | None = None
+            if task_id is not None or subagent_id is not None:
+                task_row = None
+                subagent_row = None
+                if task_id is not None:
+                    task_row = conn.execute(
+                        "SELECT * FROM task_nodes WHERE task_id = ?",
+                        (task_id,),
+                    ).fetchone()
+                if subagent_id is not None:
+                    subagent_row = conn.execute(
+                        "SELECT * FROM subagent_runs WHERE subagent_id = ?",
+                        (subagent_id,),
+                    ).fetchone()
+                task = _task_from_row(task_row) if task_row is not None else None
+                subagent = _subagent_from_row(subagent_row) if subagent_row is not None else None
+                if task is not None and task.run_id != current_approval["run_id"]:
+                    task = None
+                if subagent is not None and (
+                    subagent.run_id != current_approval["run_id"]
+                    or (task_id is not None and subagent.task_id != task_id)
+                ):
+                    subagent = None
+                terminal_task_statuses = {"completed", "failed", "cancelled", "skipped"}
+                terminal_subagent_statuses = {"completed", "failed", "cancelled"}
+                active_task_statuses = {"queued", "approved", "running", "blocked"}
+                active_subagent_statuses = {"queued", "running", "blocked"}
+                if task is not None and task.status in active_task_statuses:
+                    task_result = dict(task.result or {})
+                    task_result["approval_execution_failure"] = {
+                        "approval_id": approval_id,
+                        "claim_id": claim_id,
+                        "reason": reason,
+                    }
+                    task_cursor = conn.execute(
+                        """
+                        UPDATE task_nodes
+                        SET status = 'failed', attempt_count = attempt_count + 1,
+                            failure_reason = ?, result_json = ?, updated_at = ?
+                        WHERE task_id = ? AND run_id = ?
+                            AND status IN ('queued', 'approved', 'running', 'blocked')
+                        """,
+                        (
+                            reason,
+                            _encode(task_result),
+                            now,
+                            task.task_id,
+                            current_approval["run_id"],
+                        ),
+                    )
+                    if task_cursor.rowcount != 1:
+                        conn.rollback()
+                        return current_approval, None, None, False
+                elif task is not None and task.status not in terminal_task_statuses:
+                    task = None
+                if subagent is not None and subagent.status in active_subagent_statuses:
+                    subagent_cursor = conn.execute(
+                        """
+                        UPDATE subagent_runs
+                        SET status = 'failed', error = ?, updated_at = ?
+                        WHERE subagent_id = ? AND run_id = ?
+                            AND status IN ('queued', 'running', 'blocked')
+                        """,
+                        (
+                            reason,
+                            now,
+                            subagent.subagent_id,
+                            current_approval["run_id"],
+                        ),
+                    )
+                    if subagent_cursor.rowcount != 1:
+                        conn.rollback()
+                        return current_approval, None, None, False
+                elif subagent is not None and subagent.status not in terminal_subagent_statuses:
+                    subagent = None
+
+            approval_cursor = conn.execute(
+                """
+                UPDATE approval_requests
+                SET result_json = ?, execution_claim_owner = NULL,
+                    execution_claim_id = NULL, execution_claim_started_at = NULL,
+                    execution_claim_expires_at = NULL,
+                    execution_claim_task_id = NULL,
+                    execution_claim_subagent_id = NULL,
+                    updated_at = ?
+                WHERE approval_id = ? AND status = 'approved'
+                    AND result_json IS NULL
+                    AND execution_claim_owner = ? AND execution_claim_id = ?
+                """,
+                (json.dumps(result), now, approval_id, owner, claim_id),
+            )
+            if approval_cursor.rowcount != 1:
+                conn.rollback()
+                return current_approval, None, None, False
+            updated_approval_row = conn.execute(
+                "SELECT * FROM approval_requests WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            if updated_approval_row is None:
+                raise KeyError(f"Unknown approval: {approval_id}")
+            if task_id is not None:
+                final_task_row = conn.execute(
+                    "SELECT * FROM task_nodes WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if final_task_row is not None:
+                    updated_task = _task_from_row(final_task_row)
+            if subagent_id is not None:
+                final_subagent_row = conn.execute(
+                    "SELECT * FROM subagent_runs WHERE subagent_id = ?",
+                    (subagent_id,),
+                ).fetchone()
+                if final_subagent_row is not None:
+                    updated_subagent = _subagent_from_row(final_subagent_row)
+            return (
+                _approval_from_row(updated_approval_row),
+                updated_task,
+                updated_subagent,
+                True,
+            )
+
     def upsert_mcp_server(self, server: dict[str, Any]) -> dict[str, Any]:
         server_id = str(server["id"])
-        now = utc_now()
-        tools = list(server.get("tools", []))
-        capabilities = server.get("capabilities") or sorted(
-            {
-                str(capability)
-                for tool in tools
-                for capability in list(dict(tool).get("capabilities", []))
-            }
-        )
-        payload = {
-            "name": server.get("name", server_id),
-            "transport": server.get("transport", "stdio"),
-            "command": server.get("command"),
-            "args_json": json.dumps(server.get("args", [])),
-            "env_json": json.dumps(server.get("env", {})),
-            "url": server.get("url"),
-            "enabled": 1 if server.get("enabled", True) else 0,
-            "tools_json": json.dumps(tools),
-            "status": server.get("status", "configured"),
-            "error": server.get("error"),
-            "last_synced_at": server.get("last_synced_at"),
-            "last_seen_at": server.get("last_seen_at"),
-            "tool_count": int(server.get("tool_count", len(tools))),
-            "capabilities_json": json.dumps(capabilities),
-            "risk_policy": server.get("risk_policy", "approval_by_default"),
-            "secret_env_json": json.dumps(server.get("secret_env", {})),
-            "session_state": server.get("session_state", "disconnected"),
-            "last_call_at": server.get("last_call_at"),
-            "last_error_at": server.get("last_error_at"),
-            "failure_count": int(server.get("failure_count", 0)),
-            "last_latency_ms": server.get("last_latency_ms"),
-            "vetting_json": json.dumps(server.get("vetting", {})),
-            "updated_at": now,
-        }
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO mcp_servers (
-                    id, name, transport, command, args_json, env_json, url, enabled,
-                    tools_json, status, error, last_synced_at, last_seen_at, tool_count,
-                    capabilities_json, risk_policy, secret_env_json, session_state, last_call_at,
-                    last_error_at, failure_count, last_latency_ms, vetting_json, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    name = excluded.name,
-                    transport = excluded.transport,
-                    command = excluded.command,
-                    args_json = excluded.args_json,
-                    env_json = excluded.env_json,
-                    url = excluded.url,
-                    enabled = excluded.enabled,
-                    tools_json = excluded.tools_json,
-                    status = excluded.status,
-                    error = excluded.error,
-                    last_synced_at = excluded.last_synced_at,
-                    last_seen_at = excluded.last_seen_at,
-                    tool_count = excluded.tool_count,
-                    capabilities_json = excluded.capabilities_json,
-                    risk_policy = excluded.risk_policy,
-                    secret_env_json = excluded.secret_env_json,
-                    session_state = excluded.session_state,
-                    last_call_at = excluded.last_call_at,
-                    last_error_at = excluded.last_error_at,
-                    failure_count = excluded.failure_count,
-                    last_latency_ms = excluded.last_latency_ms,
-                    vetting_json = excluded.vetting_json,
-                    updated_at = excluded.updated_at
-                """,
-                (server_id, *payload.values()),
-            )
+            _upsert_mcp_server_row(conn, server)
         return self.get_mcp_server(server_id)
 
     def get_mcp_server(self, server_id: str) -> dict[str, Any]:
@@ -886,28 +2653,7 @@ class AgentStateStore:
     def upsert_skill(self, skill: dict[str, Any]) -> dict[str, Any]:
         skill_id = str(skill["id"])
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO skill_registry (id, name, description, path, manifest_json, enabled, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    name = excluded.name,
-                    description = excluded.description,
-                    path = excluded.path,
-                    manifest_json = excluded.manifest_json,
-                    enabled = excluded.enabled,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    skill_id,
-                    skill.get("name", skill_id),
-                    skill.get("description", ""),
-                    skill.get("path", ""),
-                    json.dumps(skill.get("manifest", {})),
-                    1 if skill.get("enabled", True) else 0,
-                    utc_now(),
-                ),
-            )
+            _upsert_skill_row(conn, skill)
         return self.get_skill(skill_id)
 
     def get_skill(self, skill_id: str) -> dict[str, Any]:
@@ -936,57 +2682,15 @@ class AgentStateStore:
 
     def upsert_plugin(self, plugin: dict[str, Any]) -> dict[str, Any]:
         plugin_id = str(plugin["id"])
-        now = utc_now()
-        created_at = str(plugin.get("created_at") or now)
         with self._connect() as conn:
-            current = conn.execute("SELECT created_at FROM plugin_registry WHERE id = ?", (plugin_id,)).fetchone()
-            if current is not None:
-                created_at = str(current["created_at"])
-            conn.execute(
-                """
-                INSERT INTO plugin_registry (
-                    id, name, description, source_url, source_ref, commit_sha, install_path,
-                    manifest_json, capabilities_json, enabled, risk_report_json,
-                    install_status, format, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    name = excluded.name,
-                    description = excluded.description,
-                    source_url = excluded.source_url,
-                    source_ref = excluded.source_ref,
-                    commit_sha = excluded.commit_sha,
-                    install_path = excluded.install_path,
-                    manifest_json = excluded.manifest_json,
-                    capabilities_json = excluded.capabilities_json,
-                    enabled = excluded.enabled,
-                    risk_report_json = excluded.risk_report_json,
-                    install_status = excluded.install_status,
-                    format = excluded.format,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    plugin_id,
-                    plugin.get("name", plugin_id),
-                    plugin.get("description", ""),
-                    plugin.get("source_url", ""),
-                    plugin.get("source_ref"),
-                    plugin.get("commit_sha", ""),
-                    plugin.get("install_path", ""),
-                    json.dumps(plugin.get("manifest", {})),
-                    json.dumps(plugin.get("capabilities", [])),
-                    1 if plugin.get("enabled", False) else 0,
-                    json.dumps(plugin.get("risk_report", {})),
-                    plugin.get("install_status", "installed"),
-                    plugin.get("format", "kestrel"),
-                    created_at,
-                    now,
-                ),
-            )
+            _upsert_plugin_row(conn, plugin)
         return self.get_plugin(plugin_id)
 
     def get_plugin(self, plugin_id: str) -> dict[str, Any]:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM plugin_registry WHERE id = ?", (plugin_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM plugin_registry WHERE id = ?", (plugin_id,)
+            ).fetchone()
         if row is None:
             raise KeyError(f"Unknown plugin: {plugin_id}")
         return _plugin_from_row(row)
@@ -1007,6 +2711,153 @@ class AgentStateStore:
     def delete_plugin(self, plugin_id: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM plugin_registry WHERE id = ?", (plugin_id,))
+
+    def replace_plugin_bundle(
+        self,
+        plugin: dict[str, Any],
+        *,
+        skills: list[dict[str, Any]],
+        mcp_servers: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Atomically replace one plugin and every namespaced extension row."""
+
+        plugin_id = str(plugin["id"])
+        prefix = f"plugin.{plugin_id}."
+        _validate_plugin_bundle_ids(prefix, skills=skills, mcp_servers=mcp_servers)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing_skills, existing_servers = _plugin_extension_rows(conn, prefix)
+            desired_skill_ids = {str(skill["id"]) for skill in skills}
+            desired_server_ids = {str(server["id"]) for server in mcp_servers}
+            desired_tool_ids = {
+                str(tool["name"])
+                for server in mcp_servers
+                for tool in server.get("tools", [])
+                if isinstance(tool, dict) and tool.get("name")
+            }
+
+            _upsert_plugin_row(conn, plugin)
+            for skill_id in sorted(existing_skills.keys() - desired_skill_ids):
+                _delete_capability_override_row(conn, "skill", skill_id)
+                _delete_capability_override_row(conn, "tool", f"skill.{skill_id}.run")
+                conn.execute("DELETE FROM skill_registry WHERE id = ?", (skill_id,))
+            for server_id in sorted(existing_servers.keys() - desired_server_ids):
+                _delete_capability_override_row(conn, "mcp_server", server_id)
+                for tool_id in _mcp_tool_ids(existing_servers[server_id]):
+                    _delete_capability_override_row(conn, "tool", tool_id)
+                conn.execute("DELETE FROM mcp_servers WHERE id = ?", (server_id,))
+            old_tool_ids = {
+                tool_id
+                for server in existing_servers.values()
+                for tool_id in _mcp_tool_ids(server)
+            }
+            for tool_id in sorted(old_tool_ids - desired_tool_ids):
+                _delete_capability_override_row(conn, "tool", tool_id)
+            for skill in skills:
+                _upsert_skill_row(conn, skill)
+            for server in mcp_servers:
+                _upsert_mcp_server_row(conn, server)
+            row = conn.execute(
+                "SELECT * FROM plugin_registry WHERE id = ?", (plugin_id,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("plugin_bundle_write_lost")
+            result = _plugin_from_row(row)
+        return result
+
+    def delete_plugin_bundle(self, plugin_id: str) -> None:
+        """Atomically delete one plugin and its namespaced extension rows."""
+
+        prefix = f"plugin.{plugin_id}."
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing_skills, existing_servers = _plugin_extension_rows(conn, prefix)
+            for skill_id in sorted(existing_skills):
+                _delete_capability_override_row(conn, "skill", skill_id)
+                _delete_capability_override_row(conn, "tool", f"skill.{skill_id}.run")
+                conn.execute("DELETE FROM skill_registry WHERE id = ?", (skill_id,))
+            for server_id, server in sorted(existing_servers.items()):
+                _delete_capability_override_row(conn, "mcp_server", server_id)
+                for tool_id in _mcp_tool_ids(server):
+                    _delete_capability_override_row(conn, "tool", tool_id)
+                conn.execute("DELETE FROM mcp_servers WHERE id = ?", (server_id,))
+            conn.execute("DELETE FROM plugin_registry WHERE id = ?", (plugin_id,))
+
+    def quiesce_plugin_bundle(self, plugin_id: str) -> dict[str, Any] | None:
+        """Disable one live plugin generation without changing row timestamps."""
+
+        prefix = f"plugin.{plugin_id}."
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            plugin = conn.execute(
+                "SELECT id, enabled FROM plugin_registry WHERE id = ?", (plugin_id,)
+            ).fetchone()
+            if plugin is None:
+                return None
+            existing_skills, existing_servers = _plugin_extension_rows(conn, prefix)
+            token: dict[str, Any] = {
+                "plugin_id": plugin_id,
+                "plugin_enabled": bool(plugin["enabled"]),
+                "skills": {
+                    skill_id: bool(skill["enabled"])
+                    for skill_id, skill in existing_skills.items()
+                },
+                "mcp_servers": {
+                    server_id: bool(server["enabled"])
+                    for server_id, server in existing_servers.items()
+                },
+            }
+            conn.execute("UPDATE plugin_registry SET enabled = 0 WHERE id = ?", (plugin_id,))
+            for skill_id in existing_skills:
+                conn.execute("UPDATE skill_registry SET enabled = 0 WHERE id = ?", (skill_id,))
+            for server_id in existing_servers:
+                conn.execute("UPDATE mcp_servers SET enabled = 0 WHERE id = ?", (server_id,))
+            return token
+
+    def restore_quiesced_plugin_bundle(self, token: dict[str, Any]) -> None:
+        """Restore exact enablement after a failed filesystem transaction."""
+
+        plugin_id = str(token["plugin_id"])
+        skills = dict(token.get("skills", {}))
+        servers = dict(token.get("mcp_servers", {}))
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            plugin = conn.execute(
+                "SELECT enabled FROM plugin_registry WHERE id = ?", (plugin_id,)
+            ).fetchone()
+            if plugin is None or bool(plugin["enabled"]):
+                raise RuntimeError("plugin_quiesce_restore_conflict")
+            current_skills = {
+                str(row["id"]): bool(row["enabled"])
+                for row in conn.execute("SELECT id, enabled FROM skill_registry").fetchall()
+                if str(row["id"]).startswith(f"plugin.{plugin_id}.")
+            }
+            current_servers = {
+                str(row["id"]): bool(row["enabled"])
+                for row in conn.execute("SELECT id, enabled FROM mcp_servers").fetchall()
+                if str(row["id"]).startswith(f"plugin.{plugin_id}.")
+            }
+            if (
+                set(current_skills) != set(skills)
+                or set(current_servers) != set(servers)
+                or any(current_skills.values())
+                or any(current_servers.values())
+            ):
+                raise RuntimeError("plugin_quiesce_restore_conflict")
+            conn.execute(
+                "UPDATE plugin_registry SET enabled = ? WHERE id = ?",
+                (1 if bool(token["plugin_enabled"]) else 0, plugin_id),
+            )
+            for skill_id, enabled in skills.items():
+                conn.execute(
+                    "UPDATE skill_registry SET enabled = ? WHERE id = ?",
+                    (1 if bool(enabled) else 0, skill_id),
+                )
+            for server_id, enabled in servers.items():
+                conn.execute(
+                    "UPDATE mcp_servers SET enabled = ? WHERE id = ?",
+                    (1 if bool(enabled) else 0, server_id),
+                )
 
     def get_capability_override(
         self,
@@ -1323,11 +3174,98 @@ class AgentStateStore:
             )
         return self.get_task_node(task_id)
 
+    def create_task_graph_once(
+        self,
+        *,
+        run_id: str,
+        tasks: list[TaskNodeRecord] | tuple[TaskNodeRecord, ...],
+    ) -> tuple[list[TaskNodeRecord], bool]:
+        """Atomically create one complete starter task graph for a queued run.
+
+        Run admission and graph construction are separate durable transactions.
+        This all-or-none insert lets startup recovery safely repair a crash in
+        that narrow window without duplicating roots or child tasks.
+        """
+
+        if not tasks:
+            raise ValueError("task graph must contain at least one task")
+        identifiers = [task.task_id for task in tasks]
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("task graph task ids must be unique")
+        known_ids = set(identifiers)
+        for task in tasks:
+            if task.run_id != run_id:
+                raise ValueError("task graph contains a task for another run")
+            if task.parent_id is not None and task.parent_id not in known_ids:
+                raise ValueError("task graph parent must belong to the same graph")
+            if any(dependency not in known_ids for dependency in task.dependencies):
+                raise ValueError("task graph dependency must belong to the same graph")
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run_row = conn.execute(
+                "SELECT status FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise KeyError(f"Unknown run: {run_id}")
+            existing = conn.execute(
+                "SELECT * FROM task_nodes WHERE run_id = ? ORDER BY created_at ASC, task_id ASC",
+                (run_id,),
+            ).fetchall()
+            if existing:
+                return [_task_from_row(row) for row in existing], False
+            if str(run_row["status"]) != "queued":
+                raise ValueError("starter task graph requires a queued run")
+
+            created = datetime.now(UTC)
+            for index, task in enumerate(tasks):
+                timestamp = (created + timedelta(microseconds=index)).isoformat()
+                conn.execute(
+                    """
+                    INSERT INTO task_nodes (
+                        task_id, run_id, parent_id, title, goal, profile, status, approved,
+                        plan_json, result_json, dependencies_json, required_tools_json, risk,
+                        acceptance_criteria_json, attempt_count, failure_reason, diagnosis_json,
+                        retry_strategy_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task.task_id,
+                        run_id,
+                        task.parent_id,
+                        task.title,
+                        task.goal,
+                        task.profile,
+                        task.status,
+                        1 if task.approved else 0,
+                        _encode(task.plan or {}),
+                        _encode(task.result) if task.result is not None else None,
+                        _encode(task.dependencies),
+                        _encode(task.required_tools),
+                        task.risk,
+                        _encode(task.acceptance_criteria),
+                        task.attempt_count,
+                        task.failure_reason,
+                        _encode(task.diagnosis) if task.diagnosis is not None else None,
+                        _encode(task.retry_strategy) if task.retry_strategy is not None else None,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            rows = conn.execute(
+                "SELECT * FROM task_nodes WHERE run_id = ? ORDER BY created_at ASC, task_id ASC",
+                (run_id,),
+            ).fetchall()
+        return [_task_from_row(row) for row in rows], True
+
     def update_task_node(self, task_id: str, **fields: object) -> TaskNodeRecord:
         if not fields:
             return self.get_task_node(task_id)
         fields["updated_at"] = utc_now()
-        assignments = ", ".join(f"{_validated_column('task_nodes', _task_column(key))} = ?" for key in fields)
+        assignments = ", ".join(
+            f"{_validated_column('task_nodes', _task_column(key))} = ?" for key in fields
+        )
         values = [_encode(value) for value in fields.values()]
         values.append(task_id)
         with self._connect() as conn:
@@ -1345,22 +3283,26 @@ class AgentStateStore:
                 raise KeyError(f"Unknown run: {run_id}")
             if str(run_row["status"]) in _TERMINAL_RUN_STATUSES:
                 return None
-            task_row = conn.execute("SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)).fetchone()
+            task_row = conn.execute(
+                "SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)
+            ).fetchone()
             if task_row is None:
                 raise KeyError(f"Unknown task: {task_id}")
             task = _task_from_row(task_row)
-            if task.run_id != run_id or task.status not in {"queued", "approved"}:
+            if task.run_id != run_id or task.status != "queued":
                 return None
             cursor = conn.execute(
                 """
                 UPDATE task_nodes SET approved = 1, status = 'approved', updated_at = ?
-                WHERE task_id = ? AND run_id = ? AND status IN ('queued', 'approved')
+                WHERE task_id = ? AND run_id = ? AND status = 'queued'
                 """,
                 (now, task_id, run_id),
             )
             if cursor.rowcount != 1:
                 return None
-            updated = conn.execute("SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)).fetchone()
+            updated = conn.execute(
+                "SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)
+            ).fetchone()
             return _task_from_row(updated) if updated is not None else None
 
     def claim_task_node(
@@ -1371,6 +3313,8 @@ class AgentStateStore:
         worker_owner: str,
         worker_claim_id: str,
         heartbeat_at: str | None = None,
+        run_lease_owner: str | None = None,
+        run_lease_generation: int | None = None,
     ) -> TaskNodeRecord | None:
         """Atomically claim one approved ready task for exactly one worker execution."""
 
@@ -1378,19 +3322,37 @@ class AgentStateStore:
         claim_id = worker_claim_id.strip()
         if not owner or not claim_id:
             raise ValueError("worker owner and claim id are required")
-        now = heartbeat_at or utc_now()
+        if (run_lease_owner is None) != (run_lease_generation is None):
+            raise ValueError("run lease owner and generation must be provided together")
+        if run_lease_owner is not None and run_lease_owner != owner:
+            raise ValueError("task worker owner must hold the run lease")
+        instant = datetime.now(UTC)
+        now = heartbeat_at or instant.isoformat()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            run_row = conn.execute("SELECT status FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            run_row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             if run_row is None:
                 raise KeyError(f"Unknown run: {run_id}")
             if str(run_row["status"]) in _TERMINAL_RUN_STATUSES:
                 return None
-            task_row = conn.execute("SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)).fetchone()
+            if run_lease_owner is not None and not _run_execution_lease_matches(
+                run_row,
+                owner=run_lease_owner,
+                generation=run_lease_generation,
+                instant=instant,
+            ):
+                return None
+            task_row = conn.execute(
+                "SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)
+            ).fetchone()
             if task_row is None:
                 raise KeyError(f"Unknown task: {task_id}")
             task = _task_from_row(task_row)
-            if task.run_id != run_id or not task.approved or task.status not in {"queued", "approved"}:
+            if (
+                task.run_id != run_id
+                or not task.approved
+                or task.status not in {"queued", "approved"}
+            ):
                 return None
             if task.dependencies:
                 placeholders = ", ".join("?" for _ in task.dependencies)
@@ -1428,7 +3390,9 @@ class AgentStateStore:
             )
             if cursor.rowcount != 1:
                 return None
-            updated = conn.execute("SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)).fetchone()
+            updated = conn.execute(
+                "SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)
+            ).fetchone()
             return _task_from_row(updated) if updated is not None else None
 
     def task_claim_matches(
@@ -1438,18 +3402,46 @@ class AgentStateStore:
         run_id: str,
         worker_owner: str,
         worker_claim_id: str,
+        run_lease_owner: str | None = None,
+        run_lease_generation: int | None = None,
     ) -> bool:
+        if (run_lease_owner is None) != (run_lease_generation is None):
+            raise ValueError("run lease owner and generation must be provided together")
+        if run_lease_owner is not None and run_lease_owner != worker_owner:
+            raise ValueError("task worker owner must hold the run lease")
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)).fetchone()
+            row = conn.execute(
+                """
+                SELECT task_nodes.*, runs.status AS _run_status,
+                    runs.lease_owner AS _run_lease_owner,
+                    runs.lease_generation AS _run_lease_generation,
+                    runs.lease_expires_at AS _run_lease_expires_at
+                FROM task_nodes JOIN runs ON runs.run_id = task_nodes.run_id
+                WHERE task_nodes.task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
         if row is None:
             raise KeyError(f"Unknown task: {task_id}")
         task = _task_from_row(row)
         result = task.result or {}
-        return (
+        matches = (
             task.run_id == run_id
             and task.status == "running"
             and result.get("worker_owner") == worker_owner
             and result.get("worker_claim_id") == worker_claim_id
+        )
+        if not matches or run_lease_owner is None:
+            return matches
+        return (
+            str(row["_run_status"]) in {"queued", "running"}
+            and _optional_str(row["_run_lease_owner"]) == run_lease_owner
+            and int(row["_run_lease_generation"]) == run_lease_generation
+            and (
+                _parse_timestamp(_optional_str(row["_run_lease_expires_at"]))
+                or datetime.min.replace(tzinfo=UTC)
+            )
+            > datetime.now(UTC)
         )
 
     def heartbeat_task_claim(
@@ -1460,16 +3452,30 @@ class AgentStateStore:
         worker_owner: str,
         worker_claim_id: str,
         heartbeat_at: str | None = None,
+        run_lease_owner: str | None = None,
+        run_lease_generation: int | None = None,
     ) -> bool:
         """Refresh a task heartbeat only if the exact execution claim is still active."""
 
-        now = heartbeat_at or utc_now()
+        if (run_lease_owner is None) != (run_lease_generation is None):
+            raise ValueError("run lease owner and generation must be provided together")
+        if run_lease_owner is not None and run_lease_owner != worker_owner:
+            raise ValueError("task worker owner must hold the run lease")
+        instant = datetime.now(UTC)
+        now = heartbeat_at or instant.isoformat()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            run_row = conn.execute("SELECT status FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            run_row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             if run_row is None:
                 raise KeyError(f"Unknown run: {run_id}")
             if str(run_row["status"]) in _ABORTED_RUN_STATUSES:
+                return False
+            if run_lease_owner is not None and not _run_execution_lease_matches(
+                run_row,
+                owner=run_lease_owner,
+                generation=run_lease_generation,
+                instant=instant,
+            ):
                 return False
             row = conn.execute("SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)).fetchone()
             if row is None:
@@ -1502,18 +3508,37 @@ class AgentStateStore:
         worker_owner: str,
         worker_claim_id: str,
         increment_attempt: bool = False,
+        run_lease_owner: str | None = None,
+        run_lease_generation: int | None = None,
         **fields: object,
     ) -> tuple[TaskNodeRecord, bool]:
         """Finish an exact task execution claim without allowing stale workers to overwrite state."""
 
         if status not in {"blocked", "completed", "failed", "cancelled", "skipped"}:
             raise ValueError(f"unsupported claimed task transition: {status}")
-        now = utc_now()
+        if (run_lease_owner is None) != (run_lease_generation is None):
+            raise ValueError("run lease owner and generation must be provided together")
+        if run_lease_owner is not None and run_lease_owner != worker_owner:
+            raise ValueError("task worker owner must hold the run lease")
+        instant = datetime.now(UTC)
+        now = instant.isoformat()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            run_row = conn.execute("SELECT status FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            run_row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             if run_row is None:
                 raise KeyError(f"Unknown run: {run_id}")
+            if run_lease_owner is not None and not _run_execution_lease_matches(
+                run_row,
+                owner=run_lease_owner,
+                generation=run_lease_generation,
+                instant=instant,
+            ):
+                row = conn.execute(
+                    "SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"Unknown task: {task_id}")
+                return _task_from_row(row), False
             row = conn.execute("SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)).fetchone()
             if row is None:
                 raise KeyError(f"Unknown task: {task_id}")
@@ -1526,7 +3551,7 @@ class AgentStateStore:
                 or claim.get("worker_claim_id") != worker_claim_id
             ):
                 return task, False
-            if str(run_row["status"]) in _ABORTED_RUN_STATUSES:
+            if str(run_row["status"]) in _ABORTED_RUN_STATUSES and status != "cancelled":
                 return task, False
             updates = dict(fields)
             updates["status"] = status
@@ -1543,10 +3568,419 @@ class AgentStateStore:
                 "WHERE task_id = ? AND run_id = ? AND status = 'running'",
                 values,
             )
-            updated = conn.execute("SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)).fetchone()
+            updated = conn.execute(
+                "SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)
+            ).fetchone()
             if updated is None:
                 raise KeyError(f"Unknown task: {task_id}")
             return _task_from_row(updated), cursor.rowcount == 1
+
+    def resume_blocked_task_for_approval(
+        self,
+        task_id: str,
+        *,
+        run_id: str,
+        subagent_id: str,
+        approval_id: str,
+        worker_owner: str,
+        worker_claim_id: str,
+        heartbeat_at: str | None = None,
+        run_lease_owner: str | None = None,
+        run_lease_generation: int | None = None,
+    ) -> tuple[TaskNodeRecord, SubagentRunRecord] | None:
+        """Atomically restore the exact scheduler task and subagent after approval."""
+
+        owner = worker_owner.strip()
+        claim_id = worker_claim_id.strip()
+        if not owner or not claim_id:
+            raise ValueError("worker owner and claim id are required")
+        if (run_lease_owner is None) != (run_lease_generation is None):
+            raise ValueError("run lease owner and generation must be provided together")
+        if run_lease_owner is not None and run_lease_owner != owner:
+            raise ValueError("task worker owner must hold the run lease")
+        instant = datetime.now(UTC)
+        now = heartbeat_at or instant.isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run_row = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise KeyError(f"Unknown run: {run_id}")
+            if str(run_row["status"]) != "running":
+                return None
+            if run_lease_owner is not None and not _run_execution_lease_matches(
+                run_row,
+                owner=run_lease_owner,
+                generation=run_lease_generation,
+                instant=instant,
+            ):
+                return None
+
+            task_row = conn.execute(
+                "SELECT * FROM task_nodes WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if task_row is None:
+                raise KeyError(f"Unknown task: {task_id}")
+            task = _task_from_row(task_row)
+            task_result = dict(task.result or {})
+            continuation = task_result.get("approval_continuation")
+            if (
+                task.run_id != run_id
+                or task.status != "blocked"
+                or not isinstance(continuation, dict)
+                or continuation.get("approval_id") != approval_id
+                or continuation.get("task_id") != task_id
+                or continuation.get("subagent_id") != subagent_id
+                or continuation.get("worker_claim_id") != subagent_id
+                or not str(continuation.get("worker_owner") or "").strip()
+            ):
+                return None
+
+            subagent_row = conn.execute(
+                "SELECT * FROM subagent_runs WHERE subagent_id = ?",
+                (subagent_id,),
+            ).fetchone()
+            if subagent_row is None:
+                raise KeyError(f"Unknown subagent run: {subagent_id}")
+            subagent = _subagent_from_row(subagent_row)
+            if (
+                subagent.run_id != run_id
+                or subagent.task_id != task_id
+                or subagent.status != "blocked"
+            ):
+                return None
+
+            # Keep the exact approval binding durable while the worker is
+            # running. The terminal/blocking pair transition replaces this
+            # result, and startup can still reconcile a crash before the tool
+            # execution claim is acquired.
+            task_result.update(
+                {
+                    "worker_owner": owner,
+                    "worker_claim_id": claim_id,
+                    "worker_heartbeat_at": now,
+                }
+            )
+            task_cursor = conn.execute(
+                """
+                UPDATE task_nodes SET status = 'running', result_json = ?, updated_at = ?
+                WHERE task_id = ? AND run_id = ? AND status = 'blocked'
+                """,
+                (_encode(task_result), now, task_id, run_id),
+            )
+            subagent_cursor = conn.execute(
+                """
+                UPDATE subagent_runs SET status = 'running', error = NULL, updated_at = ?
+                WHERE subagent_id = ? AND run_id = ? AND task_id = ? AND status = 'blocked'
+                """,
+                (now, subagent_id, run_id, task_id),
+            )
+            if task_cursor.rowcount != 1 or subagent_cursor.rowcount != 1:
+                conn.rollback()
+                return None
+            updated_task_row = conn.execute(
+                "SELECT * FROM task_nodes WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            updated_subagent_row = conn.execute(
+                "SELECT * FROM subagent_runs WHERE subagent_id = ?",
+                (subagent_id,),
+            ).fetchone()
+            if updated_task_row is None or updated_subagent_row is None:
+                raise RuntimeError("approval task continuation did not persist")
+            return _task_from_row(updated_task_row), _subagent_from_row(updated_subagent_row)
+
+    def transition_scheduler_task_and_subagent(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        run_id: str,
+        subagent_id: str,
+        worker_owner: str,
+        worker_claim_id: str,
+        task_fields: dict[str, object] | None = None,
+        subagent_result: str = "",
+        subagent_error: str | None = None,
+        increment_attempt: bool = False,
+        consumed_approval_id: str | None = None,
+        run_lease_owner: str | None = None,
+        run_lease_generation: int | None = None,
+    ) -> tuple[TaskNodeRecord, SubagentRunRecord, bool]:
+        """Atomically terminalize or block one exact scheduler worker pair."""
+
+        if status not in {"blocked", "completed", "failed", "cancelled"}:
+            raise ValueError(f"unsupported scheduler worker transition: {status}")
+        if (run_lease_owner is None) != (run_lease_generation is None):
+            raise ValueError("run lease owner and generation must be provided together")
+        if run_lease_owner is not None and run_lease_owner != worker_owner:
+            raise ValueError("task worker owner must hold the run lease")
+        instant = datetime.now(UTC)
+        now = instant.isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run_row = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise KeyError(f"Unknown run: {run_id}")
+            task_row = conn.execute(
+                "SELECT * FROM task_nodes WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            subagent_row = conn.execute(
+                "SELECT * FROM subagent_runs WHERE subagent_id = ?",
+                (subagent_id,),
+            ).fetchone()
+            if task_row is None:
+                raise KeyError(f"Unknown task: {task_id}")
+            if subagent_row is None:
+                raise KeyError(f"Unknown subagent run: {subagent_id}")
+            task = _task_from_row(task_row)
+            subagent = _subagent_from_row(subagent_row)
+            if run_lease_owner is not None and not _run_execution_lease_matches(
+                run_row,
+                owner=run_lease_owner,
+                generation=run_lease_generation,
+                instant=instant,
+            ):
+                return task, subagent, False
+            claim = task.result or {}
+            eligible_subagent_statuses = (
+                {"queued", "running"} if status == "cancelled" else {"running"}
+            )
+            if (
+                (str(run_row["status"]) in _ABORTED_RUN_STATUSES and status != "cancelled")
+                or task.run_id != run_id
+                or task.status != "running"
+                or claim.get("worker_owner") != worker_owner
+                or claim.get("worker_claim_id") != worker_claim_id
+                or subagent.run_id != run_id
+                or subagent.task_id != task_id
+                or subagent.status not in eligible_subagent_statuses
+            ):
+                return task, subagent, False
+            if consumed_approval_id is not None:
+                approval_row = conn.execute(
+                    "SELECT * FROM approval_requests WHERE approval_id = ?",
+                    (consumed_approval_id,),
+                ).fetchone()
+                if approval_row is None:
+                    return task, subagent, False
+                consumed = _approval_from_row(approval_row)
+                if (
+                    consumed["run_id"] != run_id
+                    or consumed.get("result") is None
+                    or consumed.get("execution_claim_id") is not None
+                    or consumed.get("execution_claim_task_id") != task_id
+                    or consumed.get("execution_claim_subagent_id") != subagent_id
+                ):
+                    return task, subagent, False
+
+            updates = dict(task_fields or {})
+            updates["status"] = status
+            if increment_attempt:
+                updates["attempt_count"] = task.attempt_count + 1
+            updates["updated_at"] = now
+            assignments = ", ".join(
+                f"{_validated_column('task_nodes', _task_column(key))} = ?" for key in updates
+            )
+            values = [_encode(value) for value in updates.values()]
+            values.extend([task_id, run_id])
+            task_cursor = conn.execute(  # nosec
+                f"UPDATE task_nodes SET {assignments} "
+                "WHERE task_id = ? AND run_id = ? AND status = 'running'",
+                values,
+            )
+            subagent_cursor = conn.execute(
+                """
+                UPDATE subagent_runs
+                SET status = ?, result = ?, error = ?, updated_at = ?
+                WHERE subagent_id = ? AND run_id = ? AND task_id = ? AND status = ?
+                """,
+                (
+                    status,
+                    subagent_result,
+                    subagent_error,
+                    now,
+                    subagent_id,
+                    run_id,
+                    task_id,
+                    subagent.status,
+                ),
+            )
+            if task_cursor.rowcount != 1 or subagent_cursor.rowcount != 1:
+                conn.rollback()
+                return task, subagent, False
+            if consumed_approval_id is not None:
+                approval_cursor = conn.execute(
+                    """
+                    UPDATE approval_requests
+                    SET execution_claim_task_id = NULL,
+                        execution_claim_subagent_id = NULL,
+                        updated_at = ?
+                    WHERE approval_id = ? AND run_id = ?
+                        AND result_json IS NOT NULL AND execution_claim_id IS NULL
+                        AND execution_claim_task_id = ?
+                        AND execution_claim_subagent_id = ?
+                    """,
+                    (
+                        now,
+                        consumed_approval_id,
+                        run_id,
+                        task_id,
+                        subagent_id,
+                    ),
+                )
+                if approval_cursor.rowcount != 1:
+                    conn.rollback()
+                    return task, subagent, False
+            updated_task = conn.execute(
+                "SELECT * FROM task_nodes WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            updated_subagent = conn.execute(
+                "SELECT * FROM subagent_runs WHERE subagent_id = ?",
+                (subagent_id,),
+            ).fetchone()
+            if updated_task is None or updated_subagent is None:
+                raise RuntimeError("scheduler worker transition did not persist")
+            return (
+                _task_from_row(updated_task),
+                _subagent_from_row(updated_subagent),
+                True,
+            )
+
+    def fail_scheduler_task_for_approval(
+        self,
+        task_id: str,
+        *,
+        run_id: str,
+        subagent_id: str,
+        approval_id: str,
+        reason: str,
+        expected_run_lease: tuple[str | None, int, str | None] | None = None,
+    ) -> tuple[TaskNodeRecord, SubagentRunRecord] | None:
+        """Atomically terminalize the scheduler worker bound to a denied grant."""
+
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            approval_row = conn.execute(
+                "SELECT * FROM approval_requests WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            run_row = conn.execute(
+                "SELECT lease_owner, lease_generation, lease_expires_at FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            task_row = conn.execute(
+                "SELECT * FROM task_nodes WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            subagent_row = conn.execute(
+                "SELECT * FROM subagent_runs WHERE subagent_id = ?",
+                (subagent_id,),
+            ).fetchone()
+            if approval_row is None or run_row is None or task_row is None or subagent_row is None:
+                return None
+            if (
+                expected_run_lease is not None
+                and (
+                    _optional_str(run_row["lease_owner"]),
+                    int(run_row["lease_generation"]),
+                    _optional_str(run_row["lease_expires_at"]),
+                )
+                != expected_run_lease
+            ):
+                return None
+            approval = _approval_from_row(approval_row)
+            task = _task_from_row(task_row)
+            subagent = _subagent_from_row(subagent_row)
+            task_result = dict(task.result or {})
+            continuation = task_result.get("approval_continuation")
+            active_task_statuses = {"running", "blocked"}
+            terminal_task_statuses = {"completed", "failed", "cancelled", "skipped"}
+            active_subagent_statuses = {"running", "blocked"}
+            terminal_subagent_statuses = {"completed", "failed", "cancelled"}
+            if (
+                task.run_id != run_id
+                or task.status not in active_task_statuses | terminal_task_statuses
+                or subagent.run_id != run_id
+                or subagent.task_id != task_id
+                or subagent.status not in active_subagent_statuses | terminal_subagent_statuses
+                or not isinstance(continuation, dict)
+                or continuation.get("approval_id") != approval_id
+                or continuation.get("task_id") != task_id
+                or continuation.get("subagent_id") != subagent_id
+            ):
+                return None
+            bound_task_id = approval.get("execution_claim_task_id")
+            bound_subagent_id = approval.get("execution_claim_subagent_id")
+            if (bound_task_id is not None or bound_subagent_id is not None) and (
+                bound_task_id != task_id or bound_subagent_id != subagent_id
+            ):
+                return None
+            task_result["approval_denial"] = {
+                "approval_id": approval_id,
+                "reason": reason,
+            }
+            if task.status in active_task_statuses:
+                task_cursor = conn.execute(
+                    """
+                    UPDATE task_nodes
+                    SET status = 'failed', attempt_count = attempt_count + 1,
+                        failure_reason = ?, result_json = ?, updated_at = ?
+                    WHERE task_id = ? AND run_id = ? AND status IN ('running', 'blocked')
+                    """,
+                    (reason, _encode(task_result), now, task_id, run_id),
+                )
+                if task_cursor.rowcount != 1:
+                    conn.rollback()
+                    return None
+            if subagent.status in active_subagent_statuses:
+                subagent_cursor = conn.execute(
+                    """
+                    UPDATE subagent_runs SET status = 'failed', error = ?, updated_at = ?
+                    WHERE subagent_id = ? AND run_id = ? AND task_id = ?
+                      AND status IN ('running', 'blocked')
+                    """,
+                    (reason, now, subagent_id, run_id, task_id),
+                )
+                if subagent_cursor.rowcount != 1:
+                    conn.rollback()
+                    return None
+            if bound_task_id is not None and bound_subagent_id is not None:
+                binding_cursor = conn.execute(
+                    """
+                    UPDATE approval_requests
+                    SET execution_claim_task_id = NULL,
+                        execution_claim_subagent_id = NULL,
+                        updated_at = ?
+                    WHERE approval_id = ? AND run_id = ?
+                        AND execution_claim_task_id = ?
+                        AND execution_claim_subagent_id = ?
+                    """,
+                    (now, approval_id, run_id, task_id, subagent_id),
+                )
+                if binding_cursor.rowcount != 1:
+                    conn.rollback()
+                    return None
+            updated_task = conn.execute(
+                "SELECT * FROM task_nodes WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            updated_subagent = conn.execute(
+                "SELECT * FROM subagent_runs WHERE subagent_id = ?",
+                (subagent_id,),
+            ).fetchone()
+            if updated_task is None or updated_subagent is None:
+                raise RuntimeError("scheduler approval denial did not persist")
+            return _task_from_row(updated_task), _subagent_from_row(updated_subagent)
 
     def cancel_tasks_for_run(self, run_id: str) -> list[str]:
         """Atomically cancel every non-terminal task attached to a cancelled run."""
@@ -1642,20 +4076,36 @@ class AgentStateStore:
         status: str,
         worker_owner: str,
         worker_claim_id: str,
+        run_lease_owner: str | None = None,
+        run_lease_generation: int | None = None,
     ) -> SubagentRunRecord | None:
         """Persist a worker only while its run and exact task claim are still active."""
 
         if status not in {"queued", "running"}:
             raise ValueError(f"unsupported initial subagent status: {status}")
-        now = utc_now()
+        if (run_lease_owner is None) != (run_lease_generation is None):
+            raise ValueError("run lease owner and generation must be provided together")
+        if run_lease_owner is not None and run_lease_owner != worker_owner:
+            raise ValueError("task worker owner must hold the run lease")
+        instant = datetime.now(UTC)
+        now = instant.isoformat()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            run_row = conn.execute("SELECT status FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            run_row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             if run_row is None:
                 raise KeyError(f"Unknown run: {run_id}")
             if str(run_row["status"]) in _TERMINAL_RUN_STATUSES:
                 return None
-            task_row = conn.execute("SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)).fetchone()
+            if run_lease_owner is not None and not _run_execution_lease_matches(
+                run_row,
+                owner=run_lease_owner,
+                generation=run_lease_generation,
+                instant=instant,
+            ):
+                return None
+            task_row = conn.execute(
+                "SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)
+            ).fetchone()
             if task_row is None:
                 raise KeyError(f"Unknown task: {task_id}")
             task = _task_from_row(task_row)
@@ -1710,9 +4160,7 @@ class AgentStateStore:
         updates = dict(fields)
         updates["status"] = status
         updates["updated_at"] = utc_now()
-        assignments = ", ".join(
-            f"{_validated_column('subagent_runs', key)} = ?" for key in updates
-        )
+        assignments = ", ".join(f"{_validated_column('subagent_runs', key)} = ?" for key in updates)
         values = [_encode(value) for value in updates.values()]
         placeholders = ", ".join("?" for _ in expected_statuses)
         values.extend([subagent_id, *expected_statuses])
@@ -1749,7 +4197,9 @@ class AgentStateStore:
 
     def get_subagent_run(self, subagent_id: str) -> SubagentRunRecord:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM subagent_runs WHERE subagent_id = ?", (subagent_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM subagent_runs WHERE subagent_id = ?", (subagent_id,)
+            ).fetchone()
         if row is None:
             raise KeyError(f"Unknown subagent run: {subagent_id}")
         return _subagent_from_row(row)
@@ -1772,6 +4222,128 @@ class AgentStateStore:
                 """
             ).fetchall()
         return [_subagent_from_row(row) for row in rows]
+
+    def fail_stale_worker_pair(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        subagent_id: str,
+        worker_owner: str | None,
+        worker_claim_id: str | None,
+        expected_heartbeat_at: str | None,
+        reason: str,
+    ) -> tuple[TaskNodeRecord, SubagentRunRecord, bool]:
+        """Atomically fail an exact stale worker snapshot and its subagent."""
+
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            task_row = conn.execute(
+                "SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            subagent_row = conn.execute(
+                "SELECT * FROM subagent_runs WHERE subagent_id = ?", (subagent_id,)
+            ).fetchone()
+            if task_row is None:
+                raise KeyError(f"Unknown task: {task_id}")
+            if subagent_row is None:
+                raise KeyError(f"Unknown subagent run: {subagent_id}")
+            task = _task_from_row(task_row)
+            subagent = _subagent_from_row(subagent_row)
+            result = dict(task.result or {})
+            if (
+                task.run_id != run_id
+                or task.status != "running"
+                or result.get("worker_owner") != worker_owner
+                or result.get("worker_claim_id") != worker_claim_id
+                or _optional_str(result.get("worker_heartbeat_at")) != expected_heartbeat_at
+                or subagent.run_id != run_id
+                or subagent.task_id != task_id
+                or subagent.status not in {"queued", "running"}
+            ):
+                return task, subagent, False
+            result["worker_recovery"] = {
+                "reason": reason,
+                "worker_owner": worker_owner,
+                "worker_claim_id": worker_claim_id,
+                "heartbeat_at": expected_heartbeat_at,
+            }
+            task_cursor = conn.execute(
+                """
+                UPDATE task_nodes SET status = 'failed', failure_reason = ?,
+                    result_json = ?, updated_at = ?
+                WHERE task_id = ? AND run_id = ? AND status = 'running'
+                """,
+                (reason, _encode(result), now, task_id, run_id),
+            )
+            subagent_cursor = conn.execute(
+                """
+                UPDATE subagent_runs SET status = 'failed', error = ?, updated_at = ?
+                WHERE subagent_id = ? AND run_id = ? AND task_id = ?
+                    AND status IN ('queued', 'running')
+                """,
+                (reason, now, subagent_id, run_id, task_id),
+            )
+            if task_cursor.rowcount != 1 or subagent_cursor.rowcount != 1:
+                conn.rollback()
+                return task, subagent, False
+            updated_task_row = conn.execute(
+                "SELECT * FROM task_nodes WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            updated_subagent_row = conn.execute(
+                "SELECT * FROM subagent_runs WHERE subagent_id = ?", (subagent_id,)
+            ).fetchone()
+            if updated_task_row is None or updated_subagent_row is None:
+                raise RuntimeError("stale worker recovery did not persist")
+            return _task_from_row(updated_task_row), _subagent_from_row(updated_subagent_row), True
+
+    def fail_stale_subagent_run(
+        self,
+        subagent_id: str,
+        *,
+        run_id: str,
+        expected_status: str,
+        expected_updated_at: str,
+        reason: str,
+    ) -> tuple[SubagentRunRecord, bool]:
+        """Fail one exact orphaned subagent snapshot without clobbering a renewal."""
+
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM subagent_runs WHERE subagent_id = ?", (subagent_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown subagent run: {subagent_id}")
+            current = _subagent_from_row(row)
+            if (
+                current.run_id != run_id
+                or current.status != expected_status
+                or current.updated_at != expected_updated_at
+            ):
+                return current, False
+            cursor = conn.execute(
+                """
+                UPDATE subagent_runs SET status = 'failed', error = ?, updated_at = ?
+                WHERE subagent_id = ? AND run_id = ? AND status = ? AND updated_at = ?
+                """,
+                (
+                    reason,
+                    now,
+                    subagent_id,
+                    run_id,
+                    expected_status,
+                    expected_updated_at,
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM subagent_runs WHERE subagent_id = ?", (subagent_id,)
+            ).fetchone()
+            if updated is None:
+                raise KeyError(f"Unknown subagent run: {subagent_id}")
+            return _subagent_from_row(updated), cursor.rowcount == 1
 
     def subagent_status_counts(self) -> dict[str, int]:
         with self._connect() as conn:
@@ -1880,6 +4452,7 @@ class AgentStateStore:
             )
             row = conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
             current = 0 if row is None else int(row["version"])
+            migration_required = current != SCHEMA_VERSION
             if current > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"State database schema {current} is newer than supported schema {SCHEMA_VERSION}."
@@ -1929,9 +4502,23 @@ class AgentStateStore:
             if current < 15:
                 _apply_schema_v15(conn)
                 current = 15
+            if current < 16:
+                _apply_schema_v16(conn)
+                current = 16
+            if current < 17:
+                _apply_schema_v17(conn)
+                current = 17
+            if current < 18:
+                _apply_schema_v18(conn)
+                current = 18
+            if current < 19:
+                _apply_schema_v19(conn)
+                current = 19
             if current < SCHEMA_VERSION:
-                raise RuntimeError(f"Unsupported schema migration target: {current} -> {SCHEMA_VERSION}")
-            if current == SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Unsupported schema migration target: {current} -> {SCHEMA_VERSION}"
+                )
+            if current == SCHEMA_VERSION and migration_required:
                 conn.execute(
                     """
                     INSERT INTO schema_version (id, version, updated_at)
@@ -1948,8 +4535,9 @@ class AgentStateStore:
             try:
                 conn = sqlite3.connect(self.path, timeout=5.0)
                 try:
-                    with conn:
-                        conn.execute("PRAGMA busy_timeout=5000")
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    mode = conn.execute("PRAGMA journal_mode").fetchone()
+                    if mode is None or str(mode[0]).lower() != "wal":
                         mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
                 finally:
                     conn.close()
@@ -1964,17 +4552,43 @@ class AgentStateStore:
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.path, check_same_thread=False, timeout=5.0)
-        conn.row_factory = sqlite3.Row
-        _apply_connection_pragmas(conn)
         try:
+            conn.row_factory = sqlite3.Row
+            _apply_connection_pragmas(conn)
             yield conn
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
             conn.commit()
         finally:
             conn.close()
 
 
+def _execute_schema_script(conn: sqlite3.Connection, script: str) -> None:
+    """Execute migration DDL without ``executescript``'s implicit pre-commit."""
+
+    if not conn.in_transaction:
+        raise RuntimeError("schema scripts require an active transaction")
+    pending: list[str] = []
+    for line in script.splitlines(keepends=True):
+        pending.append(line)
+        statement = "".join(pending)
+        if not sqlite3.complete_statement(statement):
+            continue
+        if statement.strip():
+            conn.execute(statement)
+        pending.clear()
+    remainder = "".join(pending).strip()
+    if remainder:
+        raise RuntimeError("incomplete SQL statement in schema migration")
+    if not conn.in_transaction:
+        raise RuntimeError("schema script unexpectedly ended its transaction")
+
+
 def _apply_schema_v1(conn: sqlite3.Connection) -> None:
-    conn.executescript(
+    _execute_schema_script(
+        conn,
         """
         CREATE TABLE IF NOT EXISTS runs (
             run_id TEXT PRIMARY KEY,
@@ -2064,7 +4678,8 @@ def _apply_schema_v2(conn: sqlite3.Connection) -> None:
         if name not in existing:
             conn.execute(f"ALTER TABLE mcp_servers ADD COLUMN {name} {definition}")
 
-    conn.executescript(
+    _execute_schema_script(
+        conn,
         """
         CREATE TABLE IF NOT EXISTS task_nodes (
             task_id TEXT PRIMARY KEY,
@@ -2146,7 +4761,8 @@ def _apply_schema_v6(conn: sqlite3.Connection) -> None:
 
 
 def _apply_schema_v7(conn: sqlite3.Connection) -> None:
-    conn.executescript(
+    _execute_schema_script(
+        conn,
         """
         CREATE TABLE IF NOT EXISTS plugin_registry (
             id TEXT PRIMARY KEY,
@@ -2172,7 +4788,8 @@ def _apply_schema_v7(conn: sqlite3.Connection) -> None:
 
 
 def _apply_schema_v8(conn: sqlite3.Connection) -> None:
-    conn.executescript(
+    _execute_schema_script(
+        conn,
         """
         CREATE TABLE IF NOT EXISTS trace_spans (
             span_id TEXT PRIMARY KEY,
@@ -2202,7 +4819,8 @@ def _apply_schema_v9(conn: sqlite3.Connection) -> None:
 
 
 def _apply_schema_v10(conn: sqlite3.Connection) -> None:
-    conn.executescript(
+    _execute_schema_script(
+        conn,
         """
         CREATE TABLE IF NOT EXISTS promotion_ledger (
             promotion_id TEXT PRIMARY KEY,
@@ -2235,7 +4853,8 @@ def _apply_schema_v10(conn: sqlite3.Connection) -> None:
 
 
 def _apply_schema_v11(conn: sqlite3.Connection) -> None:
-    conn.executescript(
+    _execute_schema_script(
+        conn,
         """
         CREATE TABLE IF NOT EXISTS behavior_delta_ledger (
             delta_id TEXT PRIMARY KEY,
@@ -2323,9 +4942,7 @@ def _apply_schema_v14(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE approval_requests ADD COLUMN expires_at TEXT")
     # Existing undecided approvals predate the expiry contract and cannot be
     # trusted indefinitely. Expire them on the first post-v14 access.
-    conn.execute(
-        "UPDATE approval_requests SET expires_at = created_at WHERE expires_at IS NULL"
-    )
+    conn.execute("UPDATE approval_requests SET expires_at = created_at WHERE expires_at IS NULL")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_approval_requests_expires_at "
         "ON approval_requests(expires_at)"
@@ -2341,10 +4958,10 @@ def _apply_schema_v15(conn: sqlite3.Connection) -> None:
         )
     if "resource_digest" not in approval_columns:
         conn.execute(
-            "ALTER TABLE approval_requests "
-            "ADD COLUMN resource_digest TEXT NOT NULL DEFAULT ''"
+            "ALTER TABLE approval_requests ADD COLUMN resource_digest TEXT NOT NULL DEFAULT ''"
         )
-    conn.executescript(
+    _execute_schema_script(
+        conn,
         """
         CREATE TABLE IF NOT EXISTS capability_overrides (
             kind TEXT NOT NULL CHECK (kind IN ('tool', 'mcp_server', 'skill')),
@@ -2379,8 +4996,316 @@ def _apply_schema_v15(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_schema_v16(conn: sqlite3.Connection) -> None:
+    columns = _columns(conn, "runs")
+    # Some narrowly scoped legacy fixtures contain only the table introduced in
+    # the version under test. A missing runs table has no run rows to migrate.
+    if not columns:
+        return
+    if "turn_source_json" not in columns:
+        conn.execute("ALTER TABLE runs ADD COLUMN turn_source_json TEXT")
+    if "turn_origin" not in columns:
+        conn.execute("ALTER TABLE runs ADD COLUMN turn_origin TEXT NOT NULL DEFAULT 'primary_user'")
+    if "transcript_scope" not in columns:
+        conn.execute("ALTER TABLE runs ADD COLUMN transcript_scope TEXT NOT NULL DEFAULT 'primary'")
+
+
+def _apply_schema_v17(conn: sqlite3.Connection) -> None:
+    _execute_schema_script(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS routines (
+            routine_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            schedule_kind TEXT NOT NULL CHECK (schedule_kind IN ('once', 'interval')),
+            start_at TEXT NOT NULL,
+            interval_seconds INTEGER,
+            enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+            revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+            next_run_at TEXT,
+            workspace TEXT,
+            provider TEXT,
+            model TEXT,
+            autonomy_mode TEXT NOT NULL DEFAULT 'background'
+                CHECK (autonomy_mode IN ('background', 'manual', 'autonomous')),
+            misfire_grace_seconds INTEGER NOT NULL DEFAULT 60
+                CHECK (
+                    misfire_grace_seconds BETWEEN
+                        {MIN_ROUTINE_MISFIRE_GRACE_SECONDS}
+                        AND {MAX_ROUTINE_MISFIRE_GRACE_SECONDS}
+                ),
+            last_scheduled_at TEXT,
+            deleted_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK (
+                (schedule_kind = 'once' AND interval_seconds IS NULL)
+                OR (
+                    schedule_kind = 'interval'
+                    AND interval_seconds BETWEEN {MIN_ROUTINE_INTERVAL_SECONDS}
+                        AND {MAX_ROUTINE_INTERVAL_SECONDS}
+                )
+            )
+        );
+
+        CREATE TABLE IF NOT EXISTS routine_occurrences (
+            occurrence_id TEXT PRIMARY KEY,
+            routine_id TEXT NOT NULL,
+            routine_revision INTEGER NOT NULL CHECK (routine_revision > 0),
+            scheduled_for TEXT NOT NULL,
+            status TEXT NOT NULL
+                CHECK (status IN ('claimed', 'running', 'completed', 'failed', 'skipped')),
+            run_id TEXT NOT NULL,
+            request_json TEXT NOT NULL DEFAULT '{{}}',
+            claim_owner TEXT,
+            claim_generation INTEGER NOT NULL DEFAULT 1 CHECK (claim_generation > 0),
+            claim_expires_at TEXT,
+            started_at TEXT,
+            finished_at TEXT,
+            skip_reason TEXT,
+            error TEXT,
+            result_json TEXT NOT NULL DEFAULT '{{}}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (routine_id, routine_revision, scheduled_for),
+            FOREIGN KEY (routine_id) REFERENCES routines(routine_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_routines_due
+            ON routines(enabled, deleted_at, next_run_at);
+        CREATE INDEX IF NOT EXISTS idx_routine_occurrences_routine
+            ON routine_occurrences(routine_id, scheduled_for);
+        CREATE INDEX IF NOT EXISTS idx_routine_occurrences_claim
+            ON routine_occurrences(status, claim_expires_at);
+        CREATE INDEX IF NOT EXISTS idx_routine_occurrences_run
+            ON routine_occurrences(run_id);
+        """
+    )
+
+
+def _apply_schema_v18(conn: sqlite3.Connection) -> None:
+    columns = _columns(conn, "approval_requests")
+    if not columns:
+        return
+    for name in (
+        "execution_claim_owner",
+        "execution_claim_id",
+        "execution_claim_started_at",
+        "execution_claim_expires_at",
+        "execution_claim_task_id",
+        "execution_claim_subagent_id",
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE approval_requests ADD COLUMN {name} TEXT")
+
+
+def _apply_schema_v19(conn: sqlite3.Connection) -> None:
+    columns = _columns(conn, "routine_occurrences")
+    if not columns:
+        return
+    if "trigger_kind" not in columns:
+        conn.execute(
+            """
+            ALTER TABLE routine_occurrences
+            ADD COLUMN trigger_kind TEXT NOT NULL DEFAULT 'scheduled'
+                CHECK (trigger_kind IN ('scheduled', 'manual'))
+            """
+        )
+    if "trigger_key_digest" not in columns:
+        conn.execute(
+            "ALTER TABLE routine_occurrences ADD COLUMN trigger_key_digest TEXT"
+        )
+    if "requested_at" not in columns:
+        conn.execute("ALTER TABLE routine_occurrences ADD COLUMN requested_at TEXT")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_routine_occurrences_manual_trigger
+            ON routine_occurrences(routine_id, trigger_key_digest)
+            WHERE trigger_kind = 'manual' AND trigger_key_digest IS NOT NULL
+        """
+    )
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _state_initialization_lock_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.kestrel-state-init.lock")
+
+
+@contextmanager
+def _state_initialization_lock(path: Path) -> Iterator[None]:
+    """Serialize sensitive SQLite initialization across OS processes."""
+
+    created_directory = _create_state_directory(path.parent)
+    if os.name != "nt":
+        directory_fd = _open_owned_state_directory(path.parent)
+        try:
+            if created_directory:
+                chmod_descriptor(directory_fd, _STATE_DIRECTORY_MODE)
+        finally:
+            os.close(directory_fd)
+    descriptor = open_private_file_descriptor(_state_initialization_lock_path(path))
+    with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
+        lock_exclusive(handle)
+        try:
+            yield
+        finally:
+            unlock(handle)
+
+
+def _prepare_private_sqlite_storage(path: Path) -> None:
+    directory = path.parent
+    created_directory = _create_state_directory(directory)
+    if os.name == "nt":
+        return
+    directory_fd = _open_owned_state_directory(directory)
+    try:
+        if created_directory:
+            chmod_descriptor(directory_fd, _STATE_DIRECTORY_MODE)
+        _harden_sqlite_entry(
+            directory_fd,
+            path.name,
+            display_path=path,
+            create=True,
+        )
+        for suffix in _SQLITE_PRIVATE_SUFFIXES[1:]:
+            _harden_sqlite_entry(
+                directory_fd,
+                f"{path.name}{suffix}",
+                display_path=Path(f"{path}{suffix}"),
+                create=False,
+            )
+    finally:
+        os.close(directory_fd)
+
+
+def _harden_private_sqlite_files(path: Path) -> None:
+    if os.name == "nt":
+        return
+    directory_fd = _open_owned_state_directory(path.parent)
+    try:
+        for suffix in _SQLITE_PRIVATE_SUFFIXES:
+            _harden_sqlite_entry(
+                directory_fd,
+                f"{path.name}{suffix}",
+                display_path=Path(f"{path}{suffix}"),
+                create=False,
+            )
+    finally:
+        os.close(directory_fd)
+
+
+def _create_state_directory(directory: Path) -> bool:
+    """Create only the immediate state directory and report who won the race."""
+
+    try:
+        directory.mkdir(mode=_STATE_DIRECTORY_MODE)
+    except FileNotFoundError:
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            directory.mkdir(mode=_STATE_DIRECTORY_MODE)
+        except FileExistsError:
+            return False
+    except FileExistsError:
+        return False
+    return True
+
+
+def _open_owned_state_directory(directory: Path) -> int:
+    if directory.is_symlink():
+        raise ValueError(f"state directory must not be a symbolic link: {directory}")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        directory_fd = os.open(directory, flags)
+    except OSError as exc:
+        if directory.is_symlink():
+            raise ValueError(f"state directory must not be a symbolic link: {directory}") from exc
+        raise
+    try:
+        metadata = os.fstat(directory_fd)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"state directory must be a directory: {directory}")
+        _require_current_owner(metadata, directory)
+    except Exception:
+        os.close(directory_fd)
+        raise
+    return directory_fd
+
+
+def _harden_sqlite_entry(
+    directory_fd: int,
+    name: str,
+    *,
+    display_path: Path,
+    create: bool,
+) -> None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        if not create:
+            return
+        try:
+            descriptor = os.open(
+                name,
+                flags | os.O_CREAT | os.O_EXCL,
+                _SQLITE_FILE_MODE,
+                dir_fd=directory_fd,
+            )
+        except FileExistsError:
+            descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except PermissionError:
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        _validate_sqlite_file(metadata, display_path)
+        os.chmod(
+            name,
+            _SQLITE_FILE_MODE,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        try:
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError:
+            raise exc from None
+        _validate_sqlite_file(metadata, display_path)
+        raise
+    try:
+        metadata = os.fstat(descriptor)
+        _validate_sqlite_file(metadata, display_path)
+        chmod_descriptor(descriptor, _SQLITE_FILE_MODE)
+    finally:
+        os.close(descriptor)
+
+
+def _validate_sqlite_file(metadata: os.stat_result, path: Path) -> None:
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"SQLite state files must not be symbolic links: {path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"SQLite state files must be regular files: {path}")
+    if metadata.st_nlink > 1:
+        raise ValueError(f"SQLite state files must not be hard-linked: {path}")
+    _require_current_owner(metadata, path)
+
+
+def _require_current_owner(metadata: os.stat_result, path: Path) -> None:
+    geteuid = getattr(os, "geteuid", None)
+    if callable(geteuid) and metadata.st_uid != geteuid():
+        raise PermissionError(f"state storage must be owned by the current user: {path}")
 
 
 def _apply_connection_pragmas(conn: sqlite3.Connection) -> None:
@@ -2410,6 +5335,9 @@ _ALLOWED_UPDATE_COLUMNS = {
         "recovery_reason",
         "config_revision",
         "config_snapshot_json",
+        "turn_source_json",
+        "turn_origin",
+        "transcript_scope",
         "updated_at",
     },
     "task_nodes": {
@@ -2480,18 +5408,25 @@ def _run_from_row(row: sqlite3.Row) -> RunRecord:
         tool_count=int(row["tool_count"]),
         stop_reason=str(row["stop_reason"]),
         error=None if row["error"] is None else str(row["error"]),
-        lease_owner=None if _row_get(row, "lease_owner") is None else str(_row_get(row, "lease_owner")),
+        lease_owner=None
+        if _row_get(row, "lease_owner") is None
+        else str(_row_get(row, "lease_owner")),
         lease_generation=int(str(_row_get(row, "lease_generation", 0) or 0)),
         lease_expires_at=None
         if _row_get(row, "lease_expires_at") is None
         else str(_row_get(row, "lease_expires_at")),
-        heartbeat_at=None if _row_get(row, "heartbeat_at") is None else str(_row_get(row, "heartbeat_at")),
+        heartbeat_at=None
+        if _row_get(row, "heartbeat_at") is None
+        else str(_row_get(row, "heartbeat_at")),
         interrupted_at=None
         if _row_get(row, "interrupted_at") is None
         else str(_row_get(row, "interrupted_at")),
         recovery_reason=str(_row_get(row, "recovery_reason", "") or ""),
         config_revision=_optional_str(_row_get(row, "config_revision")),
         config_snapshot=_json_or_empty(_row_get(row, "config_snapshot_json", "{}")),
+        turn_source=_json_dict_or_none(_row_get(row, "turn_source_json")),
+        turn_origin=str(_row_get(row, "turn_origin", "primary_user") or "primary_user"),
+        transcript_scope=str(_row_get(row, "transcript_scope", "primary") or "primary"),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
@@ -2512,9 +5447,249 @@ def _approval_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "status": str(row["status"]),
         "decision": _json_or_none(row["decision_json"]),
         "result": _json_or_none(row["result_json"]),
+        "execution_claim_owner": _optional_str(_row_get(row, "execution_claim_owner")),
+        "execution_claim_id": _optional_str(_row_get(row, "execution_claim_id")),
+        "execution_claim_started_at": _optional_str(_row_get(row, "execution_claim_started_at")),
+        "execution_claim_expires_at": _optional_str(_row_get(row, "execution_claim_expires_at")),
+        "execution_claim_task_id": _optional_str(_row_get(row, "execution_claim_task_id")),
+        "execution_claim_subagent_id": _optional_str(_row_get(row, "execution_claim_subagent_id")),
         "created_at": str(row["created_at"]),
         "updated_at": str(row["updated_at"]),
     }
+
+
+def _upsert_mcp_server_row(conn: sqlite3.Connection, server: dict[str, Any]) -> None:
+    server_id = str(server["id"])
+    tools = list(server.get("tools", []))
+    capabilities = server.get("capabilities") or sorted(
+        {
+            str(capability)
+            for tool in tools
+            for capability in list(dict(tool).get("capabilities", []))
+        }
+    )
+    payload = {
+        "name": server.get("name", server_id),
+        "transport": server.get("transport", "stdio"),
+        "command": server.get("command"),
+        "args_json": json.dumps(server.get("args", [])),
+        "env_json": json.dumps(server.get("env", {})),
+        "url": server.get("url"),
+        "enabled": 1 if server.get("enabled", True) else 0,
+        "tools_json": json.dumps(tools),
+        "status": server.get("status", "configured"),
+        "error": server.get("error"),
+        "last_synced_at": server.get("last_synced_at"),
+        "last_seen_at": server.get("last_seen_at"),
+        "tool_count": int(server.get("tool_count", len(tools))),
+        "capabilities_json": json.dumps(capabilities),
+        "risk_policy": server.get("risk_policy", "approval_by_default"),
+        "secret_env_json": json.dumps(server.get("secret_env", {})),
+        "session_state": server.get("session_state", "disconnected"),
+        "last_call_at": server.get("last_call_at"),
+        "last_error_at": server.get("last_error_at"),
+        "failure_count": int(server.get("failure_count", 0)),
+        "last_latency_ms": server.get("last_latency_ms"),
+        "vetting_json": json.dumps(server.get("vetting", {})),
+        "updated_at": utc_now(),
+    }
+    conn.execute(
+        """
+        INSERT INTO mcp_servers (
+            id, name, transport, command, args_json, env_json, url, enabled,
+            tools_json, status, error, last_synced_at, last_seen_at, tool_count,
+            capabilities_json, risk_policy, secret_env_json, session_state, last_call_at,
+            last_error_at, failure_count, last_latency_ms, vetting_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            transport = excluded.transport,
+            command = excluded.command,
+            args_json = excluded.args_json,
+            env_json = excluded.env_json,
+            url = excluded.url,
+            enabled = excluded.enabled,
+            tools_json = excluded.tools_json,
+            status = excluded.status,
+            error = excluded.error,
+            last_synced_at = excluded.last_synced_at,
+            last_seen_at = excluded.last_seen_at,
+            tool_count = excluded.tool_count,
+            capabilities_json = excluded.capabilities_json,
+            risk_policy = excluded.risk_policy,
+            secret_env_json = excluded.secret_env_json,
+            session_state = excluded.session_state,
+            last_call_at = excluded.last_call_at,
+            last_error_at = excluded.last_error_at,
+            failure_count = excluded.failure_count,
+            last_latency_ms = excluded.last_latency_ms,
+            vetting_json = excluded.vetting_json,
+            updated_at = excluded.updated_at
+        """,
+        (server_id, *payload.values()),
+    )
+
+
+def _upsert_skill_row(conn: sqlite3.Connection, skill: dict[str, Any]) -> None:
+    skill_id = str(skill["id"])
+    conn.execute(
+        """
+        INSERT INTO skill_registry (id, name, description, path, manifest_json, enabled, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            description = excluded.description,
+            path = excluded.path,
+            manifest_json = excluded.manifest_json,
+            enabled = excluded.enabled,
+            updated_at = excluded.updated_at
+        """,
+        (
+            skill_id,
+            skill.get("name", skill_id),
+            skill.get("description", ""),
+            skill.get("path", ""),
+            json.dumps(skill.get("manifest", {})),
+            1 if skill.get("enabled", True) else 0,
+            utc_now(),
+        ),
+    )
+
+
+def _upsert_plugin_row(conn: sqlite3.Connection, plugin: dict[str, Any]) -> None:
+    plugin_id = str(plugin["id"])
+    now = utc_now()
+    created_at = str(plugin.get("created_at") or now)
+    current = conn.execute(
+        "SELECT created_at FROM plugin_registry WHERE id = ?", (plugin_id,)
+    ).fetchone()
+    if current is not None:
+        created_at = str(current["created_at"])
+    conn.execute(
+        """
+        INSERT INTO plugin_registry (
+            id, name, description, source_url, source_ref, commit_sha, install_path,
+            manifest_json, capabilities_json, enabled, risk_report_json,
+            install_status, format, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            description = excluded.description,
+            source_url = excluded.source_url,
+            source_ref = excluded.source_ref,
+            commit_sha = excluded.commit_sha,
+            install_path = excluded.install_path,
+            manifest_json = excluded.manifest_json,
+            capabilities_json = excluded.capabilities_json,
+            enabled = excluded.enabled,
+            risk_report_json = excluded.risk_report_json,
+            install_status = excluded.install_status,
+            format = excluded.format,
+            updated_at = excluded.updated_at
+        """,
+        (
+            plugin_id,
+            plugin.get("name", plugin_id),
+            plugin.get("description", ""),
+            plugin.get("source_url", ""),
+            plugin.get("source_ref"),
+            plugin.get("commit_sha", ""),
+            plugin.get("install_path", ""),
+            json.dumps(plugin.get("manifest", {})),
+            json.dumps(plugin.get("capabilities", [])),
+            1 if plugin.get("enabled", False) else 0,
+            json.dumps(plugin.get("risk_report", {})),
+            plugin.get("install_status", "installed"),
+            plugin.get("format", "kestrel"),
+            created_at,
+            now,
+        ),
+    )
+
+
+def _validate_plugin_bundle_ids(
+    prefix: str,
+    *,
+    skills: list[dict[str, Any]],
+    mcp_servers: list[dict[str, Any]],
+) -> None:
+    skill_ids = [str(skill["id"]) for skill in skills]
+    server_ids = [str(server["id"]) for server in mcp_servers]
+    if len(set(skill_ids)) != len(skill_ids) or any(
+        not skill_id.startswith(prefix) for skill_id in skill_ids
+    ):
+        raise ValueError("Plugin skill bundle contains an invalid or duplicate id.")
+    if len(set(server_ids)) != len(server_ids) or any(
+        not server_id.startswith(prefix) for server_id in server_ids
+    ):
+        raise ValueError("Plugin MCP bundle contains an invalid or duplicate id.")
+
+
+def _plugin_extension_rows(
+    conn: sqlite3.Connection,
+    prefix: str,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    skill_rows = conn.execute("SELECT * FROM skill_registry").fetchall()
+    server_rows = conn.execute("SELECT * FROM mcp_servers").fetchall()
+    skills = {
+        str(row["id"]): _skill_from_row(row)
+        for row in skill_rows
+        if str(row["id"]).startswith(prefix)
+    }
+    servers = {
+        str(row["id"]): _mcp_from_row(row)
+        for row in server_rows
+        if str(row["id"]).startswith(prefix)
+    }
+    return skills, servers
+
+
+def _mcp_tool_ids(server: dict[str, Any]) -> set[str]:
+    return {
+        str(tool["name"])
+        for tool in server.get("tools", [])
+        if isinstance(tool, dict) and tool.get("name")
+    }
+
+
+def _delete_capability_override_row(
+    conn: sqlite3.Connection,
+    kind: str,
+    capability_id: str,
+) -> None:
+    row = conn.execute(
+        """
+        SELECT * FROM capability_overrides
+        WHERE kind = ? AND capability_id = ?
+        """,
+        (kind, capability_id),
+    ).fetchone()
+    if row is None:
+        return
+    current = _capability_override_from_row(row)
+    next_revision = int(current["revision"]) + 1
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO capability_change_log (
+            kind, capability_id, previous_enabled, enabled,
+            previous_revision, revision, resource_digest, updated_by, created_at
+        ) VALUES (?, ?, ?, 0, ?, ?, ?, 'system', ?)
+        """,
+        (
+            kind,
+            capability_id,
+            1 if bool(current["enabled"]) else 0,
+            int(current["revision"]),
+            next_revision,
+            current.get("resource_digest"),
+            now,
+        ),
+    )
+    conn.execute(
+        "DELETE FROM capability_overrides WHERE kind = ? AND capability_id = ?",
+        (kind, capability_id),
+    )
 
 
 def _mcp_from_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -2534,7 +5709,9 @@ def _mcp_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "last_seen_at": _row_get(row, "last_seen_at"),
         "tool_count": int(str(_row_get(row, "tool_count", 0) or 0)),
         "capabilities": json.loads(str(_row_get(row, "capabilities_json", "[]") or "[]")),
-        "risk_policy": str(_row_get(row, "risk_policy", "approval_by_default") or "approval_by_default"),
+        "risk_policy": str(
+            _row_get(row, "risk_policy", "approval_by_default") or "approval_by_default"
+        ),
         "secret_env": json.loads(str(_row_get(row, "secret_env_json", "{}") or "{}")),
         "session_state": str(_row_get(row, "session_state", "disconnected") or "disconnected"),
         "last_call_at": _row_get(row, "last_call_at"),
@@ -2698,7 +5875,9 @@ def _task_from_row(row: sqlite3.Row) -> TaskNodeRecord:
         dependencies=tuple(json.loads(str(_row_get(row, "dependencies_json", "[]") or "[]"))),
         required_tools=tuple(json.loads(str(_row_get(row, "required_tools_json", "[]") or "[]"))),
         risk=str(_row_get(row, "risk", "low") or "low"),
-        acceptance_criteria=tuple(json.loads(str(_row_get(row, "acceptance_criteria_json", "[]") or "[]"))),
+        acceptance_criteria=tuple(
+            json.loads(str(_row_get(row, "acceptance_criteria_json", "[]") or "[]"))
+        ),
         attempt_count=int(str(_row_get(row, "attempt_count", 0) or 0)),
         failure_reason=str(_row_get(row, "failure_reason", "") or ""),
         diagnosis=_json_or_none(_row_get(row, "diagnosis_json")),
@@ -2739,6 +5918,386 @@ def _trace_span_from_row(row: sqlite3.Row) -> TraceSpanRecord:
     )
 
 
+def _routine_from_row(row: sqlite3.Row) -> RoutineRecord:
+    return RoutineRecord(
+        routine_id=str(row["routine_id"]),
+        name=str(row["name"]),
+        prompt=str(row["prompt"]),
+        schedule_kind=str(row["schedule_kind"]),
+        start_at=str(row["start_at"]),
+        interval_seconds=(
+            None if row["interval_seconds"] is None else int(row["interval_seconds"])
+        ),
+        enabled=bool(row["enabled"]),
+        revision=int(row["revision"]),
+        next_run_at=_optional_str(row["next_run_at"]),
+        workspace=_optional_str(row["workspace"]),
+        provider=_optional_str(row["provider"]),
+        model=_optional_str(row["model"]),
+        autonomy_mode=str(row["autonomy_mode"]),
+        misfire_grace_seconds=int(row["misfire_grace_seconds"]),
+        last_scheduled_at=_optional_str(row["last_scheduled_at"]),
+        deleted_at=_optional_str(row["deleted_at"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _routine_occurrence_from_row(row: sqlite3.Row) -> RoutineOccurrenceRecord:
+    return RoutineOccurrenceRecord(
+        occurrence_id=str(row["occurrence_id"]),
+        routine_id=str(row["routine_id"]),
+        routine_revision=int(row["routine_revision"]),
+        scheduled_for=str(row["scheduled_for"]),
+        status=str(row["status"]),
+        run_id=str(row["run_id"]),
+        request=_json_or_empty(row["request_json"]),
+        trigger_kind=str(row["trigger_kind"]),
+        trigger_key_digest=_optional_str(row["trigger_key_digest"]),
+        requested_at=_optional_str(row["requested_at"]),
+        claim_owner=_optional_str(row["claim_owner"]),
+        claim_generation=int(row["claim_generation"]),
+        claim_expires_at=_optional_str(row["claim_expires_at"]),
+        started_at=_optional_str(row["started_at"]),
+        finished_at=_optional_str(row["finished_at"]),
+        skip_reason=_optional_str(row["skip_reason"]),
+        error=_optional_str(row["error"]),
+        result=_json_or_empty(row["result_json"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def routine_occurrence_id(
+    routine_id: str,
+    routine_revision: int,
+    scheduled_for: str,
+) -> str:
+    payload = json.dumps(
+        [
+            _routine_identifier(routine_id),
+            _positive_routine_revision(routine_revision),
+            _routine_datetime(scheduled_for, "scheduled_for").isoformat(),
+        ],
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return "occ_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:40]
+
+
+def routine_run_id(routine_id: str, occurrence_id: str) -> str:
+    payload = json.dumps(
+        [_routine_identifier(routine_id), str(occurrence_id)],
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return "run_routine_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def routine_manual_occurrence_id(routine_id: str, trigger_key_digest: str) -> str:
+    payload = json.dumps(
+        [_routine_identifier(routine_id), str(trigger_key_digest)],
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return "occ_manual_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:40]
+
+
+def routine_session_id(routine_id: str) -> str:
+    normalized = _routine_identifier(routine_id)
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
+    return f"routine:{digest}"
+
+
+def _normalize_routine_fields(
+    *,
+    routine_id: object,
+    name: object,
+    prompt: object,
+    schedule_kind: object,
+    start_at: object,
+    interval_seconds: object = None,
+    enabled: object = False,
+    workspace: object = None,
+    provider: object = None,
+    model: object = None,
+    autonomy_mode: object = "background",
+    misfire_grace_seconds: object = 60,
+) -> dict[str, object]:
+    normalized_kind = str(schedule_kind).strip().lower()
+    if normalized_kind not in {"once", "interval"}:
+        raise ValueError("schedule_kind must be once or interval")
+    interval: int | None = None
+    if normalized_kind == "interval":
+        interval = validate_routine_interval(interval_seconds)
+    elif interval_seconds is not None:
+        raise ValueError("once routines cannot set interval_seconds")
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled must be a boolean")
+    misfire_grace = validate_routine_misfire_grace(misfire_grace_seconds)
+    normalized_autonomy = str(autonomy_mode).strip().lower()
+    if normalized_autonomy not in {"background", "manual", "autonomous"}:
+        raise ValueError("autonomy_mode must be background, manual, or autonomous")
+    return {
+        "routine_id": _routine_identifier(routine_id),
+        "name": _secret_safe_required_text(name, "name", 200),
+        "prompt": _secret_safe_required_text(prompt, "prompt", 20_000),
+        "schedule_kind": normalized_kind,
+        "start_at": _routine_datetime(start_at, "start_at").isoformat(),
+        "interval_seconds": interval,
+        "enabled": enabled,
+        "workspace": _secret_safe_optional_text(workspace, "workspace", 4096),
+        "provider": _secret_safe_optional_text(provider, "provider", 256),
+        "model": _secret_safe_optional_text(model, "model", 256),
+        "autonomy_mode": normalized_autonomy,
+        "misfire_grace_seconds": misfire_grace,
+    }
+
+
+def _routine_identifier(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("routine_id must be a string")
+    normalized = value.strip()
+    if not normalized or len(normalized) > 128:
+        raise ValueError("routine_id must be between 1 and 128 characters")
+    if not all(character.isalnum() or character in "._-" for character in normalized):
+        raise ValueError(
+            "routine_id may contain only letters, numbers, dot, underscore, and hyphen"
+        )
+    return normalized
+
+
+def _positive_routine_revision(
+    value: object,
+    *,
+    field_name: str = "routine_revision",
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field_name} must be a positive integer")
+    return value
+
+
+def _routine_trigger_key_digest(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("idempotency_key must be a string")
+    normalized = value.strip()
+    if not 16 <= len(normalized) <= 128:
+        raise ValueError("idempotency_key must be between 16 and 128 characters")
+    if not all(character.isalnum() or character in "._:-" for character in normalized):
+        raise ValueError(
+            "idempotency_key may contain only letters, numbers, dot, underscore, colon, and hyphen"
+        )
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _bounded_required_text(value: object, field_name: str, limit: int) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field_name} is required")
+    if len(normalized) > limit:
+        raise ValueError(f"{field_name} must be at most {limit} characters")
+    return normalized
+
+
+def _bounded_optional_text(value: object, field_name: str, limit: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string or null")
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if len(normalized) > limit:
+        raise ValueError(f"{field_name} must be at most {limit} characters")
+    return normalized
+
+
+def _secret_safe_required_text(value: object, field_name: str, limit: int) -> str:
+    normalized = _bounded_required_text(value, field_name, limit)
+    _reject_raw_secret(normalized, field_name)
+    return normalized
+
+
+def _secret_safe_optional_text(
+    value: object,
+    field_name: str,
+    limit: int,
+) -> str | None:
+    normalized = _bounded_optional_text(value, field_name, limit)
+    if normalized is not None:
+        _reject_raw_secret(normalized, field_name)
+    return normalized
+
+
+def _reject_raw_secret(value: str, field_name: str) -> None:
+    if redact_text(value) != value:
+        raise ValueError(f"{field_name} may not contain raw secrets; use secret:// references")
+
+
+def _routine_datetime(value: object, field_name: str) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        raw = value.strip()
+        _reject_raw_secret(raw, field_name)
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError(f"{field_name} must be a valid ISO-8601 timestamp") from exc
+    else:
+        raise ValueError(f"{field_name} must be an ISO-8601 timestamp")
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field_name} must be timezone-aware")
+    return parsed.astimezone(UTC)
+
+
+def _require_timestamp(value: object, field_name: str) -> datetime:
+    if value is None:
+        raise ValueError(f"{field_name} is required")
+    return _routine_datetime(value, field_name)
+
+
+def _routine_request_snapshot(routine: RoutineRecord) -> dict[str, Any]:
+    return {
+        "schema": "kestrel.routine_request.v1",
+        "routine_id": routine.routine_id,
+        "routine_revision": routine.revision,
+        "prompt": routine.prompt,
+        "workspace": routine.workspace,
+        "provider": routine.provider,
+        "model": routine.model,
+        "autonomy_mode": routine.autonomy_mode,
+    }
+
+
+def _next_routine_run_at(
+    routine: RoutineRecord,
+    *,
+    scheduled: datetime,
+    now: datetime,
+) -> tuple[str | None, int]:
+    if routine.schedule_kind == "once":
+        return None, 0
+    interval = routine.interval_seconds
+    if interval is None or interval <= 0:
+        raise ValueError("interval routine is missing interval_seconds")
+    candidate = scheduled + timedelta(seconds=interval)
+    missed = 0
+    if candidate <= now:
+        missed = int((now - candidate).total_seconds() // interval) + 1
+        candidate += timedelta(seconds=missed * interval)
+    return candidate.astimezone(UTC).isoformat(), missed
+
+
+def _manual_occurrence_identity_instant(
+    conn: sqlite3.Connection,
+    *,
+    routine_id: str,
+    routine_revision: int,
+    requested_at: datetime,
+    trigger_key_digest: str,
+) -> datetime:
+    """Choose a collision-free legacy schedule identity; requested_at stays exact."""
+
+    offset = int(trigger_key_digest[:12], 16) % 1_000_000
+    candidate = requested_at + timedelta(microseconds=offset)
+    for _ in range(1_024):
+        row = conn.execute(
+            """
+            SELECT 1 FROM routine_occurrences
+            WHERE routine_id = ? AND routine_revision = ? AND scheduled_for = ?
+            """,
+            (routine_id, routine_revision, candidate.isoformat()),
+        ).fetchone()
+        if row is None:
+            return candidate
+        candidate += timedelta(microseconds=1)
+    raise RuntimeError("routine manual trigger identity space exhausted")
+
+
+def _routine_dispatch_invalid_reason(
+    routine: RoutineRecord,
+    *,
+    occurrence_revision: int,
+) -> str | None:
+    if routine.deleted_at is not None:
+        return "routine_deleted_before_dispatch"
+    if not routine.enabled:
+        return "routine_disabled_before_dispatch"
+    if routine.revision != occurrence_revision:
+        return "routine_changed_before_dispatch"
+    return None
+
+
+def _require_occurrence_row(
+    conn: sqlite3.Connection,
+    occurrence_id: str,
+) -> RoutineOccurrenceRecord:
+    row = conn.execute(
+        "SELECT * FROM routine_occurrences WHERE occurrence_id = ?",
+        (occurrence_id,),
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"Unknown routine occurrence: {occurrence_id}")
+    return _routine_occurrence_from_row(row)
+
+
+def _skip_occurrence_row(
+    conn: sqlite3.Connection,
+    occurrence_id: str,
+    *,
+    instant: datetime,
+    reason: str,
+) -> None:
+    conn.execute(
+        """
+        UPDATE routine_occurrences SET status = 'skipped', skip_reason = ?,
+            claim_owner = NULL, claim_expires_at = NULL, finished_at = ?,
+            updated_at = ? WHERE occurrence_id = ? AND status = 'claimed'
+        """,
+        (reason, instant.isoformat(), instant.isoformat(), occurrence_id),
+    )
+
+
+def _skip_claimed_occurrences_for_routine(
+    conn: sqlite3.Connection,
+    routine_id: str,
+    *,
+    instant: datetime,
+    reason: str,
+) -> None:
+    conn.execute(
+        """
+        UPDATE routine_occurrences SET status = 'skipped', skip_reason = ?,
+            claim_owner = NULL, claim_expires_at = NULL, finished_at = ?,
+            updated_at = ? WHERE routine_id = ? AND status = 'claimed'
+        """,
+        (
+            reason,
+            instant.isoformat(),
+            instant.isoformat(),
+            routine_id,
+        ),
+    )
+
+
+def _routine_occurrence_status(value: str) -> str:
+    normalized = str(value).strip().lower()
+    allowed = {"claimed", "running", "completed", "failed", "skipped"}
+    if normalized not in allowed:
+        raise ValueError(f"unsupported routine occurrence status: {normalized}")
+    return normalized
+
+
+def _routine_terminal_occurrence_status(value: str) -> str:
+    normalized = _routine_occurrence_status(value)
+    if normalized not in {"completed", "failed"}:
+        raise ValueError("routine occurrence terminal status must be completed or failed")
+    return normalized
+
+
 def _lease_instant(value: datetime | None) -> datetime:
     instant = value or datetime.now(UTC)
     if instant.tzinfo is None:
@@ -2746,10 +6305,31 @@ def _lease_instant(value: datetime | None) -> datetime:
     return instant.astimezone(UTC)
 
 
+def _run_execution_lease_matches(
+    row: sqlite3.Row,
+    *,
+    owner: str,
+    generation: int | None,
+    instant: datetime,
+    allowed_statuses: set[str] | None = None,
+) -> bool:
+    """Return whether a run row carries the exact unexpired execution fence."""
+
+    statuses = allowed_statuses or {"queued", "running"}
+    expiry = _parse_timestamp(_optional_str(_row_get(row, "lease_expires_at")))
+    return (
+        str(row["status"]) in statuses
+        and _optional_str(_row_get(row, "lease_owner")) == owner
+        and int(str(_row_get(row, "lease_generation", 0) or 0)) == generation
+        and expiry is not None
+        and expiry > instant
+    )
+
+
 def _positive_ttl(value: float) -> float:
     ttl = float(value)
-    if ttl <= 0:
-        raise ValueError("lease ttl_seconds must be positive")
+    if not isfinite(ttl) or ttl <= 0:
+        raise ValueError("lease ttl_seconds must be finite and positive")
     return ttl
 
 
@@ -2771,10 +6351,75 @@ def _json_or_empty(value: object) -> dict[str, Any]:
     return dict(parsed) if isinstance(parsed, dict) else {}
 
 
+def _json_dict_or_none(value: object) -> dict[str, Any] | None:
+    parsed = _json_or_none(value)
+    return dict(parsed) if isinstance(parsed, dict) else None
+
+
 def _json_or_none(value: object) -> Any | None:
     if value is None:
         return None
     return json.loads(str(value))
+
+
+def _bind_scheduler_approval_continuation(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    approval_id: str,
+    tool_call_id: str,
+    continuation: dict[str, str],
+    now: str,
+) -> None:
+    task_id = str(continuation.get("task_id") or "").strip()
+    subagent_id = str(continuation.get("subagent_id") or "").strip()
+    worker_owner = str(continuation.get("worker_owner") or "").strip()
+    worker_claim_id = str(continuation.get("worker_claim_id") or "").strip()
+    if not all((task_id, subagent_id, worker_owner, worker_claim_id)):
+        raise ValueError("scheduler approval continuation identity is incomplete")
+    if worker_claim_id != subagent_id:
+        raise ValueError("scheduler approval worker claim must match its subagent")
+
+    task_row = conn.execute(
+        "SELECT * FROM task_nodes WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    subagent_row = conn.execute(
+        "SELECT * FROM subagent_runs WHERE subagent_id = ?",
+        (subagent_id,),
+    ).fetchone()
+    if task_row is None or subagent_row is None:
+        raise ValueError("scheduler approval continuation target is missing")
+    task = _task_from_row(task_row)
+    subagent = _subagent_from_row(subagent_row)
+    task_result = dict(task.result or {})
+    if (
+        task.run_id != run_id
+        or task.status != "running"
+        or task_result.get("worker_owner") != worker_owner
+        or task_result.get("worker_claim_id") != worker_claim_id
+        or subagent.run_id != run_id
+        or subagent.task_id != task_id
+        or subagent.status != "running"
+    ):
+        raise ValueError("scheduler approval continuation execution fence lost")
+    task_result["approval_continuation"] = {
+        "approval_id": approval_id,
+        "tool_call_id": tool_call_id,
+        "task_id": task_id,
+        "subagent_id": subagent_id,
+        "worker_owner": worker_owner,
+        "worker_claim_id": worker_claim_id,
+    }
+    cursor = conn.execute(
+        """
+        UPDATE task_nodes SET result_json = ?, updated_at = ?
+        WHERE task_id = ? AND run_id = ? AND status = 'running'
+        """,
+        (_encode(task_result), now, task_id, run_id),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError("scheduler approval continuation bind failed")
 
 
 def _encode(value: object) -> object:

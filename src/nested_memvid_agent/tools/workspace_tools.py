@@ -5,12 +5,14 @@ import json
 import os
 import stat
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 from uuid import uuid4
 
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
-from ..security_boundary import assert_path_not_sensitive, is_sensitive_path, redact_text
+from ..security_boundary import assert_path_not_sensitive, redact_text
 from .base import AgentTool, ToolContext
 
 
@@ -31,8 +33,16 @@ class ListFilesTool(AgentTool):
         call = ToolCall(name=self.spec.name, arguments=arguments)
         try:
             path = _safe_path(context.workspace, str(arguments.get("path", ".")))
+            _assert_workspace_path_allowed(context, path)
             max_entries = int(arguments.get("max_entries", 80))
-            entries = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))[:max_entries]
+            entries = [
+                entry
+                for entry in sorted(
+                    (candidate for candidate in path.iterdir() if not candidate.is_symlink()),
+                    key=lambda p: (p.is_file(), p.name.lower()),
+                )
+                if not _workspace_path_is_private(context, entry)
+            ][:max_entries]
             data = [{"name": p.name, "type": "dir" if p.is_dir() else "file"} for p in entries]
             return self._result(call, success=True, content=json.dumps(data, indent=2), data={"entries": data})
         except Exception as exc:  # noqa: BLE001
@@ -61,8 +71,14 @@ class ReadFileTool(AgentTool):
                 path,
                 requested_path=requested_path,
             )
-            max_chars = int(arguments.get("max_chars", 20_000))
-            text = redact_text(path.read_text(errors="replace")[:max_chars])
+            _assert_workspace_path_allowed(
+                context,
+                path,
+                requested_path=requested_path,
+            )
+            max_chars = max(1, min(int(arguments.get("max_chars", 20_000)), 200_000))
+            with _open_workspace_regular_file(context, path) as (handle, _):
+                text = redact_text(handle.read(max_chars * 4).decode("utf-8", errors="replace")[:max_chars])
             return self._result(call, success=True, content=text, data={"path": str(path), "chars": len(text)})
         except Exception as exc:  # noqa: BLE001
             return self._result(call, success=False, content=str(exc), error="file_read_failed")
@@ -92,6 +108,7 @@ class FindFilesTool(AgentTool):
             return self._result(call, success=False, content="Missing pattern", error="missing_pattern")
         try:
             root = _safe_path(context.workspace, str(arguments.get("path", ".")))
+            _assert_workspace_path_allowed(context, root)
             workspace = context.workspace.resolve()
             max_results = max(1, min(int(arguments.get("max_results", 100)), 500))
             kind = str(arguments.get("type", "file"))
@@ -101,7 +118,11 @@ class FindFilesTool(AgentTool):
             for path in sorted(root.rglob(pattern), key=lambda item: item.as_posix()):
                 if len(rows) >= max_results:
                     break
+                if path.is_symlink():
+                    continue
                 if any(_skip_repo_name(part) for part in path.relative_to(workspace).parts):
+                    continue
+                if _workspace_path_is_private(context, path):
                     continue
                 if kind == "file" and not path.is_file():
                     continue
@@ -143,21 +164,34 @@ class FileStatTool(AgentTool):
                 path,
                 requested_path=requested_path,
             )
+            _assert_workspace_path_allowed(
+                context,
+                path,
+                requested_path=requested_path,
+            )
             if not path.exists():
                 return self._result(call, success=False, content=f"Path not found: {arguments.get('path', '')}", error="not_found")
-            stat = path.stat()
+            path_stat = path.lstat()
+            raw: bytes | None = None
+            if stat.S_ISREG(path_stat.st_mode):
+                with _open_workspace_regular_file(context, path) as (handle, opened_stat):
+                    path_stat = opened_stat
+                    if bool(arguments.get("hash", False)):
+                        max_hash_bytes = max(
+                            1,
+                            min(int(arguments.get("max_hash_bytes", 1_000_000)), 10_000_000),
+                        )
+                        raw = handle.read(max_hash_bytes)
             rel = path.relative_to(context.workspace.resolve()).as_posix()
             payload: dict[str, Any] = {
                 "path": rel,
-                "type": "dir" if path.is_dir() else "file",
-                "bytes": stat.st_size,
-                "modified_at": stat.st_mtime,
+                "type": "dir" if stat.S_ISDIR(path_stat.st_mode) else "file",
+                "bytes": path_stat.st_size,
+                "modified_at": path_stat.st_mtime,
             }
-            if path.is_file() and bool(arguments.get("hash", False)):
-                max_hash_bytes = max(1, min(int(arguments.get("max_hash_bytes", 1_000_000)), 10_000_000))
-                raw = path.read_bytes()[:max_hash_bytes]
+            if raw is not None:
                 payload["sha256"] = hashlib.sha256(raw).hexdigest()
-                payload["hash_truncated"] = stat.st_size > max_hash_bytes
+                payload["hash_truncated"] = path_stat.st_size > len(raw)
             return self._result(call, success=True, content=json.dumps(payload, indent=2), data=payload)
         except Exception as exc:  # noqa: BLE001
             return self._result(call, success=False, content=str(exc), error="file_stat_failed")
@@ -181,7 +215,11 @@ class WriteFileTool(AgentTool):
         try:
             requested_path = str(arguments.get("path", ""))
             path = _safe_path(context.workspace, requested_path)
-            _assert_not_broker_secret_store_path(context.workspace, path)
+            _assert_workspace_path_allowed(
+                context,
+                path,
+                requested_path=requested_path,
+            )
             text = str(arguments.get("content", ""))
             _atomic_workspace_write(context.workspace, path, text)
             return self._result(call, success=True, content=f"Wrote {path}", data={"path": str(path), "chars": len(text)})
@@ -213,14 +251,15 @@ class RepoSearchTool(AgentTool):
             return self._result(call, success=False, content="Missing query", error="missing_query")
         try:
             root = _safe_path(context.workspace, str(arguments.get("path", ".")))
+            _assert_workspace_path_allowed(context, root)
             max_results = int(arguments.get("max_results", 25))
             max_file_bytes = int(arguments.get("max_file_bytes", 300_000))
             rows: list[dict[str, object]] = []
             query_lower = query.lower()
-            for path in _iter_repo_files(root, context.workspace, max_file_bytes=max_file_bytes):
+            for path in _iter_repo_files(root, context, max_file_bytes=max_file_bytes):
                 rel = path.relative_to(context.workspace.resolve())
                 try:
-                    text = _read_workspace_file(context.workspace, path, max_file_bytes=max_file_bytes)
+                    text = _read_workspace_file(context, path, max_file_bytes=max_file_bytes)
                     if text is None:
                         continue
                     for lineno, line in enumerate(text.splitlines(), start=1):
@@ -258,6 +297,7 @@ class RepoMapTool(AgentTool):
         call = ToolCall(name=self.spec.name, arguments=arguments)
         try:
             root = _safe_path(context.workspace, str(arguments.get("path", ".")))
+            _assert_workspace_path_allowed(context, root)
             workspace = context.workspace.resolve()
             max_entries = int(arguments.get("max_entries", 120))
             max_depth = int(arguments.get("max_depth", 3))
@@ -267,7 +307,11 @@ class RepoMapTool(AgentTool):
                 rel_current = current.relative_to(workspace)
                 depth = 0 if str(rel_current) == "." else len(rel_current.parts)
                 dirs[:] = sorted(
-                    d for d in dirs if not _skip_repo_name(d) and not (current / d).is_symlink()
+                    d
+                    for d in dirs
+                    if not _skip_repo_name(d)
+                    and not (current / d).is_symlink()
+                    and not _workspace_path_is_private(context, current / d)
                 )
                 if depth > max_depth:
                     dirs[:] = []
@@ -285,6 +329,8 @@ class RepoMapTool(AgentTool):
                     if _skip_repo_name(filename):
                         continue
                     item = current / filename
+                    if _workspace_path_is_private(context, item):
+                        continue
                     item_stat = item.lstat()
                     if not stat.S_ISREG(item_stat.st_mode):
                         continue
@@ -310,11 +356,132 @@ def _safe_path(root: Path, relative: str) -> Path:
     return path
 
 
-def _assert_not_broker_secret_store_path(workspace: Path, path: Path) -> None:
-    workspace_root = workspace.resolve()
-    secrets_root = (workspace_root / ".nest" / "secrets").resolve()
-    if path == secrets_root or secrets_root in path.parents:
-        raise ValueError("Writing broker secret files is not allowed.")
+def _configured_secret_store_path(context: ToolContext) -> Path:
+    configured = Path(context.config.secret_store_path).expanduser()
+    if not configured.is_absolute():
+        configured = context.workspace.resolve() / configured
+    return configured.resolve()
+
+
+def _workspace_path_is_private(context: ToolContext, path: Path) -> bool:
+    try:
+        assert_path_not_sensitive(context.workspace, path)
+        resolved = path.resolve()
+        secret_store = _configured_secret_store_path(context)
+    except (OSError, RuntimeError, ValueError):
+        return True
+    if resolved == secret_store:
+        return True
+    if secret_store.exists() and secret_store.is_dir() and secret_store in resolved.parents:
+        return True
+    if resolved.parent == secret_store.parent:
+        lock_name = f".{secret_store.name}.lock"
+        temporary_prefix = f".{secret_store.name}."
+        if resolved.name == lock_name or (
+            resolved.name.startswith(temporary_prefix) and resolved.name.endswith(".tmp")
+        ):
+            return True
+    try:
+        path_stat = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    return any(_same_file_if_present(path_stat, candidate) for candidate in _secret_store_artifacts(context))
+
+
+def _assert_workspace_path_allowed(
+    context: ToolContext,
+    path: Path,
+    *,
+    requested_path: str | None = None,
+) -> None:
+    assert_path_not_sensitive(
+        context.workspace,
+        path,
+        requested_path=requested_path,
+    )
+    if _workspace_path_is_private(context, path):
+        raise ValueError("Access to the configured secret store is not allowed.")
+
+
+def _assert_opened_file_is_not_secret_store(
+    context: ToolContext,
+    opened_stat: os.stat_result,
+) -> None:
+    for candidate in _secret_store_artifacts(context):
+        if _same_file_if_present(opened_stat, candidate):
+            raise ValueError("Access to the configured secret store is not allowed.")
+
+
+def _secret_store_artifacts(context: ToolContext) -> tuple[Path, ...]:
+    secret_store = _configured_secret_store_path(context)
+    candidates = [
+        secret_store,
+        secret_store.with_name(f".{secret_store.name}.lock"),
+    ]
+    try:
+        candidates.extend(secret_store.parent.glob(f".{secret_store.name}.*.tmp"))
+    except OSError:
+        pass
+    return tuple(candidates)
+
+
+def _same_file_if_present(path_stat: os.stat_result, candidate: Path) -> bool:
+    try:
+        candidate_stat = os.stat(candidate, follow_symlinks=False)
+    except OSError:
+        return False
+    return os.path.samestat(path_stat, candidate_stat)
+
+
+@contextmanager
+def _open_workspace_regular_file(
+    context: ToolContext,
+    path: Path,
+) -> Iterator[tuple[IO[bytes], os.stat_result]]:
+    _assert_workspace_path_allowed(context, path)
+    root = context.workspace.resolve()
+    relative = path.relative_to(root)
+    if not relative.parts or relative == Path("."):
+        raise ValueError("A file path is required.")
+    if sys.platform == "win32":
+        current = root
+        for component in relative.parts:
+            current /= component
+            if current.is_symlink():
+                raise ValueError("Workspace read path contains a symbolic link.")
+        with current.open("rb") as handle:
+            opened_stat = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened_stat.st_mode):
+                raise ValueError("Workspace read target must be a regular file.")
+            _assert_opened_file_is_not_secret_store(context, opened_stat)
+            yield handle, opened_stat
+        return
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    parent_fd = os.open(root, directory_flags)
+    file_fd = -1
+    try:
+        for component in relative.parts[:-1]:
+            child_fd = os.open(component, directory_flags | nofollow, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = child_fd
+        file_fd = os.open(
+            relative.name,
+            os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        opened_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise ValueError("Workspace read target must be a regular file.")
+        _assert_opened_file_is_not_secret_store(context, opened_stat)
+        with os.fdopen(file_fd, "rb") as handle:
+            file_fd = -1
+            yield handle, opened_stat
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(parent_fd)
 
 
 def _atomic_workspace_write(workspace: Path, path: Path, text: str) -> None:
@@ -402,59 +569,33 @@ def _skip_repo_name(name: str) -> bool:
     return name in {".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache"} or name.startswith(".")
 
 
-def _read_workspace_file(workspace: Path, path: Path, *, max_file_bytes: int) -> str | None:
-    root = workspace.resolve()
-    relative = path.relative_to(root)
-    if is_sensitive_path(workspace, path):
-        return None
-    if sys.platform == "win32":
-        current = root
-        for component in relative.parts:
-            current /= component
-            if current.is_symlink():
-                return None
-        file_stat = current.lstat()
-        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > max_file_bytes:
-            return None
-        return redact_text(current.read_text(encoding="utf-8", errors="replace"))
-
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    parent_fd = os.open(root, directory_flags)
+def _read_workspace_file(
+    context: ToolContext,
+    path: Path,
+    *,
+    max_file_bytes: int,
+) -> str | None:
     try:
-        for component in relative.parts[:-1]:
-            child_fd = os.open(component, directory_flags | nofollow, dir_fd=parent_fd)
-            os.close(parent_fd)
-            parent_fd = child_fd
-        file_fd = os.open(
-            relative.name,
-            os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
-            dir_fd=parent_fd,
-        )
-        try:
-            file_stat = os.fstat(file_fd)
-            if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > max_file_bytes:
+        with _open_workspace_regular_file(context, path) as (handle, opened_stat):
+            if opened_stat.st_size > max_file_bytes:
                 return None
-            with os.fdopen(file_fd, "r", encoding="utf-8", errors="replace") as handle:
-                return redact_text(handle.read(max_file_bytes + 1))
-        except BaseException:
-            try:
-                os.close(file_fd)
-            except OSError:
-                pass
-            raise
-    except (FileNotFoundError, NotADirectoryError, OSError):
+            raw = handle.read(max_file_bytes + 1)
+        return redact_text(raw.decode("utf-8", errors="replace"))
+    except (FileNotFoundError, NotADirectoryError, OSError, ValueError):
         return None
-    finally:
-        os.close(parent_fd)
 
 
-def _iter_repo_files(root: Path, workspace: Path, *, max_file_bytes: int) -> list[Path]:
-    workspace_root = workspace.resolve()
+def _iter_repo_files(
+    root: Path,
+    context: ToolContext,
+    *,
+    max_file_bytes: int,
+) -> list[Path]:
+    workspace_root = context.workspace.resolve()
     files: list[Path] = []
     root_stat = root.lstat()
     if stat.S_ISREG(root_stat.st_mode):
-        if root_stat.st_size <= max_file_bytes:
+        if root_stat.st_size <= max_file_bytes and not _workspace_path_is_private(context, root):
             return [root]
         return []
     if not stat.S_ISDIR(root_stat.st_mode):
@@ -465,7 +606,8 @@ def _iter_repo_files(root: Path, workspace: Path, *, max_file_bytes: int) -> lis
             dirname
             for dirname in dirs
             if not _skip_repo_name(dirname)
-            and not is_sensitive_path(workspace_root, current / dirname)
+            and not (current / dirname).is_symlink()
+            and not _workspace_path_is_private(context, current / dirname)
         )
         for filename in sorted(filenames):
             if _skip_repo_name(filename):
@@ -479,7 +621,7 @@ def _iter_repo_files(root: Path, workspace: Path, *, max_file_bytes: int) -> lis
             if (
                 stat.S_ISREG(path_stat.st_mode)
                 and path_stat.st_size <= max_file_bytes
-                and not is_sensitive_path(workspace_root, path)
+                and not _workspace_path_is_private(context, path)
             ):
                 files.append(path)
     return files

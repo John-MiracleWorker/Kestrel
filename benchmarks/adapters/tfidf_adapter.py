@@ -1,8 +1,6 @@
 """TF-IDF baseline adapter with unified interface."""
 from __future__ import annotations
 
-from typing import Any
-
 from .base import RetrievalResult
 from .baseline_rag_flat import BaselineRAG as _BaselineRAGInner
 
@@ -10,12 +8,14 @@ from .baseline_rag_flat import BaselineRAG as _BaselineRAGInner
 class TFIDFAdapter:
     """Flat TF-IDF RAG baseline wrapper."""
 
+    BACKEND_NAME = "TF-IDF Baseline (Flat RAG)"
+
     def __init__(self) -> None:
         self._inner = _BaselineRAGInner()
         self._doc_map: dict[str, str] = {}
 
     def name(self) -> str:
-        return "TF-IDF Baseline (Flat RAG)"
+        return self.BACKEND_NAME
 
     def ingest(self, doc_id: str, text: str, layer: str | None = None) -> None:
         inner_id = self._inner.ingest(text, metadata={"id": doc_id, "layer": layer})

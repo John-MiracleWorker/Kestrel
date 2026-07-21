@@ -165,7 +165,11 @@ def test_context_compiler_propagates_packer_warnings_and_exact_expansion(tmp_pat
 
 
 def _memory(tmp_path: Path) -> LayeredMemorySystem:
-    return LayeredMemorySystem.from_backend_factory(tmp_path / "memory", InMemoryBackend)
+    return LayeredMemorySystem.from_backend_factory(
+        tmp_path / "memory",
+        InMemoryBackend,
+        enforce_stable_write_integrity=False,
+    )
 
 
 def _put(

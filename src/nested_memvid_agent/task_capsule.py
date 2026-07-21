@@ -1,18 +1,68 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+import os
+import re
+import stat
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import IO
+from uuid import uuid4
 
 from .backends.base import MemoryBackend
 from .backends.in_memory import InMemoryBackend
 from .backends.memvid_backend import MemvidBackend
 from .context_frames import MV2ContextFrame, to_memory_record
-from .models import MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
-from .nested_learning import LearningSignal
+from .file_lock import lock_exclusive, lock_shared, unlock
+from .models import EvidenceRef, MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
+from .nested_learning import LearningSignal, ValidationEvidence
+from .platform_primitives import is_link_or_reparse_point, is_windows_reparse_point
+from .private_artifacts import (
+    create_private_empty_file,
+    ensure_owner_only_directory,
+    harden_memory_artifact_files,
+    harden_private_file,
+    harden_task_capsule_run,
+    open_private_file_descriptor,
+    write_private_text,
+)
 from .runtime_models import AgentTurnResult, ToolExecution
 from .security_boundary import redact_secrets, sanitize_memory_record
+
+_CAPSULE_RUN_ID_PATTERN = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,198}[A-Za-z0-9])?\Z",
+    flags=re.ASCII,
+)
+_CAPSULE_COMPLETION_MARKER = "capsule.complete.json"
+_CAPSULE_LAYER_LOCK = ".complete.mv2.kestrel.lock"
+_CAPSULE_RETENTION_LOCK = ".kestrel-capsule-retention.lock"
+_CAPSULE_DATA_ARTIFACTS = frozenset(
+    {
+        "complete.mv2",
+        "complete.memory.json",
+        "complete.mv2.records.json",
+    }
+)
+_CAPSULE_KNOWN_ARTIFACTS = _CAPSULE_DATA_ARTIFACTS | {
+    _CAPSULE_COMPLETION_MARKER,
+    _CAPSULE_LAYER_LOCK,
+}
+_COMPLETION_MARKER_FORMAT = "kestrel-task-capsule-completion"
+_MAX_LEGACY_CAPSULE_INDEX_BYTES = 64 * 1024 * 1024
+
+
+def validate_capsule_run_id(run_id: str) -> str:
+    """Require a portable run identifier that cannot escape the capsule root."""
+
+    if not isinstance(run_id, str) or _CAPSULE_RUN_ID_PATTERN.fullmatch(run_id) is None:
+        raise ValueError(
+            "run_id must be a single safe path component using 1-200 ASCII letters, "
+            "digits, dots, underscores, or hyphens, and must start and end with a letter or digit"
+        )
+    return run_id
 
 
 @dataclass(frozen=True)
@@ -43,7 +93,10 @@ class TaskCapsuleSummary:
                     "validation_score": signal.computed_validation_score,
                     "validation_evidence": signal.validation_evidence.to_metadata()
                     if signal.validation_evidence
-                    else {"legacy_raw_score": True, "computed_score": signal.computed_validation_score},
+                    else {
+                        "legacy_raw_score": True,
+                        "computed_score": signal.computed_validation_score,
+                    },
                     "repeat_count": signal.repeat_count,
                     "explicit_instruction": signal.explicit_instruction,
                     "requested_target_layer": signal.requested_target_layer.value
@@ -58,6 +111,62 @@ class TaskCapsuleSummary:
         }
 
 
+@dataclass(frozen=True)
+class TaskCapsuleRetentionSkip:
+    """One capsule directory that retention deliberately left untouched."""
+
+    run_id: str
+    reason: str
+
+    def to_payload(self) -> dict[str, str]:
+        return {"run_id": self.run_id, "reason": self.reason}
+
+
+@dataclass(frozen=True)
+class TaskCapsuleRetentionReport:
+    """Structured result from one bounded task-capsule retention pass."""
+
+    runs_dir: Path
+    retention_count: int
+    scanned_run_count: int
+    completed_run_count: int
+    retained_run_ids: tuple[str, ...] = ()
+    deleted_run_ids: tuple[str, ...] = ()
+    deleted_artifact_count: int = 0
+    reclaimed_bytes: int = 0
+    skipped: tuple[TaskCapsuleRetentionSkip, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "runs_dir": str(self.runs_dir),
+            "retention_count": self.retention_count,
+            "scanned_run_count": self.scanned_run_count,
+            "completed_run_count": self.completed_run_count,
+            "retained_run_ids": list(self.retained_run_ids),
+            "deleted_run_ids": list(self.deleted_run_ids),
+            "deleted_artifact_count": self.deleted_artifact_count,
+            "reclaimed_bytes": self.reclaimed_bytes,
+            "skipped": [item.to_payload() for item in self.skipped],
+            "warnings": list(self.warnings),
+        }
+
+
+@dataclass(frozen=True)
+class _CompletedCapsule:
+    run_id: str
+    path: Path
+    completed_at_ns: int
+    artifact_fingerprints: tuple[tuple[object, ...], ...]
+    root_lock_fingerprint: tuple[object, ...] | None
+
+
+class _RetentionSkipError(RuntimeError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class TaskCapsuleWriter:
     """Writes a run-scoped `complete.mv2` artifact without adding a permanent layer."""
 
@@ -69,18 +178,38 @@ class TaskCapsuleWriter:
         backend: str = "memory",
     ) -> None:
         self.runs_dir = runs_dir
-        self.run_id = run_id
+        self.run_id = validate_capsule_run_id(run_id)
         self.backend_name = backend
-        self.path = runs_dir / run_id / "complete.mv2"
+        self.path = runs_dir / self.run_id / "complete.mv2"
         self.backend: MemoryBackend | None = None
+        self._root_lock_handle: IO[str] | None = None
 
     def open(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        backend_cls: type[MemoryBackend] = MemvidBackend if self.backend_name == "memvid" else InMemoryBackend
-        self.backend = backend_cls(path=self.path, layer=MemoryLayer.EPISODIC)
-        self.backend.open()
+        _reject_windows_reparse_ancestors(self.runs_dir)
+        _reject_windows_reparse_ancestors(self.path.parent)
+        ensure_owner_only_directory(self.runs_dir)
+        _reject_windows_reparse_ancestors(self.runs_dir)
+        _require_capsule_writer_directory(self.runs_dir)
+        ensure_owner_only_directory(self.path.parent)
+        _reject_windows_reparse_ancestors(self.path.parent)
+        _require_capsule_writer_directory(self.path.parent)
         if self.backend_name != "memvid":
-            self.path.touch(exist_ok=True)
+            self._acquire_root_lock()
+        try:
+            backend_cls: type[MemoryBackend] = (
+                MemvidBackend if self.backend_name == "memvid" else InMemoryBackend
+            )
+            self.backend = backend_cls(path=self.path, layer=MemoryLayer.EPISODIC)
+            self.backend.open()
+            if self.backend_name != "memvid":
+                create_private_empty_file(self.path)
+            self._harden_artifacts()
+        except Exception:
+            if self.backend is not None:
+                self.backend.close()
+                self.backend = None
+            self._release_root_lock()
+            raise
 
     def put_frame(self, frame: MV2ContextFrame) -> str:
         backend = self._backend()
@@ -112,16 +241,48 @@ class TaskCapsuleWriter:
 
     def seal(self) -> None:
         self._backend().seal()
+        self._harden_artifacts()
 
     def close(self) -> None:
         if self.backend is not None:
             self.backend.close()
-        self.backend = None
+            self.backend = None
+        try:
+            self._harden_artifacts()
+        finally:
+            self._release_root_lock()
 
     def _backend(self) -> MemoryBackend:
         if self.backend is None:
             raise RuntimeError("TaskCapsuleWriter.open() must be called before use")
         return self.backend
+
+    def _harden_artifacts(self) -> None:
+        harden_memory_artifact_files(self.path)
+
+    def _acquire_root_lock(self) -> None:
+        if self._root_lock_handle is not None:
+            return
+        descriptor = open_private_file_descriptor(
+            _capsule_root_lock_path(self.runs_dir, self.run_id)
+        )
+        handle = os.fdopen(descriptor, "r+", encoding="utf-8")
+        try:
+            lock_shared(handle, blocking=False)
+        except Exception:
+            handle.close()
+            raise
+        self._root_lock_handle = handle
+
+    def _release_root_lock(self) -> None:
+        handle = self._root_lock_handle
+        if handle is None:
+            return
+        try:
+            unlock(handle)
+        finally:
+            handle.close()
+            self._root_lock_handle = None
 
 
 def write_run_capsule(
@@ -143,6 +304,7 @@ def write_run_capsule(
     candidate_corrections: tuple[str, ...] = (),
     candidate_policy_items: tuple[str, ...] = (),
 ) -> Path:
+    run_id = validate_capsule_run_id(run_id)
     writer = TaskCapsuleWriter(runs_dir=runs_dir, run_id=run_id, backend=backend)
     writer.open()
     try:
@@ -190,9 +352,10 @@ def write_run_capsule(
         for frame in candidate_frames:
             writer.put_frame(frame)
         writer.seal()
-        return writer.path
     finally:
         writer.close()
+    _write_capsule_completion_marker(writer.path, run_id=run_id, backend=backend)
+    return writer.path
 
 
 def write_turn_capsule(
@@ -203,7 +366,9 @@ def write_turn_capsule(
     backend: str = "memory",
     selected_context: str = "",
 ) -> Path:
-    errors = tuple(execution.content for execution in result.tool_executions if not execution.success)
+    errors = tuple(
+        execution.content for execution in result.tool_executions if not execution.success
+    )
     tests = tuple(
         execution.content[:500]
         for execution in result.tool_executions
@@ -225,13 +390,139 @@ def write_turn_capsule(
     )
 
 
+def enforce_task_capsule_retention(
+    *,
+    runs_dir: Path,
+    retention_count: int = 1_000,
+    preserve_run_ids: Iterable[str] = (),
+) -> TaskCapsuleRetentionReport:
+    """Keep a bounded number of safely identified completed task capsules.
+
+    The pass is deliberately fail-closed. It never recursively removes arbitrary
+    directories: a run directory must contain only the exact Kestrel capsule
+    artifact set, have a durable completion marker (or a sealed legacy memory
+    snapshot), and have both backend locks available for exclusive acquisition.
+    """
+
+    if isinstance(retention_count, bool) or retention_count < 1:
+        raise ValueError("retention_count must be an integer greater than or equal to 1")
+    runs_dir = Path(runs_dir)
+    _reject_windows_reparse_ancestors(runs_dir)
+    ensure_owner_only_directory(runs_dir)
+    _reject_windows_reparse_ancestors(runs_dir)
+    _require_capsule_writer_directory(runs_dir)
+    preserved = tuple(preserve_run_ids)
+    with _exclusive_retention_pass(runs_dir):
+        return _enforce_task_capsule_retention_locked(
+            runs_dir=runs_dir,
+            retention_count=retention_count,
+            preserve_run_ids=preserved,
+        )
+
+
+def _enforce_task_capsule_retention_locked(
+    *,
+    runs_dir: Path,
+    retention_count: int,
+    preserve_run_ids: Iterable[str],
+) -> TaskCapsuleRetentionReport:
+    """Run one retention transaction while the root retention lock is held."""
+
+    preserved = {validate_capsule_run_id(run_id) for run_id in preserve_run_ids}
+
+    completed: list[_CompletedCapsule] = []
+    skipped: list[TaskCapsuleRetentionSkip] = []
+    scanned_run_count = 0
+    for entry in sorted(runs_dir.iterdir(), key=lambda item: item.name):
+        if _is_capsule_root_support_artifact(entry.name):
+            continue
+        try:
+            entry_metadata = os.lstat(entry)
+        except FileNotFoundError:
+            continue
+        try:
+            run_id = validate_capsule_run_id(entry.name)
+        except ValueError:
+            if stat.S_ISDIR(entry_metadata.st_mode) or stat.S_ISLNK(entry_metadata.st_mode):
+                skipped.append(TaskCapsuleRetentionSkip(entry.name, "unsafe_run_id"))
+            continue
+        scanned_run_count += 1
+        if is_link_or_reparse_point(entry_metadata) or not stat.S_ISDIR(
+            entry_metadata.st_mode
+        ):
+            skipped.append(TaskCapsuleRetentionSkip(run_id, "unsafe_run_directory"))
+            continue
+        try:
+            completed.append(_inspect_completed_capsule(runs_dir, run_id))
+        except _RetentionSkipError as exc:
+            skipped.append(TaskCapsuleRetentionSkip(run_id, exc.reason))
+
+    newest_first = sorted(
+        completed,
+        key=lambda item: (item.completed_at_ns, item.run_id),
+        reverse=True,
+    )
+    keep_run_ids = {item.run_id for item in newest_first if item.run_id in preserved}
+    if newest_first:
+        keep_run_ids.add(newest_first[0].run_id)
+    target_keep_count = max(retention_count, len(keep_run_ids))
+    for item in newest_first:
+        if len(keep_run_ids) >= target_keep_count:
+            break
+        keep_run_ids.add(item.run_id)
+
+    deleted_run_ids: list[str] = []
+    deleted_artifact_count = 0
+    reclaimed_bytes = 0
+    warnings: list[str] = []
+    for candidate in reversed(newest_first):
+        if candidate.run_id in keep_run_ids:
+            continue
+        try:
+            artifact_count, byte_count, cleanup_warnings = _delete_completed_capsule(
+                runs_dir,
+                candidate,
+            )
+        except _RetentionSkipError as exc:
+            skipped.append(TaskCapsuleRetentionSkip(candidate.run_id, exc.reason))
+            continue
+        deleted_run_ids.append(candidate.run_id)
+        deleted_artifact_count += artifact_count
+        reclaimed_bytes += byte_count
+        warnings.extend(cleanup_warnings)
+
+    retained_run_ids = tuple(
+        item.run_id for item in newest_first if item.run_id not in deleted_run_ids
+    )
+    return TaskCapsuleRetentionReport(
+        runs_dir=runs_dir,
+        retention_count=retention_count,
+        scanned_run_count=scanned_run_count,
+        completed_run_count=len(completed),
+        retained_run_ids=retained_run_ids,
+        deleted_run_ids=tuple(deleted_run_ids),
+        deleted_artifact_count=deleted_artifact_count,
+        reclaimed_bytes=reclaimed_bytes,
+        skipped=tuple(sorted(skipped, key=lambda item: (item.run_id, item.reason))),
+        warnings=tuple(warnings),
+    )
+
+
 def summarize_run_capsule(
     *,
     runs_dir: Path,
     run_id: str,
     backend: str = "memory",
 ) -> TaskCapsuleSummary:
+    run_id = validate_capsule_run_id(run_id)
+    _reject_windows_reparse_ancestors(runs_dir)
+    _reject_windows_reparse_ancestors(runs_dir / run_id)
+    ensure_owner_only_directory(runs_dir)
+    _reject_windows_reparse_ancestors(runs_dir)
+    _require_capsule_writer_directory(runs_dir)
     path = runs_dir / run_id / "complete.mv2"
+    _reject_windows_reparse_ancestors(path.parent)
+    _require_capsule_writer_directory(path.parent)
     capsule = _load_capsule_payload(path, backend=backend)
     objective = str(capsule.get("objective", ""))
     signals = extract_learning_signals(capsule, run_id=run_id)
@@ -256,6 +547,7 @@ def summarize_run_capsule(
 def extract_learning_signals(capsule: dict[str, object], *, run_id: str) -> list[LearningSignal]:
     signals: list[LearningSignal] = []
     source = "task_capsule"
+    validation_evidence = _capsule_validation_evidence(capsule.get("tool_calls"))
     for content in _string_list(capsule.get("errors_encountered")):
         signals.append(
             LearningSignal(
@@ -297,7 +589,8 @@ def extract_learning_signals(capsule: dict[str, object], *, run_id: str) -> list
                 source_layer=MemoryLayer.EPISODIC,
                 confidence=0.72,
                 importance=0.65,
-                validation_score=0.78,
+                validation_score=None if validation_evidence is not None else 0.78,
+                validation_evidence=validation_evidence,
                 repeat_count=1,
                 source=source,
                 locator=run_id,
@@ -313,7 +606,8 @@ def extract_learning_signals(capsule: dict[str, object], *, run_id: str) -> list
                 source_layer=MemoryLayer.EPISODIC,
                 confidence=0.76,
                 importance=0.78,
-                validation_score=0.82,
+                validation_score=None if validation_evidence is not None else 0.82,
+                validation_evidence=validation_evidence,
                 repeat_count=2,
                 source=source,
                 locator=run_id,
@@ -350,11 +644,127 @@ def extract_learning_signals(capsule: dict[str, object], *, run_id: str) -> list
                 explicit_instruction=False,
                 source=source,
                 locator=run_id,
-                metadata={"run_id": run_id, "capsule_signal": "policy_candidate", "requires_human_review": True},
+                metadata={
+                    "run_id": run_id,
+                    "capsule_signal": "policy_candidate",
+                    "requires_human_review": True,
+                },
                 requested_target_layer=MemoryLayer.POLICY,
             )
         )
     return signals
+
+
+def capsule_signal_staging_record(signal: LearningSignal) -> MemoryRecord | None:
+    """Convert an unvalidated capsule candidate into explicit episodic staging.
+
+    A task capsule is durable evidence, but its candidate text is not itself a
+    validated stable-memory promotion.  Applying a capsule may therefore make
+    facts, procedures, and corrections discoverable as untrusted episodic
+    evidence while leaving semantic/procedural memory untouched.  A later
+    ``memory.learn``/correction flow must bind authenticated validation receipts
+    to the exact staged claim before it can enter a stable layer.
+    """
+
+    capsule_signal = str((signal.metadata or {}).get("capsule_signal") or "")
+    requested_target = {
+        "fact": MemoryLayer.SEMANTIC,
+        "procedure": MemoryLayer.PROCEDURAL,
+        "correction": MemoryLayer.SEMANTIC,
+    }.get(capsule_signal)
+    if requested_target is None:
+        return None
+    frame_type = {
+        "fact": "section_summary",
+        "procedure": "skill_card",
+        "correction": "correction",
+    }[capsule_signal]
+    return MemoryRecord(
+        title=signal.title,
+        content=signal.content,
+        layer=MemoryLayer.EPISODIC,
+        kind=signal.kind,
+        confidence=max(signal.confidence, 0.5),
+        importance=signal.importance,
+        tags={**(signal.tags or {}), "capsule_staging": "unvalidated"},
+        metadata={
+            **(signal.metadata or {}),
+            "frame_type": frame_type,
+            "capsule_apply_status": "unvalidated_episodic_staging",
+            "actual_layer": MemoryLayer.EPISODIC.value,
+            "requested_stable_layer": requested_target.value,
+            "stable_recall_eligible": False,
+            "validation_status": "unresolved",
+        },
+        evidence=[
+            EvidenceRef(
+                source="task_capsule",
+                locator=signal.locator,
+                quote="Unvalidated capsule candidate staged as episodic evidence.",
+            )
+        ],
+    )
+
+
+def _capsule_validation_evidence(raw_calls: object) -> ValidationEvidence | None:
+    if not isinstance(raw_calls, list):
+        return None
+    buckets: dict[str, list[EvidenceRef]] = {
+        "test_refs": [],
+        "lint_refs": [],
+        "repair_refs": [],
+        "review_refs": [],
+        "task_refs": [],
+    }
+    source_evidence_chars = 0
+    for raw_call in raw_calls:
+        if not isinstance(raw_call, dict) or raw_call.get("success") is not True:
+            continue
+        data = raw_call.get("data")
+        if not isinstance(data, dict):
+            continue
+        payloads: list[object] = [
+            data.get("validation_evidence"),
+            data.get("runtime_validation_evidence"),
+        ]
+        validation = data.get("validation")
+        if isinstance(validation, dict):
+            payloads.append(validation.get("validation_evidence"))
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            for bucket in buckets:
+                raw_refs = payload.get(bucket)
+                if not isinstance(raw_refs, list):
+                    continue
+                for raw_ref in raw_refs:
+                    if not isinstance(raw_ref, dict):
+                        continue
+                    source = str(raw_ref.get("source") or "").strip()
+                    locator = str(raw_ref.get("locator") or "").strip()
+                    if source != "memory_record" or not locator:
+                        continue
+                    quote = raw_ref.get("quote")
+                    ref = EvidenceRef(
+                        source=source,
+                        locator=locator,
+                        quote=str(quote) if quote is not None else None,
+                    )
+                    if ref not in buckets[bucket]:
+                        buckets[bucket].append(ref)
+            raw_chars = payload.get("source_evidence_chars")
+            if isinstance(raw_chars, int) and not isinstance(raw_chars, bool):
+                source_evidence_chars += max(raw_chars, 0)
+    if not any(buckets.values()):
+        return None
+    return ValidationEvidence(
+        test_refs=tuple(buckets["test_refs"]),
+        lint_refs=tuple(buckets["lint_refs"]),
+        repair_refs=tuple(buckets["repair_refs"]),
+        review_refs=tuple(buckets["review_refs"]),
+        task_refs=tuple(buckets["task_refs"]),
+        source_evidence_chars=source_evidence_chars or None,
+    )
 
 
 def _candidate_frames(payload: dict[str, object]) -> list[MV2ContextFrame]:
@@ -390,7 +800,521 @@ def _candidate_frames(payload: dict[str, object]) -> list[MV2ContextFrame]:
     return frames
 
 
+def _write_capsule_completion_marker(path: Path, *, run_id: str, backend: str) -> None:
+    artifact_names: list[str] = []
+    for name in sorted(_CAPSULE_DATA_ARTIFACTS):
+        candidate = path.parent / name
+        if harden_private_file(candidate, missing_ok=True):
+            artifact_names.append(name)
+    if "complete.mv2" not in artifact_names:
+        raise RuntimeError(f"Task capsule did not materialize its canonical artifact: {path}")
+    payload = {
+        "format": _COMPLETION_MARKER_FORMAT,
+        "version": 1,
+        "status": "complete",
+        "run_id": run_id,
+        "backend": backend,
+        "artifacts": artifact_names,
+        "completed_at": datetime.now(UTC).isoformat(),
+    }
+    marker_path = path.parent / _CAPSULE_COMPLETION_MARKER
+    write_private_text(marker_path, json.dumps(payload, sort_keys=True), encoding="utf-8")
+    harden_private_file(marker_path)
+
+
+def _inspect_completed_capsule(runs_dir: Path, run_id: str) -> _CompletedCapsule:
+    run_path = runs_dir / run_id
+    try:
+        directory_metadata = _safe_directory_metadata(run_path)
+        with _exclusive_capsule_locks(runs_dir, run_id):
+            current_directory_metadata = _safe_directory_metadata(run_path)
+            if not os.path.samestat(directory_metadata, current_directory_metadata):
+                raise _RetentionSkipError("capsule_changed_during_scan")
+            return _inspect_locked_completed_capsule(runs_dir, run_id)
+    except FileNotFoundError as exc:
+        # Another safe retention pass may have quarantined this capsule after
+        # our directory listing. Treat disappearance as a skipped candidate,
+        # never as a failed run-maintenance event.
+        raise _RetentionSkipError("capsule_changed_during_scan") from exc
+
+
+def _inspect_locked_completed_capsule(runs_dir: Path, run_id: str) -> _CompletedCapsule:
+    run_path = runs_dir / run_id
+    try:
+        artifact_names = set(os.listdir(run_path))
+    except FileNotFoundError as exc:
+        raise _RetentionSkipError("capsule_changed_during_scan") from exc
+    unknown_names = artifact_names - _CAPSULE_KNOWN_ARTIFACTS
+    if unknown_names:
+        raise _RetentionSkipError("unknown_capsule_artifact")
+    if "complete.mv2" not in artifact_names or _CAPSULE_LAYER_LOCK not in artifact_names:
+        raise _RetentionSkipError("partial_capsule")
+
+    metadata_by_name: dict[str, os.stat_result] = {}
+    for name in sorted(artifact_names):
+        metadata_by_name[name] = _safe_regular_metadata(run_path / name)
+
+    marker_metadata = metadata_by_name.get(_CAPSULE_COMPLETION_MARKER)
+    if marker_metadata is not None:
+        completed_at_ns = _validated_marker_completion_time(
+            run_path,
+            run_id=run_id,
+            metadata_by_name=metadata_by_name,
+        )
+    elif _legacy_memory_snapshot_is_complete(
+        run_path,
+        run_id=run_id,
+        metadata_by_name=metadata_by_name,
+    ):
+        completed_at_ns = metadata_by_name["complete.memory.json"].st_mtime_ns
+    else:
+        raise _RetentionSkipError("partial_capsule")
+
+    root_lock_path = _capsule_root_lock_path(runs_dir, run_id)
+    try:
+        root_lock_metadata = _safe_regular_metadata(root_lock_path)
+    except FileNotFoundError:
+        root_lock_metadata = None
+    return _CompletedCapsule(
+        run_id=run_id,
+        path=run_path,
+        completed_at_ns=completed_at_ns,
+        artifact_fingerprints=tuple(
+            _artifact_fingerprint(name, metadata_by_name[name]) for name in sorted(metadata_by_name)
+        ),
+        root_lock_fingerprint=(
+            _artifact_fingerprint(root_lock_path.name, root_lock_metadata)
+            if root_lock_metadata is not None
+            else None
+        ),
+    )
+
+
+def _validated_marker_completion_time(
+    run_path: Path,
+    *,
+    run_id: str,
+    metadata_by_name: dict[str, os.stat_result],
+) -> int:
+    marker_metadata = metadata_by_name[_CAPSULE_COMPLETION_MARKER]
+    raw = _read_unchanged_regular_text(
+        run_path / _CAPSULE_COMPLETION_MARKER,
+        marker_metadata,
+        max_bytes=32_768,
+    )
+    try:
+        marker = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise _RetentionSkipError("partial_capsule") from exc
+    if not isinstance(marker, dict):
+        raise _RetentionSkipError("partial_capsule")
+    expected_artifacts = sorted(
+        name for name in metadata_by_name if name in _CAPSULE_DATA_ARTIFACTS
+    )
+    if (
+        marker.get("format") != _COMPLETION_MARKER_FORMAT
+        or marker.get("version") != 1
+        or marker.get("status") != "complete"
+        or marker.get("run_id") != run_id
+        or marker.get("artifacts") != expected_artifacts
+    ):
+        raise _RetentionSkipError("partial_capsule")
+    newest_data_write = max(metadata_by_name[name].st_mtime_ns for name in expected_artifacts)
+    if marker_metadata.st_mtime_ns < newest_data_write:
+        raise _RetentionSkipError("partial_capsule")
+    return marker_metadata.st_mtime_ns
+
+
+def _legacy_memory_snapshot_is_complete(
+    run_path: Path,
+    *,
+    run_id: str,
+    metadata_by_name: dict[str, os.stat_result],
+) -> bool:
+    snapshot_metadata = metadata_by_name.get("complete.memory.json")
+    if snapshot_metadata is None:
+        return False
+    try:
+        raw = _read_unchanged_regular_text(
+            run_path / "complete.memory.json",
+            snapshot_metadata,
+            max_bytes=_MAX_LEGACY_CAPSULE_INDEX_BYTES,
+        )
+        loaded = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError, _RetentionSkipError):
+        return False
+    if not isinstance(loaded, list) or not all(isinstance(item, dict) for item in loaded):
+        return False
+    records = [item for item in loaded if isinstance(item, dict)]
+    root = next((item for item in records if item.get("id") == f"capsule_{run_id}"), None)
+    if root is None:
+        return False
+    metadata = root.get("metadata")
+    tags = root.get("tags")
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("capsule_artifact") is not True
+        or metadata.get("permanent_layer") is not False
+        or not isinstance(tags, dict)
+        or tags.get("capsule") != "complete"
+        or tags.get("run_id") != run_id
+    ):
+        return False
+    content = root.get("content")
+    if not isinstance(content, str):
+        return False
+    payload = _json_object_from_text(content)
+    if payload is None or payload.get("run_id") != run_id:
+        return False
+    child_ids = metadata.get("child_ids", [])
+    if not isinstance(child_ids, list) or not all(isinstance(item, str) for item in child_ids):
+        return False
+    record_ids = {item.get("id") for item in records}
+    return all(child_id in record_ids for child_id in child_ids)
+
+
+@contextmanager
+def _exclusive_capsule_locks(runs_dir: Path, run_id: str) -> Iterator[None]:
+    lock_paths: list[Path] = []
+    root_lock_path = _capsule_root_lock_path(runs_dir, run_id)
+    try:
+        os.lstat(root_lock_path)
+    except FileNotFoundError:
+        pass
+    else:
+        lock_paths.append(root_lock_path)
+    layer_lock_path = runs_dir / run_id / _CAPSULE_LAYER_LOCK
+    try:
+        os.lstat(layer_lock_path)
+    except FileNotFoundError as exc:
+        raise _RetentionSkipError("partial_capsule") from exc
+    # Windows cannot rename a directory while a handle to a child lock file is
+    # open. Current writers (including Memvid) hold the root lock for their full
+    # lifetime, so that external lock is sufficient there and leaves the
+    # directory movable. POSIX keeps the additional legacy layer-lock check.
+    if os.name != "nt" or not lock_paths:
+        lock_paths.append(layer_lock_path)
+
+    handles: list[IO[str]] = []
+    try:
+        for lock_path in lock_paths:
+            handle = _open_existing_safe_lock(lock_path)
+            try:
+                lock_exclusive(handle, blocking=False)
+            except OSError as exc:
+                handle.close()
+                raise _RetentionSkipError("active_capsule") from exc
+            handles.append(handle)
+        yield
+    finally:
+        for handle in reversed(handles):
+            try:
+                unlock(handle)
+            finally:
+                handle.close()
+
+
+def _open_existing_safe_lock(path: Path) -> IO[str]:
+    try:
+        before_open = _safe_regular_metadata(path)
+    except FileNotFoundError as exc:
+        raise _RetentionSkipError("capsule_changed_during_scan") from exc
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise _RetentionSkipError("unsafe_capsule_artifact") from exc
+    try:
+        opened = os.fstat(descriptor)
+        try:
+            after_open = _safe_regular_metadata(path)
+        except FileNotFoundError as exc:
+            raise _RetentionSkipError("capsule_changed_during_scan") from exc
+        _require_safe_regular_metadata(opened)
+        if not os.path.samestat(before_open, opened) or not os.path.samestat(opened, after_open):
+            raise _RetentionSkipError("capsule_changed_during_scan")
+        return os.fdopen(descriptor, "r+", encoding="utf-8")
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _delete_completed_capsule(
+    runs_dir: Path,
+    candidate: _CompletedCapsule,
+) -> tuple[int, int, tuple[str, ...]]:
+    quarantine = runs_dir / f".kestrel-capsule-retention-{uuid4().hex}"
+    refreshed: _CompletedCapsule
+    with _exclusive_capsule_locks(runs_dir, candidate.run_id):
+        refreshed = _inspect_locked_completed_capsule(runs_dir, candidate.run_id)
+        if (
+            refreshed.artifact_fingerprints != candidate.artifact_fingerprints
+            or refreshed.root_lock_fingerprint != candidate.root_lock_fingerprint
+        ):
+            raise _RetentionSkipError("capsule_changed_during_retention")
+        try:
+            _replace_capsule_directory(candidate.path, quarantine)
+        except OSError as exc:
+            raise _RetentionSkipError("capsule_deletion_failed") from exc
+
+    artifact_count = 0
+    reclaimed_bytes = 0
+    try:
+        current_names = set(os.listdir(quarantine))
+        expected_names = {str(item[0]) for item in refreshed.artifact_fingerprints}
+        if current_names != expected_names:
+            raise _RetentionSkipError("capsule_changed_during_retention")
+        fingerprints_by_name = {str(item[0]): item for item in refreshed.artifact_fingerprints}
+        for name in sorted(current_names):
+            artifact_path = quarantine / name
+            metadata = _safe_regular_metadata(artifact_path)
+            if _artifact_fingerprint(name, metadata) != fingerprints_by_name[name]:
+                raise _RetentionSkipError("capsule_changed_during_retention")
+            artifact_path.unlink()
+            artifact_count += 1
+            reclaimed_bytes += metadata.st_size
+        quarantine.rmdir()
+    except Exception as exc:
+        if not candidate.path.exists() and quarantine.exists():
+            try:
+                _replace_capsule_directory(quarantine, candidate.path)
+            except OSError:
+                pass
+        if isinstance(exc, _RetentionSkipError):
+            raise
+        raise _RetentionSkipError("capsule_deletion_failed") from exc
+
+    warnings: list[str] = []
+    if refreshed.root_lock_fingerprint is not None:
+        root_lock_path = _capsule_root_lock_path(runs_dir, candidate.run_id)
+        try:
+            metadata = _safe_regular_metadata(root_lock_path)
+            if (
+                _artifact_fingerprint(root_lock_path.name, metadata)
+                != refreshed.root_lock_fingerprint
+            ):
+                warnings.append(f"{candidate.run_id}:root_lock_changed")
+            else:
+                root_lock_path.unlink()
+                artifact_count += 1
+                reclaimed_bytes += metadata.st_size
+        except FileNotFoundError:
+            pass
+        except (OSError, _RetentionSkipError):
+            warnings.append(f"{candidate.run_id}:root_lock_cleanup_failed")
+    return artifact_count, reclaimed_bytes, tuple(warnings)
+
+
+def _replace_capsule_directory(source: Path, destination: Path) -> None:
+    """Move a verified capsule directory without Windows replace flags."""
+
+    source_metadata = _safe_directory_metadata(source)
+    source_parent_metadata = _safe_directory_metadata(source.parent)
+    destination_parent_metadata = _safe_directory_metadata(destination.parent)
+    if not os.path.samestat(source_parent_metadata, destination_parent_metadata):
+        raise _RetentionSkipError("capsule_deletion_failed")
+    try:
+        destination_metadata = os.lstat(destination)
+    except FileNotFoundError:
+        pass
+    else:
+        if is_link_or_reparse_point(destination_metadata):
+            raise _RetentionSkipError("unsafe_run_directory")
+        raise _RetentionSkipError("capsule_deletion_failed")
+    moved = False
+    try:
+        os.replace(source, destination)
+        moved = True
+    except PermissionError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 5:
+            raise
+        source_retry = _safe_directory_metadata(source)
+        if not os.path.samestat(source_metadata, source_retry):
+            raise _RetentionSkipError("capsule_changed_during_retention") from exc
+        try:
+            os.lstat(destination)
+        except FileNotFoundError:
+            pass
+        else:
+            raise _RetentionSkipError("capsule_deletion_failed") from exc
+        os.rename(source, destination)
+        moved = True
+    try:
+        published_metadata = _safe_directory_metadata(destination)
+        if not os.path.samestat(source_metadata, published_metadata):
+            raise _RetentionSkipError("capsule_changed_during_retention")
+    except BaseException as exc:
+        if moved:
+            _restore_capsule_directory_move(destination, source, source_metadata)
+        raise exc
+
+
+def _restore_capsule_directory_move(
+    destination: Path,
+    source: Path,
+    expected: os.stat_result,
+) -> None:
+    """Restore the exact moved capsule after post-publication validation fails."""
+
+    try:
+        visible = os.lstat(destination)
+        if (
+            is_link_or_reparse_point(visible)
+            or not stat.S_ISDIR(visible.st_mode)
+            or not os.path.samestat(expected, visible)
+            or os.path.lexists(source)
+        ):
+            raise _RetentionSkipError("capsule_deletion_failed")
+        if os.name == "nt":
+            os.rename(destination, source)
+        else:
+            os.replace(destination, source)
+        restored = _safe_directory_metadata(source)
+        if not os.path.samestat(expected, restored):
+            raise _RetentionSkipError("capsule_deletion_failed")
+    except OSError as exc:
+        raise _RetentionSkipError("capsule_deletion_failed") from exc
+
+
+def _read_unchanged_regular_text(
+    path: Path,
+    expected_metadata: os.stat_result,
+    *,
+    max_bytes: int,
+) -> str:
+    if expected_metadata.st_size > max_bytes:
+        raise _RetentionSkipError("capsule_index_too_large")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise _RetentionSkipError("unsafe_capsule_artifact") from exc
+    try:
+        opened = os.fstat(descriptor)
+        after_open = _safe_regular_metadata(path)
+        _require_safe_regular_metadata(opened)
+        if not os.path.samestat(expected_metadata, opened) or not os.path.samestat(
+            opened, after_open
+        ):
+            raise _RetentionSkipError("capsule_changed_during_scan")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            return handle.read(max_bytes + 1)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _safe_directory_metadata(path: Path) -> os.stat_result:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError as exc:
+        raise _RetentionSkipError("capsule_changed_during_scan") from exc
+    if is_link_or_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise _RetentionSkipError("unsafe_run_directory")
+    _require_current_owner(metadata)
+    return metadata
+
+
+def _require_capsule_writer_directory(path: Path) -> os.stat_result:
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeError(f"Task capsule directory is unavailable: {path}") from exc
+    if is_link_or_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError(f"Task capsule path must be a real directory: {path}")
+    return metadata
+
+
+def _reject_windows_reparse_ancestors(path: Path) -> None:
+    absolute = Path(os.path.abspath(path))
+    for candidate in tuple(reversed(absolute.parents)) + (absolute,):
+        try:
+            metadata = os.lstat(candidate)
+        except FileNotFoundError:
+            continue
+        if is_windows_reparse_point(metadata):
+            raise RuntimeError(f"Task capsule path crosses a Windows reparse point: {candidate}")
+
+
+def _safe_regular_metadata(path: Path) -> os.stat_result:
+    metadata = os.lstat(path)
+    _require_safe_regular_metadata(metadata)
+    return metadata
+
+
+def _require_safe_regular_metadata(metadata: os.stat_result) -> None:
+    if (
+        is_link_or_reparse_point(metadata)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+    ):
+        raise _RetentionSkipError("unsafe_capsule_artifact")
+    _require_current_owner(metadata)
+
+
+def _require_current_owner(metadata: os.stat_result) -> None:
+    geteuid = getattr(os, "geteuid", None)
+    if os.name != "nt" and callable(geteuid) and metadata.st_uid != geteuid():
+        raise _RetentionSkipError("unsafe_capsule_owner")
+
+
+def _artifact_fingerprint(name: str, metadata: os.stat_result) -> tuple[object, ...]:
+    return (
+        name,
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        getattr(metadata, "st_file_attributes", 0),
+    )
+
+
+def _capsule_root_lock_path(runs_dir: Path, run_id: str) -> Path:
+    return runs_dir / f".{run_id}.kestrel-memory.lock"
+
+
+@contextmanager
+def _exclusive_retention_pass(runs_dir: Path) -> Iterator[None]:
+    """Serialize complete scan-and-delete passes across threads and processes."""
+
+    descriptor = open_private_file_descriptor(runs_dir / _CAPSULE_RETENTION_LOCK)
+    try:
+        handle = os.fdopen(descriptor, "r+", encoding="utf-8")
+    except Exception:
+        os.close(descriptor)
+        raise
+    acquired = False
+    try:
+        lock_exclusive(handle)
+        acquired = True
+        yield
+    finally:
+        try:
+            if acquired:
+                unlock(handle)
+        finally:
+            handle.close()
+
+
+def _is_capsule_root_support_artifact(name: str) -> bool:
+    if name == _CAPSULE_RETENTION_LOCK:
+        return True
+    suffix = ".kestrel-memory.lock"
+    if not name.startswith(".") or not name.endswith(suffix):
+        return False
+    run_id = name[1 : -len(suffix)]
+    try:
+        validate_capsule_run_id(run_id)
+    except ValueError:
+        return False
+    return True
+
+
 def _load_capsule_payload(path: Path, *, backend: str) -> dict[str, object]:
+    harden_task_capsule_run(path.parent)
     if not path.exists():
         return {"run_id": path.parent.name, "objective": "", "missing": True}
     capsule_backend = _open_capsule_backend(path, backend=backend)
@@ -427,7 +1351,9 @@ def _load_capsule_payload(path: Path, *, backend: str) -> dict[str, object]:
 
 def _open_capsule_backend(path: Path, *, backend: str) -> MemoryBackend:
     if backend == "memvid":
-        capsule_backend: MemoryBackend = MemvidBackend(path=path, layer=MemoryLayer.EPISODIC, read_only=True)
+        capsule_backend: MemoryBackend = MemvidBackend(
+            path=path, layer=MemoryLayer.EPISODIC, read_only=True
+        )
     elif backend == "memory":
         capsule_backend = InMemoryBackend(path=path, layer=MemoryLayer.EPISODIC)
     else:
@@ -518,4 +1444,7 @@ def _corrections_from_result(result: AgentTurnResult) -> tuple[str, ...]:
 
 
 def hits_to_context_text(hits: tuple[MemoryHit, ...]) -> str:
-    return "\n\n".join(f"[{hit.record.layer.value}] {hit.record.title}\n{hit.snippet or hit.record.content}" for hit in hits)
+    return "\n\n".join(
+        f"[{hit.record.layer.value}] {hit.record.title}\n{hit.snippet or hit.record.content}"
+        for hit in hits
+    )

@@ -1,0 +1,81 @@
+name: Bug report
+description: Report a reproducible Kestrel defect.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Kestrel. Do not include secrets, private memory, or sensitive repository contents. Send suspected vulnerabilities through the private reporting channel linked in SECURITY.md, not this public issue form.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and pull requests.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+        - label: I removed credentials, private memory, and sensitive data from this report.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Kestrel version or commit
+      description: Use `nest-agent doctor`, package metadata, or `git rev-parse --short HEAD`.
+      placeholder: v0.3.1 or 3562205
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installation method
+      options:
+        - Published installer
+        - Python wheel or sdist
+        - Editable source checkout
+        - Docker or Compose
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, architecture, Python version, provider, memory backend, and browser/Node version when relevant.
+      placeholder: macOS 15 arm64, Python 3.12, mock provider, memory backend
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and its impact.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Start Kestrel with ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted diagnostics
+      description: Paste the smallest useful redacted log excerpt, stack trace, or test output. Do not attach `.mv2` memory or secret-store files.
+      render: shell
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Include frequency, regression range, workarounds, or screenshots when useful.

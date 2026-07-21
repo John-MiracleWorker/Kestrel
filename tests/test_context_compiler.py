@@ -9,7 +9,11 @@ from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
 
 
 def test_context_compiler_groups_by_layer(tmp_path: Path) -> None:
-    memory = LayeredMemorySystem.from_backend_factory(tmp_path, InMemoryBackend)
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path,
+        InMemoryBackend,
+        enforce_stable_write_integrity=False,
+    )
     memory.put(
         MemoryRecord(
             title="Auth profile fact",
@@ -42,7 +46,11 @@ def test_context_compiler_respects_total_budget(tmp_path: Path) -> None:
 
 
 def test_context_compiler_uses_pack_token_budget_before_char_ceiling(tmp_path: Path) -> None:
-    memory = LayeredMemorySystem.from_backend_factory(tmp_path, InMemoryBackend)
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path,
+        InMemoryBackend,
+        enforce_stable_write_integrity=False,
+    )
     memory.put(
         MemoryRecord(
             title="Long pack memory",

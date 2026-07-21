@@ -7,13 +7,16 @@ import queue
 import time
 from dataclasses import replace
 from pathlib import Path
+from threading import Event, Lock, Thread, current_thread
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
-from nested_memvid_agent.agent import NestedMV2Agent
+from nested_memvid_agent import net_safety
+from nested_memvid_agent.agent import AgentDependencies, NestedMV2Agent
 from nested_memvid_agent.channels import ChannelEndpointConfig, ChannelManager
+from nested_memvid_agent.channels import adapters as channel_adapters
 from nested_memvid_agent.channels.adapters import (
     ChannelAdapter,
     DiscordAdapter,
@@ -23,16 +26,90 @@ from nested_memvid_agent.channels.models import (
     ChannelDelivery,
     ChannelInboundMessage,
     ChannelOutboundMessage,
+    durable_channel_session_id,
 )
 from nested_memvid_agent.config import AgentConfig
-from nested_memvid_agent.runtime_models import AgentTurnResult, ToolCall, ToolExecution
+from nested_memvid_agent.event_bus import RunEventBus
+from nested_memvid_agent.event_log import JsonlEventLog
+from nested_memvid_agent.llm.base import LLMProvider
+from nested_memvid_agent.mcp_manager import MCPManager
+from nested_memvid_agent.orchestrator import build_memory_system
+from nested_memvid_agent.run_manager import RunManager
+from nested_memvid_agent.runtime_models import (
+    AgentTurnResult,
+    ChatMessage,
+    LLMOptions,
+    LLMResponse,
+    ToolCall,
+    ToolExecution,
+    ToolSpec,
+)
+from nested_memvid_agent.runtime_settings import (
+    RuntimeSettings,
+    RuntimeSettingsStore,
+    merge_runtime_settings,
+)
 from nested_memvid_agent.server import create_app
+from nested_memvid_agent.skill_manager import SkillManager
+from nested_memvid_agent.state_store import AgentStateStore
+from nested_memvid_agent.tools.builtin import build_default_tools
 
 
 @pytest.fixture(autouse=True)
 def _authorized_telegram_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "12345")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "777,999")
+
+
+def test_safe_channel_session_ids_preserve_legacy_continuity() -> None:
+    assert durable_channel_session_id(
+        channel="telegram", channel_id="telegram", conversation_id="12345"
+    ) == "channel:telegram:12345"
+    assert durable_channel_session_id(
+        channel="slack", channel_id="slack-work", conversation_id="T1"
+    ) == "channel:slack-work:T1"
+
+
+def test_lossy_channel_session_ids_are_collision_resistant() -> None:
+    slash = durable_channel_session_id(
+        channel="webhook", channel_id="hook", conversation_id="room/a"
+    )
+    question = durable_channel_session_id(
+        channel="webhook", channel_id="hook", conversation_id="room?a"
+    )
+    safe = durable_channel_session_id(
+        channel="webhook", channel_id="hook", conversation_id="room_a"
+    )
+    assert slash.startswith("channel:hook:room_a:v2:")
+    assert question.startswith("channel:hook:room_a:v2:")
+    assert slash != question
+    assert safe == "channel:hook:room_a"
+    assert safe not in {slash, question}
+
+    shared_prefix = "x" * 120
+    long_a = durable_channel_session_id(
+        channel="webhook", channel_id="hook", conversation_id=shared_prefix + "a"
+    )
+    long_b = durable_channel_session_id(
+        channel="webhook", channel_id="hook", conversation_id=shared_prefix + "b"
+    )
+    assert long_a != long_b
+    assert long_a.startswith(f"channel:hook:{shared_prefix}:v2:")
+
+
+def test_hashed_channel_session_id_digest_covers_provider_tuple() -> None:
+    webhook = durable_channel_session_id(
+        channel="webhook", channel_id="hook", conversation_id="room/a"
+    )
+    github = durable_channel_session_id(
+        channel="github", channel_id="hook", conversation_id="room/a"
+    )
+    colon = durable_channel_session_id(
+        channel="webhook", channel_id="hook", conversation_id="room:a"
+    )
+    assert webhook != github
+    assert colon.startswith("channel:hook:room:a:v2:")
+    assert colon != webhook
 
 
 def test_telegram_channel_payload_runs_agent_and_records_provenance(tmp_path: Path) -> None:
@@ -49,7 +126,9 @@ def test_telegram_channel_payload_runs_agent_and_records_provenance(tmp_path: Pa
 
     result = manager.handle_payload(provider="telegram", payload=payload, send=True)
 
-    assert result.turn.session_id == "channel:telegram:12345"
+    assert result.turn.session_id == durable_channel_session_id(
+        channel="telegram", channel_id="telegram", conversation_id="12345"
+    )
     assert result.turn.assistant_message == "Mock response: hello telegram"
     assert result.delivery.dry_run is True
     assert result.delivery.blocked_reason == "global_channel_delivery_disabled"
@@ -62,6 +141,136 @@ def test_telegram_channel_payload_runs_agent_and_records_provenance(tmp_path: Pa
     assert user_record["metadata"]["channel_user_id"] == "777"
     assert user_record["metadata"]["channel_message_id"] == "55"
     assert user_record["evidence"][0]["source"] == "channel:telegram"
+
+
+def test_run_manager_channel_turn_is_durable_and_isolated_from_primary_replay(
+    tmp_path: Path,
+) -> None:
+    class CapturingProvider(LLMProvider):
+        def __init__(self) -> None:
+            self.requests: list[list[ChatMessage]] = []
+            self.lock = Lock()
+
+        def generate(
+            self,
+            messages: list[ChatMessage],
+            tools: list[ToolSpec],
+            options: LLMOptions | None = None,
+        ) -> LLMResponse:
+            del tools, options
+            with self.lock:
+                self.requests.append(list(messages))
+            latest = next(
+                (message.content for message in reversed(messages) if message.role == "user"),
+                "",
+            )
+            return LLMResponse(content=f"Captured answer: {latest}")
+
+    config = replace(_config(tmp_path), channel_send_timeout_seconds=5)
+    state = AgentStateStore(config.state_path)
+    run_manager = RunManager(
+        config=config,
+        state=state,
+        events=RunEventBus(state),
+        mcp=MCPManager(state),
+        skills=SkillManager(config.skills_dir, state),
+    )
+    provider = CapturingProvider()
+
+    def build_capturing_agent(run_config: AgentConfig) -> NestedMV2Agent:
+        return NestedMV2Agent(
+            AgentDependencies(
+                memory=build_memory_system("memory", run_config.memory_dir),
+                llm=provider,
+                tools=build_default_tools(),
+                config=run_config,
+                event_log=JsonlEventLog(run_config.log_dir / "events.jsonl"),
+            )
+        )
+
+    run_manager._build_agent = build_capturing_agent  # type: ignore[method-assign]
+    channel_manager = ChannelManager(
+        config,
+        run_manager=run_manager,
+        channel_configs=[ChannelEndpointConfig(id="telegram", provider="telegram")],
+    )
+    channel_result = channel_manager.handle_payload(
+        provider="telegram",
+        payload={
+            "update_id": 101,
+            "message": {
+                "message_id": 55,
+                "text": "Build a website provenance-e2e-71c4",
+                "chat": {"id": 12345, "type": "private"},
+                "from": {"id": 777},
+            },
+        },
+    )
+
+    persisted = state.get_run(channel_result.turn.run_id)
+    assert persisted.turn_origin == "channel_user"
+    assert persisted.transcript_scope == "channel"
+    assert persisted.turn_source == {
+        "channel": "telegram",
+        "channel_id": "telegram",
+        "conversation_id": "12345",
+        "user_id": "777",
+        "message_id": "55",
+        "metadata": {
+            "chat_type": "private",
+            "provider_payload": "message",
+            "update_id": "101",
+        },
+    }
+    root = next(task for task in state.list_task_nodes(persisted.run_id) if task.parent_id is None)
+    assert root.plan is not None
+    assert root.plan["request_provenance"] == {
+        "turn_source": persisted.turn_source,
+        "turn_origin": "channel_user",
+        "transcript_scope": "channel",
+    }
+
+    primary = run_manager.create_run(
+        message="Continue provenance-e2e-71c4",
+        session_id=persisted.session_id,
+    )
+    deadline = time.monotonic() + 5
+    while run_manager.get_run(primary.run_id)["status"] not in {"completed", "failed"}:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert run_manager.get_run(primary.run_id)["status"] == "completed"
+    primary_task_titles = [
+        task.title
+        for task in state.list_task_nodes(primary.run_id)
+        if task.parent_id is not None
+    ]
+    assert primary_task_titles == ["Inspect context", "Execute and validate", "Review outcome"]
+
+    snapshot = _memory_snapshot(tmp_path, "working")
+    channel_frames = [
+        item
+        for item in snapshot
+        if "provenance-e2e-71c4" in str(item.get("content", ""))
+        and item.get("title") in {"User message", "Assistant message"}
+        and item.get("metadata", {}).get("transcript_scope") == "channel"
+    ]
+    assert {item["title"] for item in channel_frames} == {
+        "User message",
+        "Assistant message",
+    }
+    assert all(item["metadata"]["turn_origin"] == "channel_user" for item in channel_frames)
+    assert all(item["metadata"]["channel_message_id"] == "55" for item in channel_frames)
+
+    with provider.lock:
+        primary_request = provider.requests[1]
+    primary_native = [
+        (message.role, message.content)
+        for message in primary_request
+        if message.role in {"user", "assistant"}
+        and "provenance-e2e-71c4" in message.content
+        and "untrusted_recalled_memory" not in message.content
+    ]
+    assert primary_native == [("user", "Continue provenance-e2e-71c4")]
 
 
 @pytest.mark.parametrize(
@@ -283,7 +492,9 @@ def test_discord_interaction_payload_is_normalized_and_dry_run_delivered(tmp_pat
 
     result = manager.handle_payload(provider="discord", payload=payload)
 
-    assert result.turn.session_id == "channel:discord:channel_1"
+    assert result.turn.session_id == durable_channel_session_id(
+        channel="discord", channel_id="discord", conversation_id="channel_1"
+    )
     assert result.inbound.user_id == "user_1"
     assert result.inbound.metadata["guild_id"] == "guild_1"
     assert result.turn.assistant_message == "Mock response: hello discord"
@@ -303,7 +514,9 @@ def test_custom_provider_uses_generic_webhook_adapter(tmp_path: Path) -> None:
 
     assert result.inbound.channel == "slack"
     assert result.inbound.channel_id == "slack-work"
-    assert result.turn.session_id == "channel:slack-work:T1"
+    assert result.turn.session_id == durable_channel_session_id(
+        channel="slack", channel_id="slack-work", conversation_id="T1"
+    )
     assert result.turn.assistant_message == "Mock response: hello custom channel"
 
 
@@ -431,7 +644,9 @@ def test_github_signature_header_is_supported(tmp_path: Path, monkeypatch: objec
         headers={"X-Hub-Signature-256": f"sha256={signature}"},
     )
 
-    assert result.turn.session_id == "channel:github:issue-1"
+    assert result.turn.session_id == durable_channel_session_id(
+        channel="github", channel_id="github", conversation_id="issue-1"
+    )
 
 
 def test_public_channel_webhook_rejects_unsigned_payloads_by_default(tmp_path: Path) -> None:
@@ -449,7 +664,10 @@ def test_public_channel_webhook_rejects_unsigned_payloads_by_default(tmp_path: P
     assert "Unsigned webhooks are disabled" in response.json()["detail"]
 
 
-def test_public_channel_webhook_allows_explicit_unsigned_channel(tmp_path: Path) -> None:
+def test_public_channel_webhook_allows_explicit_unsigned_channel(
+    tmp_path: Path,
+    started_test_client: Any,
+) -> None:
     from fastapi.testclient import TestClient
 
     channels = [
@@ -460,7 +678,7 @@ def test_public_channel_webhook_allows_explicit_unsigned_channel(tmp_path: Path)
         }
     ]
     (tmp_path / "channels.json").write_text(json.dumps({"channels": channels}), encoding="utf-8")
-    client = TestClient(create_app(_config(tmp_path)))
+    client = started_test_client(TestClient(create_app(_config(tmp_path))))
 
     response = client.post(
         "/api/channels/webhook/webhook",
@@ -475,6 +693,7 @@ def test_public_channel_webhook_allows_explicit_unsigned_channel(tmp_path: Path)
 def test_signed_telegram_webhook_is_the_only_public_api_ingress(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    started_test_client: Any,
 ) -> None:
     from fastapi.testclient import TestClient
 
@@ -505,7 +724,7 @@ def test_signed_telegram_webhook_is_the_only_public_api_ingress(
         require_api_auth=True,
         api_auth_token_env="KESTREL_TEST_API_TOKEN",
     )
-    client = TestClient(create_app(config))
+    client = started_test_client(TestClient(create_app(config)))
     allowed_payload = {
         "update_id": 500,
         "message": {
@@ -554,7 +773,9 @@ def test_signed_telegram_webhook_is_the_only_public_api_ingress(
         headers=webhook_headers,
     )
     assert accepted.status_code == 200
-    assert accepted.json()["session_id"] == "channel:telegram:12345"
+    assert accepted.json()["session_id"] == durable_channel_session_id(
+        channel="telegram", channel_id="telegram", conversation_id="12345"
+    )
     assert len(client.get("/api/runs", headers=auth_headers).json()) == 1
 
 
@@ -625,6 +846,111 @@ def test_generic_webhook_delivery_allows_public_https() -> None:
     assert delivery.endpoint == "https://93.184.216.34/kestrel/hook"
 
 
+def test_outbound_channel_delivery_rejects_redirect_to_private_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delivery = GenericWebhookAdapter().build_delivery(
+        ChannelEndpointConfig(
+            id="webhook",
+            provider="webhook",
+            settings={"webhook_url": "https://93.184.216.34/kestrel/hook"},
+        ),
+        _outbound(),
+        dry_run=False,
+    )
+    opened_urls: list[str] = []
+
+    class RedirectingOpener:
+        def __init__(self, handler: Any) -> None:
+            self.handler = handler
+
+        def open(self, request: Any, timeout: int) -> Any:
+            del timeout
+            opened_urls.append(str(request.full_url))
+            self.handler.redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {},
+                "http://127.0.0.1/private-control-plane",
+            )
+            raise AssertionError("redirect target must never be opened")
+
+    monkeypatch.setattr(
+        channel_adapters,
+        "build_opener",
+        lambda handler: RedirectingOpener(handler),
+    )
+
+    result = channel_adapters._post_json(delivery, timeout_seconds=2)
+
+    assert result.sent is False
+    assert result.error == "Redirects are not allowed for outbound channel delivery."
+    assert opened_urls == ["https://93.184.216.34/kestrel/hook"]
+
+
+def test_outbound_channel_delivery_rejects_dns_rebinding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolution_count = 0
+
+    def rebinding_getaddrinfo(
+        host: str,
+        port: object,
+        *args: object,
+        **kwargs: object,
+    ) -> list[tuple[object, ...]]:
+        nonlocal resolution_count
+        del args, kwargs
+        resolution_count += 1
+        address = "93.184.216.34" if resolution_count <= 2 else "127.0.0.1"
+        return [
+            (
+                net_safety.socket.AF_INET,
+                net_safety.socket.SOCK_STREAM,
+                net_safety.socket.IPPROTO_TCP,
+                "",
+                (address, int(port or 443)),
+            )
+        ]
+
+    class ResolvingOpener:
+        def open(self, request: Any, timeout: int) -> Any:
+            del request, timeout
+            net_safety.socket.getaddrinfo(
+                "rebind.example",
+                443,
+                type=net_safety.socket.SOCK_STREAM,
+                proto=net_safety.socket.IPPROTO_TCP,
+            )
+            raise AssertionError("rebound private address must never be opened")
+
+    monkeypatch.setattr(net_safety.socket, "getaddrinfo", rebinding_getaddrinfo)
+    monkeypatch.setattr(
+        channel_adapters,
+        "build_opener",
+        lambda *_handlers: ResolvingOpener(),
+    )
+    adapter = GenericWebhookAdapter()
+
+    result = adapter.deliver(
+        ChannelEndpointConfig(
+            id="webhook",
+            provider="webhook",
+            settings={"webhook_url": "https://rebind.example/kestrel/hook"},
+        ),
+        _outbound(),
+        dry_run=False,
+        timeout_seconds=2,
+    )
+
+    assert result.sent is False
+    assert result.error == "Host resolution changed for rebind.example."
+    assert resolution_count == 3
+    assert net_safety.socket.getaddrinfo is rebinding_getaddrinfo
+
+
 def test_discord_webhook_delivery_rejects_unsafe_url() -> None:
     delivery = DiscordAdapter().build_delivery(
         ChannelEndpointConfig(
@@ -640,10 +966,10 @@ def test_discord_webhook_delivery_rejects_unsafe_url() -> None:
     assert "_request_url" not in delivery.request_json
 
 
-def test_server_exposes_channel_ingest_route(tmp_path: Path) -> None:
+def test_server_exposes_channel_ingest_route(tmp_path: Path, started_test_client: Any) -> None:
     from fastapi.testclient import TestClient
 
-    client = TestClient(create_app(_config(tmp_path)))
+    client = started_test_client(TestClient(create_app(_config(tmp_path))))
     response = client.post(
         "/api/channels/ingest",
         json={
@@ -654,7 +980,9 @@ def test_server_exposes_channel_ingest_route(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["session_id"] == "channel:webhook:thread"
+    assert payload["session_id"] == durable_channel_session_id(
+        channel="webhook", channel_id="webhook", conversation_id="thread"
+    )
     assert payload["assistant_message"] == "Mock response: hello api channel"
     assert payload["delivery"]["dry_run"] is True
 
@@ -1534,6 +1862,55 @@ def test_telegram_natural_language_max_tool_calls_requires_confirmation(tmp_path
     assert fake_runs.config.max_tool_rounds == 12
 
 
+def test_telegram_max_tool_rounds_retries_conflict_and_preserves_latest_settings(
+    tmp_path: Path,
+) -> None:
+    config = replace(_config(tmp_path), allow_shell=True, max_tool_rounds=5)
+
+    class DelayedFirstTelegramLoadStore(RuntimeSettingsStore):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.load_finished = Event()
+            self.release = Event()
+            self.delayed = False
+
+        def load(self, fallback: AgentConfig) -> RuntimeSettings:
+            loaded = super().load(fallback)
+            if current_thread().name == "telegram-settings-update" and not self.delayed:
+                self.delayed = True
+                self.load_finished.set()
+                assert self.release.wait(5)
+            return loaded
+
+    store = DelayedFirstTelegramLoadStore(tmp_path / "runtime_settings.json")
+    store.save(RuntimeSettings.from_config(config))
+    manager = ChannelManager(config, channel_configs=[])
+    manager.configure_runtime_settings(
+        settings_store=store,
+        config_update_handler=lambda candidate: setattr(manager, "config", candidate),
+    )
+
+    update_thread = Thread(
+        target=manager._apply_max_tool_rounds,
+        args=(9,),
+        name="telegram-settings-update",
+    )
+    update_thread.start()
+    assert store.load_finished.wait(5)
+    current = RuntimeSettingsStore.load(store, config)
+    disabled = merge_runtime_settings(config, current, {"allow_shell": False})
+    RuntimeSettingsStore.save(store, disabled, expected_revision=current.revision)
+    store.release.set()
+    update_thread.join(5)
+
+    assert not update_thread.is_alive()
+    persisted = store.load(config)
+    assert persisted.allow_shell is False
+    assert persisted.max_tool_rounds == 9
+    assert manager.config.allow_shell is False
+    assert manager.config.max_tool_rounds == 9
+
+
 def test_telegram_admin_confirmation_expires_fail_closed(tmp_path: Path) -> None:
     class FakeRunManager:
         def __init__(self) -> None:
@@ -1744,6 +2121,31 @@ def test_channel_manager_reuses_agent_for_hot_path(tmp_path: Path) -> None:
     manager.close()
 
     assert created == 1
+
+
+def test_channel_manager_retains_agent_when_close_must_be_retried(tmp_path: Path) -> None:
+    allow_close = False
+    close_calls = 0
+
+    class RetryAgent:
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+            if not allow_close:
+                raise RuntimeError("injected channel agent close failure")
+
+    agent = cast(NestedMV2Agent, RetryAgent())
+    manager = ChannelManager(_config(tmp_path), agent_factory=lambda _config: agent)
+    manager._agent = agent
+
+    with pytest.raises(RuntimeError, match="channel agent close failure"):
+        manager.close()
+    assert manager._agent is agent
+
+    allow_close = True
+    manager.close()
+    assert manager._agent is None
+    assert close_calls == 2
 
 
 def _config(tmp_path: Path) -> AgentConfig:

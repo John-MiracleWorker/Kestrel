@@ -1,0 +1,11 @@
+# Default review ownership
+* @John-MiracleWorker
+
+# Security, automation, release, and governance surfaces
+/.github/ @John-MiracleWorker
+/SECURITY.md @John-MiracleWorker
+/CODE_OF_CONDUCT.md @John-MiracleWorker
+/GOVERNANCE.md @John-MiracleWorker
+/install.sh @John-MiracleWorker
+/scripts/ @John-MiracleWorker
+/src/nested_memvid_agent/ @John-MiracleWorker

@@ -5,9 +5,15 @@ import os
 from abc import ABC, abstractmethod
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.request import Request, build_opener
 
-from ..net_safety import public_url_allowed
+from ..net_safety import (
+    NoRedirectHandler,
+    pin_host_resolution,
+    public_url_allowed,
+    resolve_public_addresses,
+)
 from .models import (
     ChannelDelivery,
     ChannelEndpointConfig,
@@ -434,6 +440,23 @@ def default_adapters() -> dict[str, ChannelAdapter]:
     }
 
 
+def _safe_channel_urlopen(request: Request, timeout: int) -> Any:
+    request_url = str(request.full_url)
+    vetted_addresses = resolve_public_addresses(request_url, require_https=True)
+    parsed = urlparse(request_url)
+    if not parsed.hostname:
+        raise ValueError("Channel delivery URL must include a host.")
+    opener = build_opener(
+        NoRedirectHandler("Redirects are not allowed for outbound channel delivery.")
+    )
+    with pin_host_resolution(parsed.hostname, vetted_addresses):
+        return opener.open(request, timeout=max(timeout, 1))  # nosec B310
+
+
+# Retain this narrow injection seam for deterministic channel transport tests.
+urlopen = _safe_channel_urlopen
+
+
 def _post_json(delivery: ChannelDelivery, *, timeout_seconds: int) -> ChannelDelivery:
     request_url = delivery.request_json.get("_request_url")
     if not isinstance(request_url, str) or not request_url.startswith(("http://", "https://")):
@@ -452,9 +475,17 @@ def _post_json(delivery: ChannelDelivery, *, timeout_seconds: int) -> ChannelDel
             )
     except HTTPError as exc:
         response_text = exc.read().decode("utf-8", errors="replace")
-        return _copy_delivery(delivery, sent=False, status_code=int(exc.code), response_text=response_text, error=str(exc))
+        return _copy_delivery(
+            delivery,
+            sent=False,
+            status_code=int(exc.code),
+            response_text=response_text,
+            error=f"Channel endpoint returned HTTP {int(exc.code)}.",
+        )
     except URLError as exc:
         return _copy_delivery(delivery, sent=False, error=str(exc.reason))
+    except (OSError, ValueError) as exc:
+        return _copy_delivery(delivery, sent=False, error=str(exc))
 
 
 def _copy_delivery(

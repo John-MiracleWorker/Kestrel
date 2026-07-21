@@ -62,7 +62,7 @@ This validates managed stdio server connection, discovery, invocation, and shutd
 ### Behavior Delta and Live Learning Evals
 
 ```bash
-python scripts/eval_behavior_deltas.py --scenario tests/evals/behavior_deltas/policy_write_requires_approval.json
+python scripts/eval_behavior_deltas.py --scenario tests/evals/behavior_deltas/policy_write_requires_approval.json --fail-on-regression
 python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memory --output-root /tmp/kestrel-live-learning-memory
 python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memvid --output-root /tmp/kestrel-live-learning-memvid
 ```
@@ -94,7 +94,7 @@ Every proposed promotion must include:
 - promotion or rejection reason
 - context-flow and optimizer-trace metadata where the Nested Learning kernel is used
 
-Policy promotions require explicit instruction or reviewed rule, repeat evidence, high validation, config enablement, and human review or equivalent explicit configuration.
+Policy promotions require explicit instruction, repeat evidence, high validation, config enablement, exact-call human approval, and durable approval/result attestation through `memory.policy_promote` before they may receive system-priority recall.
 
 ## Context Validation
 

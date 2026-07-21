@@ -1,6 +1,6 @@
 # Implementation Pipeline
 
-Last updated: 2026-05-20
+Last updated: 2026-07-19
 
 This file records what has landed and what should be hardened next. `docs/IMPLEMENTATION_STATUS.md` is the authoritative current truth table.
 
@@ -160,7 +160,7 @@ Current commands:
 ```bash
 python scripts/run_golden_evals.py --backend memory --provider mock
 RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
-python scripts/eval_behavior_deltas.py --scenario tests/evals/behavior_deltas/policy_write_requires_approval.json
+python scripts/eval_behavior_deltas.py --scenario tests/evals/behavior_deltas/policy_write_requires_approval.json --fail-on-regression
 python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memory --output-root /tmp/kestrel-live-learning-memory
 python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memvid --output-root /tmp/kestrel-live-learning-memvid
 ```
@@ -185,13 +185,14 @@ Landed:
 - Managed stdio MCP sessions and gated integration fixture.
 - Multi-channel ingress and generic HMAC webhook verification.
 - Local bearer/API-key auth option.
+- Digest-pinned OCI execution for executable skills with default-deny read-snapshot-only scopes, host-runtime refusal, resource bounds, verified cleanup, and a required real-Docker integration gate.
 
 Remaining:
 
 - Production multi-user auth and isolation.
 - MCP SSE/streamable HTTP fixtures and soak tests.
 - Production bot identity verification and rate-limit behavior.
-- Container-grade skill isolation and dependency management.
+- Managed skill dependencies, portable non-Docker engines, richer explicit network grants, and containment soak coverage.
 
 ## Phase 8 - Scheduler, Subagents, and Safe Repair
 
@@ -205,17 +206,16 @@ Landed:
 - Bounded opt-in autonomous scheduler.
 - In-process planner/worker/reviewer profiles.
 - Diagnosis metadata on failed task/subagent records.
-- Repair branch preparation.
+- Coherent repair worktree preparation and task-DAG artifact handoff.
 - Repair patch/validate/orchestrate/rollback tools.
-- Repair review artifacts.
-- Repair-branch commit gate.
+- Process-signed repair validation/review artifacts, literal-tree commit gate, exact-digest rollback snapshots, and recovery quarantine.
+- Disabled-by-default proactive routines with revisioned owner controls, durable occurrence history, workbench editing, and idempotent manual run-now.
 
 Remaining:
 
-- True branch/worktree isolated worker fan-out.
-- Dynamic plan revision and reviewer enforcement across isolated workers.
+- Dynamic plan revision and multi-candidate reviewer selection across isolated workers.
 - Codex-backed worker orchestration.
-- Fully autonomous patch proposal with explicit approval and rollback controls.
+- Fully autonomous patch synthesis beyond the existing explicit approval, review, test, commit, and rollback controls.
 
 ## Phase 9 - Packaging and Release
 

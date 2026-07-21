@@ -22,9 +22,12 @@ class ToolContext:
     event_log: JsonlEventLog | None = None
     session_id: str = "default"
     run_id: str | None = None
+    execution_origin: str = "standalone"
     approval_handler: ApprovalHandler | None = None
     approved_tool_call_ids: frozenset[str] = frozenset()
     approved_tool_call_arguments: Mapping[str, dict[str, Any]] | None = None
+    approval_receipts: Mapping[str, dict[str, Any]] | None = None
+    trusted_request_origin: str | None = None
     tool_specs: tuple[ToolSpec, ...] = ()
     behavior_preflight: str = ""
     behavior_preflight_delta_ids: tuple[str, ...] = ()
@@ -32,6 +35,7 @@ class ToolContext:
 
 class AgentTool(ABC):
     spec: ToolSpec
+    wait_for_completion_on_timeout: bool = False
 
     @abstractmethod
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:

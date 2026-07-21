@@ -131,7 +131,7 @@ def test_exact_runtime_and_custom_environment_secrets_are_redacted() -> None:
 
 
 def test_recursive_redaction_removes_registered_secrets_from_mapping_keys() -> None:
-    raw_secret = "opaque-secret-dictionary-key-12345"
+    raw_secret = "opaque-secret-dictionary-key-12345"  # gitleaks:allow -- synthetic fixture
     register_secret_value(raw_secret)
 
     redacted = redact_secrets({raw_secret: {"safe": True}}, environ={})
